@@ -7,8 +7,9 @@ from "engine present" to "a shell you can launch":
 
     1. Guard   — refuse to run in the super-coder SOURCE repo, or on a fork that
                  is already installed (both would destroy content). --force skips.
-    2. Require — python3 + sqlite3 (+ a heads-up if git or a harness CLI is missing).
-    3. Detect  — the coding harness on PATH (claude / opencode) → instance.json.
+    2. Require — python3 + sqlite3 (+ a heads-up if git or curl is missing).
+    3. Harness — ensure claude + opencode are installed (official native
+                 installers, no npm); pick the launch default → instance.json.
     4. Strip   — super-coder's own per-instance content; a fork inherits the
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
@@ -74,9 +75,62 @@ def already_installed() -> bool:
 
 def detect_harness() -> str | None:
     for h in ("claude", "opencode"):
-        if shutil.which(h):
+        if _harness_installed(h):
             return h
     return None
+
+
+# Official NATIVE installers — no npm. Claude Code dropped npm as the primary
+# path (https://code.claude.com/docs/en/setup); opencode ships its own script
+# too. Pipe-to-bash, latest version.
+HARNESS_INSTALL = {
+    "claude":   "curl -fsSL https://claude.ai/install.sh | bash",
+    "opencode": "curl -fsSL https://opencode.ai/install | bash",
+}
+# Where each installer drops its binary. Checked post-install because the new
+# bin dir is NOT on this process's PATH — the installer edits shell rc files,
+# which only a fresh shell picks up. shutil.which alone would miss a just-
+# installed CLI.
+HARNESS_BIN = {
+    "claude":   Path.home() / ".local" / "bin" / "claude",
+    "opencode": Path.home() / ".opencode" / "bin" / "opencode",
+}
+
+
+def _harness_installed(name: str) -> bool:
+    return bool(shutil.which(name)) or HARNESS_BIN.get(name, Path("/nonexistent")).exists()
+
+
+def ensure_harnesses() -> dict[str, str]:
+    """Install any missing harness CLI via its official native installer (no
+    npm) — both claude + opencode, so a fork can launch and run either. Best
+    effort: a failed install warns and continues (the harness is only needed at
+    launch and can be installed by hand later). Returns {name: status}."""
+    status: dict[str, str] = {}
+    have_curl = bool(shutil.which("curl"))
+    for name, cmd in HARNESS_INSTALL.items():
+        if _harness_installed(name):
+            print(f"  {name:9} ✓ already installed")
+            status[name] = "present"
+            continue
+        if not have_curl:
+            print(f"  {name:9} ⚠ missing, and curl is unavailable — install by hand: {cmd}")
+            status[name] = "no-curl"
+            continue
+        print(f"  {name:9} … not found — installing  ($ {cmd})")
+        rc = subprocess.run(["bash", "-c", cmd]).returncode
+        if rc == 0 and _harness_installed(name):
+            print(f"  {name:9} ✓ installed")
+            status[name] = "installed"
+        else:
+            print(f"  {name:9} ⚠ install failed (rc={rc}) — retry by hand: {cmd}")
+            status[name] = "failed"
+    fresh = [n for n, s in status.items() if s == "installed"]
+    if fresh:
+        dirs = sorted({str(HARNESS_BIN[n].parent) for n in fresh})
+        print(f"  ↪ new CLIs live in {', '.join(dirs)} — open a NEW shell (or update "
+              f"PATH) before `./sc launch`, since this shell's PATH predates them.")
+    return status
 
 
 # Ignore lines a fork needs — the rebuilt/derived artifacts. The git checkout
@@ -112,7 +166,17 @@ def step(msg: str) -> None:
 
 def main(argv: list[str]) -> int:
     force = "--force" in argv
-    fork_args = [a for a in argv if a != "--force"]
+    skip_harness = "--skip-harness-install" in argv
+    # super-coder's own flags — strip them so they don't reach init_fork's parser.
+    own = {"--force", "--skip-harness-install", "--ensure-harness"}
+    fork_args = [a for a in argv if a not in own]
+
+    # Standalone: just ensure the harness CLIs and exit (for an already-installed
+    # fork). Runs before the guards so it works anywhere.
+    if "--ensure-harness" in argv:
+        step("Ensuring harness CLIs (claude + opencode)")
+        ensure_harnesses()
+        return 0
 
     # 1. Guards ---------------------------------------------------------------
     if is_source_repo() and not force:
@@ -133,21 +197,24 @@ def main(argv: list[str]) -> int:
         sys.exit("  python3 is missing the sqlite3 module — install it and retry.")
     if not shutil.which("git"):
         print("  ⚠ git not on PATH — needed for the commit→PR flow later.")
+    if not shutil.which("curl"):
+        print("  ⚠ curl not on PATH — needed to auto-install a missing harness.")
 
-    # 3. Detect harness -------------------------------------------------------
-    # We DETECT, we don't install — a fork's installer shouldn't silently run a
-    # global npm/curl install of someone else's CLI. If neither is present we
-    # print how to get one and carry on (the harness is only needed at launch).
-    step("Detecting harness")
-    harness = detect_harness()
-    if harness:
-        print(f"  found '{harness}' on PATH")
+    # 3. Ensure harness CLIs --------------------------------------------------
+    # Install both claude + opencode if missing, via their official NATIVE
+    # installers (no npm). The new harness picker lets a fork launch + run
+    # either, so we want both present. --skip-harness-install detects only
+    # (CI / air-gapped). instance.json's harness is the launch default; the
+    # picker overrides it per-launch.
+    step("Ensuring harness CLIs (claude + opencode)")
+    if skip_harness:
+        print("  --skip-harness-install set — detecting only, not installing")
+        for n in HARNESS_INSTALL:
+            print(f"  {n:9} {'✓ present' if _harness_installed(n) else 'absent'}")
     else:
-        harness = "claude"
-        print("  ⚠ no harness CLI found. Install one before `./sc launch`:")
-        print("      claude    npm i -g @anthropic-ai/claude-code   ·  https://docs.claude.com/claude-code")
-        print("      opencode  npm i -g opencode-ai                 ·  https://opencode.ai")
-        print("    Defaulting instance.json harness to 'claude' (edit it to switch).")
+        ensure_harnesses()
+    harness = detect_harness() or "claude"  # claude preferred; both should be present
+    print(f"  → default harness for instance.json: {harness}")
 
     # 3.5 Wire the host repo's .gitignore -------------------------------------
     step("Wiring .gitignore")

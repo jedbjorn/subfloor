@@ -29,9 +29,10 @@ never collides with your repo's own `/docs`, `/specs`, or skills. A fork
 inherits the **system** (schema + the skill catalogue + the render chain), never
 super-coder's own memory or roadmap.
 
-> Requirements: `python3`, `sqlite3`, `git`, and your harness CLI (`claude` or
-> `opencode`) on `PATH`; `pm2` for the review GUI. (No `make` — `./sc` is a
-> plain shell dispatcher.)
+> Requirements: `python3`, `sqlite3`, `git`, `curl`; `pm2` for the review GUI.
+> (No `make` — `./sc` is a plain shell dispatcher. No `npm` — the harness CLIs
+> install via their own native installers.) `./sc install` installs the harness
+> CLIs (`claude` + `opencode`) for you if they're missing.
 
 ```bash
 cd your-repo                    # an existing git repo
@@ -50,8 +51,10 @@ git add -A && git commit -m "chore: install super-coder"
 ./sc launch                     # starts the review GUI + boots your shell
 ```
 
-`./sc install` does the rest: checks requirements, detects your harness
-(`claude` / `opencode`), wires your `.gitignore`, **strips super-coder's own
+`./sc install` does the rest: checks requirements, **installs the harness CLIs**
+(`claude` + `opencode`, via their official native installers — no npm — if either
+is missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
+**strips super-coder's own
 per-instance content** (a fork inherits the *system* — schema + skill catalogue
 + render chain — never the memory or roadmap), builds the system DB, seeds your
 fork's **first shell** (your user + a shell carrying the CC Lineage Seed and its
