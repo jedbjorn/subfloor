@@ -2,7 +2,7 @@
 """Install super-coder into a fork — first-launch bootstrap.
 
 Run once, in a host repo that has just pulled the engine
-(`git checkout super-coder/main -- .super-coder Makefile`). It takes that repo
+(`git checkout super-coder/main -- .super-coder sc`). It takes that repo
 from "engine present" to "a shell you can launch":
 
     1. Guard   — refuse to run in the super-coder SOURCE repo, or on a fork that
@@ -14,11 +14,11 @@ from "engine present" to "a shell you can launch":
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
     6. Seed    — the fork's first user + shell (delegates to init_fork; CC lineage
                  + genesis seed + skill grants).
-    7. Persist — `make snapshot` (serialize the new shell) + `make render` (flat _sc).
+    7. Persist — `./sc snapshot` (serialize the new shell) + `./sc render` (flat _sc).
     8. Done    — print how to launch.
 
 Usage:
-    make install                      # interactive (prompts for user/shell)
+    ./sc install                      # interactive (prompts for user/shell)
     python3 .super-coder/scripts/install.py [init_fork flags] [--force]
         e.g. … --username Sam --name Dev --shortname dev --role "Dev shell"
 """
@@ -122,7 +122,7 @@ def main(argv: list[str]) -> int:
     if already_installed() and not force:
         sys.exit("install: this fork is already installed (.super-coder/instance.json "
                  "has installed_at). Re-installing destroys content — pass --force "
-                 "to override, or just `make launch`.")
+                 "to override, or just `./sc launch`.")
 
     # 2. Requirements ---------------------------------------------------------
     step("Checking requirements")
@@ -144,7 +144,7 @@ def main(argv: list[str]) -> int:
         print(f"  found '{harness}' on PATH")
     else:
         harness = "claude"
-        print("  ⚠ no harness CLI found. Install one before `make launch`:")
+        print("  ⚠ no harness CLI found. Install one before `./sc launch`:")
         print("      claude    npm i -g @anthropic-ai/claude-code   ·  https://docs.claude.com/claude-code")
         print("      opencode  npm i -g opencode-ai                 ·  https://opencode.ai")
         print("    Defaulting instance.json harness to 'claude' (edit it to switch).")
@@ -195,8 +195,8 @@ def main(argv: list[str]) -> int:
     print(f"  harness : {harness}")
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")
     print("\nNext:")
-    print("  git add .super-coder Makefile .gitignore && git commit -m 'install super-coder'")
-    print("  make launch        # starts the review GUI + boots your shell")
+    print("  git add -A && git commit -m 'install super-coder'")
+    print("  ./sc launch        # starts the review GUI + boots your shell")
     return 0
 
 

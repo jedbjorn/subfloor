@@ -6,9 +6,9 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # surface_catalogue
 
-Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Run `make map` to refresh it. Use to orient in an unfamiliar repo fast.
+Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Run `./sc map` to refresh it. Use to orient in an unfamiliar repo fast.
 
-**Category:** substrate  ·  **Command:** `make map`
+**Category:** substrate  ·  **Command:** `./sc map`
 
 ---
 
@@ -16,7 +16,7 @@ Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE g
 
 super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
 repo — query them first to orient, instead of walking the tree blind. The map is
-a derived cache (not snapshotted); refresh it with `make map` after the repo
+a derived cache (not snapshotted); refresh it with `./sc map` after the repo
 changes.
 
 | Table | Holds |
@@ -51,7 +51,7 @@ SELECT name, source_file FROM dr_env ORDER BY name;
 
 - **Map first, grep second.** Query `dr_filepath` to find the handful of files
   that matter, then read those — don't `grep -r` the whole tree.
-- **Stale map?** If the repo changed since `mapped_at`, run `make map` (or the
+- **Stale map?** If the repo changed since `mapped_at`, run `./sc map` (or the
   Map tab's re-map) before trusting it.
 - v1 maps files / deps / env. Semantic tables (APIs, db schema, routes/pages)
   are a later pass — until then, read the code the map points you at.

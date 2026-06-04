@@ -42,7 +42,7 @@ matches disk is skipped, so an unchanged DB renders to nothing):
 
 The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
 shell — gitignored caches, like `.db`. The flat `_sc` files are the tracked
-visibility surface for browsers without localhost; `make render` (and `make
+visibility surface for browsers without localhost; `./sc render` (and `make
 verify`) regenerate them, and the B6 commit→PR automation will refresh them on
 every content edit. Each rendered file carries the do-not-edit banner (spec
 §Content & Render); for bodies that already open with YAML frontmatter the
@@ -56,9 +56,9 @@ banner keys are spliced into it rather than prepended, so the YAML stays valid.
 System content: a skill's body propagates to every fork. Authored at
 `assets/skills/<name>/SKILL.md` (frontmatter `name`/`description`/`category`/
 `command`/`common` + markdown body), compiled by `scripts/seed_skills.py`
-(`make seed-skills`) into `migrations/0001_seed_skills.sql`. The catalogue rides
+(`./sc seed-skills`) into `migrations/0001_seed_skills.sql`. The catalogue rides
 in a migration (propagates); the per-shell *grant* (`shell_skills`) rides in the
-snapshot (fork-local). `make rebuild` seeds the catalogue, then loads grants.
+snapshot (fork-local). `./sc rebuild` seeds the catalogue, then loads grants.
 
 ## Adapters
 
@@ -104,5 +104,5 @@ and the static `ui/` (one page, vanilla JS) on a single per-fork port.
 `scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
 100`), bumping past anything occupied, and persists it to the gitignored
 `instance.json`. `ecosystem.config.cjs` names the pm2 process `sc-<repo>` so
-forks (and the host repo's own pm2 apps) never clash. `make up` / `down` /
+forks (and the host repo's own pm2 apps) never clash. `./sc up` / `down` /
 `health` / `serve` drive it.

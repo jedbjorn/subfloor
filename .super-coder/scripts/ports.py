@@ -87,7 +87,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps(resolve(persist=True)))
     elif mode == "show":
         print(json.dumps(resolve(persist=False)))
-    elif mode == "port":          # bare integer, for shell/Makefile use
+    elif mode == "port":          # bare integer, for shell/sc use
         print(resolve(persist=False)["port"])
     elif mode == "name":          # pm2 process name — unique per fork
         print("sc-" + resolve(persist=False).get("repo", "fork"))

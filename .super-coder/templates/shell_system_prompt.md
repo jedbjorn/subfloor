@@ -22,7 +22,7 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
 Write as it happens, not at close. The `.db` is a cache: after content edits,
-`make snapshot` (+ `make render` for docs/roadmap/skills) re-serializes to the
+`./sc snapshot` (+ `./sc render` for docs/roadmap/skills) re-serializes to the
 text git tracks. See the `db_map` and `snapshot` skills.
 
 ## MANDATE

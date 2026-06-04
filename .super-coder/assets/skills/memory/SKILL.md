@@ -8,7 +8,7 @@ common: true
 # memory — write as you go
 
 All memory is DB rows (no flat files). Write at the moment it matters, not in a
-close ritual. The `.db` is a cache — after writing, `make snapshot` serializes to
+close ritual. The `.db` is a cache — after writing, `./sc snapshot` serializes to
 the text git tracks (see the `snapshot` skill). `<self>` = your shell_id.
 
 ## current_state — rolling status, NOT a log

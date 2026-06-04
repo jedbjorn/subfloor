@@ -17,7 +17,7 @@ Schema map + reusable SQL for super-coder's shell_db.db. Check before composing 
 Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 `schema.sql` + `migrations/*.sql` + `snapshot/content.sql`). All identity,
 memory, and content live in tables — never flat files. **The `.db` is a cache:**
-after any content write, `make snapshot` re-serializes to text (see the
+after any content write, `./sc snapshot` re-serializes to text (see the
 `snapshot` skill). Lazy-load: query for what you need, don't bulk-read.
 
 ## Tables
@@ -73,6 +73,6 @@ WHERE flag_id=?;
 
 ## After writing
 
-Content lives in the `.db` until you serialize it. Run `make snapshot` (and
-`make render` if you changed documents/roadmap/skills), then commit the text —
+Content lives in the `.db` until you serialize it. Run `./sc snapshot` (and
+`./sc render` if you changed documents/roadmap/skills), then commit the text —
 see the `snapshot` skill for the full lifecycle.
