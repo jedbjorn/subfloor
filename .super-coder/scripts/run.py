@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import sys
 from datetime import date, datetime
@@ -58,6 +59,55 @@ def emit_adapter(adapter: dict) -> list[str]:
             atomic_write(REPO_ROOT / fname, src.read_text())
             written.append(fname)
     return written
+
+
+def detect_harnesses() -> list[str]:
+    """Harnesses installable RIGHT NOW: an adapter dir with adapter.json whose
+    launch command is also on PATH. Adapter-dir order. Drives the launch-time
+    picker — we only offer a harness the host can actually exec."""
+    if not ADAPTERS.exists():
+        return []
+    found = []
+    for d in sorted(ADAPTERS.iterdir()):
+        cfg = d / "adapter.json"
+        if not (d.is_dir() and cfg.exists()):
+            continue
+        try:
+            adapter = json.loads(cfg.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        cmd = (adapter.get("launch") or [d.name])[0]
+        if shutil.which(cmd):
+            found.append(adapter.get("harness", d.name))
+    return found
+
+
+def pick_harness(detected: list[str], default: str, first: bool) -> str | None:
+    """Resolve the harness when no explicit override (--harness / HARNESS) was
+    given. Returns None when nothing is detected so the caller can fall back to
+    instance.json/'claude' — preserving the old silent behavior on a host with
+    no harness CLI on PATH (headless verify, CI). The pick is per-launch only:
+    nothing is written back, so two terminals can boot the same fork on
+    different harnesses in parallel."""
+    if not detected:
+        return None
+    if len(detected) == 1:
+        return detected[0]
+    dflt = default if default in detected else detected[0]
+    # --first and non-TTY (verify/CI) never prompt — take the default silently.
+    if first or not sys.stdin.isatty():
+        return dflt
+    print("\nHarness:")
+    for i, h in enumerate(detected, 1):
+        mark = "  (default)" if h == dflt else ""
+        print(f"  {i}. {h}{mark}")
+    while True:
+        choice = input(f"\nPick (1-{len(detected)}, Enter for {dflt}): ").strip()
+        if not choice:
+            return dflt
+        if choice.isdigit() and 1 <= int(choice) <= len(detected):
+            return detected[int(choice) - 1]
+        print("  invalid choice")
 
 
 def _configured_harness() -> str | None:
@@ -198,12 +248,36 @@ def atomic_write(path: Path, content: str) -> None:
 def main() -> None:
     args = sys.argv[1:]
     first = "--first" in args
-    positional = [a for a in args if not a.startswith("-")]
+    # --harness <name> / --harness=<name> forces the harness and skips the
+    # picker; its value must not be mistaken for the shell shortname positional.
+    flag_harness = None
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--harness":
+            flag_harness = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if a.startswith("--harness="):
+            flag_harness = a.split("=", 1)[1]
+        elif not a.startswith("-"):
+            positional.append(a)
+        i += 1
     requested = positional[0] if positional else None
 
     con = open_db()
     user = authenticate(con)
     chosen = pick_shell(list_shells(con, user["user_id"]), requested, first)
+
+    # Harness pick, right after the shell pick: an explicit --harness / HARNESS
+    # override wins silently; otherwise offer the harnesses on PATH when more
+    # than one is present (per-launch, never persisted), falling back to this
+    # fork's instance.json value / 'claude' when nothing is detected.
+    default_harness = _configured_harness() or "claude"
+    harness = (flag_harness or os.environ.get("HARNESS")
+               or pick_harness(detect_harnesses(), default_harness, first)
+               or default_harness)
 
     session_id, archive_id = open_session(con, chosen["shell_id"])
 
@@ -231,10 +305,8 @@ def main() -> None:
     print(f"→ skills: {len(skills['written'])} written, "
           f"{len(skills['skipped'])} unchanged → .claude/skills/")
 
-    # Harness: HARNESS env wins, else this fork's configured harness
-    # (instance.json, set by the installer), else claude. The adapter seam owns
-    # the launch command + any harness-specific config to emit.
-    harness = os.environ.get("HARNESS") or _configured_harness() or "claude"
+    # Harness was resolved up front (override / picker / default); the adapter
+    # seam owns the launch command + any harness-specific config to emit.
     adapter = load_adapter(harness)
     emitted = emit_adapter(adapter)
     print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")

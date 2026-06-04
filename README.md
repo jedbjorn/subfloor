@@ -98,14 +98,23 @@ skill *name*, so they're immune to catalogue-id shifts.
 ## Run (everyday)
 
 ```bash
-./sc launch              # auth + pick a shell + render boot + exec the harness
-./sc launch-<shortname>  # boot one shell directly, skip the picker
+./sc launch              # auth + pick a shell + pick a harness + render boot + exec
+./sc launch-<shortname>  # boot one shell directly, skip the shell picker
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
 ./sc render              # regenerate the tracked flat _sc files from the DB
 ./sc snapshot            # serialize per-instance tables → snapshot/content.sql
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
 ./sc help                # all targets
 ```
+
+**Choosing a harness.** The boot artifact is dual-written every launch
+(`CLAUDE.md` for Claude Code, `AGENTS.md` for the rest), so any installed harness
+can boot the same shell. At launch, after you pick a shell: `--harness <name>` or
+`HARNESS=<name>` forces one; otherwise, when more than one harness is on `PATH`,
+you're prompted (default = your fork's `instance.json` harness). The pick is
+per-launch and never written back — so two terminals can run the **same** shell on
+different harnesses at once (one Claude Code, one OpenCode). A fork with a single
+harness on `PATH` skips the prompt.
 
 **Prefer `make`?** super-coder never touches your repo's `Makefile`, but you can
 alias the common case in your own — a one-liner you control:

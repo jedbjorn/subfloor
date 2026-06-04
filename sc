@@ -59,8 +59,10 @@ super-coder — forkable shell substrate
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc seed-skills         regenerate the skills seed migration from assets/skills/
   ./sc init                seed a fresh fork's first user + shell (run once after install)
-  ./sc launch              start the GUI (prints its URL) + auth + pick shell + boot + exec harness
-  ./sc launch-<shortname>  boot that shell directly (skip picker); also starts the GUI
+  ./sc launch              start the GUI (prints its URL) + auth + pick shell + pick harness + boot
+  ./sc launch-<shortname>  boot that shell directly (skip shell picker); also starts the GUI
+                             harness: --harness <name> or HARNESS=<name> forces it; else when
+                             >1 harness is on PATH you're prompted (per-launch, not persisted)
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc up / down / restart start/stop the localhost review layer (pm2, per-fork port)
   ./sc serve               run the review layer in the foreground (no pm2)
