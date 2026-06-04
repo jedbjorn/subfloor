@@ -73,7 +73,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (5, 'B1 — First-launch installer', 'next', 0, 1, 'Full installer on top of init_fork: requirements check, harness auto-detect, slot-filled shell_system_prompt template.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (6, 'B6 — Commit→PR automation', 'next', 1, 1, 'edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapshot button is the manual precursor.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (7, 'B4 — OpenCode adapter', 'near_term', 0, 1, 'Emit opencode.json + verify the research-flagged items; boot already dual-writes AGENTS.md + SKILL.md.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (8, 'B5 — Onboarding & mapping', 'long_term', 0, 1, 'Install-time dr_* mapper (generalized) + one-time first-runtime ingest skill.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (8, 'B5 — Onboarding & mapping', 'near_term', 0, 1, 'dr_* code map DONE (files/deps/env, make map, GUI Map tab, surface_catalogue skill). Next: content ingest (README/docs/specs → DB + roadmap backfill) + semantic tables (api/db/page).', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (9, 'Fork to sibling repos', 'brainstorm', 0, 1, 'Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 
 DELETE FROM documents;
@@ -613,5 +613,6 @@ INSERT INTO project_shells (project_shell_id, project_id, shell_id, role, added_
 DELETE FROM shell_skills;
 INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (2, 1, 2);
 INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (3, 1, 1);
+INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (4, 1, 3);
 
 COMMIT;

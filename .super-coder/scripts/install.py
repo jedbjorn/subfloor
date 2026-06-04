@@ -174,7 +174,11 @@ def main(argv: list[str]) -> int:
     if r.returncode != 0:
         sys.exit("install: first-shell seeding failed (or was aborted).")
 
-    # 7. Persist: snapshot + render ------------------------------------------
+    # 7. Map the host repo into the dr_* catalogue (so the shell can read it) --
+    step("Mapping the repo (dr_* catalogue)")
+    subprocess.run([PY, str(ENGINE / "scripts/map_repo.py")])
+
+    # 8. Persist: snapshot + render ------------------------------------------
     step("Serializing + rendering")
     subprocess.run([PY, str(ENGINE / "scripts/snapshot.py")])
     subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"])
@@ -185,7 +189,7 @@ def main(argv: list[str]) -> int:
     cfg["installed_at"] = date.today().isoformat()
     ports_mod.CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
 
-    # 8. Done -----------------------------------------------------------------
+    # 9. Done -----------------------------------------------------------------
     step("Installed ✓")
     print(f"  harness : {harness}")
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")

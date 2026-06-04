@@ -90,3 +90,9 @@ details summary { cursor: pointer; color: var(--accent); }
 a { color: var(--accent); }
 .list-skill { display: flex; align-items: center; gap: .5rem; padding: .2rem 0; }
 .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--panel2); border: 1px solid var(--accent); border-radius: var(--r); padding: .6rem 1rem; max-width: 420px; white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; }
+.bars { display: grid; gap: .3rem; }
+.bar-row { display: grid; grid-template-columns: 110px 1fr 40px; align-items: center; gap: .6rem; }
+.bar-label { color: var(--dim); font-size: .85rem; }
+.bar-track { background: var(--panel2); border-radius: 99px; height: 10px; overflow: hidden; }
+.bar-fill { background: var(--accent); height: 100%; }
+.bar-n { text-align: right; color: var(--dim); font-size: .8rem; }

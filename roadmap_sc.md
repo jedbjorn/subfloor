@@ -41,10 +41,8 @@ Emit opencode.json + verify the research-flagged items; boot already dual-writes
 
 _No open flags._
 
-## Long Term
-
 ### B5 — Onboarding & mapping · owner: `cc`
-Install-time dr_* mapper (generalized) + one-time first-runtime ingest skill.
+dr_* code map DONE (files/deps/env, make map, GUI Map tab, surface_catalogue skill). Next: content ingest (README/docs/specs → DB + roadmap backfill) + semantic tables (api/db/page).
 
 _No open flags._
 

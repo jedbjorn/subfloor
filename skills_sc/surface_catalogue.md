@@ -1,0 +1,57 @@
+---
+rendered_by: super-coder
+source: db
+edit: changes here are overwritten — author via the shell or localhost GUI
+---
+
+# surface_catalogue
+
+Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Run `make map` to refresh it. Use to orient in an unfamiliar repo fast.
+
+**Category:** substrate  ·  **Command:** `make map`
+
+---
+
+# surface_catalogue — read the repo from the map, not by grepping
+
+super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
+repo — query them first to orient, instead of walking the tree blind. The map is
+a derived cache (not snapshotted); refresh it with `make map` after the repo
+changes.
+
+| Table | Holds |
+|---|---|
+| `dr_repo` | the repo: name, root, remote, vcs, default_branch, file_count, mapped_at |
+| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines` |
+| `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
+| `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
+
+## Orient fast
+
+```sql
+-- what is this repo + how big:
+SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
+
+-- language mix:
+SELECT lang, COUNT(*) n, SUM(lines) lines FROM dr_filepath
+WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
+
+-- where the code lives (skip docs/config/assets):
+SELECT path, lang, lines FROM dr_filepath WHERE role='code' ORDER BY lines DESC;
+
+-- find files by area (the map is the index; grep only what it points at):
+SELECT path FROM dr_filepath WHERE path LIKE '%auth%';
+
+-- stack + config surface:
+SELECT manager, name, version FROM dr_dependency ORDER BY manager, name;
+SELECT name, source_file FROM dr_env ORDER BY name;
+```
+
+## Stance
+
+- **Map first, grep second.** Query `dr_filepath` to find the handful of files
+  that matter, then read those — don't `grep -r` the whole tree.
+- **Stale map?** If the repo changed since `mapped_at`, run `make map` (or the
+  Map tab's re-map) before trusting it.
+- v1 maps files / deps / env. Semantic tables (APIs, db schema, routes/pages)
+  are a later pass — until then, read the code the map points you at.

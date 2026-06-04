@@ -212,6 +212,49 @@ CREATE TABLE project_shells (
     UNIQUE (project_id, shell_id)
 );
 
+-- ── Repo catalogue (dr_*) — the host repo, mapped ───────────────────────────
+-- super-coder is dropped INTO a host repo; these tables are how the shell reads
+-- that repo without grepping blind. Structure is system (ships in the baseline);
+-- the ROWS are a derived cache of the host repo, populated by scripts/map_repo.py
+-- (`make map`, run at install) — NOT snapshotted, re-mappable when the repo
+-- changes. v1 maps files / deps / env; semantic tables (api/db/page) come later.
+
+CREATE TABLE dr_repo (
+    repo_id        INTEGER PRIMARY KEY,
+    name           TEXT,
+    root           TEXT,
+    remote         TEXT,
+    vcs            TEXT,
+    default_branch TEXT,
+    file_count     INTEGER,
+    mapped_at      TEXT
+);
+
+CREATE TABLE dr_filepath (
+    file_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    path     TEXT NOT NULL,           -- repo-relative
+    ext      TEXT,
+    lang     TEXT,                    -- inferred from extension
+    role     TEXT,                    -- code / doc / config / test / asset / env
+    bytes    INTEGER,
+    lines    INTEGER
+);
+
+CREATE TABLE dr_dependency (
+    dep_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    manager     TEXT,                 -- npm / pip / poetry / go / cargo
+    name        TEXT NOT NULL,
+    version     TEXT,
+    kind        TEXT,                 -- runtime / dev
+    source_file TEXT
+);
+
+CREATE TABLE dr_env (
+    env_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    source_file TEXT
+);
+
 -- ── Indexes ─────────────────────────────────────────────────────────────────
 
 CREATE INDEX idx_flags_parent   ON flags(parent_flag_id);
@@ -222,3 +265,6 @@ CREATE INDEX idx_documents_feature ON documents(feature_id, kind, seq);
 CREATE INDEX idx_sie_shell_kind_active
     ON shell_identity_entries(shell_id, kind)
     WHERE is_deleted = 0 AND retired_at IS NULL;
+CREATE INDEX idx_dr_filepath_role ON dr_filepath(role);
+CREATE INDEX idx_dr_filepath_lang ON dr_filepath(lang);
+CREATE INDEX idx_dr_dependency_mgr ON dr_dependency(manager);

@@ -4,7 +4,7 @@ PY     := python3
 
 ECO    := $(ENGINE)/ecosystem.config.cjs
 
-.PHONY: help install rebuild migrate snapshot render seed-skills init gui-up launch launch-% verify clean-db up down restart health serve ports
+.PHONY: help install rebuild migrate snapshot render seed-skills init map gui-up launch launch-% verify clean-db up down restart health serve ports
 
 help:
 	@echo "super-coder — forkable shell substrate"
@@ -14,6 +14,7 @@ help:
 	@echo "  make migrate             apply pending migrations to an existing $(DB)"
 	@echo "  make snapshot            dump per-instance tables -> $(ENGINE)/snapshot/content.sql"
 	@echo "  make render              render tracked flat _sc files (specs/docs/skills/roadmap)"
+	@echo "  make map                 scan the host repo into the dr_* catalogue (re-runnable)"
 	@echo "  make seed-skills         regenerate the skills seed migration from assets/skills/"
 	@echo "  make init                seed a fresh fork's first user + shell (run once after install)"
 	@echo "  make launch              start the GUI (prints its URL) + auth + pick shell + boot + exec harness"
@@ -39,6 +40,9 @@ snapshot:
 
 render:
 	@$(PY) $(ENGINE)/scripts/render.py flat
+
+map:
+	@$(PY) $(ENGINE)/scripts/map_repo.py
 
 seed-skills:
 	@$(PY) $(ENGINE)/scripts/seed_skills.py
