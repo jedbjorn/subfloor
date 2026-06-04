@@ -80,7 +80,7 @@ def rows(cur) -> list[dict]:
 
 def get_shells(con) -> list[dict]:
     return rows(con.execute(
-        "SELECT shell_id, display_name, shortname, role, mandate, is_shared "
+        "SELECT shell_id, display_name, shortname, role, flavor, mandate, is_shared "
         "FROM shells WHERE COALESCE(is_deleted,0)=0 ORDER BY shell_id"))
 
 

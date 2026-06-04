@@ -2,7 +2,7 @@
 name: flags
 description: Track blockers as flags — surface open ones, open new ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.
 category: substrate
-common: true
+common: false
 ---
 
 # flags — blockers & follow-ups

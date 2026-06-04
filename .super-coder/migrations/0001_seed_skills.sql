@@ -269,7 +269,7 @@ INSERT INTO skills (name, description, category, command, common, content) VALUE
   'Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
   'substrate',
   NULL,
-  1,
+  0,
   '# docs — author & review documents
 
 In super-coder the **DB owns document bodies** — never loose `.md` files. A
@@ -326,7 +326,7 @@ INSERT INTO skills (name, description, category, command, common, content) VALUE
   'Track blockers as flags — surface open ones, open new ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.',
   'substrate',
   NULL,
-  1,
+  0,
   '# flags — blockers & follow-ups
 
 A flag is an open question or blocker. Linking it to a `feature_id` makes it that
@@ -372,7 +372,7 @@ INSERT INTO skills (name, description, category, command, common, content) VALUE
   'Git conventions for a super-coder shell — one repo, one cwd. Branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
   'substrate',
   NULL,
-  1,
+  0,
   '# git — version control, the super-coder way
 
 A super-coder shell works **one repo at its root** — no cross-repo confusion, so

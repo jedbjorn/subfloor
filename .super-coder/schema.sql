@@ -47,6 +47,7 @@ CREATE TABLE shells (
     connections       TEXT,
     workspace         TEXT,
     lineage_seed      TEXT,
+    flavor            TEXT,                          -- planning / dev / review (NULL = bespoke, e.g. maintainer)
     has_identity      INTEGER NOT NULL DEFAULT 0,
     bootstrapped      INTEGER NOT NULL DEFAULT 0,   -- 1 once the shell has run first-run orientation
 

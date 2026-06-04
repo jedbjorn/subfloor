@@ -2,7 +2,7 @@
 name: git
 description: Git conventions for a super-coder shell — one repo, one cwd. Branch before committing, open PRs (never merge without the FnB's OK), attribute commits per-shell. Use before any git work.
 category: substrate
-common: true
+common: false
 ---
 
 # git — version control, the super-coder way
