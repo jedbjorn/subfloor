@@ -62,9 +62,29 @@ snapshot (fork-local). `make rebuild` seeds the catalogue, then loads grants.
 
 ## Adapters
 
-`adapters/<harness>/` holds the thin, harness-specific seam: provider/model
-config, tool/permission config, MCP config, launch command. `claude/` is v1;
-`opencode/` is next. Everything above the seam is harness-blind.
+`adapters/<harness>/` is the **only** harness-specific seam — everything above it
+is harness-blind. Each holds an `adapter.json`:
+
+| field | meaning |
+|---|---|
+| `launch` | argv exec'd to start the harness |
+| `boot_artifact` | the context file this harness reads (informational) |
+| `emit` | files in the adapter dir copied to the repo root at launch (gitignored, regenerated each launch from the tracked template) |
+| `env` | extra env merged into the launch environment |
+
+- **`claude/`** — reads `CLAUDE.md` + `.claude/skills/*/SKILL.md` natively; nothing
+  extra to emit.
+- **`opencode/`** — reads `AGENTS.md` + `.claude/skills/*/SKILL.md` natively, and
+  emits **`opencode.json`** (instructions → `AGENTS.md`, tool permissions, `mcp`
+  slot). `env.OPENCODE_DISABLE_CLAUDE_CODE=1` avoids double-loading `CLAUDE.md`
+  (we dual-write both). Edit the tracked `opencode.json` template to change a
+  fork's config.
+
+The boot render dual-writes `CLAUDE.md` + `AGENTS.md` and the skills, so both
+harnesses consume the same substrate unchanged — that's the harness-agnostic bet.
+`run.py` picks the harness (`HARNESS` env → `instance.json` → claude), loads its
+adapter, emits its files, and exec's its launch command. An unknown harness falls
+back to running its own name + reading `AGENTS.md`.
 
 ## Review layer (`api/` + `ui/`)
 

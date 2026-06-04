@@ -91,6 +91,7 @@ _GITIGNORE_BLOCK = f"""
 /.super-coder/instance.json
 /CLAUDE.md
 /AGENTS.md
+/opencode.json
 /.claude/skills/
 """
 

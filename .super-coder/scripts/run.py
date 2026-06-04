@@ -32,12 +32,32 @@ sys.path.insert(0, str(ENGINE / "render"))
 from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
 
-# The launch command per harness. The adapters/ seam owns this for real in B1;
-# inline here keeps the spine self-contained. HARNESS env overrides.
-LAUNCH = {
-    "claude": ["claude"],
-    "opencode": ["opencode"],
-}
+ADAPTERS = ENGINE / "adapters"
+
+
+def load_adapter(harness: str) -> dict:
+    """The harness-specific seam (adapters/<harness>/adapter.json): launch argv,
+    which files to emit at the repo root, and extra launch env. Unknown harness
+    falls back to running its own name + reading AGENTS.md."""
+    path = ADAPTERS / harness / "adapter.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return {"harness": harness, "launch": [harness], "boot_artifact": "AGENTS.md",
+            "emit": [], "env": {}}
+
+
+def emit_adapter(adapter: dict) -> list[str]:
+    """Copy the adapter's harness-specific config files (e.g. opencode.json) to
+    the repo root. These are emitted artifacts (gitignored), regenerated each
+    launch from the tracked template in the adapter dir."""
+    adir = ADAPTERS / adapter["harness"]
+    written = []
+    for fname in adapter.get("emit", []):
+        src = adir / fname
+        if src.exists():
+            atomic_write(REPO_ROOT / fname, src.read_text())
+            written.append(fname)
+    return written
 
 
 def _configured_harness() -> str | None:
@@ -181,19 +201,25 @@ def main() -> None:
     print(f"→ skills: {len(skills['written'])} written, "
           f"{len(skills['skipped'])} unchanged → .claude/skills/")
 
+    # Harness: HARNESS env wins, else this fork's configured harness
+    # (instance.json, set by the installer), else claude. The adapter seam owns
+    # the launch command + any harness-specific config to emit.
+    harness = os.environ.get("HARNESS") or _configured_harness() or "claude"
+    adapter = load_adapter(harness)
+    emitted = emit_adapter(adapter)
+    print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
+    if emitted:
+        print(f"→ emitted {', '.join(emitted)}")
+
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")
         return
 
-    # Harness: HARNESS env wins, else this fork's configured harness
-    # (instance.json, set by the installer), else claude.
-    harness = os.environ.get("HARNESS") or _configured_harness() or "claude"
-    cmd = LAUNCH.get(harness)
-    if not cmd:
-        sys.exit(f"unknown harness '{harness}' (known: {', '.join(LAUNCH)})")
+    cmd = adapter.get("launch") or [harness]
+    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
     os.chdir(REPO_ROOT)
     print(f"→ exec {' '.join(cmd)}\n")
-    os.execvp(cmd[0], cmd)
+    os.execvpe(cmd[0], cmd, env)
 
 
 if __name__ == "__main__":
