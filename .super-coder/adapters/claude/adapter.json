@@ -1,0 +1,7 @@
+{
+  "harness": "claude",
+  "launch": ["claude"],
+  "boot_artifact": "CLAUDE.md",
+  "emit": [],
+  "env": {}
+}
