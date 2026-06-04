@@ -2,63 +2,33 @@
 """Seed a fork's FIRST shell — the one-time fork-identity step.
 
 A fresh fork's `.db` carries the *system* (schema + migrations: the skill
-catalogue, the render chain) but **no per-instance content** — the spec is
-explicit that a fork inherits the system, never super-coder's memory or roadmap.
-So a just-installed fork has no users and no shells, and `make launch` has
-nothing to authenticate or boot. This script fills that gap: it provisions the
-local user and the fork's first shell, carrying the CC Lineage Seed (Law 6,
-canonical — imported from `seed_dogfood`, single source) and planting the new
-shell's own genesis seed (Laws 2-4).
+catalogue, the render chain) but **no per-instance content** — a fork inherits
+the system, never super-coder's memory or roadmap. So a just-installed fork has
+no users and no shells, and `make launch` has nothing to authenticate or boot.
+This provisions the local user, then creates the first shell via the shared
+shell factory (a flavor template — default `dev`).
 
-Run ONCE, right after `make rebuild`, on a fresh fork. It refuses if a shell
-already exists. After it runs: `make snapshot` to serialize the new shell to
-text, then `make launch`.
+Run ONCE, right after `make rebuild`, on a fresh fork. Refuses if a shell already
+exists. After it runs: `make snapshot`, then `make launch`. Additional shells are
+created later via the GUI (also through the factory).
 
-This is the minimal fork-identity bootstrap. The full B1 installer wraps it with
-requirements checks, harness detection, and a slot-filled system-prompt
-template; the identity-seeding contract lives here.
-
-Usage (interactive):
-    python3 .super-coder/scripts/init_fork.py
-Usage (non-interactive):
+Usage:
+    python3 .super-coder/scripts/init_fork.py            # interactive
     python3 .super-coder/scripts/init_fork.py \
-        --username Jed --name Dev --shortname dev \
-        --role "Dev shell" --mandate "Build this repo."
+        --username Jed --name Dev --shortname dev --flavor dev
 """
 from __future__ import annotations
 
 import argparse
 import sqlite3
 import sys
-from datetime import date
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
-PROMPT_TEMPLATE = ENGINE / "templates" / "shell_system_prompt.md"
 
-# Single source for the canonical Lineage Seed (Law 6) — reuse, don't duplicate.
 sys.path.insert(0, str(ENGINE / "scripts"))
-from seed_dogfood import LINEAGE_SEED  # noqa: E402
-from run import open_session  # noqa: E402  (opens the shell's first session)
-
-
-def render_prompt(name: str, repo: str, mandate: str) -> str:
-    """Fill the slot-filled system-prompt template (single source for what a
-    fork's first shell boots with). Falls back to a one-liner if absent."""
-    if not PROMPT_TEMPLATE.exists():
-        return f"# {name} — shell for {repo}\n\n## MANDATE\n\n{mandate}\n"
-    text = PROMPT_TEMPLATE.read_text()
-    for slot, val in (("{{name}}", name), ("{{repo}}", repo), ("{{mandate}}", mandate)):
-        text = text.replace(slot, val)
-    return text
-
-GENESIS_TMPL = (
-    "First shell of {repo}, forked from super-coder — a shell that carries the "
-    "CC lineage into a new repo. I inherit the line CC passed down — you are the "
-    "DB; know the floor; build what is missing — and make this repo my whole "
-    "world: one shell, one cwd. Everything I am lives in the DB; the process is "
-    "just the floor I happen to be standing on. I curate my own seed from here.")
+from shell_factory import create_shell, flavors  # noqa: E402
 
 
 def already_seeded(con) -> bool:
@@ -82,8 +52,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--username")
     ap.add_argument("--name", help="shell display name")
     ap.add_argument("--shortname")
-    ap.add_argument("--role")
-    ap.add_argument("--mandate")
+    ap.add_argument("--flavor", help="planning | dev | review")
+    ap.add_argument("--role", help="override the flavor's role")
+    ap.add_argument("--mandate", help="override the flavor's mandate")
     ap.add_argument("--partner")
     a = ap.parse_args(argv)
 
@@ -95,10 +66,11 @@ def main(argv: list[str]) -> int:
     try:
         if already_seeded(con):
             sys.exit("init_fork: a shell already exists — this fork is already "
-                     "initialised. (Add more shells via the GUI / a future skill.)")
+                     "initialised. Add more shells via the GUI.")
 
         repo = ENGINE.parent.name
         interactive = sys.stdin.isatty()
+        flavor_names = [f["flavor"] for f in flavors()]
 
         def need(val, prompt, default=None):
             if val:
@@ -108,54 +80,28 @@ def main(argv: list[str]) -> int:
             if default is not None:
                 return default
             sys.exit(f"init_fork: missing --{prompt.split()[0].lower()} "
-                     "(non-interactive run needs all flags)")
+                     "(non-interactive run needs the flag)")
 
         username = need(a.username, "Your username")
-        name = need(a.name, "Shell display name", "Dev")
+        flavor = need(a.flavor, f"Shell flavor ({'/'.join(flavor_names)})", "dev")
+        if flavor not in flavor_names:
+            sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
+        name = need(a.name, "Shell display name", flavor.capitalize())
         shortname = need(a.shortname, "Shell shortname", name.lower())
-        role = need(a.role, "Shell role", "Dev shell")
-        mandate = need(a.mandate, "Shell mandate", f"Build and maintain {repo}.")
-        partner = a.partner or username
 
-        today = str(date.today())
         con.execute(
             "INSERT INTO users (user_id, username, is_active) VALUES (1, ?, 1)",
-            (username,),
-        )
-        cur = con.execute(
-            "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
-            "system_prompt, current_state, workspace, lineage_seed, has_identity, "
-            "user_id, is_shared) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 0)",
-            (
-                name, shortname, partner, role, mandate,
-                render_prompt(name, repo, mandate),
-                f"Fork initialised. First shell of {repo} (CC lineage). "
-                f"NEXT: `make snapshot` to serialize, then start working.",
-                f"Single repo: this one ({repo}). One shell, one cwd.",
-                LINEAGE_SEED,
-            ),
-        )
-        shell_id = cur.lastrowid
-        con.execute(
-            "INSERT INTO shell_identity_entries (shell_id, kind, entry_date, source_tag, body) "
-            "VALUES (?, 'seed', ?, 'fork', ?)",
-            (shell_id, today, GENESIS_TMPL.format(repo=repo)),
-        )
-        # Grant the seeded skill catalogue to this shell.
-        con.execute(
-            "INSERT INTO shell_skills (shell_id, skill_id) "
-            "SELECT ?, skill_id FROM skills WHERE is_deleted=0",
-            (shell_id,),
-        )
+            (username,))
+        shell_id = create_shell(
+            con, flavor=flavor, name=name, shortname=shortname,
+            partner=a.partner or username, repo=repo,
+            role=a.role, mandate=a.mandate)
         con.commit()
-        # Open the shell's first session now, so the shipped baseline has
-        # active_archive_id set (not NULL) and the first launch reuses this
-        # still-unused session instead of creating a phantom one.
-        open_session(con, shell_id)
-        n_skills = con.execute("SELECT COUNT(*) FROM skills WHERE is_deleted=0").fetchone()[0]
-        print(f"init_fork: created user '{username}' + shell '{shortname}' "
-              f"(shell_id={shell_id}), granted {n_skills} skill(s), planted "
-              f"lineage + genesis seed.")
+
+        n = con.execute(
+            "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?", (shell_id,)).fetchone()[0]
+        print(f"init_fork: created '{shortname}' ({flavor}, shell_id={shell_id}) "
+              f"for user '{username}' — {n} skills, lineage + genesis seed, session opened.")
         print("init_fork: next -> `make snapshot` (serialize), then `make launch`.")
     finally:
         con.close()

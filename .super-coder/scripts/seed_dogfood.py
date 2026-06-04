@@ -160,9 +160,12 @@ def main() -> int:
         # system content (seeded via migrations/0001_seed_skills.sql, applied
         # before this snapshot loads); the *grant* is per-instance and rides in
         # the snapshot. Match by name so the grant is robust to skill_id churn.
+        # Auto-grant the COMMON catalogue (common=1). Opt-in skills (common=0:
+        # api-design, blueprint, database-migrations) are assigned per shell via
+        # the GUI / flavor templates, not granted by default.
         con.execute(
             "INSERT INTO shell_skills (shell_id, skill_id) "
-            "SELECT ?, skill_id FROM skills WHERE is_deleted=0",
+            "SELECT ?, skill_id FROM skills WHERE is_deleted=0 AND common=1",
             (shell_id,),
         )
 

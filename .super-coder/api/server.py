@@ -36,6 +36,7 @@ UI_DIR = ENGINE / "ui"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import ports as ports_mod  # noqa: E402
+import shell_factory  # noqa: E402
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -334,6 +335,8 @@ class Handler(BaseHTTPRequestHandler):
                                         "port": cfg.get("port")})
             if path == "/api/shells":
                 return self._send(200, {"shells": get_shells(con)})
+            if path == "/api/shell-templates":
+                return self._send(200, {"templates": shell_factory.flavors()})
             if path.startswith("/api/shells/"):
                 sid = int(path.rsplit("/", 1)[1])
                 shell = get_shell(con, sid)
@@ -376,6 +379,15 @@ class Handler(BaseHTTPRequestHandler):
                 fid, err = create_flag(con, self._body())
                 return self._send(400 if err else 201,
                                   {"error": err} if err else {"flag_id": fid})
+            if path == "/api/shells":
+                body = self._body()
+                if not body.get("name") or not body.get("flavor"):
+                    return self._send(400, {"error": "name and flavor required"})
+                sid = shell_factory.create_shell(
+                    con, flavor=body["flavor"], name=body["name"],
+                    shortname=body.get("shortname"), partner=body.get("partner"))
+                con.commit()
+                return self._send(201, {"shell_id": sid})
             if path == "/api/snapshot":
                 return self._send(200, {"output": run_snapshot_render()})
             if path.startswith("/api/scripts/"):

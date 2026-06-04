@@ -27,13 +27,46 @@ function toast(msg) {
 function setStatus(s) { $("#status").textContent = s; }
 
 // ── Shells ──────────────────────────────────────────────────────────────────
+let selectedShell = null;
+
 async function renderShells(root) {
   const { shells } = await api("/shells");
+  const { templates } = await api("/shell-templates");
   root.replaceChildren();
-  for (const s of shells) {
-    const full = await api("/shells/" + s.shell_id);
-    root.append(shellCard(full));
-  }
+  if (!shells.length) { root.append(el("div", { className: "card muted" }, "No shells.")); return; }
+  if (selectedShell == null || !shells.find((s) => s.shell_id === selectedShell))
+    selectedShell = shells[0].shell_id;
+
+  // switcher + new-shell
+  const bar = el("div", { className: "card shellbar" });
+  const sel = el("select", {});
+  for (const s of shells)
+    sel.append(el("option", { value: s.shell_id, selected: s.shell_id === selectedShell,
+      textContent: `${s.display_name} / ${s.shortname || ""} — ${s.role || ""}` }));
+  sel.onchange = () => { selectedShell = Number(sel.value); renderShells(root); };
+  const newBtn = el("button", { className: "act", textContent: "＋ New shell" });
+
+  const form = el("div", { className: "newshell", hidden: true });
+  const fl = el("select", {});
+  for (const t of templates)
+    fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
+  const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
+  const create = el("button", { className: "act primary", textContent: "create" });
+  create.onclick = async () => {
+    if (!nm.value.trim()) return toast("name required");
+    try {
+      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
+      selectedShell = r.shell_id; setStatus("shell created"); renderShells(root);
+    } catch (e) { toast("error: " + e.message); }
+  };
+  newBtn.onclick = () => { form.hidden = !form.hidden; if (!form.hidden) nm.focus(); };
+  form.append(el("label", { className: "k" }, "flavor"), fl,
+    el("label", { className: "k" }, "name"), nm, create);
+  bar.append(el("span", { className: "k", textContent: "shell" }), sel, newBtn, form);
+  root.append(bar);
+
+  // selected shell detail (skill grant toggles here are the per-shell assignment)
+  root.append(shellCard(await api("/shells/" + selectedShell)));
 }
 
 function field(label, value, key, sid) {
