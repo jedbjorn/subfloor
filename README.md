@@ -107,6 +107,18 @@ skill *name*, so they're immune to catalogue-id shifts.
 ./sc help                # all targets
 ```
 
+**Prefer `make`?** super-coder never touches your repo's `Makefile`, but you can
+alias the common case in your own — a one-liner you control:
+
+```make
+super:           ## boot super-coder
+	@./sc launch
+```
+
+Then `make super` runs it. (For other commands call `./sc <cmd>` directly —
+forwarding arbitrary args through `make` is the quoting mess `./sc` exists to
+avoid.)
+
 ## Review layer (localhost GUI)
 
 A zero-dependency localhost GUI to review the substrate — shells, roadmap,
