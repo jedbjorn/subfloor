@@ -2,7 +2,7 @@ ENGINE := .super-coder
 DB     := $(ENGINE)/shell_db.db
 PY     := python3
 
-.PHONY: help rebuild migrate snapshot render seed-skills launch launch-% verify clean-db
+.PHONY: help rebuild migrate snapshot render seed-skills init launch launch-% verify clean-db
 
 help:
 	@echo "super-coder — forkable shell substrate"
@@ -12,6 +12,7 @@ help:
 	@echo "  make snapshot            dump per-instance tables -> $(ENGINE)/snapshot/content.sql"
 	@echo "  make render              render tracked flat _sc files (specs/docs/skills/roadmap)"
 	@echo "  make seed-skills         regenerate the skills seed migration from assets/skills/"
+	@echo "  make init                seed a fresh fork's first user + shell (run once after install)"
 	@echo "  make launch              username auth + pick shell + render boot + exec harness"
 	@echo "  make launch-<shortname>  boot that shell directly (skip picker)"
 	@echo "  make verify              rebuild + flat render + render-only boot (headless proof)"
@@ -31,6 +32,9 @@ render:
 
 seed-skills:
 	@$(PY) $(ENGINE)/scripts/seed_skills.py
+
+init:
+	@$(PY) $(ENGINE)/scripts/init_fork.py
 
 launch:
 	@$(PY) $(ENGINE)/scripts/run.py
