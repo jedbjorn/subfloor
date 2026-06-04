@@ -174,7 +174,9 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
     if not shells:
         sys.exit("FATAL: no shells available to this user.")
     if requested:
-        chosen = next((s for s in shells if s["shortname"] == requested), None)
+        # Case-insensitive: auto-names are upper (DEV3) but `./sc launch-dev3` works.
+        chosen = next((s for s in shells if (s["shortname"] or "").lower()
+                       == requested.lower()), None)
         if chosen is None:
             avail = ", ".join(s["shortname"] or "?" for s in shells)
             sys.exit(f"no shell '{requested}'. Available: {avail}")

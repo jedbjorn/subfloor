@@ -56,7 +56,7 @@ async function renderShells(root) {
     if (!nm.value.trim()) return toast("name required");
     try {
       const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
-      selectedShell = r.shell_id; setStatus("shell created"); renderShells(root);
+      selectedShell = r.shell_id; setStatus(`shell created — ${r.shortname}`); renderShells(root);
     } catch (e) { toast("error: " + e.message); }
   };
   newBtn.onclick = () => { form.hidden = !form.hidden; if (!form.hidden) nm.focus(); };
