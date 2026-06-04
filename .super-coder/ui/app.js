@@ -427,7 +427,15 @@ function show(tab) {
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   load(tab);
 }
-document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => show(b.dataset.tab)));
+// Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
+// put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
+// hash; hashchange drives show — back/forward and deep links work too.
+function routeFromHash() {
+  const tab = location.hash.slice(1);
+  show(VIEWS[tab] ? tab : "shells");
+}
+document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
+window.addEventListener("hashchange", routeFromHash);
 $("#snapshot").onclick = async () => {
   setStatus("snapshotting…");
   try { const r = await api("/snapshot", "POST"); toast(r.output || "done"); setStatus("snapshot done"); }
@@ -436,5 +444,5 @@ $("#snapshot").onclick = async () => {
 (async () => {
   try { const h = await api("/health"); $("#repo").textContent = h.repo; setStatus("port " + h.port); }
   catch { setStatus("offline"); }
-  show("shells");
+  routeFromHash();   // honor #tab on load (refresh / deep link), else Shells
 })();
