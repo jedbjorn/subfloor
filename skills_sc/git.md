@@ -39,8 +39,8 @@ tracked `_sc` renders.
 
 ## After DB work, before committing
 
-Your DB edits live only in the `.db` until serialized. Run `make snapshot`
-(+ `make render` if docs/roadmap/skills changed) so the change is in git-tracked
+Your DB edits live only in the `.db` until serialized. Run `./sc snapshot`
+(+ `./sc render` if docs/roadmap/skills changed) so the change is in git-tracked
 text, then commit that text. See the `snapshot` skill.
 
 ## Notes

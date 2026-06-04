@@ -29,26 +29,28 @@ never collides with your repo's own `/docs`, `/specs`, or skills. A fork
 inherits the **system** (schema + the skill catalogue + the render chain), never
 super-coder's own memory or roadmap.
 
-> Requirements: `python3`, `sqlite3`, `make`, and your harness CLI (`claude` or
-> `opencode`) on `PATH`.
+> Requirements: `python3`, `sqlite3`, `git`, and your harness CLI (`claude` or
+> `opencode`) on `PATH`; `pm2` for the review GUI. (No `make` — `./sc` is a
+> plain shell dispatcher.)
 
 ```bash
 cd your-repo                    # an existing git repo
 
-# 1. Pull the engine + Makefile in via git (no history merge — just the files):
+# 1. Pull the engine + entry script in via git (no history merge — just the
+#    files; super-coder never touches your repo's own Makefile):
 git remote add super-coder https://github.com/jedbjorn/super-coder.git
 git fetch super-coder
-git checkout super-coder/main -- .super-coder Makefile
+git checkout super-coder/main -- .super-coder sc
 
 # 2. Bootstrap the fork — one command:
-make install
+./sc install
 
 # 3. Commit the install, then boot:
 git add -A && git commit -m "chore: install super-coder"
-make launch                     # starts the review GUI + boots your shell
+./sc launch                     # starts the review GUI + boots your shell
 ```
 
-`make install` does the rest: checks requirements, detects your harness
+`./sc install` does the rest: checks requirements, detects your harness
 (`claude` / `opencode`), wires your `.gitignore`, **strips super-coder's own
 per-instance content** (a fork inherits the *system* — schema + skill catalogue
 + render chain — never the memory or roadmap), builds the system DB, seeds your
@@ -65,8 +67,8 @@ python3 .super-coder/scripts/install.py \
     --role "Dev shell" --mandate "Build and maintain this repo."
 ```
 
-After `make launch` you're talking to the shell, working your repo. Author
-memory, roadmap, and specs into the DB; `make snapshot` (+ `make render`)
+After `./sc launch` you're talking to the shell, working your repo. Author
+memory, roadmap, and specs into the DB; `./sc snapshot` (+ `./sc render`)
 serializes back to the text git tracks.
 
 ## Update a fork
@@ -78,15 +80,15 @@ untouched.
 ```bash
 # (re-add the remote first if you removed it: git remote add super-coder <url>)
 git fetch super-coder
-git checkout super-coder/main -- \
+git checkout super-coder/main -- sc \
     .super-coder/schema.sql .super-coder/migrations .super-coder/scripts \
     .super-coder/render .super-coder/templates .super-coder/adapters \
     .super-coder/assets/skills
-make update                     # reconcile the fork against the new engine
+./sc update                     # reconcile the fork against the new engine
 git add -A && git commit -m "chore: update super-coder"
 ```
 
-`make update` rebuilds the `.db` from the new schema + migrations + **your**
+`./sc update` rebuilds the `.db` from the new schema + migrations + **your**
 snapshot, **re-grants any newly-added system skills** to your shells (skill
 bodies propagate via the engine; the per-instance grant doesn't, so update wires
 it), refreshes the repo map, and re-snapshots. Your shells, memory, roadmap, and
@@ -96,13 +98,13 @@ skill *name*, so they're immune to catalogue-id shifts.
 ## Run (everyday)
 
 ```bash
-make launch              # auth + pick a shell + render boot + exec the harness
-make launch-<shortname>  # boot one shell directly, skip the picker
-make rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
-make render              # regenerate the tracked flat _sc files from the DB
-make snapshot            # serialize per-instance tables → snapshot/content.sql
-make verify              # rebuild + flat render + headless boot (no exec) — the proof
-make help                # all targets
+./sc launch              # auth + pick a shell + render boot + exec the harness
+./sc launch-<shortname>  # boot one shell directly, skip the picker
+./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
+./sc render              # regenerate the tracked flat _sc files from the DB
+./sc snapshot            # serialize per-instance tables → snapshot/content.sql
+./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
+./sc help                # all targets
 ```
 
 ## Review layer (localhost GUI)
@@ -112,11 +114,11 @@ flags. One stdlib Python server serves both the JSON API and a static UI; no
 venv, no npm, no build step.
 
 ```bash
-make up        # start it (pm2) on this fork's derived port
-make health    # curl /api/health
-make down      # stop it
-make serve     # run it in the foreground (no pm2)
-make ports     # show this fork's derived port
+./sc up        # start it (pm2) on this fork's derived port
+./sc health    # curl /api/health
+./sc down      # stop it
+./sc serve     # run it in the foreground (no pm2)
+./sc ports     # show this fork's derived port
 ```
 
 **Ports are derived per repo**, never fixed — because a fork runs *inside* a
@@ -138,7 +140,7 @@ migrate, rebuild) — each with a description and a **run** button, so the commo
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
 since it discards un-snapshotted DB edits).
 
-**`make launch` brings the GUI up too** — it starts the review layer (if not
+**`./sc launch` brings the GUI up too** — it starts the review layer (if not
 already running) and prints its URL *before* handing off to the harness, so the
 shell and the GUI run side by side from one command.
 

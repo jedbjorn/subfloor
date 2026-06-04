@@ -20,7 +20,7 @@ v1 grant policy: all catalogue skills → all shells (matches install). When
 per-shell skill scoping lands, this step gets a policy.
 
 Usage:
-    make update
+    ./sc update
     python3 .super-coder/scripts/update.py
 """
 from __future__ import annotations

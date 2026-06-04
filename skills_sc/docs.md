@@ -15,7 +15,7 @@ Author or review docs & specs in super-coder. The DB owns the body (documents ta
 # docs — author & review documents
 
 In super-coder the **DB owns document bodies** — never loose `.md` files. A
-`documents` row is the source; `make render` writes the read-only flat copy to
+`documents` row is the source; `./sc render` writes the read-only flat copy to
 `specs_sc/` / `docs_sc/`, and the GUI opens it rendered in md-converter.
 
 | kind | lives on | meaning |
@@ -44,8 +44,8 @@ VALUES (?, 'doc', 1, '…', '…', 'docs_sc/….md');
 INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
 VALUES (?, 'spec', 2, '…', '…', 'specs_sc/….md');
 ```
-Then `make render` (writes the `_sc` file + injects feature/roadmap_status/frozen
-into its frontmatter) and `make snapshot` (the body is per-instance content).
+Then `./sc render` (writes the `_sc` file + injects feature/roadmap_status/frozen
+into its frontmatter) and `./sc snapshot` (the body is per-instance content).
 
 ## Freeze on ship
 

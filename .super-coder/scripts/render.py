@@ -2,7 +2,7 @@
 """Render DB content to disk on demand.
 
 Wraps `render/flat.py`. The boot launcher (`run.py`) calls the render functions
-directly for the chosen shell; this CLI is the standalone entry the Makefile and
+directly for the chosen shell; this CLI is the standalone entry the sc dispatcher and
 the (later) commit→PR automation use.
 
 Usage:
@@ -25,7 +25,7 @@ import flat  # noqa: E402
 
 def _open() -> sqlite3.Connection:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
-        sys.exit(f"render: no usable DB at {DB_PATH} — run `make rebuild` first.")
+        sys.exit(f"render: no usable DB at {DB_PATH} — run `./sc rebuild` first.")
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con

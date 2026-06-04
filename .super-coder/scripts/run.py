@@ -74,7 +74,7 @@ def open_db() -> sqlite3.Connection:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         sys.exit(
             f"FATAL: no usable DB at {DB_PATH}.\n"
-            f"  Rebuild it from text:  make rebuild"
+            f"  Rebuild it from text:  ./sc rebuild"
         )
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -85,7 +85,7 @@ def open_db() -> sqlite3.Connection:
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
 def authenticate(con: sqlite3.Connection) -> sqlite3.Row:
-    # SC_USER env wins; else prompt on a TTY; else (headless: `make verify`, CI)
+    # SC_USER env wins; else prompt on a TTY; else (headless: `./sc verify`, CI)
     # default to the first active user so launch doesn't EOFError without a TTY.
     username = os.environ.get("SC_USER")
     if not username:

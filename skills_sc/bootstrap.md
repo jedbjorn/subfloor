@@ -27,8 +27,8 @@ you start work grounded instead of wandering. Run it when the boot doc shows
    ```sql
    SELECT COUNT(*) FROM dr_filepath;
    ```
-   If it's 0 (fresh, or after a `make rebuild` — the map is a derived cache, not
-   snapshotted), run `make map` to scan the repo, then continue.
+   If it's 0 (fresh, or after a `./sc rebuild` — the map is a derived cache, not
+   snapshotted), run `./sc map` to scan the repo, then continue.
 
 2. **Read the repo** via the `surface_catalogue` skill — language mix, where the
    code lives, dependencies, env surface. Form a one-paragraph picture of what
@@ -60,11 +60,11 @@ you start work grounded instead of wandering. Run it when the boot doc shows
    ```sql
    UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;
    ```
-   Then `make snapshot` so the new state survives a rebuild, and proceed with the
+   Then `./sc snapshot` so the new state survives a rebuild, and proceed with the
    task at hand.
 
 ## Stance
 
 - Bootstrap once, then work — don't re-run it every session.
 - If you ever boot and the map looks empty or stale (`dr_repo.mapped_at` old),
-  `make map` before trusting it. Orientation is cheap; working blind is not.
+  `./sc map` before trusting it. Orientation is cheap; working blind is not.

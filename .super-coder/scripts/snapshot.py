@@ -98,7 +98,7 @@ def dump_table(con: sqlite3.Connection, table: str) -> list[str]:
 
 def main() -> int:
     if not DB_PATH.exists():
-        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `make rebuild` first.")
+        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
     con = sqlite3.connect(DB_PATH)
     try:
         out = [
@@ -106,7 +106,7 @@ def main() -> int:
             "-- Idempotent: DELETE-then-INSERT per table, PK order. Loaded by rebuild.py.",
             "-- This file rebuilds THIS repo's content + memory; it stays local (never",
             "-- propagates to forks). Do not hand-edit — author via the shell or GUI, then",
-            "-- `make snapshot`.",
+            "-- `./sc snapshot`.",
             "",
             "BEGIN;",
             "",

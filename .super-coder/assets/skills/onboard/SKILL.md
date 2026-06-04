@@ -49,7 +49,7 @@ Paste the file's real contents into `body`. If a spec describes shipped work,
 freeze it (`frozen=1, frozen_date`).
 
 ## 5. Render + persist
-`make render` (writes the `_sc` copies + frontmatter) then `make snapshot` (the
+`./sc render` (writes the `_sc` copies + frontmatter) then `./sc snapshot` (the
 bodies are per-instance content). Now the GUI's Docs/Roadmap tabs show the repo.
 
 ## 6. The host's original files — three exits (optional; coexist by default)

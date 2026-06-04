@@ -9,7 +9,7 @@ instead of grepping blind (see the `surface_catalogue` skill).
 The catalogue is a DERIVED CACHE of the repo, not authored content: it is NOT
 snapshotted. Re-run any time the repo changes:
 
-    make map          # or: python3 .super-coder/scripts/map_repo.py
+    ./sc map          # or: python3 .super-coder/scripts/map_repo.py
 
 Idempotent — clears and repopulates dr_*. v1 maps files / deps / env; the
 semantic tables (APIs, db, pages) are a later pass.
@@ -167,7 +167,7 @@ ENV_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=")
 
 def main() -> int:
     if not DB_PATH.exists():
-        sys.exit("map_repo: no DB — run `make rebuild` (or `make install`) first.")
+        sys.exit("map_repo: no DB — run `./sc rebuild` (or `./sc install`) first.")
     con = sqlite3.connect(DB_PATH)
     skip = SKIP_DIRS - ({".super-coder"} if is_source_repo() else set())
     try:

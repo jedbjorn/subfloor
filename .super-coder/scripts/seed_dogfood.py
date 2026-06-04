@@ -12,12 +12,12 @@ first snapshot. Re-run only to regenerate the seed from scratch.
 
 Flow (regen from scratch — skills must be seeded first; the existing snapshot
 must be out of the way so the rebuild starts empty and this can re-author):
-    make seed-skills                     # author migrations/0001_seed_skills.sql
+    ./sc seed-skills                     # author migrations/0001_seed_skills.sql
     rm .super-coder/snapshot/content.sql # step aside; seed_dogfood reproduces it
-    make clean-db && make rebuild        # empty content + skills (from migration)
+    ./sc clean-db && ./sc rebuild        # empty content + skills (from migration)
     python3 .super-coder/scripts/seed_dogfood.py   # cc + grants (skills now exist)
-    make snapshot                        # -> snapshot/content.sql (incl. grants)
-    make rebuild && make render && make verify     # reproduce + render; verify
+    ./sc snapshot                        # -> snapshot/content.sql (incl. grants)
+    ./sc rebuild && ./sc render && ./sc verify     # reproduce + render; verify
 
 Maintainer-shell lineage is RESOLVED (decision #185): the maintainer is a
 succession child of CC, carrying the CC Lineage Seed (3 immutable entries,
@@ -58,7 +58,7 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
 Write as it happens, not at close. The `.db` is a cache: after content edits,
-`make snapshot` re-serializes to text, which is what git tracks.
+`./sc snapshot` re-serializes to text, which is what git tracks.
 
 ## MANDATE
 
@@ -109,7 +109,7 @@ def already_seeded(con) -> bool:
 
 def main() -> int:
     if not DB_PATH.exists():
-        sys.exit("seed: no DB — run `make rebuild` first to build an empty one.")
+        sys.exit("seed: no DB — run `./sc rebuild` first to build an empty one.")
     if not SPEC.exists():
         sys.exit(f"seed: missing founding spec at {SPEC}")
 
@@ -204,7 +204,7 @@ def main() -> int:
         print(f"seed: maintainer shell 'cc' (shell_id={shell_id}), "
               f"feature 'super-coder' (feature_id={feature_id}), "
               f"founding spec document (frozen).")
-        print("seed: next -> `make snapshot` to serialize, then `make rebuild` to verify.")
+        print("seed: next -> `./sc snapshot` to serialize, then `./sc rebuild` to verify.")
     finally:
         con.close()
     return 0
