@@ -29,6 +29,7 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "render"))
 from compose import compose_boot  # noqa: E402
+import flat  # noqa: E402
 
 # The launch command per harness. The adapters/ seam owns this for real in B1;
 # inline here keeps the spine self-contained. HARNESS env overrides.
@@ -151,6 +152,10 @@ def main() -> None:
         (chosen["shell_id"],),
     ).fetchone()
     content = compose_boot(con, full, user, session_id, archive_id)
+
+    # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
+    # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
+    skills = flat.render_skill_md(con, full["shell_id"])
     con.close()
 
     # One compose, two outputs — Claude Code reads CLAUDE.md, the AGENTS.md
@@ -162,6 +167,8 @@ def main() -> None:
           f"(shell_id={full['shell_id']}, session={session_id})")
     print(f"→ wrote {REPO_ROOT/'CLAUDE.md'}")
     print(f"→ wrote {REPO_ROOT/'AGENTS.md'}")
+    print(f"→ skills: {len(skills['written'])} written, "
+          f"{len(skills['skipped'])} unchanged → .claude/skills/")
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")

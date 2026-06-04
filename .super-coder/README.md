@@ -30,9 +30,35 @@ one repo only.
 
 ## Render
 
-`render/` composes the boot artifact from live DB state and dual-writes it to
-`CLAUDE.md` + `AGENTS.md` at the repo root. Skills→`SKILL.md` and flat `_sc`
-doc/spec render land in a later phase.
+`render/` turns live DB state into three kinds of artifact, all one-way
+(DB → file, never read back) and incremental (an artifact whose content already
+matches disk is skipped, so an unchanged DB renders to nothing):
+
+| Artifact | Module | Git? | Consumer |
+|---|---|---|---|
+| Boot doc → `CLAUDE.md` + `AGENTS.md` | `compose.py` | ignored | the harness at launch |
+| Per-shell skills → `.claude/skills/<name>/SKILL.md` | `flat.render_skill_md` | ignored | the harness (Agent Skills) |
+| Flat `_sc` files → `specs_sc/` `docs_sc/` `skills_sc/` `roadmap_sc.md` | `flat.render_visibility` | **tracked** | the outsider FnB browsing the repo |
+
+The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
+shell — gitignored caches, like `.db`. The flat `_sc` files are the tracked
+visibility surface for browsers without localhost; `make render` (and `make
+verify`) regenerate them, and the B6 commit→PR automation will refresh them on
+every content edit. Each rendered file carries the do-not-edit banner (spec
+§Content & Render); for bodies that already open with YAML frontmatter the
+banner keys are spliced into it rather than prepended, so the YAML stays valid.
+
+`scripts/render.py` is the standalone CLI: `flat` (tracked `_sc`),
+`skills <shortname>` (one shell's `.claude/skills/`), or `all <shortname>`.
+
+## Skills
+
+System content: a skill's body propagates to every fork. Authored at
+`assets/skills/<name>/SKILL.md` (frontmatter `name`/`description`/`category`/
+`command`/`common` + markdown body), compiled by `scripts/seed_skills.py`
+(`make seed-skills`) into `migrations/0001_seed_skills.sql`. The catalogue rides
+in a migration (propagates); the per-shell *grant* (`shell_skills`) rides in the
+snapshot (fork-local). `make rebuild` seeds the catalogue, then loads grants.
 
 ## Adapters
 

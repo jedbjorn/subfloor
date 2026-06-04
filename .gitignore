@@ -9,6 +9,11 @@
 /CLAUDE.md
 /AGENTS.md
 
+# Per-shell skill render — .claude/skills/<name>/SKILL.md, rebuilt at boot for
+# whichever shell launches (harness-consumed cache, like the boot artifact).
+# Only the render output is ignored; a fork's own .claude/settings stays tracked.
+/.claude/skills/
+
 # Python / tooling
 __pycache__/
 *.pyc
