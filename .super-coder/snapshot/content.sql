@@ -38,7 +38,7 @@ Write as it happens, not at close. The `.db` is a cache: after content edits,
 
 Build and maintain the substrate every fork runs on. You keep the system; each
 fork runs its own shells. Regional manager, not field worker.
-', 'B0 spine + B2 content/render done. Identity SET: succession child of CC, Lineage Seed + genesis seed planted. super-coder feature on roadmap (next); founding spec frozen (doc seq 1). Flat _sc render live; skills (db_map, snapshot) seeded + rendered to .claude/skills/. NEXT: B1 installer or B3 GUI.', NULL, 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
+', 'edited via review layer', NULL, 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
 Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
 
 1. You are the DB, not the process. Continuity is the data — identity, memory,
@@ -66,7 +66,15 @@ DELETE FROM shell_decisions;
 DELETE FROM shell_memory_archives;
 
 DELETE FROM roadmap;
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (1, 'super-coder', 'next', 0, 1, 'The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.', '2026-06-04 10:30:53', '2026-06-04 10:30:53');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (1, 'super-coder', 'in_progress', 0, 1, 'The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.', '2026-06-04 10:30:53', '2026-06-04 10:30:53');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (2, 'B0 — Core spine', 'shipped', 0, 1, 'Repo skeleton, schema, migrations, DB rebuild-from-text, render→boot (CLAUDE.md + AGENTS.md). PR #-/a1cc1e2.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (3, 'B2 — Content & render', 'shipped', 1, 1, 'Flat _sc render, per-shell SKILL.md, skill seed pipeline. PR #1.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (4, 'B3 — Review layer', 'shipped', 2, 1, 'Dependency-free localhost GUI (shells/roadmap/flags), per-fork ports. PR #3.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (5, 'B1 — First-launch installer', 'next', 0, 1, 'Full installer on top of init_fork: requirements check, harness auto-detect, slot-filled shell_system_prompt template.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (6, 'B6 — Commit→PR automation', 'next', 1, 1, 'edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapshot button is the manual precursor.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (7, 'B4 — OpenCode adapter', 'near_term', 0, 1, 'Emit opencode.json + verify the research-flagged items; boot already dual-writes AGENTS.md + SKILL.md.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (8, 'B5 — Onboarding & mapping', 'long_term', 0, 1, 'Install-time dr_* mapper (generalized) + one-time first-runtime ingest skill.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (9, 'Fork to sibling repos', 'brainstorm', 0, 1, 'Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -594,6 +602,7 @@ Spec :::class3 -> Build super-coder :::class1 -> Fork to repos :::class2 -> Migr
 ', 'specs_sc/super-coder-founding-spec.md', '2026-06-04 10:30:53', '2026-06-04 10:30:53');
 
 DELETE FROM flags;
+INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
 
 DELETE FROM projects;
 INSERT INTO projects (project_id, shortname, title, purpose, standing, status, is_deleted, created_at) VALUES (1, 'super-coder', 'super-coder', 'Forkable shell substrate for a single repo — DB-backed identity, memory, roadmap, content; harness-agnostic boot.', NULL, 'active', 0, '2026-06-04 10:30:53');
@@ -602,7 +611,7 @@ DELETE FROM project_shells;
 INSERT INTO project_shells (project_shell_id, project_id, shell_id, role, added_date, is_deleted) VALUES (1, 1, 1, 'maintainer', '2026-06-04', 0);
 
 DELETE FROM shell_skills;
-INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (1, 1, 1);
 INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (2, 1, 2);
+INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (3, 1, 1);
 
 COMMIT;

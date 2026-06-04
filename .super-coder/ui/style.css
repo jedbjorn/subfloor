@@ -33,6 +33,7 @@ nav button.active { background: var(--accent2); color: var(--ink); border-color:
 #snapshot:hover { border-color: var(--accent); }
 main { padding: 1.2rem; max-width: 1100px; margin: 0 auto; }
 .view { display: grid; gap: 1rem; }
+.view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
@@ -46,6 +47,7 @@ main { padding: 1.2rem; max-width: 1100px; margin: 0 auto; }
   background: var(--accent2); color: var(--dim); border: 1px solid var(--line);
 }
 .pill.next { color: var(--accent); } .pill.shipped { color: var(--ok); }
+.pill.warn { color: var(--warn); border-color: var(--warn); }
 .grid2 { display: grid; grid-template-columns: 180px 1fr; gap: .4rem 1rem; align-items: start; }
 .grid2 > .k { color: var(--dim); }
 label.k { color: var(--dim); display: block; margin: .6rem 0 .2rem; font-size: .85rem; }
@@ -60,6 +62,11 @@ button.act {
 }
 button.act:hover { border-color: var(--accent); }
 button.act.primary { background: var(--accent); color: #0b0e13; border-color: var(--accent); }
+a.act { text-decoration: none; display: inline-block; }
+.docrow { padding: .5rem 0; border-top: 1px solid var(--line); }
+.docrow:first-of-type { border-top: none; }
+.docrow-head { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
+.docrow-label { flex: 1; color: var(--ink); }
 .locked {
   border-left: 2px solid var(--lock); padding-left: .8rem; color: var(--dim);
 }
@@ -67,6 +74,13 @@ button.act.primary { background: var(--accent); color: #0b0e13; border-color: va
 .seed-entry, .lns-entry { margin: .5rem 0; padding-left: .6rem; border-left: 1px solid var(--line); }
 .seed-entry .d { color: var(--dim); font-size: .78rem; }
 details summary { cursor: pointer; color: var(--accent); }
+.filters { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
+.chip {
+  background: var(--panel2); color: var(--dim); border: 1px solid var(--line);
+  border-radius: 99px; padding: .3rem .8rem; cursor: pointer; font: inherit; font-size: .8rem;
+}
+.chip:hover { color: var(--ink); border-color: var(--accent); }
+.chip.on { background: var(--accent); color: #0b0e13; border-color: var(--accent); font-weight: 600; }
 .bucket > h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 1.4rem 0 .5rem; }
 .doc-body { white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: .8rem; max-height: 420px; overflow: auto; font: 12.5px/1.55 ui-monospace, monospace; }
 .flag { display: flex; gap: .8rem; align-items: flex-start; padding: .6rem 0; border-bottom: 1px solid var(--line); }

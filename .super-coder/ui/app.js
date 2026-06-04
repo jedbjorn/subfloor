@@ -26,11 +26,6 @@ function toast(msg) {
 }
 function setStatus(s) { $("#status").textContent = s; }
 
-// md-converter deep-link: the spec reuses ?c= (gzip+base64url). We don't have the
-// encoder client-side, so v1 links to the app with the doc title as a hint;
-// full ?c= encoding lands when the GUI shares superCC's Python encoder.
-const MDC = "https://md-converter.designs-os.com";
-
 // ── Shells ──────────────────────────────────────────────────────────────────
 async function renderShells(root) {
   const { shells } = await api("/shells");
@@ -98,12 +93,31 @@ function shellCard(s) {
 }
 
 // ── Roadmap ───────────────────────────────────────────────────────────────────
-const STATUSES = ["brainstorm", "long_term", "near_term", "next", "shipped"];
+// Funnel order: idea inlet → most-active committed work → done.
+const STATUSES = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"];
+const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped" };
+const roadmapFilter = new Set();   // empty = show all (default)
 
 async function renderRoadmap(root) {
   const { buckets } = await api("/roadmap");
   root.replaceChildren();
-  for (const b of buckets) {
+
+  // grouped status toggle-filters; none selected = all shown
+  const bar = el("div", { className: "filters" });
+  for (const s of STATUSES) {
+    const chip = el("button", { className: "chip" + (roadmapFilter.has(s) ? " on" : ""), textContent: SLABEL[s] });
+    chip.onclick = () => {
+      roadmapFilter.has(s) ? roadmapFilter.delete(s) : roadmapFilter.add(s);
+      renderRoadmap(root);
+    };
+    bar.append(chip);
+  }
+  root.append(bar);
+
+  // buckets arrive linear from the API; filter to the selected statuses
+  const shown = roadmapFilter.size ? buckets.filter((b) => roadmapFilter.has(b.status)) : buckets;
+  if (!shown.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage(s).")); return; }
+  for (const b of shown) {
     const sec = el("div", { className: "bucket" }, el("h2", {}, b.label));
     for (const f of b.features) sec.append(featureCard(f));
     root.append(sec);
@@ -144,32 +158,63 @@ function featureCard(f) {
   return c;
 }
 
+// A document row: the primary action OPENS it rendered in md-converter (the
+// markdown rides in the URL via /open → ?c=). No inline raw-markdown expand.
+// Non-frozen docs get an explicit "edit" toggle; frozen ones are read-only.
 function docBlock(d) {
-  const wrap = el("div", {});
+  const wrap = el("div", { className: "docrow" });
   const label = `${d.kind} v${d.seq}${d.frozen ? " · frozen " + (d.frozen_date || "") : ""}: ${d.title || ""}`;
-  const det = el("details", {}, el("summary", {}, label));
-  const ta = el("textarea", { rows: 12 });
-  const open = el("button", { className: "act", textContent: "open in md-converter ↗" });
-  open.onclick = () => window.open(MDC, "_blank");
-  det.ontoggle = async () => {
-    if (!det.open || ta.dataset.loaded) return;
-    const full = await api("/documents/" + d.document_id);
-    ta.value = full.body || ""; ta.dataset.loaded = "1";
-  };
-  det.append(ta);
-  if (d.frozen) {
-    ta.readOnly = true;
-    det.append(el("div", { className: "lock-note", textContent: "frozen — read-only. Open the next spec, don't edit this one." }), open);
-  } else {
+  const open = el("a", {
+    className: "act primary", href: "/api/documents/" + d.document_id + "/open",
+    target: "_blank", rel: "noopener", textContent: "open in md-converter ↗",
+  });
+  const head = el("div", { className: "docrow-head" }, el("span", { className: "docrow-label" }, label), open);
+  wrap.append(head);
+
+  if (!d.frozen) {
+    const box = el("div", { hidden: true });
+    const ta = el("textarea", { rows: 14 });
     const save = el("button", { className: "act primary", textContent: "save doc" });
     save.onclick = async () => {
       try { await api("/documents/" + d.document_id, "PATCH", { body: ta.value }); setStatus("doc saved"); }
       catch (e) { toast("error: " + e.message); }
     };
-    det.append(el("div", { className: "row" }, save, open));
+    const edit = el("button", { className: "act", textContent: "edit" });
+    edit.onclick = async () => {
+      box.hidden = !box.hidden;
+      if (!box.hidden && !ta.dataset.loaded) {
+        const full = await api("/documents/" + d.document_id);
+        ta.value = full.body || ""; ta.dataset.loaded = "1";
+      }
+    };
+    head.append(edit);
+    box.append(ta, save);
+    wrap.append(box);
+  } else {
+    wrap.append(el("div", { className: "lock-note", textContent: "frozen — read-only. Open the next spec, don't edit this one." }));
   }
-  wrap.append(det);
   return wrap;
+}
+
+// ── Docs ──────────────────────────────────────────────────────────────────────
+async function renderDocs(root) {
+  const { docs } = await api("/docs");
+  root.replaceChildren();
+  root.append(el("div", { className: "muted" },
+    "Documentation (kind=doc), separate from the spec dev-cycle on the Roadmap. Open renders in md-converter."));
+  if (!docs.length) {
+    root.append(el("div", { className: "card muted" },
+      "No docs yet. A doc is a kind='doc' document against a feature — authored by the shell, viewable here."));
+    return;
+  }
+  const byFeat = {};
+  for (const d of docs) (byFeat[d.feature_title || "— unlinked —"] ||= []).push(d);
+  for (const [title, list] of Object.entries(byFeat)) {
+    const c = el("div", { className: "card" });
+    c.append(el("h2", {}, title));
+    for (const d of list) c.append(docBlock(d));
+    root.append(c);
+  }
 }
 
 // ── Flags ──────────────────────────────────────────────────────────────────────
@@ -233,11 +278,42 @@ function flagRow(f) {
   return row;
 }
 
+// ── Scripts ─────────────────────────────────────────────────────────────────────
+async function renderScripts(root) {
+  const { scripts } = await api("/scripts");
+  root.replaceChildren();
+  root.append(el("div", { className: "muted" },
+    "Run a maintenance script. Output appears below it. Per-instance DB edits → run Snapshot, then Render flat, to persist them to git-tracked text."));
+  for (const s of scripts) {
+    const c = el("div", { className: "card" });
+    const h = el("h2", {}, s.name);
+    if (s.danger) h.append(el("span", { className: "pill warn", textContent: " danger" }));
+    c.append(h, el("div", { className: "muted" }, s.desc));
+    const out = el("pre", { className: "doc-body", hidden: true });
+    const run = el("button", { className: "act" + (s.danger ? "" : " primary"), textContent: "run" });
+    run.onclick = async () => {
+      if (s.danger && !confirm(`Run "${s.name}"?\n\n${s.desc}`)) return;
+      run.disabled = true; setStatus("running " + s.key + "…");
+      try {
+        const r = await fetch("/api/scripts/" + s.key, { method: "POST" });
+        const data = await r.json();
+        out.hidden = false; out.textContent = data.output || "(done)";
+        setStatus(data.ok ? s.key + " ✓" : s.key + " failed (" + data.code + ")");
+      } catch (e) { out.hidden = false; out.textContent = "error: " + e.message; }
+      finally { run.disabled = false; }
+    };
+    c.append(run, out);
+    root.append(c);
+  }
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
   roadmap: ["#view-roadmap", renderRoadmap],
+  docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
+  scripts: ["#view-scripts", renderScripts],
 };
 async function load(tab) {
   const [sel, fn] = VIEWS[tab];
