@@ -62,7 +62,27 @@ def table_exists(con: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
+def dump_shell_skills(con: sqlite3.Connection) -> list[str]:
+    """Grants resolved by skill NAME, not raw skill_id. Skill ids are positional
+    (they shift when the catalogue grows), so a raw-id dump would bind a fork's
+    grants to the wrong skills after an update. Resolving by name at load time
+    makes grants id-churn-proof."""
+    rows = con.execute(
+        "SELECT ss.shell_id, s.name FROM shell_skills ss "
+        "JOIN skills s ON s.skill_id = ss.skill_id ORDER BY ss.shell_id, s.name"
+    ).fetchall()
+    lines = ["DELETE FROM shell_skills;"]
+    for shell_id, name in rows:
+        lines.append(
+            f"INSERT INTO shell_skills (shell_id, skill_id) "
+            f"SELECT {shell_id}, skill_id FROM skills WHERE name={quote(name)};")
+    lines.append("")
+    return lines
+
+
 def dump_table(con: sqlite3.Connection, table: str) -> list[str]:
+    if table == "shell_skills":
+        return dump_shell_skills(con)
     cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
     if not cols:
         return []

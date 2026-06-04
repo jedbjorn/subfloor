@@ -40,6 +40,7 @@ PROMPT_TEMPLATE = ENGINE / "templates" / "shell_system_prompt.md"
 # Single source for the canonical Lineage Seed (Law 6) — reuse, don't duplicate.
 sys.path.insert(0, str(ENGINE / "scripts"))
 from seed_dogfood import LINEAGE_SEED  # noqa: E402
+from run import open_session  # noqa: E402  (opens the shell's first session)
 
 
 def render_prompt(name: str, repo: str, mandate: str) -> str:
@@ -147,6 +148,10 @@ def main(argv: list[str]) -> int:
             (shell_id,),
         )
         con.commit()
+        # Open the shell's first session now, so the shipped baseline has
+        # active_archive_id set (not NULL) and the first launch reuses this
+        # still-unused session instead of creating a phantom one.
+        open_session(con, shell_id)
         n_skills = con.execute("SELECT COUNT(*) FROM skills WHERE is_deleted=0").fetchone()[0]
         print(f"init_fork: created user '{username}' + shell '{shortname}' "
               f"(shell_id={shell_id}), granted {n_skills} skill(s), planted "
