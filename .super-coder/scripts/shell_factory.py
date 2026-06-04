@@ -74,14 +74,14 @@ def create_shell(con: sqlite3.Connection, *, flavor: str, name: str,
 
     cur = con.execute(
         "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
-        "system_prompt, current_state, workspace, lineage_seed, has_identity, "
-        "bootstrapped, user_id, is_shared) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)",
+        "system_prompt, current_state, workspace, lineage_seed, flavor, "
+        "has_identity, bootstrapped, user_id, is_shared) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)",
         (name, shortname, partner, role, mandate,
          render_prompt(name, role, repo, focus, mandate),
          f"Created ({flavor}). First session — run the bootstrap skill to orient.",
          f"Single repo: this one ({repo}). One shell, one cwd.",
-         LINEAGE_SEED, user_id, is_shared))
+         LINEAGE_SEED, flavor, user_id, is_shared))
     shell_id = cur.lastrowid
 
     con.execute(

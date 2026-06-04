@@ -2,7 +2,7 @@
 name: docs
 description: Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.
 category: substrate
-common: true
+common: false
 ---
 
 # docs — author & review documents

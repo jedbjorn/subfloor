@@ -42,7 +42,7 @@ async function renderShells(root) {
   const sel = el("select", {});
   for (const s of shells)
     sel.append(el("option", { value: s.shell_id, selected: s.shell_id === selectedShell,
-      textContent: `${s.display_name} / ${s.shortname || ""} — ${s.role || ""}` }));
+      textContent: s.flavor ? `${s.display_name} (${s.flavor})` : `${s.display_name} — ${s.role || ""}` }));
   sel.onchange = () => { selectedShell = Number(sel.value); renderShells(root); };
   const newBtn = el("button", { className: "act", textContent: "＋ New shell" });
 

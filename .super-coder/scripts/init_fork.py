@@ -83,7 +83,9 @@ def main(argv: list[str]) -> int:
                      "(non-interactive run needs the flag)")
 
         username = need(a.username, "Your username")
-        flavor = need(a.flavor, f"Shell flavor ({'/'.join(flavor_names)})", "dev")
+        # The first shell is a PLANNING shell — every fork needs a planner to
+        # scope the work. (--flavor overrides; the GUI creates other flavors.)
+        flavor = a.flavor or "planning"
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
         name = need(a.name, "Shell display name", flavor.capitalize())
