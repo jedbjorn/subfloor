@@ -307,11 +307,81 @@ async function renderScripts(root) {
   }
 }
 
+// ── Map (dr_* repo catalogue) ───────────────────────────────────────────────────
+function bars(items, label, val) {
+  const max = Math.max(1, ...items.map(val));
+  const wrap = el("div", { className: "bars" });
+  for (const it of items) {
+    const row = el("div", { className: "bar-row" });
+    row.append(el("span", { className: "bar-label" }, label(it)));
+    const track = el("div", { className: "bar-track" });
+    const fill = el("div", { className: "bar-fill" });
+    fill.style.width = Math.round((val(it) / max) * 100) + "%";
+    track.append(fill);
+    row.append(track, el("span", { className: "bar-n" }, String(val(it))));
+    wrap.append(row);
+  }
+  return wrap;
+}
+
+async function renderMap(root) {
+  const m = await api("/map");
+  root.replaceChildren();
+  if (!m.repo) {
+    root.append(el("div", { className: "card muted" },
+      "Repo not mapped yet. Run Map (Scripts tab) or `make map` to scan the repo into the dr_* catalogue."));
+    return;
+  }
+  const r = m.repo;
+  const head = el("div", { className: "card" });
+  head.append(el("h2", {}, r.name || "(repo)"));
+  head.append(el("div", { className: "grid2" },
+    el("span", { className: "k" }, "branch"), el("span", {}, r.default_branch || "—"),
+    el("span", { className: "k" }, "remote"), el("span", { className: "muted" }, r.remote || "—"),
+    el("span", { className: "k" }, "files"), el("span", {}, String(m.total_files)),
+    el("span", { className: "k" }, "mapped"), el("span", { className: "muted" }, r.mapped_at || "—")));
+  const remap = el("button", { className: "act", textContent: "re-map ↻" });
+  remap.onclick = async () => {
+    remap.disabled = true; setStatus("mapping…");
+    try { await fetch("/api/scripts/map", { method: "POST" }); setStatus("mapped"); renderMap(root); }
+    finally { remap.disabled = false; }
+  };
+  head.append(remap);
+  root.append(head);
+
+  if (m.by_lang.length) {
+    const c = el("div", { className: "card" });
+    c.append(el("h2", {}, "Languages"));
+    c.append(bars(m.by_lang, (x) => x.lang, (x) => x.n));
+    root.append(c);
+  }
+  if (m.by_role.length) {
+    const c = el("div", { className: "card" });
+    c.append(el("h2", {}, "File roles"));
+    c.append(bars(m.by_role, (x) => x.role, (x) => x.n));
+    root.append(c);
+  }
+  if (m.deps.length) {
+    const c = el("div", { className: "card" });
+    c.append(el("h2", {}, `Dependencies (${m.deps.length})`));
+    for (const d of m.deps) c.append(el("div", { className: "tag" },
+      `${d.manager} · ${d.name} ${d.version || ""}${d.kind === "dev" ? " (dev)" : ""}`));
+    root.append(c);
+  }
+  if (m.env.length) {
+    const c = el("div", { className: "card" });
+    c.append(el("h2", {}, `Env vars (${m.env.length})`));
+    for (const e of m.env) c.append(el("div", { className: "tag" }, `${e.name}  — ${e.source_file}`));
+    root.append(c);
+  }
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
+  map: ["#view-map", renderMap],
   flags: ["#view-flags", renderFlags],
   scripts: ["#view-scripts", renderScripts],
 };

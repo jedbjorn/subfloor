@@ -153,6 +153,27 @@ def get_docs(con) -> dict:
         "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
 
 
+def get_map(con) -> dict:
+    """The dr_* repo catalogue, summarized — how the shell (and the FnB) sees
+    what's in the host repo."""
+    repo = con.execute("SELECT * FROM dr_repo WHERE repo_id=1").fetchone()
+    total = con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0]
+    return {
+        "repo": dict(repo) if repo else None,
+        "total_files": total,
+        "by_lang": rows(con.execute(
+            "SELECT lang, COUNT(*) AS n, COALESCE(SUM(lines),0) AS lines "
+            "FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC")),
+        "by_role": rows(con.execute(
+            "SELECT role, COUNT(*) AS n FROM dr_filepath GROUP BY role ORDER BY n DESC")),
+        "deps": rows(con.execute(
+            "SELECT manager, name, version, kind, source_file FROM dr_dependency "
+            "ORDER BY manager, name")),
+        "env": rows(con.execute(
+            "SELECT name, source_file FROM dr_env ORDER BY name")),
+    }
+
+
 def get_flags(con) -> dict:
     flags = rows(con.execute(
         "SELECT f.flag_id, f.display_name, f.priority, f.description, f.created_date, "
@@ -229,6 +250,9 @@ _SCRIPTS = {
                     [_PY, str(ENGINE / "scripts/seed_skills.py")], False),
     "migrate": ("Migrate", "Apply any pending migrations to the live DB (ledger-tracked).",
                 [_PY, str(ENGINE / "scripts/migrate.py"), str(DB_PATH)], False),
+    "map": ("Map repo", "Scan the host repo into the dr_* catalogue "
+            "(files / deps / env) — how the shell reads its repo. Re-run when the "
+            "repo changes.", [_PY, str(ENGINE / "scripts/map_repo.py")], False),
     "rebuild": ("Rebuild DB", "Rebuild shell_db.db from schema + migrations + snapshot "
                 "(backs up the current DB first). Discards any DB edits you have NOT "
                 "snapshotted.", [_PY, str(ENGINE / "scripts/rebuild.py")], True),
@@ -319,6 +343,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_roadmap(con))
             if path == "/api/docs":
                 return self._send(200, get_docs(con))
+            if path == "/api/map":
+                return self._send(200, get_map(con))
             if path.startswith("/api/documents/"):
                 parts = path.strip("/").split("/")   # api documents {id} [open]
                 did = int(parts[2])
