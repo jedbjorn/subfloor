@@ -19,14 +19,18 @@ Run:
 """
 from __future__ import annotations
 
+import base64
+import gzip
 import json
 import sqlite3
+import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 ENGINE = Path(__file__).resolve().parents[1]
+REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 UI_DIR = ENGINE / "ui"
 
@@ -39,6 +43,19 @@ _STATIC = {
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+
+# md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`
+# param — gzip → base64url (no padding) — which the live md-converter decodes on
+# mount (src/lib/inline). One source: no md-converter fork, no upload, no fetch.
+# Contract is byte-identical to its TS encoder; mtime=0 keeps the URL deterministic.
+MDC_BASE = "https://md-converter.designs-os.com"
+
+
+def mdc_url(markdown: str) -> str:
+    packed = base64.urlsafe_b64encode(
+        gzip.compress((markdown or "").encode(), mtime=0)).rstrip(b"=").decode()
+    return f"{MDC_BASE}/?c={packed}"
+
 
 # Shell fields the review layer may write. seed/L&S/system_prompt/mandate are
 # deliberately ABSENT — the law says the shell curates them, so there is no door.
@@ -94,9 +111,10 @@ def get_shell(con, sid: int) -> dict | None:
     return shell
 
 
-_ORDER = ["next", "near_term", "long_term", "brainstorm", "shipped"]
-_LABEL = {"next": "Next", "near_term": "Near term", "long_term": "Long term",
-          "brainstorm": "Brainstorm", "shipped": "Shipped"}
+# Funnel order: idea inlet → most-active committed work → done.
+_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"]
+_LABEL = {"brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
+          "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped"}
 
 
 def get_roadmap(con) -> dict:
@@ -104,10 +122,12 @@ def get_roadmap(con) -> dict:
         "SELECT r.feature_id, r.title, r.roadmap_status, r.sort_order, r.summary, "
         "s.shortname AS owner FROM roadmap r LEFT JOIN shells s "
         "ON s.shell_id=r.owning_shell ORDER BY r.sort_order, r.feature_id"))
+    # Roadmap tracks the development cycle = the SPECS. Docs (kind='doc') live on
+    # their own tab.
     docs_by: dict[int, list] = {}
     for d in rows(con.execute(
             "SELECT document_id, feature_id, kind, seq, title, frozen, frozen_date, "
-            "render_path FROM documents ORDER BY feature_id, kind, seq")):
+            "render_path FROM documents WHERE kind='spec' ORDER BY feature_id, seq")):
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
     for f in rows(con.execute(
@@ -121,6 +141,16 @@ def get_roadmap(con) -> dict:
                 "features": [f for f in feats if f["roadmap_status"] == s]}
                for s in _ORDER]
     return {"buckets": [b for b in buckets if b["features"]]}
+
+
+def get_docs(con) -> dict:
+    """Documentation (kind='doc'), grouped client-side by feature. Distinct from
+    the spec dev-cycle the roadmap tracks."""
+    return {"docs": rows(con.execute(
+        "SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, d.frozen, "
+        "d.frozen_date, r.title AS feature_title FROM documents d "
+        "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
+        "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
 
 
 def get_flags(con) -> dict:
@@ -182,16 +212,52 @@ def set_grant(con, sid, skill_id, granted):
     con.commit()
 
 
-def run_snapshot_render():
-    """Serialize + render after edits (manual precursor to the B6 automation)."""
-    import subprocess
-    out = []
-    for script in ("snapshot.py", "render.py"):
-        arg = ["flat"] if script == "render.py" else []
-        p = subprocess.run([sys.executable, str(ENGINE / "scripts" / script), *arg],
-                           capture_output=True, text=True)
-        out.append((p.stdout + p.stderr).strip())
-    return "\n".join(out)
+# Whitelisted maintenance scripts runnable from the GUI. Each is a fixed argv —
+# the GUI passes only a registry KEY, never a command, so nothing arbitrary runs.
+# Order = display order; `danger` ones prompt for confirmation in the UI.
+_PY = sys.executable
+_SCRIPTS = {
+    "snapshot": ("Snapshot", "Serialize the per-instance tables → snapshot/content.sql "
+                 "(deterministic, idempotent). Run after editing identity, roadmap, "
+                 "docs, or flags so the change survives a rebuild.",
+                 [_PY, str(ENGINE / "scripts/snapshot.py")], False),
+    "render": ("Render flat", "Regenerate the tracked flat _sc files "
+               "(specs_sc / docs_sc / skills_sc / roadmap_sc.md) from the DB. Incremental.",
+               [_PY, str(ENGINE / "scripts/render.py"), "flat"], False),
+    "seed_skills": ("Seed skills", "Recompile assets/skills/ into the skills seed migration "
+                    "(migrations/0001_seed_skills.sql). Run after editing a skill body.",
+                    [_PY, str(ENGINE / "scripts/seed_skills.py")], False),
+    "migrate": ("Migrate", "Apply any pending migrations to the live DB (ledger-tracked).",
+                [_PY, str(ENGINE / "scripts/migrate.py"), str(DB_PATH)], False),
+    "rebuild": ("Rebuild DB", "Rebuild shell_db.db from schema + migrations + snapshot "
+                "(backs up the current DB first). Discards any DB edits you have NOT "
+                "snapshotted.", [_PY, str(ENGINE / "scripts/rebuild.py")], True),
+}
+
+
+def script_list() -> list[dict]:
+    return [{"key": k, "name": v[0], "desc": v[1], "danger": v[3]}
+            for k, v in _SCRIPTS.items()]
+
+
+def run_script(key: str) -> dict | None:
+    spec = _SCRIPTS.get(key)
+    if not spec:
+        return None
+    argv = spec[2]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           cwd=str(REPO_ROOT), timeout=180)
+        return {"ok": p.returncode == 0, "code": p.returncode,
+                "output": (p.stdout + p.stderr).strip() or "(no output)"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "code": -1, "output": "timed out (>180s)"}
+
+
+def run_snapshot_render() -> str:
+    """The header 'snapshot ⤓' shortcut — serialize then render."""
+    return (run_script("snapshot")["output"] + "\n"
+            + run_script("render")["output"]).strip()
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -207,6 +273,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, location: str):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -246,16 +317,27 @@ class Handler(BaseHTTPRequestHandler):
                                   shell or {"error": "no such shell"})
             if path == "/api/roadmap":
                 return self._send(200, get_roadmap(con))
+            if path == "/api/docs":
+                return self._send(200, get_docs(con))
             if path.startswith("/api/documents/"):
-                did = int(path.rsplit("/", 1)[1])
+                parts = path.strip("/").split("/")   # api documents {id} [open]
+                did = int(parts[2])
+                if len(parts) == 4 and parts[3] == "open":
+                    r = con.execute("SELECT body FROM documents WHERE document_id=?",
+                                    (did,)).fetchone()
+                    if r is None:
+                        return self._send(404, {"error": "no such document"})
+                    return self._redirect(mdc_url(r["body"]))
                 r = con.execute("SELECT * FROM documents WHERE document_id=?",
                                 (did,)).fetchone()
                 return self._send(200 if r else 404,
                                   dict(r) if r else {"error": "no such document"})
             if path == "/api/flags":
                 return self._send(200, get_flags(con))
+            if path == "/api/scripts":
+                return self._send(200, {"scripts": script_list()})
             return self._send(404, {"error": "not found"})
-        except (ValueError, sqlite3.Error) as e:
+        except Exception as e:
             return self._send(400, {"error": str(e)})
         finally:
             con.close()
@@ -270,8 +352,13 @@ class Handler(BaseHTTPRequestHandler):
                                   {"error": err} if err else {"flag_id": fid})
             if path == "/api/snapshot":
                 return self._send(200, {"output": run_snapshot_render()})
+            if path.startswith("/api/scripts/"):
+                r = run_script(path.rsplit("/", 1)[1])
+                if r is None:
+                    return self._send(404, {"error": "no such script"})
+                return self._send(200 if r["ok"] else 500, r)
             return self._send(404, {"error": "not found"})
-        except (ValueError, sqlite3.Error) as e:
+        except Exception as e:
             return self._send(400, {"error": str(e)})
         finally:
             con.close()
@@ -304,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = patch_document(con, did, body)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
             return self._send(404, {"error": "not found"})
-        except (ValueError, sqlite3.Error) as e:
+        except Exception as e:
             return self._send(400, {"error": str(e)})
         finally:
             con.close()
@@ -320,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
                           bool(self._body().get("granted")))
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
-        except (ValueError, sqlite3.Error) as e:
+        except Exception as e:
             return self._send(400, {"error": str(e)})
         finally:
             con.close()

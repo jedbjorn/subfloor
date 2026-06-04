@@ -120,8 +120,9 @@ CREATE TABLE roadmap (
     feature_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     title          TEXT    NOT NULL,
     roadmap_status TEXT    NOT NULL DEFAULT 'brainstorm'
+                   -- funnel order: idea inlet → most-active committed work → done.
                    CHECK (roadmap_status IN
-                       ('brainstorm','long_term','near_term','next','shipped')),
+                       ('brainstorm','in_progress','next','near_term','long_term','shipped')),
     sort_order     INTEGER NOT NULL DEFAULT 0,   -- ordering within a bucket
     owning_shell   INTEGER REFERENCES shells(shell_id),
     summary        TEXT,

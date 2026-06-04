@@ -2,6 +2,9 @@
 rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
+feature: super-coder
+roadmap_status: in_progress
+frozen: true
 title: super-coder — Founding Spec
 tags: [super-coder, spec, architecture, harness-agnostic, fork]
 date: 2026-06-04

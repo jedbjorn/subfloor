@@ -138,10 +138,20 @@ Each fork hashes its path to a stable port in the `88xx` band (clear of superCC
 
 What you can do in the GUI: read everything; edit a shell's operational fields
 (`current_state`, `connections`, `workspace`) and skill grants; edit the roadmap
-and **non-frozen** documents; create and resolve flags. **seed and L&S are
-read-only** — the laws say the shell curates them, so the API ships no endpoint
-to write them at all. A `snapshot ⤓` button re-serializes + renders after edits
-(the manual precursor to the B6 commit→PR automation).
+(linear status buckets, with toggle-filters) and **non-frozen** documents; create
+and resolve flags. **seed and L&S are read-only** — the laws say the shell
+curates them, so the API ships no endpoint to write them at all. A `snapshot ⤓`
+button re-serializes + renders after edits (the manual precursor to the B6
+commit→PR automation).
+
+The **Scripts** tab lists the maintenance scripts (snapshot, render, seed-skills,
+migrate, rebuild) — each with a description and a **run** button, so the common
+chores work from the GUI without dropping to a terminal (rebuild prompts first,
+since it discards un-snapshotted DB edits).
+
+**`make launch` brings the GUI up too** — it starts the review layer (if not
+already running) and prints its URL *before* handing off to the harness, so the
+shell and the GUI run side by side from one command.
 
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
 git-tracked text. See `.super-coder/README.md` for the full model.

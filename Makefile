@@ -4,7 +4,7 @@ PY     := python3
 
 ECO    := $(ENGINE)/ecosystem.config.cjs
 
-.PHONY: help rebuild migrate snapshot render seed-skills init launch launch-% verify clean-db up down restart health serve ports
+.PHONY: help rebuild migrate snapshot render seed-skills init gui-up launch launch-% verify clean-db up down restart health serve ports
 
 help:
 	@echo "super-coder — forkable shell substrate"
@@ -15,8 +15,8 @@ help:
 	@echo "  make render              render tracked flat _sc files (specs/docs/skills/roadmap)"
 	@echo "  make seed-skills         regenerate the skills seed migration from assets/skills/"
 	@echo "  make init                seed a fresh fork's first user + shell (run once after install)"
-	@echo "  make launch              username auth + pick shell + render boot + exec harness"
-	@echo "  make launch-<shortname>  boot that shell directly (skip picker)"
+	@echo "  make launch              start the GUI (prints its URL) + auth + pick shell + boot + exec harness"
+	@echo "  make launch-<shortname>  boot that shell directly (skip picker); also starts the GUI"
 	@echo "  make verify              rebuild + flat render + render-only boot (headless proof)"
 	@echo "  make up / down / restart start/stop the localhost review layer (pm2, per-fork port)"
 	@echo "  make serve               run the review layer in the foreground (no pm2)"
@@ -42,10 +42,17 @@ seed-skills:
 init:
 	@$(PY) $(ENGINE)/scripts/init_fork.py
 
-launch:
+# Bring the review GUI up (idempotent) and print its address. Prerequisite of
+# the launch targets, so the GUI URL is shown before the harness takes over.
+gui-up:
+	@$(PY) $(ENGINE)/scripts/ports.py ensure >/dev/null
+	@pm2 start $(ECO) >/dev/null 2>&1 || true
+	@echo "→ review GUI at http://127.0.0.1:$$($(PY) $(ENGINE)/scripts/ports.py port)"
+
+launch: gui-up
 	@$(PY) $(ENGINE)/scripts/run.py
 
-launch-%:
+launch-%: gui-up
 	@$(PY) $(ENGINE)/scripts/run.py $*
 
 verify:

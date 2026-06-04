@@ -38,20 +38,23 @@ BANNER_KEYS = [
 ]
 
 
-def with_banner(body: str) -> str:
-    """Stamp the render banner onto a markdown body.
+def with_banner(body: str, extra: list[str] | None = None) -> str:
+    """Stamp the render banner (+ optional `extra` frontmatter keys) onto a body.
 
     A document body may already open with its own YAML frontmatter (themed
     markdown does). YAML frontmatter must be the very first thing in the file,
-    so we cannot prepend a second block — instead we splice the banner keys into
-    the existing frontmatter. Bodies with no frontmatter get a fresh banner
-    block. Either way the warning travels with the file and the YAML stays valid.
+    so we cannot prepend a second block — instead we splice the keys into the
+    existing frontmatter. Bodies with no frontmatter get a fresh banner block.
+    Either way the warning + metadata travel with the file and the YAML stays
+    valid. `extra` carries per-document metadata (feature, roadmap_status,
+    frozen) so a reader of the rendered spec sees where its feature sits.
     """
+    keys = [*BANNER_KEYS, *(extra or [])]
     body = body.lstrip("\n")
     lines = body.split("\n")
     if lines and lines[0].strip() == "---":
-        return "\n".join([lines[0], *BANNER_KEYS, *lines[1:]])
-    return "\n".join(["---", *BANNER_KEYS, "---", "", body])
+        return "\n".join([lines[0], *keys, *lines[1:]])
+    return "\n".join(["---", *keys, "---", "", body])
 
 
 # ── Incremental writer ──────────────────────────────────────────────────────
@@ -76,8 +79,10 @@ def _render_documents(con, written, skipped) -> None:
     derive a stable path from kind + title.
     """
     rows = con.execute(
-        "SELECT feature_id, kind, seq, title, body, render_path FROM documents "
-        "ORDER BY feature_id, kind, seq"
+        "SELECT d.feature_id, d.kind, d.seq, d.title, d.body, d.render_path, "
+        "d.frozen, r.roadmap_status, r.title AS feature_title FROM documents d "
+        "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
+        "ORDER BY d.feature_id, d.kind, d.seq"
     ).fetchall()
     for r in rows:
         if not r["body"]:
@@ -89,13 +94,21 @@ def _render_documents(con, written, skipped) -> None:
             slug = slug.lower().replace(" ", "-").replace("—", "-")
             slug = "".join(c for c in slug if c.isalnum() or c in "-_")
             rel = f"{base}/{slug}.md"
-        _write_if_changed(REPO_ROOT / rel, with_banner(r["body"]), written, skipped)
+        # Per-document metadata into the rendered frontmatter — where the
+        # feature sits in the plan + whether this spec is frozen.
+        extra = [
+            f"feature: {r['feature_title'] or ''}",
+            f"roadmap_status: {r['roadmap_status'] or ''}",
+            f"frozen: {'true' if r['frozen'] else 'false'}",
+        ]
+        _write_if_changed(REPO_ROOT / rel, with_banner(r["body"], extra),
+                          written, skipped)
 
 
-_ROADMAP_ORDER = ["next", "near_term", "long_term", "brainstorm", "shipped"]
+_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"]
 _ROADMAP_LABEL = {
-    "next": "Next", "near_term": "Near term", "long_term": "Long term",
-    "brainstorm": "Brainstorm", "shipped": "Shipped",
+    "brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
+    "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
 }
 
 
