@@ -65,3 +65,24 @@ snapshot (fork-local). `make rebuild` seeds the catalogue, then loads grants.
 `adapters/<harness>/` holds the thin, harness-specific seam: provider/model
 config, tool/permission config, MCP config, launch command. `claude/` is v1;
 `opencode/` is next. Everything above the seam is harness-blind.
+
+## Review layer (`api/` + `ui/`)
+
+A **zero-dependency** localhost GUI over the live DB — no FastAPI, no venv, no
+npm/build. `api/server.py` is a stdlib HTTP server that serves both the JSON API
+and the static `ui/` (one page, vanilla JS) on a single per-fork port.
+
+- **Read** shells, roadmap, flags. **Edit** a shell's operational fields
+  (`current_state`, `connections`, `workspace`) + skill grants, the roadmap, and
+  **non-frozen** documents. **Create / resolve** flags.
+- **Law enforcement is structural:** seed and L&S have *no write route* (Laws
+  2–4, 7) — not a disabled control, an absent endpoint. Frozen documents reject
+  edits server-side.
+- `POST /api/snapshot` runs `snapshot.py` + `render.py flat` — the manual
+  precursor to the B6 commit→PR automation.
+
+`scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
+100`), bumping past anything occupied, and persists it to the gitignored
+`instance.json`. `ecosystem.config.cjs` names the pm2 process `sc-<repo>` so
+forks (and the host repo's own pm2 apps) never clash. `make up` / `down` /
+`health` / `serve` drive it.

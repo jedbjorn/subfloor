@@ -14,6 +14,10 @@
 # Only the render output is ignored; a fork's own .claude/settings stays tracked.
 /.claude/skills/
 
+# Per-instance local config — derived ports etc. Local to this fork, never
+# propagates (re-derived from the repo path if absent). Hand-overridable.
+/.super-coder/instance.json
+
 # Python / tooling
 __pycache__/
 *.pyc

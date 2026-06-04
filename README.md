@@ -116,6 +116,33 @@ make verify              # rebuild + flat render + headless boot (no exec) — t
 make help                # all targets
 ```
 
+## Review layer (localhost GUI)
+
+A zero-dependency localhost GUI to review the substrate — shells, roadmap,
+flags. One stdlib Python server serves both the JSON API and a static UI; no
+venv, no npm, no build step.
+
+```bash
+make up        # start it (pm2) on this fork's derived port
+make health    # curl /api/health
+make down      # stop it
+make serve     # run it in the foreground (no pm2)
+make ports     # show this fork's derived port
+```
+
+**Ports are derived per repo**, never fixed — because a fork runs *inside* a
+host repo that may have its own dev server, and several forks can run at once.
+Each fork hashes its path to a stable port in the `88xx` band (clear of superCC
+8000 / dos-arch 8001 and common host ports), persisted to a gitignored
+`.super-coder/instance.json` you can hand-edit. Two forks won't collide.
+
+What you can do in the GUI: read everything; edit a shell's operational fields
+(`current_state`, `connections`, `workspace`) and skill grants; edit the roadmap
+and **non-frozen** documents; create and resolve flags. **seed and L&S are
+read-only** — the laws say the shell curates them, so the API ships no endpoint
+to write them at all. A `snapshot ⤓` button re-serializes + renders after edits
+(the manual precursor to the B6 commit→PR automation).
+
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
 git-tracked text. See `.super-coder/README.md` for the full model.
 
