@@ -5,7 +5,86 @@
 
 BEGIN;
 
-DELETE FROM skills WHERE name IN ('bootstrap', 'db_map', 'docs', 'flags', 'git', 'memory', 'snapshot', 'surface_catalogue');
+DELETE FROM skills WHERE name IN ('api-design', 'blueprint', 'bootstrap', 'database-migrations', 'db_map', 'docs', 'flags', 'git', 'memory', 'snapshot', 'surface_catalogue');
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'api-design',
+  'REST/HTTP API design patterns — resource naming, status codes, pagination, filtering, errors, versioning, idempotency. Use when designing or reviewing API endpoints.',
+  'craft',
+  NULL,
+  0,
+  '# api-design — designing & reviewing HTTP APIs
+
+Catalogue skill (opt-in). Reach for it when shaping or reviewing an endpoint.
+
+## Resources & methods
+- Name resources as **plural nouns**, not verbs: `/users`, `/users/{id}/orders`.
+- `GET` read (safe, idempotent) · `POST` create / non-idempotent action ·
+  `PUT` full replace (idempotent) · `PATCH` partial update · `DELETE` remove.
+- Nest only one level deep; beyond that, link by id.
+
+## Status codes
+- `200` ok · `201` created (+ `Location`) · `204` no content.
+- `400` bad input · `401` unauth · `403` forbidden · `404` not found ·
+  `409` conflict · `422` validation · `429` rate-limited.
+- `5xx` = server''s fault; never use it for client errors.
+
+## Payloads
+- Consistent error shape: `{ "error": { "code", "message", "details" } }`.
+- **Pagination**: cursor-based for large/changing sets (`?cursor=&limit=`),
+  return `next_cursor`; offset only for small stable sets.
+- **Filtering/sorting**: explicit query params (`?status=open&sort=-created`);
+  whitelist fields — never interpolate them into a query.
+- Timestamps ISO-8601 UTC; ids opaque strings.
+
+## Robustness
+- **Idempotency**: make retries safe — `PUT`/`DELETE` naturally; for `POST`,
+  accept an idempotency key.
+- **Versioning**: prefix (`/v1/…`) or header; add fields backward-compatibly,
+  never repurpose one.
+- Validate at the boundary; reject unknown fields or ignore them — decide and
+  document. Don''t leak internals (stack traces, SQL) in errors.
+
+## Review lens
+Does each endpoint do one thing? Right method + status? Errors uniform? Inputs
+validated/whitelisted? Retries safe? Breaking change hiding in a "small" tweak?'
+);
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'blueprint',
+  'Turn a one-line objective into a sequenced construction plan — decompose into steps, find the dependency order, mark what can run in parallel, name the verification gate. Use before multi-step builds.',
+  'craft',
+  NULL,
+  0,
+  '# blueprint — objective → sequenced plan
+
+Catalogue skill (opt-in). Use before a build that spans more than a couple of
+steps, so the work has a shape before you start cutting.
+
+## Produce
+
+1. **Restate the objective** in one sentence + the done-condition (how you''ll
+   know it''s finished).
+2. **Decompose** into concrete steps — each a unit you could verify on its own.
+3. **Order by dependency** — what must precede what. Mark steps with no
+   dependency on each other as **parallelizable**.
+4. **Per step**: the change, the files/areas it touches (use `surface_catalogue`
+   to ground this in the real repo), and its **verification** (test, run,
+   review).
+5. **Risks / unknowns** — what could break the plan; resolve the riskiest
+   unknown first (spike it) rather than last.
+6. **Gate** — the adversarial check before calling it done: does each step''s
+   verification actually prove the done-condition?
+
+## Stance
+- Plan to the **next solid checkpoint**, not the whole universe — re-plan as
+  reality lands. A plan that survives contact is short and concrete.
+- Sequence so something **works end-to-end early** (a thin slice), then deepen —
+  beats building all the pieces and integrating last.
+- In super-coder, land the plan as a **spec** on the roadmap (the `docs` skill):
+  a feature row + a `spec` document, so the plan is reviewable and freezes on
+  ship.'
+);
 
 INSERT INTO skills (name, description, category, command, common, content) VALUES (
   'bootstrap',
@@ -69,6 +148,48 @@ you start work grounded instead of wandering. Run it when the boot doc shows
 - Bootstrap once, then work — don''t re-run it every session.
 - If you ever boot and the map looks empty or stale (`dr_repo.mapped_at` old),
   `make map` before trusting it. Orientation is cheap; working blind is not.'
+);
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'database-migrations',
+  'Database migration safety + how super-coder''s own migrations work (schema.sql baseline + ordered migrations/ deltas + ledger). Use when altering tables, adding columns, or running backfills — in the host repo''s DB or super-coder''s.',
+  'craft',
+  NULL,
+  0,
+  '# database-migrations — change schemas safely
+
+Catalogue skill (opt-in). Two halves: super-coder''s own migration model, and
+general migration safety for the host repo''s database.
+
+## super-coder''s model
+- `schema.sql` = the **current baseline** (full schema). `migrations/*.sql` =
+  **ordered, additive deltas** applied on top; the `schema_migrations` ledger
+  dedups so each runs once. `rebuild` = schema → migrations → snapshot-load.
+- **Never fold a migration back into `schema.sql`** (double-apply). Add a
+  delta as a new numbered migration instead. *(Pre-fork, while there are no
+  downstream forks, editing the baseline directly is acceptable — once forks
+  exist, only additive migrations propagate.)*
+- System content (e.g. the skill catalogue) is seeded by migration + re-seed;
+  per-instance content rides in the snapshot. See `db_map` / `snapshot`.
+
+## General safety (host repo DBs)
+- **Additive first**: add columns/tables before you read them; deploy code that
+  tolerates both shapes; remove the old shape only after nothing uses it
+  (expand → migrate → contract).
+- **Backfills**: batch large updates (don''t lock the table); make them
+  resumable and idempotent; separate the schema change from the data change.
+- **Nullable or defaulted** new columns on a populated table — a `NOT NULL` with
+  no default fails on existing rows.
+- **Reversibility**: know the rollback for each migration before applying it; a
+  destructive change (drop/rename) needs a deploy plan, not just a script.
+- **SQLite specifics**: limited `ALTER` — changing a constraint means
+  recreate-and-copy (new table → copy → drop → rename), with `foreign_keys` off
+  during the swap. Renames break FK references; check them.
+
+## Stance
+Migrate forward in small, reversible steps. A schema change is a deploy event:
+migrated ≠ deployed — restart the consumer, then verify the running process, not
+just the DB.'
 );
 
 INSERT INTO skills (name, description, category, command, common, content) VALUES (

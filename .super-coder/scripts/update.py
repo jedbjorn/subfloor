@@ -44,10 +44,13 @@ def run(*script_args: str) -> None:
 def regrant() -> int:
     con = sqlite3.connect(DB_PATH)
     try:
+        # Grant newly-added COMMON skills to every shell. Opt-in (common=0)
+        # skills are per-shell assignments — left untouched so an update never
+        # overrides who-has-which catalogue skill.
         cur = con.execute(
             "INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
             "SELECT s.shell_id, k.skill_id FROM shells s, skills k "
-            "WHERE COALESCE(s.is_deleted,0)=0 AND k.is_deleted=0")
+            "WHERE COALESCE(s.is_deleted,0)=0 AND k.is_deleted=0 AND k.common=1")
         con.commit()
         return cur.rowcount
     finally:
