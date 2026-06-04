@@ -30,7 +30,10 @@ DB_PATH = ENGINE / "shell_db.db"
 
 SKIP_DIRS = {".git", "node_modules", ".super-coder", ".venv", "venv",
              "__pycache__", ".svelte-kit", "dist", "build", ".next", "target",
-             "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache"}
+             "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache",
+             # super-coder's own render output — mirrors the DB, not host source.
+             "specs_sc", "docs_sc", "skills_sc"}
+SKIP_FILES = {"roadmap_sc.md", "CLAUDE.md", "AGENTS.md", "opencode.json"}
 MAX_FILES = 20000  # backstop for huge trees; logs if hit
 
 LANG = {
@@ -177,7 +180,7 @@ def main() -> int:
             rel_parts = p.relative_to(REPO_ROOT).parts
             if any(part in skip for part in rel_parts):
                 continue
-            if not p.is_file():
+            if not p.is_file() or p.name in SKIP_FILES:
                 continue
             if files >= MAX_FILES:
                 truncated = True

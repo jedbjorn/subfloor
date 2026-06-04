@@ -632,6 +632,7 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='flags';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='git';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='onboard';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='snapshot';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='surface_catalogue';
 

@@ -168,6 +168,16 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                   if map_count and mapped_at_row and mapped_at_row[0]
                   else "not mapped — run `make map` (or the bootstrap skill)")
 
+    # Ingest status: repo docs (role=doc) vs how many are in the DB. If the repo
+    # has docs not yet ingested, point at the onboard skill.
+    repo_docs = con.execute(
+        "SELECT COUNT(*) FROM dr_filepath WHERE role='doc' "
+        "AND path NOT LIKE '.super-coder/%'").fetchone()[0]
+    ingested = con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    docs_status = f"{ingested} ingested / {repo_docs} in repo"
+    if repo_docs > ingested:
+        docs_status += " — run the `onboard` skill"
+
     first_run = []
     if not bootstrapped:
         first_run = [
@@ -216,6 +226,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         f"- **L&S:** {counts['lns']}",
         f"- **Flags:** {counts['flags']} open",
         f"- **Repo map:** {map_status}",
+        f"- **Docs:** {docs_status}",
         "",
     ]
     return "\n".join(parts)

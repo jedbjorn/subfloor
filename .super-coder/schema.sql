@@ -140,7 +140,7 @@ CREATE TABLE roadmap (
 
 CREATE TABLE documents (
     document_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    feature_id   INTEGER NOT NULL REFERENCES roadmap(feature_id),
+    feature_id   INTEGER REFERENCES roadmap(feature_id),  -- NULL = general doc (not tied to a feature)
     kind         TEXT    NOT NULL DEFAULT 'spec' CHECK (kind IN ('spec','doc')),
     seq          INTEGER NOT NULL DEFAULT 1,     -- lineage within (feature, kind)
     title        TEXT,
