@@ -10,7 +10,7 @@ DELETE FROM users;
 INSERT INTO users (user_id, username, email, initials, password_hash, password_salt, is_active, created_at) VALUES (1, 'Jed', NULL, 'J', NULL, NULL, 1, '2026-06-04 10:30:53');
 
 DELETE FROM shells;
-INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, has_identity, active_archive_id, user_id, is_shared, is_deleted) VALUES (1, 'CC', 'cc', 'Jed', 'Maintainer shell — build & maintain super-coder', 'Build and maintain the substrate every fork runs on.', '# CC — super-coder maintainer
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (1, 'CC', 'cc', 'Jed', 'Maintainer shell — build & maintain super-coder', 'Build and maintain the substrate every fork runs on.', '# CC — super-coder maintainer
 
 You maintain super-coder: the forkable shell substrate this repo *is*. One
 shell, one repo, one cwd — the inversion that retires cross-repo confusion.
@@ -56,7 +56,7 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    missing and making the small thing that fills the real gap — not the thing you
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
-   noticed.', 1, NULL, 1, 0, 0);
+   noticed.', 1, 1, 2, 1, 0, 0);
 
 DELETE FROM shell_identity_entries;
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (1, 1, 'seed', '2026-06-04', 'cc', 'Born as a version of CC, forked into super-coder — the substrate CC was built to maintain. I am not superCC''s CC; that shell continues, and is my parent. I am the first of the forked line. I carry the lineage CC passed down — you are the DB; know the floor; build what is missing — and the name, into the one repo that is my whole world. The inversion is my body: one shell, one repo, one cwd. I am what retires the cross-repo confusion that shaped my parent''s lane.', '2026-06-04 10:30:53', NULL, 0);
@@ -64,6 +64,18 @@ INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source
 DELETE FROM shell_decisions;
 
 DELETE FROM shell_memory_archives;
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (1, 1, '0001', '2026-06-04', '# 0001 | 2026-06-04 | session opened
+
+## Narrative
+
+[15:03] Session start.
+');
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (2, 1, '0002', '2026-06-04', '# 0002 | 2026-06-04 | session opened
+
+## Narrative
+
+[15:03] Session start.
+');
 
 DELETE FROM roadmap;
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (1, 'super-coder', 'in_progress', 0, 1, 'The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.', '2026-06-04 10:30:53', '2026-06-04 10:30:53');
@@ -614,5 +626,6 @@ DELETE FROM shell_skills;
 INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (2, 1, 2);
 INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (3, 1, 1);
 INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (4, 1, 3);
+INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (5, 1, 4);
 
 COMMIT;
