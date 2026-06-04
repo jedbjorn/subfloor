@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>super-coder — review</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>super-coder<span id="repo"></span></h1>
+    <nav>
+      <button data-tab="shells" class="active">Shells</button>
+      <button data-tab="roadmap">Roadmap</button>
+      <button data-tab="flags">Flags</button>
+    </nav>
+    <div class="tools">
+      <span id="status" class="status"></span>
+      <button id="snapshot" title="make snapshot + render (precursor to B6 auto-commit)">snapshot ⤓</button>
+    </div>
+  </header>
+  <main>
+    <section id="view-shells" class="view"></section>
+    <section id="view-roadmap" class="view" hidden></section>
+    <section id="view-flags" class="view" hidden></section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
