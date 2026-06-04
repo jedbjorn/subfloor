@@ -4,11 +4,12 @@ PY     := python3
 
 ECO    := $(ENGINE)/ecosystem.config.cjs
 
-.PHONY: help rebuild migrate snapshot render seed-skills init gui-up launch launch-% verify clean-db up down restart health serve ports
+.PHONY: help install rebuild migrate snapshot render seed-skills init gui-up launch launch-% verify clean-db up down restart health serve ports
 
 help:
 	@echo "super-coder — forkable shell substrate"
 	@echo ""
+	@echo "  make install             first-launch bootstrap for a fork (requirements, harness, first shell)"
 	@echo "  make rebuild             build $(DB) from schema + migrations + snapshot"
 	@echo "  make migrate             apply pending migrations to an existing $(DB)"
 	@echo "  make snapshot            dump per-instance tables -> $(ENGINE)/snapshot/content.sql"
@@ -23,6 +24,9 @@ help:
 	@echo "  make health              curl the review layer's /api/health"
 	@echo "  make ports               show this fork's derived port"
 	@echo "  make clean-db            remove the rebuilt $(DB) (text serializations untouched)"
+
+install:
+	@$(PY) $(ENGINE)/scripts/install.py
 
 rebuild:
 	@$(PY) $(ENGINE)/scripts/rebuild.py

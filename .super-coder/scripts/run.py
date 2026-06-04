@@ -17,6 +17,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -37,6 +38,16 @@ LAUNCH = {
     "claude": ["claude"],
     "opencode": ["opencode"],
 }
+
+
+def _configured_harness() -> str | None:
+    cfg = ENGINE / "instance.json"
+    if cfg.exists():
+        try:
+            return json.loads(cfg.read_text()).get("harness")
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
 
 
 def open_db() -> sqlite3.Connection:
@@ -174,7 +185,9 @@ def main() -> None:
         print("→ RENDER_ONLY set — not exec'ing the harness.")
         return
 
-    harness = os.environ.get("HARNESS", "claude")
+    # Harness: HARNESS env wins, else this fork's configured harness
+    # (instance.json, set by the installer), else claude.
+    harness = os.environ.get("HARNESS") or _configured_harness() or "claude"
     cmd = LAUNCH.get(harness)
     if not cmd:
         sys.exit(f"unknown harness '{harness}' (known: {', '.join(LAUNCH)})")
