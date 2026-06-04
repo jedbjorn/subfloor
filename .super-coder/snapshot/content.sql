@@ -623,9 +623,13 @@ DELETE FROM project_shells;
 INSERT INTO project_shells (project_shell_id, project_id, shell_id, role, added_date, is_deleted) VALUES (1, 1, 1, 'maintainer', '2026-06-04', 0);
 
 DELETE FROM shell_skills;
-INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (2, 1, 2);
-INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (3, 1, 1);
-INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (4, 1, 3);
-INSERT INTO shell_skills (shell_skill_id, shell_id, skill_id) VALUES (5, 1, 4);
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='bootstrap';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='db_map';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='docs';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='flags';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='git';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='snapshot';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='surface_catalogue';
 
 COMMIT;

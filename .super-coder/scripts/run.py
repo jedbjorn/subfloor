@@ -85,9 +85,19 @@ def open_db() -> sqlite3.Connection:
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
 def authenticate(con: sqlite3.Connection) -> sqlite3.Row:
-    username = input("Username: ").strip()
+    # SC_USER env wins; else prompt on a TTY; else (headless: `make verify`, CI)
+    # default to the first active user so launch doesn't EOFError without a TTY.
+    username = os.environ.get("SC_USER")
     if not username:
-        sys.exit("aborted")
+        if sys.stdin.isatty():
+            username = input("Username: ").strip()
+        else:
+            row = con.execute(
+                "SELECT username FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
+            ).fetchone()
+            username = row["username"] if row else None
+    if not username:
+        sys.exit("aborted — no user (set SC_USER or provision a user)")
     row = con.execute(
         "SELECT user_id, username FROM users "
         "WHERE LOWER(username)=LOWER(?) AND is_active=1",
@@ -136,7 +146,27 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
 
 # ── Session archive ─────────────────────────────────────────────────────────
 
+def _is_unused(narrative: str) -> bool:
+    """A freshly-opened session whose narrative is still just the 'Session start'
+    stub (no work appended). Detected by a single timestamp entry."""
+    return (narrative or "").count("\n[") <= 1
+
+
 def open_session(con: sqlite3.Connection, shell_id: int) -> tuple[str, int]:
+    # Reuse the active session if it was opened but never used (e.g. install
+    # opened session 0001, or a prior launch did no work) — avoids phantom empty
+    # sessions and the incidental first-snapshot diff.
+    active = con.execute(
+        "SELECT active_archive_id FROM shells WHERE shell_id=?", (shell_id,)
+    ).fetchone()[0]
+    if active:
+        row = con.execute(
+            "SELECT archive_id, session_id, full_narrative FROM shell_memory_archives "
+            "WHERE archive_id=?", (active,)
+        ).fetchone()
+        if row and _is_unused(row["full_narrative"]):
+            return row["session_id"], row["archive_id"]
+
     last = con.execute(
         "SELECT MAX(CAST(session_id AS INTEGER)) FROM shell_memory_archives WHERE shell_id=?",
         (shell_id,),

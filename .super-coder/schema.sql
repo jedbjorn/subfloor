@@ -174,7 +174,7 @@ CREATE TABLE flags (
 
 CREATE TABLE skills (
     skill_id    INTEGER PRIMARY KEY,
-    name        TEXT    NOT NULL,
+    name        TEXT    NOT NULL UNIQUE,
     description TEXT,
     category    TEXT,
     content     TEXT,

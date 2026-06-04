@@ -76,16 +76,22 @@ propagates via migrations; your per-instance content (the snapshot) is
 untouched.
 
 ```bash
-git fetch super-coder           # (re-add the remote first if you removed it)
+# (re-add the remote first if you removed it: git remote add super-coder <url>)
+git fetch super-coder
 git checkout super-coder/main -- \
     .super-coder/schema.sql .super-coder/migrations .super-coder/scripts \
-    .super-coder/render .super-coder/templates .super-coder/assets/skills
-make rebuild                    # re-applies your snapshot + any NEW system migrations
+    .super-coder/render .super-coder/templates .super-coder/adapters \
+    .super-coder/assets/skills
+make update                     # reconcile the fork against the new engine
+git add -A && git commit -m "chore: update super-coder"
 ```
 
-The migration ledger (`schema_migrations`) skips already-applied migrations, so
-`rebuild` only lays down what's new. Your shells, memory, and roadmap come back
-from your own `snapshot/content.sql`.
+`make update` rebuilds the `.db` from the new schema + migrations + **your**
+snapshot, **re-grants any newly-added system skills** to your shells (skill
+bodies propagate via the engine; the per-instance grant doesn't, so update wires
+it), refreshes the repo map, and re-snapshots. Your shells, memory, roadmap, and
+docs survive — they ride in your `snapshot/content.sql`; grants are dumped by
+skill *name*, so they're immune to catalogue-id shifts.
 
 ## Run (everyday)
 

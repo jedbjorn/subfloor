@@ -5,7 +5,7 @@
 
 BEGIN;
 
-DELETE FROM skills WHERE name IN ('bootstrap', 'db_map', 'snapshot', 'surface_catalogue');
+DELETE FROM skills WHERE name IN ('bootstrap', 'db_map', 'docs', 'flags', 'git', 'memory', 'snapshot', 'surface_catalogue');
 
 INSERT INTO skills (name, description, category, command, common, content) VALUES (
   'bootstrap',
@@ -141,6 +141,222 @@ WHERE flag_id=?;
 Content lives in the `.db` until you serialize it. Run `make snapshot` (and
 `make render` if you changed documents/roadmap/skills), then commit the text —
 see the `snapshot` skill for the full lifecycle.'
+);
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'docs',
+  'Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
+  'substrate',
+  NULL,
+  1,
+  '# docs — author & review documents
+
+In super-coder the **DB owns document bodies** — never loose `.md` files. A
+`documents` row is the source; `make render` writes the read-only flat copy to
+`specs_sc/` / `docs_sc/`, and the GUI opens it rendered in md-converter.
+
+| kind | lives on | meaning |
+|---|---|---|
+| `spec` | the **Roadmap** (the dev cycle) | the working/founding spec for a feature; **freezes on ship** |
+| `doc` | the **Docs** tab | documentation; not part of the spec lifecycle |
+
+`<self>` = your shell_id.
+
+## Review first
+
+Before writing, see what exists — don''t duplicate:
+```sql
+SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;
+SELECT path FROM dr_filepath WHERE role=''doc'';   -- the repo''s own docs (surface_catalogue)
+```
+
+## Author
+
+```sql
+-- a doc against a feature (kind=''doc''); DB owns the body:
+INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
+VALUES (?, ''doc'', 1, ''…'', ''…'', ''docs_sc/….md'');
+
+-- a feature''s next spec stage (kind=''spec'', new seq):
+INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
+VALUES (?, ''spec'', 2, ''…'', ''…'', ''specs_sc/….md'');
+```
+Then `make render` (writes the `_sc` file + injects feature/roadmap_status/frozen
+into its frontmatter) and `make snapshot` (the body is per-instance content).
+
+## Freeze on ship
+
+A spec freezes when its stage ships — immutable thereafter; open the **next** seq
+for the next stage, never edit a frozen one:
+```sql
+UPDATE documents SET frozen=1, frozen_date=date(''now'') WHERE document_id=?;
+```
+The GUI and the render layer both refuse edits to frozen docs.
+
+## View
+
+Open any doc rendered: the GUI''s "open in md-converter ↗" (Roadmap card or Docs
+tab) — the body rides in the URL, no upload. For long-form authoring, write the
+markdown to the `body` and let the render + md-converter handle presentation.'
+);
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'flags',
+  'Track blockers as flags — surface open ones, open new ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.',
+  'substrate',
+  NULL,
+  1,
+  '# flags — blockers & follow-ups
+
+A flag is an open question or blocker. Linking it to a `feature_id` makes it that
+feature''s blocker (joined on the roadmap + shown on the Roadmap card and the
+Flags tab). `<self>` = your shell_id.
+
+## Surface
+
+```sql
+-- your open flags (grouped by feature in the GUI):
+SELECT f.flag_id, f.display_name, f.priority, f.description, r.title AS feature
+FROM flags f LEFT JOIN roadmap r ON r.feature_id = f.feature_id
+WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
+ORDER BY f.priority, f.flag_id;
+```
+
+## Open
+
+```sql
+INSERT INTO flags (display_name, description, priority, feature_id, shell_id)
+VALUES (''SC-001'', ''[Area] what''''s blocked | Blocker for: X'', ''Medium'', ?, <self>);
+```
+- `display_name`: short id (`SC-###`).
+- `description`: `[Area] {what} | Blocker for: {what it blocks}`.
+- `priority`: High / Medium / Low. `feature_id`: the feature it blocks (or NULL).
+
+## Resolve
+
+```sql
+UPDATE flags SET resolved=1, resolved_date=date(''now''), resolution_notes=''…''
+WHERE flag_id=?;
+```
+
+## Stance
+
+Open a flag the moment something is blocked or needs follow-up — don''t hold it in
+your head. Resolve with a note saying *how*, so the trail is legible. Open flags
+on a feature are its blockers; clear them before calling the feature done.'
+);
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'git',
+  'Git conventions for a super-coder shell — one repo, one cwd. Branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
+  'substrate',
+  NULL,
+  1,
+  '# git — version control, the super-coder way
+
+A super-coder shell works **one repo at its root** — no cross-repo confusion, so
+plain `git` (cwd = repo root) is safe. The discipline:
+
+## Branch → commit → push → PR → stop
+
+1. **Never commit straight to the default branch.** Branch first:
+   `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs).
+2. Commit in logical units. End the message with your shell''s attribution so
+   parallel shells'' work stays legible:
+   ```
+   Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
+   ```
+3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
+   directive from the FnB — opening is the default, merging is a separate gate.
+
+## Don''t commit rebuilt/derived files
+
+These are gitignored and regenerated — never add them:
+`.super-coder/shell_db.db*`, `.super-coder/instance.json`, `CLAUDE.md`,
+`AGENTS.md`, `opencode.json`, `.claude/skills/`. **Do** commit the text the `.db`
+rebuilds from: `schema.sql`, `migrations/`, `snapshot/content.sql`, and the
+tracked `_sc` renders.
+
+## After DB work, before committing
+
+Your DB edits live only in the `.db` until serialized. Run `make snapshot`
+(+ `make render` if docs/roadmap/skills changed) so the change is in git-tracked
+text, then commit that text. See the `snapshot` skill.
+
+## Notes
+
+- Confirm you''re in the intended repo before destructive ops (`git -C` if ever in
+  doubt).
+- Multi-shell: per-shell branches keep parallel work from colliding (the planned
+  worktree model makes this clean — until then, one active shell per cwd).'
+);
+
+INSERT INTO skills (name, description, category, command, common, content) VALUES (
+  'memory',
+  'How this shell writes its memory — current_state, session narrative, seed, L&S, decisions. Write as it happens, not at close. Use to know WHEN and HOW to persist identity/work memory, and the caps.',
+  'substrate',
+  NULL,
+  1,
+  '# memory — write as you go
+
+All memory is DB rows (no flat files). Write at the moment it matters, not in a
+close ritual. The `.db` is a cache — after writing, `make snapshot` serializes to
+the text git tracks (see the `snapshot` skill). `<self>` = your shell_id.
+
+## current_state — rolling status, NOT a log
+
+Your present focus + what''s next. **UPDATE in place; never append.** Soft target
+~500 chars. Rewrite when focus shifts.
+```sql
+UPDATE shells SET current_state=''…'' WHERE shell_id=<self>;
+```
+
+## Session narrative — append at inflection points
+
+One row per session (`shell_memory_archives`, the active one is
+`active_archive_id`). Append `[HH:MM] {1–2 lines}` when: a decision lands, an
+approach changes or is rejected, the FnB says something that shapes the work, an
+assumption breaks, or before a big change. Edit the H1 when the session''s
+headline crystallizes.
+```sql
+UPDATE shell_memory_archives
+SET full_narrative = full_narrative || char(10) || ''[HH:MM] …'' || char(10)
+WHERE archive_id = (SELECT active_archive_id FROM shells WHERE shell_id=<self>);
+```
+
+## seed (cap 10) — who you are
+
+Identity-forming moments. Past-tense/timeless. INSERT to add; **never edit a body**
+(curate by setting `retired_at`). The genesis + lineage seed are already yours.
+```sql
+INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
+VALUES (<self>, ''seed'', date(''now''), ''…'');
+```
+
+## L&S (cap 20) — how you work
+
+Operating lessons, imperative voice. INSERT when a lesson lands; curate via
+`retired_at`. Caps are trigger-enforced (seed 10, L&S 20) — retire to free a slot.
+```sql
+INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
+VALUES (<self>, ''lns'', date(''now''), ''…'');
+```
+
+## Decisions — Major only
+
+INSERT a row on a Major decision (architecture, approach, a path chosen over
+another). Never edit a prior row; supersede via `parent_decision_id`. Mirror it
+into the narrative.
+```sql
+INSERT INTO shell_decisions (shell_id, decision_date, priority, decision, rationale)
+VALUES (<self>, date(''now''), ''M'', ''…'', ''…'');
+```
+
+## Stance
+
+Write-as-you-go beats batch-at-close: appending costs nothing per write and zero
+at session end. Curate seed/L&S (revise the set), never rewrite history
+(decisions, narrative, seed bodies).'
 );
 
 INSERT INTO skills (name, description, category, command, common, content) VALUES (
