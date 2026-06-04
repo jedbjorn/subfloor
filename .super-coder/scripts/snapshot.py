@@ -25,9 +25,12 @@ ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
 OUT_PATH = ENGINE / "snapshot" / "content.sql"
 
-# Per-instance tables, parents-before-children for readability. System tables
-# (skills, shell_skills, schema_migrations) are intentionally excluded — they
-# come from migrations/assets, not from one fork's snapshot.
+# Per-instance tables, parents-before-children for readability. The `skills`
+# catalogue and `schema_migrations` ledger are excluded — they are SYSTEM
+# content seeded from migrations, not one fork's snapshot. `shell_skills` IS
+# here, though: which shell is *granted* a skill is a fork-local decision (the
+# bodies propagate via migration; the grants do not). It loads after `shells`
+# (its FK target) and after the skills migration has run, so both ends exist.
 PER_INSTANCE_TABLES = [
     "users",
     "shells",
@@ -39,6 +42,7 @@ PER_INSTANCE_TABLES = [
     "flags",
     "projects",
     "project_shells",
+    "shell_skills",
 ]
 
 

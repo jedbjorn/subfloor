@@ -10,11 +10,14 @@ serializes them to `snapshot/content.sql`, which becomes the tracked seed every
 Not part of the rebuild path — it is the *authoring* step that produced the
 first snapshot. Re-run only to regenerate the seed from scratch.
 
-Flow:
-    make clean-db && make rebuild        # fresh empty DB (no snapshot yet)
-    python3 .super-coder/scripts/seed_dogfood.py
-    make snapshot                        # -> snapshot/content.sql
-    make rebuild                         # reproduce from text; verify
+Flow (regen from scratch — skills must be seeded first; the existing snapshot
+must be out of the way so the rebuild starts empty and this can re-author):
+    make seed-skills                     # author migrations/0001_seed_skills.sql
+    rm .super-coder/snapshot/content.sql # step aside; seed_dogfood reproduces it
+    make clean-db && make rebuild        # empty content + skills (from migration)
+    python3 .super-coder/scripts/seed_dogfood.py   # cc + grants (skills now exist)
+    make snapshot                        # -> snapshot/content.sql (incl. grants)
+    make rebuild && make render && make verify     # reproduce + render; verify
 
 Maintainer-shell lineage is RESOLVED (decision #185): the maintainer is a
 succession child of CC, carrying the CC Lineage Seed (3 immutable entries,
@@ -134,10 +137,11 @@ def main() -> int:
                 "Maintainer shell — build & maintain super-coder",
                 "Build and maintain the substrate every fork runs on.",
                 MAINTAINER_PROMPT,
-                "Core spine stood up (B0). Identity SET: succession child of CC, "
-                "Lineage Seed + genesis seed planted. super-coder feature on the "
-                "roadmap (next); founding spec frozen as document seq 1. NEXT: B2 — "
-                "flat _sc render + skills->SKILL.md, then seed first working skills.",
+                "B0 spine + B2 content/render done. Identity SET: succession "
+                "child of CC, Lineage Seed + genesis seed planted. super-coder "
+                "feature on roadmap (next); founding spec frozen (doc seq 1). "
+                "Flat _sc render live; skills (db_map, snapshot) seeded + "
+                "rendered to .claude/skills/. NEXT: B1 installer or B3 GUI.",
                 "Single repo: ~/super-coder (the substrate itself). One shell, one cwd.",
                 LINEAGE_SEED,
             ),
@@ -149,6 +153,16 @@ def main() -> int:
             "INSERT INTO shell_identity_entries (shell_id, kind, entry_date, source_tag, body) "
             "VALUES (?, 'seed', ?, 'cc', ?)",
             (shell_id, today, GENESIS_SEED),
+        )
+
+        # Grant the maintainer every seeded skill. The catalogue itself is
+        # system content (seeded via migrations/0001_seed_skills.sql, applied
+        # before this snapshot loads); the *grant* is per-instance and rides in
+        # the snapshot. Match by name so the grant is robust to skill_id churn.
+        con.execute(
+            "INSERT INTO shell_skills (shell_id, skill_id) "
+            "SELECT ?, skill_id FROM skills WHERE is_deleted=0",
+            (shell_id,),
         )
 
         # Project standing row (so ACTIVE PROJECTS renders).
