@@ -1,0 +1,17 @@
+# super-coder — the .db is rebuilt from git-tracked text (schema + migrations +
+# snapshot). Never commit it: binary churn + merge hell, fatal with parallel shells.
+.super-coder/shell_db.db
+.super-coder/shell_db.db-wal
+.super-coder/shell_db.db-shm
+
+# Boot artifact — rebuilt at launch from the DB. The harness dictates the name;
+# we dual-write both. Ignored everywhere.
+/CLAUDE.md
+/AGENTS.md
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.svelte-kit/

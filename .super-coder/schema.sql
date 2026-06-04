@@ -1,0 +1,223 @@
+-- super-coder — SQLite schema (full current baseline).
+--
+-- Forkable shell substrate for a single repo. Derived from superCC's substrate
+-- schema, inverted to the one-repo model and extended with the roadmap index +
+-- content store (spec §Data Model).
+--
+-- The live shell_db.db is GITIGNORED and rebuilt from this file + migrations/ +
+-- snapshot/. A fresh build applies this whole file; existing forks catch up via
+-- ordered migrations/*.sql (recorded in schema_migrations).
+--
+-- Auth note (v1): the launcher is username-only — no password challenge. The
+-- password_hash/password_salt columns are kept nullable for forward-compat but
+-- are unused at v1.
+
+-- ── Migration ledger ────────────────────────────────────────────────────────
+-- Records which migrations/*.sql files have been applied. A fresh build stamps
+-- every existing migration as the baseline (squash); updates apply only the
+-- unstamped ones.
+
+CREATE TABLE schema_migrations (
+    filename   TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ── Identity ────────────────────────────────────────────────────────────────
+
+CREATE TABLE users (
+    user_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT    NOT NULL UNIQUE,
+    email         TEXT,
+    initials      TEXT,
+    password_hash TEXT,                 -- unused at v1 (no-password launcher)
+    password_salt TEXT,                 -- unused at v1
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE shells (
+    shell_id          INTEGER PRIMARY KEY,
+    display_name      TEXT    NOT NULL,
+    shortname         TEXT,
+    partner           TEXT,
+    role              TEXT,
+    mandate           TEXT,
+    system_prompt     TEXT    NOT NULL,
+    current_state     TEXT,
+    connections       TEXT,
+    workspace         TEXT,
+    lineage_seed      TEXT,
+    has_identity      INTEGER NOT NULL DEFAULT 0,
+    active_archive_id INTEGER,
+    user_id           INTEGER REFERENCES users(user_id),
+    is_shared         INTEGER NOT NULL DEFAULT 0,
+    is_deleted        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE shell_memory_archives (
+    archive_id     INTEGER PRIMARY KEY,
+    shell_id       INTEGER NOT NULL REFERENCES shells(shell_id),
+    session_id     TEXT,
+    date           DATE    NOT NULL,
+    full_narrative TEXT
+);
+
+-- ── Seed + L&S (table-backed, cap-enforced) ─────────────────────────────────
+
+CREATE TABLE shell_identity_entries (
+    entry_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    shell_id    INTEGER NOT NULL REFERENCES shells(shell_id),
+    kind        TEXT    NOT NULL CHECK (kind IN ('seed', 'lns')),
+    entry_date  TEXT,
+    source_tag  TEXT,
+    body        TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    retired_at  TEXT,
+    is_deleted  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TRIGGER trg_sie_cap_seed
+BEFORE INSERT ON shell_identity_entries
+WHEN NEW.kind = 'seed' AND (
+  SELECT COUNT(*) FROM shell_identity_entries
+  WHERE shell_id = NEW.shell_id AND kind='seed'
+    AND is_deleted=0 AND retired_at IS NULL
+) >= 10
+BEGIN
+  SELECT RAISE(ABORT, 'seed cap (10) reached for this shell — retire an entry first');
+END;
+
+CREATE TRIGGER trg_sie_cap_lns
+BEFORE INSERT ON shell_identity_entries
+WHEN NEW.kind = 'lns' AND (
+  SELECT COUNT(*) FROM shell_identity_entries
+  WHERE shell_id = NEW.shell_id AND kind='lns'
+    AND is_deleted=0 AND retired_at IS NULL
+) >= 20
+BEGIN
+  SELECT RAISE(ABORT, 'L&S cap (20) reached for this shell — retire an entry first');
+END;
+
+-- ── Decisions ───────────────────────────────────────────────────────────────
+
+CREATE TABLE shell_decisions (
+    decision_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    shell_id           INTEGER NOT NULL REFERENCES shells(shell_id),
+    decision_date      DATE    NOT NULL,
+    priority           TEXT    NOT NULL DEFAULT 'M' CHECK(priority IN ('M','m')),
+    decision           TEXT    NOT NULL,
+    rationale          TEXT,
+    parent_decision_id INTEGER REFERENCES shell_decisions(decision_id),
+    is_deleted         INTEGER NOT NULL DEFAULT 0,
+    created_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Roadmap (NEW — the feature index) ───────────────────────────────────────
+-- One row per planned feature. The DB *is* the index that kills "where does the
+-- spec for X live." Status is a planning horizon (a column, not a folder).
+
+CREATE TABLE roadmap (
+    feature_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    title          TEXT    NOT NULL,
+    roadmap_status TEXT    NOT NULL DEFAULT 'brainstorm'
+                   CHECK (roadmap_status IN
+                       ('brainstorm','long_term','near_term','next','shipped')),
+    sort_order     INTEGER NOT NULL DEFAULT 0,   -- ordering within a bucket
+    owning_shell   INTEGER REFERENCES shells(shell_id),
+    summary        TEXT,
+    created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ── Documents (NEW — the content store) ─────────────────────────────────────
+-- DB owns the body, always. A feature accumulates MULTIPLE specs over its life:
+-- each stage's spec freezes on ship (frozen=1, immutable), the feature lives on,
+-- the next stage opens a new spec. One feature : many docs, each freezable.
+
+CREATE TABLE documents (
+    document_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_id   INTEGER NOT NULL REFERENCES roadmap(feature_id),
+    kind         TEXT    NOT NULL DEFAULT 'spec' CHECK (kind IN ('spec','doc')),
+    seq          INTEGER NOT NULL DEFAULT 1,     -- lineage within (feature, kind)
+    title        TEXT,
+    frozen       INTEGER NOT NULL DEFAULT 0,     -- 1 = frozen on ship, immutable
+    frozen_date  TEXT,
+    body         TEXT,                           -- canonical markdown, lives here
+    render_path  TEXT,                           -- repo-relative flat-file target
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(feature_id, kind, seq)
+);
+
+-- ── Flags (substrate task tracking; link to a feature) ──────────────────────
+
+CREATE TABLE flags (
+    flag_id          INTEGER PRIMARY KEY,
+    display_name     TEXT,
+    priority         TEXT    NOT NULL DEFAULT 'Medium'
+                     CHECK(priority IN ('High','Medium','Low')),
+    description      TEXT,
+    created_date     DATE    NOT NULL DEFAULT (date('now')),
+    resolved_date    DATE,
+    resolved         INTEGER NOT NULL DEFAULT 0,
+    shell_id         INTEGER REFERENCES shells(shell_id),
+    feature_id       INTEGER REFERENCES roadmap(feature_id),  -- a feature's blockers
+    resolution_notes TEXT,
+    parent_flag_id   INTEGER REFERENCES flags(flag_id),
+    is_deleted       INTEGER NOT NULL DEFAULT 0
+);
+
+-- ── Skills (system content — seeded from assets/, propagates) ────────────────
+
+CREATE TABLE skills (
+    skill_id    INTEGER PRIMARY KEY,
+    name        TEXT    NOT NULL,
+    description TEXT,
+    category    TEXT,
+    content     TEXT,
+    command     TEXT,
+    common      INTEGER NOT NULL DEFAULT 1,
+    is_deleted  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE shell_skills (
+    shell_skill_id  INTEGER PRIMARY KEY,
+    shell_id        INTEGER NOT NULL REFERENCES shells(shell_id),
+    skill_id        INTEGER NOT NULL REFERENCES skills(skill_id),
+    UNIQUE(shell_id, skill_id)
+);
+
+-- ── Projects (per-shell project standing) ───────────────────────────────────
+
+CREATE TABLE projects (
+    project_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    shortname    TEXT NOT NULL UNIQUE,
+    title        TEXT NOT NULL,
+    purpose      TEXT,
+    standing     TEXT,
+    status       TEXT NOT NULL DEFAULT 'active'
+                 CHECK(status IN ('active','inactive','paused')),
+    is_deleted   INTEGER NOT NULL DEFAULT 0,
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE project_shells (
+    project_shell_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id       INTEGER NOT NULL REFERENCES projects(project_id),
+    shell_id         INTEGER NOT NULL REFERENCES shells(shell_id),
+    role             TEXT,
+    added_date       DATE NOT NULL DEFAULT (date('now')),
+    is_deleted       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (project_id, shell_id)
+);
+
+-- ── Indexes ─────────────────────────────────────────────────────────────────
+
+CREATE INDEX idx_flags_parent   ON flags(parent_flag_id);
+CREATE INDEX idx_flags_feature  ON flags(feature_id);
+CREATE INDEX idx_decisions_shell ON shell_decisions(shell_id, decision_date);
+CREATE INDEX idx_roadmap_status ON roadmap(roadmap_status, sort_order);
+CREATE INDEX idx_documents_feature ON documents(feature_id, kind, seq);
+CREATE INDEX idx_sie_shell_kind_active
+    ON shell_identity_entries(shell_id, kind)
+    WHERE is_deleted = 0 AND retired_at IS NULL;
