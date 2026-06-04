@@ -22,7 +22,8 @@ gui_up() {
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
-  install)      exec "$PY" "$S/install.py" "$@" ;;
+  install)         exec "$PY" "$S/install.py" "$@" ;;
+  ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   update)       exec "$PY" "$S/update.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
@@ -51,6 +52,7 @@ case "$cmd" in
 super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
+  ./sc ensure-harness      install claude + opencode if missing (official native installers, no npm)
   ./sc update              reconcile a fork after pulling an engine update (rebuild + re-grant skills + map)
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
