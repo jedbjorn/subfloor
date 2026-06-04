@@ -131,7 +131,8 @@ def main() -> int:
         cur = con.execute(
             "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
             "system_prompt, current_state, workspace, lineage_seed, has_identity, "
-            "user_id, is_shared) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 0)",
+            "bootstrapped, user_id, is_shared) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 0)",
             (
                 "CC", "cc", "Jed",
                 "Maintainer shell — build & maintain super-coder",

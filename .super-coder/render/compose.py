@@ -158,6 +158,27 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     current_state = (shell["current_state"] or "(none)").strip()
     workspace = (shell["workspace"] or "(none)").strip()
 
+    # Orientation state: has this shell run first-run bootstrap, and is the repo
+    # mapped? Drives the FIRST RUN prompt + the map-status line.
+    bootstrapped = con.execute(
+        "SELECT bootstrapped FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
+    map_count = con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0]
+    mapped_at_row = con.execute("SELECT mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+    map_status = (f"{map_count} files, mapped {mapped_at_row[0]}"
+                  if map_count and mapped_at_row and mapped_at_row[0]
+                  else "not mapped — run `make map` (or the bootstrap skill)")
+
+    first_run = []
+    if not bootstrapped:
+        first_run = [
+            "## FIRST RUN", "",
+            "You have not oriented in this repo yet. Run the **bootstrap** skill "
+            "now — it maps the repo (if needed), reads the map + your identity, "
+            "sets your `current_state`, and marks you oriented. Do this before "
+            "other work.",
+            "", "---", "",
+        ]
+
     parts = [
         template,
         "",
@@ -168,6 +189,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         f"- session_id: `{session_id}`",
         f"- archive_id: `{archive_id}`",
         "", "---", "",
+        *first_run,
         "## OPERATOR", "", render_operator(user),
         "", "---", "",
         "## IDENTITY", "", render_identity(shell),
@@ -193,6 +215,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         f"- **Seed:** {counts['seed']}",
         f"- **L&S:** {counts['lns']}",
         f"- **Flags:** {counts['flags']} open",
+        f"- **Repo map:** {map_status}",
         "",
     ]
     return "\n".join(parts)

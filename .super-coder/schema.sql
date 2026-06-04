@@ -48,6 +48,8 @@ CREATE TABLE shells (
     workspace         TEXT,
     lineage_seed      TEXT,
     has_identity      INTEGER NOT NULL DEFAULT 0,
+    bootstrapped      INTEGER NOT NULL DEFAULT 0,   -- 1 once the shell has run first-run orientation
+
     active_archive_id INTEGER,
     user_id           INTEGER REFERENCES users(user_id),
     is_shared         INTEGER NOT NULL DEFAULT 0,
