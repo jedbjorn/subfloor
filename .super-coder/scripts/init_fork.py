@@ -89,7 +89,9 @@ def main(argv: list[str]) -> int:
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
         name = need(a.name, "Shell display name", flavor.capitalize())
-        shortname = need(a.shortname, "Shell shortname", name.lower())
+        # shortname is optional — omit it and create_shell auto-names <ABBR><n>
+        # from the flavor (e.g. PLN1). --shortname still overrides.
+        shortname = a.shortname or None
 
         con.execute(
             "INSERT INTO users (user_id, username, is_active) VALUES (1, ?, 1)",
@@ -99,6 +101,8 @@ def main(argv: list[str]) -> int:
             partner=a.partner or username, repo=repo,
             role=a.role, mandate=a.mandate)
         con.commit()
+        shortname = con.execute(
+            "SELECT shortname FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
 
         n = con.execute(
             "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?", (shell_id,)).fetchone()[0]

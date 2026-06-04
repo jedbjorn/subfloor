@@ -48,6 +48,22 @@ def load_flavor(flavor: str) -> dict:
     return json.loads(p.read_text())
 
 
+def _auto_shortname(con: sqlite3.Connection, abbr: str) -> str:
+    """Default shortname when the caller gives none: <ABBR><n> — the flavor's
+    abbreviation + the next integer (e.g. DEV3, PLN1). Numbered max-suffix + 1
+    over ALL shells with that abbr, deleted included, so a number is never
+    reused after a delete. Lets a fork spin up shells without naming each one."""
+    abbr = abbr.upper()
+    hi = 0
+    for (sn,) in con.execute(
+            "SELECT shortname FROM shells WHERE shortname IS NOT NULL"):
+        if sn.upper().startswith(abbr):
+            suffix = sn[len(abbr):]
+            if suffix.isdigit():
+                hi = max(hi, int(suffix))
+    return f"{abbr}{hi + 1}"
+
+
 def render_prompt(name: str, role: str, repo: str, focus: str, mandate: str) -> str:
     if not PROMPT_TEMPLATE.exists():
         return f"# {name} — {role} for {repo}\n\n{focus}\n\n## MANDATE\n\n{mandate}\n"
@@ -70,7 +86,10 @@ def create_shell(con: sqlite3.Connection, *, flavor: str, name: str,
     role = role or tpl["role"]
     mandate = (mandate or tpl["mandate"]).replace("{{repo}}", repo)
     focus = tpl.get("focus", "").replace("{{repo}}", repo)
-    shortname = (shortname or name.lower().replace(" ", "-")).strip()
+    # Explicit shortname wins; otherwise auto-name <ABBR><n> from the flavor so
+    # the caller (GUI / init) need not supply one.
+    abbr = tpl.get("abbr") or flavor[:3]
+    shortname = shortname.strip() if shortname else _auto_shortname(con, abbr)
 
     cur = con.execute(
         "INSERT INTO shells (display_name, shortname, partner, role, mandate, "

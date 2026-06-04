@@ -387,7 +387,9 @@ class Handler(BaseHTTPRequestHandler):
                     con, flavor=body["flavor"], name=body["name"],
                     shortname=body.get("shortname"), partner=body.get("partner"))
                 con.commit()
-                return self._send(201, {"shell_id": sid})
+                sn = con.execute(
+                    "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
+                return self._send(201, {"shell_id": sid, "shortname": sn})
             if path == "/api/snapshot":
                 return self._send(200, {"output": run_snapshot_render()})
             if path.startswith("/api/scripts/"):
