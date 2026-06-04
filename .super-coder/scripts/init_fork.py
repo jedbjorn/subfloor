@@ -35,43 +35,22 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
+PROMPT_TEMPLATE = ENGINE / "templates" / "shell_system_prompt.md"
 
 # Single source for the canonical Lineage Seed (Law 6) — reuse, don't duplicate.
 sys.path.insert(0, str(ENGINE / "scripts"))
 from seed_dogfood import LINEAGE_SEED  # noqa: E402
 
-# A minimal, generic system prompt. The B1 installer will render a slot-filled
-# template; this inline default keeps a fresh fork bootable today.
-SYSTEM_PROMPT_TMPL = """\
-# {name} — shell for {repo}
 
-You work {repo} through whatever coding harness booted you. One shell, one repo,
-one cwd — no cross-repo confusion.
-
-## MEMORY ARCHITECTURE
-
-Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `snapshot/content.sql`). All identity and memory
-live in DB tables — no flat-file memory, no harness auto-memory.
-
-| Surface | Where |
-|---|---|
-| Identity (core) | `shells WHERE shell_id=<self>` — mandate, system_prompt, current_state (rolling, ~500 chars) |
-| Seed + L&S | `shell_identity_entries` — kind seed (cap 10) / lns (cap 20), trigger-enforced |
-| Decisions | `shell_decisions` — major decisions; INSERT, never edit |
-| Flags | `flags` — open + resolved; link to a feature via feature_id |
-| Roadmap | `roadmap` — one row per planned feature; status is a planning horizon |
-| Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
-| Session narrative | `shell_memory_archives` — one row per session, appended progressively |
-
-Write as it happens, not at close. The `.db` is a cache: after content edits,
-`make snapshot` (+ `make render` for docs/roadmap/skills) re-serializes to the
-text git tracks. See the `db_map` and `snapshot` skills.
-
-## MANDATE
-
-{mandate}
-"""
+def render_prompt(name: str, repo: str, mandate: str) -> str:
+    """Fill the slot-filled system-prompt template (single source for what a
+    fork's first shell boots with). Falls back to a one-liner if absent."""
+    if not PROMPT_TEMPLATE.exists():
+        return f"# {name} — shell for {repo}\n\n## MANDATE\n\n{mandate}\n"
+    text = PROMPT_TEMPLATE.read_text()
+    for slot, val in (("{{name}}", name), ("{{repo}}", repo), ("{{mandate}}", mandate)):
+        text = text.replace(slot, val)
+    return text
 
 GENESIS_TMPL = (
     "First shell of {repo}, forked from super-coder — a shell that carries the "
@@ -148,7 +127,7 @@ def main(argv: list[str]) -> int:
             "user_id, is_shared) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 0)",
             (
                 name, shortname, partner, role, mandate,
-                SYSTEM_PROMPT_TMPL.format(name=name, repo=repo, mandate=mandate),
+                render_prompt(name, repo, mandate),
                 f"Fork initialised. First shell of {repo} (CC lineage). "
                 f"NEXT: `make snapshot` to serialize, then start working.",
                 f"Single repo: this one ({repo}). One shell, one cwd.",

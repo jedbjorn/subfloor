@@ -40,51 +40,34 @@ git remote add super-coder https://github.com/jedbjorn/super-coder.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder Makefile
 
-# 2. A fork takes the SYSTEM, not super-coder's per-instance content — drop it:
-rm .super-coder/snapshot/content.sql \
-   .super-coder/assets/seed/super-coder-founding-spec.md
-git remote remove super-coder   # optional; re-add when you want updates (below)
+# 2. Bootstrap the fork — one command:
+make install
 
-# 3. Add these lines to your .gitignore (the .db + boot artifact + skill render
-#    are all rebuilt — never commit them):
-cat >> .gitignore <<'EOF'
-
-# super-coder — rebuilt from git-tracked text; never commit
-/.super-coder/shell_db.db
-/.super-coder/shell_db.db-wal
-/.super-coder/shell_db.db-shm
-/CLAUDE.md
-/AGENTS.md
-/.claude/skills/
-EOF
-
-# 4. Build the system DB (schema + skill-catalogue migration; no content yet):
-make rebuild
-
-# 5. Seed this fork's first shell — your user + a shell carrying the CC lineage
-#    seed and its own genesis seed (interactive prompts, or pass flags):
-make init
-#   non-interactive: python3 .super-coder/scripts/init_fork.py \
-#       --username Jed --name Dev --shortname dev --role "Dev shell" \
-#       --mandate "Build and maintain this repo."
-
-# 6. Serialize that shell to git-tracked text, then commit the install:
-make snapshot
-git add .super-coder Makefile .gitignore && git commit -m "chore: install super-coder"
-
-# 7. Boot it through your harness:
-make launch                     # username auth → pick shell → render boot → exec
+# 3. Commit the install, then boot:
+git add -A && git commit -m "chore: install super-coder"
+make launch                     # starts the review GUI + boots your shell
 ```
 
-After step 7 you're talking to the shell, working your repo. Author memory,
-roadmap, and specs into the DB; `make snapshot` (+ `make render` for
-docs/roadmap/skills) serializes back to the text git tracks.
+`make install` does the rest: checks requirements, detects your harness
+(`claude` / `opencode`), wires your `.gitignore`, **strips super-coder's own
+per-instance content** (a fork inherits the *system* — schema + skill catalogue
++ render chain — never the memory or roadmap), builds the system DB, seeds your
+fork's **first shell** (your user + a shell carrying the CC Lineage Seed and its
+own genesis seed), and renders. It refuses to run in the super-coder source repo
+or on an already-installed fork (guarding against content loss).
 
-> **What `make init` does** (the fork-identity step): provisions your local user
-> and the fork's first shell, writes the canonical CC Lineage Seed into it, and
-> plants the shell's own genesis seed. This is the minimal v1 bootstrap — a
-> richer installer (requirements check, harness auto-detect, slot-filled
-> system-prompt template) is the next phase.
+Interactive by default (prompts for the shell's name/role/mandate); pass flags
+to script it:
+
+```bash
+python3 .super-coder/scripts/install.py \
+    --username Jed --name Dev --shortname dev \
+    --role "Dev shell" --mandate "Build and maintain this repo."
+```
+
+After `make launch` you're talking to the shell, working your repo. Author
+memory, roadmap, and specs into the DB; `make snapshot` (+ `make render`)
+serializes back to the text git tracks.
 
 ## Update a fork
 
