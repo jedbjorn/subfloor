@@ -81,7 +81,15 @@ details summary { cursor: pointer; color: var(--accent); }
 }
 .chip:hover { color: var(--ink); border-color: var(--accent); }
 .chip.on { background: var(--accent); color: #0b0e13; border-color: var(--accent); font-weight: 600; }
-.bucket > h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 1.4rem 0 .5rem; }
+/* segmented single-select group: connected, no gaps, shared border */
+.filters.seg { gap: 0; width: fit-content; }
+.filters.seg .chip { border-radius: 0; border-left-width: 0; }
+.filters.seg .chip:first-child { border-top-left-radius: 99px; border-bottom-left-radius: 99px; border-left-width: 1px; }
+.filters.seg .chip:last-child { border-top-right-radius: 99px; border-bottom-right-radius: 99px; }
+.bucket > h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 1.4rem 0 .5rem; cursor: pointer; user-select: none; }
+.bucket > h2::before { content: "▾"; display: inline-block; width: 1em; color: var(--dim); transition: transform .12s; }
+.bucket.collapsed > h2::before { transform: rotate(-90deg); }
+.bucket.collapsed > .card { display: none; }
 .doc-body { white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: .8rem; max-height: 420px; overflow: auto; font: 12.5px/1.55 ui-monospace, monospace; }
 .flag { display: flex; gap: .8rem; align-items: flex-start; padding: .6rem 0; border-bottom: 1px solid var(--line); }
 .flag.resolved { opacity: .5; }

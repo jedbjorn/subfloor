@@ -129,29 +129,36 @@ function shellCard(s) {
 // Funnel order: idea inlet → most-active committed work → done.
 const STATUSES = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"];
 const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped" };
-const roadmapFilter = new Set();   // empty = show all (default)
+let roadmapFilter = null;            // null = show all (default); single-select
+const roadmapCollapsed = new Set();  // statuses whose section is collapsed
 
 async function renderRoadmap(root) {
   const { buckets } = await api("/roadmap");
   root.replaceChildren();
 
-  // grouped status toggle-filters; none selected = all shown
-  const bar = el("div", { className: "filters" });
+  // segmented single-select toggle; re-click the active one to clear → show all
+  const bar = el("div", { className: "filters seg" });
   for (const s of STATUSES) {
-    const chip = el("button", { className: "chip" + (roadmapFilter.has(s) ? " on" : ""), textContent: SLABEL[s] });
+    const chip = el("button", { className: "chip" + (roadmapFilter === s ? " on" : ""), textContent: SLABEL[s] });
     chip.onclick = () => {
-      roadmapFilter.has(s) ? roadmapFilter.delete(s) : roadmapFilter.add(s);
+      roadmapFilter = roadmapFilter === s ? null : s;
       renderRoadmap(root);
     };
     bar.append(chip);
   }
   root.append(bar);
 
-  // buckets arrive linear from the API; filter to the selected statuses
-  const shown = roadmapFilter.size ? buckets.filter((b) => roadmapFilter.has(b.status)) : buckets;
-  if (!shown.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage(s).")); return; }
+  // buckets arrive linear from the API; filter to the single selected status
+  const shown = roadmapFilter ? buckets.filter((b) => b.status === roadmapFilter) : buckets;
+  if (!shown.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage.")); return; }
   for (const b of shown) {
-    const sec = el("div", { className: "bucket" }, el("h2", {}, b.label));
+    const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(b.status) ? " collapsed" : "") });
+    const h = el("h2", {}, b.label);
+    h.onclick = () => {
+      roadmapCollapsed.has(b.status) ? roadmapCollapsed.delete(b.status) : roadmapCollapsed.add(b.status);
+      renderRoadmap(root);
+    };
+    sec.append(h);
     for (const f of b.features) sec.append(featureCard(f));
     root.append(sec);
   }
@@ -178,8 +185,9 @@ function featureCard(f) {
     el("span", { className: "k" }, "status"), status,
     el("span", { className: "k" }, "summary"), summary), save);
 
-  // documents — tabbed; non-frozen editable, frozen read-only
-  for (const d of f.documents || []) c.append(docBlock(d));
+  // documents — specs (editable/frozen per state) then docs (read-only here;
+  // the Docs tab is where docs are edited)
+  for (const d of f.documents || []) c.append(docBlock(d, { readOnly: d.kind === "doc" }));
 
   // open flags = blockers
   if (f.open_flags?.length) {
@@ -194,15 +202,19 @@ function featureCard(f) {
 // A document row: the primary action OPENS it rendered in md-converter (the
 // markdown rides in the URL via /open → ?c=). No inline raw-markdown expand.
 // Non-frozen docs get an explicit "edit" toggle; frozen ones are read-only.
-function docBlock(d) {
+function docBlock(d, { readOnly = false } = {}) {
   const wrap = el("div", { className: "docrow" });
-  const label = `${d.kind} v${d.seq}${d.frozen ? " · frozen " + (d.frozen_date || "") : ""}: ${d.title || ""}`;
+  const label = d.kind === "doc"
+    ? `Doc - ${d.title || "(untitled)"}`
+    : `${d.kind} v${d.seq}${d.frozen ? " · frozen " + (d.frozen_date || "") : ""}: ${d.title || ""}`;
   const open = el("a", {
     className: "act primary", href: "/api/documents/" + d.document_id + "/open",
     target: "_blank", rel: "noopener", textContent: "open in md-converter ↗",
   });
   const head = el("div", { className: "docrow-head" }, el("span", { className: "docrow-label" }, label), open);
   wrap.append(head);
+
+  if (readOnly) return wrap;   // open-link only — no edit toggle, no lock-note
 
   if (!d.frozen) {
     const box = el("div", { hidden: true });
