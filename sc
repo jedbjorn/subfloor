@@ -93,6 +93,7 @@ case "$cmd" in
     docker run -d --name "$CNAME" --restart unless-stopped \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
+      -e SC_SANDBOX=1 \
       -w "$here" \
       -v "$here:$here" \
       -v "$HOME/.claude:$HOME/.claude" \

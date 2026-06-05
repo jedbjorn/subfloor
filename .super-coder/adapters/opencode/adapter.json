@@ -3,5 +3,12 @@
   "launch": ["opencode"],
   "boot_artifact": "AGENTS.md",
   "emit": ["opencode.json"],
-  "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" }
+  "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" },
+  "sandbox": {
+    "merge_json": {
+      "opencode.json": {
+        "permission": { "bash": "allow" }
+      }
+    }
+  }
 }

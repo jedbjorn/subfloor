@@ -3,5 +3,12 @@
   "launch": ["claude"],
   "boot_artifact": "CLAUDE.md",
   "emit": [],
-  "env": {}
+  "env": {},
+  "sandbox": {
+    "merge_json": {
+      ".claude/settings.json": {
+        "permissions": { "defaultMode": "bypassPermissions" }
+      }
+    }
+  }
 }
