@@ -38,24 +38,23 @@ super-coder's own memory or roadmap.
 > `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
 > `sqlite3` (and a harness on `PATH`).
 
-**Docker mode — rootful vs rootless.** `./sc doctor` checks your docker and
-prints setup guidance. Both work (the launcher's `duser()` adapts), but
-**rootful is the smoother default**: bind-mounts map 1:1 to your uid and the
-harness runs as a normal user. Under rootless the sandbox runs the container as
-root (which maps to you), which works but makes `claude` run as root inside
-(its `--dangerously-skip-permissions` flag is blocked — the sandbox replaces the
-need for it). `./sc install` runs this preflight for you.
+**Docker mode — rootless is the default.** `./sc doctor` checks your docker.
+Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen
+default: zero setup, same function.** Under rootless the sandbox runs the
+container as root, which maps to *you*, so repo writes come out owned by you —
+no phantom-uid problem (verified). Its only wart: `claude` runs as root inside,
+so its `--dangerously-skip-permissions` flag is blocked — the sandbox replaces
+the need for it. **Rootful is optional**, purely to drop that wart (1:1
+bind-mounts, harness runs as a normal user); it costs a one-time sudo + re-login.
 
-**Docker setup is one-time.** Do it once per machine; it persists across reboots,
-and `./sc launch` never repeats it (launch just checks the daemon is reachable
-and points you here if not). Two paths:
+**Setup is one-time per machine (and rootless needs none).** `./sc launch` only
+checks the daemon is reachable and points you here if not — it never does setup.
 
-- **Rootless — zero setup.** If rootless docker already runs as your user,
-  nothing to do; `./sc launch` works as-is. (Trade-off: the claude-as-root wart
-  above.)
-- **Rootful — one-time, needs sudo + a re-login.** Smoother runtime; the re-login
-  is unavoidable (a new `docker` group only applies to a fresh session), which is
-  why this can't fold into `launch`:
+- **Rootless (default) — nothing to do.** If rootless docker runs as your user,
+  `./sc launch` works as-is.
+- **Rootful (optional upgrade).** Needs sudo + a re-login (a new `docker` group
+  only applies to a fresh session — which is exactly why it can't fold into
+  `launch`):
 
   ```bash
   sudo usermod -aG docker $USER            # 1. join the docker group

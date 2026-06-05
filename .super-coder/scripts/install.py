@@ -158,17 +158,15 @@ def report_docker() -> dict:
     st = docker_status()
     user = os.environ.get("USER", "$USER")
     state = st["state"]
-    if state == "rootful":
-        print("  docker    ✓ rootful — ideal: 1:1 uid bind-mounts, harness runs as you")
-    elif state == "rootless":
-        print("  docker    ✓ rootless — works. The sandbox runs the container as root,")
-        print("            which under rootless maps to YOU, so mounts come out yours.")
-        print("            One wart: claude runs as root inside (its --dangerously-skip-")
-        print("            permissions flag is blocked; the sandbox replaces the need).")
-        print("            For a normal-user harness + simpler mounts, prefer rootful:")
-        print(f"              sudo usermod -aG docker {user}")
-        print("              sudo systemctl enable --now docker.socket   # log out/in after")
-        print("              docker context use default")
+    if state == "rootless":
+        print("  docker    ✓ rootless — the default, nothing to set up. The sandbox runs")
+        print("            the container as root, which under rootless maps to YOU, so repo")
+        print("            writes come out yours (no phantom-uid problem). Only wart: claude")
+        print("            runs as root inside (its --dangerously-skip-permissions flag is")
+        print("            blocked — the sandbox replaces the need for it).")
+    elif state == "rootful":
+        print("  docker    ✓ rootful — also fine: 1:1 uid bind-mounts, harness runs as you")
+        print("            (no claude-as-root wart). Either mode works; duser() adapts.")
     elif state == "no-daemon":
         print("  docker    ⚠ CLI present but no daemon reachable. Start one:")
         print(f"            rootful : sudo usermod -aG docker {user} && sudo systemctl enable --now docker.socket  (re-login)")
