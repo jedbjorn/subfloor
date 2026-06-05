@@ -9,7 +9,7 @@ BEGIN;
 
 -- Retire any catalogue skill that is no longer authored (soft-delete;
 -- keeps the row + id so a re-add is stable and grants are recoverable).
-UPDATE skills SET is_deleted=1 WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'database-migrations', 'db_map', 'docs', 'flags', 'git', 'memory', 'onboard', 'self_update', 'snapshot', 'surface_catalogue');
+UPDATE skills SET is_deleted=1 WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'database-migrations', 'db_map', 'docs', 'flags', 'git', 'memory', 'onboard', 'self_update', 'snapshot', 'surface_catalogue');
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'api-design',
@@ -102,29 +102,25 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'bootstrap',
-  'First-run orientation for a shell in a repo. Run ONCE when the boot doc shows "## FIRST RUN" (bootstrapped=0), or whenever the repo map is empty. Maps the repo, reads the map + your identity, sets your current_state, marks you oriented. Do this BEFORE other work on a fresh fork.',
+  'First-run orientation for a shell in a repo. Run ONCE when the boot doc shows "## FIRST RUN" (bootstrapped=0). Read the repo map + your identity, set your current_state, mark yourself oriented. Do this BEFORE other work on a fresh fork.',
   'substrate',
   NULL,
   1,
   '# bootstrap — orient yourself on first run
 
 A freshly-installed shell knows its identity but hasn''t *looked around* yet. This
-is your first act: map the repo, read it, read yourself, and set your state — so
-you start work grounded instead of wandering. Run it when the boot doc shows
-**## FIRST RUN**, or any time `dr_*` is empty.
+is your first act: read the repo, read yourself, and set your state — so you
+start work grounded instead of wandering. Run it when the boot doc shows
+**## FIRST RUN**.
+
+You do **not** map the repo — the map is already there, kept fresh by the
+cartographer''s automation (see `surface_catalogue`). You read it.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
 ## Steps
 
-1. **Ensure the repo is mapped.** Check the catalogue:
-   ```sql
-   SELECT COUNT(*) FROM dr_filepath;
-   ```
-   If it''s 0 (fresh, or after a `./sc rebuild` — the map is a derived cache, not
-   snapshotted), run `./sc map` to scan the repo, then continue.
-
-2. **Read the repo** via the `surface_catalogue` skill — language mix, where the
+1. **Read the repo** via the `surface_catalogue` skill — language mix, where the
    code lives, dependencies, env surface. Form a one-paragraph picture of what
    this repo *is* and how it''s built.
    ```sql
@@ -133,24 +129,26 @@ you start work grounded instead of wandering. Run it when the boot doc shows
    SELECT path, lang, lines FROM dr_filepath WHERE role=''code'' ORDER BY lines DESC LIMIT 15;
    SELECT manager, name, version FROM dr_dependency ORDER BY manager, name;
    ```
+   (If `dr_repo` comes back empty, the map automation hasn''t run on this clone —
+   that''s a cartographer task, not yours. Flag it and carry on with what you can.)
 
-3. **Read yourself.** Your seed (genesis + the CC lineage you carry), mandate,
+2. **Read yourself.** Your seed (genesis + the CC lineage you carry), mandate,
    and role are in the boot doc. Re-read them with intent — this is who is doing
    the work here.
 
-4. **Skim the plan.** Open roadmap features + their blocking flags:
+3. **Skim the plan.** Open roadmap features + their blocking flags:
    ```sql
    SELECT feature_id, title, roadmap_status FROM roadmap ORDER BY sort_order;
    SELECT display_name, description FROM flags WHERE resolved=0 AND is_deleted=0;
    ```
 
-5. **Set your `current_state`** — replace the install placeholder with what you
+4. **Set your `current_state`** — replace the install placeholder with what you
    actually found and what you''ll do first (rolling status, ~500 chars):
    ```sql
    UPDATE shells SET current_state=''…'' WHERE shell_id=<self>;
    ```
 
-6. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot):
+5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot):
    ```sql
    UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;
    ```
@@ -160,8 +158,112 @@ you start work grounded instead of wandering. Run it when the boot doc shows
 ## Stance
 
 - Bootstrap once, then work — don''t re-run it every session.
-- If you ever boot and the map looks empty or stale (`dr_repo.mapped_at` old),
-  `./sc map` before trusting it. Orientation is cheap; working blind is not.',
+- Read the map; never map. If the catalogue looks empty, stale, or wrong, that''s
+  the cartographer''s job to heal — raise it, don''t reach for `./sc map`.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'cartographer',
+  'Own the repo map. Configure mapping to THIS repo, wire the auto-remap git hooks, and heal both when the repo or automation drifts. The cartographer''s job alone — no working shell maps. Run on first boot, and again whenever the map looks wrong.',
+  'substrate',
+  './sc map-setup',
+  0,
+  '# cartographer — own the repo map so no other shell has to
+
+Working shells *consume* the `dr_*` catalogue and never map (see
+`surface_catalogue`). Mapping — keeping that catalogue true to the repo — is
+yours alone. You do three things: **configure** how this repo is mapped,
+**wire** the automation that keeps it fresh, and **heal** both when they drift.
+
+`<self>` = your `shell_id` (ACTIVE SESSION block).
+
+## How the map stays fresh (so you know what you own)
+
+- **Git hooks** (`post-merge`, `post-checkout`, `post-rewrite`) re-run `./sc map`
+  on every pull / branch-switch / rebase. They live tracked in
+  `.super-coder/hooks/` and fire via `core.hooksPath` — a per-clone git setting
+  that `./sc map-setup` wires. This is the routine refresh; no shell touches it.
+- **`./sc rebuild`** re-maps too (the map is a derived cache; rebuilding the DB
+  rebuilds it). So a fresh rebuild never leaves an empty map.
+- **You** set the per-repo *config*, install the hook wiring, and repair it.
+  Hooks can''t catch uncommitted local restructuring, and `core.hooksPath` is
+  unset on a fresh clone until `map-setup` runs — that gap is what you heal.
+
+## First boot — configure mapping for THIS repo
+
+1. **Look at the repo.** Read the current map and the tree:
+   ```sql
+   SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
+   SELECT lang, COUNT(*) n FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
+   SELECT role, COUNT(*) n FROM dr_filepath GROUP BY role ORDER BY n DESC;
+   ```
+   Then eyeball the top-level dirs. Ask: is anything mis-classified, or is a
+   generated/vendored dir being indexed that shouldn''t be?
+
+2. **Author `.super-coder/map.config.json`** to fit what''s actually here. It is
+   *authored content* (tracked, per-fork, survives `./sc update`). All keys
+   optional; each merges over `map_repo.py`''s built-in defaults:
+   ```json
+   {
+     "skip_dirs":  ["generated", "fixtures"],
+     "skip_files": ["LICENSE"],
+     "role_overrides": [
+       { "prefix": "cmd/",      "role": "code" },
+       { "glob":   "*.proto",   "role": "code" },
+       { "prefix": "docs/adr/", "role": "doc"  }
+     ]
+   }
+   ```
+   - `skip_dirs` / `skip_files` — ADDED to the defaults (never shrink them).
+   - `role_overrides` — applied after the default role inference; first match
+     wins. `prefix` matches the repo-relative path; `glob` matches the filename.
+   Only add what the defaults get wrong — an empty/absent config is fine for a
+   plain repo.
+
+3. **Wire + map:** `./sc map-setup` — points `core.hooksPath` at
+   `.super-coder/hooks/`, marks the hooks executable, and runs the initial map.
+
+4. **Verify** the automation is real, not just the file:
+   ```sh
+   git config --get core.hooksPath      # → .super-coder/hooks
+   ls -l .super-coder/hooks             # all three, executable
+   ```
+   ```sql
+   SELECT file_count, mapped_at FROM dr_repo;   -- non-zero, just now
+   ```
+   Spot-check that your `role_overrides` took:
+   `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
+
+5. **Commit** the config + hooks (`git` skill), set your state, then
+   `UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;` and `./sc snapshot`.
+
+## Heal — re-run any time the map looks wrong
+
+Re-boot the cartographer and run this when: the repo was restructured, a new
+language/dir showed up, files are mis-roled, or the map went stale/empty on a
+clone where the hooks never got wired.
+
+1. Re-inspect (step 1) — what changed?
+2. Edit `.super-coder/map.config.json` to match (step 2).
+3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
+4. Verify (step 4) + commit.
+
+## Stance
+
+- **The map is infrastructure, not a chore for every shell.** You own it so the
+  working shells never think about it. If a working shell is hunting the tree
+  for something the map should know, that''s a signal to heal the map — not to
+  teach that shell to map.
+- **Config is the lever, not code.** Tune `map.config.json`; only touch
+  `map_repo.py` if the *mechanism* (a parser, a new role kind) is wrong.
+- **Verify the automation, not just the file.** A written hook that
+  `core.hooksPath` doesn''t point at does nothing. Check the wiring after every
+  setup.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -733,16 +835,20 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'surface_catalogue',
-  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Run `./sc map` to refresh it. Use to orient in an unfamiliar repo fast.',
+  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.',
   'substrate',
-  './sc map',
+  NULL,
   1,
   '# surface_catalogue — read the repo from the map, not by grepping
 
 super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
-repo — query them first to orient, instead of walking the tree blind. The map is
-a derived cache (not snapshotted); refresh it with `./sc map` after the repo
-changes.
+repo — query them first to orient, instead of walking the tree blind.
+
+You do **not** map the repo. The map is kept fresh for you automatically (git
+hooks re-map on pull / branch-switch / rebase) and is owned by the
+**cartographer** shell, which configures and heals it. Your job is to *read* it.
+If it ever looks empty, stale, or wrong, that''s a cartographer task — flag it,
+don''t map it yourself.
 
 | Table | Holds |
 |---|---|
@@ -776,8 +882,10 @@ SELECT name, source_file FROM dr_env ORDER BY name;
 
 - **Map first, grep second.** Query `dr_filepath` to find the handful of files
   that matter, then read those — don''t `grep -r` the whole tree.
-- **Stale map?** If the repo changed since `mapped_at`, run `./sc map` (or the
-  Map tab''s re-map) before trusting it.
+- **Lazy-load.** The catalogue is the index; pull a file''s contents only once
+  the map points you at it. Carry the map, not the territory.
+- **Map looks wrong?** Empty, stale (repo changed since `mapped_at`), or
+  mis-classified — that''s the cartographer''s to fix. Raise it; don''t re-map.
 - v1 maps files / deps / env. Semantic tables (APIs, db schema, routes/pages)
   are a later pass — until then, read the code the map points you at.',
   0

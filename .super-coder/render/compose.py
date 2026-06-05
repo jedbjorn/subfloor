@@ -164,11 +164,13 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     # mapped? Drives the FIRST RUN prompt + the map-status line.
     bootstrapped = con.execute(
         "SELECT bootstrapped FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
+    flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
     map_count = con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0]
     mapped_at_row = con.execute("SELECT mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+    # Working shells never map — an unmapped repo is the cartographer's to fix.
     map_status = (f"{map_count} files, mapped {mapped_at_row[0]}"
                   if map_count and mapped_at_row and mapped_at_row[0]
-                  else "not mapped — run `make map` (or the bootstrap skill)")
+                  else "not mapped — cartographer: `./sc map-setup`")
 
     # Ingest status: repo docs (role=doc) vs how many are in the DB. If the repo
     # has docs not yet ingested, point at the onboard skill.
@@ -182,14 +184,20 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
 
     first_run = []
     if not bootstrapped:
-        first_run = [
-            "## FIRST RUN", "",
-            "You have not oriented in this repo yet. Run the **bootstrap** skill "
-            "now — it maps the repo (if needed), reads the map + your identity, "
-            "sets your `current_state`, and marks you oriented. Do this before "
-            "other work.",
-            "", "---", "",
-        ]
+        if flavor == "cartographer":
+            prompt = (
+                "You own the repo map and haven't set it up yet. Run the "
+                "**cartographer** skill now — configure `map.config.json` for "
+                "this repo, wire the auto-remap git hooks (`./sc map-setup`), and "
+                "map. Do this before other work; the working shells rely on it.")
+        else:
+            prompt = (
+                "You have not oriented in this repo yet. Run the **bootstrap** "
+                "skill now — read the repo map + your identity, set your "
+                "`current_state`, and mark yourself oriented. (You don't map the "
+                "repo — the cartographer keeps the map fresh for you.) Do this "
+                "before other work.")
+        first_run = ["## FIRST RUN", "", prompt, "", "---", ""]
 
     parts = [
         template,

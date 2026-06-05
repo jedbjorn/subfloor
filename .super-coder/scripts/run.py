@@ -358,7 +358,7 @@ def main() -> None:
 
     full = con.execute(
         "SELECT shell_id, display_name, shortname, partner, role, mandate, "
-        "current_state, system_prompt, workspace FROM shells WHERE shell_id=?",
+        "current_state, system_prompt, workspace, flavor FROM shells WHERE shell_id=?",
         (chosen["shell_id"],),
     ).fetchone()
     content = compose_boot(con, full, user, session_id, archive_id)

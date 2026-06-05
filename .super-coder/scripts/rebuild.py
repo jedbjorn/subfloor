@@ -29,6 +29,7 @@ BACKUP_DIR = Path.home() / "db_backups" / "super-coder"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import migrate as migrate_mod  # noqa: E402
+import map_repo  # noqa: E402
 
 
 def backup_existing() -> None:
@@ -74,6 +75,17 @@ def main(argv: list[str]) -> int:
             con.close()
     else:
         print("rebuild: no snapshot/content.sql — built empty (no per-instance content).")
+
+    # The dr_* map is a derived cache, not snapshotted — a fresh DB has an empty
+    # one. Refill it here so a bare `./sc rebuild` / `./sc verify` never leaves a
+    # shell booting unmapped. Best-effort: the map is a cache, not load-bearing
+    # for the rebuild itself. (Hook wiring is map-setup's job, not rebuild's.)
+    try:
+        map_repo.main()
+    except SystemExit as e:  # map_repo.main() sys.exit()s on its own errors
+        print(f"rebuild: map skipped ({e}) — run `./sc map` once the repo is ready")
+    except Exception as e:  # noqa: BLE001 — never let a map failure fail rebuild
+        print(f"rebuild: map failed ({e}) — run `./sc map`")
 
     size_kb = DB_PATH.stat().st_size / 1024
     print(f"rebuild: done -> {DB_PATH.relative_to(ENGINE.parent)} ({size_kb:.0f} KB)")
