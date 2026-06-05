@@ -76,6 +76,7 @@ case "$cmd" in
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
   render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
   map)          exec "$PY" "$S/map_repo.py" ;;
+  map-setup)    exec "$PY" "$S/map_setup.py" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
@@ -128,6 +129,7 @@ super-coder — forkable shell substrate
   ./sc snapshot            dump per-instance tables -> .super-coder/snapshot/content.sql
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
+  ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
   ./sc seed-skills         regenerate the skills seed migration from assets/skills/
   ./sc init                seed a fresh fork's first user + shell (run once after install)
 

@@ -21,7 +21,7 @@ Flow:
     4. sync the skills catalogue (idempotent, id-stable UPSERT) — new/changed
        skills reach the fork without a rebuild.
     5. re-grant common skills to all shells.
-    6. map the repo + snapshot the (live) state.
+    6. wire the auto-remap hooks + map the repo + snapshot the (live) state.
 
 Then review + commit. Restart the session to boot onto the new floor.
 
@@ -49,8 +49,9 @@ import seed_skills  # noqa: E402
 # The ENGINE = system content that propagates to every fork; all of it is safe
 # to overwrite from the super-coder remote. The per-instance set is deliberately
 # NOT listed, so a checkout never touches it: snapshot/ (this fork's content),
-# shell_db.db* (gitignored), instance.json (gitignored). assets/seed/ is
-# super-coder-only (stripped on install); assets/shells/ is empty/vestigial.
+# shell_db.db* (gitignored), instance.json (gitignored), map.config.json (the
+# cartographer's per-repo map tuning). assets/seed/ is super-coder-only (stripped
+# on install); assets/shells/ is empty/vestigial.
 ENGINE_PATHS = [
     "sc",
     ".super-coder/aliases.mk",
@@ -65,6 +66,7 @@ ENGINE_PATHS = [
     ".super-coder/api",
     ".super-coder/ui",
     ".super-coder/assets/skills",
+    ".super-coder/hooks",
 ]
 
 
@@ -174,8 +176,8 @@ def main(argv: list[str]) -> int:
     sync_skills()
     print("→ re-grant catalogue skills to all shells")
     print(f"  {regrant()} new grant(s)")
-    print("→ map the repo")
-    run_script("map_repo.py")
+    print("→ wire map automation + map the repo")
+    run_script("map_setup.py")
     print("→ snapshot the live state")
     run_script("snapshot.py")
 

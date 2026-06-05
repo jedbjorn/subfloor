@@ -100,14 +100,24 @@ def main(argv: list[str]) -> int:
             con, flavor=flavor, name=name, shortname=shortname,
             partner=a.partner or username, repo=repo,
             role=a.role, mandate=a.mandate)
+        # Every fork also gets a dedicated Cartographer: it owns the repo map so
+        # no working shell ever maps. Configured + wired by `./sc map-setup`
+        # (install runs it); re-bootable to heal the map automation later.
+        cart_id = create_shell(
+            con, flavor="cartographer", name="Cartographer",
+            partner=a.partner or username, repo=repo)
         con.commit()
         shortname = con.execute(
             "SELECT shortname FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
+        cart_sn = con.execute(
+            "SELECT shortname FROM shells WHERE shell_id=?", (cart_id,)).fetchone()[0]
 
         n = con.execute(
             "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?", (shell_id,)).fetchone()[0]
         print(f"init_fork: created '{shortname}' ({flavor}, shell_id={shell_id}) "
               f"for user '{username}' — {n} skills, lineage + genesis seed, session opened.")
+        print(f"init_fork: created '{cart_sn}' (cartographer, shell_id={cart_id}) "
+              "— owns the repo map.")
         print("init_fork: next -> `./sc snapshot` (serialize), then `./sc launch`.")
     finally:
         con.close()

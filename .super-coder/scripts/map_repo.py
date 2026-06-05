@@ -16,6 +16,7 @@ semantic tables (APIs, db, pages) are a later pass.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 import sqlite3
@@ -27,7 +28,13 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
+# Per-fork map tuning, authored by the cartographer (see the `cartographer`
+# skill). Tracked content, deliberately NOT in update.py's ENGINE_PATHS, so it
+# survives `./sc update`. Absent → built-in defaults only.
+CONFIG_PATH = ENGINE / "map.config.json"
 
+# Built-in defaults. A fork's map.config.json EXTENDS the skip sets and may add
+# role_overrides — it never shrinks these (so the engine dirs below stay hidden).
 SKIP_DIRS = {".git", "node_modules", ".super-coder", ".venv", "venv",
              "__pycache__", ".svelte-kit", "dist", "build", ".next", "target",
              "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache",
@@ -66,6 +73,40 @@ def infer_role(path: str, ext: str, lang: str | None) -> str:
     if lang in CODE_LANGS:
         return "code"
     return "asset"
+
+
+def load_config() -> dict:
+    """Read the per-fork map.config.json, if any. Shape (all keys optional):
+        {"skip_dirs": [...], "skip_files": [...],
+         "role_overrides": [{"prefix": "cmd/", "role": "code"},
+                            {"glob": "*.proto", "role": "code"}]}
+    Malformed config is a warning, not a failure — fall back to defaults so a
+    bad edit never breaks the auto-remap hooks."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+        if not isinstance(cfg, dict):
+            raise ValueError("top-level JSON must be an object")
+        return cfg
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(f"map_repo: ignoring {CONFIG_PATH.name} ({e}) — using defaults")
+        return {}
+
+
+def apply_role_override(rel: str, role: str, overrides: list[dict]) -> str:
+    """First matching override wins. `prefix` matches the repo-relative path;
+    `glob` matches the filename (fnmatch). Returns the original role if none
+    match or the override is malformed."""
+    name = rel.rsplit("/", 1)[-1]
+    for ov in overrides:
+        if not isinstance(ov, dict) or not ov.get("role"):
+            continue
+        if "prefix" in ov and rel.startswith(ov["prefix"]):
+            return ov["role"]
+        if "glob" in ov and fnmatch.fnmatch(name, ov["glob"]):
+            return ov["role"]
+    return role
 
 
 def count_lines(p: Path) -> int | None:
@@ -169,7 +210,13 @@ def main() -> int:
     if not DB_PATH.exists():
         sys.exit("map_repo: no DB — run `./sc rebuild` (or `./sc install`) first.")
     con = sqlite3.connect(DB_PATH)
-    skip = SKIP_DIRS - ({".super-coder"} if is_source_repo() else set())
+    cfg = load_config()
+    # Config EXTENDS the defaults (never shrinks them); .super-coder stays mapped
+    # only in the source repo. role_overrides retag files after default inference.
+    skip = (SKIP_DIRS | set(cfg.get("skip_dirs") or [])) - (
+        {".super-coder"} if is_source_repo() else set())
+    skip_files = SKIP_FILES | set(cfg.get("skip_files") or [])
+    overrides = cfg.get("role_overrides") or []
     try:
         for t in ("dr_repo", "dr_filepath", "dr_dependency", "dr_env"):
             con.execute(f"DELETE FROM {t}")
@@ -180,7 +227,7 @@ def main() -> int:
             rel_parts = p.relative_to(REPO_ROOT).parts
             if any(part in skip for part in rel_parts):
                 continue
-            if not p.is_file() or p.name in SKIP_FILES:
+            if not p.is_file() or p.name in skip_files:
                 continue
             if files >= MAX_FILES:
                 truncated = True
@@ -188,7 +235,7 @@ def main() -> int:
             rel = "/".join(rel_parts)
             ext = p.suffix.lower()
             lang = LANG.get(ext)
-            role = infer_role(rel, ext, lang)
+            role = apply_role_override(rel, infer_role(rel, ext, lang), overrides)
             try:
                 size = p.stat().st_size
             except OSError:

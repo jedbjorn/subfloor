@@ -1,0 +1,12 @@
+#!/bin/sh
+# super-coder auto-remap — keep the dr_* catalogue fresh after a branch switch.
+# Tracked hook, fired via core.hooksPath (wired by `./sc map-setup`). Owned by
+# the cartographer; no working shell maps. Best-effort: never block the checkout.
+#
+# Args: $1 prev HEAD, $2 new HEAD, $3 branch-checkout flag (1=branch, 0=file).
+# Only remap on a real branch switch — skip per-file checkouts (`git checkout -- f`).
+[ "$3" = "1" ] || exit 0
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -x "$root/sc" ] || exit 0
+( cd "$root" && ./sc map >/dev/null 2>&1 ) || true
+exit 0

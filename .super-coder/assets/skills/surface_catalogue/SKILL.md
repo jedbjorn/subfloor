@@ -1,17 +1,20 @@
 ---
 name: surface_catalogue
-description: Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Run `./sc map` to refresh it. Use to orient in an unfamiliar repo fast.
+description: Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.
 category: substrate
-command: ./sc map
 common: true
 ---
 
 # surface_catalogue — read the repo from the map, not by grepping
 
 super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
-repo — query them first to orient, instead of walking the tree blind. The map is
-a derived cache (not snapshotted); refresh it with `./sc map` after the repo
-changes.
+repo — query them first to orient, instead of walking the tree blind.
+
+You do **not** map the repo. The map is kept fresh for you automatically (git
+hooks re-map on pull / branch-switch / rebase) and is owned by the
+**cartographer** shell, which configures and heals it. Your job is to *read* it.
+If it ever looks empty, stale, or wrong, that's a cartographer task — flag it,
+don't map it yourself.
 
 | Table | Holds |
 |---|---|
@@ -45,7 +48,9 @@ SELECT name, source_file FROM dr_env ORDER BY name;
 
 - **Map first, grep second.** Query `dr_filepath` to find the handful of files
   that matter, then read those — don't `grep -r` the whole tree.
-- **Stale map?** If the repo changed since `mapped_at`, run `./sc map` (or the
-  Map tab's re-map) before trusting it.
+- **Lazy-load.** The catalogue is the index; pull a file's contents only once
+  the map points you at it. Carry the map, not the territory.
+- **Map looks wrong?** Empty, stale (repo changed since `mapped_at`), or
+  mis-classified — that's the cartographer's to fix. Raise it; don't re-map.
 - v1 maps files / deps / env. Semantic tables (APIs, db schema, routes/pages)
   are a later pass — until then, read the code the map points you at.

@@ -345,9 +345,12 @@ def main(argv: list[str]) -> int:
     if r.returncode != 0:
         sys.exit("install: first-shell seeding failed (or was aborted).")
 
-    # 7. Map the host repo into the dr_* catalogue (so the shell can read it) --
-    step("Mapping the repo (dr_* catalogue)")
-    subprocess.run([PY, str(ENGINE / "scripts/map_repo.py")])
+    # 7. Wire the auto-remap hooks + map the host repo --------------------------
+    # map-setup points core.hooksPath at the tracked hooks so the dr_* catalogue
+    # stays fresh on every pull/checkout/rebase, then runs the initial map. The
+    # Cartographer shell (seeded above) tunes map.config.json + heals later.
+    step("Wiring map automation + mapping the repo (dr_* catalogue)")
+    subprocess.run([PY, str(ENGINE / "scripts/map_setup.py")])
 
     # 8. Persist: snapshot + render ------------------------------------------
     step("Serializing + rendering")
