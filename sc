@@ -47,6 +47,7 @@ cmd="${1:-help}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   install)         exec "$PY" "$S/install.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
+  doctor)          exec "$PY" "$S/install.py" --check-docker ;;
   update)       exec "$PY" "$S/update.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
@@ -96,6 +97,7 @@ super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode if missing (official native installers, no npm)
+  ./sc doctor              docker preflight for the sandbox (rootless/rootful + setup guidance)
   ./sc update              self-fetch the engine + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db

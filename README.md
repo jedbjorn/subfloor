@@ -38,6 +38,14 @@ super-coder's own memory or roadmap.
 > `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
 > `sqlite3` (and a harness on `PATH`).
 
+**Docker mode — rootful vs rootless.** `./sc doctor` checks your docker and
+prints setup guidance. Both work (the launcher's `duser()` adapts), but
+**rootful is the smoother default**: bind-mounts map 1:1 to your uid and the
+harness runs as a normal user. Under rootless the sandbox runs the container as
+root (which maps to you), which works but makes `claude` run as root inside
+(its `--dangerously-skip-permissions` flag is blocked — the sandbox replaces the
+need for it). `./sc install` runs this preflight for you.
+
 ```bash
 cd your-repo                    # an existing git repo
 

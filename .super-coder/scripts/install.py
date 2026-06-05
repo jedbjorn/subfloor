@@ -7,7 +7,8 @@ from "engine present" to "a shell you can launch":
 
     1. Guard   — refuse to run in the super-coder SOURCE repo, or on a fork that
                  is already installed (both would destroy content). --force skips.
-    2. Require — python3 + sqlite3 (+ a heads-up if git or curl is missing).
+    2. Require — python3 + sqlite3 (+ a heads-up if git/curl missing, and a
+                 docker preflight for the sandbox run path — advisory, not fatal).
     3. Harness — ensure claude + opencode are installed (official native
                  installers, no npm); pick the launch default → instance.json.
     4. Strip   — super-coder's own per-instance content; a fork inherits the
@@ -26,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -133,6 +135,53 @@ def ensure_harnesses() -> dict[str, str]:
     return status
 
 
+# ── Docker preflight (the default run mode is a sandbox container) ────────────
+# Advisory only: real docker setup needs root + a re-login, so install GUIDES with
+# the right commands for the state it finds, never mutates. Mirrors the git/curl
+# warnings — a missing/under-configured docker is not fatal, because the no-docker
+# escape hatch (`./sc serve` + `./sc boot`) still runs the shell on the host.
+
+def docker_status() -> dict:
+    """Docker availability + mode. 'absent' (no CLI) · 'no-daemon' (CLI but no
+    reachable daemon / no socket access) · 'rootless' · 'rootful'."""
+    if not shutil.which("docker"):
+        return {"state": "absent"}
+    p = sh("docker", "info", "--format", "{{.SecurityOptions}}")
+    if p.returncode != 0:
+        tail = (p.stderr or "").strip().splitlines()
+        return {"state": "no-daemon", "detail": tail[-1] if tail else ""}
+    return {"state": "rootless" if "rootless" in (p.stdout or "").lower() else "rootful"}
+
+
+def report_docker() -> dict:
+    """Print the docker preflight block for the sandbox run path. Returns status."""
+    st = docker_status()
+    user = os.environ.get("USER", "$USER")
+    state = st["state"]
+    if state == "rootful":
+        print("  docker    ✓ rootful — ideal: 1:1 uid bind-mounts, harness runs as you")
+    elif state == "rootless":
+        print("  docker    ✓ rootless — works. The sandbox runs the container as root,")
+        print("            which under rootless maps to YOU, so mounts come out yours.")
+        print("            One wart: claude runs as root inside (its --dangerously-skip-")
+        print("            permissions flag is blocked; the sandbox replaces the need).")
+        print("            For a normal-user harness + simpler mounts, prefer rootful:")
+        print(f"              sudo usermod -aG docker {user}")
+        print("              sudo systemctl enable --now docker.socket   # log out/in after")
+        print("              docker context use default")
+    elif state == "no-daemon":
+        print("  docker    ⚠ CLI present but no daemon reachable. Start one:")
+        print(f"            rootful : sudo usermod -aG docker {user} && sudo systemctl enable --now docker.socket  (re-login)")
+        print("            rootless: dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker")
+        if st.get("detail"):
+            print(f"            ({st['detail']})")
+    else:  # absent
+        print("  docker    ⚠ not found — the default run mode is a sandbox container.")
+        print("            Install it (e.g. Arch: sudo pacman -S docker), then `./sc doctor`.")
+        print("            Or run without docker via the escape hatch: ./sc serve + ./sc boot")
+    return st
+
+
 # Ignore lines a fork needs — the rebuilt/derived artifacts. The git checkout
 # that brings the engine in doesn't carry super-coder's .gitignore, so the
 # installer appends them to the host repo's .gitignore (idempotent via marker).
@@ -168,7 +217,7 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness"}
+    own = {"--force", "--skip-harness-install", "--ensure-harness", "--check-docker"}
     fork_args = [a for a in argv if a not in own]
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
@@ -176,6 +225,12 @@ def main(argv: list[str]) -> int:
     if "--ensure-harness" in argv:
         step("Ensuring harness CLIs (claude + opencode)")
         ensure_harnesses()
+        return 0
+
+    # Standalone docker preflight (re-run after configuring docker) — `./sc doctor`.
+    if "--check-docker" in argv:
+        step("Checking the sandbox runtime (docker)")
+        report_docker()
         return 0
 
     # 1. Guards ---------------------------------------------------------------
@@ -199,6 +254,9 @@ def main(argv: list[str]) -> int:
         print("  ⚠ git not on PATH — needed for the commit→PR flow later.")
     if not shutil.which("curl"):
         print("  ⚠ curl not on PATH — needed to auto-install a missing harness.")
+    # Docker is the default run path (the sandbox); guide if it's missing or
+    # under-configured. Never fatal — `./sc serve`+`boot` run without it.
+    report_docker()
 
     # 3. Ensure harness CLIs --------------------------------------------------
     # Install both claude + opencode if missing, via their official NATIVE
