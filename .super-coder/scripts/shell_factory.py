@@ -93,7 +93,7 @@ def create_shell(con: sqlite3.Connection, *, flavor: str, name: str,
 
     cur = con.execute(
         "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
-        "system_prompt, current_state, workspace, lineage_seed, flavor, "
+        "system_prompt, current_state, connections, lineage_seed, flavor, "
         "has_identity, bootstrapped, user_id, is_shared) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)",
         (name, shortname, partner, role, mandate,

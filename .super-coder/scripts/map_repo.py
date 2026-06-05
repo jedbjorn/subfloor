@@ -11,8 +11,11 @@ snapshotted. Re-run any time the repo changes:
 
     ./sc map          # or: python3 .super-coder/scripts/map_repo.py
 
-Idempotent — clears and repopulates dr_*. v1 maps files / deps / env; the
-semantic tables (APIs, db, pages) are a later pass.
+Idempotent. dr_repo / dr_dependency / dr_env are wiped + repopulated; dr_filepath
+is UPSERTed by path so cartographer-authored `desc` survives the auto-remap hook,
+with vanished paths pruned. dr_section (authored) is left untouched, and seeded
+from top-level dirs only when empty. v1 maps files / deps / env; per-file
+descriptions + sections are the B5 navigation layer.
 """
 from __future__ import annotations
 
@@ -206,6 +209,24 @@ ENV_FILES = (".env.example", ".env.sample", ".env.template", ".env.dist")
 ENV_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=")
 
 
+def seed_sections(con: sqlite3.Connection) -> None:
+    """Seed dr_section from the repo's top-level directories — ONLY when the table
+    is empty, so the cartographer's curated sections (and any loaded from the
+    snapshot on rebuild) are never overwritten. Each top-level dir becomes one
+    section (`name=dir`, `path_prefix=dir/`, description NULL-until-curated).
+    Root-level files match no prefix and surface under the render-time catch-all.
+    The cartographer renames / merges / splits / describes from here."""
+    if con.execute("SELECT COUNT(*) FROM dr_section").fetchone()[0]:
+        return
+    dirs = [r[0] for r in con.execute(
+        "SELECT DISTINCT substr(path, 1, instr(path, '/') - 1) AS top "
+        "FROM dr_filepath WHERE instr(path, '/') > 0 ORDER BY top")]
+    for i, d in enumerate(dirs):
+        con.execute(
+            "INSERT OR IGNORE INTO dr_section (name, path_prefix, description, sort_order) "
+            "VALUES (?, ?, NULL, ?)", (d, d + "/", i))
+
+
 def main() -> int:
     if not DB_PATH.exists():
         sys.exit("map_repo: no DB — run `./sc rebuild` (or `./sc install`) first.")
@@ -218,8 +239,14 @@ def main() -> int:
     skip_files = SKIP_FILES | set(cfg.get("skip_files") or [])
     overrides = cfg.get("role_overrides") or []
     try:
-        for t in ("dr_repo", "dr_filepath", "dr_dependency", "dr_env"):
+        # Derived tables with no authored content — wiped + repopulated each run.
+        for t in ("dr_repo", "dr_dependency", "dr_env"):
             con.execute(f"DELETE FROM {t}")
+        # dr_filepath carries cartographer-authored `desc`, so it is NEVER blind-
+        # wiped (a post-checkout hook on a working shell would otherwise destroy
+        # it). Track the paths seen this run; UPSERT keeps `desc` for surviving
+        # paths, and we prune only the paths that vanished from the repo.
+        con.execute("CREATE TEMP TABLE _seen (path TEXT PRIMARY KEY)")
 
         files = deps = envs = 0
         truncated = False
@@ -242,9 +269,13 @@ def main() -> int:
                 size = None
             con.execute(
                 "INSERT INTO dr_filepath (path, ext, lang, role, bytes, lines) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(path) DO UPDATE SET "
+                "ext=excluded.ext, lang=excluded.lang, role=excluded.role, "
+                "bytes=excluded.bytes, lines=excluded.lines",  # desc untouched → preserved
                 (rel, ext or None, lang, role, size,
                  count_lines(p) if (lang or role in ("doc", "config")) else None))
+            con.execute("INSERT OR IGNORE INTO _seen (path) VALUES (?)", (rel,))
             files += 1
 
             name = p.name
@@ -261,6 +292,12 @@ def main() -> int:
                         con.execute("INSERT INTO dr_env (name, source_file) VALUES (?, ?)",
                                     (m.group(1), rel))
                         envs += 1
+
+        # Prune paths that vanished from the repo (their authored desc goes with
+        # them — correct). Surviving paths kept their desc via the UPSERT above.
+        con.execute("DELETE FROM dr_filepath WHERE path NOT IN (SELECT path FROM _seen)")
+        con.execute("DROP TABLE _seen")
+        seed_sections(con)
 
         con.execute(
             "INSERT INTO dr_repo (repo_id, name, root, remote, vcs, default_branch, "

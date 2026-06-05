@@ -253,6 +253,53 @@ clone where the hooks never got wired.
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
 4. Verify (step 4) + commit.
 
+## Standing jobs — sections & descriptions (the navigation layer)
+
+Beyond keeping the file list true, you own the two AUTHORED layers that turn the
+raw map into navigation. Both are best-effort and NULL-until-curated; neither
+blocks the auto-remap hook the working shells trigger. Both survive the remap
+(`dr_section` is never touched by the mapper; `dr_filepath.desc` is preserved by
+its UPSERT). The boot `## CONNECTIONS` block renders the section index; the
+descriptions are the leaves a shell queries once it has narrowed to a section.
+
+**1. Sections (`dr_section`)** — author/curate the navigational index. Seeded
+from top-level dirs on first map (one section per dir), so it is non-empty on day
+one; your job is to make it *good*: rename to what shells call the area, split a
+coarse dir into real areas, merge noise, write the one-line `description`.
+
+```sql
+-- the current index + live file counts:
+SELECT s.name, s.path_prefix, s.description,
+       (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') n
+FROM dr_section s ORDER BY s.sort_order, s.name;
+
+-- split / rename / describe (authored — survives the remap, snapshotted):
+UPDATE dr_section SET name=''API'', path_prefix=''shell_core/api/'', description=''FastAPI routers'' WHERE name=''shell_core'';
+INSERT INTO dr_section (name, path_prefix, description, sort_order)
+VALUES (''UI'', ''shell_core/ui/'', ''SvelteKit substrate UI'', 5);
+
+-- WORKLIST — keep the catch-all empty. Files under no section = a new area to
+-- section (they render under "other / unsectioned" in CONNECTIONS until you do):
+SELECT path FROM dr_filepath f WHERE NOT EXISTS
+  (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || ''%'')
+ORDER BY path;
+```
+
+**2. Descriptions (`dr_filepath.desc`)** — fill per-file one-liners (≤100 chars),
+worklist-driven. They are queried by working shells *within a chosen section*
+(via `surface_catalogue`), never bulk-loaded at boot.
+
+```sql
+-- WORKLIST — undescribed files, most-load-bearing first:
+SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
+
+-- describe (≤100 chars; preserved across the next auto-remap):
+UPDATE dr_filepath SET desc=''Boot composer — assembles CLAUDE.md from DB state'' WHERE path=''.super-coder/render/compose.py'';
+```
+
+After a curation pass, `./sc snapshot` (sections are snapshotted; descriptions
+ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
+
 ## Stance
 
 - **The map is infrastructure, not a chore for every shell.** You own it so the
@@ -336,7 +383,8 @@ after any content write, `./sc snapshot` re-serializes to text (see the
 
 | Table | Holds | Write rule |
 |---|---|---|
-| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `workspace`, `lineage_seed`, `active_archive_id` | UPDATE in place |
+| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `connections` (authored "where things live" notes → boot `## CONNECTIONS`), `lineage_seed`, `active_archive_id` | UPDATE in place |
+| `dr_section` | the navigation index — `name`, `path_prefix`, `description`; rendered in boot `## CONNECTIONS`. Cartographer-authored | INSERT/UPDATE (cartographer) |
 | `shell_identity_entries` | seed (cap 10) + L&S (`kind=''lns''`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
 | `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
@@ -853,13 +901,26 @@ don''t map it yourself.
 | Table | Holds |
 |---|---|
 | `dr_repo` | the repo: name, root, remote, vcs, default_branch, file_count, mapped_at |
-| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines` |
+| `dr_section` | the navigational index: `name`, `path_prefix`, `description` — "UI here / API here / docs here". Rendered in the boot `## CONNECTIONS` block; start here. |
+| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
 | `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
 | `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
 
 ## Orient fast
 
+The boot `## CONNECTIONS` block already shows the **section index** (where to
+start). The flow is: pick a section there → query *that section''s leaves* (file
+names + descriptions) → read the one or two files you need. Section-first, one
+cheap query deep — never a full preload.
+
 ```sql
+-- the section index (same as boot CONNECTIONS) — where to start:
+SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
+
+-- a chosen section''s leaves — the descriptions tell you which file to open:
+SELECT path, desc, lines FROM dr_filepath
+WHERE path LIKE ''shell_core/api/%'' ORDER BY path;
+
 -- what is this repo + how big:
 SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
 
@@ -886,8 +947,11 @@ SELECT name, source_file FROM dr_env ORDER BY name;
   the map points you at it. Carry the map, not the territory.
 - **Map looks wrong?** Empty, stale (repo changed since `mapped_at`), or
   mis-classified — that''s the cartographer''s to fix. Raise it; don''t re-map.
-- v1 maps files / deps / env. Semantic tables (APIs, db schema, routes/pages)
-  are a later pass — until then, read the code the map points you at.',
+  A file under "other / unsectioned", or a `desc IS NULL` where you needed one,
+  is also a cartographer worklist item — flag it, don''t author the map yourself.
+- Maps files / deps / env + the navigation layer (sections + per-file
+  descriptions). Symbol-level semantics (functions/classes) are a later pass —
+  until then, read the code the section + descriptions point you at.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

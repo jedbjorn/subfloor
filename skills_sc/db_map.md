@@ -24,11 +24,12 @@ after any content write, `./sc snapshot` re-serializes to text (see the
 
 | Table | Holds | Write rule |
 |---|---|---|
-| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `workspace`, `lineage_seed`, `active_archive_id` | UPDATE in place |
+| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `connections` (authored "where things live" notes → boot `## CONNECTIONS`), `lineage_seed`, `active_archive_id` | UPDATE in place |
+| `dr_section` | the navigation index — `name`, `path_prefix`, `description`; rendered in boot `## CONNECTIONS`. Cartographer-authored | INSERT/UPDATE (cartographer) |
 | `shell_identity_entries` | seed (cap 10) + L&S (`kind='lns'`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
 | `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
-| `roadmap` | one row per planned feature; `roadmap_status` is a planning horizon (`brainstorm`→`long_term`→`near_term`→`next`→`shipped`), `sort_order` within a bucket | INSERT/UPDATE |
+| `roadmap` | one row per planned feature; `roadmap_status` is a planning horizon (`brainstorm`→`in_progress`→`next`→`near_term`→`long_term`→`shipped`→`retired`), `sort_order` within a bucket. `shipped` = delivered; `retired` = taken off the board (decided-against / split / absorbed / replaced) without shipping — keep the row | INSERT/UPDATE |
 | `documents` | the content store — specs/docs bodies live here; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; never edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
 | `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | catalogue via migration; grants via snapshot |
@@ -53,8 +54,9 @@ UPDATE shell_identity_entries SET retired_at=datetime('now') WHERE entry_id=?;
 INSERT INTO shell_decisions (shell_id, decision_date, title, body)
 VALUES (<self>, date('now'), '…', '…');
 
--- roadmap: move a feature's horizon / add one:
+-- roadmap: move a feature's horizon / add one / retire one off the board:
 UPDATE roadmap SET roadmap_status='next' WHERE feature_id=?;
+UPDATE roadmap SET roadmap_status='retired' WHERE feature_id=?;  -- decided-against / split / absorbed; keeps the row
 INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary)
 VALUES ('…', 'brainstorm', 0, <self>, '…');
 

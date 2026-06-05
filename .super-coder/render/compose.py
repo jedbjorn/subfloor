@@ -124,6 +124,45 @@ def render_roadmap(con, shell_id: int) -> str:
     return "\n".join(parts).rstrip() or "(none)"
 
 
+def render_connections(con, shell) -> str:
+    """## CONNECTIONS — the single "where things live" surface (B5). Three layers,
+    top to bottom: a derived header (facts, never authored), the section index
+    (`dr_section`, prefix-joined to live file counts), and the authored notes
+    (`shells.connections` free text — wiring the map can't derive). The shell sees
+    *where to start* here, then queries one section's leaves on demand."""
+    repo = con.execute(
+        "SELECT root, default_branch, mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+    lines = ["**Need to find something? Look here first** — read the `dr_*` map via "
+             "the `surface_catalogue` skill; don't grep the tree blind."]
+    if repo and repo["root"]:
+        branch = f" · `{repo['default_branch']}`" if repo["default_branch"] else ""
+        mapped = f" · mapped {repo['mapped_at']}" if repo["mapped_at"] else ""
+        lines.append(f"- Repo root: `{repo['root']}`{branch}{mapped}")
+        lines.append(f"- Shared (scratch / handoff): `{repo['root']}/shared`")
+
+    sections = con.execute(
+        "SELECT s.name, s.path_prefix, s.description, "
+        "  (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') AS n "
+        "FROM dr_section s ORDER BY s.sort_order, s.name").fetchall()
+    if sections:
+        lines += ["", "**Sections** — `name · location · files · what's there`. Query a "
+                  "section's leaves (file names + descriptions) on demand, never all at once:"]
+        for s in sections:
+            desc = f" — {s['description']}" if s["description"] else ""
+            lines.append(f"- **{s['name']}** · `{s['path_prefix']}` · {s['n']} files{desc}")
+        unsectioned = con.execute(
+            "SELECT COUNT(*) FROM dr_filepath f WHERE NOT EXISTS "
+            "(SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || '%')"
+        ).fetchone()[0]
+        if unsectioned:
+            lines.append(f"- _other / unsectioned_ · {unsectioned} files — cartographer worklist")
+
+    notes = ((shell["connections"] if "connections" in shell.keys() else None) or "").strip()
+    if notes:
+        lines += ["", notes]
+    return "\n".join(lines)
+
+
 def render_skills(con, shell_id: int) -> str:
     rows = con.execute(
         "SELECT s.name, s.description FROM skills s "
@@ -158,7 +197,6 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
 
     system_prompt = (shell["system_prompt"] or "").strip().replace("<self>", str(shell_id))
     current_state = (shell["current_state"] or "(none)").strip()
-    workspace = (shell["workspace"] or "(none)").strip()
 
     # Orientation state: has this shell run first-run bootstrap, and is the repo
     # mapped? Drives the FIRST RUN prompt + the map-status line.
@@ -172,13 +210,23 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                   if map_count and mapped_at_row and mapped_at_row[0]
                   else "not mapped — cartographer: `./sc map-setup`")
 
-    # Ingest status: repo docs (role=doc) vs how many are in the DB. If the repo
-    # has docs not yet ingested, point at the onboard skill.
+    # Ingest status: INGESTABLE host-repo docs vs how many are in the DB. The
+    # denominator is narrowed (B5) so the ratio stops reading as a false backlog:
+    # exclude the engine + embedded substrate assets (.super-coder/), .github
+    # templates/workflows, and standard meta files (README/CHANGELOG/LICENSE/…)
+    # that `onboard` would never ingest.
     repo_docs = con.execute(
         "SELECT COUNT(*) FROM dr_filepath WHERE role='doc' "
-        "AND path NOT LIKE '.super-coder/%'").fetchone()[0]
+        "AND path NOT LIKE '.super-coder/%' "
+        "AND path NOT LIKE '.github/%' "
+        "AND lower(path) NOT LIKE '%readme.md' "
+        "AND lower(path) NOT LIKE '%changelog%' "
+        "AND lower(path) NOT LIKE '%license%' "
+        "AND lower(path) NOT LIKE '%contributing.md' "
+        "AND lower(path) NOT LIKE '%code_of_conduct.md' "
+        "AND lower(path) NOT LIKE '%security.md'").fetchone()[0]
     ingested = con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-    docs_status = f"{ingested} ingested / {repo_docs} in repo"
+    docs_status = f"{ingested} ingested / {repo_docs} ingestable in repo"
     if repo_docs > ingested:
         docs_status += " — run the `onboard` skill"
 
@@ -224,7 +272,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## ACTIVE PROJECTS", "", render_projects(con, shell_id),
         "", "---", "",
-        "## WORKSPACE", "", workspace,
+        "## CONNECTIONS", "", render_connections(con, shell),
         "", "---", "",
         "## ROADMAP", "", render_roadmap(con, shell_id),
         "", "---", "",
