@@ -53,6 +53,7 @@ import seed_skills  # noqa: E402
 # super-coder-only (stripped on install); assets/shells/ is empty/vestigial.
 ENGINE_PATHS = [
     "sc",
+    ".super-coder/aliases.mk",
     ".super-coder/schema.sql",
     ".super-coder/ecosystem.config.cjs",
     ".super-coder/README.md",
