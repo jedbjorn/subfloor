@@ -11,6 +11,16 @@ harness-specific file OpenCode wants and the launch command.
   Edit this **template** (tracked) to change a fork's OpenCode config; the live
   file is regenerated each launch. Model is intentionally unset — the harness is
   rented; pick it in OpenCode (`-m provider/model`) or add `"model"` here.
+- **`"lsp": true`** — enabled by default. OpenCode's own default is LSP *off*; we
+  turn it on so the model gets language-server diagnostics as a feedback loop
+  (it sees the type error / unresolved import it just introduced and fixes it
+  before handing back). Servers start lazily, per detected file extension, so
+  languages absent from a fork cost nothing. Built-in servers cover the common
+  languages (Pyright, tsserver, gopls, rust-analyzer, …); switch `true` → `{}`
+  to keep built-ins while adding custom servers. **Offline/airgapped forks:** set
+  `OPENCODE_DISABLE_LSP_DOWNLOAD=true` in the environment — OpenCode auto-fetches
+  server binaries on first use, and this is the only knob for it (env-only, no
+  JSON key), so we leave it to the env rather than forcing it off here.
 - **`env.OPENCODE_DISABLE_CLAUDE_CODE=1`** — best-effort: stop OpenCode from also
   loading `CLAUDE.md` (we dual-write both with identical content; this avoids a
   double-load). ⚠ The exact env name is a **research flag to verify on live
