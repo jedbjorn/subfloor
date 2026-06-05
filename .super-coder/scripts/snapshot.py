@@ -43,6 +43,11 @@ PER_INSTANCE_TABLES = [
     "projects",
     "project_shells",
     "shell_skills",
+    # dr_section is AUTHORED navigation (cartographer-curated), so it is per-
+    # instance content that must survive a rebuild — unlike the rest of dr_*
+    # (a derived cache the mapper repopulates). map_repo only seeds it when
+    # empty, so a snapshot-loaded set is never overwritten on rebuild.
+    "dr_section",
 ]
 
 

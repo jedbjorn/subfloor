@@ -42,7 +42,7 @@ Emit opencode.json + verify the research-flagged items; boot already dual-writes
 _No open flags._
 
 ### B5 — Onboarding & mapping · owner: `cc`
-dr_* code map DONE (files/deps/env, make map, GUI Map tab, surface_catalogue skill). Next: content ingest (README/docs/specs → DB + roadmap backfill) + semantic tables (api/db/page).
+Base dr_* code map shipped (files/deps/env, ./sc map, surface_catalogue). NEXT — navigation layer (spec authored): dr_section + per-file desc (cartographer-authored, preserved across remap) + a CONNECTIONS block that replaces WORKSPACE. Supersedes the typed-semantic-tables plan. See specs_sc/b5-repo-navigation.md.
 
 _No open flags._
 

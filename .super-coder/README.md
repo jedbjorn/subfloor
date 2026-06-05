@@ -93,7 +93,7 @@ npm/build. `api/server.py` is a stdlib HTTP server that serves both the JSON API
 and the static `ui/` (one page, vanilla JS) on a single per-fork port.
 
 - **Read** shells, roadmap, flags. **Edit** a shell's operational fields
-  (`current_state`, `connections`, `workspace`) + skill grants, the roadmap, and
+  (`current_state`, `connections`) + skill grants, the roadmap, and
   **non-frozen** documents. **Create / resolve** flags.
 - **Law enforcement is structural:** seed and L&S have *no write route* (Laws
   2–4, 7) — not a disabled control, an absent endpoint. Frozen documents reject

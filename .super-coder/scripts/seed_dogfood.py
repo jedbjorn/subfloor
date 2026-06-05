@@ -130,7 +130,7 @@ def main() -> int:
         # Maintainer shell — succession child of CC, identity set (decision #185).
         cur = con.execute(
             "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
-            "system_prompt, current_state, workspace, lineage_seed, has_identity, "
+            "system_prompt, current_state, connections, lineage_seed, has_identity, "
             "bootstrapped, user_id, is_shared) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 0)",
             (

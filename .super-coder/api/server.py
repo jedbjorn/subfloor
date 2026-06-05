@@ -61,7 +61,7 @@ def mdc_url(markdown: str) -> str:
 
 # Shell fields the review layer may write. seed/L&S/system_prompt/mandate are
 # deliberately ABSENT — the law says the shell curates them, so there is no door.
-SHELL_EDITABLE = {"current_state", "connections", "workspace"}
+SHELL_EDITABLE = {"current_state", "connections"}  # workspace retired (B5) → connections is the one surface
 FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "priority"}
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order"}
 
@@ -94,7 +94,7 @@ def get_shells(con) -> list[dict]:
 def get_shell(con, sid: int) -> dict | None:
     r = con.execute(
         "SELECT shell_id, display_name, shortname, partner, role, mandate, "
-        "system_prompt, current_state, connections, workspace, lineage_seed, "
+        "system_prompt, current_state, connections, lineage_seed, "
         "has_identity, active_archive_id FROM shells "
         "WHERE shell_id=? AND COALESCE(is_deleted,0)=0", (sid,)).fetchone()
     if r is None:

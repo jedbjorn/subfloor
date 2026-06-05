@@ -324,6 +324,19 @@ def main(argv: list[str]) -> int:
     print("  added super-coder ignore lines" if ensure_gitignore()
           else "  (already present)")
 
+    # 3.6 Create the shared scratch / handoff dir -----------------------------
+    # A host-repo dir for screenshots, drafts, quick handoffs. The CONNECTIONS
+    # boot block states its path by convention (<repo_root>/shared) — create it
+    # so the path it points at exists.
+    step("Creating shared/ (scratch + handoff dir)")
+    shared = REPO_ROOT / "shared"
+    if shared.exists():
+        print("  (already present)")
+    else:
+        shared.mkdir()
+        (shared / ".gitkeep").write_text("")
+        print(f"  created {shared.relative_to(REPO_ROOT)}/")
+
     # 4. Strip super-coder's per-instance content -----------------------------
     step("Stripping super-coder's per-instance content (a fork inherits the system, not the memory)")
     for p in STRIP:

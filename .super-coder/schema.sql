@@ -44,8 +44,9 @@ CREATE TABLE shells (
     mandate           TEXT,
     system_prompt     TEXT    NOT NULL,
     current_state     TEXT,
-    connections       TEXT,
-    workspace         TEXT,
+    connections       TEXT,                          -- authored "where things live" notes; rendered in ## CONNECTIONS (B5)
+    workspace         TEXT,                          -- RETIRED (B5): superseded by connections; unrendered, unauthored, kept to avoid a table rebuild
+
     lineage_seed      TEXT,
     flavor            TEXT,                          -- planning / dev / review (NULL = bespoke, e.g. maintainer)
     has_identity      INTEGER NOT NULL DEFAULT 0,
@@ -238,12 +239,27 @@ CREATE TABLE dr_repo (
 
 CREATE TABLE dr_filepath (
     file_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    path     TEXT NOT NULL,           -- repo-relative
+    path     TEXT NOT NULL UNIQUE,    -- repo-relative; UNIQUE → map_repo UPSERTs by path
     ext      TEXT,
     lang     TEXT,                    -- inferred from extension
     role     TEXT,                    -- code / doc / config / test / asset / env
     bytes    INTEGER,
-    lines    INTEGER
+    lines    INTEGER,
+    desc     TEXT                     -- ≤100 chars, cartographer-authored; NULL until described.
+);                                    -- PRESERVED across the auto-remap (map_repo UPSERT keeps it).
+
+-- Sectioned navigation over the file map (B5). Authored, stable, small (~10-20
+-- rows) — NOT wiped by the remap. Files join to a section by path-prefix at
+-- query/render time (no file ids stored), so a wiped+repopulated dr_filepath
+-- never needs re-stitching and a new file auto-falls into its section. Seeded
+-- from top-level dirs on first map; the cartographer renames / merges / curates.
+CREATE TABLE dr_section (
+    section_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,          -- "API", "UI", "Docs", "Schema", …
+    path_prefix  TEXT NOT NULL,          -- repo-relative prefix the section covers
+    description  TEXT,                    -- one line, what this area is
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(name)
 );
 
 CREATE TABLE dr_dependency (

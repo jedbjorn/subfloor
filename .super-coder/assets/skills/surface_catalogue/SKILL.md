@@ -19,13 +19,26 @@ don't map it yourself.
 | Table | Holds |
 |---|---|
 | `dr_repo` | the repo: name, root, remote, vcs, default_branch, file_count, mapped_at |
-| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines` |
+| `dr_section` | the navigational index: `name`, `path_prefix`, `description` — "UI here / API here / docs here". Rendered in the boot `## CONNECTIONS` block; start here. |
+| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
 | `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
 | `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
 
 ## Orient fast
 
+The boot `## CONNECTIONS` block already shows the **section index** (where to
+start). The flow is: pick a section there → query *that section's leaves* (file
+names + descriptions) → read the one or two files you need. Section-first, one
+cheap query deep — never a full preload.
+
 ```sql
+-- the section index (same as boot CONNECTIONS) — where to start:
+SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
+
+-- a chosen section's leaves — the descriptions tell you which file to open:
+SELECT path, desc, lines FROM dr_filepath
+WHERE path LIKE 'shell_core/api/%' ORDER BY path;
+
 -- what is this repo + how big:
 SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
 
@@ -52,5 +65,8 @@ SELECT name, source_file FROM dr_env ORDER BY name;
   the map points you at it. Carry the map, not the territory.
 - **Map looks wrong?** Empty, stale (repo changed since `mapped_at`), or
   mis-classified — that's the cartographer's to fix. Raise it; don't re-map.
-- v1 maps files / deps / env. Semantic tables (APIs, db schema, routes/pages)
-  are a later pass — until then, read the code the map points you at.
+  A file under "other / unsectioned", or a `desc IS NULL` where you needed one,
+  is also a cartographer worklist item — flag it, don't author the map yourself.
+- Maps files / deps / env + the navigation layer (sections + per-file
+  descriptions). Symbol-level semantics (functions/classes) are a later pass —
+  until then, read the code the section + descriptions point you at.
