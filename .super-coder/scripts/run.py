@@ -33,6 +33,9 @@ sys.path.insert(0, str(ENGINE / "render"))
 from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
 
+sys.path.insert(0, str(ENGINE / "scripts"))
+import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
+
 ADAPTERS = ENGINE / "adapters"
 
 
@@ -61,10 +64,32 @@ def emit_adapter(adapter: dict) -> list[str]:
     return written
 
 
+def ensure_harness_path() -> None:
+    """Prepend the dirs where the official installers drop harness binaries onto
+    this process's PATH, so detection (shutil.which) and exec (execvpe) agree
+    with what `./sc install` / `./sc ensure-harness` installed.
+
+    The opencode installer drops its binary in ~/.opencode/bin and only edits a
+    shell rc — a dir a fresh launch shell does NOT carry on PATH. Without this,
+    detect_harnesses() silently never offers opencode even though ensure-harness
+    reported it installed: install.py trusts HARNESS_BIN, the launcher trusted
+    PATH only, and they disagreed. Reuse install.HARNESS_BIN so there is one
+    source for where a harness lives."""
+    try:
+        bin_dirs = [p.parent for p in install.HARNESS_BIN.values()]
+    except Exception:
+        return
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    add = [str(d) for d in bin_dirs if d.is_dir() and str(d) not in parts]
+    if add:
+        os.environ["PATH"] = os.pathsep.join(add + parts)
+
+
 def detect_harnesses() -> list[str]:
     """Harnesses installable RIGHT NOW: an adapter dir with adapter.json whose
-    launch command is also on PATH. Adapter-dir order. Drives the launch-time
-    picker — we only offer a harness the host can actually exec."""
+    launch command is also on PATH (after ensure_harness_path() has folded in
+    the installer bin dirs). Adapter-dir order. Drives the launch-time picker —
+    we only offer a harness the host can actually exec."""
     if not ADAPTERS.exists():
         return []
     found = []
@@ -275,7 +300,10 @@ def main() -> None:
     # Harness pick, right after the shell pick: an explicit --harness / HARNESS
     # override wins silently; otherwise offer the harnesses on PATH when more
     # than one is present (per-launch, never persisted), falling back to this
-    # fork's instance.json value / 'claude' when nothing is detected.
+    # fork's instance.json value / 'claude' when nothing is detected. Fold the
+    # installer bin dirs onto PATH first so detection sees an installed-but-not-
+    # yet-on-PATH harness (e.g. opencode in ~/.opencode/bin).
+    ensure_harness_path()
     default_harness = _configured_harness() or "claude"
     harness = (flag_harness or os.environ.get("HARNESS")
                or pick_harness(detect_harnesses(), default_harness, first)
