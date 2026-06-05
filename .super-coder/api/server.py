@@ -67,9 +67,15 @@ ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order"}
 
 
 def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    # The server and a harness session now write this DB from separate processes
+    # (both share the bind-mounted file in the sandbox). WAL lets a reader and a
+    # writer coexist; busy_timeout makes a contended write wait instead of raising
+    # "database is locked". WAL is a persistent DB property — set once, sticks.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     return con
 
 
