@@ -209,10 +209,10 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
     if first or not sys.stdin.isatty():
         return shells[0]
     # Interactive picker
-    print(f"\n{'ID':>3}  {'Name':<16}{'Shortname':<14}Mandate")
+    print(f"\n{'ID':>3}  {'Name':<16}{'Shortname':<14}")
     for s in shells:
         print(f"{s['shell_id']:>3}  {(s['display_name'] or ''):<16}"
-              f"{(s['shortname'] or ''):<14}{s['mandate'] or ''}")
+              f"{(s['shortname'] or ''):<14}")
     valid = {s["shell_id"] for s in shells}
     while True:
         choice = input("\nPick (ID): ").strip()

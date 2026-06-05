@@ -123,12 +123,15 @@ def get_roadmap(con) -> dict:
         "SELECT r.feature_id, r.title, r.roadmap_status, r.sort_order, r.summary, "
         "s.shortname AS owner FROM roadmap r LEFT JOIN shells s "
         "ON s.shell_id=r.owning_shell ORDER BY r.sort_order, r.feature_id"))
-    # Roadmap tracks the development cycle = the SPECS. Docs (kind='doc') live on
-    # their own tab.
+    # Roadmap tracks the development cycle = the SPECS, with each feature's DOCS
+    # (kind='doc') listed underneath so specs and docs sit together. Docs are
+    # read-only here (open-link only); the Docs tab is where they're edited.
+    # kind DESC orders 'spec' before 'doc' within a feature.
     docs_by: dict[int, list] = {}
     for d in rows(con.execute(
             "SELECT document_id, feature_id, kind, seq, title, frozen, frozen_date, "
-            "render_path FROM documents WHERE kind='spec' ORDER BY feature_id, seq")):
+            "render_path FROM documents WHERE kind IN ('spec','doc') "
+            "ORDER BY feature_id, kind DESC, seq")):
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
     for f in rows(con.execute(
