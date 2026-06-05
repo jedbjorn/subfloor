@@ -53,7 +53,7 @@ super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode if missing (official native installers, no npm)
-  ./sc update              reconcile a fork after pulling an engine update (rebuild + re-grant skills + map)
+  ./sc update              self-fetch the engine + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables -> .super-coder/snapshot/content.sql
