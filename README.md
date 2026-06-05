@@ -76,27 +76,33 @@ serializes back to the text git tracks.
 
 ## Update a fork
 
-Ship an improvement to super-coder, pull it into each fork — the system
-propagates via migrations; your per-instance content (the snapshot) is
-untouched.
+Ship an improvement to super-coder, pull it into each fork — **in place**, with
+no loss of memory. The shell updates its own substrate: it pulls the new engine,
+applies new migrations under its own feet, and the next boot stands on the new
+floor with every row intact. (The shell-facing version of this is the
+`self_update` skill — same procedure, framed as the handoff it is.)
 
 ```bash
-# (re-add the remote first if you removed it: git remote add super-coder <url>)
-git fetch super-coder
-git checkout super-coder/main -- sc \
-    .super-coder/schema.sql .super-coder/migrations .super-coder/scripts \
-    .super-coder/render .super-coder/templates .super-coder/adapters \
-    .super-coder/assets/skills
-./sc update                     # reconcile the fork against the new engine
+./sc update                     # self-fetch + reconcile in place
 git add -A && git commit -m "chore: update super-coder"
 ```
 
-`./sc update` rebuilds the `.db` from the new schema + migrations + **your**
-snapshot, **re-grants any newly-added system skills** to your shells (skill
-bodies propagate via the engine; the per-instance grant doesn't, so update wires
-it), refreshes the repo map, and re-snapshots. Your shells, memory, roadmap, and
-docs survive — they ride in your `snapshot/content.sql`; grants are dumped by
-skill *name*, so they're immune to catalogue-id shifts.
+`./sc update` self-fetches the engine from the `super-coder` remote (one
+canonical path list — code, schema, migrations, skills; your `snapshot/`, DB,
+and `instance.json` are never touched), backs up the live DB, **applies pending
+migrations in place** (never a rebuild-from-snapshot — your unsnapshotted
+in-session writes survive), syncs the skills catalogue (id-stable, so grants
+stay valid), re-grants any new common skills, refreshes the repo map, and
+re-snapshots the live state. Then restart the session to boot onto the new floor.
+
+- `./sc update --no-fetch` reconciles against an already-checked-out engine
+  (offline / dev). `--branch <name>` to track a non-`main` engine branch.
+- Missing remote? `git remote add super-coder https://github.com/jedbjorn/super-coder.git`
+
+**The contract:** every schema change *after* a fork exists ships as a
+`migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration
+ledger is what carries a delta across to an existing fork. Additive where you
+can make it.
 
 ## Run (everyday)
 
