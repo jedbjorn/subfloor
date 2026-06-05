@@ -180,6 +180,45 @@ def report_docker() -> dict:
     return st
 
 
+# ── Harness login preflight ──────────────────────────────────────────────────
+# The sandbox mounts your host harness creds in (binaries are baked in the image;
+# auth is host-mounted so you don't re-login on every restart). So a one-time
+# host login is what makes those cred files exist. We detect + guide; the login
+# itself is an interactive oauth flow we can't script.
+
+def harness_login_status() -> dict:
+    """Heuristic 'logged in?' per harness, from the host cred files the sandbox
+    mounts. claude stores an oauthAccount in ~/.claude.json; opencode writes
+    ~/.local/share/opencode/auth.json on `auth login`."""
+    claude = False
+    cj = Path.home() / ".claude.json"
+    if cj.exists():
+        try:
+            claude = "oauthAccount" in json.loads(cj.read_text())
+        except (json.JSONDecodeError, OSError):
+            claude = False
+    oc = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+    opencode = oc.exists() and oc.stat().st_size > 2
+    return {"claude": claude, "opencode": opencode}
+
+
+def report_logins() -> dict:
+    """Print the harness-login preflight. The sandbox can't run a harness you
+    haven't logged into; the login lives on the host and gets mounted in."""
+    st = harness_login_status()
+    if st["claude"]:
+        print("  claude    ✓ logged in")
+    else:
+        print("  claude    ⚠ not logged in — run `claude` then `/login` once on the host")
+        print("            (creates ~/.claude.json, which the sandbox mounts in).")
+    if st["opencode"]:
+        print("  opencode  ✓ logged in")
+    else:
+        print("  opencode  ⚠ not logged in — run `opencode auth login` once on the host")
+        print("            (creates ~/.local/share/opencode/auth.json, mounted in).")
+    return st
+
+
 # Ignore lines a fork needs — the rebuilt/derived artifacts. The git checkout
 # that brings the engine in doesn't carry super-coder's .gitignore, so the
 # installer appends them to the host repo's .gitignore (idempotent via marker).
@@ -225,10 +264,13 @@ def main(argv: list[str]) -> int:
         ensure_harnesses()
         return 0
 
-    # Standalone docker preflight (re-run after configuring docker) — `./sc doctor`.
+    # Standalone preflight (re-run after configuring docker / logging in) —
+    # `./sc doctor`: is the sandbox ready to launch + boot a harness?
     if "--check-docker" in argv:
-        step("Checking the sandbox runtime (docker)")
+        step("Sandbox runtime (docker)")
         report_docker()
+        step("Harness login (host creds the sandbox mounts in)")
+        report_logins()
         return 0
 
     # 1. Guards ---------------------------------------------------------------
@@ -271,6 +313,11 @@ def main(argv: list[str]) -> int:
         ensure_harnesses()
     harness = detect_harness() or "claude"  # claude preferred; both should be present
     print(f"  → default harness for instance.json: {harness}")
+
+    # 3.1 Harness login — the sandbox mounts host creds in, so a one-time host
+    # login is what populates them. Detect + guide; the oauth flow isn't scriptable.
+    step("Harness login (one-time, on the host — the sandbox mounts these creds in)")
+    report_logins()
 
     # 3.5 Wire the host repo's .gitignore -------------------------------------
     step("Wiring .gitignore")

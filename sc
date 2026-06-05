@@ -34,6 +34,16 @@ dcheck() {
   fi
 }
 
+# Ensure the harness cred mount-sources exist as the RIGHT TYPE before docker
+# bind-mounts them. A missing DIR source is harmless (docker makes a dir), but a
+# missing FILE source (~/.claude.json) gets auto-created as a directory and
+# breaks claude — so seed it with empty json. Real creds come from a one-time
+# host login (`./sc doctor` guides it); this just keeps the mounts valid.
+dcreds() {
+  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" 2>/dev/null || true
+  [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+}
+
 # Which in-container uid writes the bind-mounted repo as YOU on the host.
 # Rootless docker maps container-root → host-you, so run as root (it is not real
 # root — just your user inside the namespace). Rootful maps uid 1:1, so run as
@@ -75,6 +85,7 @@ case "$cmd" in
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
     dcheck
+    dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dbuild
@@ -109,7 +120,7 @@ super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode if missing (official native installers, no npm)
-  ./sc doctor              docker preflight for the sandbox (rootless/rootful + setup guidance)
+  ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
   ./sc update              self-fetch the engine + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
