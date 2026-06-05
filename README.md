@@ -29,10 +29,14 @@ never collides with your repo's own `/docs`, `/specs`, or skills. A fork
 inherits the **system** (schema + the skill catalogue + the render chain), never
 super-coder's own memory or roadmap.
 
-> Requirements: `python3`, `sqlite3`, `git`, `curl`; `pm2` for the review GUI.
-> (No `make` — `./sc` is a plain shell dispatcher. No `npm` — the harness CLIs
-> install via their own native installers.) `./sc install` installs the harness
-> CLIs (`claude` + `opencode`) for you if they're missing.
+> Requirements: `docker` — the default run mode is a sandbox container, so the
+> harness's "allow everything" is safe (the kernel is the boundary; the
+> container sees only this repo + your harness creds). The image bakes the rest:
+> `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs (`claude` +
+> `opencode`, via their official native installers, no npm). `make` targets wrap
+> the common commands; `./sc <cmd>` works without `make`. No docker? The
+> `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
+> `sqlite3` (and a harness on `PATH`).
 
 ```bash
 cd your-repo                    # an existing git repo
@@ -48,7 +52,8 @@ git checkout super-coder/main -- .super-coder sc
 
 # 3. Commit the install, then boot:
 git add -A && git commit -m "chore: install super-coder"
-./sc launch                     # starts the review GUI + boots your shell
+./sc launch                     # build + start the sandbox (server + GUI)
+./sc enter                      # attach: auth + pick shell + pick harness + boot
 ```
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
@@ -70,7 +75,7 @@ python3 .super-coder/scripts/install.py \
     --role "Dev shell" --mandate "Build and maintain this repo."
 ```
 
-After `./sc launch` you're talking to the shell, working your repo. Author
+After `./sc enter` you're talking to the shell, working your repo. Author
 memory, roadmap, and specs into the DB; `./sc snapshot` (+ `./sc render`)
 serializes back to the text git tracks.
 
@@ -107,13 +112,16 @@ can make it.
 ## Run (everyday)
 
 ```bash
-./sc launch              # auth + pick a shell + pick a harness + render boot + exec
-./sc launch-<shortname>  # boot one shell directly, skip the shell picker
+./sc launch              # build + start the sandbox container (server + GUI), 127.0.0.1 only
+./sc enter               # attach a session: auth + pick a shell + pick a harness + boot
+./sc enter-<shortname>   # attach + boot one shell directly, skip the shell picker
+./sc down                # stop + remove the sandbox container
+./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
 ./sc render              # regenerate the tracked flat _sc files from the DB
 ./sc snapshot            # serialize per-instance tables → snapshot/content.sql
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
-./sc help                # all targets
+./sc help                # all commands
 ```
 
 **Choosing a harness.** The boot artifact is dual-written every launch
@@ -125,17 +133,11 @@ per-launch and never written back — so two terminals can run the **same** shel
 different harnesses at once (one Claude Code, one OpenCode). A fork with a single
 harness on `PATH` skips the prompt.
 
-**Prefer `make`?** super-coder never touches your repo's `Makefile`, but you can
-alias the common case in your own — a one-liner you control:
-
-```make
-super:           ## boot super-coder
-	@./sc launch
-```
-
-Then `make super` runs it. (For other commands call `./sc <cmd>` directly —
-forwarding arbitrary args through `make` is the quoting mess `./sc` exists to
-avoid.)
+**`make`.** The source repo ships a thin root `Makefile` that delegates to
+`./sc` (`make launch` / `make enter` / `make enter s=cc` / `make down`). It is
+source-repo ergonomics only — `install.py` checks out `.super-coder` + `sc`, not
+the `Makefile`, so it never propagates to a fork or clobbers a fork's own
+`Makefile`. In a fork, use `./sc <cmd>` (or alias it in your own `Makefile`).
 
 ## Review layer (localhost GUI)
 
@@ -143,11 +145,16 @@ A zero-dependency localhost GUI to review the substrate — shells, roadmap,
 flags. One stdlib Python server serves both the JSON API and a static UI; no
 venv, no npm, no build step.
 
+The server runs **inside the sandbox container** as its foreground process, so
+`./sc launch` brings it up and `./sc down` stops it. The port publishes to
+`127.0.0.1` only.
+
 ```bash
-./sc up        # start it (pm2) on this fork's derived port
+./sc launch    # start the sandbox — server + GUI come up on this fork's derived port
 ./sc health    # curl /api/health
-./sc down      # stop it
-./sc serve     # run it in the foreground (no pm2)
+./sc down      # stop the sandbox (and the server with it)
+./sc logs      # tail the server logs
+./sc serve     # run the server in the foreground on the host (no docker)
 ./sc ports     # show this fork's derived port
 ```
 
@@ -170,9 +177,10 @@ migrate, rebuild) — each with a description and a **run** button, so the commo
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
 since it discards un-snapshotted DB edits).
 
-**`./sc launch` brings the GUI up too** — it starts the review layer (if not
-already running) and prints its URL *before* handing off to the harness, so the
-shell and the GUI run side by side from one command.
+**One container, two access paths** — `./sc launch` starts the server (GUI) as
+the container's foreground process and prints its URL; `./sc enter` then attaches
+an interactive harness session into that same container via `docker exec`, so the
+shell and the GUI run side by side, sharing the one bind-mounted repo + creds.
 
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
 git-tracked text. See `.super-coder/README.md` for the full model.

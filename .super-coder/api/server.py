@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -464,8 +465,13 @@ def main(argv):
         port = ports_mod.resolve().get("port", 8800)
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `make rebuild` first.")
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"super-coder review layer → http://127.0.0.1:{port}  (DB: {DB_PATH.name})")
+    # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
+    # network controls). In the container set SC_BIND=0.0.0.0 so docker can
+    # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
+    # keeps it loopback-only on the host regardless of the in-container bind.
+    bind = os.environ.get("SC_BIND", "127.0.0.1")
+    httpd = ThreadingHTTPServer((bind, port), Handler)
+    print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

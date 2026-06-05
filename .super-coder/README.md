@@ -103,6 +103,8 @@ and the static `ui/` (one page, vanilla JS) on a single per-fork port.
 
 `scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
 100`), bumping past anything occupied, and persists it to the gitignored
-`instance.json`. `ecosystem.config.cjs` names the pm2 process `sc-<repo>` so
-forks (and the host repo's own pm2 apps) never clash. `./sc up` / `down` /
-`health` / `serve` drive it.
+`instance.json`. The server runs inside the docker sandbox (`Dockerfile` +
+`./sc launch`/`down`); the container is named `sc-<repo>` so forks never clash,
+and the port publishes to `127.0.0.1` only. `./sc serve` runs it on the host
+without docker (the escape hatch). `ecosystem.config.cjs` (pm2) is legacy from
+the pre-docker host model and no longer on the default path.
