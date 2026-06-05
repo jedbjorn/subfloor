@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -66,9 +67,15 @@ ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order"}
 
 
 def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    # The server and a harness session now write this DB from separate processes
+    # (both share the bind-mounted file in the sandbox). WAL lets a reader and a
+    # writer coexist; busy_timeout makes a contended write wait instead of raising
+    # "database is locked". WAL is a persistent DB property — set once, sticks.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     return con
 
 
@@ -464,8 +471,13 @@ def main(argv):
         port = ports_mod.resolve().get("port", 8800)
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `make rebuild` first.")
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"super-coder review layer → http://127.0.0.1:{port}  (DB: {DB_PATH.name})")
+    # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
+    # network controls). In the container set SC_BIND=0.0.0.0 so docker can
+    # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
+    # keeps it loopback-only on the host regardless of the in-container bind.
+    bind = os.environ.get("SC_BIND", "127.0.0.1")
+    httpd = ThreadingHTTPServer((bind, port), Handler)
+    print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

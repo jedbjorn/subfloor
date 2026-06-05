@@ -151,8 +151,12 @@ def open_db() -> sqlite3.Connection:
             f"FATAL: no usable DB at {DB_PATH}.\n"
             f"  Rebuild it from text:  ./sc rebuild"
         )
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.row_factory = sqlite3.Row
+    # Coexist with the review server writing the same file from another process
+    # (see server.py db()): WAL + a busy_timeout instead of "database is locked".
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
     con.execute("SELECT 1 FROM shells LIMIT 1")  # smoke
     return con
 

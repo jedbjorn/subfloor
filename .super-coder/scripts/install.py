@@ -7,7 +7,8 @@ from "engine present" to "a shell you can launch":
 
     1. Guard   — refuse to run in the super-coder SOURCE repo, or on a fork that
                  is already installed (both would destroy content). --force skips.
-    2. Require — python3 + sqlite3 (+ a heads-up if git or curl is missing).
+    2. Require — python3 + sqlite3 (+ a heads-up if git/curl missing, and a
+                 docker preflight for the sandbox run path — advisory, not fatal).
     3. Harness — ensure claude + opencode are installed (official native
                  installers, no npm); pick the launch default → instance.json.
     4. Strip   — super-coder's own per-instance content; a fork inherits the
@@ -26,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -133,6 +135,90 @@ def ensure_harnesses() -> dict[str, str]:
     return status
 
 
+# ── Docker preflight (the default run mode is a sandbox container) ────────────
+# Advisory only: real docker setup needs root + a re-login, so install GUIDES with
+# the right commands for the state it finds, never mutates. Mirrors the git/curl
+# warnings — a missing/under-configured docker is not fatal, because the no-docker
+# escape hatch (`./sc serve` + `./sc boot`) still runs the shell on the host.
+
+def docker_status() -> dict:
+    """Docker availability + mode. 'absent' (no CLI) · 'no-daemon' (CLI but no
+    reachable daemon / no socket access) · 'rootless' · 'rootful'."""
+    if not shutil.which("docker"):
+        return {"state": "absent"}
+    p = sh("docker", "info", "--format", "{{.SecurityOptions}}")
+    if p.returncode != 0:
+        tail = (p.stderr or "").strip().splitlines()
+        return {"state": "no-daemon", "detail": tail[-1] if tail else ""}
+    return {"state": "rootless" if "rootless" in (p.stdout or "").lower() else "rootful"}
+
+
+def report_docker() -> dict:
+    """Print the docker preflight block for the sandbox run path. Returns status."""
+    st = docker_status()
+    user = os.environ.get("USER", "$USER")
+    state = st["state"]
+    if state == "rootless":
+        print("  docker    ✓ rootless — the default, nothing to set up. The sandbox runs")
+        print("            the container as root, which under rootless maps to YOU, so repo")
+        print("            writes come out yours (no phantom-uid problem). Only wart: claude")
+        print("            runs as root inside (its --dangerously-skip-permissions flag is")
+        print("            blocked — the sandbox replaces the need for it).")
+    elif state == "rootful":
+        print("  docker    ✓ rootful — also fine: 1:1 uid bind-mounts, harness runs as you")
+        print("            (no claude-as-root wart). Either mode works; duser() adapts.")
+    elif state == "no-daemon":
+        print("  docker    ⚠ CLI present but no daemon reachable. Start one:")
+        print(f"            rootful : sudo usermod -aG docker {user} && sudo systemctl enable --now docker.socket  (re-login)")
+        print("            rootless: dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker")
+        if st.get("detail"):
+            print(f"            ({st['detail']})")
+    else:  # absent
+        print("  docker    ⚠ not found — the default run mode is a sandbox container.")
+        print("            Install it (e.g. Arch: sudo pacman -S docker), then `./sc doctor`.")
+        print("            Or run without docker via the escape hatch: ./sc serve + ./sc boot")
+    return st
+
+
+# ── Harness login preflight ──────────────────────────────────────────────────
+# The sandbox mounts your host harness creds in (binaries are baked in the image;
+# auth is host-mounted so you don't re-login on every restart). So a one-time
+# host login is what makes those cred files exist. We detect + guide; the login
+# itself is an interactive oauth flow we can't script.
+
+def harness_login_status() -> dict:
+    """Heuristic 'logged in?' per harness, from the host cred files the sandbox
+    mounts. claude stores an oauthAccount in ~/.claude.json; opencode writes
+    ~/.local/share/opencode/auth.json on `auth login`."""
+    claude = False
+    cj = Path.home() / ".claude.json"
+    if cj.exists():
+        try:
+            claude = "oauthAccount" in json.loads(cj.read_text())
+        except (json.JSONDecodeError, OSError):
+            claude = False
+    oc = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+    opencode = oc.exists() and oc.stat().st_size > 2
+    return {"claude": claude, "opencode": opencode}
+
+
+def report_logins() -> dict:
+    """Print the harness-login preflight. The sandbox can't run a harness you
+    haven't logged into; the login lives on the host and gets mounted in."""
+    st = harness_login_status()
+    if st["claude"]:
+        print("  claude    ✓ logged in")
+    else:
+        print("  claude    ⚠ not logged in — run `claude` then `/login` once on the host")
+        print("            (creates ~/.claude.json, which the sandbox mounts in).")
+    if st["opencode"]:
+        print("  opencode  ✓ logged in")
+    else:
+        print("  opencode  ⚠ not logged in — run `opencode auth login` once on the host")
+        print("            (creates ~/.local/share/opencode/auth.json, mounted in).")
+    return st
+
+
 # Ignore lines a fork needs — the rebuilt/derived artifacts. The git checkout
 # that brings the engine in doesn't carry super-coder's .gitignore, so the
 # installer appends them to the host repo's .gitignore (idempotent via marker).
@@ -168,7 +254,7 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness"}
+    own = {"--force", "--skip-harness-install", "--ensure-harness", "--check-docker"}
     fork_args = [a for a in argv if a not in own]
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
@@ -176,6 +262,15 @@ def main(argv: list[str]) -> int:
     if "--ensure-harness" in argv:
         step("Ensuring harness CLIs (claude + opencode)")
         ensure_harnesses()
+        return 0
+
+    # Standalone preflight (re-run after configuring docker / logging in) —
+    # `./sc doctor`: is the sandbox ready to launch + boot a harness?
+    if "--check-docker" in argv:
+        step("Sandbox runtime (docker)")
+        report_docker()
+        step("Harness login (host creds the sandbox mounts in)")
+        report_logins()
         return 0
 
     # 1. Guards ---------------------------------------------------------------
@@ -199,6 +294,9 @@ def main(argv: list[str]) -> int:
         print("  ⚠ git not on PATH — needed for the commit→PR flow later.")
     if not shutil.which("curl"):
         print("  ⚠ curl not on PATH — needed to auto-install a missing harness.")
+    # Docker is the default run path (the sandbox); guide if it's missing or
+    # under-configured. Never fatal — `./sc serve`+`boot` run without it.
+    report_docker()
 
     # 3. Ensure harness CLIs --------------------------------------------------
     # Install both claude + opencode if missing, via their official NATIVE
@@ -215,6 +313,11 @@ def main(argv: list[str]) -> int:
         ensure_harnesses()
     harness = detect_harness() or "claude"  # claude preferred; both should be present
     print(f"  → default harness for instance.json: {harness}")
+
+    # 3.1 Harness login — the sandbox mounts host creds in, so a one-time host
+    # login is what populates them. Detect + guide; the oauth flow isn't scriptable.
+    step("Harness login (one-time, on the host — the sandbox mounts these creds in)")
+    report_logins()
 
     # 3.5 Wire the host repo's .gitignore -------------------------------------
     step("Wiring .gitignore")
