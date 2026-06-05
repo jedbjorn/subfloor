@@ -64,6 +64,47 @@ def emit_adapter(adapter: dict) -> list[str]:
     return written
 
 
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """Recursively merge patch into base (patch wins on scalar conflicts);
+    mutates and returns base. Nested dicts merge key-wise so a fork's other
+    settings survive."""
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def apply_sandbox(adapter: dict) -> list[str]:
+    """Sandbox-only: elevate harness permissions to allow-all when booting
+    INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
+    container is the safety boundary, so permission prompts inside it are pure
+    friction; the no-docker host escape hatch (`./sc boot` with SC_SANDBOX
+    unset) keeps normal prompts. Each adapter declares sandbox.merge_json:
+    {repo-relative-path: patch}; we deep-merge the patch into that
+    project-scoped file (preserving any keys the fork set). Paths are
+    repo-relative, so this never touches host-global config (~/.claude etc.)."""
+    if not os.environ.get("SC_SANDBOX"):
+        return []
+    spec = (adapter.get("sandbox") or {}).get("merge_json") or {}
+    touched = []
+    for rel, patch in spec.items():
+        dst = REPO_ROOT / rel
+        cur: dict = {}
+        if dst.exists():
+            try:
+                cur = json.loads(dst.read_text())
+            except (json.JSONDecodeError, OSError):
+                print(f"  ! {rel} is not valid JSON — leaving it untouched")
+                continue
+        _deep_merge(cur, patch)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(dst, json.dumps(cur, indent=2) + "\n")
+        touched.append(rel)
+    return touched
+
+
 def ensure_harness_path() -> None:
     """Prepend the dirs where the official installers drop harness binaries onto
     this process's PATH, so detection (shutil.which) and exec (execvpe) agree
@@ -346,6 +387,9 @@ def main() -> None:
     print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
+    sandboxed = apply_sandbox(adapter)
+    if sandboxed:
+        print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")
