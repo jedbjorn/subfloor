@@ -127,8 +127,8 @@ function shellCard(s) {
 
 // ── Roadmap ───────────────────────────────────────────────────────────────────
 // Funnel order: idea inlet → most-active committed work → done.
-const STATUSES = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"];
-const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped" };
+const STATUSES = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"];
+const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped", retired: "Retired" };
 let roadmapFilter = null;            // null = show all (default); single-select
 const roadmapCollapsed = new Set();  // statuses whose section is collapsed
 

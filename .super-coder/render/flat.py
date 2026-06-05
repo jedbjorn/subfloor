@@ -105,10 +105,11 @@ def _render_documents(con, written, skipped) -> None:
                           written, skipped)
 
 
-_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"]
+_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"]
 _ROADMAP_LABEL = {
     "brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
     "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
+    "retired": "Retired",
 }
 
 

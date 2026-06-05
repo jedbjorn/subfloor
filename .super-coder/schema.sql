@@ -123,9 +123,12 @@ CREATE TABLE roadmap (
     feature_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     title          TEXT    NOT NULL,
     roadmap_status TEXT    NOT NULL DEFAULT 'brainstorm'
-                   -- funnel order: idea inlet → most-active committed work → done.
+                   -- funnel order: idea inlet → most-active committed work →
+                   -- done (shipped) → taken-off-the-board (retired). shipped
+                   -- means we delivered; retired means we chose not to.
                    CHECK (roadmap_status IN
-                       ('brainstorm','in_progress','next','near_term','long_term','shipped')),
+                       ('brainstorm','in_progress','next','near_term',
+                        'long_term','shipped','retired')),
     sort_order     INTEGER NOT NULL DEFAULT 0,   -- ordering within a bucket
     owning_shell   INTEGER REFERENCES shells(shell_id),
     summary        TEXT,

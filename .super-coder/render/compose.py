@@ -83,11 +83,13 @@ def render_projects(con, shell_id: int) -> str:
     return "\n".join(lines)
 
 
-# Funnel order: idea inlet → most-active committed work → done (shipped, summarized).
-_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"]
+# Funnel order: idea inlet → most-active committed work → done (shipped,
+# summarized) → taken-off-the-board (retired).
+_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"]
 _ROADMAP_LABEL = {
     "brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
     "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
+    "retired": "Retired",
 }
 
 

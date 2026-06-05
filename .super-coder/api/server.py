@@ -119,10 +119,12 @@ def get_shell(con, sid: int) -> dict | None:
     return shell
 
 
-# Funnel order: idea inlet → most-active committed work → done.
-_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped"]
+# Funnel order: idea inlet → most-active committed work → done (shipped) →
+# taken-off-the-board (retired). shipped = delivered; retired = chose not to.
+_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"]
 _LABEL = {"brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
-          "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped"}
+          "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
+          "retired": "Retired"}
 
 
 def get_roadmap(con) -> dict:
