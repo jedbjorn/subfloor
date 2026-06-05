@@ -23,6 +23,17 @@ port() { "$PY" "$S/ports.py" port; }
 IMG=super-coder-sandbox
 CNAME="sc-$(basename "$here")"   # unique per fork, like the pm2 name
 
+# Fail fast with the fix if the docker daemon isn't reachable, instead of a
+# cryptic build/run error. Host setup is one-time and lives in `./sc doctor` /
+# `./sc install` — it needs sudo + a re-login, so it can't fold into launch.
+dcheck() {
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "✗ docker daemon not reachable — the sandbox needs it." >&2
+    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc serve + ./sc boot" >&2
+    exit 1
+  fi
+}
+
 # Which in-container uid writes the bind-mounted repo as YOU on the host.
 # Rootless docker maps container-root → host-you, so run as root (it is not real
 # root — just your user inside the namespace). Rootful maps uid 1:1, so run as
@@ -63,6 +74,7 @@ case "$cmd" in
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
+    dcheck
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dbuild
@@ -83,7 +95,7 @@ case "$cmd" in
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running" ;;
-  build)        dbuild ;;
+  build)        dcheck; dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
     "$PY" "$S/rebuild.py"

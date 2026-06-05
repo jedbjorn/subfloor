@@ -46,6 +46,26 @@ root (which maps to you), which works but makes `claude` run as root inside
 (its `--dangerously-skip-permissions` flag is blocked — the sandbox replaces the
 need for it). `./sc install` runs this preflight for you.
 
+**Docker setup is one-time.** Do it once per machine; it persists across reboots,
+and `./sc launch` never repeats it (launch just checks the daemon is reachable
+and points you here if not). Two paths:
+
+- **Rootless — zero setup.** If rootless docker already runs as your user,
+  nothing to do; `./sc launch` works as-is. (Trade-off: the claude-as-root wart
+  above.)
+- **Rootful — one-time, needs sudo + a re-login.** Smoother runtime; the re-login
+  is unavoidable (a new `docker` group only applies to a fresh session), which is
+  why this can't fold into `launch`:
+
+  ```bash
+  sudo usermod -aG docker $USER            # 1. join the docker group
+  sudo systemctl enable --now docker.socket # 2. start the system daemon
+  # 3. LOG OUT and back in (the group only applies to a new session)
+  docker context use default                # 4. point the CLI at the system daemon
+  systemctl --user disable --now docker.service  # 5. optional: stop rootless
+  ./sc doctor                               # verify → "docker ✓ rootful"
+  ```
+
 ```bash
 cd your-repo                    # an existing git repo
 
