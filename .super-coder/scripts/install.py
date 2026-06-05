@@ -354,6 +354,22 @@ def main(argv: list[str]) -> int:
     subprocess.run([PY, str(ENGINE / "scripts/snapshot.py")])
     subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"])
 
+    # 8.5 Wire `make` aliases — opt-in, never clobber a host Makefile (#13).
+    # No Makefile → drop a one-line include so `make launch`/`enter` work out of
+    # the box. Already have one → leave it; just print the line to opt in.
+    step("Wiring make aliases")
+    mk = REPO_ROOT / "Makefile"
+    if mk.exists():
+        print("  Makefile present — left untouched. For `make launch`/`enter`, add:")
+        print("    include .super-coder/aliases.mk")
+    else:
+        mk.write_text(
+            "# Fork Makefile — super-coder convenience aliases (make launch / enter).\n"
+            "# Edit freely; add your own targets below the include.\n"
+            "include .super-coder/aliases.mk\n"
+        )
+        print("  wrote Makefile (include .super-coder/aliases.mk) → `make launch` works")
+
     # Record harness + installed marker in instance.json ---------------------
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
@@ -366,7 +382,8 @@ def main(argv: list[str]) -> int:
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")
     print("\nNext:")
     print("  git add -A && git commit -m 'install super-coder'")
-    print("  ./sc launch        # starts the review GUI + boots your shell")
+    print("  ./sc launch        # or: make launch — starts the sandbox + GUI")
+    print("  ./sc enter         # or: make enter  — attach + boot your shell")
     return 0
 
 
