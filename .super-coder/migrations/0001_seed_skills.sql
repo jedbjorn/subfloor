@@ -618,6 +618,19 @@ plain `git` (cwd = repo root) is safe. The discipline:
 3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
    directive from the FnB — opening is the default, merging is a separate gate.
 
+## After a merge — clean up local
+
+Once the FnB merges your PR, tidy local so stale branches don''t accumulate:
+
+1. `git checkout main && git pull` — fast-forward onto the merged commit.
+2. Delete the merged branch: `git branch -d <branch>`. If it was
+   **squash-merged**, git won''t recognize it as merged and `-d` refuses — confirm
+   the PR shows *merged* on the remote, then `git branch -D <branch>`.
+3. `git fetch --prune` — drop remote-tracking refs for branches deleted upstream.
+
+Only after the PR is merged. Never delete a branch carrying unmerged, un-PR''d
+work — a deleted branch with no PR is lost work.
+
 ## Don''t commit rebuilt/derived files
 
 These are gitignored and regenerated — never add them:
