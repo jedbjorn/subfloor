@@ -42,3 +42,18 @@ shell, `--message send <shortname> <body>`; mark an item read with
 `--message mark-read <id>` once you've acted on it.
 
 ---
+
+## RUNNING THE APP
+
+Two runtimes, two homes — keep them apart:
+
+- **Project dev servers** (vite, `npm run dev`, etc.) belong in the **sandbox**,
+  bound to `0.0.0.0:$SC_DEV_PORT` — the per-fork port `./sc launch` publishes to
+  the host for exactly this. Reach it at `http://127.0.0.1:$SC_DEV_PORT`.
+- **A process-supervised host stack** (pm2 / `make`) is owned by its supervisor.
+  Start/stop/restart only through it (`make up`, `make restart`) — never a bare
+  `vite dev` / `npm run dev` on the host. A hand-run dev server races the
+  supervised process for its port, fails to bind, and orphans — taking the app
+  down.
+
+---
