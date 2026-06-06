@@ -241,6 +241,8 @@ function docBlock(d, { readOnly = false } = {}) {
 }
 
 // ── Docs ──────────────────────────────────────────────────────────────────────
+let docsQuery = "";   // persists across re-renders so the search box keeps its value
+
 async function renderDocs(root) {
   const { docs } = await api("/docs");
   root.replaceChildren();
@@ -251,17 +253,34 @@ async function renderDocs(root) {
       "No docs yet. A doc is a kind='doc' document against a feature — authored by the shell, viewable here."));
     return;
   }
-  const byFeat = {};
-  for (const d of docs) (byFeat[d.feature_title || "— unlinked —"] ||= []).push(d);
-  for (const [title, list] of Object.entries(byFeat)) {
-    const c = el("div", { className: "card" });
-    c.append(el("h2", {}, title));
-    for (const d of list) c.append(docBlock(d));
-    root.append(c);
-  }
+
+  // search bar — filters by doc title or feature on every keystroke
+  const search = el("input", { type: "text", className: "search", placeholder: "search docs…", value: docsQuery });
+  const results = el("div", {});
+  const draw = () => {
+    const q = docsQuery.trim().toLowerCase();
+    const matched = q
+      ? docs.filter((d) => `${d.title || ""} ${d.feature_title || ""}`.toLowerCase().includes(q))
+      : docs;
+    results.replaceChildren();
+    if (!matched.length) { results.append(el("div", { className: "muted" }, "No docs match.")); return; }
+    const byFeat = {};
+    for (const d of matched) (byFeat[d.feature_title || "— unlinked —"] ||= []).push(d);
+    for (const [title, list] of Object.entries(byFeat)) {
+      const c = el("div", { className: "card" });
+      c.append(el("h2", {}, title));
+      for (const d of list) c.append(docBlock(d));
+      results.append(c);
+    }
+  };
+  search.oninput = () => { docsQuery = search.value; draw(); };
+  root.append(search, results);
+  draw();
 }
 
 // ── Flags ──────────────────────────────────────────────────────────────────────
+let flagFilter = "open";   // open | resolved | all — persists across re-renders
+
 async function renderFlags(root) {
   const { flags, features } = await api("/flags");
   root.replaceChildren();
@@ -291,9 +310,21 @@ async function renderFlags(root) {
     el("span", { className: "k" }, "priority"), prio), create);
   root.append(card);
 
-  // grouped by feature
+  // open | resolved | all toggle (segmented, single-select)
+  const bar = el("div", { className: "filters seg" });
+  for (const [key, label] of [["open", "Open"], ["resolved", "Resolved"], ["all", "All"]]) {
+    const chip = el("button", { className: "chip" + (flagFilter === key ? " on" : ""), textContent: label });
+    chip.onclick = () => { flagFilter = key; renderFlags(root); };
+    bar.append(chip);
+  }
+  root.append(bar);
+
+  // grouped by feature, filtered by the toggle
+  const shown = flags.filter((f) =>
+    flagFilter === "all" ? true : flagFilter === "resolved" ? f.resolved : !f.resolved);
+  if (!shown.length) { root.append(el("div", { className: "muted" }, "No flags in this view.")); return; }
   const byFeat = {};
-  for (const f of flags) (byFeat[f.feature_title || "— unlinked —"] ||= []).push(f);
+  for (const f of shown) (byFeat[f.feature_title || "— unlinked —"] ||= []).push(f);
   for (const [title, list] of Object.entries(byFeat)) {
     const c = el("div", { className: "card" });
     c.append(el("h2", {}, title));
@@ -425,8 +456,8 @@ const VIEWS = {
   shells: ["#view-shells", renderShells],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
-  map: ["#view-map", renderMap],
   flags: ["#view-flags", renderFlags],
+  map: ["#view-map", renderMap],
   scripts: ["#view-scripts", renderScripts],
 };
 async function load(tab) {
