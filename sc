@@ -90,11 +90,22 @@ case "$cmd" in
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dbuild
+    # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
+    # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
+    # host's gh login. NOTE: this widens the sandbox — anything in the container
+    # can act as you on GitHub within the token's scope. A fine-grained,
+    # single-repo PAT in SC_GH_TOKEN is the tighter option.
+    gh_token="${SC_GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
+    git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
     docker run -d --name "$CNAME" --restart unless-stopped \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
       -e SC_SANDBOX=1 \
+      -e GH_TOKEN="$gh_token" \
+      -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
+      -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
       -w "$here" \
       -v "$here:$here" \
       -v "$HOME/.claude:$HOME/.claude" \
