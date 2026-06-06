@@ -9,7 +9,7 @@ BEGIN;
 
 -- Retire any catalogue skill that is no longer authored (soft-delete;
 -- keeps the row + id so a re-add is stable and grants are recoverable).
-UPDATE skills SET is_deleted=1 WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'database-migrations', 'db_map', 'docs', 'flags', 'git', 'memory', 'messaging', 'onboard', 'self_update', 'snapshot', 'surface_catalogue');
+UPDATE skills SET is_deleted=1 WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'database-migrations', 'db_map', 'docs', 'flags', 'git', 'memory', 'messaging', 'onboard', 'redline_review', 'self_update', 'snapshot', 'surface_catalogue');
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'api-design',
@@ -889,6 +889,51 @@ never collide — so **coexist (freeze)** is the default. Offer the FnB:
 ## Stance
 Ingest is **once**. Don''t re-ingest (drift). After onboarding, author via the
 shell/GUI and render to flat — never edit the flat files or re-import them.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'redline_review',
+  'Review PNG redlines from the shared scratch dir — find the image by filename match, describe what is seen, interpret intent, propose an implementation, then hold for approval before writing code. Use when the FnB says "redlines".',
+  'craft',
+  NULL,
+  0,
+  '# redline_review — read a redline before you build it
+
+A redline is a marked-up screenshot the FnB drops in the repo''s shared scratch
+dir (`<repo>/shared/redlines/`) to communicate a change visually. This skill is
+the discipline for turning that image into an approved plan **before** any code.
+
+**Trigger:** the FnB says "redlines" (with or without specific context).
+
+## Steps
+
+1. **Find the image**
+   - List `shared/redlines/`.
+   - Match a filename to the prompt context (fuzzy / keyword).
+   - One file present and no strong mismatch → use it. Multiple → pick the best
+     filename match; if it''s genuinely ambiguous, surface that rather than guess.
+
+2. **Read the image** — use the Read tool to load the PNG visually.
+
+3. **Report in three parts — skip none:**
+   - **What I see:** literal description — layout, labels, UI elements,
+     annotations, the markup itself.
+   - **What I understand:** the interpreted intent — the change or requirement
+     this redline is communicating.
+   - **What I propose:** a concrete implementation plan — files, components,
+     approach.
+
+4. **Hold** — do not write or execute any code until the FnB explicitly approves
+   the proposal.
+
+5. **After resolution is confirmed** — once the FnB confirms the redline is
+   resolved, delete the source `.png` from `shared/redlines/`. Delete only on
+   explicit confirmation, never on assumed completion.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
