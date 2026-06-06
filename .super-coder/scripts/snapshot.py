@@ -43,6 +43,11 @@ PER_INSTANCE_TABLES = [
     "projects",
     "project_shells",
     "shell_skills",
+    # shell_messages is per-instance memory (the inbox between this fork's
+    # shells), so it survives a rebuild like flags/decisions — not a derived
+    # cache. Loads after `shells` (its FK target). read_at is preserved, so an
+    # unread message stays unread across a rebuild.
+    "shell_messages",
     # dr_section is AUTHORED navigation (cartographer-curated), so it is per-
     # instance content that must survive a rebuild — unlike the rest of dr_*
     # (a derived cache the mapper repopulates). map_repo only seeds it when

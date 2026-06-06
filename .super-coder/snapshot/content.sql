@@ -960,7 +960,9 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='flags';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='git';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='messaging';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='onboard';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='self_update';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='snapshot';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='surface_catalogue';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='bootstrap';
@@ -968,9 +970,12 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='db_map';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='git';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='messaging';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='self_update';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='snapshot';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='surface_catalogue';
+
+DELETE FROM shell_messages;
 
 DELETE FROM dr_section;
 INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (2, '.super-coder', '.super-coder/', NULL, 0);

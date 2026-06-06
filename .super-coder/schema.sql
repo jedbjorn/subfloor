@@ -175,6 +175,23 @@ CREATE TABLE flags (
     is_deleted       INTEGER NOT NULL DEFAULT 0
 );
 
+-- ── Shell Inbox (inter-shell messaging) ─────────────────────────────────────
+-- A shell writes a markdown message to another shell; the recipient discovers it
+-- on its next boot (the `## STATUS` Inbox count + the `messaging` skill's `check`
+-- verb) and marks it read by UPDATE-ing `read_at`. No API layer in v1 — the
+-- `messaging` skill runs parameterized SQL directly (single-user, localhost). The
+-- only enforcement v1 has is at the DB layer: FK on from/to, NOT NULL, body CHECK.
+-- See migrations/0004_shell_messages.sql (convergent — carries an existing fork).
+
+CREATE TABLE shell_messages (
+    message_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
+    to_shell_id   INTEGER NOT NULL REFERENCES shells(shell_id),
+    body          TEXT    NOT NULL CHECK (length(body) > 0),
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    read_at       TEXT                          -- NULL = unread
+);
+
 -- ── Skills (system content — seeded from assets/, propagates) ────────────────
 
 CREATE TABLE skills (
@@ -287,6 +304,7 @@ CREATE INDEX idx_documents_feature ON documents(feature_id, kind, seq);
 CREATE INDEX idx_sie_shell_kind_active
     ON shell_identity_entries(shell_id, kind)
     WHERE is_deleted = 0 AND retired_at IS NULL;
+CREATE INDEX idx_shell_messages_to_unread ON shell_messages(to_shell_id, read_at);
 CREATE INDEX idx_dr_filepath_role ON dr_filepath(role);
 CREATE INDEX idx_dr_filepath_lang ON dr_filepath(lang);
 CREATE INDEX idx_dr_dependency_mgr ON dr_dependency(manager);
