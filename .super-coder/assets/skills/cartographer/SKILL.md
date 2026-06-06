@@ -133,6 +133,44 @@ UPDATE dr_filepath SET desc='Boot composer — assembles CLAUDE.md from DB state
 After a curation pass, `./sc snapshot` (sections are snapshotted; descriptions
 ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
 
+## Shape-change notices — the curation trigger
+
+The git hooks keep the *mechanical* catalogue fresh on their own (paths, langs,
+deps), but a newly-landed file arrives `desc IS NULL` and unsectioned — the
+authored layer above doesn't fill itself. So working shells **message you** when
+they change the repo's shape, turning curation from a next-boot *pull* into a
+timely *push*. This is the only inbox traffic you act on as cartographer.
+
+**The notice contract** (what the relay shells send — one source of truth here;
+the relay skills point at this section). A working shell sends, via the
+`messaging` skill, to shortname `cartographer`:
+
+```
+--message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."
+```
+
+- Sent by the shell that *lands code shape*: the **dev/coder** shell on merge (new
+  feature implemented, new doc written). NOT the planner — specs render into a
+  known, predictable area and need no semantic curation.
+- The body names **what** changed and **where** (the path region) so your pass is
+  scoped, not a full re-survey. A `documents`/feature ref is welcome but optional.
+
+**On a notice** — check inbox, then run the existing worklists *scoped to the
+named region*, and mark read:
+
+```sql
+-- 1. the new files this notice is about (scope by the region it named):
+SELECT path, role FROM dr_filepath
+WHERE desc IS NULL AND path LIKE 'region/%' ORDER BY role, path;
+-- 2. describe them (≤100 chars) — UPDATE dr_filepath SET desc=… per the worklist above.
+-- 3. do they form / join a section? curate dr_section if the region is a new area.
+```
+
+Then `./sc snapshot` and `--message mark-read <id>` (see the `messaging` skill).
+The mechanical remap already ran via the hook; your job on the notice is purely
+the authored layer — describe the new leaves, section a new area. Scope is free:
+`desc IS NULL` already narrows to exactly the uncurated tail.
+
 ## Stance
 
 - **The map is infrastructure, not a chore for every shell.** You own it so the

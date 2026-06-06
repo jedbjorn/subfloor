@@ -58,6 +58,21 @@ CREATE TABLE shells (
     is_deleted        INTEGER NOT NULL DEFAULT 0
 );
 
+-- Singleton guard: a fork has exactly one cartographer — it owns the repo map
+-- and no other shell maps, so a second one is incoherent. Mirrors the seed/L&S
+-- cap triggers (RAISE(ABORT) below the line). is_deleted=0 so a deleted
+-- cartographer frees the slot. shell_factory pre-checks for a friendly error;
+-- this is the DB backstop that also catches direct writes / the API path.
+CREATE TRIGGER trg_singleton_cartographer
+BEFORE INSERT ON shells
+WHEN NEW.flavor = 'cartographer' AND (
+  SELECT COUNT(*) FROM shells
+  WHERE flavor = 'cartographer' AND is_deleted = 0
+) >= 1
+BEGIN
+  SELECT RAISE(ABORT, 'cartographer is a singleton — this fork already has one');
+END;
+
 CREATE TABLE shell_memory_archives (
     archive_id     INTEGER PRIMARY KEY,
     shell_id       INTEGER NOT NULL REFERENCES shells(shell_id),
