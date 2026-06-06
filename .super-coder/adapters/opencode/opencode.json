@@ -1,11 +1,18 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "lsp": true,
-  "instructions": ["AGENTS.md"],
+  "instructions": ["AGENTS.md", ".super-coder/adapters/opencode/tool-discipline.md"],
   "permission": {
     "edit": "allow",
     "webfetch": "allow",
     "bash": "ask"
+  },
+  "provider": {
+    "openrouter": {
+      "options": {
+        "extraBody": { "parallel_tool_calls": false }
+      }
+    }
   },
   "mcp": {}
 }

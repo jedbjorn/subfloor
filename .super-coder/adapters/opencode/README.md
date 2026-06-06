@@ -25,6 +25,22 @@ harness-specific file OpenCode wants and the launch command.
   loading `CLAUDE.md` (we dual-write both with identical content; this avoids a
   double-load). ⚠ The exact env name is a **research flag to verify on live
   OpenCode** — if wrong it's a harmless no-op (the content is identical anyway).
+- **`tool-discipline.md`** + its entry in `instructions` — a static, harness-level
+  steer (not part of the render-chain-generated `AGENTS.md`, so it survives
+  regeneration). It tells the model never to emit tool calls as text/XML and never
+  to call the synthetic `invalid`/`unknown` tools. This breaks a **compounding
+  failure loop** seen with text-tool-call models (Qwen/Hermes): one malformed call
+  makes OpenCode inject its own `invalid`-tool error into context, which the model
+  then parrots back as more malformed calls. Referenced in place under
+  `.super-coder/adapters/opencode/` (path is relative to the repo root where
+  OpenCode runs); not emitted, just read.
+- **`provider.openrouter.options.extraBody.parallel_tool_calls: false`** — caps the
+  model to one tool call per turn over OpenRouter. Fewer batched calls means fewer
+  chances for a single malformed entry to poison the turn; a known stabilizer for
+  Qwen tool-calling. `extraBody` is merged straight into the request body by
+  OpenCode's bundled AI SDK (verified in the binary), so it reliably overrides the
+  default. Provider-scoped (all OpenRouter models); harmless for non-Qwen models.
+  `reasoning` is intentionally left untouched — the next dial if noise persists.
 
 ## Verify on live OpenCode (research flags from the spec)
 
