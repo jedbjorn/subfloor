@@ -75,6 +75,7 @@ a.act { text-decoration: none; display: inline-block; }
 .seed-entry, .lns-entry { margin: .5rem 0; padding-left: .6rem; border-left: 1px solid var(--line); }
 .seed-entry .d { color: var(--dim); font-size: .78rem; }
 details summary { cursor: pointer; color: var(--accent); }
+.search { margin: 0 0 1rem; }
 .filters { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
 .chip {
   background: var(--panel2); color: var(--dim); border: 1px solid var(--line);
