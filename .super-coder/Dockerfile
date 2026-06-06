@@ -1,9 +1,11 @@
 # super-coder sandbox image — the *environment*, not the code.
 #
 # The repo is bind-mounted at runtime (see `./sc launch`); this image carries
-# only what the harness needs to run: python3 + sqlite3, git/curl, and the two
+# what the harness needs to run: python3 + sqlite3, git/curl, gh, and the two
 # harness CLIs baked in via their official native installers (the same ones
 # install.py uses — keep the URLs in sync with scripts/install.py HARNESS_INSTALL).
+# It also carries the common *project* runtimes a forked repo's dev surface needs
+# (node LTS), so `npm`/dev servers work without an ephemeral in-container install.
 #
 # Why bake the binaries but mount the creds: claude installs as a symlink into
 # ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode is a fat
@@ -36,6 +38,17 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+# Node.js LTS — a *project* runtime, not a harness dep. Forked repos increasingly
+# ship a JS/TS dev surface (vite/SvelteKit/etc); without node baked in, a shell
+# can run `npm` only by installing into the ephemeral container FS, which
+# evaporates on the next rebuild. Baked here it persists like python3. The
+# "no npm" note on the harness install below still holds — that's about how
+# claude/opencode get installed, not a ban on node for project work. NodeSource's
+# apt repo pins a clean LTS major (same pipe-to-bash idiom as the installers).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.

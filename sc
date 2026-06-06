@@ -14,6 +14,7 @@ DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
 
 port() { "$PY" "$S/ports.py" port; }
+devport() { "$PY" "$S/ports.py" devport; }
 
 # Host-side docker orchestration (raw docker — no compose plugin dependency).
 # The sandbox runs as you (uid/gid → no root-owned files), bind-mounts this repo
@@ -89,6 +90,7 @@ case "$cmd" in
     dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
+    dp="$(devport)"
     dbuild
     # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
     # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
@@ -102,7 +104,7 @@ case "$cmd" in
     docker run -d --name "$CNAME" --restart unless-stopped \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
-      -e SC_SANDBOX=1 \
+      -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
       -e GH_TOKEN="$gh_token" \
       -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
       -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
@@ -113,8 +115,10 @@ case "$cmd" in
       -v "$HOME/.config/opencode:$HOME/.config/opencode" \
       -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
       -p "127.0.0.1:$p:$p" \
+      -p "127.0.0.1:$dp:$dp" \
       "$IMG" ./sc serve --port "$p" >/dev/null
     echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
+    echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
     echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)" ;;
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
