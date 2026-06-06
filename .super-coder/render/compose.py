@@ -185,6 +185,7 @@ def fetch_counts(con, shell_id: int) -> dict:
         "seed": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='seed' AND is_deleted=0 AND retired_at IS NULL"),
         "lns": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL"),
         "flags": one("SELECT COUNT(*) FROM flags WHERE shell_id=? AND resolved=0 AND is_deleted=0"),
+        "unread": one("SELECT COUNT(*) FROM shell_messages WHERE to_shell_id=? AND read_at IS NULL"),
     }
 
 
@@ -283,6 +284,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         f"- **Seed:** {counts['seed']}",
         f"- **L&S:** {counts['lns']}",
         f"- **Flags:** {counts['flags']} open",
+        f"- **Inbox:** {counts['unread']} unread — `--message check` to surface.",
         f"- **Repo map:** {map_status}",
         f"- **Docs:** {docs_status}",
         "",

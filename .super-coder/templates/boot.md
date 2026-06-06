@@ -32,3 +32,13 @@ any per-shell prompt loads, before any query runs.
 7. L&S is how you work. Operating principles distilled from doing the job. The shell curates — revision allowed. Cap 20.
 
 ---
+
+## MESSAGING
+
+Shells coordinate through an inbox. On boot, if the `## STATUS` `Inbox:` line is
+non-zero, run the `messaging` skill (`--message check`) to surface your unread
+items and act on the first before continuing the session. To message another
+shell, `--message send <shortname> <body>`; mark an item read with
+`--message mark-read <id>` once you've acted on it.
+
+---
