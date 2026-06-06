@@ -7,7 +7,7 @@
   "sandbox": {
     "merge_json": {
       ".claude/settings.json": {
-        "permissions": { "defaultMode": "bypassPermissions" }
+        "permissions": { "defaultMode": "acceptEdits" }
       }
     }
   }
