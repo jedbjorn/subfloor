@@ -82,6 +82,13 @@ def create_shell(con: sqlite3.Connection, *, flavor: str, name: str,
     """Insert a shell from `flavor`, grant its skills, open its first session.
     Returns the new shell_id. Caller commits."""
     tpl = load_flavor(flavor)
+    # Cartographer is a singleton: one map-keeper per fork. Friendly pre-check
+    # here; the trg_singleton_cartographer trigger is the DB backstop. is_deleted=0
+    # so a deleted cartographer frees the slot.
+    if flavor == "cartographer" and con.execute(
+            "SELECT COUNT(*) FROM shells WHERE flavor='cartographer' AND is_deleted=0"
+    ).fetchone()[0] >= 1:
+        raise ValueError("cartographer is a singleton — this fork already has one")
     repo = repo or REPO_ROOT.name
     role = role or tpl["role"]
     mandate = (mandate or tpl["mandate"]).replace("{{repo}}", repo)
