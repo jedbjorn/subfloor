@@ -19,7 +19,8 @@
     </nav>
     <div class="tools">
       <span id="status" class="status"></span>
-      <button id="snapshot" title="make snapshot + render (precursor to B6 auto-commit)">snapshot ⤓</button>
+      <button id="snapshot" title="serialize the DB → content.sql + render the flat _sc files (local only, no git)">snapshot ⤓</button>
+      <button id="publish" class="primary" title="snapshot + render, then commit → push → open/update one PR on the gui-content branch">publish ⤴</button>
     </div>
   </header>
   <main>

@@ -452,6 +452,18 @@ $("#snapshot").onclick = async () => {
   try { const r = await api("/snapshot", "POST"); toast(r.output || "done"); setStatus("snapshot done"); }
   catch (e) { toast("error: " + e.message); }
 };
+$("#publish").onclick = async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  setStatus("publishing…");
+  try {
+    const r = await api("/publish", "POST");
+    toast(r.output || "published");
+    setStatus(r.pr_url ? "published → PR ready" : "published");
+    if (r.pr_url) window.open(r.pr_url, "_blank", "noopener");
+  } catch (e) { toast("publish error: " + e.message); setStatus("publish failed"); }
+  finally { btn.disabled = false; }
+};
 (async () => {
   try { const h = await api("/health"); $("#repo").textContent = h.repo; setStatus("port " + h.port); }
   catch { setStatus("offline"); }

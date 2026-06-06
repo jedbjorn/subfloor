@@ -26,6 +26,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -297,6 +299,146 @@ def run_snapshot_render() -> str:
             + run_script("render")["output"]).strip()
 
 
+# ── Publish: serialize → commit → push → PR (the GUI "publish" button) ─────────
+# Single-rolling-branch model: every GUI edit lands on PUBLISH_BRANCH with ONE
+# open PR to main, so branches never proliferate and main stays clean until you
+# merge. Push + PR need a GitHub token in the env (GH_TOKEN); `./sc launch`
+# forwards it into the sandbox. Without a token the change is still COMMITTED
+# locally — the tree never goes dirty — only the push/PR is skipped, with a clear
+# message. A module lock serializes concurrent publishes (one git index).
+BASE_BRANCH = "main"
+PUBLISH_BRANCH = "gui-content"
+_PUBLISH_LOCK = threading.Lock()
+# The git-tracked text the DB rebuilds from + the flat renders. NOT the .db
+# (gitignored — see the install .gitignore block).
+PUBLISH_PATHS = [
+    ".super-coder/snapshot/content.sql",
+    ".super-coder/schema.sql",
+    ".super-coder/migrations",
+    "specs_sc", "docs_sc", "skills_sc", "roadmap_sc.md",
+]
+
+
+def _git(*args):
+    return subprocess.run(["git", *args], cwd=str(REPO_ROOT),
+                          capture_output=True, text=True)
+
+
+def _gh_token() -> str:
+    return (os.environ.get("SC_GH_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+
+
+def _origin_https() -> str | None:
+    """origin URL as https (ssh `git@host:owner/repo` → https), so a token push
+    needs no ssh keys in the container."""
+    url = _git("remote", "get-url", "origin").stdout.strip()
+    if not url:
+        return None
+    if url.startswith("git@"):
+        url = "https://" + url.split("@", 1)[1].replace(":", "/", 1)
+    if url.startswith("https://") and not url.endswith(".git"):
+        url += ".git"
+    return url
+
+
+def _redact(s: str, token: str) -> str:
+    return s.replace(token, "***") if token else s
+
+
+def git_publish() -> dict:
+    out: list[str] = []
+
+    # 1. serialize the DB → git-tracked text + render the flat files.
+    out.append(run_snapshot_render())
+
+    # 2. land on the rolling branch (created from HEAD on first publish; the
+    #    operator stays on it — editing lives on gui-content, main stays clean).
+    cur = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if cur != PUBLISH_BRANCH:
+        exists = _git("rev-parse", "--verify", "--quiet",
+                      f"refs/heads/{PUBLISH_BRANCH}").returncode == 0
+        sw = (_git("checkout", PUBLISH_BRANCH) if exists
+              else _git("checkout", "-b", PUBLISH_BRANCH))
+        if sw.returncode != 0:
+            return {"ok": False, "output": "\n".join(out) +
+                    f"\n\n✗ can't switch to '{PUBLISH_BRANCH}' from '{cur}':\n"
+                    f"{sw.stderr.strip()}\n\nCheck out '{PUBLISH_BRANCH}' (or commit/"
+                    "stash) before editing."}
+        out.append(f"on branch {PUBLISH_BRANCH} (from {cur})")
+
+    # 3. stage the publishable text + renders; commit if anything is new.
+    #    Filter to paths that exist — `git add` is fatal on a missing pathspec, and
+    #    a minimal fork may lack some (e.g. docs_sc/ before any doc is authored).
+    present = [p for p in PUBLISH_PATHS if (REPO_ROOT / p).exists()]
+    if present:
+        _git("add", "--", *present)
+    staged = _git("diff", "--cached", "--name-only").stdout.strip()
+    if staged:
+        n = len(staged.splitlines())
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        msg = (f"gui: publish content edits ({n} file{'s' if n != 1 else ''})\n\n"
+               f"Serialized + rendered from the review GUI at {stamp}.\n\n"
+               + "\n".join(f"- {f}" for f in staged.splitlines()))
+        c = _git("commit", "-m", msg)
+        if c.returncode != 0:
+            return {"ok": False, "output": "\n".join(out) +
+                    "\n\n✗ commit failed:\n" + (c.stderr or c.stdout).strip()}
+        out.append(f"committed {n} file(s)")
+    else:
+        out.append("no new content to commit")
+
+    # 4. nothing ahead of main → nothing to publish.
+    ahead = _git("rev-list", "--count",
+                 f"{BASE_BRANCH}..{PUBLISH_BRANCH}").stdout.strip() or "0"
+    if ahead == "0":
+        return {"ok": True, "output": "\n".join(out) +
+                f"\n\n✓ {PUBLISH_BRANCH} matches {BASE_BRANCH} — nothing to publish."}
+
+    # 5. token gate: committed locally either way (tree clean), but push/PR needs it.
+    token = _gh_token()
+    if not token:
+        return {"ok": True, "output": "\n".join(out) +
+                f"\n\n⚠ committed on {PUBLISH_BRANCH} ({ahead} commit(s) ahead of "
+                f"{BASE_BRANCH}), but no GH_TOKEN — can't push or open a PR. Set "
+                "SC_GH_TOKEN, or `./sc launch` with a host gh login."}
+
+    # 6. push over token-https (no ssh keys needed).
+    url = _origin_https()
+    if not url:
+        return {"ok": False, "output": "\n".join(out) +
+                "\n\n✗ no 'origin' remote to push to."}
+    push_url = url.replace("https://", f"https://x-access-token:{token}@", 1)
+    p = _git("push", push_url, f"{PUBLISH_BRANCH}:{PUBLISH_BRANCH}")
+    if p.returncode != 0:
+        return {"ok": False, "output": "\n".join(out) +
+                "\n\n✗ push failed:\n" + _redact((p.stderr or p.stdout).strip(), token)}
+    out.append(f"pushed {PUBLISH_BRANCH} → origin ({ahead} commit(s) ahead)")
+
+    # 7. upsert ONE PR (gh reads the token from the env).
+    env = {**os.environ, "GH_TOKEN": token}
+
+    def gh(*args):
+        return subprocess.run(["gh", *args], cwd=str(REPO_ROOT),
+                              capture_output=True, text=True, env=env)
+
+    pr_url = gh("pr", "view", PUBLISH_BRANCH, "--json", "url", "-q", ".url").stdout.strip()
+    if not pr_url:
+        cr = gh("pr", "create", "--base", BASE_BRANCH, "--head", PUBLISH_BRANCH,
+                "--title", "GUI content edits",
+                "--body", "Rolling PR for content edited via the super-coder "
+                "review GUI (roadmap, docs, flags, identity). Auto-updated on each "
+                "publish; merge to land on main.")
+        if cr.returncode != 0:
+            return {"ok": False, "output": "\n".join(out) +
+                    "\n\n✗ PR create failed:\n" + _redact((cr.stderr or cr.stdout).strip(), token)}
+        pr_url = cr.stdout.strip()
+        out.append(f"opened PR: {pr_url}")
+    else:
+        out.append(f"updated PR: {pr_url}")
+
+    return {"ok": True, "output": "\n".join(out), "pr_url": pr_url}
+
+
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -404,6 +546,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, {"shell_id": sid, "shortname": sn})
             if path == "/api/snapshot":
                 return self._send(200, {"output": run_snapshot_render()})
+            if path == "/api/publish":
+                with _PUBLISH_LOCK:
+                    r = git_publish()
+                return self._send(200 if r["ok"] else 500, r)
             if path.startswith("/api/scripts/"):
                 r = run_script(path.rsplit("/", 1)[1])
                 if r is None:

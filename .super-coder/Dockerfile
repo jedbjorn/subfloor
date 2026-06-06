@@ -26,6 +26,18 @@ RUN apt-get update \
       sqlite3 git curl bash ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI (gh) — the in-container push/PR path: the GUI "publish" flow
+# (snapshot → render → commit → push → PR) and shells that open their own PRs.
+# Not in Debian's default repos, so add the official gh apt source. Auth is NOT
+# baked: the token arrives at runtime via GH_TOKEN (`./sc launch` forwards the
+# host's `gh auth token`, or a repo-scoped SC_GH_TOKEN) — never in the image.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 RUN groupadd -g ${SC_GID} ${SC_USER} \
  && useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}
