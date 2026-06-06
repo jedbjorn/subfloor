@@ -52,6 +52,18 @@ ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 RUN curl -fsSL https://claude.ai/install.sh | bash \
  && curl -fsSL https://opencode.ai/install | bash
 
+# Safe in-container git auth — structurally prevents a token in a URL. The
+# sandbox has no ssh, so `git@github.com:` remotes (e.g. a fork's default
+# origin) fail and tempt a `https://x-access-token:$TOK@github.com/...` fallback
+# that leaks the token to logs / `push -u` upstream output. Two configs close
+# that: (1) rewrite GitHub SSH remotes to HTTPS so plain `git push origin`
+# works; (2) hand credentials to git via `gh`, which serves them from the
+# runtime GH_TOKEN on demand — never on the command line, never in a URL. With
+# this, `git push origin <branch>` and `gh pr create` need zero manual token
+# handling; absent a token they fail closed (no prompt-loop, no leak).
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:" \
+ && git config --global credential."https://github.com".helper "!gh auth git-credential"
+
 WORKDIR /home/${SC_USER}/super-coder
 
 # Foreground stdlib server (api + static UI on one port). compose overrides the
