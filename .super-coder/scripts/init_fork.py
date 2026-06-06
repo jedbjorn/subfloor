@@ -4,12 +4,12 @@
 A fresh fork's `.db` carries the *system* (schema + migrations: the skill
 catalogue, the render chain) but **no per-instance content** — a fork inherits
 the system, never super-coder's memory or roadmap. So a just-installed fork has
-no users and no shells, and `./sc launch` has nothing to authenticate or boot.
+no users and no shells, and `./sc enter` has nothing to authenticate or boot.
 This provisions the local user, then creates the first shell via the shared
 shell factory (a flavor template — default `dev`).
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
-exists. After it runs: `./sc snapshot`, then `./sc launch`. Additional shells are
+exists. After it runs: `./sc snapshot`, then `./sc enter`. Additional shells are
 created later via the GUI (also through the factory).
 
 Usage:
@@ -118,7 +118,7 @@ def main(argv: list[str]) -> int:
               f"for user '{username}' — {n} skills, lineage + genesis seed, session opened.")
         print(f"init_fork: created '{cart_sn}' (cartographer, shell_id={cart_id}) "
               "— owns the repo map.")
-        print("init_fork: next -> `./sc snapshot` (serialize), then `./sc launch`.")
+        print("init_fork: next -> `./sc snapshot` (serialize), then `./sc enter`.")
     finally:
         con.close()
     return 0

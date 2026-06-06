@@ -1,9 +1,9 @@
 #!/bin/sh
 # super-coder entry point — the dispatcher. All engine logic lives here so it
-# travels with a fork (install.py checks out .super-coder + sc). Host commands
-# (launch/enter/down) drive a docker sandbox; the in-container primitives
-# (serve/boot) need only python3 + sqlite3 and double as the no-docker host
-# escape hatch. Run from the repo root:  ./sc <command> [args]   ·   ./sc help
+# travels with a fork (install.py checks out .super-coder + sc). The shell runs
+# directly on the host (no container): `enter`/`boot` boot a harness in this repo
+# with allow-all permissions; `launch` backgrounds the optional review GUI. Needs
+# only python3 + sqlite3. Run from the repo root:  ./sc <command> [args] · ./sc help
 set -e
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$here"
@@ -15,60 +15,21 @@ S="$ENGINE/scripts"
 
 port() { "$PY" "$S/ports.py" port; }
 
-# Host-side docker orchestration (raw docker — no compose plugin dependency).
-# The sandbox runs as you (uid/gid → no root-owned files), bind-mounts this repo
-# at its host path + your harness creds rw, and publishes this fork's derived
-# port to 127.0.0.1 only. The in-container primitives (`serve`, `boot`) need no
-# docker and so run the same whether on the host or inside the container.
-IMG=super-coder-sandbox
-CNAME="sc-$(basename "$here")"   # unique per fork, like the pm2 name
-
-# Fail fast with the fix if the docker daemon isn't reachable, instead of a
-# cryptic build/run error. Host setup is one-time and lives in `./sc doctor` /
-# `./sc install` — it needs sudo + a re-login, so it can't fold into launch.
-dcheck() {
-  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-    echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc serve + ./sc boot" >&2
-    exit 1
-  fi
-}
-
-# Ensure the harness cred mount-sources exist as the RIGHT TYPE before docker
-# bind-mounts them. A missing DIR source is harmless (docker makes a dir), but a
-# missing FILE source (~/.claude.json) gets auto-created as a directory and
-# breaks claude — so seed it with empty json. Real creds come from a one-time
-# host login (`./sc doctor` guides it); this just keeps the mounts valid.
-dcreds() {
-  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" 2>/dev/null || true
-  [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
-}
-
-# Which in-container uid writes the bind-mounted repo as YOU on the host.
-# Rootless docker maps container-root → host-you, so run as root (it is not real
-# root — just your user inside the namespace). Rootful maps uid 1:1, so run as
-# your uid. Get this wrong and the mount is read-only-ish (EACCES on write).
-duser() {
-  if docker info 2>/dev/null | grep -qi rootless; then echo "0:0"
-  else echo "$(id -u):$(id -g)"; fi
-}
-
-# Build the env image (the repo is bind-mounted at run time, never baked — see
-# .dockerignore: the build context is empty). Cheap to re-run; layers cache.
-dbuild() {
-  docker build -t "$IMG" -f "$ENGINE/Dockerfile" \
-    --build-arg SC_USER="$(id -un)" \
-    --build-arg SC_UID="$(id -u)" \
-    --build-arg SC_GID="$(id -g)" \
-    "$here"
-}
+# The review GUI (api + static UI) runs as a backgrounded host process; its pid
+# + log live under .super-coder/run/ so `down` can stop it and `logs` can tail
+# it. Booting a harness needs none of this — `enter`/`boot` just exec run.py on
+# the host, in this repo, with allow-all permissions (the host IS the trust
+# boundary now; SC_TRUST=0 reverts to normal prompts).
+RUN="$ENGINE/run"
+PIDFILE="$RUN/serve.pid"
+LOGFILE="$RUN/serve.log"
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
   install)         exec "$PY" "$S/install.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
-  doctor)          exec "$PY" "$S/install.py" --check-docker ;;
+  doctor)          exec "$PY" "$S/install.py" --check-host ;;
   update)       exec "$PY" "$S/update.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
@@ -79,48 +40,34 @@ case "$cmd" in
   map-setup)    exec "$PY" "$S/map_setup.py" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
-  # ── in-container primitives (no docker; also the host escape hatch) ──
+  # ── boot a harness on the host (the way to run) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
-  # ── docker sandbox (host-side; the default way to run) ──
+  enter)        exec "$PY" "$S/run.py" "$@" ;;
+  enter-*)      exec "$PY" "$S/run.py" "${cmd#enter-}" "$@" ;;
+  # ── review GUI (optional; backgrounded host process, 127.0.0.1 only) ──
   launch)
-    dcheck
-    dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
-    dbuild
-    # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
-    # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
-    # host's gh login. NOTE: this widens the sandbox — anything in the container
-    # can act as you on GitHub within the token's scope. A fine-grained,
-    # single-repo PAT in SC_GH_TOKEN is the tighter option.
-    gh_token="${SC_GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
-    git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
-    git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
-    docker rm -f "$CNAME" >/dev/null 2>&1 || true
-    docker run -d --name "$CNAME" --restart unless-stopped \
-      --user "$(duser)" \
-      -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
-      -e SC_SANDBOX=1 \
-      -e GH_TOKEN="$gh_token" \
-      -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
-      -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
-      -w "$here" \
-      -v "$here:$here" \
-      -v "$HOME/.claude:$HOME/.claude" \
-      -v "$HOME/.claude.json:$HOME/.claude.json" \
-      -v "$HOME/.config/opencode:$HOME/.config/opencode" \
-      -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
-      -p "127.0.0.1:$p:$p" \
-      "$IMG" ./sc serve --port "$p" >/dev/null
-    echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
+    mkdir -p "$RUN"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "→ review GUI already up (pid $(cat "$PIDFILE")) · http://127.0.0.1:$p"
+    else
+      nohup "$PY" "$ENGINE/api/server.py" --port "$p" >"$LOGFILE" 2>&1 &
+      echo $! > "$PIDFILE"
+      echo "→ review GUI up (pid $(cat "$PIDFILE")) · http://127.0.0.1:$p"
+    fi
     echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)" ;;
-  enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
-  enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
-  down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running" ;;
-  build)        dcheck; dbuild ;;
-  logs)         exec docker logs -f "$CNAME" ;;
+  down)
+    if [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null; then
+      rm -f "$PIDFILE"; echo "→ review GUI stopped"
+    else
+      rm -f "$PIDFILE"; echo "→ not running"
+    fi ;;
+  logs)
+    if [ -f "$LOGFILE" ]; then exec tail -f "$LOGFILE"
+    else echo "→ no log yet — run ./sc launch first"; exit 1; fi ;;
   verify)
     "$PY" "$S/rebuild.py"
     "$PY" "$S/render.py" flat
@@ -133,7 +80,7 @@ super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode if missing (official native installers, no npm)
-  ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
+  ./sc doctor              host readiness: harness installed + harness login
   ./sc update              self-fetch the engine + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
@@ -144,20 +91,19 @@ super-coder — forkable shell substrate
   ./sc seed-skills         regenerate the skills seed migration from assets/skills/
   ./sc init                seed a fresh fork's first user + shell (run once after install)
 
-  Sandbox (docker — the default way to run; allow-everything is safe because the
-  container only sees this repo + your harness creds):
-  ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
-  ./sc enter               attach an interactive session: auth + pick shell + pick harness + boot
-  ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
+  Run on the host (allow-all permissions — no container; you trust the model +
+  this repo. Off-switch: SC_TRUST=0 keeps normal permission prompts):
+  ./sc enter               boot a shell: auth + pick shell + pick harness + boot
+  ./sc enter-<shortname>   boot that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
-  ./sc down                stop + remove the sandbox container
-  ./sc build               (re)build the sandbox image
-  ./sc logs                tail the sandbox server logs
+  ./sc boot [shortname]    alias of enter (the in-engine primitive name)
 
-  Primitives (run inside the container; also the no-docker host escape hatch):
-  ./sc serve               run the review layer (api + static UI) in the foreground
-  ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
+  Review GUI (optional; backgrounded host process, 127.0.0.1 only):
+  ./sc launch              start the review layer (api + static UI) in the background
+  ./sc serve               run the review layer in the foreground instead
+  ./sc down                stop the backgrounded review layer
+  ./sc logs                tail the review layer log
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health

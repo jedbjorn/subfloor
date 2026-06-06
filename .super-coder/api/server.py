@@ -72,8 +72,8 @@ def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=5)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
-    # The server and a harness session now write this DB from separate processes
-    # (both share the bind-mounted file in the sandbox). WAL lets a reader and a
+    # The server and a harness session now write this DB from separate host
+    # processes (the same file on disk). WAL lets a reader and a
     # writer coexist; busy_timeout makes a contended write wait instead of raising
     # "database is locked". WAL is a persistent DB property — set once, sticks.
     con.execute("PRAGMA journal_mode=WAL")
@@ -302,8 +302,8 @@ def run_snapshot_render() -> str:
 # ── Publish: serialize → commit → push → PR (the GUI "publish" button) ─────────
 # Single-rolling-branch model: every GUI edit lands on PUBLISH_BRANCH with ONE
 # open PR to main, so branches never proliferate and main stays clean until you
-# merge. Push + PR need a GitHub token in the env (GH_TOKEN); `./sc launch`
-# forwards it into the sandbox. Without a token the change is still COMMITTED
+# merge. Push + PR need a GitHub token in the env (GH_TOKEN) or a configured
+# `gh` login on the host. Without a token the change is still COMMITTED
 # locally — the tree never goes dirty — only the push/PR is skipped, with a clear
 # message. A module lock serializes concurrent publishes (one git index).
 BASE_BRANCH = "main"
@@ -330,7 +330,7 @@ def _gh_token() -> str:
 
 def _origin_https() -> str | None:
     """origin URL as https (ssh `git@host:owner/repo` → https), so a token push
-    needs no ssh keys in the container."""
+    needs no ssh keys."""
     url = _git("remote", "get-url", "origin").stdout.strip()
     if not url:
         return None
@@ -400,7 +400,8 @@ def git_publish() -> dict:
         return {"ok": True, "output": "\n".join(out) +
                 f"\n\n⚠ committed on {PUBLISH_BRANCH} ({ahead} commit(s) ahead of "
                 f"{BASE_BRANCH}), but no GH_TOKEN — can't push or open a PR. Set "
-                "SC_GH_TOKEN, or `./sc launch` with a host gh login."}
+                "GH_TOKEN / SC_GH_TOKEN in the env that started the GUI (a host "
+                "`gh auth login` populates GH_TOKEN)."}
 
     # 6. push over token-https (no ssh keys needed).
     url = _origin_https()
@@ -620,9 +621,8 @@ def main(argv):
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `make rebuild` first.")
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
-    # network controls). In the container set SC_BIND=0.0.0.0 so docker can
-    # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
-    # keeps it loopback-only on the host regardless of the in-container bind.
+    # network controls). SC_BIND can override (e.g. 0.0.0.0) for an operator who
+    # fronts it with their own reverse-proxy / firewall.
     bind = os.environ.get("SC_BIND", "127.0.0.1")
     httpd = ThreadingHTTPServer((bind, port), Handler)
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")

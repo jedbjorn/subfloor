@@ -76,18 +76,20 @@ def _deep_merge(base: dict, patch: dict) -> dict:
     return base
 
 
-def apply_sandbox(adapter: dict) -> list[str]:
-    """Sandbox-only: elevate harness permissions to allow-all when booting
-    INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
-    container is the safety boundary, so permission prompts inside it are pure
-    friction; the no-docker host escape hatch (`./sc boot` with SC_SANDBOX
-    unset) keeps normal prompts. Each adapter declares sandbox.merge_json:
-    {repo-relative-path: patch}; we deep-merge the patch into that
-    project-scoped file (preserving any keys the fork set). Paths are
-    repo-relative, so this never touches host-global config (~/.claude etc.)."""
-    if not os.environ.get("SC_SANDBOX"):
+def apply_trust(adapter: dict) -> list[str]:
+    """Elevate harness permissions to allow-all on boot — the DEFAULT, since the
+    shell now runs directly on the host and the host (the repo you trust + the
+    model) IS the boundary; there is no container to be the boundary anymore.
+    Off-switch: SC_TRUST in {0,false,no,off} reverts to normal permission
+    prompts (for a cautious fork or a one-off careful launch). Each adapter
+    declares trust.merge_json: {repo-relative-path: patch}; we deep-merge the
+    patch into that project-scoped file (preserving any keys the fork set).
+    Paths are repo-relative, so this never touches host-global config
+    (~/.claude etc.) — and the targets (e.g. .claude/settings.local.json,
+    opencode.json) are gitignored launch artifacts, never tracked config."""
+    if os.environ.get("SC_TRUST", "1").strip().lower() in ("0", "false", "no", "off"):
         return []
-    spec = (adapter.get("sandbox") or {}).get("merge_json") or {}
+    spec = (adapter.get("trust") or {}).get("merge_json") or {}
     touched = []
     for rel, patch in spec.items():
         dst = REPO_ROOT / rel
@@ -244,7 +246,7 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
     if not shells:
         sys.exit("FATAL: no shells available to this user.")
     if requested:
-        # Case-insensitive: auto-names are upper (DEV3) but `./sc launch-dev3` works.
+        # Case-insensitive: auto-names are upper (DEV3) but `./sc enter-dev3` works.
         chosen = next((s for s in shells if (s["shortname"] or "").lower()
                        == requested.lower()), None)
         if chosen is None:
@@ -387,9 +389,11 @@ def main() -> None:
     print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
-    sandboxed = apply_sandbox(adapter)
-    if sandboxed:
-        print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
+    trusted = apply_trust(adapter)
+    if trusted:
+        print(f"→ trust: allow-all permissions → {', '.join(trusted)}")
+    elif os.environ.get("SC_TRUST", "1").strip().lower() in ("0", "false", "no", "off"):
+        print("→ trust: OFF (SC_TRUST) — normal permission prompts")
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")

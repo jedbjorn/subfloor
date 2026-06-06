@@ -103,8 +103,10 @@ and the static `ui/` (one page, vanilla JS) on a single per-fork port.
 
 `scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
 100`), bumping past anything occupied, and persists it to the gitignored
-`instance.json`. The server runs inside the docker sandbox (`Dockerfile` +
-`./sc launch`/`down`); the container is named `sc-<repo>` so forks never clash,
-and the port publishes to `127.0.0.1` only. `./sc serve` runs it on the host
-without docker (the escape hatch). `ecosystem.config.cjs` (pm2) is legacy from
-the pre-docker host model and no longer on the default path.
+`instance.json`. The shell runs **directly on the host** — no container: `./sc
+enter` boots a harness in this repo with allow-all permissions (the host is the
+trust boundary; `SC_TRUST=0` reverts to normal prompts). `./sc launch`
+backgrounds the optional review GUI (api + static UI, `127.0.0.1` only; `./sc
+down` / `./sc logs` manage it), or `./sc serve` runs it in the foreground.
+`ecosystem.config.cjs` (pm2) is an alternative way to keep the GUI alive, not on
+the default path.

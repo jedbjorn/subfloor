@@ -16,9 +16,17 @@
 # Only the render output is ignored; a fork's own .claude/settings stays tracked.
 /.claude/skills/
 
+# Allow-all trust override, written at boot (Claude's local, gitignored-by-
+# convention settings file). A launch artifact like the boot doc — never tracked,
+# so it can't clobber a fork's committed .claude/settings.json.
+/.claude/settings.local.json
+
 # Per-instance local config — derived ports etc. Local to this fork, never
 # propagates (re-derived from the repo path if absent). Hand-overridable.
 /.super-coder/instance.json
+
+# Backgrounded review-GUI pid + log (./sc launch → ./sc down / ./sc logs).
+/.super-coder/run/
 
 # Python / tooling
 __pycache__/

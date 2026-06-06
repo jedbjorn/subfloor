@@ -8,19 +8,18 @@
 # overwrites a Makefile you already have. Delete the include and you lose
 # nothing — `./sc <cmd>` is identical.
 #
-#   make launch         build + start the docker sandbox (+ review GUI)
-#   make enter          attach an interactive session (pick shell + harness)
-#   make enter s=ap01   attach + boot the 'ap01' shell directly
-#   make down           stop the sandbox
+#   make enter          boot a shell on the host (pick shell + harness)
+#   make enter s=ap01   boot the 'ap01' shell directly
+#   make launch         start the review GUI in the background
+#   make down           stop the review GUI
 #   make sc ARGS=health run any ./sc subcommand (passthrough)
 #
 SC := ./sc
-.PHONY: launch enter down build logs serve health ports verify update snapshot render map install sc
+.PHONY: launch enter down logs serve health ports verify update snapshot render map install sc
 
 launch:   ; $(SC) launch
 enter:    ; $(SC) $(if $(s),enter-$(s),enter)
 down:     ; $(SC) down
-build:    ; $(SC) build
 logs:     ; $(SC) logs
 serve:    ; $(SC) serve
 health:   ; $(SC) health

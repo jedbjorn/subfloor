@@ -8,8 +8,8 @@
 # shared with forks (install wires a fork to include the same file). Edit the
 # aliases there, not here.
 #
-#   make launch            build + start the docker sandbox
-#   make enter             attach an interactive session (pick shell + harness)
-#   make enter s=cc        attach + boot the 'cc' shell directly
-#   make down              stop the sandbox
+#   make enter             boot a shell on the host (pick shell + harness)
+#   make enter s=cc        boot the 'cc' shell directly
+#   make launch            start the review GUI in the background
+#   make down              stop the review GUI
 include .super-coder/aliases.mk

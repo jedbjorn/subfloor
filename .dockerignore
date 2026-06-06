@@ -1,4 +1,0 @@
-# The sandbox image COPYs nothing from the build context (the repo is bind-
-# mounted at runtime, not baked). So send the daemon an empty context — keeps
-# builds fast and avoids tar'ing .git / the .db / node_modules.
-*

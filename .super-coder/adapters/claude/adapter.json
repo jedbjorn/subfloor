@@ -4,10 +4,10 @@
   "boot_artifact": "CLAUDE.md",
   "emit": [],
   "env": {},
-  "sandbox": {
+  "trust": {
     "merge_json": {
-      ".claude/settings.json": {
-        "permissions": { "defaultMode": "acceptEdits" }
+      ".claude/settings.local.json": {
+        "permissions": { "defaultMode": "bypassPermissions" }
       }
     }
   }
