@@ -8,7 +8,7 @@ common: true
 # db_map — super-coder's DB at a glance
 
 Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
-`schema.sql` + `migrations/*.sql` + `snapshot/content.sql`). All identity,
+`schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
 memory, and content live in tables — never flat files. **The `.db` is a cache:**
 after any content write, `./sc snapshot` re-serializes to text (see the
 `snapshot` skill). Lazy-load: query for what you need, don't bulk-read.

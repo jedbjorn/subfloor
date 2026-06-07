@@ -2,7 +2,7 @@
 """Serialize this fork's per-instance content + memory to text.
 
 Dumps the per-instance tables of the live `shell_db.db` to
-`.super-coder/snapshot/content.sql` as a deterministic, idempotent SQL script:
+`.sc-state/content.sql` as a deterministic, idempotent SQL script:
 each table is `DELETE`d then re-`INSERT`ed in primary-key order, so re-running
 produces a byte-identical file (clean git diffs) and loading it is repeatable.
 
@@ -22,8 +22,13 @@ import sqlite3
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
+REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
-OUT_PATH = ENGINE / "snapshot" / "content.sql"
+# Per-fork memory lives OUTSIDE the gitignored engine dir (B7) — see rebuild.py.
+OUT_PATH = REPO_ROOT / ".sc-state" / "content.sql"
+# One-release cleanup: if a not-yet-migrated fork still carries the old in-engine
+# copy, remove it once we write the new one so it can't shadow or drift.
+LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
 
 # Per-instance tables, parents-before-children for readability. The `skills`
 # catalogue and `schema_migrations` ledger are excluded — they are SYSTEM
@@ -129,7 +134,16 @@ def main() -> int:
         OUT_PATH.write_text("\n".join(out) + "\n")
     finally:
         con.close()
-    print(f"snapshot: wrote {OUT_PATH.relative_to(ENGINE.parent)}")
+    # Relocate-on-write: drop a stale legacy copy so the new .sc-state/ path is
+    # the single source after the first snapshot post-B7.
+    if LEGACY_PATH.exists():
+        LEGACY_PATH.unlink()
+        try:
+            LEGACY_PATH.parent.rmdir()  # remove empty snapshot/ dir
+        except OSError:
+            pass
+        print(f"snapshot: removed legacy {LEGACY_PATH.relative_to(REPO_ROOT)}")
+    print(f"snapshot: wrote {OUT_PATH.relative_to(REPO_ROOT)}")
     return 0
 
 

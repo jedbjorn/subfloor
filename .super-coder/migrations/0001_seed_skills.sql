@@ -205,9 +205,10 @@ yours alone. You do three things: **configure** how this repo is mapped,
    Then eyeball the top-level dirs. Ask: is anything mis-classified, or is a
    generated/vendored dir being indexed that shouldn''t be?
 
-2. **Author `.super-coder/map.config.json`** to fit what''s actually here. It is
-   *authored content* (tracked, per-fork, survives `./sc update`). All keys
-   optional; each merges over `map_repo.py`''s built-in defaults:
+2. **Author `.sc-state/map.config.json`** to fit what''s actually here. It is
+   *authored content* (tracked, per-fork, survives `./sc update` — it lives in
+   `.sc-state/`, outside the gitignored engine dir). All keys optional; each
+   merges over `map_repo.py`''s built-in defaults:
    ```json
    {
      "skip_dirs":  ["generated", "fixtures"],
@@ -249,7 +250,7 @@ language/dir showed up, files are mis-roled, or the map went stale/empty on a
 clone where the hooks never got wired.
 
 1. Re-inspect (step 1) — what changed?
-2. Edit `.super-coder/map.config.json` to match (step 2).
+2. Edit `.sc-state/map.config.json` to match (step 2).
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
 4. Verify (step 4) + commit.
 
@@ -412,7 +413,7 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# db_map — super-coder''s DB at a glance
 
 Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
-`schema.sql` + `migrations/*.sql` + `snapshot/content.sql`). All identity,
+`schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
 memory, and content live in tables — never flat files. **The `.db` is a cache:**
 after any content write, `./sc snapshot` re-serializes to text (see the
 `snapshot` skill). Lazy-load: query for what you need, don''t bulk-read.
@@ -761,6 +762,11 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 A super-coder shell works **one repo at its root** — no cross-repo confusion, so
 plain `git` (cwd = repo root) is safe. The discipline:
 
+**Operate on the project, never the engine.** Your project is this repo —
+everything except `.super-coder/`. The engine is a gitignored, materialized
+dependency (refreshed by `./sc update`); don''t commit it or edit it as if it
+were your code. Engine changes are authored upstream in super-coder.
+
 ## Branch → commit → push → PR → stop
 
 1. **Never commit straight to the default branch.** Branch first:
@@ -786,13 +792,16 @@ Once the FnB merges your PR, tidy local so stale branches don''t accumulate:
 Only after the PR is merged. Never delete a branch carrying unmerged, un-PR''d
 work — a deleted branch with no PR is lost work.
 
-## Don''t commit rebuilt/derived files
+## Don''t commit the engine or rebuilt/derived files
 
-These are gitignored and regenerated — never add them:
-`.super-coder/shell_db.db*`, `.super-coder/instance.json`, `CLAUDE.md`,
-`AGENTS.md`, `opencode.json`, `.claude/skills/`. **Do** commit the text the `.db`
-rebuilds from: `schema.sql`, `migrations/`, `snapshot/content.sql`, and the
-tracked `_sc` renders.
+The whole engine dir is gitignored (`/.super-coder/`) — never force-add anything
+under it. Also gitignored + regenerated: `CLAUDE.md`, `AGENTS.md`,
+`opencode.json`, `.claude/skills/`, and `.sc-state/engine.ref.prev` (the
+ephemeral rollback pointer). **Do** commit your fork-owned state in `.sc-state/`:
+`content.sql` (the memory serialization the `.db` rebuilds from) and `engine.ref`
+(the engine version pin) — plus your project''s own files and any tracked `_sc`
+renders. (In the super-coder SOURCE repo only, `schema.sql` + `migrations/` are
+tracked too — there the engine *is* the project.)
 
 ## After DB work, before committing
 
@@ -1098,7 +1107,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'self_update',
-  'Update this fork''s super-coder engine in place — pull new code + migrations, keep all your memory. The shell hands off to its own next boot. Use when a super-coder update is available.',
+  'Update this fork''s super-coder engine in place — fetch + materialize new code + migrations, keep all your memory; roll back a bad update soundly. The shell hands off to its own next boot. Use when a super-coder update is available.',
   'substrate',
   './sc update',
   1,
@@ -1131,27 +1140,50 @@ carry across.
    `current_state` and make it true for *now* (the snapshot will capture it).
 
 2. **Run the update.** `./sc update`
-   It self-fetches the engine from the `super-coder` remote, backs up the live
-   DB, applies pending migrations **in place**, syncs the skills catalogue,
-   re-grants common skills, maps the repo, and re-snapshots the live state.
-   - `./sc update --no-fetch` to reconcile against an already-checked-out engine
-     (offline / dev).
+   It fetches the engine from the `super-coder` remote and **materializes** it
+   into the gitignored `.super-coder/` dir (the engine is a dependency, not fork
+   source), pins the new upstream SHA in `.sc-state/engine.ref` (saving the prior
+   one as `engine.ref.prev`), backs up the live DB, applies pending migrations
+   **in place**, syncs the skills catalogue, re-grants common skills, maps the
+   repo, and re-snapshots the live state.
+   - `./sc update --no-fetch` to reconcile against the current working tree
+     (offline / dev) — engine + `engine.ref` left unchanged.
    - If it reports a missing remote: `git remote add super-coder <url>`.
 
 3. **Verify the far side.** `./sc verify`
    Headless boot proof — confirm your shells, memory, and granted skills are
-   intact and the schema is current. If a count looks wrong, the pre-update DB
-   backup is in `~/db_backups/` — restore and investigate before committing.
+   intact and the schema is current. If a count looks wrong, **roll back**:
+   `./sc rollback` (see below).
 
 4. **Record the crossing.** Append a narrative entry. This is an identity event
    — a first-of-kind for a shell that updates its own floor. Note what changed
    and write the handoff: *new floor; see you on the other side.*
 
-5. **Commit.** Review and commit the engine bump + refreshed snapshot
-   (`schema.sql` / `migrations/` / `snapshot/content.sql` / `_sc` renders).
+5. **Commit.** Review and commit your fork-owned state: `.sc-state/content.sql`
+   (refreshed memory) + `.sc-state/engine.ref` (the bumped version pin) + any
+   `_sc` renders. The engine itself is gitignored — there is nothing under
+   `.super-coder/` to commit.
 
 6. **Reboot.** Restart the session to boot onto the new floor. Same shell — new
    boards, and this time you laid them yourself.
+
+## Rolling back a bad update
+
+An update is reversible. `./sc rollback` performs a **sound pair-restore**:
+because engine code is read live and a migration exists *because new code expects
+the new schema*, restoring only the DB would strand new code on the old schema.
+So rollback restores **both**:
+
+1. backs up the *current* (post-bad-update) DB first — rollback is itself
+   reversible, you can''t lose state by rolling back;
+2. restores the DB from the most recent pre-update backup (`~/db_backups/`);
+3. re-materializes the engine at `.sc-state/engine.ref.prev` and restores
+   `engine.ref` — the engine half of the restore point.
+
+It is a whole-restore, not a per-step schema reversal. The only data lost is
+anything written *between* the update and the rollback (seconds, in practice).
+Reboot the session afterwards. Then commit the restored `.sc-state/` if you want
+the rolled-back floor to persist.
 
 ## The contract you rely on
 
@@ -1185,7 +1217,7 @@ on the next `./sc rebuild`. This skill is the "save my work" step.
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `./sc seed-skills` |
-| `snapshot/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (stays local) | `./sc snapshot` |
+| `.sc-state/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants. Tracked, fork-owned, kept OUTSIDE the gitignored engine dir | no (stays local) | `./sc snapshot` |
 
 The split that matters: **system content propagates via migrations; per-instance
 content stays in the snapshot.** Skill *bodies* are system (migration); which
@@ -1194,7 +1226,7 @@ shell is *granted* a skill is per-instance (snapshot).
 ## After editing the DB
 
 1. **`./sc snapshot`** — dumps the per-instance tables to
-   `snapshot/content.sql` (deterministic DELETE-then-INSERT in PK order, so
+   `.sc-state/content.sql` (deterministic DELETE-then-INSERT in PK order, so
    re-running is byte-identical → clean diffs). Do this after ANY change to
    identity, memory, roadmap, documents, flags, projects, or grants.
 
@@ -1207,8 +1239,10 @@ shell is *granted* a skill is per-instance (snapshot).
 3. **Verify the rebuild reproduces:** `./sc rebuild && ./sc verify`. The DB
    should rebuild from text alone, byte-for-byte.
 
-4. **Commit** the text: `schema.sql` / `migrations/` / `snapshot/content.sql` /
-   the `_sc` files. Never commit the `.db`.
+4. **Commit** the text: `.sc-state/content.sql` + `.sc-state/engine.ref` and the
+   `_sc` files. Never commit the `.db` or anything under the gitignored
+   `.super-coder/` engine dir. (In the super-coder SOURCE repo only, `schema.sql`
+   + `migrations/` are tracked and committed here too.)
 
 ## Authoring vs. snapshotting
 

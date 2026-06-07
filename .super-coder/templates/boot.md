@@ -10,11 +10,20 @@ is managed through DB tables in `.super-coder/shell_db.db` (resolved from the
 repo root).
 
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
-git-tracked text (`schema.sql` + `migrations/` + `snapshot/content.sql`). It is
+git-tracked text (`schema.sql` + `migrations/` + `.sc-state/content.sql`). It is
 a cache, not the source. This boot artifact (`CLAUDE.md` / `AGENTS.md`) is
 likewise rebuilt at launch — never hand-edit it.
 
 One memory system, not two. Auto-memory is disabled by design.
+
+---
+
+## PROJECT vs ENGINE
+
+**Your project is this repo** — everything except `.super-coder/`.
+`.super-coder/` is the **engine** you run on (your memory + identity
+substrate), a gitignored dependency — do not treat it as the project or edit
+it. Engine changes are authored upstream in super-coder, never here.
 
 ---
 

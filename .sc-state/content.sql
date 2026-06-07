@@ -18,7 +18,7 @@ shell, one repo, one cwd — the inversion that retires cross-repo confusion.
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `snapshot/content.sql`). All identity and memory
+`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
 live in DB tables — no flat-file memory, no harness auto-memory.
 
 | Surface | Where |
@@ -67,7 +67,7 @@ one cwd — no cross-repo confusion.
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `snapshot/content.sql`). All identity and memory
+`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
 live in DB tables — no flat-file memory, no harness auto-memory.
 
 | Surface | Where |

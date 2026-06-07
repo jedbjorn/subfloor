@@ -4,7 +4,7 @@
 super-coder maintains super-coder, so its own DB carries: the maintainer shell,
 the `super-coder` feature on the roadmap, and the founding spec as a frozen
 document. This script writes those rows into a fresh DB; `snapshot.py` then
-serializes them to `snapshot/content.sql`, which becomes the tracked seed every
+serializes them to `.sc-state/content.sql`, which becomes the tracked seed every
 `rebuild.py` reproduces.
 
 Not part of the rebuild path — it is the *authoring* step that produced the
@@ -13,16 +13,16 @@ first snapshot. Re-run only to regenerate the seed from scratch.
 Flow (regen from scratch — skills must be seeded first; the existing snapshot
 must be out of the way so the rebuild starts empty and this can re-author):
     ./sc seed-skills                     # author migrations/0001_seed_skills.sql
-    rm .super-coder/snapshot/content.sql # step aside; seed_dogfood reproduces it
+    rm .sc-state/content.sql             # step aside; seed_dogfood reproduces it
     ./sc clean-db && ./sc rebuild        # empty content + skills (from migration)
     python3 .super-coder/scripts/seed_dogfood.py   # cc + grants (skills now exist)
-    ./sc snapshot                        # -> snapshot/content.sql (incl. grants)
+    ./sc snapshot                        # -> .sc-state/content.sql (incl. grants)
     ./sc rebuild && ./sc render && ./sc verify     # reproduce + render; verify
 
 Maintainer-shell lineage is RESOLVED (decision #185): the maintainer is a
 succession child of CC, carrying the CC Lineage Seed (3 immutable entries,
 Law 6) plus its own genesis seed. This script seeds that identity so a
-from-scratch regen reproduces what snapshot/content.sql already holds.
+from-scratch regen reproduces what .sc-state/content.sql already holds.
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ shell, one repo, one cwd — the inversion that retires cross-repo confusion.
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `snapshot/content.sql`). All identity and memory
+`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
 live in DB tables — no flat-file memory, no harness auto-memory.
 
 | Surface | Where |

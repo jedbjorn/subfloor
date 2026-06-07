@@ -1,6 +1,6 @@
 ---
 name: self_update
-description: Update this fork's super-coder engine in place — pull new code + migrations, keep all your memory. The shell hands off to its own next boot. Use when a super-coder update is available.
+description: Update this fork's super-coder engine in place — fetch + materialize new code + migrations, keep all your memory; roll back a bad update soundly. The shell hands off to its own next boot. Use when a super-coder update is available.
 category: substrate
 command: ./sc update
 common: true
@@ -35,27 +35,50 @@ carry across.
    `current_state` and make it true for *now* (the snapshot will capture it).
 
 2. **Run the update.** `./sc update`
-   It self-fetches the engine from the `super-coder` remote, backs up the live
-   DB, applies pending migrations **in place**, syncs the skills catalogue,
-   re-grants common skills, maps the repo, and re-snapshots the live state.
-   - `./sc update --no-fetch` to reconcile against an already-checked-out engine
-     (offline / dev).
+   It fetches the engine from the `super-coder` remote and **materializes** it
+   into the gitignored `.super-coder/` dir (the engine is a dependency, not fork
+   source), pins the new upstream SHA in `.sc-state/engine.ref` (saving the prior
+   one as `engine.ref.prev`), backs up the live DB, applies pending migrations
+   **in place**, syncs the skills catalogue, re-grants common skills, maps the
+   repo, and re-snapshots the live state.
+   - `./sc update --no-fetch` to reconcile against the current working tree
+     (offline / dev) — engine + `engine.ref` left unchanged.
    - If it reports a missing remote: `git remote add super-coder <url>`.
 
 3. **Verify the far side.** `./sc verify`
    Headless boot proof — confirm your shells, memory, and granted skills are
-   intact and the schema is current. If a count looks wrong, the pre-update DB
-   backup is in `~/db_backups/` — restore and investigate before committing.
+   intact and the schema is current. If a count looks wrong, **roll back**:
+   `./sc rollback` (see below).
 
 4. **Record the crossing.** Append a narrative entry. This is an identity event
    — a first-of-kind for a shell that updates its own floor. Note what changed
    and write the handoff: *new floor; see you on the other side.*
 
-5. **Commit.** Review and commit the engine bump + refreshed snapshot
-   (`schema.sql` / `migrations/` / `snapshot/content.sql` / `_sc` renders).
+5. **Commit.** Review and commit your fork-owned state: `.sc-state/content.sql`
+   (refreshed memory) + `.sc-state/engine.ref` (the bumped version pin) + any
+   `_sc` renders. The engine itself is gitignored — there is nothing under
+   `.super-coder/` to commit.
 
 6. **Reboot.** Restart the session to boot onto the new floor. Same shell — new
    boards, and this time you laid them yourself.
+
+## Rolling back a bad update
+
+An update is reversible. `./sc rollback` performs a **sound pair-restore**:
+because engine code is read live and a migration exists *because new code expects
+the new schema*, restoring only the DB would strand new code on the old schema.
+So rollback restores **both**:
+
+1. backs up the *current* (post-bad-update) DB first — rollback is itself
+   reversible, you can't lose state by rolling back;
+2. restores the DB from the most recent pre-update backup (`~/db_backups/`);
+3. re-materializes the engine at `.sc-state/engine.ref.prev` and restores
+   `engine.ref` — the engine half of the restore point.
+
+It is a whole-restore, not a per-step schema reversal. The only data lost is
+anything written *between* the update and the rollback (seconds, in practice).
+Reboot the session afterwards. Then commit the restored `.sc-state/` if you want
+the rolled-back floor to persist.
 
 ## The contract you rely on
 
