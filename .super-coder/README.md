@@ -11,7 +11,7 @@ serializations:
 | Category | File(s) | Git? | Role |
 |---|---|---|---|
 | **System migrations** | `migrations/*.sql` | tracked | ordered; **propagate** to forks; schema + system content |
-| **Per-instance snapshot** | `snapshot/content.sql` | tracked | idempotent dump of *this* repo's content + memory; **stays local** |
+| **Per-instance snapshot** | `.sc-state/content.sql` | tracked (fork-owned, outside the engine dir) | idempotent dump of *this* repo's content + memory; **stays local** |
 | **Baseline schema** | `schema.sql` | tracked | full current schema; applied on fresh build |
 | **`.db`, boot artifact** | — | ignored | rebuilt at launch |
 
@@ -23,9 +23,11 @@ one repo only.
 
 | Script | Does |
 |---|---|
-| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load `snapshot/content.sql`. Builds a fresh `.db`. |
+| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load `.sc-state/content.sql`. Builds a fresh `.db`. |
 | `scripts/migrate.py` | apply pending `migrations/*.sql` to an existing `.db`; record in `schema_migrations`. |
-| `scripts/snapshot.py` | dump per-instance tables → `snapshot/content.sql` (deterministic). |
+| `scripts/snapshot.py` | dump per-instance tables → `.sc-state/content.sql` (deterministic). |
+| `scripts/update.py` | fetch + materialize the engine (gitignored dep) at an upstream ref → pin `.sc-state/engine.ref` → migrate in place → sync skills → snapshot. |
+| `scripts/rollback.py` | sound undo of a bad update — restore the DB + engine (`engine.ref.prev`) pair. |
 | `scripts/run.py` | launcher: username-only auth → pick shell → render boot (`CLAUDE.md` + `AGENTS.md`) → exec harness. |
 
 ## Render

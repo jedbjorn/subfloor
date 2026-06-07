@@ -12,10 +12,12 @@
 #   make enter          attach an interactive session (pick shell + harness)
 #   make enter s=ap01   attach + boot the 'ap01' shell directly
 #   make down           stop the sandbox
+#   make update         fetch + materialize the engine, reconcile in place
+#   make rollback       sound undo of a bad update (restore DB + engine)
 #   make sc ARGS=health run any ./sc subcommand (passthrough)
 #
 SC := ./sc
-.PHONY: launch enter down build logs serve health ports verify update snapshot render map install sc
+.PHONY: launch enter down build logs serve health ports verify update rollback snapshot render map install sc
 
 launch:   ; $(SC) launch
 enter:    ; $(SC) $(if $(s),enter-$(s),enter)
@@ -27,6 +29,7 @@ health:   ; $(SC) health
 ports:    ; $(SC) ports
 verify:   ; $(SC) verify
 update:   ; $(SC) update
+rollback: ; $(SC) rollback
 snapshot: ; $(SC) snapshot
 render:   ; $(SC) render $(ARGS)
 map:      ; $(SC) map

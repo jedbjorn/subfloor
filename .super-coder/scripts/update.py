@@ -9,21 +9,30 @@ update needs no DB work; only schema changes touch the DB, and they do so as
 in-place migrations (never a rebuild-from-snapshot, which would revert the DB to
 the last snapshot and lose unsnapshotted in-session writes).
 
+B7 model: the engine is a **gitignored, materialized dependency** — it is not
+committed to the fork. So an update FETCHES the engine and MATERIALIZES it into
+`.super-coder/` (copy from the fetched ref), instead of `git checkout`ing tracked
+paths. The upstream SHA is pinned in `.sc-state/engine.ref`; the previous pin is
+kept as `.sc-state/engine.ref.prev` — the engine half of the restore point that
+makes `./sc rollback` sound (DB + engine restored together).
+
 Flow:
-    1. fetch + checkout the engine from the super-coder remote (code, schema,
-       migrations, skills). Per-instance content (snapshot/, the DB,
-       instance.json) is never listed, so it survives untouched. --no-fetch
-       uses the working tree as-is.
-    2. back up the live DB (restore point).
-    3. migrate IN PLACE — apply only un-applied migrations (ledger-tracked),
+    1. capture the restore point: the current `engine.ref` → `engine.ref.prev`.
+    2. fetch upstream; materialize the engine paths at the new ref into the
+       gitignored `.super-coder/` dir; write the new `engine.ref`. Per-instance
+       content (`.sc-state/`, the DB, instance.json) is never in the materialize
+       set, so it survives untouched. --no-fetch reconciles the working tree as-is.
+    3. back up the live DB (the other half of the restore point).
+    4. migrate IN PLACE — apply only un-applied migrations (ledger-tracked),
        preserving all rows incl. in-session writes. No DB yet (fresh fork) ->
        fall back to a from-text rebuild.
-    4. sync the skills catalogue (idempotent, id-stable UPSERT) — new/changed
+    5. sync the skills catalogue (idempotent, id-stable UPSERT) — new/changed
        skills reach the fork without a rebuild.
-    5. re-grant common skills to all shells.
-    6. wire the auto-remap hooks + map the repo + snapshot the (live) state.
+    6. re-grant common skills to all shells.
+    7. wire the auto-remap hooks + map the repo + snapshot the (live) state.
 
-Then review + commit. Restart the session to boot onto the new floor.
+Then review + commit (only `.sc-state/` — content.sql + engine.ref — moves; the
+engine is ignored). Restart the session to boot onto the new floor.
 
 Usage:
     ./sc update [--no-fetch] [--branch <name>]
@@ -31,6 +40,7 @@ Usage:
 """
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +49,9 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
+STATE_DIR = REPO_ROOT / ".sc-state"
+ENGINE_REF = STATE_DIR / "engine.ref"
+ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -47,11 +60,11 @@ import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 
 # The ENGINE = system content that propagates to every fork; all of it is safe
-# to overwrite from the super-coder remote. The per-instance set is deliberately
-# NOT listed, so a checkout never touches it: snapshot/ (this fork's content),
-# shell_db.db* (gitignored), instance.json (gitignored), map.config.json (the
-# cartographer's per-repo map tuning). assets/seed/ is super-coder-only (stripped
-# on install); assets/shells/ is empty/vestigial.
+# to materialize from the super-coder remote (it is wholesale-replaced, never
+# fork-edited). The per-instance set is deliberately NOT listed, so a materialize
+# never touches it: `.sc-state/` (this fork's content.sql + map tuning + engine
+# pin), shell_db.db* (gitignored), instance.json (gitignored). assets/seed/ is
+# super-coder-only (stripped on install); assets/shells/ is empty/vestigial.
 ENGINE_PATHS = [
     "sc",
     ".super-coder/aliases.mk",
@@ -84,6 +97,14 @@ def run_script(name: str) -> None:
         sys.exit(f"update: {name} failed.")
 
 
+def is_source_repo() -> bool:
+    """The super-coder SOURCE repo (origin basename == super-coder) tracks the
+    engine as its canonical source — it must NEVER untrack or materialize over
+    it. A fork's origin is its own repo (super-coder is a separate remote)."""
+    url = git("remote", "get-url", "origin", check=False).stdout.strip()
+    return bool(url) and url.rstrip("/").split("/")[-1].removesuffix(".git") == "super-coder"
+
+
 def super_coder_remote() -> str:
     """The remote pointing at super-coder. Prefer a URL match (robust to a
     rename), else a remote literally named 'super-coder'."""
@@ -103,13 +124,61 @@ def super_coder_remote() -> str:
              "  git remote add super-coder https://github.com/jedbjorn/super-coder.git")
 
 
-def fetch_engine(branch: str) -> None:
+def materialize_engine(ref: str) -> None:
+    """Write the engine paths at `ref` into the working tree WITHOUT touching the
+    git index — the engine is gitignored, so a `git checkout -- <paths>` (which
+    stages) is wrong. `git archive | tar -x` copies the fetched tree over the
+    top, leaving the gitignored per-instance files (shell_db.db*, instance.json)
+    in place. (Files deleted upstream linger until a future doctor sweep — same
+    gap the old checkout had; acceptable for a wholesale-overwrite dependency.)"""
+    archive = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "archive", ref, "--", *ENGINE_PATHS],
+        capture_output=True)
+    if archive.returncode != 0:
+        sys.exit("update: git archive of the engine failed:\n"
+                 + archive.stderr.decode(errors="replace").strip())
+    extract = subprocess.run(["tar", "-x", "-C", str(REPO_ROOT)], input=archive.stdout)
+    if extract.returncode != 0:
+        sys.exit("update: extracting the engine archive failed.")
+
+
+def fetch_and_materialize(branch: str) -> None:
     remote = super_coder_remote()
-    print(f"→ fetch {remote} + checkout engine ({remote}/{branch})")
+    print(f"→ fetch {remote} + materialize engine ({remote}/{branch})")
     git("fetch", remote, branch)
-    # Only the engine paths — per-instance content is never named, so it is
-    # untouched. A single canonical list (ENGINE_PATHS), not README prose.
-    git("checkout", f"{remote}/{branch}", "--", *ENGINE_PATHS)
+    sha = git("rev-parse", f"{remote}/{branch}").stdout.strip()
+
+    # Restore point (engine half): remember where we were before overwriting.
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if ENGINE_REF.exists():
+        shutil.copy2(ENGINE_REF, ENGINE_REF_PREV)
+    else:
+        # First update after B7 (or a fresh fork): no prior pin. Record HEAD's
+        # engine ref if discoverable; else leave prev absent (rollback will warn).
+        ENGINE_REF_PREV.unlink(missing_ok=True)
+
+    materialize_engine(sha)
+    ENGINE_REF.write_text(sha + "\n")
+    print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref)")
+
+
+def migrate_engine_untrack() -> None:
+    """One-time B7 migration for a fork that predates the gitignore model: stop
+    tracking `.super-coder/` and ensure .gitignore keeps it out. Idempotent — a
+    no-op once done. (Fresh installs are already untracked by install.py.)"""
+    tracked = git("ls-files", "--error-unmatch", ".super-coder",
+                  check=False).returncode == 0
+    if tracked:
+        git("rm", "-r", "--cached", "--quiet", ".super-coder", check=False)
+        print("→ B7: untracked .super-coder/ (engine is now a gitignored dependency)")
+    gi = REPO_ROOT / ".gitignore"
+    text = gi.read_text() if gi.exists() else ""
+    if "/.super-coder/" not in text.splitlines():
+        with gi.open("a") as f:
+            f.write(("" if text.endswith("\n") or not text else "\n")
+                    + "\n# super-coder — engine is a gitignored materialized dependency (B7)\n"
+                    + "/.super-coder/\n/.sc-state/engine.ref.prev\n")
+        print("→ B7: added /.super-coder/ to .gitignore")
 
 
 def migrate_or_rebuild() -> None:
@@ -166,10 +235,21 @@ def main(argv: list[str]) -> int:
         if i + 1 < len(argv):
             branch = argv[i + 1]
 
-    if no_fetch:
-        print("→ --no-fetch: reconciling against the current working tree")
+    source = is_source_repo()
+    if source:
+        # The source repo IS the engine — it has no upstream to materialize from
+        # and must keep tracking .super-coder/. Reconcile its own tree only.
+        print("→ super-coder SOURCE repo — engine is tracked here; "
+              "skipping fetch/materialize/untrack (reconcile in place only)")
+        no_fetch = True
     else:
-        fetch_engine(branch)
+        migrate_engine_untrack()  # one-time B7: untrack the engine (idempotent)
+
+    if no_fetch:
+        print("→ --no-fetch: reconciling against the current working tree "
+              "(engine + engine.ref unchanged)")
+    else:
+        fetch_and_materialize(branch)
 
     migrate_or_rebuild()
 
@@ -183,7 +263,9 @@ def main(argv: list[str]) -> int:
     run_script("snapshot.py")
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
-    print("  Review + commit: schema.sql / migrations / snapshot/content.sql / _sc renders.")
+    print("  Review + commit: .sc-state/ (content.sql + engine.ref) + _sc renders.")
+    print("  (The engine is gitignored — nothing under .super-coder/ to commit.)")
+    print("  A bad update? `./sc rollback` restores the DB + engine together.")
     print("  Restart your session to boot onto the new floor.")
     return 0
 

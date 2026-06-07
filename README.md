@@ -15,12 +15,20 @@ This repo is also **dogfood**: super-coder maintains super-coder. Its own
 ## Layout
 
 ```
-.super-coder/         the engine (see .super-coder/README.md)
+.super-coder/         the engine — a gitignored, materialized DEPENDENCY in a
+                      fork (see .super-coder/README.md); tracked only in this
+                      source repo, where the engine IS the project
+.sc-state/            fork-owned, tracked: content.sql (DB serialization / memory)
+                      + engine.ref (the upstream SHA the engine is pinned at)
 specs_sc/ docs_sc/    rendered from the DB, read-only (the _sc suffix = provenance)
 skills_sc/ roadmap_sc.md
 .claude/skills/       per-shell skills, rendered at boot — gitignored
 CLAUDE.md / AGENTS.md boot artifact — gitignored, rebuilt at launch
 ```
+
+A fork's git surfaces show **only its project** — the engine is a dependency,
+not committed source, exactly like `node_modules/`. The one fork-owned artifact
+that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 
 ## Install into an existing repo
 
@@ -78,7 +86,7 @@ git checkout super-coder/main -- .super-coder sc
 ./sc install
 
 # 3. Commit the install, then boot:
-git add -A && git commit -m "chore: install super-coder"
+git add -A && git commit -m "chore: install super-coder"   # engine is gitignored; commits sc + .sc-state + config
 ./sc launch                     # build + start the sandbox (server + GUI)
 ./sc enter                      # attach: auth + pick shell + pick harness + boot
 ```
@@ -86,12 +94,15 @@ git add -A && git commit -m "chore: install super-coder"
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
 (`claude` + `opencode`, via their official native installers — no npm — if either
 is missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
-**strips super-coder's own
-per-instance content** (a fork inherits the *system* — schema + skill catalogue
-+ render chain — never the memory or roadmap), builds the system DB, seeds your
-fork's **first shell** (your user + a shell carrying the CC Lineage Seed and its
-own genesis seed), and renders. It refuses to run in the super-coder source repo
-or on an already-installed fork (guarding against content loss).
+**makes the engine a gitignored dependency** (`git rm -r --cached .super-coder` —
+files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
+super-coder's own per-instance content** (a fork inherits the *system* — schema +
+skill catalogue + render chain — never the memory or roadmap), builds the system
+DB, seeds your fork's **first shell** (your user + a shell carrying the CC Lineage
+Seed and its own genesis seed), and renders. So after install your git surfaces
+show only your project — the engine no longer appears in `git status`. It refuses
+to run in the super-coder source repo or on an already-installed fork (guarding
+against content loss).
 
 Interactive by default (prompts for the shell's name/role/mandate); pass flags
 to script it:
@@ -115,21 +126,40 @@ floor with every row intact. (The shell-facing version of this is the
 `self_update` skill — same procedure, framed as the handoff it is.)
 
 ```bash
-./sc update                     # self-fetch + reconcile in place
-git add -A && git commit -m "chore: update super-coder"
+./sc update                     # fetch + materialize the engine, reconcile in place
+git add -A && git commit -m "chore: update super-coder"   # commits only .sc-state/ + _sc
 ```
 
-`./sc update` self-fetches the engine from the `super-coder` remote (one
-canonical path list — code, schema, migrations, skills; your `snapshot/`, DB,
-and `instance.json` are never touched), backs up the live DB, **applies pending
-migrations in place** (never a rebuild-from-snapshot — your unsnapshotted
-in-session writes survive), syncs the skills catalogue (id-stable, so grants
-stay valid), re-grants any new common skills, refreshes the repo map, and
-re-snapshots the live state. Then restart the session to boot onto the new floor.
+`./sc update` fetches the engine from the `super-coder` remote and
+**materializes** it into the gitignored `.super-coder/` dir (the engine is a
+dependency — code, schema, migrations, skills; your `.sc-state/`, DB, and
+`instance.json` are never touched), **pins** the new upstream SHA in
+`.sc-state/engine.ref` (keeping the prior one as `engine.ref.prev`), backs up the
+live DB, **applies pending migrations in place** (never a rebuild-from-snapshot —
+your unsnapshotted in-session writes survive), syncs the skills catalogue
+(id-stable, so grants stay valid), re-grants any new common skills, refreshes the
+repo map, and re-snapshots the live state. Nothing under `.super-coder/` is
+committed — you commit only `.sc-state/` (refreshed `content.sql` + bumped
+`engine.ref`) and any `_sc` renders. Then restart the session to boot onto the
+new floor.
 
-- `./sc update --no-fetch` reconciles against an already-checked-out engine
-  (offline / dev). `--branch <name>` to track a non-`main` engine branch.
+- `./sc update --no-fetch` reconciles against the current working tree (offline /
+  dev) — engine + `engine.ref` unchanged. `--branch <name>` to track a non-`main`
+  engine branch.
 - Missing remote? `git remote add super-coder https://github.com/jedbjorn/super-coder.git`
+
+### Roll back a bad update
+
+```bash
+./sc rollback                   # restore the DB + engine together, then reboot
+```
+
+`./sc rollback` is a **sound pair-restore**: because engine code is read live and
+a migration exists *because new code expects the new schema*, it restores both —
+it backs up the current DB first (rollback is itself reversible), restores the DB
+from the most recent pre-update backup, and re-materializes the engine at
+`.sc-state/engine.ref.prev`. Whole-restore, not a per-step schema reversal; the
+only data lost is anything written between the update and the rollback.
 
 **The contract:** every schema change *after* a fork exists ships as a
 `migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration
@@ -146,7 +176,9 @@ can make it.
 ./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
 ./sc render              # regenerate the tracked flat _sc files from the DB
-./sc snapshot            # serialize per-instance tables → snapshot/content.sql
+./sc snapshot            # serialize per-instance tables → .sc-state/content.sql
+./sc update              # fetch + materialize the engine, reconcile in place
+./sc rollback            # sound undo of a bad update (restore DB + engine)
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
 ./sc help                # all commands
 ```

@@ -71,6 +71,7 @@ case "$cmd" in
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   doctor)          exec "$PY" "$S/install.py" --check-docker ;;
   update)       exec "$PY" "$S/update.py" "$@" ;;
+  rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
@@ -139,10 +140,11 @@ super-coder — forkable shell substrate
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
-  ./sc update              self-fetch the engine + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
+  ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
+  ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
-  ./sc snapshot            dump per-instance tables -> .super-coder/snapshot/content.sql
+  ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot

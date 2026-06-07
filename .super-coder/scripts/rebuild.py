@@ -5,7 +5,7 @@ The `.db` is gitignored and disposable. This reconstructs it deterministically:
 
     1. apply schema.sql            (the v1 baseline)
     2. apply migrations/*.sql      (ordered deltas, via migrate.py; ledger-tracked)
-    3. load snapshot/content.sql   (this fork's per-instance content + memory)
+    3. load .sc-state/content.sql  (this fork's per-instance content + memory)
 
 If a live DB already exists it is removed first (after an optional backup). The
 text serializations are the source of truth; the DB is a cache.
@@ -22,14 +22,37 @@ from datetime import datetime
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
+REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 SCHEMA = ENGINE / "schema.sql"
-SNAPSHOT = ENGINE / "snapshot" / "content.sql"
+# Per-fork memory lives OUTSIDE the engine dir (B7): the engine is a gitignored,
+# wholesale-replaced dependency, so the one artifact that must survive can't sit
+# inside it. New path is `.sc-state/content.sql`; the old `.super-coder/snapshot/`
+# location is a one-release read shim for forks that predate the relocation.
+SNAPSHOT = REPO_ROOT / ".sc-state" / "content.sql"
+SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
 BACKUP_DIR = Path.home() / "db_backups" / "super-coder"
+
+
+def snapshot_path() -> Path:
+    """The content.sql to load: the new `.sc-state/` location, falling back to
+    the legacy in-engine path for a not-yet-migrated fork."""
+    return SNAPSHOT if SNAPSHOT.exists() else SNAPSHOT_LEGACY
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import migrate as migrate_mod  # noqa: E402
 import map_repo  # noqa: E402
+
+
+KEEP_BACKUPS = 5  # restore points retained per prefix; older are pruned
+
+
+def prune_backups(prefix: str) -> None:
+    """Keep only the newest KEEP_BACKUPS copies for a backup prefix. Timestamped
+    names sort chronologically, so lexical sort = chronological."""
+    backups = sorted(BACKUP_DIR.glob(f"{prefix}.*.db"))
+    for old in backups[:-KEEP_BACKUPS]:
+        old.unlink(missing_ok=True)
 
 
 def backup_existing() -> None:
@@ -39,6 +62,7 @@ def backup_existing() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dst = BACKUP_DIR / f"shell_db.prerebuild.{ts}.db"
     shutil.copy2(DB_PATH, dst)
+    prune_backups("shell_db.prerebuild")
     print(f"rebuild: backed up existing DB -> {dst}")
 
 
@@ -65,16 +89,17 @@ def main(argv: list[str]) -> int:
     migrate_mod.migrate(str(DB_PATH))
 
     # Load this fork's per-instance content.
-    if SNAPSHOT.exists():
+    snap = snapshot_path()
+    if snap.exists():
         con = sqlite3.connect(DB_PATH)
         try:
-            con.executescript(SNAPSHOT.read_text())
+            con.executescript(snap.read_text())
             con.commit()
-            print(f"rebuild: loaded {SNAPSHOT.relative_to(ENGINE.parent)}")
+            print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
         finally:
             con.close()
     else:
-        print("rebuild: no snapshot/content.sql — built empty (no per-instance content).")
+        print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
 
     # The dr_* map is a derived cache, not snapshotted — a fresh DB has an empty
     # one. Refill it here so a bare `./sc rebuild` / `./sc verify` never leaves a

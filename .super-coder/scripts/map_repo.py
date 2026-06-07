@@ -32,13 +32,15 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 # Per-fork map tuning, authored by the cartographer (see the `cartographer`
-# skill). Tracked content, deliberately NOT in update.py's ENGINE_PATHS, so it
-# survives `./sc update`. Absent → built-in defaults only.
-CONFIG_PATH = ENGINE / "map.config.json"
+# skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
+# so a wholesale engine refresh never touches it. Absent → built-in defaults
+# only. The legacy in-engine path is read as a one-release fallback.
+CONFIG_PATH = REPO_ROOT / ".sc-state" / "map.config.json"
+CONFIG_PATH_LEGACY = ENGINE / "map.config.json"
 
 # Built-in defaults. A fork's map.config.json EXTENDS the skip sets and may add
 # role_overrides — it never shrinks these (so the engine dirs below stay hidden).
-SKIP_DIRS = {".git", "node_modules", ".super-coder", ".venv", "venv",
+SKIP_DIRS = {".git", "node_modules", ".super-coder", ".sc-state", ".venv", "venv",
              "__pycache__", ".svelte-kit", "dist", "build", ".next", "target",
              "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache",
              # super-coder's own render output — mirrors the DB, not host source.
@@ -85,15 +87,16 @@ def load_config() -> dict:
                             {"glob": "*.proto", "role": "code"}]}
     Malformed config is a warning, not a failure — fall back to defaults so a
     bad edit never breaks the auto-remap hooks."""
-    if not CONFIG_PATH.exists():
+    path = CONFIG_PATH if CONFIG_PATH.exists() else CONFIG_PATH_LEGACY
+    if not path.exists():
         return {}
     try:
-        cfg = json.loads(CONFIG_PATH.read_text())
+        cfg = json.loads(path.read_text())
         if not isinstance(cfg, dict):
             raise ValueError("top-level JSON must be an object")
         return cfg
     except (json.JSONDecodeError, OSError, ValueError) as e:
-        print(f"map_repo: ignoring {CONFIG_PATH.name} ({e}) — using defaults")
+        print(f"map_repo: ignoring {path.name} ({e}) — using defaults")
         return {}
 
 

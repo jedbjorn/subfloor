@@ -253,7 +253,7 @@ def set_grant(con, sid, skill_id, granted):
 # Order = display order; `danger` ones prompt for confirmation in the UI.
 _PY = sys.executable
 _SCRIPTS = {
-    "snapshot": ("Snapshot", "Serialize the per-instance tables → snapshot/content.sql "
+    "snapshot": ("Snapshot", "Serialize the per-instance tables → .sc-state/content.sql "
                  "(deterministic, idempotent). Run after editing identity, roadmap, "
                  "docs, or flags so the change survives a rebuild.",
                  [_PY, str(ENGINE / "scripts/snapshot.py")], False),
@@ -310,9 +310,14 @@ BASE_BRANCH = "main"
 PUBLISH_BRANCH = "gui-content"
 _PUBLISH_LOCK = threading.Lock()
 # The git-tracked text the DB rebuilds from + the flat renders. NOT the .db
-# (gitignored — see the install .gitignore block).
+# (gitignored). schema.sql + migrations are engine paths: TRACKED in the source
+# repo, GITIGNORED in a fork (B7) — git_publish() filters ignored paths so the
+# same list self-adapts (they stay in source, drop out in a fork, where the
+# engine is a materialized dependency authored upstream). .sc-state/ is the
+# fork-owned memory serialization + engine pin (always tracked).
 PUBLISH_PATHS = [
-    ".super-coder/snapshot/content.sql",
+    ".sc-state/content.sql",
+    ".sc-state/engine.ref",
     ".super-coder/schema.sql",
     ".super-coder/migrations",
     "specs_sc", "docs_sc", "skills_sc", "roadmap_sc.md",
@@ -369,7 +374,13 @@ def git_publish() -> dict:
     # 3. stage the publishable text + renders; commit if anything is new.
     #    Filter to paths that exist — `git add` is fatal on a missing pathspec, and
     #    a minimal fork may lack some (e.g. docs_sc/ before any doc is authored).
-    present = [p for p in PUBLISH_PATHS if (REPO_ROOT / p).exists()]
+    #    Drop gitignored paths too: in a fork the engine (schema/migrations) is
+    #    ignored, and `git add -- <ignored>` aborts the WHOLE add (staging
+    #    nothing). check-ignore lets the same list serve source + fork.
+    def _ignored(p: str) -> bool:
+        return _git("check-ignore", "-q", "--", p).returncode == 0
+    present = [p for p in PUBLISH_PATHS
+              if (REPO_ROOT / p).exists() and not _ignored(p)]
     if present:
         _git("add", "--", *present)
     staged = _git("diff", "--cached", "--name-only").stdout.strip()

@@ -44,7 +44,8 @@ import ports as ports_mod  # noqa: E402
 # super-coder's own per-instance content — present in a freshly-pulled fork
 # because the git checkout brought it along. A fork must not inherit it.
 STRIP = [
-    ENGINE / "snapshot" / "content.sql",
+    REPO_ROOT / ".sc-state" / "content.sql",
+    ENGINE / "snapshot" / "content.sql",  # legacy pre-B7 location (one-release)
     ENGINE / "assets" / "seed" / "super-coder-founding-spec.md",
 ]
 
@@ -238,14 +239,19 @@ def report_logins() -> dict:
 _GITIGNORE_MARKER = "# super-coder — rebuilt/derived; never commit"
 _GITIGNORE_BLOCK = f"""
 {_GITIGNORE_MARKER}
-/.super-coder/shell_db.db
-/.super-coder/shell_db.db-wal
-/.super-coder/shell_db.db-shm
-/.super-coder/instance.json
+# The engine is a materialized, gitignored DEPENDENCY (B7) — fetched from
+# upstream, refreshed by `./sc update`, never committed to the fork. Your project
+# is everything ELSE in this repo. The one fork-owned artifact that must survive,
+# the DB serialization, lives in the tracked .sc-state/ below.
+/.super-coder/
+# Boot artifacts + per-shell skill render — rebuilt at launch from the DB.
 /CLAUDE.md
 /AGENTS.md
 /opencode.json
 /.claude/skills/
+# .sc-state/ is TRACKED (content.sql + engine.ref). Only the ephemeral
+# pre-update restore pointer is ignored.
+/.sc-state/engine.ref.prev
 """
 
 
@@ -257,6 +263,53 @@ def ensure_gitignore() -> bool:
     with gi.open("a") as f:
         f.write(("" if existing.endswith("\n") or not existing else "\n") + _GITIGNORE_BLOCK)
     return True
+
+
+def sc_remote() -> str | None:
+    """The remote pointing at super-coder (the bootstrap checkout added it)."""
+    named = None
+    for line in sh("git", "-C", str(REPO_ROOT), "remote", "-v").stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name, url = parts[0], parts[1]
+        if "super-coder" in url:
+            return name
+        if name == "super-coder":
+            named = name
+    return named
+
+
+def untrack_engine() -> bool:
+    """B7: the engine is a gitignored materialized dependency, not fork source.
+    The bootstrap `git checkout super-coder/<ref> -- .super-coder sc` staged it
+    into the fork's index; drop it (files stay on disk, only git stops tracking).
+    Idempotent: a no-op once already untracked."""
+    tracked = sh("git", "-C", str(REPO_ROOT), "ls-files", "--error-unmatch",
+                 ".super-coder").returncode == 0
+    if not tracked:
+        return False
+    sh("git", "-C", str(REPO_ROOT), "rm", "-r", "--cached", "--quiet", ".super-coder")
+    return True
+
+
+def pin_engine() -> str | None:
+    """Record the upstream SHA the engine was materialized at → .sc-state/engine.ref
+    (the fork's version record + the engine half of a sound rollback). Best-effort:
+    if the remote ref can't be resolved, `./sc update` will pin it later."""
+    state = REPO_ROOT / ".sc-state"
+    state.mkdir(parents=True, exist_ok=True)
+    remote = sc_remote()
+    if not remote:
+        return None
+    # rev-parse on an unfetched ref echoes the ref name and exits non-zero — guard
+    # on BOTH (a clean exit AND a 40-hex SHA) so a miss leaves the pin for update.
+    r = sh("git", "-C", str(REPO_ROOT), "rev-parse", f"{remote}/main")
+    sha = r.stdout.strip()
+    if r.returncode != 0 or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
+        return None
+    (state / "engine.ref").write_text(sha + "\n")
+    return sha
 
 
 def step(msg: str) -> None:
@@ -336,6 +389,17 @@ def main(argv: list[str]) -> int:
     step("Wiring .gitignore")
     print("  added super-coder ignore lines" if ensure_gitignore()
           else "  (already present)")
+
+    # 3.55 Engine = gitignored dependency (B7) — untrack it + pin its version ---
+    # The bootstrap checkout staged .super-coder/ into the fork's index; drop it
+    # so the fork's git surfaces show only the project, and record the upstream
+    # SHA so `./sc rollback` has an engine version to restore to.
+    step("Making the engine a dependency (untrack + pin)")
+    print("  git rm -r --cached .super-coder (files kept on disk)" if untrack_engine()
+          else "  (engine already untracked)")
+    pinned = pin_engine()
+    print(f"  pinned engine.ref at {pinned[:12]}" if pinned
+          else "  (could not resolve upstream ref — `./sc update` will pin it)")
 
     # 3.6 Create the shared scratch / handoff dir -----------------------------
     # A host-repo dir for screenshots, drafts, quick handoffs. The CONNECTIONS

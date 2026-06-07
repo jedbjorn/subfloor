@@ -44,9 +44,10 @@ yours alone. You do three things: **configure** how this repo is mapped,
    Then eyeball the top-level dirs. Ask: is anything mis-classified, or is a
    generated/vendored dir being indexed that shouldn't be?
 
-2. **Author `.super-coder/map.config.json`** to fit what's actually here. It is
-   *authored content* (tracked, per-fork, survives `./sc update`). All keys
-   optional; each merges over `map_repo.py`'s built-in defaults:
+2. **Author `.sc-state/map.config.json`** to fit what's actually here. It is
+   *authored content* (tracked, per-fork, survives `./sc update` — it lives in
+   `.sc-state/`, outside the gitignored engine dir). All keys optional; each
+   merges over `map_repo.py`'s built-in defaults:
    ```json
    {
      "skip_dirs":  ["generated", "fixtures"],
@@ -88,7 +89,7 @@ language/dir showed up, files are mis-roled, or the map went stale/empty on a
 clone where the hooks never got wired.
 
 1. Re-inspect (step 1) — what changed?
-2. Edit `.super-coder/map.config.json` to match (step 2).
+2. Edit `.sc-state/map.config.json` to match (step 2).
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
 4. Verify (step 4) + commit.
 

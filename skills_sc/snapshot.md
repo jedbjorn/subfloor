@@ -24,7 +24,7 @@ on the next `./sc rebuild`. This skill is the "save my work" step.
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `./sc seed-skills` |
-| `snapshot/content.sql` | **this repo's** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (stays local) | `./sc snapshot` |
+| `.sc-state/content.sql` | **this repo's** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants. Tracked, fork-owned, kept OUTSIDE the gitignored engine dir | no (stays local) | `./sc snapshot` |
 
 The split that matters: **system content propagates via migrations; per-instance
 content stays in the snapshot.** Skill *bodies* are system (migration); which
@@ -33,7 +33,7 @@ shell is *granted* a skill is per-instance (snapshot).
 ## After editing the DB
 
 1. **`./sc snapshot`** — dumps the per-instance tables to
-   `snapshot/content.sql` (deterministic DELETE-then-INSERT in PK order, so
+   `.sc-state/content.sql` (deterministic DELETE-then-INSERT in PK order, so
    re-running is byte-identical → clean diffs). Do this after ANY change to
    identity, memory, roadmap, documents, flags, projects, or grants.
 
@@ -46,8 +46,10 @@ shell is *granted* a skill is per-instance (snapshot).
 3. **Verify the rebuild reproduces:** `./sc rebuild && ./sc verify`. The DB
    should rebuild from text alone, byte-for-byte.
 
-4. **Commit** the text: `schema.sql` / `migrations/` / `snapshot/content.sql` /
-   the `_sc` files. Never commit the `.db`.
+4. **Commit** the text: `.sc-state/content.sql` + `.sc-state/engine.ref` and the
+   `_sc` files. Never commit the `.db` or anything under the gitignored
+   `.super-coder/` engine dir. (In the super-coder SOURCE repo only, `schema.sql`
+   + `migrations/` are tracked and committed here too.)
 
 ## Authoring vs. snapshotting
 

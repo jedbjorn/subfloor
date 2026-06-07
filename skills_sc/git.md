@@ -17,6 +17,11 @@ Git conventions for a super-coder shell — one repo, one cwd. Branch before com
 A super-coder shell works **one repo at its root** — no cross-repo confusion, so
 plain `git` (cwd = repo root) is safe. The discipline:
 
+**Operate on the project, never the engine.** Your project is this repo —
+everything except `.super-coder/`. The engine is a gitignored, materialized
+dependency (refreshed by `./sc update`); don't commit it or edit it as if it
+were your code. Engine changes are authored upstream in super-coder.
+
 ## Branch → commit → push → PR → stop
 
 1. **Never commit straight to the default branch.** Branch first:
@@ -42,13 +47,16 @@ Once the FnB merges your PR, tidy local so stale branches don't accumulate:
 Only after the PR is merged. Never delete a branch carrying unmerged, un-PR'd
 work — a deleted branch with no PR is lost work.
 
-## Don't commit rebuilt/derived files
+## Don't commit the engine or rebuilt/derived files
 
-These are gitignored and regenerated — never add them:
-`.super-coder/shell_db.db*`, `.super-coder/instance.json`, `CLAUDE.md`,
-`AGENTS.md`, `opencode.json`, `.claude/skills/`. **Do** commit the text the `.db`
-rebuilds from: `schema.sql`, `migrations/`, `snapshot/content.sql`, and the
-tracked `_sc` renders.
+The whole engine dir is gitignored (`/.super-coder/`) — never force-add anything
+under it. Also gitignored + regenerated: `CLAUDE.md`, `AGENTS.md`,
+`opencode.json`, `.claude/skills/`, and `.sc-state/engine.ref.prev` (the
+ephemeral rollback pointer). **Do** commit your fork-owned state in `.sc-state/`:
+`content.sql` (the memory serialization the `.db` rebuilds from) and `engine.ref`
+(the engine version pin) — plus your project's own files and any tracked `_sc`
+renders. (In the super-coder SOURCE repo only, `schema.sql` + `migrations/` are
+tracked too — there the engine *is* the project.)
 
 ## After DB work, before committing
 
