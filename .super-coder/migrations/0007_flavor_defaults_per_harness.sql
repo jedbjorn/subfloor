@@ -16,11 +16,17 @@
 --
 -- Doctrine (see shell_decisions, CC home DB): middle roles (dev, cartographer) =
 -- a fast coding-tuned model; bookends (planner, reviewer) = premium. Each flavor
--- offers an OpenAI option on the CODEX harness (ChatGPT-subscription billing, no
--- per-token API metering — the reason this exists) and an Anthropic option on the
--- CLAUDE harness. The reviewer DEFAULTS to claude (is_default) — a different model
--- lineage from the GPT-authored code it reviews, for adversarial diversity.
--- Codex model ids are bare (gpt-5.4); claude uses aliases (sonnet/haiku/opus).
+-- offers THREE provider lineages, one per harness:
+--   codex    — OpenAI via ChatGPT subscription (flat billing, no per-token API
+--              metering — the reason this exists). Bare model ids (gpt-5.4).
+--   claude   — Anthropic via subscription. Aliases (sonnet/haiku/opus).
+--   opencode — open-weights via Ollama Cloud, a deliberately DIFFERENT lineage
+--              (not a second OpenAI path). provider/model ids (ollama/…-cloud);
+--              opencode's ollama-cloud provider config + signin is handled
+--              per-fork, not here — these rows only set the runtime model.
+-- The reviewer DEFAULTS to claude (is_default) — a different model lineage from
+-- the GPT-authored code it reviews, for adversarial diversity. Codex/claude are
+-- the picker defaults; opencode is always the third option (is_default 0).
 -- Retune with UPDATE / a later migration as trial data lands.
 
 BEGIN;
@@ -36,13 +42,17 @@ CREATE TABLE flavor_defaults (
 );
 
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES
-    ('dev',          'codex',  'gpt-5.4', 1),
-    ('dev',          'claude', 'sonnet',  0),
-    ('cartographer', 'codex',  'gpt-5.4', 1),
-    ('cartographer', 'claude', 'haiku',   0),
-    ('planner',      'codex',  'gpt-5.5', 1),
-    ('planner',      'claude', 'opus',    0),
-    ('reviewer',     'codex',  'gpt-5.5', 0),
-    ('reviewer',     'claude', 'opus',    1);
+    ('dev',          'codex',    'gpt-5.4',                       1),
+    ('dev',          'claude',   'sonnet',                        0),
+    ('dev',          'opencode', 'ollama/qwen3-coder:480b-cloud', 0),
+    ('cartographer', 'codex',    'gpt-5.4',                       1),
+    ('cartographer', 'claude',   'haiku',                         0),
+    ('cartographer', 'opencode', 'ollama/gpt-oss:20b-cloud',      0),
+    ('planner',      'codex',    'gpt-5.5',                       1),
+    ('planner',      'claude',   'opus',                          0),
+    ('planner',      'opencode', 'ollama/deepseek-v4-pro:cloud',  0),
+    ('reviewer',     'codex',    'gpt-5.5',                       0),
+    ('reviewer',     'claude',   'opus',                          1),
+    ('reviewer',     'opencode', 'ollama/kimi-k2.6:cloud',        0);
 
 COMMIT;
