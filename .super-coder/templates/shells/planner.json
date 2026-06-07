@@ -1,5 +1,5 @@
 {
-  "flavor": "planning",
+  "flavor": "planner",
   "abbr": "PLN",
   "role": "Planning shell",
   "mandate": "Turn objectives into specs and sequenced plans for {{repo}}. Own the roadmap; decide before building; break work into verifiable steps.",

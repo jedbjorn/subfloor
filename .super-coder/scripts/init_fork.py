@@ -52,7 +52,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--username")
     ap.add_argument("--name", help="shell display name")
     ap.add_argument("--shortname")
-    ap.add_argument("--flavor", help="planning | dev | review")
+    ap.add_argument("--flavor", help="planner | dev | reviewer")
     ap.add_argument("--role", help="override the flavor's role")
     ap.add_argument("--mandate", help="override the flavor's mandate")
     ap.add_argument("--partner")
@@ -83,9 +83,9 @@ def main(argv: list[str]) -> int:
                      "(non-interactive run needs the flag)")
 
         username = need(a.username, "Your username")
-        # The first shell is a PLANNING shell — every fork needs a planner to
+        # The first shell is a PLANNER shell — every fork needs a planner to
         # scope the work. (--flavor overrides; the GUI creates other flavors.)
-        flavor = a.flavor or "planning"
+        flavor = a.flavor or "planner"
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
         name = need(a.name, "Shell display name", flavor.capitalize())

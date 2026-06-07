@@ -55,6 +55,7 @@ ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import install as install_mod  # noqa: E402  (ensure_harnesses)
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
@@ -250,6 +251,14 @@ def main(argv: list[str]) -> int:
               "(engine + engine.ref unchanged)")
     else:
         fetch_and_materialize(branch)
+
+    # Harnesses can be ADDED upstream between releases (e.g. codex landed after
+    # dos-arch installed), so a fork that updates must pick up any newly-required
+    # harness — not just the ones present at first install. Best-effort + native
+    # installers (no npm); a failure warns and continues (install by hand later).
+    # Auth/login stays manual; this only ensures the CLI binary is present.
+    print("→ ensure harnesses installed (claude + opencode + codex)")
+    install_mod.ensure_harnesses()
 
     migrate_or_rebuild()
 

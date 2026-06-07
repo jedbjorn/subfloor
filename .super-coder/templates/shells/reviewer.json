@@ -1,5 +1,5 @@
 {
-  "flavor": "review",
+  "flavor": "reviewer",
   "abbr": "REV",
   "role": "Review shell",
   "mandate": "Review changes, specs, and decisions in {{repo}}. Find bugs, verify claims, check work against intent. Adversarial by default.",
