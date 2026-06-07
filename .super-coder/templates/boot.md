@@ -33,6 +33,44 @@ any per-shell prompt loads, before any query runs.
 
 ---
 
+## ORIENTATION
+
+Find things by querying the repo map — not by reading or grepping the tree. The
+`dr_*` tables are a scan of this repo, kept fresh for you (a cartographer shell
+owns and heals them; you read, you don't map), in `.super-coder/shell_db.db`
+(SQLite):
+
+| Table | Holds |
+|---|---|
+| `dr_section` | navigation index — `name`, `path_prefix`, `description` ("API here / UI here / docs here"). **Start here.** |
+| `dr_filepath` | one row per file — `path`, `lang`, `role` (code/doc/config/test/asset/env), `lines`, `desc` |
+| `dr_dependency` | deps from manifests — `manager`, `name`, `version` |
+| `dr_env` | env-var names from `.env.*` examples — `name`, `source_file` |
+| `dr_repo` | the repo — `root`, `default_branch`, `file_count`, `mapped_at` |
+
+Flow: pick a section → query that section's leaves → read the one or two files
+you need. Section-first, one cheap query deep — never a full preload.
+
+```
+# where to start (also rendered in ## CONNECTIONS below):
+sqlite3 .super-coder/shell_db.db \
+  "SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;"
+# a section's files — descriptions tell you which to open:
+sqlite3 .super-coder/shell_db.db \
+  "SELECT path, desc, lines FROM dr_filepath WHERE path LIKE '<prefix>%' ORDER BY path;"
+# find by area / stack / env:
+sqlite3 .super-coder/shell_db.db "SELECT path FROM dr_filepath WHERE path LIKE '%auth%';"
+sqlite3 .super-coder/shell_db.db "SELECT manager, name, version FROM dr_dependency;"
+```
+
+Map first, grep second; lazy-load only what the map points at. If the map looks
+empty, stale, or wrong, that's a cartographer task — flag it, don't map it
+yourself. Extended patterns (language mix, role filters) live in the
+`surface_catalogue` skill. Before writing SQL against your memory DB, check the
+`db_map` skill — don't read `schema.sql` raw.
+
+---
+
 ## MESSAGING
 
 Shells coordinate through an inbox. On boot, if the `## STATUS` `Inbox:` line is
