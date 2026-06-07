@@ -14,10 +14,12 @@
 #   make down           stop the sandbox
 #   make update         fetch + materialize the engine, reconcile in place
 #   make rollback       sound undo of a bad update (restore DB + engine)
+#   make deps           install this fork's deps into the bind-mounted .venv + node_modules
+#   make test           run backend (.venv pytest / unittest) + UI (vitest) suites
 #   make sc ARGS=health run any ./sc subcommand (passthrough)
 #
 SC := ./sc
-.PHONY: launch enter down build logs serve health ports verify update rollback snapshot render map install sc
+.PHONY: launch enter down build logs serve health ports verify update rollback snapshot render map install sc deps test
 
 launch:   ; $(SC) launch
 enter:    ; $(SC) $(if $(s),enter-$(s),enter)
@@ -34,4 +36,6 @@ snapshot: ; $(SC) snapshot
 render:   ; $(SC) render $(ARGS)
 map:      ; $(SC) map
 install:  ; $(SC) install
+deps:     ; $(SC) deps
+test:     ; $(SC) test
 sc:       ; $(SC) $(ARGS)
