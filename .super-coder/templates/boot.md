@@ -92,7 +92,10 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 ## RUNNING THE APP
 
-Two runtimes, two homes — keep them apart:
+You run **inside the sandbox container**; this repo is bind-mounted in at its host
+path. The app the FnB watches in their browser is a **separate instance** — the
+host-supervised stack, outside your container. So there are two runtimes with two
+homes — keep them apart:
 
 - **Project dev servers** (vite, `npm run dev`, etc.) belong in the **sandbox**,
   bound to `0.0.0.0:$SC_DEV_PORT` — the per-fork port `./sc launch` publishes to
