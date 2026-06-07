@@ -128,9 +128,11 @@ sc_deps() {
         "$venv/bin/pip" install -q -r "$dev" || exit 1
       fi
     done || rc=1
-    # Engine baseline test kit — only-if-needed never overrides a fork's pin.
-    echo "→ deps: engine test kit (pytest httpx coverage, only-if-needed)"
-    "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage || rc=1
+    # Engine baseline dev kit — test (pytest/httpx/coverage), lint+format (ruff),
+    # type-check (mypy), SQLite GUI (datasette). only-if-needed never overrides a
+    # fork's pin or its [tool.ruff]/[tool.mypy] config — available, not enforced.
+    echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette, only-if-needed)"
+    "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette || rc=1
   fi
   pkgs="$(_sc_find_manifests 'package.json')"
   if [ -n "$pkgs" ]; then
@@ -181,6 +183,26 @@ sc_test() {
   echo "✓ test: all suites passed"
 }
 
+# Lint + format-check the fork's python with the .venv's ruff (honors the fork's
+# [tool.ruff] config). Defaults to the repo root; pass paths/flags through. The
+# tool is available, not enforced — a fork opts in by running this. Needs `./sc deps`.
+sc_lint() {
+  venv="$here/.venv"
+  [ -x "$venv/bin/ruff" ] || { echo "✗ lint: no .venv/bin/ruff — run ./sc deps first" >&2; return 1; }
+  echo "→ lint: $venv/bin/ruff check"
+  ( cd "$here" && "$venv/bin/ruff" check "$@" )
+}
+
+# Type-check the fork's python with the .venv's mypy (honors the fork's
+# [tool.mypy] config). Same available-not-enforced stance as lint. Needs `./sc deps`.
+sc_typecheck() {
+  venv="$here/.venv"
+  [ -x "$venv/bin/mypy" ] || { echo "✗ typecheck: no .venv/bin/mypy — run ./sc deps first" >&2; return 1; }
+  echo "→ typecheck: $venv/bin/mypy"
+  if [ $# -gt 0 ]; then ( cd "$here" && "$venv/bin/mypy" "$@" )
+  else ( cd "$here" && "$venv/bin/mypy" . ); fi
+}
+
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
@@ -204,6 +226,8 @@ case "$cmd" in
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   deps)         sc_deps "$@" ;;
   test)         sc_test "$@" ;;
+  lint)         sc_lint "$@" ;;
+  typecheck)    sc_typecheck "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
     dcheck
@@ -287,7 +311,10 @@ super-coder — forkable shell substrate
   ./sc serve               run the review layer (api + static UI) in the foreground
   ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
   ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
+                             (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette)
   ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure
+  ./sc lint [paths]        ruff check the fork's python (.venv ruff; honors [tool.ruff]) — available, not enforced
+  ./sc typecheck [paths]   mypy the fork's python (.venv mypy; honors [tool.mypy]) — available, not enforced
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health
