@@ -52,6 +52,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
+# pytest — a *project* test runtime, not a harness/engine dep. The engine's own
+# tests are stdlib-unittest by design (no-dependency style), but forked repos'
+# dev surfaces commonly use pytest; baking it system-wide (same rationale as node
+# above) means shells run `pytest` without an ephemeral pip install that
+# evaporates on the next rebuild. Installed as root into /usr/local so it's on
+# PATH for the unprivileged ${SC_USER} the container actually runs as.
+RUN pip install --no-cache-dir pytest
+
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 RUN groupadd -g ${SC_GID} ${SC_USER} \
  && useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}
