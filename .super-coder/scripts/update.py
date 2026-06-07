@@ -257,7 +257,7 @@ def main(argv: list[str]) -> int:
     # harness — not just the ones present at first install. Best-effort + native
     # installers (no npm); a failure warns and continues (install by hand later).
     # Auth/login stays manual; this only ensures the CLI binary is present.
-    print("→ ensure harnesses installed (claude + opencode + codex)")
+    print("→ ensure harnesses installed (claude + opencode + codex + vibe)")
     install_mod.ensure_harnesses()
 
     migrate_or_rebuild()

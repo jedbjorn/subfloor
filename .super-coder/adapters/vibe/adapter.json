@@ -1,0 +1,8 @@
+{
+  "harness": "vibe",
+  "launch": ["vibe", "--trust"],
+  "boot_artifact": "AGENTS.md",
+  "emit": [],
+  "env": {},
+  "sandbox": { "launch_flags": ["--agent", "auto-approve"] }
+}
