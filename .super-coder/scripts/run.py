@@ -232,15 +232,38 @@ def authenticate(con: sqlite3.Connection) -> sqlite3.Row:
 
 def list_shells(con: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
     return con.execute(
-        "SELECT shell_id, display_name, shortname, mandate, is_shared FROM shells "
+        "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor FROM shells "
         "WHERE (user_id=? OR is_shared=1) AND COALESCE(is_deleted,0)=0 "
         "ORDER BY is_shared, shell_id",
         (user_id,),
     ).fetchall()
 
 
+def flavor_defaults(con: sqlite3.Connection) -> dict:
+    """flavor -> {'harness', 'model'} launch defaults. Empty if the table is
+    absent (older fork mid-migration) so the launcher degrades to its prior
+    behavior rather than failing."""
+    try:
+        return {r["flavor"]: r for r in
+                con.execute("SELECT flavor, harness, model FROM flavor_defaults")}
+    except sqlite3.OperationalError:
+        return {}
+
+
+def _default_label(defaults: dict, flavor: str | None) -> str:
+    """Picker annotation: the harness (+ short model id) a shell of this flavor
+    boots with by default, so the operator knows which harness to launch if they
+    forget. Blank for bespoke shells with no flavor default."""
+    fd = defaults.get(flavor)
+    if not fd or not fd["harness"]:
+        return ""
+    model = fd["model"]
+    return fd["harness"] + (f" · {model.split('/')[-1]}" if model else "")
+
+
 def pick_shell(shells: list[sqlite3.Row], requested: str | None,
-               first: bool) -> sqlite3.Row:
+               first: bool, defaults: dict | None = None) -> sqlite3.Row:
+    defaults = defaults or {}
     if not shells:
         sys.exit("FATAL: no shells available to this user.")
     if requested:
@@ -253,11 +276,12 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
         return chosen
     if first or not sys.stdin.isatty():
         return shells[0]
-    # Interactive picker
-    print(f"\n{'ID':>3}  {'Name':<16}{'Shortname':<14}")
+    # Interactive picker — the Default column tells the operator the intended
+    # harness/model (advisory; overridable at launch).
+    print(f"\n{'ID':>3}  {'Name':<16}{'Shortname':<14}{'Default (harness · model)'}")
     for s in shells:
         print(f"{s['shell_id']:>3}  {(s['display_name'] or ''):<16}"
-              f"{(s['shortname'] or ''):<14}")
+              f"{(s['shortname'] or ''):<14}{_default_label(defaults, s['flavor'])}")
     valid = {s["shell_id"] for s in shells}
     while True:
         choice = input("\nPick (ID): ").strip()
@@ -340,16 +364,24 @@ def main() -> None:
 
     con = open_db()
     user = authenticate(con)
-    chosen = pick_shell(list_shells(con, user["user_id"]), requested, first)
+    fdefaults = flavor_defaults(con)
+    chosen = pick_shell(list_shells(con, user["user_id"]), requested, first, fdefaults)
+
+    # This shell's flavor default (advisory): the harness it boots with and, for
+    # opencode, the model to pre-select. Both are overridable below — the flavor
+    # default only sets the fallback, never a lock.
+    fdef = fdefaults.get(chosen["flavor"])
+    flavor_harness = fdef["harness"] if fdef else None
+    flavor_model = fdef["model"] if fdef else None
 
     # Harness pick, right after the shell pick: an explicit --harness / HARNESS
     # override wins silently; otherwise offer the harnesses on PATH when more
     # than one is present (per-launch, never persisted), falling back to this
-    # fork's instance.json value / 'claude' when nothing is detected. Fold the
-    # installer bin dirs onto PATH first so detection sees an installed-but-not-
-    # yet-on-PATH harness (e.g. opencode in ~/.opencode/bin).
+    # shell's flavor default, then the fork's instance.json value / 'claude'.
+    # Fold the installer bin dirs onto PATH first so detection sees an installed-
+    # but-not-yet-on-PATH harness (e.g. opencode in ~/.opencode/bin).
     ensure_harness_path()
-    default_harness = _configured_harness() or "claude"
+    default_harness = flavor_harness or _configured_harness() or "claude"
     harness = (flag_harness or os.environ.get("HARNESS")
                or pick_harness(detect_harnesses(), default_harness, first)
                or default_harness)
@@ -387,6 +419,22 @@ def main() -> None:
     print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
+
+    # Flavor model default: pre-select the model in the emitted opencode.json so
+    # the operator boots straight into the intended model. opencode-specific (the
+    # only emitted config with a model field); a NULL flavor model, or a harness
+    # that doesn't emit opencode.json (e.g. claude), skips this. Still overridable
+    # in-session / via `-m`.
+    if flavor_model and "opencode.json" in (adapter.get("emit") or []):
+        ocfg = REPO_ROOT / "opencode.json"
+        if ocfg.exists():
+            try:
+                cfg = json.loads(ocfg.read_text())
+            except (json.JSONDecodeError, OSError):
+                cfg = {}
+            cfg["model"] = flavor_model
+            atomic_write(ocfg, json.dumps(cfg, indent=2) + "\n")
+            print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
     sandboxed = apply_sandbox(adapter)
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")

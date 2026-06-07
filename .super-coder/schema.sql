@@ -48,7 +48,7 @@ CREATE TABLE shells (
     workspace         TEXT,                          -- RETIRED (B5): superseded by connections; unrendered, unauthored, kept to avoid a table rebuild
 
     lineage_seed      TEXT,
-    flavor            TEXT,                          -- planning / dev / review (NULL = bespoke, e.g. maintainer)
+    flavor            TEXT,                          -- dev / planner / reviewer / cartographer (NULL = bespoke, e.g. maintainer); launch defaults in flavor_defaults
     has_identity      INTEGER NOT NULL DEFAULT 0,
     bootstrapped      INTEGER NOT NULL DEFAULT 0,   -- 1 once the shell has run first-run orientation
 
@@ -72,6 +72,17 @@ WHEN NEW.flavor = 'cartographer' AND (
 BEGIN
   SELECT RAISE(ABORT, 'cartographer is a singleton — this fork already has one');
 END;
+
+-- Per-flavor launch defaults: the harness + model a shell of this flavor boots
+-- with. ADVISORY ONLY — overridable per launch (--harness / -m / the picker);
+-- run.py reads these to set the default and annotate the picker. model is
+-- harness-specific (opencode "provider/model"); NULL = let the harness pick its
+-- own (e.g. the claude harness). Seeded in migrations/0006.
+CREATE TABLE flavor_defaults (
+    flavor   TEXT PRIMARY KEY,
+    harness  TEXT NOT NULL,
+    model    TEXT
+);
 
 CREATE TABLE shell_memory_archives (
     archive_id     INTEGER PRIMARY KEY,
