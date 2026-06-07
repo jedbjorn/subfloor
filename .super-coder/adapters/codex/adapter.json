@@ -1,0 +1,9 @@
+{
+  "harness": "codex",
+  "launch": ["codex"],
+  "boot_artifact": "AGENTS.md",
+  "emit": [],
+  "env": {},
+  "model": { "flag": "--model" },
+  "sandbox": { "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"] }
+}

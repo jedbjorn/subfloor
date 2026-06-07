@@ -9,7 +9,7 @@ from "engine present" to "a shell you can launch":
                  is already installed (both would destroy content). --force skips.
     2. Require — python3 + sqlite3 (+ a heads-up if git/curl missing, and a
                  docker preflight for the sandbox run path — advisory, not fatal).
-    3. Harness — ensure claude + opencode are installed (official native
+    3. Harness — ensure claude + opencode + codex are installed (official native
                  installers, no npm); pick the launch default → instance.json.
     4. Strip   — super-coder's own per-instance content; a fork inherits the
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
@@ -76,26 +76,29 @@ def already_installed() -> bool:
 
 
 def detect_harness() -> str | None:
-    for h in ("claude", "opencode"):
+    for h in ("claude", "opencode", "codex"):
         if _harness_installed(h):
             return h
     return None
 
 
 # Official NATIVE installers — no npm. Claude Code dropped npm as the primary
-# path (https://code.claude.com/docs/en/setup); opencode ships its own script
-# too. Pipe-to-bash, latest version.
+# path (https://code.claude.com/docs/en/setup); opencode + codex ship their own
+# scripts too. Pipe-to-shell, latest version.
 HARNESS_INSTALL = {
     "claude":   "curl -fsSL https://claude.ai/install.sh | bash",
     "opencode": "curl -fsSL https://opencode.ai/install | bash",
+    "codex":    "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
 }
 # Where each installer drops its binary. Checked post-install because the new
 # bin dir is NOT on this process's PATH — the installer edits shell rc files,
 # which only a fresh shell picks up. shutil.which alone would miss a just-
-# installed CLI.
+# installed CLI. (codex's native installer drops into ~/.local/bin, same as
+# claude; ~/.codex is its config/auth home, not the binary.)
 HARNESS_BIN = {
     "claude":   Path.home() / ".local" / "bin" / "claude",
     "opencode": Path.home() / ".opencode" / "bin" / "opencode",
+    "codex":    Path.home() / ".local" / "bin" / "codex",
 }
 
 
@@ -105,7 +108,7 @@ def _harness_installed(name: str) -> bool:
 
 def ensure_harnesses() -> dict[str, str]:
     """Install any missing harness CLI via its official native installer (no
-    npm) — both claude + opencode, so a fork can launch and run either. Best
+    npm) — claude + opencode + codex, so a fork can launch and run any. Best
     effort: a failed install warns and continues (the harness is only needed at
     launch and can be installed by hand later). Returns {name: status}."""
     status: dict[str, str] = {}
@@ -199,7 +202,12 @@ def harness_login_status() -> dict:
             claude = False
     oc = Path.home() / ".local" / "share" / "opencode" / "auth.json"
     opencode = oc.exists() and oc.stat().st_size > 2
-    return {"claude": claude, "opencode": opencode}
+    # codex writes ~/.codex/auth.json on ChatGPT/API login (unless using the
+    # system keyring, which we can't probe — false negative is safe: it only
+    # downgrades the ✓ to a ⚠ reminder).
+    cx = Path.home() / ".codex" / "auth.json"
+    codex = cx.exists() and cx.stat().st_size > 2
+    return {"claude": claude, "opencode": opencode, "codex": codex}
 
 
 def report_logins() -> dict:
@@ -216,6 +224,11 @@ def report_logins() -> dict:
     else:
         print("  opencode  ⚠ not logged in — run `opencode auth login` once on the host")
         print("            (creates ~/.local/share/opencode/auth.json, mounted in).")
+    if st["codex"]:
+        print("  codex     ✓ logged in")
+    else:
+        print("  codex     ⚠ not logged in — run `codex` then sign in with ChatGPT once on the host")
+        print("            (creates ~/.codex/auth.json, which the sandbox mounts in).")
     return st
 
 
@@ -260,7 +273,7 @@ def main(argv: list[str]) -> int:
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
     # fork). Runs before the guards so it works anywhere.
     if "--ensure-harness" in argv:
-        step("Ensuring harness CLIs (claude + opencode)")
+        step("Ensuring harness CLIs (claude + opencode + codex)")
         ensure_harnesses()
         return 0
 
@@ -299,12 +312,12 @@ def main(argv: list[str]) -> int:
     report_docker()
 
     # 3. Ensure harness CLIs --------------------------------------------------
-    # Install both claude + opencode if missing, via their official NATIVE
-    # installers (no npm). The new harness picker lets a fork launch + run
-    # either, so we want both present. --skip-harness-install detects only
-    # (CI / air-gapped). instance.json's harness is the launch default; the
-    # picker overrides it per-launch.
-    step("Ensuring harness CLIs (claude + opencode)")
+    # Install claude + opencode + codex if missing, via their official NATIVE
+    # installers (no npm). The harness picker lets a fork launch + run any, so we
+    # want all present. --skip-harness-install detects only (CI / air-gapped).
+    # instance.json's harness is the launch default; the picker overrides it
+    # per-launch.
+    step("Ensuring harness CLIs (claude + opencode + codex)")
     if skip_harness:
         print("  --skip-harness-install set — detecting only, not installing")
         for n in HARNESS_INSTALL:

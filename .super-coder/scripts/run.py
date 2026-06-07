@@ -240,14 +240,23 @@ def list_shells(con: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
 
 
 def flavor_defaults(con: sqlite3.Connection) -> dict:
-    """flavor -> {'harness', 'model'} launch defaults. Empty if the table is
-    absent (older fork mid-migration) so the launcher degrades to its prior
-    behavior rather than failing."""
+    """flavor -> {'default_harness', 'models': {harness: model}} launch defaults.
+    The (flavor, harness) matrix: each flavor names a model per harness, and one
+    harness is the picker default (is_default). Empty if the table is absent
+    (older fork mid-migration) so the launcher degrades to its prior behavior
+    rather than failing."""
     try:
-        return {r["flavor"]: r for r in
-                con.execute("SELECT flavor, harness, model FROM flavor_defaults")}
+        rows = con.execute(
+            "SELECT flavor, harness, model, is_default FROM flavor_defaults")
     except sqlite3.OperationalError:
         return {}
+    out: dict = {}
+    for r in rows:
+        fd = out.setdefault(r["flavor"], {"default_harness": None, "models": {}})
+        fd["models"][r["harness"]] = r["model"]
+        if r["is_default"]:
+            fd["default_harness"] = r["harness"]
+    return out
 
 
 def _default_label(defaults: dict, flavor: str | None) -> str:
@@ -255,10 +264,11 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     boots with by default, so the operator knows which harness to launch if they
     forget. Blank for bespoke shells with no flavor default."""
     fd = defaults.get(flavor)
-    if not fd or not fd["harness"]:
+    if not fd or not fd["default_harness"]:
         return ""
-    model = fd["model"]
-    return fd["harness"] + (f" · {model.split('/')[-1]}" if model else "")
+    harness = fd["default_harness"]
+    model = fd["models"].get(harness)
+    return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
 def pick_shell(shells: list[sqlite3.Row], requested: str | None,
@@ -367,12 +377,12 @@ def main() -> None:
     fdefaults = flavor_defaults(con)
     chosen = pick_shell(list_shells(con, user["user_id"]), requested, first, fdefaults)
 
-    # This shell's flavor default (advisory): the harness it boots with and, for
-    # opencode, the model to pre-select. Both are overridable below — the flavor
-    # default only sets the fallback, never a lock.
+    # This shell's flavor default (advisory): the harness it boots with. The
+    # model is resolved AFTER the harness pick — a flavor names a model PER
+    # harness, so the model tracks whichever harness the operator lands on. Both
+    # are overridable — the flavor default only sets the fallback, never a lock.
     fdef = fdefaults.get(chosen["flavor"])
-    flavor_harness = fdef["harness"] if fdef else None
-    flavor_model = fdef["model"] if fdef else None
+    flavor_harness = fdef["default_harness"] if fdef else None
 
     # Harness pick, right after the shell pick: an explicit --harness / HARNESS
     # override wins silently; otherwise offer the harnesses on PATH when more
@@ -385,6 +395,11 @@ def main() -> None:
     harness = (flag_harness or os.environ.get("HARNESS")
                or pick_harness(detect_harnesses(), default_harness, first)
                or default_harness)
+
+    # Now that the harness is known, resolve THIS flavor's model for it (the
+    # (flavor, harness) cell). None when the flavor has no entry for the chosen
+    # harness (e.g. opencode as a manual fallback) — then the harness picks its own.
+    flavor_model = fdef["models"].get(harness) if fdef else None
 
     session_id, archive_id = open_session(con, chosen["shell_id"])
 
@@ -420,30 +435,44 @@ def main() -> None:
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
 
-    # Flavor model default: pre-select the model in the emitted opencode.json so
-    # the operator boots straight into the intended model. opencode-specific (the
-    # only emitted config with a model field); a NULL flavor model, or a harness
-    # that doesn't emit opencode.json (e.g. claude), skips this. Still overridable
-    # in-session / via `-m`.
-    if flavor_model and "opencode.json" in (adapter.get("emit") or []):
-        ocfg = REPO_ROOT / "opencode.json"
-        if ocfg.exists():
+    # Flavor model default: route the model to the harness the operator picked.
+    # The adapter declares HOW it takes a model — a launch flag (claude/codex:
+    # `--model <id>`) or a config-file key (opencode: opencode.json "model"). A
+    # NULL flavor model, or a harness declaring neither, skips this. Still
+    # overridable in-session / via the harness's own `-m`.
+    model_args: list[str] = []
+    mcfg = adapter.get("model") or {}
+    if flavor_model and mcfg.get("flag"):
+        model_args = [mcfg["flag"], flavor_model]
+        print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
+    elif flavor_model and mcfg.get("file"):
+        mfile = REPO_ROOT / mcfg["file"]
+        if mfile.exists():
             try:
-                cfg = json.loads(ocfg.read_text())
+                cfg = json.loads(mfile.read_text())
             except (json.JSONDecodeError, OSError):
                 cfg = {}
-            cfg["model"] = flavor_model
-            atomic_write(ocfg, json.dumps(cfg, indent=2) + "\n")
+            cfg[mcfg.get("key", "model")] = flavor_model
+            atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
             print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
     sandboxed = apply_sandbox(adapter)
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
 
+    # Sandbox-only launch flags — e.g. codex's approval/sandbox bypass, safe
+    # because the container is the safety boundary. The no-docker host path keeps
+    # the harness's normal prompts (SC_SANDBOX unset).
+    sandbox_flags: list[str] = []
+    if os.environ.get("SC_SANDBOX"):
+        sandbox_flags = (adapter.get("sandbox") or {}).get("launch_flags") or []
+        if sandbox_flags:
+            print(f"→ sandbox: launch flags → {' '.join(sandbox_flags)}")
+
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")
         return
 
-    cmd = adapter.get("launch") or [harness]
+    cmd = (adapter.get("launch") or [harness]) + model_args + sandbox_flags
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
     os.chdir(REPO_ROOT)
     print(f"→ exec {' '.join(cmd)}\n")
