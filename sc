@@ -80,6 +80,107 @@ dbuild() {
     "$here"
 }
 
+# ── dev kit (deps + test) — in-container primitives, like serve/boot ──────────
+# A shell runs these from INSIDE the sandbox, where pip/npm act directly on the
+# bind-mounted repo: the .venv / node_modules they create live in the mount and so
+# persist across image rebuilds (the point of installing per-fork instead of baking
+# into the image). They run in the CURRENT environment — no docker re-exec — so on
+# the no-docker host path they use host python3/node, exactly like serve/boot.
+
+# List a fork's manifests, pruning the install-artifact + engine + vcs trees that
+# map_repo.py's SKIP_DIRS also excludes (never descend an installed/engine tree).
+# Also prunes `vendor/` — installing has a stronger reason to skip it than mapping
+# does: a vendored/submodule package.json (e.g. ui/vendor/md-converter) is built by
+# its parent, and a stray `npm ci`/`pip install` there runs third-party lifecycle
+# scripts we don't own. We install only the manifests the fork itself authors.
+_sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
+  find "$here" \
+    \( -name node_modules -o -name .venv -o -name venv -o -name .super-coder \
+       -o -name .sc-state -o -name .git -o -name __pycache__ \
+       -o -name dist -o -name build -o -name vendor \) -prune -o \
+    -name "$1" -type f -print
+}
+
+# Install the fork's deps into the bind-mounted repo: one repo-root .venv from every
+# requirements*.txt (fork pins win), then an engine baseline test kit layered on with
+# only-if-needed so `./sc test` works even if the fork's reqs omit pytest; plus
+# `npm ci` for each package.json. Discovery is a glob walk (map-independent — runs on
+# a fresh fork before `./sc map`). A map-backed fast path would read dr_filepath.path
+# (dr_dependency.source_file is basename-only, so it can't locate a manifest's dir).
+sc_deps() {
+  rc=0
+  venv="$here/.venv"
+  reqs="$(_sc_find_manifests 'requirements*.txt')"
+  base_reqs="$(printf '%s\n' "$reqs" | grep -v 'requirements-dev\.txt' || true)"
+  if [ -n "$base_reqs" ]; then
+    if [ ! -x "$venv/bin/python" ]; then
+      echo "→ deps: creating $venv"
+      "$PY" -m venv "$venv" || { echo "✗ deps: venv create failed" >&2; return 1; }
+    fi
+    # Fork pins first (authoritative), with a sibling requirements-dev.txt if present.
+    printf '%s\n' "$base_reqs" | while IFS= read -r req; do
+      [ -n "$req" ] || continue
+      echo "→ deps: pip install -r $req"
+      "$venv/bin/pip" install -q -r "$req" || exit 1
+      dev="$(dirname "$req")/requirements-dev.txt"
+      if [ -f "$dev" ]; then
+        echo "→ deps: pip install -r $dev"
+        "$venv/bin/pip" install -q -r "$dev" || exit 1
+      fi
+    done || rc=1
+    # Engine baseline test kit — only-if-needed never overrides a fork's pin.
+    echo "→ deps: engine test kit (pytest httpx coverage, only-if-needed)"
+    "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage || rc=1
+  fi
+  pkgs="$(_sc_find_manifests 'package.json')"
+  if [ -n "$pkgs" ]; then
+    printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
+      [ -n "$pkg" ] || continue
+      d="$(dirname "$pkg")"
+      if [ -f "$d/package-lock.json" ]; then
+        echo "→ deps: npm ci in $d"; ( cd "$d" && npm ci ) || exit 1
+      else
+        echo "→ deps: npm install in $d"; ( cd "$d" && npm install ) || exit 1
+      fi
+    done || rc=1
+  fi
+  if [ -z "$base_reqs" ] && [ -z "$pkgs" ]; then
+    echo "→ deps: no requirements*.txt or package.json found — nothing to install"
+  fi
+  [ "$rc" -eq 0 ] || { echo "✗ deps: one or more installs failed" >&2; return 1; }
+  echo "✓ deps: done"
+}
+
+# Run the fork's test suites: backend (the .venv's pytest, honoring the fork's
+# pytest.ini; else the engine's own stdlib-unittest suite) + UI (npm run test /
+# vitest in any package.json dir that declares a test script). Non-zero if any fail.
+sc_test() {
+  rc=0
+  venv="$here/.venv"
+  if [ -x "$venv/bin/pytest" ]; then
+    echo "→ test: $venv/bin/pytest"
+    ( cd "$here" && "$venv/bin/pytest" "$@" ) || rc=1
+  elif ls "$here"/tests/test_*.py >/dev/null 2>&1; then
+    echo "→ test: python3 -m unittest discover (stdlib)"
+    ( cd "$here" && "$PY" -m unittest discover -s tests -p 'test_*.py' ) || rc=1
+  else
+    echo "→ test: no python tests found"
+  fi
+  pkgs="$(_sc_find_manifests 'package.json')"
+  if [ -n "$pkgs" ]; then
+    printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
+      [ -n "$pkg" ] || continue
+      d="$(dirname "$pkg")"
+      # Only run where a "test" script is declared (else npm errors "missing script").
+      if "$PY" -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('scripts',{}).get('test') else 1)" "$pkg" 2>/dev/null; then
+        echo "→ test: npm run test in $d"; ( cd "$d" && npm run test ) || exit 1
+      fi
+    done || rc=1
+  fi
+  [ "$rc" -eq 0 ] || { echo "✗ test: one or more suites failed" >&2; return 1; }
+  echo "✓ test: all suites passed"
+}
+
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
@@ -101,6 +202,8 @@ case "$cmd" in
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
+  deps)         sc_deps "$@" ;;
+  test)         sc_test "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
     dcheck
@@ -183,6 +286,8 @@ super-coder — forkable shell substrate
   Primitives (run inside the container; also the no-docker host escape hatch):
   ./sc serve               run the review layer (api + static UI) in the foreground
   ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
+  ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
+  ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health

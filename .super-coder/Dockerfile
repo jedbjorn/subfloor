@@ -1,12 +1,14 @@
 # super-coder sandbox image — the *environment*, not the code.
 #
 # The repo is bind-mounted at runtime (see `./sc launch`); this image carries
-# what the harness needs to run: python3 + sqlite3, git/curl, gh, and the
-# harness CLIs (claude / opencode / codex) baked in via their official native
-# installers (the same ones install.py uses — keep the URLs in sync with
+# what the harness needs to run: python3 + sqlite3, git/curl/ripgrep, gh, and the
+# harness CLIs (claude / opencode / codex / vibe) baked in via their official
+# native installers (the same ones install.py uses — keep the URLs in sync with
 # scripts/install.py HARNESS_INSTALL).
-# It also carries the common *project* runtimes a forked repo's dev surface needs
-# (node LTS), so `npm`/dev servers work without an ephemeral in-container install.
+# It also carries the dev-kit TOOLCHAIN super-coder develops against — node LTS for
+# Svelte/Vite, plus a baked Playwright+Chromium browser for E2E tests — but NOT the
+# fork's app deps: those install per-fork into the bind-mounted repo's own .venv /
+# node_modules via `./sc deps`, so versions track the fork's pins, not the image.
 #
 # Why bake the binaries but mount the creds: claude installs as a symlink into
 # ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode + codex
@@ -24,9 +26,11 @@ ARG SC_UID=1000
 ARG SC_GID=1000
 
 # sqlite3 CLI + git + curl + bash + ca-certs (installers pipe-to-bash over https).
+# ripgrep (rg) — the fast code search shells reach for when working a repo; the
+# mapping flow and a shell grepping its tree both expect `rg` on PATH.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      sqlite3 git curl bash ca-certificates \
+      sqlite3 git curl bash ca-certificates ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI (gh) — the in-container push/PR path: the GUI "publish" flow
@@ -52,13 +56,22 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
-# pytest — a *project* test runtime, not a harness/engine dep. The engine's own
-# tests are stdlib-unittest by design (no-dependency style), but forked repos'
-# dev surfaces commonly use pytest; baking it system-wide (same rationale as node
-# above) means shells run `pytest` without an ephemeral pip install that
-# evaporates on the next rebuild. Installed as root into /usr/local so it's on
-# PATH for the unprivileged ${SC_USER} the container actually runs as.
-RUN pip install --no-cache-dir pytest
+# Playwright E2E browser — baked at the IMAGE level on purpose, unlike the per-fork
+# app deps (those land in the fork's .venv / node_modules via `./sc deps`). It stays
+# baked because: (1) Chromium needs a pile of OS libraries (`--with-deps` shells out
+# to apt), which only root can install and which don't belong in a venv; (2) the E2E
+# runner drives the *running app over HTTP*, not via the app's venv, so it must be
+# present whichever fork is mounted. Install browsers to a world-readable shared path
+# so the unprivileged ${SC_USER} (the container's real uid) finds them — the default
+# /root/.cache/ms-playwright is unreadable to that user. PLAYWRIGHT_BROWSERS_PATH is
+# inherited by the running container, so a fork's own playwright / @playwright/test
+# runner (in its .venv / node_modules) resolves the SAME baked browser. Pin the
+# version: a runner only drives the browser build it shipped with, so an unpinned
+# client + an older cached browser silently mismatch — keep this >= any fork's pin.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN pip install --no-cache-dir "playwright==1.60.0" \
+ && playwright install --with-deps chromium \
+ && chmod -R a+rX /opt/ms-playwright
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 RUN groupadd -g ${SC_GID} ${SC_USER} \
@@ -71,10 +84,12 @@ ENV HOME=/home/${SC_USER}
 ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 
 # Harness CLIs — official native installers, no npm (mirrors install.py).
-# codex drops into ~/.local/bin (already on PATH above), same as claude.
+# codex drops into ~/.local/bin (already on PATH above), same as claude. vibe's
+# installer self-bootstraps uv (astral.sh) then `uv tool install`s into ~/.local/bin.
 RUN curl -fsSL https://claude.ai/install.sh | bash \
  && curl -fsSL https://opencode.ai/install | bash \
- && curl -fsSL https://chatgpt.com/codex/install.sh | sh
+ && curl -fsSL https://chatgpt.com/codex/install.sh | sh \
+ && curl -LsSf https://mistral.ai/vibe/install.sh | bash
 
 # Safe in-container git auth — structurally prevents a token in a URL. The
 # sandbox has no ssh, so `git@github.com:` remotes (e.g. a fork's default
