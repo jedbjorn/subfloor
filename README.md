@@ -41,7 +41,7 @@ super-coder's own memory or roadmap.
 > harness's "allow everything" is safe (the kernel is the boundary; the
 > container sees only this repo + your harness creds). The image bakes the rest:
 > `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs (`claude` +
-> `opencode`, via their official native installers, no npm). `make` targets wrap
+> `opencode` + `codex`, via their official native installers, no npm). `make` targets wrap
 > the common commands; `./sc <cmd>` works without `make`. No docker? The
 > `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
 > `sqlite3` (and a harness on `PATH`).
@@ -92,8 +92,8 @@ git add -A && git commit -m "chore: install super-coder"   # engine is gitignore
 ```
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
-(`claude` + `opencode`, via their official native installers — no npm — if either
-is missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
+(`claude` + `opencode` + `codex`, via their official native installers — no npm —
+if any are missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
 **makes the engine a gitignored dependency** (`git rm -r --cached .super-coder` —
 files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
 super-coder's own per-instance content** (a fork inherits the *system* — schema +
@@ -116,6 +116,32 @@ python3 .super-coder/scripts/install.py \
 After `./sc enter` you're talking to the shell, working your repo. Author
 memory, roadmap, and specs into the DB; `./sc snapshot` (+ `./sc render`)
 serializes back to the text git tracks.
+
+## Sign in to your harness (on the host)
+
+The harnesses are just CLIs — `./sc install` (and `./sc update`, `./sc
+ensure-harness`) install the binaries, but you authenticate each **once, on the
+host**, with your own account/subscription:
+
+```bash
+claude                      # Claude Code — prompts to sign in on first run
+opencode auth login         # OpenCode
+codex login                 # Codex (OpenAI / ChatGPT account)
+```
+
+`./sc launch` bind-mounts each harness's credential dir into the sandbox
+(`~/.claude` + `~/.claude.json`, `~/.config/opencode` + `~/.local/share/opencode`,
+`~/.codex`), so host auth flows straight into the container — **you never sign in
+inside the sandbox.** Authenticate on the host, then `./sc enter`.
+
+> **⚠ Sign in on the host, not inside the sandbox.** OAuth logins spin up a
+> localhost callback server (Codex uses `:1455`). Run the login on the **host** so
+> your browser's callback reaches it. Logging in from *inside* the sandbox fails —
+> that port isn't published, so the browser gets `ERR_CONNECTION_REFUSED`.
+
+A note on Codex models: driven by a **ChatGPT account** (not an API key), Codex
+exposes `gpt-5.5` and `gpt-5.4-mini` — the flavor defaults are set to those.
+Plain API-only ids (e.g. `gpt-5.4`) return a 400 on a ChatGPT account.
 
 ## Update a fork
 
