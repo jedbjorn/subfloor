@@ -4,6 +4,7 @@
   "boot_artifact": "AGENTS.md",
   "emit": ["opencode.json"],
   "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" },
+  "model": { "file": "opencode.json", "key": "model" },
   "sandbox": {
     "merge_json": {
       "opencode.json": {

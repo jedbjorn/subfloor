@@ -4,6 +4,7 @@
   "boot_artifact": "CLAUDE.md",
   "emit": [],
   "env": {},
+  "model": { "flag": "--model" },
   "sandbox": {
     "merge_json": {
       ".claude/settings.json": {

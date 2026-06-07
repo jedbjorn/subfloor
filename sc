@@ -41,7 +41,7 @@ dcheck() {
 # breaks claude — so seed it with empty json. Real creds come from a one-time
 # host login (`./sc doctor` guides it); this just keeps the mounts valid.
 dcreds() {
-  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" 2>/dev/null || true
+  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" 2>/dev/null || true
   [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 }
 
@@ -114,6 +114,7 @@ case "$cmd" in
       -v "$HOME/.claude.json:$HOME/.claude.json" \
       -v "$HOME/.config/opencode:$HOME/.config/opencode" \
       -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
+      -v "$HOME/.codex:$HOME/.codex" \
       -p "127.0.0.1:$p:$p" \
       -p "127.0.0.1:$dp:$dp" \
       "$IMG" ./sc serve --port "$p" >/dev/null
@@ -136,7 +137,7 @@ case "$cmd" in
 super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
-  ./sc ensure-harness      install claude + opencode if missing (official native installers, no npm)
+  ./sc ensure-harness      install claude + opencode + codex if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
   ./sc update              self-fetch the engine + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
   ./sc rebuild             build the .db from schema + migrations + snapshot

@@ -1,18 +1,19 @@
 # super-coder sandbox image — the *environment*, not the code.
 #
 # The repo is bind-mounted at runtime (see `./sc launch`); this image carries
-# what the harness needs to run: python3 + sqlite3, git/curl, gh, and the two
-# harness CLIs baked in via their official native installers (the same ones
-# install.py uses — keep the URLs in sync with scripts/install.py HARNESS_INSTALL).
+# what the harness needs to run: python3 + sqlite3, git/curl, gh, and the
+# harness CLIs (claude / opencode / codex) baked in via their official native
+# installers (the same ones install.py uses — keep the URLs in sync with
+# scripts/install.py HARNESS_INSTALL).
 # It also carries the common *project* runtimes a forked repo's dev surface needs
 # (node LTS), so `npm`/dev servers work without an ephemeral in-container install.
 #
 # Why bake the binaries but mount the creds: claude installs as a symlink into
-# ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode is a fat
-# self-contained binary. Baking both sidesteps the symlink dance. Auth/config
-# (~/.claude, ~/.claude.json, ~/.config/opencode, ~/.local/share/opencode) is
-# mounted rw from the host so the container reuses the login you already did —
-# no in-container `auth login`.
+# ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode + codex
+# are fat self-contained binaries. Baking them sidesteps the symlink dance.
+# Auth/config (~/.claude, ~/.claude.json, ~/.config/opencode,
+# ~/.local/share/opencode, ~/.codex) is mounted rw from the host so the container
+# reuses the login you already did — no in-container `auth login`.
 #
 # The container runs as your uid (compose `user:`) with HOME=/home/<user> equal
 # to the host, so paths match host==container and Path.home() finds everything.
@@ -62,8 +63,10 @@ ENV HOME=/home/${SC_USER}
 ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 
 # Harness CLIs — official native installers, no npm (mirrors install.py).
+# codex drops into ~/.local/bin (already on PATH above), same as claude.
 RUN curl -fsSL https://claude.ai/install.sh | bash \
- && curl -fsSL https://opencode.ai/install | bash
+ && curl -fsSL https://opencode.ai/install | bash \
+ && curl -fsSL https://chatgpt.com/codex/install.sh | sh
 
 # Safe in-container git auth — structurally prevents a token in a URL. The
 # sandbox has no ssh, so `git@github.com:` remotes (e.g. a fork's default

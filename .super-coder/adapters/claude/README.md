@@ -12,6 +12,8 @@ the launch command. No extra config file to emit at v1.
 | `boot_artifact` | the context file this harness reads (informational) |
 | `emit` | files in this dir copied to the repo root at launch (none for Claude) |
 | `env` | extra env merged into the launch environment |
+| `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's claude model (alias: `sonnet`/`haiku`/`opus`) |
+| `sandbox` | `merge_json`: project-scoped config patched in-sandbox (allow-all permissions) |
 
 A `.claude/settings.json` template could live here later (permissions, hooks);
 not needed for v1.
