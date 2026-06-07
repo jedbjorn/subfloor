@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compose the boot artifact from live DB state.
 
-Pure render: reads the chosen shell's identity, memory, projects, roadmap, and
-skills out of the DB and assembles one markdown document. The launcher
+Pure render: reads the chosen shell's identity, memory, projects, and skills
+out of the DB and assembles one markdown document. The launcher
 (`scripts/run.py`) dual-writes the result to `CLAUDE.md` + `AGENTS.md` at the
 repo root — one compose, two outputs, consumed natively by Claude Code and the
 AGENTS.md-reading harnesses (OpenCode, Goose, Crush).
@@ -81,47 +81,6 @@ def render_projects(con, shell_id: int) -> str:
         role = f" ({r['role']})" if r["role"] else ""
         lines.append(f"- {r['shortname']}{role}: {r['purpose'] or '(no purpose set)'}")
     return "\n".join(lines)
-
-
-# Funnel order: idea inlet → most-active committed work → done (shipped,
-# summarized) → taken-off-the-board (retired).
-_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"]
-_ROADMAP_LABEL = {
-    "brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
-    "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
-    "retired": "Retired",
-}
-
-
-def render_roadmap(con, shell_id: int) -> str:
-    """Compact roadmap index for the boot doc. Features owned by this shell are
-    marked; the DB is the index, so the shell sees what's planned at a glance.
-    Shipped features are summarized as a count, not enumerated."""
-    rows = con.execute(
-        "SELECT feature_id, title, roadmap_status, owning_shell, sort_order "
-        "FROM roadmap ORDER BY sort_order, feature_id"
-    ).fetchall()
-    if not rows:
-        return "(none)"
-    buckets: dict[str, list] = {}
-    shipped = 0
-    for r in rows:
-        if r["roadmap_status"] == "shipped":
-            shipped += 1
-            continue
-        buckets.setdefault(r["roadmap_status"], []).append(r)
-    parts = []
-    for status in _ROADMAP_ORDER:
-        if status not in buckets:
-            continue
-        parts.append(f"**{_ROADMAP_LABEL[status]}**")
-        for r in buckets[status]:
-            mine = " · *mine*" if r["owning_shell"] == shell_id else ""
-            parts.append(f"- {r['title']}{mine}")
-        parts.append("")
-    if shipped:
-        parts.append(f"_{shipped} shipped._")
-    return "\n".join(parts).rstrip() or "(none)"
 
 
 def render_connections(con, shell) -> str:
@@ -265,6 +224,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## SYSTEM PROMPT", "", system_prompt,
         "", "---", "",
+        "## CONNECTIONS", "", render_connections(con, shell),
+        "", "---", "",
         "## CURRENT STATE", "", current_state,
         "", "---", "",
         "## SEED", "", render_seed(con, shell_id),
@@ -272,10 +233,6 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "## LESSONS & STANCES", "", render_lns(con, shell_id),
         "", "---", "",
         "## ACTIVE PROJECTS", "", render_projects(con, shell_id),
-        "", "---", "",
-        "## CONNECTIONS", "", render_connections(con, shell),
-        "", "---", "",
-        "## ROADMAP", "", render_roadmap(con, shell_id),
         "", "---", "",
         "## SKILLS", "", render_skills(con, shell_id),
         "", "---", "",
