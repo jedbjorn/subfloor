@@ -34,6 +34,11 @@ edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapsh
 
 _No open flags._
 
+### B7 — Engine/Fork Separation & Update Lifecycle · owner: `cc`
+Engine becomes a gitignored downstream dependency (materialized from upstream, pinned by engine.ref); fork's DB is the one preserved artifact; update = snapshot→migrate, rollback = sound (DB+engine) pair-restore. Stops shells confusing the substrate for the project. See specs_sc/b7-engine-fork-separation.md.
+
+_No open flags._
+
 ## Near Term
 
 ### B4 — OpenCode adapter · owner: `cc`
