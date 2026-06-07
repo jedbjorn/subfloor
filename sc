@@ -23,6 +23,10 @@ devport() { "$PY" "$S/ports.py" devport; }
 # docker and so run the same whether on the host or inside the container.
 IMG=super-coder-sandbox
 CNAME="sc-$(basename "$here")"   # unique per fork, like the pm2 name
+# Shared inter-fork network. Sandbox containers join it so a shell in one fork
+# can reach another fork's API by container name (http://sc-<repo>:<port>) — see
+# dnet(). Override with SC_NET to isolate a fork onto its own network.
+SC_NET="${SC_NET:-sc-net}"
 
 # Fail fast with the fix if the docker daemon isn't reachable, instead of a
 # cryptic build/run error. Host setup is one-time and lives in `./sc doctor` /
@@ -52,6 +56,18 @@ dcreds() {
 duser() {
   if docker info 2>/dev/null | grep -qi rootless; then echo "0:0"
   else echo "$(id -u):$(id -g)"; fi
+}
+
+# Ensure the shared inter-fork network exists (idempotent — created once, reused
+# by every fork). Sandbox containers join it so a shell in one fork can reach
+# another fork's API by container name (http://sc-<repo>:<port>, e.g.
+# sc-dos-arch:8804) — Docker's embedded DNS resolves container names on a
+# user-defined network, which the default bridge does NOT do. This is
+# container<->container only: host port publishing stays 127.0.0.1-bound, so no
+# new host exposure. A fork that wants isolation sets SC_NET to its own name.
+dnet() {
+  docker network inspect "$SC_NET" >/dev/null 2>&1 \
+    || docker network create "$SC_NET" >/dev/null
 }
 
 # Build the env image (the repo is bind-mounted at run time, never baked — see
@@ -93,6 +109,7 @@ case "$cmd" in
     p="$(port)"
     dp="$(devport)"
     dbuild
+    dnet
     # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
     # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
     # host's gh login. NOTE: this widens the sandbox — anything in the container
@@ -103,6 +120,7 @@ case "$cmd" in
     git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
     docker run -d --name "$CNAME" --restart unless-stopped \
+      --network "$SC_NET" \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
       -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
