@@ -329,6 +329,37 @@ source-repo ergonomics only — `install.py` checks out `.super-coder` + `sc`, n
 the `Makefile`, so it never propagates to a fork or clobbers a fork's own
 `Makefile`. In a fork, use `./sc <cmd>` (or alias it in your own `Makefile`).
 
+## Dev kit
+
+Every sandbox bakes a **toolchain** — `rg`, `sqlite3`, `curl`, Node 22 / `npm`,
+and a Playwright + Chromium browser for E2E — but deliberately **not** your
+project's dependencies. Those you install per fork with `./sc deps`, which builds
+a repo-root `.venv` from every `requirements*.txt` (your pins are authoritative)
+and runs `npm ci`/`install` for each `package.json`. Because the install lands in
+the **bind-mounted repo** rather than the image, it survives rebuilds — built in
+the container, run in the container, persisted in the mount. Run it first in a
+fresh sandbox; a "module not found" is almost always just deps-not-yet-installed.
+On top of your deps it layers a small engine baseline — `pytest`, `httpx`,
+`coverage`, `ruff`, `mypy`, `datasette` — with pip's `only-if-needed` strategy, so
+it never overrides a fork's pin or its `[tool.ruff]` / `[tool.mypy]` config.
+**Available, not enforced:** opt into whichever pieces you want, fork by fork.
+
+```bash
+./sc deps          # install fork deps into the bind-mount (.venv + npm) — run first
+./sc test          # backend (.venv pytest / stdlib unittest) + UI (npm test / vitest)
+./sc lint [paths]  # ruff check  (.venv/bin/ruff format to apply formatting)
+./sc typecheck     # mypy
+```
+
+One boundary trips people up: **you work inside the sandbox container**, and the
+app the FnB watches in their browser is a *separate*, host-supervised instance. To
+see your own changes, start a dev server **inside** the container on
+`0.0.0.0:$SC_DEV_PORT` — the launcher publishes it to `http://127.0.0.1:$SC_DEV_PORT`
+on the host — and use `datasette <db.sqlite>` the same way to browse a SQLite DB in
+a web GUI. Never restart the host stack from inside the sandbox; run your own
+instance instead. (The boot doc's `RUNNING THE APP` section and the `dev_kit` skill
+carry the full detail.)
+
 ## Review layer (localhost GUI)
 
 A zero-dependency localhost GUI to review the substrate — shells, roadmap,
