@@ -44,8 +44,8 @@ CREATE TABLE shells (
     mandate           TEXT,
     system_prompt     TEXT    NOT NULL,
     current_state     TEXT,
-    connections       TEXT,                          -- authored "where things live" notes; rendered in ## CONNECTIONS (B5)
-    workspace         TEXT,                          -- RETIRED (B5): superseded by connections; unrendered, unauthored, kept to avoid a table rebuild
+    connections       TEXT,                          -- RETIRED (B5): authored "where things live" layer; nothing prompted shells to fill it so it sat empty — ## CONNECTIONS is now wholly derived from the dr_* map. Unrendered, unauthored, kept to avoid a table rebuild
+    workspace         TEXT,                          -- RETIRED (B5): superseded by connections (itself since retired); unrendered, unauthored, kept to avoid a table rebuild
 
     lineage_seed      TEXT,
     flavor            TEXT,                          -- dev / planner / reviewer / cartographer (NULL = bespoke, e.g. maintainer); launch defaults in flavor_defaults
