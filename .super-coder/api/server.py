@@ -146,7 +146,7 @@ def get_roadmap(con) -> dict:
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
     for f in rows(con.execute(
-            "SELECT flag_id, display_name, description FROM flags "
+            "SELECT flag_id, feature_id, display_name, description FROM flags "
             "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 AND feature_id IS NOT NULL")):
         flags_by.setdefault(f["feature_id"], []).append(f)
     for f in feats:
