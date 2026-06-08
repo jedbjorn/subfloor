@@ -45,6 +45,7 @@ PER_INSTANCE_TABLES = [
     "roadmap",
     "documents",
     "flags",
+    "spec_tasks",
     "projects",
     "project_shells",
     "skills",
