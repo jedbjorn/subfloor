@@ -7,8 +7,9 @@ each table is `DELETE`d then re-`INSERT`ed in primary-key order, so re-running
 produces a byte-identical file (clean git diffs) and loading it is repeatable.
 
 This is the *per-instance* serialization — it rebuilds THIS repo's content and
-stays local. It never propagates to forks (that is migrations' job). System
-content (skills) is seeded from assets/ via migrations, not dumped here.
+stays local. It never propagates to forks (that is migrations' job). Engine
+skills are seeded from assets/ via migrations. Project-local skills are dumped
+here so a fork can author its own skills without upstreaming them.
 
 FK checks are off during load (SQLite default), so dump order is for readability
 only, not correctness.
@@ -30,12 +31,11 @@ OUT_PATH = REPO_ROOT / ".sc-state" / "content.sql"
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
 
-# Per-instance tables, parents-before-children for readability. The `skills`
-# catalogue and `schema_migrations` ledger are excluded — they are SYSTEM
-# content seeded from migrations, not one fork's snapshot. `shell_skills` IS
-# here, though: which shell is *granted* a skill is a fork-local decision (the
-# bodies propagate via migration; the grants do not). It loads after `shells`
-# (its FK target) and after the skills migration has run, so both ends exist.
+# Per-instance tables, parents-before-children for readability.
+# `schema_migrations` is excluded. Engine-authored skills are system content
+# seeded from migrations; project-local skills are serialized by the special
+# `skills` dumper below. `shell_skills` loads after `skills`, so grants to
+# local skill names resolve on rebuild.
 PER_INSTANCE_TABLES = [
     "users",
     "shells",
@@ -47,6 +47,7 @@ PER_INSTANCE_TABLES = [
     "flags",
     "projects",
     "project_shells",
+    "skills",
     "shell_skills",
     # shell_messages is per-instance memory (the inbox between this fork's
     # shells), so it survives a rebuild like flags/decisions — not a derived
@@ -77,6 +78,30 @@ def table_exists(con: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
+def engine_skill_names() -> list[str]:
+    """Names authored by the engine seed assets.
+
+    Any live skill whose name is not in this set is project-local and belongs in
+    `.sc-state/content.sql`. This keeps local skills durable while engine
+    updates can still UPSERT their own catalogue rows.
+    """
+    skills_dir = ENGINE / "assets" / "skills"
+    names: list[str] = []
+    for path in sorted(skills_dir.glob("*/SKILL.md")):
+        text = path.read_text()
+        if not text.startswith("---"):
+            continue
+        try:
+            _, fm, _ = text.split("---", 2)
+        except ValueError:
+            continue
+        for line in fm.strip().splitlines():
+            if line.startswith("name:"):
+                names.append(line.split(":", 1)[1].strip())
+                break
+    return names
+
+
 def dump_shell_skills(con: sqlite3.Connection) -> list[str]:
     """Grants resolved by skill NAME, not raw skill_id. Skill ids are positional
     (they shift when the catalogue grows), so a raw-id dump would bind a fork's
@@ -95,7 +120,55 @@ def dump_shell_skills(con: sqlite3.Connection) -> list[str]:
     return lines
 
 
+def dump_local_skills(con: sqlite3.Connection) -> list[str]:
+    """Serialize project-local skills only, keyed by name.
+
+    The engine seed owns rows whose names exist under assets/skills. Everything
+    else is fork-local content and must survive rebuild/update from snapshot.
+    """
+    engine_names = engine_skill_names()
+    if engine_names:
+        placeholders = ", ".join("?" for _ in engine_names)
+        where = f"name NOT IN ({placeholders})"
+        params = engine_names
+        delete_line = (
+            "DELETE FROM skills WHERE name NOT IN ("
+            + ", ".join(quote(n) for n in engine_names)
+            + ");"
+        )
+    else:
+        where = "1=1"
+        params = []
+        delete_line = "DELETE FROM skills;"
+
+    cols = [r[1] for r in con.execute("PRAGMA table_info(skills)")]
+    collist = ", ".join(cols)
+    mutable_cols = [c for c in cols if c != "skill_id"]
+    insert_cols = ", ".join(mutable_cols)
+    update_cols = [c for c in mutable_cols if c != "name"]
+    update_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
+
+    rows = con.execute(
+        f"SELECT {insert_cols} FROM skills WHERE {where} ORDER BY name", params
+    ).fetchall()
+
+    lines = [
+        "-- Project-local skills only. Engine-seeded skills come from migrations.",
+        delete_line,
+    ]
+    for row in rows:
+        vals = ", ".join(quote(v) for v in row)
+        lines.append(
+            f"INSERT INTO skills ({insert_cols}) VALUES ({vals}) "
+            f"ON CONFLICT(name) DO UPDATE SET {update_clause};"
+        )
+    lines.append("")
+    return lines
+
+
 def dump_table(con: sqlite3.Connection, table: str) -> list[str]:
+    if table == "skills":
+        return dump_local_skills(con)
     if table == "shell_skills":
         return dump_shell_skills(con)
     cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]

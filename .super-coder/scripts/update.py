@@ -26,8 +26,9 @@ Flow:
     4. migrate IN PLACE — apply only un-applied migrations (ledger-tracked),
        preserving all rows incl. in-session writes. No DB yet (fresh fork) ->
        fall back to a from-text rebuild.
-    5. sync the skills catalogue (idempotent, id-stable UPSERT) — new/changed
-       skills reach the fork without a rebuild.
+    5. sync the engine skills catalogue (idempotent, id-stable UPSERT) —
+       new/changed engine skills reach the fork without a rebuild, while
+       project-local skills are left intact.
     6. re-grant common skills to all shells.
     7. wire the auto-remap hooks + map the repo + snapshot the (live) state.
 
@@ -193,12 +194,16 @@ def migrate_or_rebuild() -> None:
 
 
 def sync_skills() -> None:
-    """Re-apply the skills seed against the live DB. The seed is id-stable
-    (retire-missing + UPSERT by name), so new/changed catalogue skills land
-    without a rebuild and existing skill_ids — and the grants that reference
-    them — stay valid. The migrate ledger would otherwise skip the already-
+    """Re-apply the engine skills seed against the live DB.
+
+    The seed is id-stable and UPSERTs by name, so new/changed engine catalogue
+    skills land without a rebuild and existing skill_ids — and the grants that
+    reference them — stay valid. It deliberately does not retire names absent
+    from assets/skills because those may be project-local skills serialized by
+    the fork snapshot. The migrate ledger would otherwise skip the already-
     stamped seed file; catalogue currency is a per-update sync, not a one-time
-    migration."""
+    migration.
+    """
     seed = seed_skills.OUT
     if not seed.exists():
         print("  (no skills seed to sync)")
