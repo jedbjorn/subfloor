@@ -3,7 +3,7 @@ name: self_update
 description: Update this fork's super-coder engine in place — fetch + materialize new code + migrations, keep all your memory; roll back a bad update soundly. The shell hands off to its own next boot. Use when a super-coder update is available.
 category: substrate
 command: ./sc update
-common: true
+common: false
 ---
 
 # self_update — laying a new floor under your own feet
