@@ -2,6 +2,7 @@
 name: migration_management
 description: Author and apply fork-specific DB schema migrations — naming, format, how to apply locally and verify.
 category: substrate
+common: false
 ---
 
 # migration_management — fork-specific schema changes
