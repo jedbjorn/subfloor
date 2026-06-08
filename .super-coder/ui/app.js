@@ -86,7 +86,6 @@ function shellCard(s) {
 
   // editable operational fields
   c.append(field("current_state", s.current_state, "current_state", s.shell_id));
-  c.append(field("connections", s.connections, "connections", s.shell_id));
 
   // skills + grants (editable)
   const sk = el("div", {});

@@ -17,7 +17,7 @@ after any content write, `./sc snapshot` re-serializes to text (see the
 
 | Table | Holds | Write rule |
 |---|---|---|
-| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `connections` (authored "where things live" notes → boot `## CONNECTIONS`), `lineage_seed`, `active_archive_id` | UPDATE in place |
+| `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `lineage_seed`, `active_archive_id`. (`connections`/`workspace` retired — boot `## CONNECTIONS` is derived from the `dr_*` map, not authored here) | UPDATE in place |
 | `dr_section` | the navigation index — `name`, `path_prefix`, `description`; rendered in boot `## CONNECTIONS`. Cartographer-authored | INSERT/UPDATE (cartographer) |
 | `shell_identity_entries` | seed (cap 10) + L&S (`kind='lns'`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |

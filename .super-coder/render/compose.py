@@ -83,12 +83,13 @@ def render_projects(con, shell_id: int) -> str:
     return "\n".join(lines)
 
 
-def render_connections(con, shell) -> str:
-    """## CONNECTIONS — the single "where things live" surface (B5). Three layers,
-    top to bottom: a derived header (facts, never authored), the section index
-    (`dr_section`, prefix-joined to live file counts), and the authored notes
-    (`shells.connections` free text — wiring the map can't derive). The shell sees
-    *where to start* here, then queries one section's leaves on demand."""
+def render_connections(con) -> str:
+    """## CONNECTIONS — the single "where things live" surface (B5). Two layers,
+    top to bottom: a derived header (facts, never authored) and the section index
+    (`dr_section`, prefix-joined to live file counts). The shell sees *where to
+    start* here, then queries one section's leaves on demand. (The old authored
+    `shells.connections` free-text layer was retired — nothing prompted shells to
+    fill it, so it sat empty; the map is the surface now.)"""
     repo = con.execute(
         "SELECT root, default_branch, mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
     lines = ["**Need to find something? Look here first** — read the `dr_*` map via "
@@ -116,9 +117,6 @@ def render_connections(con, shell) -> str:
         if unsectioned:
             lines.append(f"- _other / unsectioned_ · {unsectioned} files — cartographer worklist")
 
-    notes = ((shell["connections"] if "connections" in shell.keys() else None) or "").strip()
-    if notes:
-        lines += ["", notes]
     return "\n".join(lines)
 
 
@@ -224,7 +222,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## SYSTEM PROMPT", "", system_prompt,
         "", "---", "",
-        "## CONNECTIONS", "", render_connections(con, shell),
+        "## CONNECTIONS", "", render_connections(con),
         "", "---", "",
         "## CURRENT STATE", "", current_state,
         "", "---", "",
