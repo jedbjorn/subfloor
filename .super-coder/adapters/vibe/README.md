@@ -46,3 +46,10 @@ install mistral-vibe`; the `vibe` binary lands in `~/.local/bin`), then
 `vibe --setup` to store the API key, or export `MISTRAL_API_KEY` in your shell.
 `./sc install` / `./sc update` / `./sc ensure-harness` install the binary
 automatically; auth stays manual.
+
+**Sandbox credentials:** `./sc launch` bind-mounts the host `~/.vibe` into the
+container (alongside the claude/codex/opencode cred dirs), so `vibe --setup`'s
+stored key + `.env` flow straight in — no in-sandbox login. The env-var path is
+also forwarded: if `MISTRAL_API_KEY` is set on the host at launch, it's passed
+through (only when non-empty, so it can't shadow the mounted `~/.vibe` creds).
+Authenticate on the host, then re-run `./sc launch` so the mount picks it up.

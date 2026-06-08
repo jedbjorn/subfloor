@@ -3,7 +3,8 @@
 A **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
-whatever coding harness you point at it (Claude Code today, OpenCode next).
+whatever coding harness you point at it: **Claude Code, OpenCode, and Codex** are
+fully sandbox-integrated, with **Mistral Vibe** available on the no-docker host path.
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
@@ -30,6 +31,37 @@ A fork's git surfaces show **only its project** — the engine is a dependency,
 not committed source, exactly like `node_modules/`. The one fork-owned artifact
 that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 
+## Quick start
+
+Drop super-coder into an existing git repo and boot a shell. Requires `docker`
+(rootless is fine) and an account for one coding harness — Claude Code, OpenCode,
+or Codex.
+
+```bash
+cd your-repo                                                  # an existing git repo
+
+# 1. Pull in the engine + entry script (files only, no history merge):
+git remote add super-coder https://github.com/jedbjorn/super-coder.git
+git fetch super-coder
+git checkout super-coder/main -- .super-coder sc
+
+# 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your first shell:
+./sc install
+
+# 3. Sign in to your harness once, on the HOST (not inside the sandbox):
+claude                          # or:  opencode auth login  ·  codex login
+
+# 4. Launch the sandbox (server + GUI) and attach a session:
+./sc launch
+./sc enter                      # auth + pick a shell + pick a harness + boot
+
+# 5. Commit the install (engine is gitignored — only sc + .sc-state + config track):
+git add -A && git commit -m "chore: install super-coder"
+```
+
+That's the happy path. Each step is covered in depth below — installer internals,
+harness sign-in, the docker modes, and the localhost review GUI.
+
 ## Install into an existing repo
 
 super-coder installs **alongside** your code — it renders to `_sc` dirs, so it
@@ -41,7 +73,7 @@ super-coder's own memory or roadmap.
 > harness's "allow everything" is safe (the kernel is the boundary; the
 > container sees only this repo + your harness creds). The image bakes the rest:
 > `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs (`claude` +
-> `opencode` + `codex`, via their official native installers, no npm). `make` targets wrap
+> `opencode` + `codex` + `vibe`, via their official native installers, no npm). `make` targets wrap
 > the common commands; `./sc <cmd>` works without `make`. No docker? The
 > `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
 > `sqlite3` (and a harness on `PATH`).
@@ -92,8 +124,8 @@ git add -A && git commit -m "chore: install super-coder"   # engine is gitignore
 ```
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
-(`claude` + `opencode` + `codex`, via their official native installers — no npm —
-if any are missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
+(`claude` + `opencode` + `codex` + `vibe`, via their official native installers — no
+npm — if any are missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
 **makes the engine a gitignored dependency** (`git rm -r --cached .super-coder` —
 files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
 super-coder's own per-instance content** (a fork inherits the *system* — schema +
@@ -127,21 +159,94 @@ host**, with your own account/subscription:
 claude                      # Claude Code — prompts to sign in on first run
 opencode auth login         # OpenCode
 codex login                 # Codex (OpenAI / ChatGPT account)
+vibe --setup                # Mistral Vibe — stores the API key (or export MISTRAL_API_KEY)
 ```
 
 `./sc launch` bind-mounts each harness's credential dir into the sandbox
 (`~/.claude` + `~/.claude.json`, `~/.config/opencode` + `~/.local/share/opencode`,
-`~/.codex`), so host auth flows straight into the container — **you never sign in
-inside the sandbox.** Authenticate on the host, then `./sc enter`.
+`~/.codex`, `~/.vibe`), so host auth flows straight into the container — **you
+never sign in inside the sandbox.** Authenticate on the host, then `./sc enter`.
+
+> **Vibe creds.** `vibe --setup` stores your key under `~/.vibe`, which the
+> sandbox now mounts — so Vibe works inside the container like the others. If you
+> instead use the env-var path, `export MISTRAL_API_KEY` on the host before
+> `./sc launch` and it's forwarded in (only when set). Re-run `./sc launch` after
+> first authenticating, so the mount picks up `~/.vibe`.
 
 > **⚠ Sign in on the host, not inside the sandbox.** OAuth logins spin up a
 > localhost callback server (Codex uses `:1455`). Run the login on the **host** so
 > your browser's callback reaches it. Logging in from *inside* the sandbox fails —
 > that port isn't published, so the browser gets `ERR_CONNECTION_REFUSED`.
 
+> **OpenCode is the exception.** Its `opencode auth login` for **API-key**
+> providers is a paste-the-key prompt, not an OAuth callback, so it works at
+> **either level** — run it on the host *or* from inside the container (`./sc
+> enter`). Because `~/.config/opencode` + `~/.local/share/opencode` are bind-mounted
+> read-write, a key entered on either side lands in the same `auth.json` and is
+> available to both. (OAuth-based OpenCode providers still follow the host rule
+> above.)
+
 A note on Codex models: driven by a **ChatGPT account** (not an API key), Codex
 exposes `gpt-5.5` and `gpt-5.4-mini` — the flavor defaults are set to those.
 Plain API-only ids (e.g. `gpt-5.4`) return a 400 on a ChatGPT account.
+
+## Harnesses, plans & model choice
+
+### Prefer a subscription plan over a raw API key
+
+Agentic coding burns **huge** token volume — multi-step loops, large context,
+constant re-reads. Metered per-token API billing scales with every one of those
+tokens and gets expensive fast. A flat **subscription plan** is generally far
+cheaper *and* predictable for this workload, so we recommend running each harness
+against its plan rather than its pay-as-you-go API:
+
+| Harness | Provider | Recommended plan |
+|---|---|---|
+| **Claude Code** | Anthropic | [Claude Pro / Max](https://claude.com/pricing) |
+| **Codex** | OpenAI | [ChatGPT Plus / Pro](https://openai.com/chatgpt/pricing/) |
+| **Vibe** | Mistral | [Mistral plans](https://mistral.ai/pricing) |
+| **OpenCode** → open-weights | Ollama | [Ollama Cloud (or run local, free)](https://ollama.com/) |
+
+Codex exists for exactly this reason — a ChatGPT account bills **flat, with no
+per-token metering**. OpenCode with a raw API key stays the **metered catch-all**:
+reach for it when you need a model no plan covers, accepting per-token cost. Ollama
+goes one further — open-weights models you can run **locally for free** on your own
+hardware, or on Ollama Cloud's plan.
+
+### Why each role defaults to the model it does
+
+Every shell has a **flavor** (its role); each flavor ships an advisory model
+default per harness (the `flavor_defaults` table — the picker pre-selects it;
+`--harness` / `-m` / the picker override). The doctrine:
+
+| Flavor | Job | Codex | Claude | OpenCode (open-weights) |
+|---|---|---|---|---|
+| **planner** | architecture, plans | `gpt-5.5` ★ | `opus` | `deepseek-v4-pro` |
+| **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `kimi-k2.6` |
+| **dev** | write the code | `gpt-5.4-mini` ★ | `sonnet` | `qwen3-coder:480b` |
+| **cartographer** | map the repo | `gpt-5.4-mini` ★ | `haiku` | `gpt-oss:20b` |
+
+★ = the harness the picker pre-selects for that flavor.
+
+The logic, three rules:
+
+- **Bookends premium, middle fast.** Planner and reviewer are *low-volume,
+  high-leverage reasoning* — one good plan or one sharp review pays for the
+  premium model. Dev and cartographer are *high-volume mechanical work* (bulk
+  code, file mapping), where a fast, cheap, coding-tuned model wins on
+  cost-per-token because the volume is highest.
+- **The reviewer runs a different lineage than the code it reviews.** It defaults
+  to **Claude (Opus)** so it isn't blind to the same mistakes a GPT model made
+  authoring the code — adversarial *diversity*, not a second opinion from the same
+  brain.
+- **Three lineages, always.** Every flavor offers Codex (OpenAI), Claude
+  (Anthropic), and OpenCode (open-weights via Ollama) — pick any provider for any
+  role at launch.
+
+> **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch
+> seam — it selects its own via `active_model` in `~/.vibe/config.toml`
+> (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a
+> fourth column here.
 
 ## Update a fork
 
@@ -273,3 +378,7 @@ git-tracked text. See `.super-coder/README.md` for the full model.
 > Spec: the founding design lives in the roadmap (`super-coder` feature row) and
 > renders to `specs_sc/`. Build plan + log: tracked in superCC
 > `shared/super-coder-impl-plan.md` during bring-up.
+
+## License
+
+[MIT](LICENSE) © 2026 jedbjorn.
