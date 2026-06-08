@@ -45,7 +45,7 @@ dcheck() {
 # breaks claude — so seed it with empty json. Real creds come from a one-time
 # host login (`./sc doctor` guides it); this just keeps the mounts valid.
 dcreds() {
-  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" 2>/dev/null || true
+  mkdir -p "$HOME/.claude" "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.codex" "$HOME/.vibe" 2>/dev/null || true
   [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 }
 
@@ -243,6 +243,11 @@ case "$cmd" in
     # can act as you on GitHub within the token's scope. A fine-grained,
     # single-repo PAT in SC_GH_TOKEN is the tighter option.
     gh_token="${SC_GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    # Forward a Mistral key for vibe's API-key auth path — ONLY when set, so an
+    # empty value can't shadow the mounted ~/.vibe creds (vibe --setup stores its
+    # key + .env there; the mount below carries them in like every other harness).
+    mistral_env=""
+    [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
     git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
     git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
@@ -251,7 +256,7 @@ case "$cmd" in
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
       -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-      -e GH_TOKEN="$gh_token" \
+      -e GH_TOKEN="$gh_token" $mistral_env \
       -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
       -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
       -w "$here" \
@@ -261,6 +266,7 @@ case "$cmd" in
       -v "$HOME/.config/opencode:$HOME/.config/opencode" \
       -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
       -v "$HOME/.codex:$HOME/.codex" \
+      -v "$HOME/.vibe:$HOME/.vibe" \
       -p "127.0.0.1:$p:$p" \
       -p "127.0.0.1:$dp:$dp" \
       "$IMG" ./sc serve --port "$p" >/dev/null
