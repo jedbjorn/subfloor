@@ -3,8 +3,8 @@
 A **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
-whatever coding harness you point at it: **Claude Code, OpenCode, and Codex** are
-fully sandbox-integrated, with **Mistral Vibe** available on the no-docker host path.
+whatever coding harness you point at it — **Claude Code, OpenCode, Codex, and
+Mistral Vibe**, all sandbox-integrated (or run on the no-docker host path).
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
