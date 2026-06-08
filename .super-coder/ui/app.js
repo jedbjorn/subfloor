@@ -70,7 +70,7 @@ async function renderShells(root) {
 }
 
 function field(label, value, key, sid) {
-  const ta = el("textarea", { value: value || "", rows: key === "current_state" ? 4 : 2 });
+  const ta = el("textarea", { value: value || "", rows: key === "current_state" ? 12 : 2 });
   const save = el("button", { className: "act", textContent: "save" });
   save.onclick = async () => {
     try { await api("/shells/" + sid, "PATCH", { [key]: ta.value }); setStatus("saved " + key); }
@@ -163,37 +163,48 @@ async function renderRoadmap(root) {
 }
 
 function featureCard(f) {
-  const c = el("div", { className: "card" });
-  const head = el("h2", {}, f.title || "(untitled)");
-  if (f.owner) head.append(el("span", { className: "pill " + f.roadmap_status, textContent: " " + f.owner }));
-  c.append(head);
+  // Expandable box: collapsed shows title + status/owner pills + a one-line
+  // summary preview; expanded reveals the editable fields, docs, and blockers.
+  const c = el("details", { className: "card feature" });
+  const sum = el("summary", { className: "feature-head" });
+  sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)"));
+  const meta = el("span", { className: "feature-meta" });
+  meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: SLABEL[f.roadmap_status] || f.roadmap_status }));
+  if (f.owner) meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: f.owner }));
+  if (f.open_flags?.length) meta.append(el("span", { className: "pill warn", textContent: f.open_flags.length + " ⚑" }));
+  sum.append(meta);
+  c.append(sum);
+  if (f.summary) c.append(el("div", { className: "feature-preview muted" }, f.summary));
+
+  const body = el("div", { className: "feature-body" });
 
   // editable: title / status / summary / sort
   const title = el("input", { type: "text", value: f.title || "" });
   const status = el("select", {});
   for (const s of STATUSES) status.append(el("option", { value: s, selected: s === f.roadmap_status, textContent: s }));
-  const summary = el("textarea", { value: f.summary || "", rows: 2 });
+  const summary = el("textarea", { value: f.summary || "", rows: 7 });
   const save = el("button", { className: "act", textContent: "save feature" });
   save.onclick = async () => {
     try { await api("/roadmap/" + f.feature_id, "PATCH", { title: title.value, roadmap_status: status.value, summary: summary.value }); setStatus("feature saved"); load("roadmap"); }
     catch (e) { toast("error: " + e.message); }
   };
-  c.append(el("div", { className: "grid2" },
+  body.append(el("div", { className: "grid2" },
     el("span", { className: "k" }, "title"), title,
     el("span", { className: "k" }, "status"), status,
     el("span", { className: "k" }, "summary"), summary), save);
 
   // documents — specs (editable/frozen per state) then docs (read-only here;
   // the Docs tab is where docs are edited)
-  for (const d of f.documents || []) c.append(docBlock(d, { readOnly: d.kind === "doc" }));
+  for (const d of f.documents || []) body.append(docBlock(d, { readOnly: d.kind === "doc" }));
 
   // open flags = blockers
   if (f.open_flags?.length) {
     const fl = el("div", {});
     fl.append(el("label", { className: "k", textContent: "blockers (open flags)" }));
     for (const x of f.open_flags) fl.append(el("div", { className: "tag" }, `${x.display_name || ""} ${x.description || ""}`));
-    c.append(fl);
+    body.append(fl);
   }
+  c.append(body);
   return c;
 }
 
@@ -333,13 +344,20 @@ async function renderFlags(root) {
 }
 
 function flagRow(f) {
-  const row = el("div", { className: "flag" + (f.resolved ? " resolved" : "") });
-  row.append(el("span", { className: "pill " + (f.priority || "").toLowerCase() }, f.priority || ""));
-  const d = el("div", { className: "desc" });
+  // Expandable: collapsed row shows priority + name + description on one line;
+  // expanding reveals the resolution note (resolved) or the resolve action (open).
+  const row = el("details", { className: "flag" + (f.resolved ? " resolved" : "") });
+  const head = el("summary", { className: "flag-head" });
+  head.append(el("span", { className: "pill " + (f.priority || "").toLowerCase() }, f.priority || ""));
+  const d = el("span", { className: "desc" });
   d.append(el("b", {}, (f.display_name ? f.display_name + " " : "")), esc(f.description || ""));
-  if (f.resolved) d.append(el("div", { className: "tag" }, `resolved ${f.resolved_date || ""} — ${f.resolution_notes || ""}`));
-  row.append(d);
-  if (!f.resolved) {
+  head.append(d);
+  row.append(head);
+
+  const body = el("div", { className: "flag-body" });
+  if (f.resolved) {
+    body.append(el("div", { className: "tag" }, `resolved ${f.resolved_date || ""} — ${f.resolution_notes || ""}`));
+  } else {
     const btn = el("button", { className: "act", textContent: "resolve" });
     btn.onclick = async () => {
       const notes = prompt("Resolution notes:");
@@ -347,8 +365,9 @@ function flagRow(f) {
       try { await api("/flags/" + f.flag_id, "PATCH", { resolved: 1, resolution_notes: notes }); setStatus("flag resolved"); load("flags"); }
       catch (e) { toast("error: " + e.message); }
     };
-    row.append(btn);
+    body.append(btn);
   }
+  row.append(body);
   return row;
 }
 
