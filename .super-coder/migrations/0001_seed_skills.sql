@@ -896,7 +896,7 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   'Create, persist, assign, and remove fork-specific skills — the correct authoring path so skills survive snapshot/rebuild cycles.',
   'substrate',
   NULL,
-  1,
+  0,
   '# local_skill_management — fork-specific skills that survive
 
 Fork-specific skills live in the DB and are persisted via `.sc-state/content.sql`
@@ -1173,7 +1173,7 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   'Author and apply fork-specific DB schema migrations — naming, format, how to apply locally and verify.',
   'substrate',
   NULL,
-  1,
+  0,
   '# migration_management — fork-specific schema changes
 
 Migrations live in `.super-coder/migrations/` and apply in numeric order,

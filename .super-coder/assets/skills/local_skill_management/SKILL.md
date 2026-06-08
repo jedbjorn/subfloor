@@ -2,6 +2,7 @@
 name: local_skill_management
 description: Create, persist, assign, and remove fork-specific skills — the correct authoring path so skills survive snapshot/rebuild cycles.
 category: substrate
+common: false
 ---
 
 # local_skill_management — fork-specific skills that survive
