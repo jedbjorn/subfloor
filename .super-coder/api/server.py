@@ -27,6 +27,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -146,7 +147,7 @@ def get_roadmap(con) -> dict:
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
     for f in rows(con.execute(
-            "SELECT flag_id, display_name, description FROM flags "
+            "SELECT flag_id, feature_id, display_name, description FROM flags "
             "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 AND feature_id IS NOT NULL")):
         flags_by.setdefault(f["feature_id"], []).append(f)
     for f in feats:
@@ -481,6 +482,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    def _fail(self, exc: Exception):
+        """Unhandled handler error. The do_* methods swallow everything so one
+        bad request can't kill the server thread — but a silent `400 {error:
+        str(exc)}` hid genuine SERVER bugs behind a client-error status with no
+        trace (a SELECT omitting a column read by key surfaced only as
+        `{"error": "'feature_id'"}`, no stack, status 400). Log the full
+        traceback to stderr and return 500 so it reads as a server fault."""
+        traceback.print_exc()
+        return self._send(500, {"error": str(exc)})
+
     # -- static + GET --
     def do_GET(self):
         path = urlparse(self.path).path
@@ -532,7 +543,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"scripts": script_list()})
             return self._send(404, {"error": "not found"})
         except Exception as e:
-            return self._send(400, {"error": str(e)})
+            return self._fail(e)
         finally:
             con.close()
 
@@ -568,7 +579,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if r["ok"] else 500, r)
             return self._send(404, {"error": "not found"})
         except Exception as e:
-            return self._send(400, {"error": str(e)})
+            return self._fail(e)
         finally:
             con.close()
 
@@ -601,7 +612,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
             return self._send(404, {"error": "not found"})
         except Exception as e:
-            return self._send(400, {"error": str(e)})
+            return self._fail(e)
         finally:
             con.close()
 
@@ -617,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
         except Exception as e:
-            return self._send(400, {"error": str(e)})
+            return self._fail(e)
         finally:
             con.close()
 
