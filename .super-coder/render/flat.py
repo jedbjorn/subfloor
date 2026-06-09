@@ -11,9 +11,14 @@ reverse):
     DB → flat is one-way; the files are never read back.
 
   • Harness skills — `.claude/skills/<name>/SKILL.md` for the booting shell's
-    granted skills. Consumed natively by Claude Code / OpenCode / Crush.
-    Like the boot artifact (CLAUDE.md/AGENTS.md) this is GITIGNORED and rebuilt
-    at launch — a per-shell cache, not tracked content.
+    granted skills. A NON-load-bearing convenience cache for harnesses that
+    auto-discover this path natively (Claude Code / OpenCode / Crush). It is NOT
+    the source of truth and NOT the cross-harness load path: codex reads its own
+    `$CODEX_HOME/skills` and vibe (Mistral) has no skill dir at all. The
+    canonical, harness-agnostic load path is the DB — the boot doc's `## SKILLS`
+    block renders each grant's exact `SELECT content FROM skills …` query
+    (see compose.render_skills). Like the boot artifact (CLAUDE.md/AGENTS.md)
+    this dir is GITIGNORED and rebuilt at launch — a per-shell cache.
 
 Render is incremental: an artifact whose composed content already matches what
 is on disk is skipped (no write, no mtime churn), so re-rendering an unchanged
