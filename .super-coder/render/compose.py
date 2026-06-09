@@ -129,10 +129,26 @@ def render_skills(con, shell_id: int) -> str:
     ).fetchall()
     if not rows:
         return "(none)"
-    return "\n".join(
-        f"- **{r['name']}** — {(r['description'] or '').strip().splitlines()[0] if r['description'] else ''}"
-        for r in rows
-    )
+    # Substrate skills load from the DB, not a harness skill dir — so they work
+    # on every harness (claude/codex/opencode/vibe), present and future, with no
+    # per-harness bridging. These are SEPARATE from and ADDITIONAL to whatever
+    # native skills your harness ships (codex's `.system` set, claude plugins,
+    # …; vibe ships none). Below: name, one-line description, and the exact query
+    # to load each skill's full procedure on demand.
+    lines = [
+        "Substrate skills granted to you — loaded from your memory DB, **in "
+        "addition to** any native skills your harness provides. Load a skill's "
+        "full procedure on demand with the query under it:",
+        "",
+    ]
+    for r in rows:
+        desc = (r["description"] or "").strip().splitlines()[0] if r["description"] else ""
+        lines.append(f"- **{r['name']}** — {desc}")
+        lines.append(
+            "  - load: `sqlite3 .super-coder/shell_db.db \"SELECT content FROM "
+            f"skills WHERE name='{r['name']}' AND is_deleted=0;\"`"
+        )
+    return "\n".join(lines)
 
 
 def fetch_counts(con, shell_id: int) -> dict:
