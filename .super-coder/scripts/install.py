@@ -111,6 +111,31 @@ def _harness_installed(name: str) -> bool:
     return bool(shutil.which(name)) or HARNESS_BIN.get(name, Path("/nonexistent")).exists()
 
 
+def update_harnesses() -> dict[str, str]:
+    """Force-update all harness CLIs by re-running their official native
+    installers regardless of whether they're already present. Unlike
+    ensure_harnesses(), never skips an installed harness — the installers
+    are idempotent and self-update to latest."""
+    status: dict[str, str] = {}
+    have_curl = bool(shutil.which("curl"))
+    for name, cmd in HARNESS_INSTALL.items():
+        if not have_curl:
+            print(f"  {name:9} ⚠ curl unavailable — update by hand: {cmd}")
+            status[name] = "no-curl"
+            continue
+        present = _harness_installed(name)
+        label = "updating" if present else "installing"
+        print(f"  {name:9} … {label}  ($ {cmd})")
+        rc = subprocess.run(["bash", "-c", cmd]).returncode
+        if rc == 0:
+            print(f"  {name:9} ✓ {'updated' if present else 'installed'}")
+            status[name] = "updated" if present else "installed"
+        else:
+            print(f"  {name:9} ⚠ installer returned rc={rc} — retry by hand: {cmd}")
+            status[name] = "failed"
+    return status
+
+
 def ensure_harnesses() -> dict[str, str]:
     """Install any missing harness CLI via its official native installer (no
     npm) — claude + opencode + codex + vibe, so a fork can launch and run any. Best
@@ -329,8 +354,14 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness", "--check-docker"}
+    own = {"--force", "--skip-harness-install", "--ensure-harness", "--update-harnesses", "--check-docker"}
     fork_args = [a for a in argv if a not in own]
+
+    # Standalone: force-update all harness CLIs to latest and exit.
+    if "--update-harnesses" in argv:
+        step("Updating harness CLIs to latest (claude + opencode + codex + vibe)")
+        update_harnesses()
+        return 0
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
     # fork). Runs before the guards so it works anywhere.
