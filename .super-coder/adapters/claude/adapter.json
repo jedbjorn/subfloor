@@ -5,6 +5,23 @@
   "emit": [],
   "env": {},
   "model": { "flag": "--model" },
+  "merge_json": {
+    ".claude/settings.local.json": {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash \"$CLAUDE_PROJECT_DIR/.super-coder/adapters/claude/hooks/branch-guard.sh\""
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
   "sandbox": {
     "merge_json": {
       ".claude/settings.json": {

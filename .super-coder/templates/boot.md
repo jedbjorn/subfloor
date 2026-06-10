@@ -90,6 +90,19 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 ---
 
+## VERSION CONTROL
+
+Branch before you build. Before the **first edit** of a new unit of work, create
+a branch — `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). One
+branch per unit of work; never edit on the default branch. Commit each unit when
+it is done, then push, open a PR, and **stop** — merging is the FnB's gate, not
+yours. (On Claude this is enforced: edits made while on the default branch are
+blocked at the harness level. On other harnesses it is yours to keep — same
+rule.) Full procedure — attribution, cleanup, what not to commit: the `git`
+skill.
+
+---
+
 ## RUNNING THE APP
 
 You run **inside the sandbox container**; this repo is bind-mounted in at its host
