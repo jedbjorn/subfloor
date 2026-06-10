@@ -90,6 +90,20 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 ---
 
+## VERSION CONTROL
+
+Branch before you build. Before the **first edit** of a new unit of work, create
+a branch — `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). One
+branch per unit of work; never edit on the default branch. Commit each unit when
+it is done, then push, open a PR, and **stop** — merging is the FnB's gate, not
+yours. (This is enforced, not just asked: claude/codex/opencode block edits made
+while on the default branch at the harness level; a git pre-commit hook refuses
+the commit on every harness, vibe included. Both are escapable when you mean it —
+`git commit --no-verify` — but the default is the rule.) Full procedure —
+attribution, cleanup, what not to commit: the `git` skill.
+
+---
+
 ## RUNNING THE APP
 
 You run **inside the sandbox container**; this repo is bind-mounted in at its host

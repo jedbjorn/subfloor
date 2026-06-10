@@ -16,6 +16,12 @@
 # Only the render output is ignored; a fork's own .claude/settings stays tracked.
 /.claude/skills/
 
+# Engine-managed harness config, re-emitted each launch (the branch-guard hook
+# per harness). Kept separate from the fork's own tracked config: claude's
+# settings.LOCAL.json (not settings.json), codex's hooks.json (not config.toml).
+/.claude/settings.local.json
+/.codex/hooks.json
+
 # Per-instance local config — derived ports etc. Local to this fork, never
 # propagates (re-derived from the repo path if absent). Hand-overridable.
 /.super-coder/instance.json

@@ -59,7 +59,9 @@ def emit_adapter(adapter: dict) -> list[str]:
     for fname in adapter.get("emit", []):
         src = adir / fname
         if src.exists():
-            atomic_write(REPO_ROOT / fname, src.read_text())
+            dst = REPO_ROOT / fname
+            dst.parent.mkdir(parents=True, exist_ok=True)  # fname may be nested (e.g. .codex/hooks.json)
+            atomic_write(dst, src.read_text())
             written.append(fname)
     return written
 
@@ -76,20 +78,13 @@ def _deep_merge(base: dict, patch: dict) -> dict:
     return base
 
 
-def apply_sandbox(adapter: dict) -> list[str]:
-    """Sandbox-only: elevate harness permissions to allow-all when booting
-    INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
-    container is the safety boundary, so permission prompts inside it are pure
-    friction; the no-docker host escape hatch (`./sc boot` with SC_SANDBOX
-    unset) keeps normal prompts. Each adapter declares sandbox.merge_json:
-    {repo-relative-path: patch}; we deep-merge the patch into that
-    project-scoped file (preserving any keys the fork set). Paths are
-    repo-relative, so this never touches host-global config (~/.claude etc.)."""
-    if not os.environ.get("SC_SANDBOX"):
-        return []
-    spec = (adapter.get("sandbox") or {}).get("merge_json") or {}
+def _merge_json_spec(spec: dict) -> list[str]:
+    """Deep-merge each {repo-relative-path: patch} into that project-scoped JSON
+    file, preserving any keys the fork already set. Paths are repo-relative, so
+    this never touches host-global config (~/.claude etc.). Writes the same bytes
+    when the patch is already present, so re-running produces no git churn."""
     touched = []
-    for rel, patch in spec.items():
+    for rel, patch in (spec or {}).items():
         dst = REPO_ROOT / rel
         cur: dict = {}
         if dst.exists():
@@ -103,6 +98,28 @@ def apply_sandbox(adapter: dict) -> list[str]:
         atomic_write(dst, json.dumps(cur, indent=2) + "\n")
         touched.append(rel)
     return touched
+
+
+def apply_merge_json(adapter: dict) -> list[str]:
+    """Always-on config patches the adapter declares at top-level `merge_json`
+    (distinct from sandbox.merge_json, which is sandbox-only). Used to install
+    engine-managed, gitignored harness config every launch — e.g. claude's
+    PreToolUse branch-guard hook in .claude/settings.local.json (kept out of the
+    fork's tracked .claude/settings.json so fork-owned config is never clobbered)."""
+    return _merge_json_spec(adapter.get("merge_json") or {})
+
+
+def apply_sandbox(adapter: dict) -> list[str]:
+    """Sandbox-only: elevate harness permissions to allow-all when booting
+    INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
+    container is the safety boundary, so permission prompts inside it are pure
+    friction; the no-docker host escape hatch (`./sc boot` with SC_SANDBOX
+    unset) keeps normal prompts. Each adapter declares sandbox.merge_json:
+    {repo-relative-path: patch}; we deep-merge the patch into that
+    project-scoped file (preserving any keys the fork set)."""
+    if not os.environ.get("SC_SANDBOX"):
+        return []
+    return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {})
 
 
 def ensure_harness_path() -> None:
@@ -455,6 +472,9 @@ def main() -> None:
             cfg[mcfg.get("key", "model")] = flavor_model
             atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
             print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
+    merged = apply_merge_json(adapter)
+    if merged:
+        print(f"→ harness config → {', '.join(merged)}")
     sandboxed = apply_sandbox(adapter)
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
