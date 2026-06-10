@@ -10,6 +10,18 @@ a first-party, open-source (Apache-2.0) CLI billed against a Mistral plan
 coding models. opencode stays the universal metered catch-all; vibe is the
 native Mistral path.
 
+## Branch guard — no in-line block (by harness limitation)
+
+Vibe has **no pre-tool hook** and no programmatic, branch-aware tool gate — its
+permissions are static (per-tool always/ask/deny, agent profiles), so unlike
+claude/codex/opencode it cannot block an edit at the moment it happens based on
+git state. Vibe's branch enforcement is therefore two-layered and honest about it:
+the always-loaded **VERSION CONTROL** rule in the boot artifact (advisory), and
+the universal **git pre-commit backstop** (`.super-coder/hooks/pre-commit`, wired
+via `core.hooksPath`) that refuses the *commit* on a protected default branch — a
+commit-time gate rather than an edit-time one, but a real gate. If Mistral adds a
+pre-tool hook later, wire it here to match the others.
+
 `adapter.json` fields (the harness seam contract):
 
 | field | meaning |

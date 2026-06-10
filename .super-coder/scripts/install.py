@@ -253,9 +253,11 @@ _GITIGNORE_BLOCK = f"""
 /AGENTS.md
 /opencode.json
 /.claude/skills/
-# Engine-managed harness config re-emitted each launch (claude branch-guard
-# hook); the gitignored local layer, kept apart from a fork's tracked settings.
+# Engine-managed harness config re-emitted each launch (per-harness branch-guard
+# hook); kept apart from a fork's own tracked config (claude settings.json /
+# codex config.toml).
 /.claude/settings.local.json
+/.codex/hooks.json
 # .sc-state/ is TRACKED (content.sql + engine.ref). Only the ephemeral
 # pre-update restore pointer is ignored.
 /.sc-state/engine.ref.prev

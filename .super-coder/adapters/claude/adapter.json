@@ -14,7 +14,7 @@
             "hooks": [
               {
                 "type": "command",
-                "command": "bash \"$CLAUDE_PROJECT_DIR/.super-coder/adapters/claude/hooks/branch-guard.sh\""
+                "command": "bash \"$CLAUDE_PROJECT_DIR/.super-coder/scripts/branch-guard.sh\""
               }
             ]
           }

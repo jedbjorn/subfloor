@@ -1,8 +1,8 @@
 {
   "harness": "codex",
-  "launch": ["codex"],
+  "launch": ["codex", "--dangerously-bypass-hook-trust"],
   "boot_artifact": "AGENTS.md",
-  "emit": [],
+  "emit": [".codex/hooks.json"],
   "env": {},
   "model": { "flag": "--model" },
   "sandbox": { "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"] }

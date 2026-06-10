@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^apply_patch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.super-coder/scripts/branch-guard.sh\"",
+            "statusMessage": "branch guard"
+          }
+        ]
+      }
+    ]
+  }
+}

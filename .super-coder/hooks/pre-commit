@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# super-coder pre-commit — universal branch-guard backstop.
+#
+# Fires for EVERY harness (and the FnB) via core.hooksPath, so it is the only
+# real enforcement for vibe (which has no pre-tool hook) and a defense-in-depth
+# net behind the claude/codex/opencode edit-time hooks. Gates the COMMIT, not the
+# edit: refuses to commit while HEAD is a protected default branch.
+#
+# Reuses the one shared branch-decision script (exit 2 = block, stderr = reason);
+# any non-zero aborts the commit. Bypassable with `git commit --no-verify` — by
+# design, an escape hatch for the rare deliberate commit on a default branch.
+exec bash "$(git rev-parse --show-toplevel)/.super-coder/scripts/branch-guard.sh"

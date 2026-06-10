@@ -41,6 +41,17 @@ harness-specific file OpenCode wants and the launch command.
   OpenCode's bundled AI SDK (verified in the binary), so it reliably overrides the
   default. Provider-scoped (all OpenRouter models); harmless for non-Qwen models.
   `reasoning` is intentionally left untouched — the next dial if noise persists.
+- **`protect-default-branch.js`** + its entry in `opencode.json` `plugin` — a
+  `tool.execute.before` hook that blocks `write`/`edit`/`patch` while HEAD is a
+  protected default branch (forcing a feature branch before work lands).
+  Registered by repo-relative path (like `tool-discipline.md`), so it is read
+  in-place from the engine dir — not emitted, survives regeneration. It shells
+  out to the shared `.super-coder/scripts/branch-guard.sh` (one branch-decision
+  source across all harnesses; honors `SC_PROTECTED_BRANCHES`). Throwing in the
+  hook aborts that one tool call and surfaces the reason to the model. This is
+  opencode's equivalent of the claude/codex `PreToolUse` deny hook; the git
+  pre-commit backstop (`.super-coder/hooks/pre-commit`) catches shell-driven
+  writes that route around the tool path.
 
 ## Verify on live OpenCode (research flags from the spec)
 

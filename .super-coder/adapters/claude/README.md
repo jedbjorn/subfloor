@@ -20,7 +20,8 @@ the launch command. No extra config file to emit at v1.
 
 `merge_json` deep-merges a `PreToolUse` hook into **`.claude/settings.local.json`**
 (the gitignored personal layer — never the fork's tracked `.claude/settings.json`,
-so fork-owned config is untouched). The hook runs `hooks/branch-guard.sh` before
+so fork-owned config is untouched). The hook runs the shared
+`../../scripts/branch-guard.sh` before
 every `Edit`/`Write`/`NotebookEdit`/`MultiEdit` and blocks the edit (exit 2) when
 HEAD is a protected default branch — forcing a feature branch before any work
 lands. Protected set defaults to `main master`; override per-fork with
@@ -28,3 +29,7 @@ lands. Protected set defaults to `main master`; override per-fork with
 `git` skill and the boot-template VERSION CONTROL rule — a skill loads too late to
 stop the first edit; the hook fires before it. Re-emitted (idempotently) each
 launch, so it survives `./sc update`.
+
+`scripts/branch-guard.sh` is the **one** branch-decision script shared by all four
+harnesses (claude + codex hooks, the opencode plugin, the git pre-commit backstop)
+— so `SC_PROTECTED_BRANCHES` and the message stay identical everywhere.

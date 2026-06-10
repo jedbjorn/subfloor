@@ -59,7 +59,9 @@ def emit_adapter(adapter: dict) -> list[str]:
     for fname in adapter.get("emit", []):
         src = adir / fname
         if src.exists():
-            atomic_write(REPO_ROOT / fname, src.read_text())
+            dst = REPO_ROOT / fname
+            dst.parent.mkdir(parents=True, exist_ok=True)  # fname may be nested (e.g. .codex/hooks.json)
+            atomic_write(dst, src.read_text())
             written.append(fname)
     return written
 
