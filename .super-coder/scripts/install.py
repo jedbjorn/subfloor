@@ -283,6 +283,8 @@ _GITIGNORE_BLOCK = f"""
 # codex config.toml).
 /.claude/settings.local.json
 /.codex/hooks.json
+# Dev-shell worktrees — one per dev shell, linked inside the repo root.
+/.sc-worktrees/
 # .sc-state/ is TRACKED (content.sql + engine.ref). Only the ephemeral
 # pre-update restore pointer is ignored.
 /.sc-state/engine.ref.prev

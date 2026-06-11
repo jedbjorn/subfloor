@@ -26,6 +26,11 @@
 # propagates (re-derived from the repo path if absent). Hand-overridable.
 /.super-coder/instance.json
 
+# Dev-shell worktrees — one per dev shell, at .sc-worktrees/<shortname>/. Git
+# worktrees inside the repo root; gitignored so the linked trees don't surface
+# as untracked content in the main working tree.
+/.sc-worktrees/
+
 # Fork-owned state (B7): .sc-state/ is TRACKED (content.sql is the memory
 # serialization; engine.ref pins the engine version). Only the ephemeral
 # pre-update restore pointer is ignored. NOTE: this SOURCE repo deliberately

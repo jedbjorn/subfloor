@@ -58,6 +58,11 @@ Repo skeleton, schema, migrations, DB rebuild-from-text, render→boot (CLAUDE.m
 
 _No open flags._
 
+### Dev shell git worktrees · owner: `cc`
+Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).
+
+_No open flags._
+
 ### B2 — Content & render · owner: `cc`
 Flat _sc render, per-shell SKILL.md, skill seed pipeline. PR #1.
 
