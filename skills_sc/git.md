@@ -22,6 +22,31 @@ everything except `.super-coder/`. The engine is a gitignored, materialized
 dependency (refreshed by `./sc update`); don't commit it or edit it as if it
 were your code. Engine changes are authored upstream in super-coder.
 
+## Sync before you start
+
+Your `shell/<shortname>` branch is a **moving base pinned to `origin/main`**,
+not a content branch — work happens on feature branches cut from it. A worktree
+is born at first-boot HEAD and drifts as other shells' PRs merge; a stale base
+means you read code that no longer exists and your PRs conflict on arrival.
+
+The launcher checks drift at every boot and **auto-syncs when provably nothing
+can be lost** (on the base branch, clean tree, no local-only commits). The
+result is the `sync:` line in ACTIVE SESSION above — read it. When it says
+**NOT auto-synced**, or mid-session before starting a new unit of work:
+
+1. `git fetch origin main && git rev-list --count HEAD..origin/main` — behind
+   count. Zero → carry on.
+2. Behind → take stock of local state BEFORE touching anything:
+   `git status` (uncommitted), `git rev-list origin/main..HEAD` (unmerged
+   commits), `git branch --no-merged origin/main` (unlanded branches).
+3. Anything local → **surface it to the FnB first**: list the commits/files and
+   ask — land it, stash it, or discard? No sync without their call (soft gate).
+4. Clean (or FnB said go) → `git checkout shell/<shortname> && git reset --hard
+   origin/main`. **Never `git pull`/merge on the base branch** — merge bubbles
+   accumulate forever, and your own squash-merged work replays as conflicts.
+5. Never reset a *feature* branch to `origin/main` — only the base. A stale
+   feature branch gets `git rebase origin/main` if it must catch up.
+
 ## Branch → commit → push → PR → stop
 
 1. **Never commit straight to the default branch.** Branch first:
@@ -29,7 +54,8 @@ were your code. Engine changes are authored upstream in super-coder.
    *Admin-flavor exception:* the admin shell boots in the repo root on `main`
    and maintains it directly (engine updates, migrations, applying approved
    patches) — the branch-guard exempts it. If that's you, commit to main is
-   your mandate; every other shell branches first, always.
+   your mandate; start each session with `git pull --ff-only` so you maintain
+   the real main. Every other shell branches first, always.
 2. Commit in logical units. End the message with your shell's attribution so
    parallel shells' work stays legible:
    ```
@@ -42,7 +68,11 @@ were your code. Engine changes are authored upstream in super-coder.
 
 Once the FnB merges your PR, tidy local so stale branches don't accumulate:
 
-1. `git checkout main && git pull` — fast-forward onto the merged commit.
+1. Re-pin your base onto the merged commit. In a worktree you **cannot**
+   `git checkout main` — main is checked out at the repo root, and git refuses
+   a branch already checked out in another worktree. Instead:
+   `git checkout shell/<shortname> && git fetch origin && git reset --hard
+   origin/main`. (Admin shell, repo root: `git pull --ff-only` on main.)
 2. Delete the merged branch: `git branch -d <branch>`. If it was
    **squash-merged**, git won't recognize it as merged and `-d` refuses — confirm
    the PR shows *merged* on the remote, then `git branch -D <branch>`.
@@ -73,9 +103,10 @@ text, then commit that text. See the `snapshot` skill.
 - Confirm you're in the intended repo before destructive ops (`git -C` if ever in
   doubt).
 - Multi-shell: shells each boot into their own git worktree at
-  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`. Parallel shells
-  never share a cwd — worktree isolation is automatic. The admin shell is the
-  one exception: it boots in the repo root on `main`.
+  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>` — a moving base
+  the launcher keeps pinned to `origin/main` (see 'Sync before you start').
+  Parallel shells never share a cwd — worktree isolation is automatic. The
+  admin shell is the one exception: it boots in the repo root on `main`.
 - Preview UI work: because you edit in your worktree, your changes do NOT show on
   the fork's main dev server. `./sc preview` runs a router that serves every
   shell's worktree UI live (HMR) on the fork's `dev_port`, one subdomain each:

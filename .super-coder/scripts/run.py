@@ -146,6 +146,62 @@ def ensure_worktree(work_dir: Path, shortname: str) -> None:
         sys.exit(f"FATAL: could not create worktree at {work_dir}:\n{result.stderr.strip()}")
 
 
+def _git(work_dir: Path, *args: str, timeout: int = 15) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(["git", "-C", str(work_dir), *args],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def sync_worktree(work_dir: Path, shortname: str) -> str:
+    """Bring a shell's worktree base in line with the default branch — or say
+    why not. Returns a one-line status for the boot doc + launch print.
+
+    Doctrine: `shell/<shortname>` is a MOVING BASE pinned to origin/<default>,
+    not a content branch — work happens on feature branches cut from it, so a
+    worktree is born at first-boot HEAD and drifts as PRs merge unless someone
+    moves it. This does, when provably nothing can be lost: HEAD is the shell
+    base branch, the tree is clean, and there are no local-only commits → fetch
+    + `reset --hard origin/<default>` (NEVER pull/merge: merge bubbles on a
+    long-lived branch, and squash-merged work replays as conflicts). Anything
+    local → no touch; the status tells the shell to surface it to the FnB
+    (git skill, 'Sync before you start'). Soft-fails on network/timeout —
+    an offline boot must never block on a drift check.
+    """
+    default = (os.environ.get("SC_PROTECTED_BRANCHES") or "main").split()[0]
+    upstream = f"origin/{default}"
+    try:
+        if _git(work_dir, "fetch", "origin", default, "--quiet",
+                timeout=20).returncode != 0:
+            return f"drift check skipped (could not fetch {upstream} — offline?)"
+        if _git(work_dir, "rev-parse", "--verify", "--quiet",
+                upstream).returncode != 0:
+            return f"drift check skipped (no {upstream})"
+        behind = int(_git(work_dir, "rev-list", "--count",
+                          f"HEAD..{upstream}").stdout.strip() or 0)
+        ahead = int(_git(work_dir, "rev-list", "--count",
+                         f"{upstream}..HEAD").stdout.strip() or 0)
+        dirty = bool(_git(work_dir, "status", "--porcelain").stdout.strip())
+        branch = _git(work_dir, "symbolic-ref", "--short", "HEAD").stdout.strip()
+
+        local = [p for p, on in ((f"{ahead} unmerged local commit(s)", ahead),
+                                 ("uncommitted changes", dirty)) if on]
+        if behind == 0:
+            note = f" ({'; '.join(local)})" if local else ""
+            return f"in sync with {upstream}{note}"
+        if branch != f"shell/{shortname.lower()}":
+            return (f"{behind} behind {upstream}, mid-work on `{branch}` — not "
+                    "auto-synced; land or stash first (git skill: 'Sync before "
+                    "you start')")
+        if local:
+            return (f"⚠ {behind} behind {upstream} with {' + '.join(local)} — "
+                    "NOT auto-synced. Surface the local work to the FnB before "
+                    "doing anything else (git skill: 'Sync before you start')")
+        if _git(work_dir, "reset", "--hard", upstream).returncode != 0:
+            return f"⚠ {behind} behind {upstream} — auto-sync FAILED; see git skill"
+        return f"auto-synced to {upstream} (was {behind} behind; nothing local to lose)"
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return "drift check skipped (git timed out or errored)"
+
+
 def ensure_harness_path() -> None:
     """Prepend the dirs where the official installers drop harness binaries onto
     this process's PATH, so detection (shutil.which) and exec (execvpe) agree
@@ -466,12 +522,15 @@ def main() -> None:
     # patches), so it boots in the repo root — no worktree, no shell/* branch.
     # The branch-guard exempts it via SC_SHELL_FLAVOR (exported at exec below).
     work_dir = REPO_ROOT
+    sync_note = None
     if chosen["shortname"] and chosen["flavor"] != "admin":
         work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
         ensure_worktree(work_dir, chosen["shortname"])
+        sync_note = sync_worktree(work_dir, chosen["shortname"])
 
     content = compose_boot(con, full, user, session_id, archive_id,
-                           work_dir=work_dir if work_dir != REPO_ROOT else None)
+                           work_dir=work_dir if work_dir != REPO_ROOT else None,
+                           sync_note=sync_note)
 
     # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
     # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
@@ -487,6 +546,7 @@ def main() -> None:
           f"(shell_id={full['shell_id']}, session={session_id})")
     if work_dir != REPO_ROOT:
         print(f"→ worktree: {work_dir}")
+        print(f"→ sync: {sync_note}")
     elif chosen["flavor"] == "admin":
         print("→ working dir: repo root (admin — maintains main directly)")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")

@@ -163,12 +163,16 @@ def fetch_counts(con, shell_id: int) -> dict:
 
 
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
-                 archive_id: int, work_dir: "Path | None" = None) -> str:
+                 archive_id: int, work_dir: "Path | None" = None,
+                 sync_note: "str | None" = None) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
     worktree). Its path is surfaced in ACTIVE SESSION so the shell knows it
-    operates from a worktree rather than the repo root.
+    operates from a worktree rather than the repo root. sync_note is the
+    launcher's worktree-drift status (run.sync_worktree) — surfaced alongside
+    so a stale or divergent worktree is ambient knowledge, not something the
+    shell must remember to check.
     """
     template = TEMPLATE_PATH.read_text().rstrip()
     shell_id = shell["shell_id"]
@@ -236,6 +240,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     if work_dir is not None:
         active_session.append(
             f"- worktree: `{work_dir}` (your cwd — branch and commit from here)")
+        if sync_note:
+            active_session.append(f"- sync: {sync_note}")
     elif shell["flavor"] == "admin":
         active_session.append(
             "- working dir: repo root, branch `main` — you maintain main "
