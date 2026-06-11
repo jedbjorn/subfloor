@@ -1,0 +1,25 @@
+name: render-check
+
+# Guard against rendered-mirror drift. The flat _sc files (skills_sc/, specs_sc/,
+# docs_sc/, roadmap_sc.md) are RENDERED from the DB; their source lives in
+# assets/skills/*, the seed migration, and content.sql. A source edit committed
+# without re-rendering the mirror drifts it silently (see #57 → db_map.md). This
+# job rebuilds the DB from committed text, re-renders, and fails on any diff.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  render-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Rebuild the DB from committed text (schema + migrations + content.sql)
+        run: ./sc rebuild
+      - name: Fail if the flat _sc mirror drifts from the DB render
+        run: ./sc render-check

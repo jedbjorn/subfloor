@@ -217,6 +217,7 @@ case "$cmd" in
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
   render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
+  render-check) exec "$PY" "$S/render_check.py" ;;
   map)          exec "$PY" "$S/map_repo.py" ;;
   map-setup)    exec "$PY" "$S/map_setup.py" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
@@ -300,6 +301,7 @@ super-coder — forkable shell substrate
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
+  ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
   ./sc seed-skills         regenerate the skills seed migration from assets/skills/
