@@ -72,3 +72,8 @@ _No open flags._
 Dependency-free localhost GUI (shells/roadmap/flags), per-fork ports. PR #3.
 
 _No open flags._
+
+### Dev shell live UI preview · owner: `cc`
+One router on the fork's dev_port fans out to each dev shell's worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.
+
+_No open flags._

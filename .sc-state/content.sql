@@ -201,6 +201,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (9, 'Fork to sibling repos', 'brainstorm', 0, 1, 'Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (10, 'B7 — Engine/Fork Separation & Update Lifecycle', 'next', 70, 1, 'Engine becomes a gitignored downstream dependency (materialized from upstream, pinned by engine.ref); fork''s DB is the one preserved artifact; update = snapshot→migrate, rollback = sound (DB+engine) pair-restore. Stops shells confusing the substrate for the project. See specs_sc/b7-engine-fork-separation.md.', '2026-06-07 13:25:16', '2026-06-07 13:25:16');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (11, 'Dev shell git worktrees', 'shipped', 0, 1, 'Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).', '2026-06-11 00:15:53', '2026-06-11 00:29:51');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (12, 'Dev shell live UI preview', 'shipped', 73, 1, 'One router on the fork''s dev_port fans out to each dev shell''s worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.', '2026-06-11 05:14:10', '2026-06-11 05:14:10');
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -1317,6 +1318,100 @@ A new dev shell created via `./sc init` or the GUI has a worktree at the
 expected path. Launching that shell opens claude with cwd = worktree path.
 Two dev shells can be launched simultaneously on different branches without
 touching each other''s uncommitted work.', 'specs_sc/dev-worktrees.md', '2026-06-11 00:15:53', '2026-06-11 00:15:53');
+INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (5, 12, 'spec', 1, 'Dev shell live UI preview — implementation spec', 0, NULL, '# Dev shell live UI preview
+
+## Problem
+
+Dev shells each own a git worktree (`.sc-worktrees/<shortname>/`) — see
+[dev-worktrees](dev-worktrees.md). That isolates *edits*, but it breaks
+*viewing*: the fork''s dev server runs from the main checkout, so a shell''s UI
+changes — made in its worktree — never show on the live dev server. Pointing the
+one dev server at a single worktree would just clobber the isolation the
+worktrees exist to provide, and two shells previewing at once would fight over
+one port.
+
+## Solution
+
+One router on the fork''s `dev_port` that fans out to a per-worktree vite, routed
+by **subdomain**:
+
+    http://dev1.localhost:<dev_port>/      dev1''s worktree UI, live (HMR)
+    http://dev2.localhost:<dev_port>/      dev2''s worktree UI, live (HMR)
+    http://localhost:<dev_port>/           index of available shells
+
+`*.localhost` resolves to 127.0.0.1 on modern systems — no hosts-file or DNS
+setup. Each worktree''s vite runs at root on a private internal port; the router
+reads the `Host` header and proxies to the matching backend.
+
+### Why subdomain, not path-prefix (`:port/dev1/...`)
+
+The fork UIs are SvelteKit with SSR server routes (the same-origin `/api/*`
+trust seam is a real server route). Serving several apps under one port by
+**path prefix** would force every app to emit `/dev1/`-prefixed URLs — i.e.
+`kit.paths.base`, an app-wide build-time setting baked into every internal link
+*and* the `/api` seam — injected per-shell into each fork''s committed config,
+plus an HMR-behind-prefix dance. **Subdomain** sidesteps all of it: each
+subdomain is a distinct origin, so the app serves from root unchanged — no base
+config, `/api` seam intact, native HMR.
+
+### Why per-connection routing works
+
+A browser keeps one TCP connection per origin, so the first `Host` seen on a
+connection is its route for life. The router reads the request header block,
+picks the backend, then splices raw bytes both directions — HTTP keep-alive and
+websocket upgrades (HMR) flow through untouched, no per-request reparsing.
+
+## Surfaces
+
+### 1. `preview.py` (`./sc preview`)
+Discovers `.sc-worktrees/*` with a UI dir; for each: symlinks the main
+checkout''s `node_modules` into the worktree UI (same repo + lockfile → valid),
+best-effort `git submodule update --init`, writes a generated sidecar vite
+config (`.sc-preview.vite.config.js`, gitignored under `.sc-worktrees/`) that
+extends the worktree''s own config with `allowedHosts: [''.localhost'']` and
+`hmr.clientPort = dev_port` (so the HMR client dials the front port, not the
+private one), then launches `vite dev` on a free internal port. An asyncio
+proxy on `dev_port` routes by `Host` subdomain label. A 5s reconcile loop picks
+up new worktrees and reaps removed ones — dynamic, no restart.
+
+Binds `$SC_BIND` (0.0.0.0 in the sandbox so the published port is reachable;
+127.0.0.1 on the host). Front port is `$SC_DEV_PORT` if set (the sandbox
+publishes it) else the repo-derived `dev_port`. Binds the front port first, so a
+clash (e.g. the sandbox already publishes `dev_port`) fails fast with guidance
+instead of spawning vites it would have to reap.
+
+### 2. `sc` — `preview)` dispatch + help line.
+
+### 3. `post-commit` hook
+Fires via `core.hooksPath`. On a commit from a worktree
+(`*/.sc-worktrees/*`), prints `→ preview: http://<shortname>.localhost:<dev_port>/`.
+Silent on the main checkout. Best-effort — never blocks the commit.
+
+### 4. `git` skill
+A note so the shell surfaces the printed preview URL to the FnB after committing
+UI work, and starts `./sc preview` if it isn''t already up.
+
+## Runtime model
+
+`./sc preview` is meant to run where the shells run: inside the sandbox
+container `dev_port` is free (the publish maps it out to the host), so the router
+binds it there and `http://<shortname>.localhost:<dev_port>/` is reachable from
+the host browser. On a pm2/host fork, run it on the host where `dev_port` is
+free. It is long-lived (one per fork) and reaps its vites on Ctrl-C.
+
+## Out of scope (this spec)
+
+- A pm2/supervised long-run wrapper — run it in the foreground or background it.
+- HTTPS / non-`.localhost` hostnames — dev-only, plain HTTP.
+- Reviewer/planner shells — git read-only, no UI to preview.
+
+## Done condition
+
+With two dev-shell worktrees that carry a UI, `./sc preview` serves each at
+`http://<shortname>.localhost:<dev_port>/` — independent content per branch,
+assets and the `/api` seam intact, and HMR live (a `101 Switching Protocols`
+through the router). Committing in a worktree prints that worktree''s preview URL.
+', 'specs_sc/dev-preview.md', '2026-06-11 05:14:10', '2026-06-11 05:14:10');
 
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
