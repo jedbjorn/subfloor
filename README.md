@@ -24,6 +24,8 @@ This repo is also **dogfood**: super-coder maintains super-coder. Its own
 specs_sc/ docs_sc/    rendered from the DB, read-only (the _sc suffix = provenance)
 skills_sc/ roadmap_sc.md
 .claude/skills/       per-shell skills, rendered at boot — gitignored
+.sc-worktrees/        one git worktree per shell — gitignored (admin excepted;
+                      see "How shells share one repo")
 CLAUDE.md / AGENTS.md boot artifact — gitignored, rebuilt at launch
 ```
 
@@ -35,7 +37,7 @@ that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 
 Drop super-coder into an existing git repo and boot a shell. Requires `docker`
 (rootless is fine) and an account for one coding harness — Claude Code, OpenCode,
-or Codex.
+Codex, or Mistral Vibe.
 
 ```bash
 cd your-repo                                                  # an existing git repo
@@ -49,7 +51,7 @@ git checkout super-coder/main -- .super-coder sc
 ./sc install
 
 # 3. Sign in to your harness once, on the HOST (not inside the sandbox):
-claude                          # or:  opencode auth login  ·  codex login
+claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup
 
 # 4. Launch the sandbox (server + GUI) and attach a session:
 ./sc launch
@@ -72,9 +74,7 @@ super-coder's own memory or roadmap.
 > Requirements: `docker` — the default run mode is a sandbox container, so the
 > harness's "allow everything" is safe (the kernel is the boundary; the
 > container sees only this repo + your harness creds). The image bakes the rest:
-> `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs (`claude` +
-> `opencode` + `codex` + `vibe`, via their official native installers, no npm). `make` targets wrap
-> the common commands; `./sc <cmd>` works without `make`. No docker? The
+> `python3`, `sqlite3`, `git`, `curl`, and the four harness CLIs. No docker? The
 > `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
 > `sqlite3` (and a harness on `PATH`).
 
@@ -105,23 +105,9 @@ checks the daemon is reachable and points you here if not — it never does setu
   ./sc doctor                               # verify → "docker ✓ rootful"
   ```
 
-```bash
-cd your-repo                    # an existing git repo
-
-# 1. Pull the engine + entry script in via git (no history merge — just the
-#    files; super-coder never touches your repo's own Makefile):
-git remote add super-coder https://github.com/jedbjorn/super-coder.git
-git fetch super-coder
-git checkout super-coder/main -- .super-coder sc
-
-# 2. Bootstrap the fork — one command:
-./sc install
-
-# 3. Commit the install, then boot:
-git add -A && git commit -m "chore: install super-coder"   # engine is gitignored; commits sc + .sc-state + config
-./sc launch                     # build + start the sandbox (server + GUI)
-./sc enter                      # attach: auth + pick shell + pick harness + boot
-```
+The commands are the five steps in the Quick start above — pull the engine in
+via git (no history merge; super-coder never touches your repo's own
+`Makefile`), `./sc install`, sign in, launch, commit.
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
 (`claude` + `opencode` + `codex` + `vibe`, via their official native installers — no
@@ -130,11 +116,12 @@ npm — if any are missing; `--skip-harness-install` to detect only), wires your
 files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
 super-coder's own per-instance content** (a fork inherits the *system* — schema +
 skill catalogue + render chain — never the memory or roadmap), builds the system
-DB, seeds your fork's **first shell** (your user + a shell carrying the CC Lineage
-Seed and its own genesis seed), and renders. So after install your git surfaces
-show only your project — the engine no longer appears in `git status`. It refuses
-to run in the super-coder source repo or on an already-installed fork (guarding
-against content loss).
+DB, seeds your fork's **first shell** (your user + a planner-flavor shell by
+default, carrying the CC Lineage Seed and its own genesis seed) plus the
+**Cartographer** (the singleton repo-map owner), and renders. So after install
+your git surfaces show only your project — the engine no longer appears in
+`git status`. It refuses to run in the super-coder source repo or on an
+already-installed fork (guarding against content loss).
 
 Interactive by default (prompts for the shell's name/role/mandate); pass flags
 to script it:
@@ -243,18 +230,41 @@ The logic, three rules:
 - **Three lineages, always.** Every flavor offers Codex (OpenAI), Claude
   (Anthropic), and OpenCode (open-weights via Ollama) — pick any provider for any
   role at launch.
-- **Admin is the one shell on `main`.** Every other shell boots into an isolated
-  git worktree (`.sc-worktrees/<shortname>/`, branch `shell/<shortname>`) and
-  lands work via PRs; the admin shell boots in the **repo root** and maintains
-  the default branch directly — engine updates, rollbacks, migrations, applying
-  approved patches, fork-local skills. The branch-guard exempts it (and only
-  it). Its decisions carry real risk (a wrong rollback is data loss), so it
+- **Admin decisions carry real risk** (a wrong rollback is data loss), so the
+  one shell that maintains `main` (see *How shells share one repo*, next)
   defaults premium on Codex.
 
 > **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch
 > seam — it selects its own via `active_model` in `~/.vibe/config.toml`
 > (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a
 > fourth column here.
+
+## How shells share one repo
+
+A fork can run a whole team — create more shells from the GUI, one per flavor
+as needed. They all work the same repo without clobbering each other:
+
+- **Every shell boots into its own git worktree** at
+  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>` — parallel shells
+  never share a cwd. The branch is a **moving base pinned to `origin/main`**,
+  not a content branch: shells cut feature branches from it, push, and open
+  PRs. Merging stays the operator's gate.
+- **The launcher keeps bases fresh.** Every boot fetches and auto-syncs the
+  worktree onto `origin/main` — but only when provably nothing can be lost
+  (on the base branch, clean tree, no local-only commits). Anything local
+  blocks the sync and is surfaced in the boot doc instead, so the shell asks
+  you before any work is touched.
+- **A branch-guard blocks work on `main`** in every harness — pre-tool hooks
+  (Claude Code, Codex), an OpenCode plugin, and a git pre-commit backstop, all
+  one shared script.
+- **The admin shell is the one exception.** It boots in the **repo root** on
+  `main` and maintains it directly — engine updates, rollbacks, migrations,
+  applying approved patches, fork-local skills. The branch-guard exempts it
+  (and only it). Working shells consume the substrate; admin owns the floor.
+- **Reviewing a shell's UI work:** worktree edits never show on your main dev
+  server. `./sc preview` serves every shell worktree's UI live (HMR) on the
+  fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
+  — and the post-commit hook prints the shell's URL after each commit.
 
 ## Update a fork
 
@@ -315,7 +325,9 @@ can make it.
 ./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
 ./sc render              # regenerate the tracked flat _sc files from the DB
+./sc render-check        # fail if the committed _sc files drift from the DB render (CI guard)
 ./sc snapshot            # serialize per-instance tables → .sc-state/content.sql
+./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
@@ -366,7 +378,8 @@ see your own changes, start a dev server **inside** the container on
 on the host — and use `datasette <db.sqlite>` the same way to browse a SQLite DB in
 a web GUI. Never restart the host stack from inside the sandbox; run your own
 instance instead. (The boot doc's `RUNNING THE APP` section and the `dev_kit` skill
-carry the full detail.)
+carry the full detail. For the FnB-facing review of a shell's UI changes, use
+`./sc preview` — see *How shells share one repo*.)
 
 ## Review layer (localhost GUI)
 
@@ -375,14 +388,13 @@ flags. One stdlib Python server serves both the JSON API and a static UI; no
 venv, no npm, no build step.
 
 The server runs **inside the sandbox container** as its foreground process, so
-`./sc launch` brings it up and `./sc down` stops it. The port publishes to
-`127.0.0.1` only.
+`./sc launch` brings it up (printing its URL) and `./sc down` stops it;
+`./sc enter` then attaches the interactive harness session into that same
+container via `docker exec`, so the shell and the GUI run side by side, sharing
+the one bind-mounted repo + creds. The port publishes to `127.0.0.1` only.
 
 ```bash
-./sc launch    # start the sandbox — server + GUI come up on this fork's derived port
 ./sc health    # curl /api/health
-./sc down      # stop the sandbox (and the server with it)
-./sc logs      # tail the server logs
 ./sc serve     # run the server in the foreground on the host (no docker)
 ./sc ports     # show this fork's derived port
 ```
@@ -393,30 +405,27 @@ Each fork hashes its path to a stable port in the `88xx` band (clear of superCC
 8000 / dos-arch 8001 and common host ports), persisted to a gitignored
 `.super-coder/instance.json` you can hand-edit. Two forks won't collide.
 
-What you can do in the GUI: read everything; edit a shell's operational fields
-(`current_state`, `connections`, `workspace`) and skill grants; edit the roadmap
-(linear status buckets, with toggle-filters) and **non-frozen** documents; create
-and resolve flags. **seed and L&S are read-only** — the laws say the shell
-curates them, so the API ships no endpoint to write them at all. A `snapshot ⤓`
-button re-serializes + renders after edits (the manual precursor to the B6
-commit→PR automation).
+What you can do in the GUI: read everything; **create shells** (pick a flavor —
+the factory grants its skill set and opens its first session); edit a shell's
+operational fields (`current_state`, `connections`, `workspace`) and skill
+grants; edit the roadmap (linear status buckets, with toggle-filters) and
+**non-frozen** documents; create and resolve flags. **seed and L&S are
+read-only** — the laws say the shell curates them, so the API ships no endpoint
+to write them at all. A `snapshot ⤓` button re-serializes + renders after
+edits; **publish** goes one further — it snapshots, then lands your content
+edits as a commit on a rolling `gui-content` branch, so `main` stays clean and
+merging stays yours.
 
 The **Scripts** tab lists the maintenance scripts (snapshot, render, seed-skills,
 migrate, rebuild) — each with a description and a **run** button, so the common
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
 since it discards un-snapshotted DB edits).
 
-**One container, two access paths** — `./sc launch` starts the server (GUI) as
-the container's foreground process and prints its URL; `./sc enter` then attaches
-an interactive harness session into that same container via `docker exec`, so the
-shell and the GUI run side by side, sharing the one bind-mounted repo + creds.
-
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
 git-tracked text. See `.super-coder/README.md` for the full model.
 
 > Spec: the founding design lives in the roadmap (`super-coder` feature row) and
-> renders to `specs_sc/`. Build plan + log: tracked in superCC
-> `shared/super-coder-impl-plan.md` during bring-up.
+> renders to `specs_sc/`.
 
 ## License
 
