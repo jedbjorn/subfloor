@@ -327,22 +327,25 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
         return chosen
     if first or not sys.stdin.isatty():
         return shells[0]
-    # Interactive picker — shells grouped by flavor, each group labelled.
-    print(f"\n{'ID':>3}  {'Name':<16}{'Shortname':<14}{'Default (harness · model)'}")
+    # Interactive picker — shells grouped by flavor, each group labelled. The
+    # pick number is the row's 1-based position in the already-grouped list, so
+    # it always reads 1, 2, 3… down the screen. shell_id is global and
+    # non-contiguous, so showing it here made the numbering jump around within a
+    # group; position tracks the display order instead.
+    print(f"\n{'#':>3}  {'Name':<16}{'Shortname':<14}{'Default (harness · model)'}")
     _sentinel = object()
     cur_flavor: object = _sentinel
-    for s in shells:
+    for n, s in enumerate(shells, 1):
         if s["flavor"] != cur_flavor:
             cur_flavor = s["flavor"]
             print(f"\n{cur_flavor or '(bespoke)'}")
-        print(f"{s['shell_id']:>3}  {(s['display_name'] or ''):<16}"
+        print(f"{n:>3}  {(s['display_name'] or ''):<16}"
               f"{(s['shortname'] or ''):<14}{_default_label(defaults, s['flavor'])}")
-    valid = {s["shell_id"] for s in shells}
     while True:
-        choice = input("\nPick (ID): ").strip()
-        if choice.isdigit() and int(choice) in valid:
-            return next(s for s in shells if s["shell_id"] == int(choice))
-        print("  invalid id")
+        choice = input("\nPick (#): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(shells):
+            return shells[int(choice) - 1]
+        print("  invalid choice")
 
 
 # ── Session archive ─────────────────────────────────────────────────────────
