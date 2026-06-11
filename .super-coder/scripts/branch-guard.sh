@@ -20,6 +20,15 @@ set -euo pipefail
 # Not a git work tree (rare for a fork, but be safe) → nothing to guard.
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
 
+# The admin shell is the ONE exemption: it boots in the repo root (no worktree)
+# and maintains the default branch directly — engine updates, migrations,
+# applying approved patches. run.py exports SC_SHELL_FLAVOR at launch; like
+# SC_PROTECTED_BRANCHES this is a guardrail against accidents, not a security
+# boundary.
+if [ "${SC_SHELL_FLAVOR:-}" = "admin" ]; then
+  exit 0
+fi
+
 # symbolic-ref answers "which branch is HEAD" reliably: it returns the name even
 # on an unborn branch (first commit on main → still guarded), and returns nothing
 # on detached HEAD (rebases/bisects stay unblocked). Fall back to rev-parse.

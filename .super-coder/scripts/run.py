@@ -461,9 +461,12 @@ def main() -> None:
     # separate branches without clobbering each other — planner/reviewer commit
     # their own artifacts (specs, snapshots, state) there too. All artifacts
     # (CLAUDE.md, AGENTS.md, skills, harness config) land in the worktree root;
-    # the harness is exec'd from there.
+    # the harness is exec'd from there. The ONE exception is the admin flavor:
+    # it maintains `main` itself (engine updates, migrations, applying approved
+    # patches), so it boots in the repo root — no worktree, no shell/* branch.
+    # The branch-guard exempts it via SC_SHELL_FLAVOR (exported at exec below).
     work_dir = REPO_ROOT
-    if chosen["shortname"]:
+    if chosen["shortname"] and chosen["flavor"] != "admin":
         work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
         ensure_worktree(work_dir, chosen["shortname"])
 
@@ -484,6 +487,8 @@ def main() -> None:
           f"(shell_id={full['shell_id']}, session={session_id})")
     if work_dir != REPO_ROOT:
         print(f"→ worktree: {work_dir}")
+    elif chosen["flavor"] == "admin":
+        print("→ working dir: repo root (admin — maintains main directly)")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
     print(f"→ skills: {len(skills['written'])} written, "
@@ -539,6 +544,10 @@ def main() -> None:
 
     cmd = (adapter.get("launch") or [harness]) + model_args + sandbox_flags
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
+    # The booted shell's flavor, inherited by everything the harness spawns.
+    # branch-guard.sh reads it to exempt the admin shell (which works on main
+    # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
+    env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
     os.execvpe(cmd[0], cmd, env)

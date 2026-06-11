@@ -19,6 +19,10 @@ were your code. Engine changes are authored upstream in super-coder.
 
 1. **Never commit straight to the default branch.** Branch first:
    `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs).
+   *Admin-flavor exception:* the admin shell boots in the repo root on `main`
+   and maintains it directly (engine updates, migrations, applying approved
+   patches) — the branch-guard exempts it. If that's you, commit to main is
+   your mandate; every other shell branches first, always.
 2. Commit in logical units. End the message with your shell's attribution so
    parallel shells' work stays legible:
    ```
@@ -61,9 +65,10 @@ text, then commit that text. See the `snapshot` skill.
 
 - Confirm you're in the intended repo before destructive ops (`git -C` if ever in
   doubt).
-- Multi-shell: dev shells each boot into their own git worktree at
-  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`. Parallel dev shells
-  never share a cwd — worktree isolation is automatic.
+- Multi-shell: shells each boot into their own git worktree at
+  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`. Parallel shells
+  never share a cwd — worktree isolation is automatic. The admin shell is the
+  one exception: it boots in the repo root on `main`.
 - Preview UI work: because you edit in your worktree, your changes do NOT show on
   the fork's main dev server. `./sc preview` runs a router that serves every
   shell's worktree UI live (HMR) on the fork's `dev_port`, one subdomain each:

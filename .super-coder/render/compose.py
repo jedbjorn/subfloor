@@ -236,6 +236,11 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     if work_dir is not None:
         active_session.append(
             f"- worktree: `{work_dir}` (your cwd — branch and commit from here)")
+    elif shell["flavor"] == "admin":
+        active_session.append(
+            "- working dir: repo root, branch `main` — you maintain main "
+            "directly (the only shell that does; every other shell works "
+            "from a worktree and lands changes via PRs)")
 
     parts = [
         template,

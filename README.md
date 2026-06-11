@@ -225,6 +225,7 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 | **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `kimi-k2.6` |
 | **dev** | write the code | `gpt-5.4-mini` ★ | `sonnet` | `qwen3-coder:480b` |
 | **cartographer** | map the repo | `gpt-5.4-mini` ★ | `haiku` | `gpt-oss:20b` |
+| **admin** | own the substrate, maintain `main` | `gpt-5.5` ★ | `sonnet` | `qwen3-coder:480b` |
 
 ★ = the harness the picker pre-selects for that flavor.
 
@@ -242,6 +243,13 @@ The logic, three rules:
 - **Three lineages, always.** Every flavor offers Codex (OpenAI), Claude
   (Anthropic), and OpenCode (open-weights via Ollama) — pick any provider for any
   role at launch.
+- **Admin is the one shell on `main`.** Every other shell boots into an isolated
+  git worktree (`.sc-worktrees/<shortname>/`, branch `shell/<shortname>`) and
+  lands work via PRs; the admin shell boots in the **repo root** and maintains
+  the default branch directly — engine updates, rollbacks, migrations, applying
+  approved patches, fork-local skills. The branch-guard exempts it (and only
+  it). Its decisions carry real risk (a wrong rollback is data loss), so it
+  defaults premium on Codex.
 
 > **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch
 > seam — it selects its own via `active_model` in `~/.vibe/config.toml`
