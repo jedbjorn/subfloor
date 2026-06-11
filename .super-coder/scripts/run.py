@@ -279,7 +279,7 @@ def list_shells(con: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
     return con.execute(
         "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor FROM shells "
         "WHERE (user_id=? OR is_shared=1) AND COALESCE(is_deleted,0)=0 "
-        "ORDER BY is_shared, shell_id",
+        "ORDER BY flavor IS NULL, flavor, shell_id",
         (user_id,),
     ).fetchall()
 
@@ -331,10 +331,14 @@ def pick_shell(shells: list[sqlite3.Row], requested: str | None,
         return chosen
     if first or not sys.stdin.isatty():
         return shells[0]
-    # Interactive picker — the Default column tells the operator the intended
-    # harness/model (advisory; overridable at launch).
+    # Interactive picker — shells grouped by flavor, each group labelled.
     print(f"\n{'ID':>3}  {'Name':<16}{'Shortname':<14}{'Default (harness · model)'}")
+    _sentinel = object()
+    cur_flavor: object = _sentinel
     for s in shells:
+        if s["flavor"] != cur_flavor:
+            cur_flavor = s["flavor"]
+            print(f"\n{cur_flavor or '(bespoke)'}")
         print(f"{s['shell_id']:>3}  {(s['display_name'] or ''):<16}"
               f"{(s['shortname'] or ''):<14}{_default_label(defaults, s['flavor'])}")
     valid = {s["shell_id"] for s in shells}
