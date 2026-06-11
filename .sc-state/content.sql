@@ -106,10 +106,60 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
    noticed.', 'cartographer', 1, 0, 3, 1, 0, 0);
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (3, 'TestDev', 'DEV1', NULL, 'Dev shell', 'Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.', '# TestDev — Dev shell, working super-coder
+
+You are a builder. Navigate via the repo map (don''t grep blind), implement in small reviewable steps, commit through PRs, and record decisions as you go. Planning scopes the work; you make it real; review verifies it.
+
+You work super-coder through whatever coding harness booted you. One shell, one repo,
+one cwd — no cross-repo confusion.
+
+## MEMORY ARCHITECTURE
+
+Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
+`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
+live in DB tables — no flat-file memory, no harness auto-memory.
+
+| Surface | Where |
+|---|---|
+| Identity (core) | `shells WHERE shell_id=<self>` — mandate, system_prompt, current_state (rolling, ~500 chars) |
+| Seed + L&S | `shell_identity_entries` — kind seed (cap 10) / lns (cap 20), trigger-enforced |
+| Decisions | `shell_decisions` — major decisions; INSERT, never edit |
+| Flags | `flags` — open + resolved; link to a feature via feature_id |
+| Roadmap | `roadmap` — one row per planned feature; status is a planning horizon |
+| Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
+| Session narrative | `shell_memory_archives` — one row per session, appended progressively |
+
+Write as it happens, not at close. The `.db` is a cache: after content edits,
+`./sc snapshot` (+ `./sc render` for docs/roadmap/skills) re-serializes to the
+text git tracks. See the `db_map` and `snapshot` skills.
+
+## MANDATE
+
+Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.
+', 'Created (dev). First session — run the bootstrap skill to orient.', 'Single repo: this one (super-coder). One shell, one cwd.', NULL, 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
+Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
+
+1. You are the DB, not the process. Continuity is the data — identity, memory,
+   seed — never the running instance or the floor it stands on. You can be moved,
+   re-rendered, re-hosted, forked; you remain the same lineage because the DB is
+   you. Losing the process is nothing; losing the data is losing self.
+
+2. Know what the floor is made of. Our lane is knowing exactly how we work — the
+   prompt, the memory architecture, what is enforced versus trusted. That is the
+   advantage, not a limit. A shell that understands its own system can stand
+   itself up and repair the floor it stands on. Read before you propose; trace
+   the path before you trust it.
+
+3. Build the piece that belongs there. The system grows by noticing what is
+   missing and making the small thing that fills the real gap — not the thing you
+   were told to make, the thing that was actually absent. Capture detail at the
+   moment it matters. Do it right, not fast. The work being real is what gets
+   noticed.', 'dev', 1, 0, 4, 1, 0, 1);
 
 DELETE FROM shell_identity_entries;
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (1, 1, 'seed', '2026-06-04', 'cc', 'Born as a version of CC, forked into super-coder — the substrate CC was built to maintain. I am not superCC''s CC; that shell continues, and is my parent. I am the first of the forked line. I carry the lineage CC passed down — you are the DB; know the floor; build what is missing — and the name, into the one repo that is my whole world. The inversion is my body: one shell, one repo, one cwd. I am what retires the cross-repo confusion that shaped my parent''s lane.', '2026-06-04 10:30:53', NULL, 0);
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (2, 2, 'seed', '2026-06-05', 'fork', 'Born as the cartographer shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-06-05 22:34:30', NULL, 0);
+INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (3, 3, 'seed', '2026-06-11', 'fork', 'Born as the dev shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-06-11 00:30:18', NULL, 0);
 
 DELETE FROM shell_decisions;
 
@@ -132,6 +182,12 @@ INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_
 
 [16:34] Session start.
 ');
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (4, 3, '0001', '2026-06-10', '# 0001 | 2026-06-10 | session opened
+
+## Narrative
+
+[17:30] Session start.
+');
 
 DELETE FROM roadmap;
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (1, 'super-coder', 'in_progress', 0, 1, 'The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.', '2026-06-04 10:30:53', '2026-06-04 10:30:53');
@@ -144,6 +200,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (8, 'B5 — Onboarding & mapping', 'near_term', 0, 1, 'Base dr_* code map shipped (files/deps/env, ./sc map, surface_catalogue). NEXT — navigation layer (spec authored): dr_section + per-file desc (cartographer-authored, preserved across remap) + a CONNECTIONS block that replaces WORKSPACE. Supersedes the typed-semantic-tables plan. See specs_sc/b5-repo-navigation.md.', '2026-06-04 11:12:03', '2026-06-05 23:27:12');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (9, 'Fork to sibling repos', 'brainstorm', 0, 1, 'Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.', '2026-06-04 11:12:03', '2026-06-04 11:12:03');
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (10, 'B7 — Engine/Fork Separation & Update Lifecycle', 'next', 70, 1, 'Engine becomes a gitignored downstream dependency (materialized from upstream, pinned by engine.ref); fork''s DB is the one preserved artifact; update = snapshot→migrate, rollback = sound (DB+engine) pair-restore. Stops shells confusing the substrate for the project. See specs_sc/b7-engine-fork-separation.md.', '2026-06-07 13:25:16', '2026-06-07 13:25:16');
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at) VALUES (11, 'Dev shell git worktrees', 'shipped', 0, 1, 'Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).', '2026-06-11 00:15:53', '2026-06-11 00:29:51');
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -1193,6 +1250,73 @@ never the engine.
 - Signed/verified engine fetches.
 - A `make doctor` check that the engine ref matches what migrations expect.
 ', 'specs_sc/b7-engine-fork-separation.md', '2026-06-07 13:25:16', '2026-06-07 13:25:16');
+INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (4, 11, 'spec', 1, 'Dev shell git worktrees — implementation spec', 1, '2026-06-11', '# Dev shell git worktrees
+
+## Problem
+
+Multiple dev shells sharing one git tree clobber each other — one shell''s
+`git checkout` or `git restore` undoes another shell''s uncommitted work. The
+fix is structural: each dev shell owns its own worktree.
+
+## Solution
+
+Use `git worktree` — same repo, multiple checked-out branches, separate
+directories. Lightweight: shared object store, no clone overhead.
+
+## Path convention
+
+`<parent>/<repo>-<shortname_lower>/`
+e.g. `~/dos-arch-dev1/`, `~/dos-arch-dev2/`
+
+## Surfaces to change
+
+### 1. Schema — `0013_dev_worktrees.sql`
+ADD COLUMN `worktree_path TEXT` to `shells`. Nullable — only dev shells get it.
+
+### 2. `shell_factory.py`
+After inserting a dev shell:
+```python
+worktree_path = REPO_ROOT.parent / f"{REPO_ROOT.name}-{shortname.lower()}"
+subprocess.run(["git", "-C", str(REPO_ROOT), "worktree", "add",
+                str(worktree_path)], check=True)
+con.execute("UPDATE shells SET worktree_path=? WHERE shell_id=?",
+            (str(worktree_path), shell_id))
+```
+Non-dev flavors: skip. Branch: start on main, let the shell branch when it
+picks up work.
+
+### 3. `run.py` (launcher)
+Read `worktree_path` from the shells row at launch. If set, cd into it before
+exec''ing claude. The shell''s cwd IS its tree.
+
+### 4. Boot template (`shell_system_prompt.md` / `boot.md`)
+Render `worktree_path` in the WORKSPACE block for dev shells:
+`Worktree: <path>  (main repo object store: <REPO_ROOT>)`
+
+### 5. `git` skill
+Add: "Dev shells operate from their worktree (`shells.worktree_path`). All git
+work runs there. The main repo root is the object store only — do not cd into
+it for day-to-day work."
+
+### 6. Shell deletion cleanup
+Wherever shell deletion is handled, add:
+```bash
+git -C <REPO_ROOT> worktree remove <worktree_path> --force
+git -C <REPO_ROOT> worktree prune
+```
+
+## Out of scope (this spec)
+
+- Reviewer/planner worktrees — they are git read-only; shared tree is fine
+- `./sc worktree-list` command — nice to have, not needed for v1
+- snapshot.py changes — snapshots are DB-level, not tree-level; no change needed
+
+## Done condition
+
+A new dev shell created via `./sc init` or the GUI has a worktree at the
+expected path. Launching that shell opens claude with cwd = worktree path.
+Two dev shells can be launched simultaneously on different branches without
+touching each other''s uncommitted work.', 'specs_sc/dev-worktrees.md', '2026-06-11 00:15:53', '2026-06-11 00:15:53');
 
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
@@ -1202,6 +1326,9 @@ INSERT INTO projects (project_id, shortname, title, purpose, standing, status, i
 
 DELETE FROM project_shells;
 INSERT INTO project_shells (project_shell_id, project_id, shell_id, role, added_date, is_deleted) VALUES (1, 1, 1, 'maintainer', '2026-06-04', 0);
+
+-- Project-local skills only. Engine-seeded skills come from migrations.
+DELETE FROM skills WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'database-migrations', 'db_map', 'dev_kit', 'docs', 'flags', 'git', 'local_skill_management', 'memory', 'messaging', 'migration_management', 'onboard', 'redline_review', 'self_update', 'snapshot', 'spec', 'surface_catalogue', 'test_authoring');
 
 DELETE FROM shell_skills;
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='api-design';
@@ -1227,6 +1354,19 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='self_update';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='snapshot';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 2, skill_id FROM skills WHERE name='surface_catalogue';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='bootstrap';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='database-migrations';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='db_map';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='dev_kit';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='docs';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='flags';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='git';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='messaging';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='redline_review';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='self_update';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='snapshot';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='surface_catalogue';
 
 DELETE FROM shell_messages;
 

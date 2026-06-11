@@ -9,6 +9,7 @@ Flow:
     2. pick a shell (arg shortname · --first · interactive picker)
     3. open a session archive row
     4. compose the boot artifact and dual-write CLAUDE.md + AGENTS.md at root
+       (dev-flavor shells: write to their worktree root, not the repo root)
     5. exec the harness  (skipped when RENDER_ONLY=1 — used to verify headless)
 
 Usage:
@@ -21,6 +22,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -28,6 +30,10 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
+
+# Flavors that get an isolated git worktree at .sc-worktrees/<shortname>/.
+# Reviewer and planner are git read-only — they share the main working tree.
+_WORKTREE_FLAVORS = {"dev"}
 
 sys.path.insert(0, str(ENGINE / "render"))
 from compose import compose_boot  # noqa: E402
@@ -50,16 +56,16 @@ def load_adapter(harness: str) -> dict:
             "emit": [], "env": {}}
 
 
-def emit_adapter(adapter: dict) -> list[str]:
+def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Copy the adapter's harness-specific config files (e.g. opencode.json) to
-    the repo root. These are emitted artifacts (gitignored), regenerated each
-    launch from the tracked template in the adapter dir."""
+    `root` (the working directory). These are emitted artifacts (gitignored),
+    regenerated each launch from the tracked template in the adapter dir."""
     adir = ADAPTERS / adapter["harness"]
     written = []
     for fname in adapter.get("emit", []):
         src = adir / fname
         if src.exists():
-            dst = REPO_ROOT / fname
+            dst = root / fname
             dst.parent.mkdir(parents=True, exist_ok=True)  # fname may be nested (e.g. .codex/hooks.json)
             atomic_write(dst, src.read_text())
             written.append(fname)
@@ -78,14 +84,13 @@ def _deep_merge(base: dict, patch: dict) -> dict:
     return base
 
 
-def _merge_json_spec(spec: dict) -> list[str]:
+def _merge_json_spec(spec: dict, root: Path = REPO_ROOT) -> list[str]:
     """Deep-merge each {repo-relative-path: patch} into that project-scoped JSON
-    file, preserving any keys the fork already set. Paths are repo-relative, so
-    this never touches host-global config (~/.claude etc.). Writes the same bytes
-    when the patch is already present, so re-running produces no git churn."""
+    file under `root`, preserving any keys the fork already set. Writes the same
+    bytes when the patch is already present, so re-running produces no git churn."""
     touched = []
     for rel, patch in (spec or {}).items():
-        dst = REPO_ROOT / rel
+        dst = root / rel
         cur: dict = {}
         if dst.exists():
             try:
@@ -100,16 +105,16 @@ def _merge_json_spec(spec: dict) -> list[str]:
     return touched
 
 
-def apply_merge_json(adapter: dict) -> list[str]:
+def apply_merge_json(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Always-on config patches the adapter declares at top-level `merge_json`
     (distinct from sandbox.merge_json, which is sandbox-only). Used to install
     engine-managed, gitignored harness config every launch — e.g. claude's
     PreToolUse branch-guard hook in .claude/settings.local.json (kept out of the
     fork's tracked .claude/settings.json so fork-owned config is never clobbered)."""
-    return _merge_json_spec(adapter.get("merge_json") or {})
+    return _merge_json_spec(adapter.get("merge_json") or {}, root)
 
 
-def apply_sandbox(adapter: dict) -> list[str]:
+def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Sandbox-only: elevate harness permissions to allow-all when booting
     INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
     container is the safety boundary, so permission prompts inside it are pure
@@ -119,7 +124,30 @@ def apply_sandbox(adapter: dict) -> list[str]:
     project-scoped file (preserving any keys the fork set)."""
     if not os.environ.get("SC_SANDBOX"):
         return []
-    return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {})
+    return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {}, root)
+
+
+def ensure_worktree(work_dir: Path, shortname: str) -> None:
+    """Create a git worktree for a dev shell at work_dir on branch shell/<shortname>.
+
+    Idempotent: if work_dir already exists, assumes the worktree is intact and
+    returns immediately. Creates the branch from HEAD if it doesn't exist yet;
+    checks it out if it does. Exits with a clear message on git failure.
+    """
+    if work_dir.exists():
+        return
+    work_dir.parent.mkdir(parents=True, exist_ok=True)
+    branch = f"shell/{shortname.lower()}"
+    existing = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "branch", "--list", branch],
+        capture_output=True, text=True,
+    )
+    branch_exists = bool(existing.stdout.strip())
+    cmd = ["git", "-C", str(REPO_ROOT), "worktree", "add", str(work_dir)]
+    cmd += [branch] if branch_exists else ["-b", branch]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"FATAL: could not create worktree at {work_dir}:\n{result.stderr.strip()}")
 
 
 def ensure_harness_path() -> None:
@@ -425,29 +453,42 @@ def main() -> None:
         "current_state, system_prompt, connections, flavor FROM shells WHERE shell_id=?",
         (chosen["shell_id"],),
     ).fetchone()
-    content = compose_boot(con, full, user, session_id, archive_id)
+
+    # Dev-flavor shells get an isolated git worktree so parallel dev shells can
+    # work on separate branches without clobbering each other. All artifacts
+    # (CLAUDE.md, AGENTS.md, skills, harness config) land in the worktree root;
+    # the harness is exec'd from there. All other flavors use the repo root.
+    work_dir = REPO_ROOT
+    if chosen["flavor"] in _WORKTREE_FLAVORS and chosen["shortname"]:
+        work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
+        ensure_worktree(work_dir, chosen["shortname"])
+
+    content = compose_boot(con, full, user, session_id, archive_id,
+                           work_dir=work_dir if work_dir != REPO_ROOT else None)
 
     # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
     # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
-    skills = flat.render_skill_md(con, full["shell_id"])
+    skills = flat.render_skill_md(con, full["shell_id"], work_dir)
     con.close()
 
     # One compose, two outputs — Claude Code reads CLAUDE.md, the AGENTS.md
-    # harnesses read AGENTS.md. Both at the repo root.
+    # harnesses read AGENTS.md. Both at the working directory root.
     for name in ("CLAUDE.md", "AGENTS.md"):
-        atomic_write(REPO_ROOT / name, content)
+        atomic_write(work_dir / name, content)
 
     print(f"\n→ booted {full['display_name']} "
           f"(shell_id={full['shell_id']}, session={session_id})")
-    print(f"→ wrote {REPO_ROOT/'CLAUDE.md'}")
-    print(f"→ wrote {REPO_ROOT/'AGENTS.md'}")
+    if work_dir != REPO_ROOT:
+        print(f"→ worktree: {work_dir}")
+    print(f"→ wrote {work_dir / 'CLAUDE.md'}")
+    print(f"→ wrote {work_dir / 'AGENTS.md'}")
     print(f"→ skills: {len(skills['written'])} written, "
           f"{len(skills['skipped'])} unchanged → .claude/skills/")
 
     # Harness was resolved up front (override / picker / default); the adapter
     # seam owns the launch command + any harness-specific config to emit.
     adapter = load_adapter(harness)
-    emitted = emit_adapter(adapter)
+    emitted = emit_adapter(adapter, work_dir)
     print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
@@ -463,7 +504,7 @@ def main() -> None:
         model_args = [mcfg["flag"], flavor_model]
         print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
     elif flavor_model and mcfg.get("file"):
-        mfile = REPO_ROOT / mcfg["file"]
+        mfile = work_dir / mcfg["file"]
         if mfile.exists():
             try:
                 cfg = json.loads(mfile.read_text())
@@ -472,10 +513,10 @@ def main() -> None:
             cfg[mcfg.get("key", "model")] = flavor_model
             atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
             print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
-    merged = apply_merge_json(adapter)
+    merged = apply_merge_json(adapter, work_dir)
     if merged:
         print(f"→ harness config → {', '.join(merged)}")
-    sandboxed = apply_sandbox(adapter)
+    sandboxed = apply_sandbox(adapter, work_dir)
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
 
@@ -494,7 +535,7 @@ def main() -> None:
 
     cmd = (adapter.get("launch") or [harness]) + model_args + sandbox_flags
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
-    os.chdir(REPO_ROOT)
+    os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
     os.execvpe(cmd[0], cmd, env)
 

@@ -68,5 +68,6 @@ text, then commit that text. See the `snapshot` skill.
 
 - Confirm you're in the intended repo before destructive ops (`git -C` if ever in
   doubt).
-- Multi-shell: per-shell branches keep parallel work from colliding (the planned
-  worktree model makes this clean — until then, one active shell per cwd).
+- Multi-shell: dev shells each boot into their own git worktree at
+  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`. Parallel dev shells
+  never share a cwd — worktree isolation is automatic.

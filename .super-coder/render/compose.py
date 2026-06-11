@@ -163,8 +163,13 @@ def fetch_counts(con, shell_id: int) -> dict:
 
 
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
-                 archive_id: int) -> str:
-    """Assemble the full boot markdown for `shell`, driven by `user`."""
+                 archive_id: int, work_dir: "Path | None" = None) -> str:
+    """Assemble the full boot markdown for `shell`, driven by `user`.
+
+    work_dir, when set, is the shell's effective working directory (dev-shell
+    worktree). Its path is surfaced in ACTIVE SESSION so the shell knows it
+    operates from a worktree rather than the repo root.
+    """
     template = TEMPLATE_PATH.read_text().rstrip()
     shell_id = shell["shell_id"]
     counts = fetch_counts(con, shell_id)
@@ -221,15 +226,22 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                 "before other work.")
         first_run = ["## FIRST RUN", "", prompt, "", "---", ""]
 
-    parts = [
-        template,
-        "",
-        "## ACTIVE SESSION", "",
+    active_session = [
         f"- shell_id: `{shell_id}`",
         f"- display_name: `{shell['display_name']}`",
         f"- shortname: `{shell['shortname']}`",
         f"- session_id: `{session_id}`",
         f"- archive_id: `{archive_id}`",
+    ]
+    if work_dir is not None:
+        active_session.append(
+            f"- worktree: `{work_dir}` (your cwd — branch and commit from here)")
+
+    parts = [
+        template,
+        "",
+        "## ACTIVE SESSION", "",
+        *active_session,
         "", "---", "",
         *first_run,
         "## OPERATOR", "", render_operator(user),
