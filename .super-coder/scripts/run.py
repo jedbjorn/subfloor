@@ -31,10 +31,6 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 
-# Flavors that get an isolated git worktree at .sc-worktrees/<shortname>/.
-# Reviewer and planner are git read-only — they share the main working tree.
-_WORKTREE_FLAVORS = {"dev"}
-
 sys.path.insert(0, str(ENGINE / "render"))
 from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
@@ -128,7 +124,7 @@ def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
 
 
 def ensure_worktree(work_dir: Path, shortname: str) -> None:
-    """Create a git worktree for a dev shell at work_dir on branch shell/<shortname>.
+    """Create a git worktree for a shell at work_dir on branch shell/<shortname>.
 
     Idempotent: if work_dir already exists, assumes the worktree is intact and
     returns immediately. Creates the branch from HEAD if it doesn't exist yet;
@@ -458,12 +454,13 @@ def main() -> None:
         (chosen["shell_id"],),
     ).fetchone()
 
-    # Dev-flavor shells get an isolated git worktree so parallel dev shells can
-    # work on separate branches without clobbering each other. All artifacts
+    # Every shell gets an isolated git worktree so parallel shells can work on
+    # separate branches without clobbering each other — planner/reviewer commit
+    # their own artifacts (specs, snapshots, state) there too. All artifacts
     # (CLAUDE.md, AGENTS.md, skills, harness config) land in the worktree root;
-    # the harness is exec'd from there. All other flavors use the repo root.
+    # the harness is exec'd from there.
     work_dir = REPO_ROOT
-    if chosen["flavor"] in _WORKTREE_FLAVORS and chosen["shortname"]:
+    if chosen["shortname"]:
         work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
         ensure_worktree(work_dir, chosen["shortname"])
 
