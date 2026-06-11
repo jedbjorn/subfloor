@@ -61,6 +61,13 @@ text, then commit that text. See the `snapshot` skill.
 
 - Confirm you're in the intended repo before destructive ops (`git -C` if ever in
   doubt).
-- Multi-shell: every shell boots into its own worktree at
-  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>` — per-shell
-  branches keep parallel work from colliding.
+- Multi-shell: dev shells each boot into their own git worktree at
+  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`. Parallel dev shells
+  never share a cwd — worktree isolation is automatic.
+- Preview UI work: because you edit in your worktree, your changes do NOT show on
+  the fork's main dev server. `./sc preview` runs a router that serves every
+  shell's worktree UI live (HMR) on the fork's `dev_port`, one subdomain each:
+  `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your
+  URL after each commit — surface that line to the FnB so they can eyeball the
+  change. If preview isn't running, start it once from the main checkout:
+  `./sc preview`.

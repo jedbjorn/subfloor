@@ -1,0 +1,23 @@
+#!/bin/sh
+# super-coder post-commit — surface this dev shell's live preview URL.
+# Tracked hook, fired via core.hooksPath (wired by `./sc map-setup`). Best-effort,
+# never blocks: a commit always succeeds regardless of what this prints.
+#
+# A dev shell commits from its worktree (.sc-worktrees/<shortname>/), so its UI
+# edits are live at http://<shortname>.localhost:<dev_port>/ once `./sc preview`
+# is running. Print that line after every commit so the shell (and the FnB) can
+# eyeball the change immediately. On the main checkout (not a worktree) there is
+# nothing to preview — stay silent.
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+case "$root" in
+  */.sc-worktrees/*) ;;   # in a shell worktree → continue
+  *) exit 0 ;;            # main checkout or elsewhere → nothing to preview
+esac
+short="$(basename "$root")"
+# Engine + dev_port resolution: walk up to the main repo root that owns ./sc.
+main="${root%/.sc-worktrees/*}"
+[ -x "$main/.super-coder/scripts/ports.py" ] || exit 0
+dp="$("${SC_PYTHON:-python3}" "$main/.super-coder/scripts/ports.py" devport 2>/dev/null)" || exit 0
+[ -n "$dp" ] || exit 0
+echo "→ preview: http://$short.localhost:$dp/   (run './sc preview' from $main if not up)"
+exit 0

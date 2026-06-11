@@ -221,6 +221,7 @@ case "$cmd" in
   map-setup)    exec "$PY" "$S/map_setup.py" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
+  preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
@@ -327,6 +328,8 @@ super-coder — forkable shell substrate
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health
   ./sc ports               show this fork's derived port
+  ./sc preview             live-preview every dev shell's worktree UI on one port,
+                             routed by subdomain (http://<shortname>.localhost:<dev_port>/)
   ./sc clean-db            remove the rebuilt .db (text serializations untouched)
 EOF
     ;;
