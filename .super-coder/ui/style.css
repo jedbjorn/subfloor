@@ -193,9 +193,6 @@ details.feature[open] > .feature-preview { display: none; }
 .grant { color: var(--ink); font-size: .85rem; cursor: pointer; }
 a { color: var(--accent); }
 .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--menu-bg); border: 1px solid var(--menu-border); box-shadow: var(--menu-shadow); border-radius: var(--r); padding: .6rem 1rem; max-width: 420px; white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; }
-.newshell { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; width: 100%; margin-top: .6rem; padding-top: .6rem; border-top: 1px solid var(--line); }
-.newshell select, .newshell input { width: auto; }
-.newshell label.k { margin: 0; }
 .bars { display: grid; gap: .3rem; }
 .bar-row { display: grid; grid-template-columns: 110px 1fr 40px; align-items: center; gap: .6rem; }
 .bar-label { color: var(--dim); font-size: .85rem; }

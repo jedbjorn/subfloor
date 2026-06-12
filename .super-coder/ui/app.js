@@ -180,6 +180,33 @@ async function openSkillContentModal(skill) {
   } catch (e) { toast("error: " + e.message); }
 }
 
+// New-shell form in a 600×300 modal — Create bottom-left, Cancel bottom-right,
+// same dialog pattern as the new-flag modal.
+function openNewShellModal(templates, root) {
+  const fl = el("select", {});
+  for (const t of templates)
+    fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
+  const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
+  const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const form = el("div", { className: "modal-form" },
+    el("span", { className: "k" }, "flavor"), fl,
+    el("span", { className: "k" }, "name"), nm);
+  const close = openModal({ title: "New shell", bodyNode: form,
+    footNodes: [create, cancel], width: 600, height: 300 });
+  create.onclick = async () => {
+    if (!nm.value.trim()) return toast("name required");
+    create.disabled = true; create.textContent = "Creating…";
+    try {
+      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
+      selectedShell = r.shell_id; activeSkillId = null;
+      close(); setStatus(`shell created — ${r.shortname}`); renderShells(root);
+    } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
+  };
+  cancel.onclick = close;
+  nm.focus();
+}
+
 async function renderShells(root) {
   const { shells } = await api("/shells");
   const { templates } = await api("/shell-templates");
@@ -204,25 +231,10 @@ async function renderShells(root) {
   if (s.mandate) idy.append(el("div", { className: "kv" }, microlabel("Mandate"), el("span", {}, s.mandate)));
   sub.append(idy);
 
-  // new shell — pill toggle + inline form
+  // new shell — modal trigger
   const newBtn = el("button", { className: "act", type: "button", textContent: "＋ New shell" });
-  const form = el("div", { className: "newshell", hidden: true });
-  const fl = el("select", {});
-  for (const t of templates)
-    fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
-  const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
-  const create = el("button", { className: "act primary", type: "button", textContent: "create" });
-  create.onclick = async () => {
-    if (!nm.value.trim()) return toast("name required");
-    try {
-      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
-      selectedShell = r.shell_id; setStatus(`shell created — ${r.shortname}`); renderShells(root);
-    } catch (e) { toast("error: " + e.message); }
-  };
-  newBtn.onclick = () => { form.hidden = !form.hidden; if (!form.hidden) nm.focus(); };
-  form.append(el("label", { className: "k" }, "flavor"), fl,
-    el("label", { className: "k" }, "name"), nm, create);
-  sub.append(newBtn, form);
+  newBtn.onclick = () => openNewShellModal(templates, root);
+  sub.append(newBtn);
   root.append(sub);
 
   // sub-tabs — Harness / Skills, both scoped to the selected shell
