@@ -17,7 +17,8 @@ header {
 h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: .2px; }
 h1 span { color: var(--dim); font-weight: 400; }
 h1 span::before { content: " / "; color: var(--line); }
-nav { display: flex; gap: .25rem; }
+nav { display: flex; gap: .25rem; align-items: center; }
+.navsep { width: 1px; height: 1.1rem; background: var(--line); margin: 0 .35rem; }
 nav button {
   background: none; border: 1px solid transparent; color: var(--dim);
   padding: .35rem .8rem; border-radius: var(--r); cursor: pointer; font: inherit;
@@ -47,6 +48,7 @@ main { padding: 1.2rem; max-width: 1100px; margin: 0 auto; }
   background: var(--accent2); color: var(--dim); border: 1px solid var(--line);
 }
 .pill.next { color: var(--accent); } .pill.shipped { color: var(--ok); }
+.pill.ok { color: var(--ok); }
 .pill.retired { color: var(--dim); opacity: .6; text-decoration: line-through; }
 .pill.warn { color: var(--warn); border-color: var(--warn); }
 .grid2 { display: grid; grid-template-columns: 180px 1fr; gap: .4rem 1rem; align-items: start; }
@@ -113,6 +115,16 @@ details.feature[open] > .feature-preview { display: none; }
 .filters.seg .chip:first-child { border-top-left-radius: 99px; border-bottom-left-radius: 99px; border-left-width: 1px; }
 .filters.seg .chip:last-child { border-top-right-radius: 99px; border-bottom-right-radius: 99px; }
 .bucket > h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 1.4rem 0 .5rem; cursor: pointer; user-select: none; }
+.bucket > h2 .count {
+  font-size: .7rem; background: var(--accent2); border: 1px solid var(--line);
+  border-radius: 99px; padding: 0 .45rem; margin-left: .4rem; letter-spacing: 0;
+}
+.bucket > .note { margin: -.3rem 0 .5rem; font-size: .8rem; }
+.subhead {
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--dim); margin: .7rem 0 .2rem; border-bottom: 1px solid var(--line);
+  padding-bottom: .2rem;
+}
 .bucket > h2::before { content: "▾"; display: inline-block; width: 1em; color: var(--dim); transition: transform .12s; }
 .bucket.collapsed > h2::before { transform: rotate(-90deg); }
 .bucket.collapsed > .card { display: none; }
@@ -133,6 +145,32 @@ details.feature[open] > .feature-preview { display: none; }
 .flag .desc { flex: 1; }
 .flag-body { padding: 0 .4rem .7rem 1.8rem; }
 .tag { font-size: .72rem; color: var(--dim); }
+
+/* ── Skills catalogue (Skills tab) — expandable rows, like flags ──────────── */
+.card.skills { padding: .3rem 1.1rem; }
+.skill { border-bottom: 1px solid var(--line); }
+.skill:last-of-type { border-bottom: none; }
+.skill > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; gap: .8rem; align-items: center;
+  padding: .6rem .4rem; border-radius: 6px;
+}
+.skill > summary::-webkit-details-marker { display: none; }
+.skill > summary::before {
+  content: "▸"; color: var(--dim); flex: none; transition: transform .12s; font-size: .8rem;
+}
+.skill[open] > summary::before { transform: rotate(90deg); }
+.skill > summary:hover { background: var(--accent2); }
+.skill-name { flex: none; }
+.skill-head .desc {
+  flex: 1 1 auto; min-width: 0; font-size: .85rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.skill-body { padding: 0 .4rem .8rem 1.8rem; display: grid; gap: .4rem; justify-items: start; }
+.skill-body code { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 0 .35rem; }
+.grants { display: flex; gap: .9rem; flex-wrap: wrap; align-items: center; }
+.grants > .k { margin: 0; }
+.grant { color: var(--ink); font-size: .85rem; cursor: pointer; }
 a { color: var(--accent); }
 .list-skill { display: flex; align-items: center; gap: .5rem; padding: .2rem 0; }
 .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--panel2); border: 1px solid var(--accent); border-radius: var(--r); padding: .6rem 1rem; max-width: 420px; white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; }

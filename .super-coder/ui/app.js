@@ -26,6 +26,30 @@ function toast(msg) {
 }
 function setStatus(s) { $("#status").textContent = s; }
 
+// ── Skill sections ──────────────────────────────────────────────────────────
+// One grouping rule for the Skills tab AND the Shells grant list. "Repo skills"
+// are fork-local (origin='repo', derived server-side from the snapshot rule:
+// name not under engine assets/skills) and always lead; engine skills section
+// by their category.
+const SECTION_ORDER = ["repo", "substrate", "craft"];
+const SECTION_LABEL = { repo: "Repo skills", substrate: "Substrate", craft: "Craft", other: "Other" };
+const SECTION_NOTE = {
+  repo: "Authored in this repo — not engine catalogue. Durable via .sc-state/content.sql; see the local_skill_management skill.",
+};
+const sectionOf = (s) => (s.origin === "repo" ? "repo" : (s.category || "other"));
+const sectionLabel = (k) => SECTION_LABEL[k] || k.charAt(0).toUpperCase() + k.slice(1);
+
+function groupSkills(skills, { alwaysRepo = false } = {}) {
+  const by = {};
+  if (alwaysRepo) by.repo = [];   // surface the section even when empty
+  for (const s of skills) (by[sectionOf(s)] ||= []).push(s);
+  const keys = [
+    ...SECTION_ORDER.filter((k) => k in by),
+    ...Object.keys(by).filter((k) => !SECTION_ORDER.includes(k)).sort(),
+  ];
+  return keys.map((k) => ({ key: k, label: sectionLabel(k), skills: by[k] }));
+}
+
 // ── Shells ──────────────────────────────────────────────────────────────────
 let selectedShell = null;
 
@@ -87,40 +111,127 @@ function shellCard(s) {
   // editable operational fields
   c.append(field("current_state", s.current_state, "current_state", s.shell_id));
 
-  // skills + grants (editable)
+  // skills + grants (editable), grouped by the same sections as the Skills tab
   const sk = el("div", {});
   sk.append(el("label", { className: "k", textContent: "skills + grants" }));
-  for (const k of s.skills) {
-    const cb = el("input", { type: "checkbox", checked: !!k.granted });
-    cb.onchange = async () => {
-      try { await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: cb.checked }); setStatus("grant updated"); }
-      catch (e) { toast("error: " + e.message); cb.checked = !cb.checked; }
-    };
-    sk.append(el("div", { className: "list-skill" }, cb, el("b", {}, k.name),
-      el("span", { className: "muted", textContent: " — " + (k.description || "").split("\n")[0] })));
+  const granted = s.skills.filter((k) => k.granted).length;
+  sk.append(el("div", { className: "tag" }, `${granted} of ${s.skills.length} granted`));
+  for (const sec of groupSkills(s.skills)) {
+    sk.append(el("div", { className: "subhead" }, sec.label));
+    for (const k of sec.skills) {
+      const cb = el("input", { type: "checkbox", checked: !!k.granted });
+      cb.onchange = async () => {
+        try { await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: cb.checked }); setStatus("grant updated"); }
+        catch (e) { toast("error: " + e.message); cb.checked = !cb.checked; }
+      };
+      sk.append(el("div", { className: "list-skill" }, cb, el("b", {}, k.name),
+        el("span", { className: "muted", textContent: " — " + (k.description || "").split("\n")[0] })));
+    }
   }
   c.append(sk);
 
-  // seed + L&S — READ ONLY (no edit endpoint exists; law-curated)
+  // seed + L&S — READ ONLY (no edit endpoint exists; law-curated). Collapsed by
+  // default: identity reads on demand, operational fields stay above the fold.
   if (s.seed?.length) {
+    const d = el("details", {}, el("summary", {}, `seed (${s.seed.length}) — read-only, shell-curated, Laws 2–4`));
     const box = el("div", { className: "locked" });
-    box.append(el("label", { className: "k", textContent: "seed (read-only — shell-curated, Laws 2–4)" }));
     for (const e of s.seed) box.append(el("div", { className: "seed-entry" },
       el("div", { className: "d", textContent: e.entry_date }), el("div", {}, e.body)));
-    c.append(box);
+    d.append(box);
+    c.append(d);
   }
   if (s.lns?.length) {
+    const d = el("details", {}, el("summary", {}, `lessons & stances (${s.lns.length}) — read-only, Law 7`));
     const box = el("div", { className: "locked" });
-    box.append(el("label", { className: "k", textContent: "lessons & stances (read-only — Law 7)" }));
     for (const e of s.lns) box.append(el("div", { className: "lns-entry" }, e.body));
-    c.append(box);
+    d.append(box);
+    c.append(d);
   }
   if (s.lineage_seed) {
     const d = el("details", {}, el("summary", {}, "lineage seed (read-only)"));
     d.append(el("div", { className: "locked seed-entry" }, s.lineage_seed));
     c.append(d);
   }
+  if (s.decisions?.length) {
+    const d = el("details", {}, el("summary", {}, `recent decisions (${s.decisions.length})`));
+    const box = el("div", { className: "locked" });
+    for (const e of s.decisions) box.append(el("div", { className: "seed-entry" },
+      el("div", { className: "d", textContent: `${e.decision_date || ""} ${e.priority || ""}`.trim() }),
+      el("div", {}, e.decision)));
+    d.append(box);
+    c.append(d);
+  }
   return c;
+}
+
+// ── Skills (catalogue, sectioned) ────────────────────────────────────────────
+async function renderSkills(root) {
+  const { skills, shells } = await api("/skills");
+  root.replaceChildren();
+  root.append(el("div", { className: "muted" },
+    "The skills catalogue, sectioned. Engine skills ship with super-coder and group by category; repo skills are authored in this fork. Grants are editable here and on each shell."));
+  for (const sec of groupSkills(skills, { alwaysRepo: true })) {
+    const wrap = el("div", { className: "bucket" });
+    const h = el("h2", {}, `${sec.label} `, el("span", { className: "count" }, String(sec.skills.length)));
+    wrap.append(h);
+    if (SECTION_NOTE[sec.key]) wrap.append(el("div", { className: "muted note" }, SECTION_NOTE[sec.key]));
+    if (!sec.skills.length) {
+      wrap.append(el("div", { className: "card muted" },
+        "No repo skills yet — author one with the local_skill_management skill (file → seed → grant → snapshot)."));
+      root.append(wrap);
+      continue;
+    }
+    const card = el("div", { className: "card skills" });
+    for (const s of sec.skills) card.append(skillRow(s, shells));
+    wrap.append(card);
+    root.append(wrap);
+  }
+}
+
+function skillRow(s, shells) {
+  const row = el("details", { className: "skill" });
+  const head = el("summary", { className: "skill-head" });
+  head.append(el("b", { className: "skill-name" }, s.name));
+  const meta = el("span", { className: "feature-meta" });
+  if (s.origin === "repo" && s.category) meta.append(el("span", { className: "pill" }, s.category));
+  if (s.common) meta.append(el("span", { className: "pill ok" }, "common"));
+  meta.append(el("span", { className: "pill" }, `${s.granted_shells.length} shell${s.granted_shells.length === 1 ? "" : "s"}`));
+  head.append(
+    el("span", { className: "muted desc", textContent: (s.description || "").split("\n")[0] }),
+    meta);
+  row.append(head);
+
+  const body = el("div", { className: "skill-body" });
+  if (s.command) body.append(el("div", { className: "tag" }, "command: ", el("code", {}, s.command)));
+
+  // grants — same PUT the Shells tab uses, managed from the skill's side here
+  const gr = el("div", { className: "grants" });
+  gr.append(el("label", { className: "k", textContent: "granted to" }));
+  for (const sh of shells) {
+    const cb = el("input", { type: "checkbox", checked: s.granted_shells.includes(sh.shell_id) });
+    cb.onchange = async () => {
+      try { await api(`/shells/${sh.shell_id}/skills/${s.skill_id}`, "PUT", { granted: cb.checked }); setStatus("grant updated"); }
+      catch (e) { toast("error: " + e.message); cb.checked = !cb.checked; }
+    };
+    gr.append(el("label", { className: "grant" }, cb, ` ${sh.display_name}`));
+  }
+  body.append(gr);
+
+  // full procedure body, lazy-loaded on first expand of the viewer
+  const pre = el("pre", { className: "doc-body", hidden: true });
+  const view = el("button", { className: "act", textContent: "view content" });
+  view.onclick = async () => {
+    pre.hidden = !pre.hidden;
+    if (!pre.hidden && !pre.dataset.loaded) {
+      try {
+        const full = await api("/skills/" + s.skill_id);
+        pre.textContent = full.content || "(no content)"; pre.dataset.loaded = "1";
+      } catch (e) { pre.textContent = "error: " + e.message; }
+    }
+  };
+  body.append(view, pre);
+  row.append(body);
+  return row;
 }
 
 // ── Roadmap ───────────────────────────────────────────────────────────────────
@@ -472,6 +583,7 @@ async function renderMap(root) {
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
+  skills: ["#view-skills", renderSkills],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
