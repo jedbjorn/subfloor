@@ -32,9 +32,15 @@ nav button.active { background: var(--accent2); color: var(--ink); border-color:
   padding: .35rem .7rem; border-radius: var(--r); cursor: pointer; font: inherit;
 }
 #snapshot:hover { border-color: var(--accent); }
-main { padding: 1.2rem; max-width: 1100px; margin: 0 auto; }
-.view { display: grid; gap: 1rem; }
+main { padding: 1.2rem; }
+.view { display: grid; gap: 1rem; margin: 0 auto; width: 100%; max-width: var(--page-w, 1100px); }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
+/* Per-page width, normalized: every page is centered and capped, but the cap
+   matches the content — prose/stat pages read narrower, list pages standard,
+   the editor-heavy roadmap gets room for its textareas + doc rows. */
+#view-shells, #view-map, #view-scripts { --page-w: 920px; }
+#view-skills, #view-docs, #view-flags { --page-w: 1080px; }
+#view-roadmap { --page-w: 1240px; }
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
