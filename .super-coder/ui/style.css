@@ -59,7 +59,10 @@ nav button.active::after {
 #snapshot:hover { border-color: var(--accent); }
 main { padding: 1.2rem; }
 /* One shared content width for every page — no per-tab jumps. */
-.view { display: grid; gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
+/* minmax(0,1fr): grid items default to min-width:auto, so any nowrap line
+   (e.g. a skill row's one-line description) would force the track — and the
+   cards — past the max-width instead of truncating. Clamp the track to 0. */
+.view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
 
 .card {
@@ -225,7 +228,7 @@ a { color: var(--accent); }
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
   background: var(--accent);
 }
-.shell-pane { display: grid; gap: .6rem; align-content: start; }
+.shell-pane { display: grid; grid-template-columns: minmax(0, 1fr); gap: .6rem; align-content: start; }
 .viewer-head { display: flex; align-items: center; gap: .9rem; padding: 0 .2rem; margin-top: .2rem; }
 .vpanel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); }
 .viewer-panel { padding: 1rem 1.1rem; min-height: 12rem; }
