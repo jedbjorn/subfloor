@@ -191,9 +191,32 @@ details.feature[open] > .feature-preview { display: none; }
 }
 .skill-body { padding: 0 .4rem .8rem 1.8rem; display: grid; gap: .4rem; justify-items: start; }
 .skill-body code { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 0 .35rem; }
-.grants { display: flex; gap: .9rem; flex-wrap: wrap; align-items: center; }
-.grants > .k { margin: 0; }
-.grant { color: var(--ink); font-size: .85rem; cursor: pointer; }
+.grants { width: 100%; }
+.grants > .k { margin: 0 0 .2rem; }
+.grant-list { max-width: 320px; }
+.grant-row {
+  display: flex; align-items: center; justify-content: space-between; gap: .8rem;
+  padding: .4rem 0; border-bottom: 1px solid var(--line-soft); font-size: .85rem;
+}
+.grant-row:last-child { border-bottom: none; }
+.grant-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* on/off switch */
+.switch { position: relative; display: inline-block; width: 32px; height: 18px; flex: none; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
+.switch .slider {
+  position: absolute; inset: 0; border-radius: 99px;
+  background: var(--panel2); border: 1px solid var(--line);
+  transition: background .15s, border-color .15s;
+}
+.switch .slider::before {
+  content: ""; position: absolute; width: 12px; height: 12px; left: 2px; top: 2px;
+  border-radius: 50%; background: rgba(255,255,255,.55);
+  transition: transform .15s, background .15s;
+}
+.switch input:checked + .slider { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(14px); background: #0b0e13; }
+.switch input:focus-visible + .slider { box-shadow: 0 0 0 2px rgba(255,255,255,.25); }
 a { color: var(--accent); }
 .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--menu-bg); border: 1px solid var(--menu-border); box-shadow: var(--menu-shadow); border-radius: var(--r); padding: .6rem 1rem; max-width: 420px; white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; }
 .bars { display: grid; gap: .3rem; }

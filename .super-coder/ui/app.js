@@ -93,6 +93,14 @@ function statRow(pairs) {
   return r;
 }
 
+// On/off switch — a styled checkbox; onChange gets (next, input) so a failed
+// write can flip the control back.
+function toggleSwitch(checked, onChange) {
+  const cb = el("input", { type: "checkbox", checked });
+  cb.onchange = () => onChange(cb.checked, cb);
+  return el("label", { className: "switch" }, cb, el("span", { className: "slider" }));
+}
+
 // Vanilla port of dos-arch's GlassDropdown: pill trigger + solid-grey popover.
 // One document-level mousedown handler (registered at boot) closes any open
 // .gmenu the click landed outside of.
@@ -428,17 +436,27 @@ function skillRow(s, shells) {
   const body = el("div", { className: "skill-body" });
   if (s.command) body.append(el("div", { className: "tag" }, "command: ", el("code", {}, s.command)));
 
-  // grants — same PUT the Shells tab uses, managed from the skill's side here
+  // grants — every available shell as a row with an on/off toggle; same PUT
+  // the Shells tab uses, managed from the skill's side here
   const gr = el("div", { className: "grants" });
   gr.append(el("label", { className: "k", textContent: "granted to" }));
+  const list = el("div", { className: "grant-list" });
   for (const sh of shells) {
-    const cb = el("input", { type: "checkbox", checked: s.granted_shells.includes(sh.shell_id) });
-    cb.onchange = async () => {
-      try { await api(`/shells/${sh.shell_id}/skills/${s.skill_id}`, "PUT", { granted: cb.checked }); setStatus("grant updated"); }
-      catch (e) { toast("error: " + e.message); cb.checked = !cb.checked; }
-    };
-    gr.append(el("label", { className: "grant" }, cb, ` ${sh.display_name}`));
+    const sw = toggleSwitch(s.granted_shells.includes(sh.shell_id), async (next, cb) => {
+      try {
+        await api(`/shells/${sh.shell_id}/skills/${s.skill_id}`, "PUT", { granted: next });
+        setStatus("grant updated");
+        const i = s.granted_shells.indexOf(sh.shell_id);
+        if (next && i < 0) s.granted_shells.push(sh.shell_id);
+        if (!next && i >= 0) s.granted_shells.splice(i, 1);
+      } catch (e) { toast("error: " + e.message); cb.checked = !next; }
+    });
+    list.append(el("div", { className: "grant-row" },
+      el("span", { className: "grant-name" }, sh.display_name,
+        el("span", { className: "muted", textContent: sh.shortname ? " /" + sh.shortname : "" })),
+      sw));
   }
+  gr.append(list);
   body.append(gr);
 
   // full procedure body opens in the viewer modal (800×650)
