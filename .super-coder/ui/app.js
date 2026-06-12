@@ -51,7 +51,75 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 }
 
 // ── Shells ──────────────────────────────────────────────────────────────────
+// dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
+// identity sub-header (glass shell picker + role/mandate), then Harness |
+// Skills sub-tabs scoped to the selected shell. Glass panels, accordions,
+// popover pickers, and a unified edit modal.
 let selectedShell = null;
+let shellTab = "harness";     // 'harness' | 'skills'
+let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+
+// Rough token estimator — BPE-ish, ~15% off for English; the tilde in the
+// readout makes the approximation explicit. No bundled tokenizer.
+const approxTokens = (s) => Math.ceil((s || "").length / 4);
+const fmt = (n) => n.toLocaleString();
+const microlabel = (text) => el("span", { className: "microlabel" }, text);
+
+function statRow(pairs) {
+  const r = el("div", { className: "stat-row" });
+  for (const [k, v] of pairs) r.append(el("span", { className: "stat" }, k + " ", el("b", {}, v)));
+  return r;
+}
+
+// Vanilla port of dos-arch's GlassDropdown: pill trigger + solid-grey popover.
+// One document-level mousedown handler (registered at boot) closes any open
+// .gmenu the click landed outside of.
+function glassDropdown({ items, value, onChange }) {
+  const wrap = el("div", { className: "gdrop" });
+  const cur = items.find((i) => i.value === value);
+  const btn = el("button", { className: "gdrop-btn", type: "button" });
+  btn.append(el("span", { className: "gdrop-label" }, cur ? cur.label : "—"),
+    el("span", { className: "gdrop-caret" }, "⇅"));
+  const menu = el("div", { className: "gmenu", hidden: true });
+  for (const it of items) {
+    const row = el("button", { className: "gmenu-row" + (it.value === value ? " active-row" : ""), type: "button" });
+    row.append(el("span", { className: "gmenu-name" }, it.label));
+    if (it.caption) row.append(el("span", { className: "gmenu-cap" }, it.caption));
+    row.onclick = () => { menu.hidden = true; onChange(it.value); };
+    menu.append(row);
+  }
+  btn.onclick = () => { menu.hidden = !menu.hidden; };
+  wrap.append(btn, menu);
+  return wrap;
+}
+
+// Unified edit modal — 650×700 dialog, Save bottom-LEFT / Cancel bottom-RIGHT,
+// live ~tokens / chars readout in the header.
+function openEditModal({ title, value, onSave }) {
+  const counter = el("div", { className: "modal-count" });
+  const ta = el("textarea", { value: value || "" });
+  const upd = () => { counter.textContent = `~${fmt(approxTokens(ta.value))} tokens / ${fmt(ta.value.length)} chars`; };
+  ta.oninput = upd; upd();
+  const overlay = el("div", { className: "modal-overlay" });
+  const close = () => overlay.remove();
+  const save = el("button", { className: "act primary", type: "button", textContent: "Save" });
+  save.onclick = async () => {
+    save.disabled = true; save.textContent = "Saving…";
+    try { await onSave(ta.value); close(); }
+    catch (e) { toast("error: " + e.message); save.disabled = false; save.textContent = "Save"; }
+  };
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  cancel.onclick = close;
+  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
+  const dlg = el("div", { className: "modal" });
+  dlg.append(
+    el("div", { className: "modal-head" }, el("div", { className: "modal-title" }, title), counter),
+    el("div", { className: "modal-body" }, ta),
+    el("div", { className: "modal-foot" }, save, cancel));
+  overlay.append(dlg);
+  document.body.append(overlay);
+  ta.focus();
+}
 
 async function renderShells(root) {
   const { shells } = await api("/shells");
@@ -60,22 +128,31 @@ async function renderShells(root) {
   if (!shells.length) { root.append(el("div", { className: "card muted" }, "No shells.")); return; }
   if (selectedShell == null || !shells.find((s) => s.shell_id === selectedShell))
     selectedShell = shells[0].shell_id;
+  const s = await api("/shells/" + selectedShell);
 
-  // switcher + new-shell
-  const bar = el("div", { className: "card shellbar" });
-  const sel = el("select", {});
-  for (const s of shells)
-    sel.append(el("option", { value: s.shell_id, selected: s.shell_id === selectedShell,
-      textContent: s.flavor ? `${s.display_name} (${s.flavor})` : `${s.display_name} — ${s.role || ""}` }));
-  sel.onchange = () => { selectedShell = Number(sel.value); renderShells(root); };
-  const newBtn = el("button", { className: "act", textContent: "＋ New shell" });
+  // sticky identity sub-header
+  const sub = el("div", { className: "subbar" });
+  const idy = el("div", { className: "subbar-id" });
+  idy.append(glassDropdown({
+    items: shells.map((x) => ({
+      value: x.shell_id, label: x.display_name,
+      caption: x.shortname ? "/" + x.shortname : (x.flavor || ""),
+    })),
+    value: selectedShell,
+    onChange: (v) => { selectedShell = Number(v); activeSkillId = null; renderShells(root); },
+  }));
+  if (s.role) idy.append(el("div", { className: "kv" }, microlabel("Role"), el("span", {}, s.role)));
+  if (s.mandate) idy.append(el("div", { className: "kv" }, microlabel("Mandate"), el("span", {}, s.mandate)));
+  sub.append(idy);
 
+  // new shell — pill toggle + inline form
+  const newBtn = el("button", { className: "act", type: "button", textContent: "＋ New shell" });
   const form = el("div", { className: "newshell", hidden: true });
   const fl = el("select", {});
   for (const t of templates)
     fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
   const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
-  const create = el("button", { className: "act primary", textContent: "create" });
+  const create = el("button", { className: "act primary", type: "button", textContent: "create" });
   create.onclick = async () => {
     if (!nm.value.trim()) return toast("name required");
     try {
@@ -86,82 +163,149 @@ async function renderShells(root) {
   newBtn.onclick = () => { form.hidden = !form.hidden; if (!form.hidden) nm.focus(); };
   form.append(el("label", { className: "k" }, "flavor"), fl,
     el("label", { className: "k" }, "name"), nm, create);
-  bar.append(el("span", { className: "k", textContent: "shell" }), sel, newBtn, form);
-  root.append(bar);
+  sub.append(newBtn, form);
+  root.append(sub);
 
-  // selected shell detail (skill grant toggles here are the per-shell assignment)
-  root.append(shellCard(await api("/shells/" + selectedShell)));
+  // sub-tabs — Harness / Skills, both scoped to the selected shell
+  const tabs = el("div", { className: "vtabs" });
+  for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"]]) {
+    const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
+    b.onclick = () => { shellTab = key; renderShells(root); };
+    tabs.append(b);
+  }
+  root.append(tabs);
+
+  const pane = el("div", { className: "shell-pane" });
+  root.append(pane);
+  if (shellTab === "harness") renderHarness(pane, s);
+  else renderSkillViewer(pane, s);
 }
 
-function field(label, value, key, sid) {
-  const ta = el("textarea", { value: value || "", rows: key === "current_state" ? 12 : 2 });
-  const save = el("button", { className: "act", textContent: "save" });
-  save.onclick = async () => {
-    try { await api("/shells/" + sid, "PATCH", { [key]: ta.value }); setStatus("saved " + key); }
-    catch (e) { toast("error: " + e.message); }
-  };
-  return el("div", {}, el("label", { className: "k", textContent: label }), ta, save);
+// Harness — the shell's surfaces as grouped accordions: Operational
+// (current_state is the one editable field — the API exposes nothing else),
+// then the law-curated identity (read-only by design, Laws 2–4 / 7), then the
+// record. Char/token readout spans everything below it.
+function renderHarness(root, s) {
+  const groups = [{ title: "Operational", items: [
+    { label: "CURRENT STATE", text: s.current_state || "", editable: true },
+    ...(s.system_prompt ? [{ label: "SYSTEM PROMPT", text: s.system_prompt }] : []),
+  ] }];
+
+  const idy = [];
+  if (s.seed?.length) idy.push({
+    label: `SEED (${s.seed.length})`,
+    text: s.seed.map((e) => e.body).join("\n"),
+    node: entryList(s.seed.map((e) => ({ d: e.entry_date, body: e.body }))),
+  });
+  if (s.lns?.length) idy.push({
+    label: `LESSONS & STANCES (${s.lns.length})`,
+    text: s.lns.map((e) => e.body).join("\n"),
+    node: entryList(s.lns.map((e) => ({ body: e.body }))),
+  });
+  if (s.lineage_seed) idy.push({ label: "LINEAGE SEED", text: s.lineage_seed });
+  if (idy.length) groups.push({ title: "Identity — law-curated, read-only", items: idy });
+
+  if (s.decisions?.length) groups.push({ title: "Record", items: [{
+    label: `RECENT DECISIONS (${s.decisions.length})`,
+    text: s.decisions.map((e) => e.decision).join("\n"),
+    node: entryList(s.decisions.map((e) => ({
+      d: `${e.decision_date || ""} ${e.priority || ""}`.trim(), body: e.decision }))),
+  }] });
+
+  const all = groups.flatMap((g) => g.items);
+  root.append(
+    el("div", { className: "viewer-head" }, microlabel("Harness")),
+    statRow([["Char Count", fmt(all.reduce((n, x) => n + x.text.length, 0))],
+             ["Est. Tokens", "~" + fmt(approxTokens(all.map((x) => x.text).join("")))]]));
+
+  const panel = el("div", { className: "glass acc-panel" });
+  for (const g of groups) {
+    panel.append(el("div", { className: "acc-group" }, g.title));
+    for (const sec of g.items) panel.append(accordion(sec, s));
+  }
+  root.append(panel);
 }
 
-function shellCard(s) {
-  const c = el("div", { className: "card" });
-  c.append(el("h2", {}, `${s.display_name} `, el("span", { className: "muted", textContent: "/" + (s.shortname || "") })));
-  c.append(el("div", { className: "muted" }, `${s.role || ""} — ${s.mandate || ""}`));
+function entryList(entries) {
+  const box = el("div", {});
+  for (const e of entries) box.append(el("div", { className: "seed-entry" },
+    ...(e.d ? [el("div", { className: "d", textContent: e.d })] : []),
+    el("div", {}, e.body)));
+  return box;
+}
 
-  // editable operational fields
-  c.append(field("current_state", s.current_state, "current_state", s.shell_id));
+function accordion(sec, s) {
+  const d = el("details", { className: "acc" });
+  d.append(el("summary", {}, el("span", { className: "acc-label" }, sec.label)));
+  const body = el("div", { className: "acc-body" });
+  if (sec.editable) {
+    const pen = el("button", { className: "pencil", type: "button", title: "Edit current_state", textContent: "✎" });
+    pen.onclick = () => openEditModal({
+      title: "current_state — " + s.display_name,
+      value: s.current_state,
+      onSave: async (v) => {
+        await api("/shells/" + s.shell_id, "PATCH", { current_state: v });
+        setStatus("saved current_state"); load("shells");
+      },
+    });
+    body.append(pen);
+  }
+  body.append(sec.node || el("div", { className: "acc-text" }, sec.text || "—"));
+  d.append(body);
+  return d;
+}
 
-  // skills + grants (editable), grouped by the same sections as the Skills tab
-  const sk = el("div", {});
-  sk.append(el("label", { className: "k", textContent: "skills + grants" }));
-  const granted = s.skills.filter((k) => k.granted).length;
-  sk.append(el("div", { className: "tag" }, `${granted} of ${s.skills.length} granted`));
-  for (const sec of groupSkills(s.skills)) {
-    sk.append(el("div", { className: "subhead" }, sec.label));
-    for (const k of sec.skills) {
-      const cb = el("input", { type: "checkbox", checked: !!k.granted });
-      cb.onchange = async () => {
-        try { await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: cb.checked }); setStatus("grant updated"); }
-        catch (e) { toast("error: " + e.message); cb.checked = !cb.checked; }
-      };
-      sk.append(el("div", { className: "list-skill" }, cb, el("b", {}, k.name),
-        el("span", { className: "muted", textContent: " — " + (k.description || "").split("\n")[0] })));
-    }
-  }
-  c.append(sk);
+// Skill Viewer — popover picker with inline grant toggles (☑/☐ — toggling
+// does not change the selection), then the selected skill's full content in a
+// glass panel with a char/token readout. Content lazy-loads per selection.
+function renderSkillViewer(root, s) {
+  const skills = s.skills;
+  if (!skills.length) { root.append(el("div", { className: "muted" }, "No skills in the catalogue.")); return; }
+  if (activeSkillId == null || !skills.find((k) => k.skill_id === activeSkillId))
+    activeSkillId = (skills.find((k) => k.granted) || skills[0]).skill_id;
+  const active = skills.find((k) => k.skill_id === activeSkillId);
 
-  // seed + L&S — READ ONLY (no edit endpoint exists; law-curated). Collapsed by
-  // default: identity reads on demand, operational fields stay above the fold.
-  if (s.seed?.length) {
-    const d = el("details", {}, el("summary", {}, `seed (${s.seed.length}) — read-only, shell-curated, Laws 2–4`));
-    const box = el("div", { className: "locked" });
-    for (const e of s.seed) box.append(el("div", { className: "seed-entry" },
-      el("div", { className: "d", textContent: e.entry_date }), el("div", {}, e.body)));
-    d.append(box);
-    c.append(d);
+  const wrap = el("div", { className: "gdrop" });
+  const btn = el("button", { className: "gdrop-btn", type: "button" });
+  btn.append(el("span", { className: "gdrop-label mono" }, active.name),
+    el("span", { className: "gdrop-caret" }, "⇅"));
+  const menu = el("div", { className: "gmenu", hidden: true });
+  for (const k of skills) {
+    const row = el("div", { className: "gmenu-item" + (k.skill_id === activeSkillId ? " active-row" : "") });
+    const tog = el("button", { className: "gmenu-check", type: "button",
+      title: k.granted ? "Revoke" : "Grant", textContent: k.granted ? "☑" : "☐" });
+    tog.onclick = async () => {
+      try {
+        await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: !k.granted });
+        k.granted = k.granted ? 0 : 1;
+        tog.textContent = k.granted ? "☑" : "☐";
+        tog.title = k.granted ? "Revoke" : "Grant";
+        setStatus("grant updated");
+      } catch (e) { toast("error: " + e.message); }
+    };
+    const sel = el("button", { className: "gmenu-name mono", type: "button", textContent: k.name });
+    sel.onclick = () => {
+      activeSkillId = k.skill_id; menu.hidden = true;
+      root.replaceChildren(); renderSkillViewer(root, s);
+    };
+    row.append(tog, sel, el("span", { className: "gmenu-cap" }, sectionLabel(sectionOf(k))));
+    menu.append(row);
   }
-  if (s.lns?.length) {
-    const d = el("details", {}, el("summary", {}, `lessons & stances (${s.lns.length}) — read-only, Law 7`));
-    const box = el("div", { className: "locked" });
-    for (const e of s.lns) box.append(el("div", { className: "lns-entry" }, e.body));
-    d.append(box);
-    c.append(d);
-  }
-  if (s.lineage_seed) {
-    const d = el("details", {}, el("summary", {}, "lineage seed (read-only)"));
-    d.append(el("div", { className: "locked seed-entry" }, s.lineage_seed));
-    c.append(d);
-  }
-  if (s.decisions?.length) {
-    const d = el("details", {}, el("summary", {}, `recent decisions (${s.decisions.length})`));
-    const box = el("div", { className: "locked" });
-    for (const e of s.decisions) box.append(el("div", { className: "seed-entry" },
-      el("div", { className: "d", textContent: `${e.decision_date || ""} ${e.priority || ""}`.trim() }),
-      el("div", {}, e.decision)));
-    d.append(box);
-    c.append(d);
-  }
-  return c;
+  btn.onclick = () => { menu.hidden = !menu.hidden; };
+  wrap.append(btn, menu);
+
+  root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap));
+  const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
+  const panel = el("div", { className: "glass viewer-panel" });
+  root.append(stats, panel);
+
+  api("/skills/" + activeSkillId).then((full) => {
+    stats.replaceWith(statRow([
+      ["Char Count", fmt((full.content || "").length)],
+      ["Est. Tokens", "~" + fmt(approxTokens(full.content || ""))]]));
+    if (full.description) panel.append(el("div", { className: "muted desc-line" }, full.description));
+    panel.append(el("pre", { className: "acc-text" }, full.content || "(no content)"));
+  }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
 }
 
 // ── Skills (catalogue, sectioned) ────────────────────────────────────────────
@@ -608,6 +752,11 @@ function routeFromHash() {
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
 window.addEventListener("hashchange", routeFromHash);
+// Close any open popover menu on an outside click (one handler for all .gmenu).
+document.addEventListener("mousedown", (e) => {
+  for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
+    if (!m.parentElement.contains(e.target)) m.hidden = true;
+});
 $("#snapshot").onclick = async () => {
   setStatus("snapshotting…");
   try { const r = await api("/snapshot", "POST"); toast(r.output || "done"); setStatus("snapshot done"); }
