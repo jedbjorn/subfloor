@@ -478,8 +478,8 @@ async function renderRoadmap(root) {
   const { buckets } = await api("/roadmap");
   root.replaceChildren();
 
-  // segmented single-select toggle; re-click the active one to clear → show all
-  const bar = el("div", { className: "filters seg" });
+  // separated pill filters, centered; re-click the active one to clear → show all
+  const bar = el("div", { className: "filters centered" });
   for (const s of STATUSES) {
     const chip = el("button", { className: "chip" + (roadmapFilter === s ? " on" : ""), textContent: SLABEL[s] });
     chip.onclick = () => {
