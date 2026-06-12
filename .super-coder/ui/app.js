@@ -417,15 +417,12 @@ async function renderSkills(root) {
 
 function skillRow(s, shells) {
   const row = el("details", { className: "skill" });
+  // collapsed row stays quiet: mono name + truncated description, no badges —
+  // origin/section is the group header, grants live in the expanded body
   const head = el("summary", { className: "skill-head" });
-  head.append(el("b", { className: "skill-name" }, s.name));
-  const meta = el("span", { className: "feature-meta" });
-  if (s.origin === "repo" && s.category) meta.append(el("span", { className: "pill" }, s.category));
-  if (s.common) meta.append(el("span", { className: "pill ok" }, "common"));
-  meta.append(el("span", { className: "pill" }, `${s.granted_shells.length} shell${s.granted_shells.length === 1 ? "" : "s"}`));
   head.append(
-    el("span", { className: "muted desc", textContent: (s.description || "").split("\n")[0] }),
-    meta);
+    el("b", { className: "skill-name mono" }, s.name),
+    el("span", { className: "muted desc", textContent: (s.description || "").split("\n")[0] }));
   row.append(head);
 
   const body = el("div", { className: "skill-body" });
