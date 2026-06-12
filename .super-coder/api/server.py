@@ -48,6 +48,10 @@ _STATIC = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    # vendored markdown pipeline (marked MIT, DOMPurify MPL-2.0/Apache-2.0) —
+    # local copies so the no-build UI renders sanitized GFM without a CDN.
+    "/vendor/marked.umd.js": ("vendor/marked.umd.js", "application/javascript; charset=utf-8"),
+    "/vendor/purify.min.js": ("vendor/purify.min.js", "application/javascript; charset=utf-8"),
 }
 
 # md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`

@@ -305,12 +305,18 @@ button.gmenu-name:hover { color: #fff; }
   max-width: 92vw; max-height: 88vh; border-radius: 16px;
   border: 1px solid rgba(255,255,255,.10); background: var(--menu-bg); box-shadow: var(--menu-shadow);
 }
-.modal-pre {
-  flex: 1; min-height: 0; overflow: auto; margin: 0; white-space: pre-wrap;
-  overflow-wrap: break-word; background: var(--panel2); border: 1px solid var(--line);
-  border-radius: 8px; padding: .8rem 1rem; font: 12px/1.55 ui-monospace, monospace;
-  color: var(--ink);
+.modal-pre, .modal-md {
+  flex: 1; min-height: 0; overflow: auto; margin: 0;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 8px; padding: .8rem 1rem; color: var(--ink);
 }
+.modal-pre { white-space: pre-wrap; overflow-wrap: break-word; font: 12px/1.55 ui-monospace, monospace; }
+.modal-md { font-size: 13px; }
+.modal-form {
+  flex: 1; min-height: 0; overflow: auto; align-content: start;
+  display: grid; grid-template-columns: 110px 1fr; gap: .6rem 1rem;
+}
+.modal-form > .k { color: var(--dim); font-size: .85rem; padding-top: .45rem; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.2rem .8rem; border-bottom: 1px solid var(--line); }
 .modal-title { font-size: .9rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .modal-count { font: 11px ui-monospace, monospace; color: rgba(255,255,255,.40); flex: none; }
@@ -318,6 +324,64 @@ button.gmenu-name:hover { color: #fff; }
 .modal-body textarea { flex: 1; resize: none; font: 12px/1.55 ui-monospace, monospace; }
 .modal-foot { display: flex; justify-content: space-between; padding: .6rem 1.2rem 1rem; }
 .modal-foot .act { margin-top: 0; }
+
+/* ── Markdown surfaces (vendored marked + DOMPurify; dos-arch ramp on flat
+      grey) — headings step down to micro-labels, code reads as inset wells. */
+.md { overflow-wrap: break-word; color: var(--ink); font-size: 12.5px; line-height: 1.6; }
+.md h1, .md h2, .md h3, .md h4 {
+  font-size: .8rem; font-weight: 600; letter-spacing: .15em;
+  text-transform: uppercase; color: rgba(255,255,255,.40); margin: .9em 0 .3em;
+}
+.md h1:first-child, .md h2:first-child, .md h3:first-child { margin-top: 0; }
+.md p { margin: .4em 0; }
+.md p:first-child { margin-top: 0; }
+.md p:last-child { margin-bottom: 0; }
+.md ul, .md ol { margin: .4em 0; padding-left: 1.3em; }
+.md li { margin: .15em 0; }
+.md a { color: var(--accent); text-decoration: underline; }
+.md strong { font-weight: 600; color: #fff; }
+.md code {
+  background: var(--panel2); border: 1px solid var(--line); padding: .05em .35em;
+  border-radius: 4px; font-family: ui-monospace, monospace; font-size: .93em;
+  overflow-wrap: anywhere;
+}
+.md pre {
+  background: var(--panel2); border: 1px solid var(--line); padding: .7em .9em;
+  border-radius: 10px; font-family: ui-monospace, monospace; font-size: .9em;
+  margin: .6em 0; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.md pre code { background: transparent; border: 0; padding: 0; }
+.md blockquote {
+  border-left: 2px solid rgba(255,255,255,.15); margin: .6em 0;
+  padding: .1em .9em; color: rgba(255,255,255,.60);
+}
+.md hr { border: 0; border-top: 1px solid var(--line); margin: .9em 0; }
+.md table {
+  display: block; width: 100%; max-width: 100%; overflow-x: auto;
+  border-collapse: collapse; margin: .6em 0; font-size: .93em;
+}
+.md thead { border-bottom: 1px solid rgba(255,255,255,.15); }
+.md th, .md td { padding: .25em .7em .25em 0; text-align: left; vertical-align: top; }
+.md th { color: rgba(255,255,255,.50); font-weight: 600; }
+.md td:first-child, .md th:first-child { white-space: nowrap; }
+.md tbody tr { border-bottom: 1px solid var(--line-soft); }
+
+/* raw-markdown toggle + raw view */
+.rawtoggle {
+  margin-left: auto; background: none; border: none; cursor: pointer;
+  color: rgba(255,255,255,.40); font: 11px ui-monospace, monospace;
+  text-transform: uppercase; letter-spacing: .1em; padding: .2rem .4rem;
+}
+.rawtoggle:hover { color: #fff; }
+.raw-pre {
+  white-space: pre-wrap; overflow-wrap: break-word; margin: 0;
+  font: 12px/1.55 ui-monospace, monospace; color: rgba(255,255,255,.78);
+}
+
+/* flags toolbar — segmented filter left, new-flag trigger right */
+.flagbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.flagbar .filters { margin: 0; }
+.flagbar .act { margin-top: 0; }
 
 /* ── Polish: motion + depth ──────────────────────────────────────────────── */
 nav button, button.act, .chip, #snapshot, .gdrop-btn, .gmenu-row, .gmenu-name,

@@ -9,6 +9,28 @@ const el = (t, props = {}, ...kids) => {
 };
 const esc = (s) => (s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
+// Markdown → sanitized HTML via the vendored marked + DOMPurify (the same
+// pipeline as dos-arch's MarkdownBlock). External links open in a new tab
+// with rel=noopener; the hook is global to the DOMPurify singleton, so it is
+// registered exactly once.
+marked.setOptions({ gfm: true, breaks: true });
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName !== "A" || !node.hasAttribute("href")) return;
+  const href = node.getAttribute("href");
+  if (/^https?:\/\//i.test(href) && !href.startsWith(window.location.origin)) {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  } else {
+    node.removeAttribute("target");
+  }
+});
+function mdBlock(text) {
+  const div = el("div", { className: "md" });
+  if (text) div.innerHTML = DOMPurify.sanitize(
+    marked.parse(String(text)), { USE_PROFILES: { html: true } });
+  return div;
+}
+
 async function api(path, method = "GET", body) {
   const r = await fetch("/api" + path, {
     method, headers: body ? { "Content-Type": "application/json" } : {},
@@ -131,17 +153,27 @@ function openEditModal({ title, value, onSave }) {
   ta.focus();
 }
 
-// Read-only skill-content viewer — 800×650, char/~token readout in the header.
+// Read-only skill-content viewer — 800×650, rendered markdown with a raw
+// toggle bottom-left, char/~token readout in the header.
 async function openSkillContentModal(skill) {
   try {
     const full = await api("/skills/" + skill.skill_id);
     const counter = el("div", { className: "modal-count" },
       `~${fmt(approxTokens(full.content || ""))} tokens / ${fmt((full.content || "").length)} chars`);
+    const body = el("div", { className: "modal-md" });
+    const rendered = mdBlock(full.content || "(no content)");
+    const raw = el("pre", { className: "raw-pre", hidden: true }, full.content || "");
+    body.append(rendered, raw);
+    const rawBtn = el("button", { className: "act", type: "button", textContent: "raw" });
+    rawBtn.onclick = () => {
+      raw.hidden = !raw.hidden;
+      rendered.hidden = !raw.hidden;
+      rawBtn.textContent = raw.hidden ? "raw" : "rendered";
+    };
     const closeBtn = el("button", { className: "act", type: "button", textContent: "Close" });
     const close = openModal({
-      title: skill.name, headExtra: counter,
-      bodyNode: el("pre", { className: "modal-pre" }, full.content || "(no content)"),
-      footNodes: [el("span", {}), closeBtn],
+      title: skill.name, headExtra: counter, bodyNode: body,
+      footNodes: [rawBtn, closeBtn],
       width: 800, height: 650,
     });
     closeBtn.onclick = close;
@@ -257,7 +289,7 @@ function entryList(entries) {
   const box = el("div", {});
   for (const e of entries) box.append(el("div", { className: "seed-entry" },
     ...(e.d ? [el("div", { className: "d", textContent: e.d })] : []),
-    el("div", {}, e.body)));
+    mdBlock(e.body)));
   return box;
 }
 
@@ -277,7 +309,7 @@ function accordion(sec, s) {
     });
     body.append(pen);
   }
-  body.append(sec.node || el("div", { className: "acc-text" }, sec.text || "—"));
+  body.append(sec.node || (sec.text ? mdBlock(sec.text) : el("div", { className: "acc-text" }, "—")));
   d.append(body);
   return d;
 }
@@ -321,7 +353,10 @@ function renderSkillViewer(root, s) {
   btn.onclick = () => { menu.hidden = !menu.hidden; };
   wrap.append(btn, menu);
 
-  root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap));
+  // rendered markdown by default; the right-aligned toggle shows raw text
+  const rawBtn = el("button", { className: "rawtoggle", type: "button",
+    title: "Toggle raw markdown", textContent: "raw", hidden: true });
+  root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
   const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
   const panel = el("div", { className: "vpanel viewer-panel" });
   root.append(stats, panel);
@@ -331,7 +366,15 @@ function renderSkillViewer(root, s) {
       ["Char Count", fmt((full.content || "").length)],
       ["Est. Tokens", "~" + fmt(approxTokens(full.content || ""))]]));
     if (full.description) panel.append(el("div", { className: "muted desc-line" }, full.description));
-    panel.append(el("pre", { className: "acc-text" }, full.content || "(no content)"));
+    const rendered = mdBlock(full.content || "(no content)");
+    const raw = el("pre", { className: "raw-pre", hidden: true }, full.content || "");
+    panel.append(rendered, raw);
+    rawBtn.hidden = false;
+    rawBtn.onclick = () => {
+      raw.hidden = !raw.hidden;
+      rendered.hidden = !raw.hidden;
+      rawBtn.textContent = raw.hidden ? "raw" : "rendered";
+    };
   }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
 }
 
@@ -564,13 +607,8 @@ async function renderDocs(root) {
 // ── Flags ──────────────────────────────────────────────────────────────────────
 let flagFilter = "open";   // open | resolved | all — persists across re-renders
 
-async function renderFlags(root) {
-  const { flags, features } = await api("/flags");
-  root.replaceChildren();
-
-  // create
-  const card = el("div", { className: "card" });
-  card.append(el("h2", {}, "New flag"));
+// New-flag form in a 600×400 modal — Create bottom-left, Cancel bottom-right.
+function openNewFlagModal(features) {
   const name = el("input", { type: "text", placeholder: "display name (e.g. SC-001)" });
   const desc = el("textarea", { rows: 4, placeholder: "[Area] description | Blocker for: …" });
   const feat = el("select", {});
@@ -578,29 +616,42 @@ async function renderFlags(root) {
   for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: f.title }));
   const prio = el("select", {});
   for (const p of ["High", "Medium", "Low"]) prio.append(el("option", { value: p, selected: p === "Medium", textContent: p }));
-  const create = el("button", { className: "act primary", textContent: "create flag" });
-  create.onclick = async () => {
-    if (!desc.value) return toast("description required");
-    try {
-      await api("/flags", "POST", { display_name: name.value || null, description: desc.value, feature_id: feat.value || null, priority: prio.value });
-      setStatus("flag created"); load("flags");
-    } catch (e) { toast("error: " + e.message); }
-  };
-  card.append(el("div", { className: "grid2" },
+  const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "name"), name,
     el("span", { className: "k" }, "description"), desc,
     el("span", { className: "k" }, "feature"), feat,
-    el("span", { className: "k" }, "priority"), prio), create);
-  root.append(card);
+    el("span", { className: "k" }, "priority"), prio);
+  const close = openModal({ title: "New flag", bodyNode: form,
+    footNodes: [create, cancel], width: 600, height: 400 });
+  create.onclick = async () => {
+    if (!desc.value) return toast("description required");
+    create.disabled = true; create.textContent = "Creating…";
+    try {
+      await api("/flags", "POST", { display_name: name.value || null, description: desc.value,
+        feature_id: feat.value || null, priority: prio.value });
+      close(); setStatus("flag created"); load("flags");
+    } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
+  };
+  cancel.onclick = close;
+  desc.focus();
+}
 
-  // open | resolved | all toggle (segmented, single-select)
+async function renderFlags(root) {
+  const { flags, features } = await api("/flags");
+  root.replaceChildren();
+
+  // open | resolved | all toggle (segmented) + the new-flag modal trigger
   const bar = el("div", { className: "filters seg" });
   for (const [key, label] of [["open", "Open"], ["resolved", "Resolved"], ["all", "All"]]) {
     const chip = el("button", { className: "chip" + (flagFilter === key ? " on" : ""), textContent: label });
     chip.onclick = () => { flagFilter = key; renderFlags(root); };
     bar.append(chip);
   }
-  root.append(bar);
+  const newBtn = el("button", { className: "act newflag", type: "button", textContent: "＋ New flag" });
+  newBtn.onclick = () => openNewFlagModal(features);
+  root.append(el("div", { className: "flagbar" }, bar, newBtn));
 
   // grouped by feature, filtered by the toggle
   const shown = flags.filter((f) =>
