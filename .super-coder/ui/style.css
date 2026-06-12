@@ -263,7 +263,9 @@ a { color: var(--accent); }
 .pencil:hover { color: #fff; }
 
 /* pill dropdown + popover menus — solid medium-grey surface */
-.gdrop { position: relative; }
+/* fit-content: in a stretch flex column the wrapper would otherwise span the
+   full row, and the menu's width:100% would resolve against THAT, not the pill. */
+.gdrop { position: relative; width: fit-content; max-width: 100%; }
 .gdrop-btn {
   display: flex; align-items: center; gap: .5rem; min-width: 12rem; max-width: 100%;
   padding: .4rem .95rem; border-radius: 99px; border: 1px solid rgba(255,255,255,.10);
