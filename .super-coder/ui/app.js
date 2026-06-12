@@ -102,7 +102,8 @@ function glassDropdown({ items, value, onChange }) {
   const btn = el("button", { className: "gdrop-btn", type: "button" });
   btn.append(el("span", { className: "gdrop-label" }, cur ? cur.label : "—"),
     el("span", { className: "gdrop-caret" }, "⇅"));
-  const menu = el("div", { className: "gmenu", hidden: true });
+  // gmenu-fit: the menu matches the trigger's width (long labels ellipsize)
+  const menu = el("div", { className: "gmenu gmenu-fit", hidden: true });
   for (const it of items) {
     const row = el("button", { className: "gmenu-row" + (it.value === value ? " active-row" : ""), type: "button" });
     row.append(el("span", { className: "gmenu-name" }, it.label));

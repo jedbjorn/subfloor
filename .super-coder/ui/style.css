@@ -278,6 +278,9 @@ a { color: var(--accent); }
   border-radius: 16px; border: 1px solid var(--menu-border);
   background: var(--menu-bg); box-shadow: var(--menu-shadow); padding: .45rem 0;
 }
+/* fit variant — popover takes exactly the trigger's width */
+.gmenu.gmenu-fit { width: 100%; min-width: 0; }
+.gmenu-fit .gmenu-row > .gmenu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .gmenu-row, .gmenu-item { display: flex; align-items: center; width: 100%; white-space: nowrap; }
 .gmenu-row {
   background: none; border: none; cursor: pointer; text-align: left; gap: .6rem;
