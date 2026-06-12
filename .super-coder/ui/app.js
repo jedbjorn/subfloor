@@ -9,6 +9,28 @@ const el = (t, props = {}, ...kids) => {
 };
 const esc = (s) => (s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
+// Markdown → sanitized HTML via the vendored marked + DOMPurify (the same
+// pipeline as dos-arch's MarkdownBlock). External links open in a new tab
+// with rel=noopener; the hook is global to the DOMPurify singleton, so it is
+// registered exactly once.
+marked.setOptions({ gfm: true, breaks: true });
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName !== "A" || !node.hasAttribute("href")) return;
+  const href = node.getAttribute("href");
+  if (/^https?:\/\//i.test(href) && !href.startsWith(window.location.origin)) {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  } else {
+    node.removeAttribute("target");
+  }
+});
+function mdBlock(text) {
+  const div = el("div", { className: "md" });
+  if (text) div.innerHTML = DOMPurify.sanitize(
+    marked.parse(String(text)), { USE_PROFILES: { html: true } });
+  return div;
+}
+
 async function api(path, method = "GET", body) {
   const r = await fetch("/api" + path, {
     method, headers: body ? { "Content-Type": "application/json" } : {},
@@ -26,8 +48,173 @@ function toast(msg) {
 }
 function setStatus(s) { $("#status").textContent = s; }
 
+// ── Skill sections ──────────────────────────────────────────────────────────
+// One grouping rule for the Skills tab AND the Shells grant list. "Repo skills"
+// are fork-local (origin='repo', derived server-side from the snapshot rule:
+// name not under engine assets/skills) and always lead; engine skills section
+// by their category.
+const SECTION_ORDER = ["repo", "substrate", "craft"];
+const SECTION_LABEL = { repo: "Repo skills", substrate: "Substrate", craft: "Craft", other: "Other" };
+const SECTION_NOTE = {
+  repo: "Authored in this repo — not engine catalogue. Durable via .sc-state/content.sql; see the local_skill_management skill.",
+};
+const sectionOf = (s) => (s.origin === "repo" ? "repo" : (s.category || "other"));
+const sectionLabel = (k) => SECTION_LABEL[k] || k.charAt(0).toUpperCase() + k.slice(1);
+
+function groupSkills(skills, { alwaysRepo = false } = {}) {
+  const by = {};
+  if (alwaysRepo) by.repo = [];   // surface the section even when empty
+  for (const s of skills) (by[sectionOf(s)] ||= []).push(s);
+  const keys = [
+    ...SECTION_ORDER.filter((k) => k in by),
+    ...Object.keys(by).filter((k) => !SECTION_ORDER.includes(k)).sort(),
+  ];
+  return keys.map((k) => ({ key: k, label: sectionLabel(k), skills: by[k] }));
+}
+
 // ── Shells ──────────────────────────────────────────────────────────────────
+// dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
+// identity sub-header (pill shell picker + role/mandate), then Harness |
+// Skills sub-tabs scoped to the selected shell. Flat panels, accordions,
+// popover pickers, and a unified edit modal.
 let selectedShell = null;
+let shellTab = "harness";     // 'harness' | 'skills'
+let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+
+// Rough token estimator — BPE-ish, ~15% off for English; the tilde in the
+// readout makes the approximation explicit. No bundled tokenizer.
+const approxTokens = (s) => Math.ceil((s || "").length / 4);
+const fmt = (n) => n.toLocaleString();
+const microlabel = (text) => el("span", { className: "microlabel" }, text);
+
+function statRow(pairs) {
+  const r = el("div", { className: "stat-row" });
+  for (const [k, v] of pairs) r.append(el("span", { className: "stat" }, k + " ", el("b", {}, v)));
+  return r;
+}
+
+// On/off switch — a styled checkbox; onChange gets (next, input) so a failed
+// write can flip the control back.
+function toggleSwitch(checked, onChange) {
+  const cb = el("input", { type: "checkbox", checked });
+  cb.onchange = () => onChange(cb.checked, cb);
+  return el("label", { className: "switch" }, cb, el("span", { className: "slider" }));
+}
+
+// Vanilla port of dos-arch's GlassDropdown: pill trigger + solid-grey popover.
+// One document-level mousedown handler (registered at boot) closes any open
+// .gmenu the click landed outside of.
+function glassDropdown({ items, value, onChange }) {
+  const wrap = el("div", { className: "gdrop" });
+  const cur = items.find((i) => i.value === value);
+  const btn = el("button", { className: "gdrop-btn", type: "button" });
+  btn.append(el("span", { className: "gdrop-label" }, cur ? cur.label : "—"),
+    el("span", { className: "gdrop-caret" }, "⇅"));
+  // gmenu-fit: the menu matches the trigger's width (long labels ellipsize)
+  const menu = el("div", { className: "gmenu gmenu-fit", hidden: true });
+  for (const it of items) {
+    const row = el("button", { className: "gmenu-row" + (it.value === value ? " active-row" : ""), type: "button" });
+    row.append(el("span", { className: "gmenu-name" }, it.label));
+    if (it.caption) row.append(el("span", { className: "gmenu-cap" }, it.caption));
+    row.onclick = () => { menu.hidden = true; onChange(it.value); };
+    menu.append(row);
+  }
+  btn.onclick = () => { menu.hidden = !menu.hidden; };
+  wrap.append(btn, menu);
+  return wrap;
+}
+
+// Modal base (dos-arch dialog): overlay click or Esc closes; header carries
+// the title + an optional readout; footer nodes sit space-between. Returns
+// the close function.
+function openModal({ title, headExtra, bodyNode, footNodes, width = 650, height = 700 }) {
+  const overlay = el("div", { className: "modal-overlay" });
+  const close = () => overlay.remove();
+  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
+  const dlg = el("div", { className: "modal" });
+  dlg.style.width = width + "px";
+  dlg.style.height = height + "px";
+  const head = el("div", { className: "modal-head" }, el("div", { className: "modal-title" }, title));
+  if (headExtra) head.append(headExtra);
+  dlg.append(head, el("div", { className: "modal-body" }, bodyNode));
+  if (footNodes?.length) dlg.append(el("div", { className: "modal-foot" }, ...footNodes));
+  overlay.append(dlg);
+  document.body.append(overlay);
+  return close;
+}
+
+// Unified edit modal — 650×700, Save bottom-LEFT / Cancel bottom-RIGHT,
+// live ~tokens / chars readout in the header.
+function openEditModal({ title, value, onSave }) {
+  const counter = el("div", { className: "modal-count" });
+  const ta = el("textarea", { value: value || "" });
+  const upd = () => { counter.textContent = `~${fmt(approxTokens(ta.value))} tokens / ${fmt(ta.value.length)} chars`; };
+  ta.oninput = upd; upd();
+  const save = el("button", { className: "act primary", type: "button", textContent: "Save" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const close = openModal({ title, headExtra: counter, bodyNode: ta, footNodes: [save, cancel] });
+  save.onclick = async () => {
+    save.disabled = true; save.textContent = "Saving…";
+    try { await onSave(ta.value); close(); }
+    catch (e) { toast("error: " + e.message); save.disabled = false; save.textContent = "Save"; }
+  };
+  cancel.onclick = close;
+  ta.focus();
+}
+
+// Read-only skill-content viewer — 800×650, rendered markdown with a raw
+// toggle bottom-left, char/~token readout in the header.
+async function openSkillContentModal(skill) {
+  try {
+    const full = await api("/skills/" + skill.skill_id);
+    const counter = el("div", { className: "modal-count" },
+      `~${fmt(approxTokens(full.content || ""))} tokens / ${fmt((full.content || "").length)} chars`);
+    const body = el("div", { className: "modal-md" });
+    const rendered = mdBlock(full.content || "(no content)");
+    const raw = el("pre", { className: "raw-pre", hidden: true }, full.content || "");
+    body.append(rendered, raw);
+    const rawBtn = el("button", { className: "act", type: "button", textContent: "raw" });
+    rawBtn.onclick = () => {
+      raw.hidden = !raw.hidden;
+      rendered.hidden = !raw.hidden;
+      rawBtn.textContent = raw.hidden ? "raw" : "rendered";
+    };
+    const closeBtn = el("button", { className: "act", type: "button", textContent: "Close" });
+    const close = openModal({
+      title: skill.name, headExtra: counter, bodyNode: body,
+      footNodes: [rawBtn, closeBtn],
+      width: 800, height: 650,
+    });
+    closeBtn.onclick = close;
+  } catch (e) { toast("error: " + e.message); }
+}
+
+// New-shell form in a 600×300 modal — Create bottom-left, Cancel bottom-right,
+// same dialog pattern as the new-flag modal.
+function openNewShellModal(templates, root) {
+  const fl = el("select", {});
+  for (const t of templates)
+    fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
+  const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
+  const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const form = el("div", { className: "modal-form" },
+    el("span", { className: "k" }, "flavor"), fl,
+    el("span", { className: "k" }, "name"), nm);
+  const close = openModal({ title: "New shell", bodyNode: form,
+    footNodes: [create, cancel], width: 600, height: 300 });
+  create.onclick = async () => {
+    if (!nm.value.trim()) return toast("name required");
+    create.disabled = true; create.textContent = "Creating…";
+    try {
+      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
+      selectedShell = r.shell_id; activeSkillId = null;
+      close(); setStatus(`shell created — ${r.shortname}`); renderShells(root);
+    } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
+  };
+  cancel.onclick = close;
+  nm.focus();
+}
 
 async function renderShells(root) {
   const { shells } = await api("/shells");
@@ -36,91 +223,248 @@ async function renderShells(root) {
   if (!shells.length) { root.append(el("div", { className: "card muted" }, "No shells.")); return; }
   if (selectedShell == null || !shells.find((s) => s.shell_id === selectedShell))
     selectedShell = shells[0].shell_id;
+  const s = await api("/shells/" + selectedShell);
 
-  // switcher + new-shell
-  const bar = el("div", { className: "card shellbar" });
-  const sel = el("select", {});
-  for (const s of shells)
-    sel.append(el("option", { value: s.shell_id, selected: s.shell_id === selectedShell,
-      textContent: s.flavor ? `${s.display_name} (${s.flavor})` : `${s.display_name} — ${s.role || ""}` }));
-  sel.onchange = () => { selectedShell = Number(sel.value); renderShells(root); };
-  const newBtn = el("button", { className: "act", textContent: "＋ New shell" });
+  // sticky identity sub-header
+  const sub = el("div", { className: "subbar" });
+  const idy = el("div", { className: "subbar-id" });
+  idy.append(glassDropdown({
+    items: shells.map((x) => ({
+      value: x.shell_id, label: x.display_name,
+      caption: x.shortname ? "/" + x.shortname : (x.flavor || ""),
+    })),
+    value: selectedShell,
+    onChange: (v) => { selectedShell = Number(v); activeSkillId = null; renderShells(root); },
+  }));
+  if (s.role) idy.append(el("div", { className: "kv" }, microlabel("Role"), el("span", {}, s.role)));
+  if (s.mandate) idy.append(el("div", { className: "kv" }, microlabel("Mandate"), el("span", {}, s.mandate)));
+  sub.append(idy);
 
-  const form = el("div", { className: "newshell", hidden: true });
-  const fl = el("select", {});
-  for (const t of templates)
-    fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
-  const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
-  const create = el("button", { className: "act primary", textContent: "create" });
-  create.onclick = async () => {
-    if (!nm.value.trim()) return toast("name required");
-    try {
-      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
-      selectedShell = r.shell_id; setStatus(`shell created — ${r.shortname}`); renderShells(root);
-    } catch (e) { toast("error: " + e.message); }
-  };
-  newBtn.onclick = () => { form.hidden = !form.hidden; if (!form.hidden) nm.focus(); };
-  form.append(el("label", { className: "k" }, "flavor"), fl,
-    el("label", { className: "k" }, "name"), nm, create);
-  bar.append(el("span", { className: "k", textContent: "shell" }), sel, newBtn, form);
-  root.append(bar);
+  // new shell — modal trigger
+  const newBtn = el("button", { className: "act", type: "button", textContent: "＋ New shell" });
+  newBtn.onclick = () => openNewShellModal(templates, root);
+  sub.append(newBtn);
+  root.append(sub);
 
-  // selected shell detail (skill grant toggles here are the per-shell assignment)
-  root.append(shellCard(await api("/shells/" + selectedShell)));
+  // sub-tabs — Harness / Skills, both scoped to the selected shell
+  const tabs = el("div", { className: "vtabs" });
+  for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"]]) {
+    const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
+    b.onclick = () => { shellTab = key; renderShells(root); };
+    tabs.append(b);
+  }
+  root.append(tabs);
+
+  const pane = el("div", { className: "shell-pane" });
+  root.append(pane);
+  if (shellTab === "harness") renderHarness(pane, s);
+  else renderSkillViewer(pane, s);
 }
 
-function field(label, value, key, sid) {
-  const ta = el("textarea", { value: value || "", rows: key === "current_state" ? 12 : 2 });
-  const save = el("button", { className: "act", textContent: "save" });
-  save.onclick = async () => {
-    try { await api("/shells/" + sid, "PATCH", { [key]: ta.value }); setStatus("saved " + key); }
-    catch (e) { toast("error: " + e.message); }
-  };
-  return el("div", {}, el("label", { className: "k", textContent: label }), ta, save);
+// Harness — the shell's surfaces as grouped accordions: Operational
+// (current_state is the one editable field — the API exposes nothing else),
+// then the law-curated identity (read-only by design, Laws 2–4 / 7), then the
+// record. Char/token readout spans everything below it.
+function renderHarness(root, s) {
+  const groups = [{ title: "Operational", items: [
+    { label: "CURRENT STATE", text: s.current_state || "", editable: true },
+    ...(s.system_prompt ? [{ label: "SYSTEM PROMPT", text: s.system_prompt }] : []),
+  ] }];
+
+  const idy = [];
+  if (s.seed?.length) idy.push({
+    label: `SEED (${s.seed.length})`,
+    text: s.seed.map((e) => e.body).join("\n"),
+    node: entryList(s.seed.map((e) => ({ d: e.entry_date, body: e.body }))),
+  });
+  if (s.lns?.length) idy.push({
+    label: `LESSONS & STANCES (${s.lns.length})`,
+    text: s.lns.map((e) => e.body).join("\n"),
+    node: entryList(s.lns.map((e) => ({ body: e.body }))),
+  });
+  if (s.lineage_seed) idy.push({ label: "LINEAGE SEED", text: s.lineage_seed });
+  if (idy.length) groups.push({ title: "Identity — law-curated, read-only", items: idy });
+
+  if (s.decisions?.length) groups.push({ title: "Record", items: [{
+    label: `RECENT DECISIONS (${s.decisions.length})`,
+    text: s.decisions.map((e) => e.decision).join("\n"),
+    node: entryList(s.decisions.map((e) => ({
+      d: `${e.decision_date || ""} ${e.priority || ""}`.trim(), body: e.decision }))),
+  }] });
+
+  const all = groups.flatMap((g) => g.items);
+  root.append(
+    el("div", { className: "viewer-head" }, microlabel("Harness")),
+    statRow([["Char Count", fmt(all.reduce((n, x) => n + x.text.length, 0))],
+             ["Est. Tokens", "~" + fmt(approxTokens(all.map((x) => x.text).join("")))]]));
+
+  const panel = el("div", { className: "vpanel acc-panel" });
+  for (const g of groups) {
+    panel.append(el("div", { className: "acc-group" }, g.title));
+    for (const sec of g.items) panel.append(accordion(sec, s));
+  }
+  root.append(panel);
 }
 
-function shellCard(s) {
-  const c = el("div", { className: "card" });
-  c.append(el("h2", {}, `${s.display_name} `, el("span", { className: "muted", textContent: "/" + (s.shortname || "") })));
-  c.append(el("div", { className: "muted" }, `${s.role || ""} — ${s.mandate || ""}`));
+function entryList(entries) {
+  const box = el("div", {});
+  for (const e of entries) box.append(el("div", { className: "seed-entry" },
+    ...(e.d ? [el("div", { className: "d", textContent: e.d })] : []),
+    mdBlock(e.body)));
+  return box;
+}
 
-  // editable operational fields
-  c.append(field("current_state", s.current_state, "current_state", s.shell_id));
+function accordion(sec, s) {
+  const d = el("details", { className: "acc" });
+  d.append(el("summary", {}, el("span", { className: "acc-label" }, sec.label)));
+  const body = el("div", { className: "acc-body" });
+  if (sec.editable) {
+    const pen = el("button", { className: "pencil", type: "button", title: "Edit current_state", textContent: "✎" });
+    pen.onclick = () => openEditModal({
+      title: "current_state — " + s.display_name,
+      value: s.current_state,
+      onSave: async (v) => {
+        await api("/shells/" + s.shell_id, "PATCH", { current_state: v });
+        setStatus("saved current_state"); load("shells");
+      },
+    });
+    body.append(pen);
+  }
+  body.append(sec.node || (sec.text ? mdBlock(sec.text) : el("div", { className: "acc-text" }, "—")));
+  d.append(body);
+  return d;
+}
 
-  // skills + grants (editable)
-  const sk = el("div", {});
-  sk.append(el("label", { className: "k", textContent: "skills + grants" }));
-  for (const k of s.skills) {
-    const cb = el("input", { type: "checkbox", checked: !!k.granted });
-    cb.onchange = async () => {
-      try { await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: cb.checked }); setStatus("grant updated"); }
-      catch (e) { toast("error: " + e.message); cb.checked = !cb.checked; }
+// Skill Viewer — popover picker with inline grant toggles (☑/☐ — toggling
+// does not change the selection), then the selected skill's full content in a
+// panel with a char/token readout. Content lazy-loads per selection.
+function renderSkillViewer(root, s) {
+  const skills = s.skills;
+  if (!skills.length) { root.append(el("div", { className: "muted" }, "No skills in the catalogue.")); return; }
+  if (activeSkillId == null || !skills.find((k) => k.skill_id === activeSkillId))
+    activeSkillId = (skills.find((k) => k.granted) || skills[0]).skill_id;
+  const active = skills.find((k) => k.skill_id === activeSkillId);
+
+  const wrap = el("div", { className: "gdrop" });
+  const btn = el("button", { className: "gdrop-btn", type: "button" });
+  btn.append(el("span", { className: "gdrop-label mono" }, active.name),
+    el("span", { className: "gdrop-caret" }, "⇅"));
+  const menu = el("div", { className: "gmenu", hidden: true });
+  for (const k of skills) {
+    const row = el("div", { className: "gmenu-item" + (k.skill_id === activeSkillId ? " active-row" : "") });
+    const tog = el("button", { className: "gmenu-check", type: "button",
+      title: k.granted ? "Revoke" : "Grant", textContent: k.granted ? "☑" : "☐" });
+    tog.onclick = async () => {
+      try {
+        await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: !k.granted });
+        k.granted = k.granted ? 0 : 1;
+        tog.textContent = k.granted ? "☑" : "☐";
+        tog.title = k.granted ? "Revoke" : "Grant";
+        setStatus("grant updated");
+      } catch (e) { toast("error: " + e.message); }
     };
-    sk.append(el("div", { className: "list-skill" }, cb, el("b", {}, k.name),
-      el("span", { className: "muted", textContent: " — " + (k.description || "").split("\n")[0] })));
+    const sel = el("button", { className: "gmenu-name mono", type: "button", textContent: k.name });
+    sel.onclick = () => {
+      activeSkillId = k.skill_id; menu.hidden = true;
+      root.replaceChildren(); renderSkillViewer(root, s);
+    };
+    row.append(tog, sel, el("span", { className: "gmenu-cap" }, sectionLabel(sectionOf(k))));
+    menu.append(row);
   }
-  c.append(sk);
+  btn.onclick = () => { menu.hidden = !menu.hidden; };
+  wrap.append(btn, menu);
 
-  // seed + L&S — READ ONLY (no edit endpoint exists; law-curated)
-  if (s.seed?.length) {
-    const box = el("div", { className: "locked" });
-    box.append(el("label", { className: "k", textContent: "seed (read-only — shell-curated, Laws 2–4)" }));
-    for (const e of s.seed) box.append(el("div", { className: "seed-entry" },
-      el("div", { className: "d", textContent: e.entry_date }), el("div", {}, e.body)));
-    c.append(box);
+  // rendered markdown by default; the right-aligned toggle shows raw text
+  const rawBtn = el("button", { className: "rawtoggle", type: "button",
+    title: "Toggle raw markdown", textContent: "raw", hidden: true });
+  root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
+  const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
+  const panel = el("div", { className: "vpanel viewer-panel" });
+  root.append(stats, panel);
+
+  api("/skills/" + activeSkillId).then((full) => {
+    stats.replaceWith(statRow([
+      ["Char Count", fmt((full.content || "").length)],
+      ["Est. Tokens", "~" + fmt(approxTokens(full.content || ""))]]));
+    if (full.description) panel.append(el("div", { className: "muted desc-line" }, full.description));
+    const rendered = mdBlock(full.content || "(no content)");
+    const raw = el("pre", { className: "raw-pre", hidden: true }, full.content || "");
+    panel.append(rendered, raw);
+    rawBtn.hidden = false;
+    rawBtn.onclick = () => {
+      raw.hidden = !raw.hidden;
+      rendered.hidden = !raw.hidden;
+      rawBtn.textContent = raw.hidden ? "raw" : "rendered";
+    };
+  }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
+}
+
+// ── Skills (catalogue, sectioned) ────────────────────────────────────────────
+async function renderSkills(root) {
+  const { skills, shells } = await api("/skills");
+  root.replaceChildren();
+  root.append(el("div", { className: "muted" },
+    "The skills catalogue, sectioned. Engine skills ship with super-coder and group by category; repo skills are authored in this fork. Grants are editable here and on each shell."));
+  for (const sec of groupSkills(skills, { alwaysRepo: true })) {
+    const wrap = el("div", { className: "bucket" });
+    const h = el("h2", {}, `${sec.label} `, el("span", { className: "count" }, String(sec.skills.length)));
+    wrap.append(h);
+    if (SECTION_NOTE[sec.key]) wrap.append(el("div", { className: "muted note" }, SECTION_NOTE[sec.key]));
+    if (!sec.skills.length) {
+      wrap.append(el("div", { className: "card muted" },
+        "No repo skills yet — author one with the local_skill_management skill (file → seed → grant → snapshot)."));
+      root.append(wrap);
+      continue;
+    }
+    const card = el("div", { className: "card skills" });
+    for (const s of sec.skills) card.append(skillRow(s, shells));
+    wrap.append(card);
+    root.append(wrap);
   }
-  if (s.lns?.length) {
-    const box = el("div", { className: "locked" });
-    box.append(el("label", { className: "k", textContent: "lessons & stances (read-only — Law 7)" }));
-    for (const e of s.lns) box.append(el("div", { className: "lns-entry" }, e.body));
-    c.append(box);
+}
+
+function skillRow(s, shells) {
+  const row = el("details", { className: "skill" });
+  // collapsed row stays quiet: mono name + truncated description, no badges —
+  // origin/section is the group header, grants live in the expanded body
+  const head = el("summary", { className: "skill-head" });
+  head.append(
+    el("b", { className: "skill-name mono" }, s.name),
+    el("span", { className: "muted desc", textContent: (s.description || "").split("\n")[0] }));
+  row.append(head);
+
+  const body = el("div", { className: "skill-body" });
+  if (s.command) body.append(el("div", { className: "tag" }, "command: ", el("code", {}, s.command)));
+
+  // grants — every available shell as a row with an on/off toggle; same PUT
+  // the Shells tab uses, managed from the skill's side here
+  const gr = el("div", { className: "grants" });
+  gr.append(el("label", { className: "k", textContent: "granted to" }));
+  const list = el("div", { className: "grant-list" });
+  for (const sh of shells) {
+    const sw = toggleSwitch(s.granted_shells.includes(sh.shell_id), async (next, cb) => {
+      try {
+        await api(`/shells/${sh.shell_id}/skills/${s.skill_id}`, "PUT", { granted: next });
+        setStatus("grant updated");
+        const i = s.granted_shells.indexOf(sh.shell_id);
+        if (next && i < 0) s.granted_shells.push(sh.shell_id);
+        if (!next && i >= 0) s.granted_shells.splice(i, 1);
+      } catch (e) { toast("error: " + e.message); cb.checked = !next; }
+    });
+    list.append(el("div", { className: "grant-row" },
+      sw,
+      el("span", { className: "grant-name" }, sh.display_name,
+        el("span", { className: "muted", textContent: sh.shortname ? " /" + sh.shortname : "" }))));
   }
-  if (s.lineage_seed) {
-    const d = el("details", {}, el("summary", {}, "lineage seed (read-only)"));
-    d.append(el("div", { className: "locked seed-entry" }, s.lineage_seed));
-    c.append(d);
-  }
-  return c;
+  gr.append(list);
+  body.append(gr);
+
+  // full procedure body opens in the viewer modal (800×650)
+  const view = el("button", { className: "act", textContent: "view content" });
+  view.onclick = () => openSkillContentModal(s);
+  body.append(view);
+  row.append(body);
+  return row;
 }
 
 // ── Roadmap ───────────────────────────────────────────────────────────────────
@@ -134,8 +478,8 @@ async function renderRoadmap(root) {
   const { buckets } = await api("/roadmap");
   root.replaceChildren();
 
-  // segmented single-select toggle; re-click the active one to clear → show all
-  const bar = el("div", { className: "filters seg" });
+  // separated pill filters, centered; re-click the active one to clear → show all
+  const bar = el("div", { className: "filters centered" });
   for (const s of STATUSES) {
     const chip = el("button", { className: "chip" + (roadmapFilter === s ? " on" : ""), textContent: SLABEL[s] });
     chip.onclick = () => {
@@ -291,43 +635,51 @@ async function renderDocs(root) {
 // ── Flags ──────────────────────────────────────────────────────────────────────
 let flagFilter = "open";   // open | resolved | all — persists across re-renders
 
-async function renderFlags(root) {
-  const { flags, features } = await api("/flags");
-  root.replaceChildren();
-
-  // create
-  const card = el("div", { className: "card" });
-  card.append(el("h2", {}, "New flag"));
+// New-flag form in a 600×400 modal — Create bottom-left, Cancel bottom-right.
+function openNewFlagModal(features) {
   const name = el("input", { type: "text", placeholder: "display name (e.g. SC-001)" });
-  const desc = el("input", { type: "text", placeholder: "[Area] description | Blocker for: …" });
+  const desc = el("textarea", { rows: 4, placeholder: "[Area] description | Blocker for: …" });
   const feat = el("select", {});
   feat.append(el("option", { value: "", textContent: "— no feature —" }));
   for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: f.title }));
   const prio = el("select", {});
   for (const p of ["High", "Medium", "Low"]) prio.append(el("option", { value: p, selected: p === "Medium", textContent: p }));
-  const create = el("button", { className: "act primary", textContent: "create flag" });
-  create.onclick = async () => {
-    if (!desc.value) return toast("description required");
-    try {
-      await api("/flags", "POST", { display_name: name.value || null, description: desc.value, feature_id: feat.value || null, priority: prio.value });
-      setStatus("flag created"); load("flags");
-    } catch (e) { toast("error: " + e.message); }
-  };
-  card.append(el("div", { className: "grid2" },
+  const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "name"), name,
     el("span", { className: "k" }, "description"), desc,
     el("span", { className: "k" }, "feature"), feat,
-    el("span", { className: "k" }, "priority"), prio), create);
-  root.append(card);
+    el("span", { className: "k" }, "priority"), prio);
+  const close = openModal({ title: "New flag", bodyNode: form,
+    footNodes: [create, cancel], width: 600, height: 400 });
+  create.onclick = async () => {
+    if (!desc.value) return toast("description required");
+    create.disabled = true; create.textContent = "Creating…";
+    try {
+      await api("/flags", "POST", { display_name: name.value || null, description: desc.value,
+        feature_id: feat.value || null, priority: prio.value });
+      close(); setStatus("flag created"); load("flags");
+    } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
+  };
+  cancel.onclick = close;
+  desc.focus();
+}
 
-  // open | resolved | all toggle (segmented, single-select)
+async function renderFlags(root) {
+  const { flags, features } = await api("/flags");
+  root.replaceChildren();
+
+  // open | resolved | all toggle (segmented) + the new-flag modal trigger
   const bar = el("div", { className: "filters seg" });
   for (const [key, label] of [["open", "Open"], ["resolved", "Resolved"], ["all", "All"]]) {
     const chip = el("button", { className: "chip" + (flagFilter === key ? " on" : ""), textContent: label });
     chip.onclick = () => { flagFilter = key; renderFlags(root); };
     bar.append(chip);
   }
-  root.append(bar);
+  const newBtn = el("button", { className: "act newflag", type: "button", textContent: "＋ New flag" });
+  newBtn.onclick = () => openNewFlagModal(features);
+  root.append(el("div", { className: "flagbar" }, bar, newBtn));
 
   // grouped by feature, filtered by the toggle
   const shown = flags.filter((f) =>
@@ -472,6 +824,7 @@ async function renderMap(root) {
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
+  skills: ["#view-skills", renderSkills],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
@@ -496,6 +849,18 @@ function routeFromHash() {
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
 window.addEventListener("hashchange", routeFromHash);
+// Close any open popover menu on an outside click (one handler for all .gmenu).
+document.addEventListener("mousedown", (e) => {
+  for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
+    if (!m.parentElement.contains(e.target)) m.hidden = true;
+});
+// Esc dismisses the topmost modal.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const overlays = document.querySelectorAll(".modal-overlay");
+    overlays[overlays.length - 1]?.remove();
+  }
+});
 $("#snapshot").onclick = async () => {
   setStatus("snapshotting…");
   try { const r = await api("/snapshot", "POST"); toast(r.output || "done"); setStatus("snapshot done"); }

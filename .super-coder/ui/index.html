@@ -11,9 +11,12 @@
     <h1>super-coder<span id="repo"></span></h1>
     <nav>
       <button data-tab="shells" class="active">Shells</button>
+      <button data-tab="skills">Skills</button>
+      <span class="navsep"></span>
       <button data-tab="roadmap">Roadmap</button>
       <button data-tab="docs">Docs</button>
       <button data-tab="flags">Flags</button>
+      <span class="navsep"></span>
       <button data-tab="map">Map</button>
       <button data-tab="scripts">Scripts</button>
     </nav>
@@ -25,12 +28,15 @@
   </header>
   <main>
     <section id="view-shells" class="view"></section>
+    <section id="view-skills" class="view" hidden></section>
     <section id="view-roadmap" class="view" hidden></section>
     <section id="view-docs" class="view" hidden></section>
     <section id="view-flags" class="view" hidden></section>
     <section id="view-map" class="view" hidden></section>
     <section id="view-scripts" class="view" hidden></section>
   </main>
+  <script src="/vendor/marked.umd.js"></script>
+  <script src="/vendor/purify.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

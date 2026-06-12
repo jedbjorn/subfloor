@@ -31,7 +31,7 @@ The correct path: **file → seed → grant → snapshot → commit**.
    ```yaml
    ---
    name: skill_name
-   description: One-line summary — shown in boot and catalogue
+   description: One-line summary — shown in boot, catalogue, and the GUI Skills tab
    category: substrate   # or craft; omit for default
    ---
    ```
@@ -99,6 +99,30 @@ Then `./sc snapshot && ./sc render` and commit.
    `.super-coder/assets/skills/`, remove it too so `./sc seed-skills` doesn't
    re-insert it.
 
+## How the GUI organizes skills
+
+The review GUI has a **Skills tab**: the full catalogue in sections, with
+per-shell grant toggles on every skill. The Shells tab groups its grant list
+by the same sections.
+
+- **Repo skills** — the lead section: skills authored in this fork. Membership
+  is *derived*, not declared — a skill whose name has no
+  `.super-coder/assets/skills/<name>/SKILL.md` is repo-local. This is the same
+  rule snapshot.py uses to decide what serializes into `.sc-state/content.sql`,
+  so the section shows exactly what the snapshot keeps durable. No frontmatter
+  flag exists or is needed.
+- **Substrate / Craft / …** — engine skills, sectioned by their `category`
+  frontmatter. A repo skill's `category` still displays as a label on its row,
+  but never moves it out of the Repo section.
+- One transient caveat: while a repo skill's asset file still sits under
+  `assets/skills/` (between authoring and the next `./sc update` materialize),
+  the derivation reads it as engine — it appears under its category section
+  until the update wipes the asset. Harmless; the DB row is the durable thing.
+
+Grant toggles in the GUI hit the same DB table as the SQL in this skill —
+they still need a **snapshot** (header button or `./sc snapshot`) to survive
+a rebuild.
+
 ## What NOT to do
 
 - **Never skip the snapshot after creating a skill.** The asset file under
@@ -106,5 +130,6 @@ Then `./sc snapshot && ./sc render` and commit.
   without snapshotting, the skill vanishes on the next engine update.
 - **Never edit `0001_seed_skills.sql` by hand.** It is generated; hand edits
   are overwritten on the next `./sc seed-skills`.
-- **Never use the GUI to create skills.** The GUI writes only to the DB — it
-  cannot write the asset file or trigger a snapshot. Use this procedure instead.
+- **Never use the GUI to create skills.** Toggling grants in the GUI is fine
+  (snapshot after); creating is not — the GUI writes only to the DB and cannot
+  write the asset file or seed it. Use this procedure instead.

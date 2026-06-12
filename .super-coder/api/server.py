@@ -41,12 +41,17 @@ UI_DIR = ENGINE / "ui"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
+import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
+    # vendored markdown pipeline (marked MIT, DOMPurify MPL-2.0/Apache-2.0) —
+    # local copies so the no-build UI renders sanitized GFM without a CDN.
+    "/vendor/marked.umd.js": ("vendor/marked.umd.js", "application/javascript; charset=utf-8"),
+    "/vendor/purify.min.js": ("vendor/purify.min.js", "application/javascript; charset=utf-8"),
 }
 
 # md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`
@@ -112,14 +117,47 @@ def get_shell(con, sid: int) -> dict | None:
         "WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL "
         "ORDER BY entry_date, entry_id", (sid,)))
     shell["skills"] = rows(con.execute(
-        "SELECT s.skill_id, s.name, s.description, "
+        "SELECT s.skill_id, s.name, s.description, s.category, "
         "(SELECT 1 FROM shell_skills ss WHERE ss.shell_id=? AND ss.skill_id=s.skill_id) "
         "AS granted FROM skills s WHERE s.is_deleted=0 ORDER BY s.name", (sid,)))
+    tag_origin(shell["skills"])
     shell["decisions"] = rows(con.execute(
         "SELECT decision_id, decision_date, priority, decision FROM shell_decisions "
         "WHERE shell_id=? AND COALESCE(is_deleted,0)=0 ORDER BY decision_id DESC "
         "LIMIT 25", (sid,)))
     return shell
+
+
+def tag_origin(skills: list[dict]) -> list[dict]:
+    """Annotate skill rows with origin: 'engine' | 'repo'.
+
+    Same rule snapshot.py uses to decide what serializes into content.sql —
+    a name under assets/skills/ is engine catalogue; anything else is a
+    repo-local skill. One rule, two consumers: the UI's "Repo skills" section
+    shows exactly what the snapshot will keep durable."""
+    engine = set(snapshot_mod.engine_skill_names())
+    for s in skills:
+        s["origin"] = "engine" if s["name"] in engine else "repo"
+    return skills
+
+
+def get_skills(con) -> dict:
+    """The full skills catalogue + per-skill grants, for the Skills tab.
+    Grouping into sections (repo / category) happens client-side, like
+    flags/docs."""
+    skills = rows(con.execute(
+        "SELECT skill_id, name, description, category, command, common "
+        "FROM skills WHERE is_deleted=0 ORDER BY name"))
+    tag_origin(skills)
+    grants: dict[int, list] = {}
+    for g in rows(con.execute(
+            "SELECT ss.skill_id, ss.shell_id FROM shell_skills ss "
+            "JOIN shells sh ON sh.shell_id=ss.shell_id "
+            "WHERE COALESCE(sh.is_deleted,0)=0 ORDER BY ss.shell_id")):
+        grants.setdefault(g["skill_id"], []).append(g["shell_id"])
+    for s in skills:
+        s["granted_shells"] = grants.get(s["skill_id"], [])
+    return {"skills": skills, "shells": get_shells(con)}
 
 
 # Funnel order: idea inlet → most-active committed work → done (shipped) →
@@ -518,6 +556,17 @@ class Handler(BaseHTTPRequestHandler):
                 shell = get_shell(con, sid)
                 return self._send(200 if shell else 404,
                                   shell or {"error": "no such shell"})
+            if path == "/api/skills":
+                return self._send(200, get_skills(con))
+            if path.startswith("/api/skills/"):
+                kid = int(path.rsplit("/", 1)[1])
+                r = con.execute(
+                    "SELECT skill_id, name, description, category, command, "
+                    "common, content FROM skills WHERE skill_id=? AND is_deleted=0",
+                    (kid,)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such skill"})
+                return self._send(200, tag_origin([dict(r)])[0])
             if path == "/api/roadmap":
                 return self._send(200, get_roadmap(con))
             if path == "/api/docs":

@@ -66,8 +66,15 @@ def seed(con: sqlite3.Connection) -> dict:
         "INSERT INTO flags (display_name, description, resolved, is_deleted, "
         "feature_id, shell_id) VALUES ('CC-001', 'blocker', 0, 0, ?, ?)",
         (fid, sid))
+    # A repo-local skill (name not under assets/skills/) + a grant, so the
+    # Skills-tab assembler exercises both origins and the grant aggregation.
+    kid = con.execute(
+        "INSERT INTO skills (name, description, category, common, is_deleted) "
+        "VALUES ('local_only_skill', 'fixture repo skill', 'craft', 0, 0)").lastrowid
+    con.execute("INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+                (sid, kid))
     con.commit()
-    return {"shell_id": sid, "feature_id": fid}
+    return {"shell_id": sid, "feature_id": fid, "skill_id": kid}
 
 
 class AssemblerSmokeTest(unittest.TestCase):
@@ -110,6 +117,21 @@ class AssemblerSmokeTest(unittest.TestCase):
         self.assertTrue(out["flags"])
         self.assertTrue(any(f["feature_title"] == "Feature A"
                             for f in out["flags"]))
+
+    def test_get_skills_origin_and_grants(self) -> None:
+        out = server.get_skills(self.con)
+        self.assertTrue(out["shells"])
+        by_name = {s["name"]: s for s in out["skills"]}
+        # the fixture skill has no assets/skills/ dir → repo origin, granted once
+        fixture = by_name["local_only_skill"]
+        self.assertEqual(fixture["origin"], "repo")
+        self.assertEqual(fixture["granted_shells"], [self.ids["shell_id"]])
+        # an engine-seeded skill derives as engine
+        self.assertEqual(by_name["db_map"]["origin"], "engine")
+
+    def test_get_shell_skills_carry_origin(self) -> None:
+        out = server.get_shell(self.con, self.ids["shell_id"])
+        self.assertTrue(all("origin" in k and "category" in k for k in out["skills"]))
 
     def test_get_map_empty_catalogue(self) -> None:
         # dr_* catalogue is empty in a fresh DB — must not crash.
