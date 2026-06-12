@@ -19,12 +19,14 @@ body {
   margin: 0; background: var(--bg); color: var(--ink);
   font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
-/* thin scrollbars — global, not opt-in */
-html { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.10) transparent; }
+/* thin scrollbars — on EVERY scrollable element, never the browser default.
+   The `*` selector (not html) catches textareas/pres/popovers that don't
+   inherit the Firefox scrollbar-* props from the root. */
+* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.12) transparent; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,.10); border-radius: 999px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.22); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.24); }
 :focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(255,255,255,.25); }
 input:focus-visible, textarea:focus-visible, select:focus-visible { box-shadow: none; }
 header {
@@ -57,7 +59,7 @@ nav button.active::after {
 #snapshot:hover { border-color: var(--accent); }
 main { padding: 1.2rem; }
 /* One shared content width for every page — no per-tab jumps. */
-.view { display: grid; gap: 1rem; margin: 0 auto; width: 100%; max-width: 1140px; }
+.view { display: grid; gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
 
 .card {
@@ -293,7 +295,7 @@ button.gmenu-name:hover { color: #fff; }
   box-shadow: inset 2px 0 0 0 var(--accent); color: #fff;
 }
 
-/* unified edit modal — 650×700, Save bottom-left / Cancel bottom-right */
+/* modal dialogs — size set inline per use (edit 650×700, viewer 800×650) */
 .modal-overlay {
   position: fixed; inset: 0; z-index: 50; display: flex;
   align-items: center; justify-content: center; background: rgba(0,0,0,.55);
@@ -302,6 +304,12 @@ button.gmenu-name:hover { color: #fff; }
   display: flex; flex-direction: column; width: 650px; height: 700px;
   max-width: 92vw; max-height: 88vh; border-radius: 16px;
   border: 1px solid rgba(255,255,255,.10); background: var(--menu-bg); box-shadow: var(--menu-shadow);
+}
+.modal-pre {
+  flex: 1; min-height: 0; overflow: auto; margin: 0; white-space: pre-wrap;
+  overflow-wrap: break-word; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 8px; padding: .8rem 1rem; font: 12px/1.55 ui-monospace, monospace;
+  color: var(--ink);
 }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.2rem .8rem; border-bottom: 1px solid var(--line); }
 .modal-title { font-size: .9rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

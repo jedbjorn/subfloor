@@ -93,32 +93,59 @@ function glassDropdown({ items, value, onChange }) {
   return wrap;
 }
 
-// Unified edit modal — 650×700 dialog, Save bottom-LEFT / Cancel bottom-RIGHT,
+// Modal base (dos-arch dialog): overlay click or Esc closes; header carries
+// the title + an optional readout; footer nodes sit space-between. Returns
+// the close function.
+function openModal({ title, headExtra, bodyNode, footNodes, width = 650, height = 700 }) {
+  const overlay = el("div", { className: "modal-overlay" });
+  const close = () => overlay.remove();
+  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
+  const dlg = el("div", { className: "modal" });
+  dlg.style.width = width + "px";
+  dlg.style.height = height + "px";
+  const head = el("div", { className: "modal-head" }, el("div", { className: "modal-title" }, title));
+  if (headExtra) head.append(headExtra);
+  dlg.append(head, el("div", { className: "modal-body" }, bodyNode));
+  if (footNodes?.length) dlg.append(el("div", { className: "modal-foot" }, ...footNodes));
+  overlay.append(dlg);
+  document.body.append(overlay);
+  return close;
+}
+
+// Unified edit modal — 650×700, Save bottom-LEFT / Cancel bottom-RIGHT,
 // live ~tokens / chars readout in the header.
 function openEditModal({ title, value, onSave }) {
   const counter = el("div", { className: "modal-count" });
   const ta = el("textarea", { value: value || "" });
   const upd = () => { counter.textContent = `~${fmt(approxTokens(ta.value))} tokens / ${fmt(ta.value.length)} chars`; };
   ta.oninput = upd; upd();
-  const overlay = el("div", { className: "modal-overlay" });
-  const close = () => overlay.remove();
   const save = el("button", { className: "act primary", type: "button", textContent: "Save" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const close = openModal({ title, headExtra: counter, bodyNode: ta, footNodes: [save, cancel] });
   save.onclick = async () => {
     save.disabled = true; save.textContent = "Saving…";
     try { await onSave(ta.value); close(); }
     catch (e) { toast("error: " + e.message); save.disabled = false; save.textContent = "Save"; }
   };
-  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
   cancel.onclick = close;
-  overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
-  const dlg = el("div", { className: "modal" });
-  dlg.append(
-    el("div", { className: "modal-head" }, el("div", { className: "modal-title" }, title), counter),
-    el("div", { className: "modal-body" }, ta),
-    el("div", { className: "modal-foot" }, save, cancel));
-  overlay.append(dlg);
-  document.body.append(overlay);
   ta.focus();
+}
+
+// Read-only skill-content viewer — 800×650, char/~token readout in the header.
+async function openSkillContentModal(skill) {
+  try {
+    const full = await api("/skills/" + skill.skill_id);
+    const counter = el("div", { className: "modal-count" },
+      `~${fmt(approxTokens(full.content || ""))} tokens / ${fmt((full.content || "").length)} chars`);
+    const closeBtn = el("button", { className: "act", type: "button", textContent: "Close" });
+    const close = openModal({
+      title: skill.name, headExtra: counter,
+      bodyNode: el("pre", { className: "modal-pre" }, full.content || "(no content)"),
+      footNodes: [el("span", {}), closeBtn],
+      width: 800, height: 650,
+    });
+    closeBtn.onclick = close;
+  } catch (e) { toast("error: " + e.message); }
 }
 
 async function renderShells(root) {
@@ -361,19 +388,10 @@ function skillRow(s, shells) {
   }
   body.append(gr);
 
-  // full procedure body, lazy-loaded on first expand of the viewer
-  const pre = el("pre", { className: "doc-body", hidden: true });
+  // full procedure body opens in the viewer modal (800×650)
   const view = el("button", { className: "act", textContent: "view content" });
-  view.onclick = async () => {
-    pre.hidden = !pre.hidden;
-    if (!pre.hidden && !pre.dataset.loaded) {
-      try {
-        const full = await api("/skills/" + s.skill_id);
-        pre.textContent = full.content || "(no content)"; pre.dataset.loaded = "1";
-      } catch (e) { pre.textContent = "error: " + e.message; }
-    }
-  };
-  body.append(view, pre);
+  view.onclick = () => openSkillContentModal(s);
+  body.append(view);
   row.append(body);
   return row;
 }
@@ -554,7 +572,7 @@ async function renderFlags(root) {
   const card = el("div", { className: "card" });
   card.append(el("h2", {}, "New flag"));
   const name = el("input", { type: "text", placeholder: "display name (e.g. SC-001)" });
-  const desc = el("input", { type: "text", placeholder: "[Area] description | Blocker for: …" });
+  const desc = el("textarea", { rows: 4, placeholder: "[Area] description | Blocker for: …" });
   const feat = el("select", {});
   feat.append(el("option", { value: "", textContent: "— no feature —" }));
   for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: f.title }));
@@ -756,6 +774,13 @@ window.addEventListener("hashchange", routeFromHash);
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
     if (!m.parentElement.contains(e.target)) m.hidden = true;
+});
+// Esc dismisses the topmost modal.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const overlays = document.querySelectorAll(".modal-overlay");
+    overlays[overlays.length - 1]?.remove();
+  }
 });
 $("#snapshot").onclick = async () => {
   setStatus("snapshotting…");
