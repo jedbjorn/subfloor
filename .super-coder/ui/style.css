@@ -1,30 +1,25 @@
-/* Design language ported from dos-arch shell_core/ui (layout.css + /shells):
-   spatial-glass on a dark gradient canvas — glass panels over hairlines,
-   uppercase micro-labels, mono names, pill controls, solid-grey popovers. */
+/* Layout language ported from dos-arch shell_core/ui (/shells): uppercase
+   micro-labels, mono names, pill controls, popover menus, accordion viewers,
+   accent-underline tabs — on flat grey surfaces, no glass/gradient canvas. */
 :root {
-  --bg: #0a0a14;
-  --app-gradient:
-    radial-gradient(ellipse 80% 60% at 20% 0%,    rgba(99, 102, 241, 0.28), transparent),
-    radial-gradient(ellipse 60% 80% at 100% 100%, rgba(236, 72, 153, 0.20), transparent),
-    radial-gradient(ellipse 50% 50% at 60% 50%,   rgba(56, 189, 248, 0.14), transparent);
-  --panel: rgba(255, 255, 255, 0.03);            /* glass */
-  --panel2: rgba(0, 0, 0, 0.30);                 /* inset wells (inputs, pre) */
-  --line: rgba(255, 255, 255, 0.08);             /* hairline */
-  --line-soft: rgba(255, 255, 255, 0.06);
-  --ink: rgba(255, 255, 255, 0.90); --dim: rgba(255, 255, 255, 0.45);
-  --accent: #6ea8fe; --accent2: rgba(255, 255, 255, 0.06);
-  --ok: #4caf7d; --warn: #d4914a; --lock: rgba(255, 255, 255, 0.30);
-  --menu-bg: rgb(56, 56, 64); --menu-border: rgba(255, 255, 255, 0.12);
+  --bg: #131316;
+  --panel: #1a1a1f;                              /* card / panel surface */
+  --panel2: #101013;                             /* inset wells (inputs, pre) */
+  --line: #2a2a31;
+  --line-soft: #232329;
+  --ink: #e8e8ec; --dim: #9a9aa5;
+  --accent: #6ea8fe; --accent2: #26262e;
+  --ok: #4caf7d; --warn: #d4914a; --lock: #6a6a75;
+  --menu-bg: #2e2e35; --menu-border: #3a3a42;
   --menu-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   --r: 14px; font-synthesis: none;
 }
 * { box-sizing: border-box; }
 body {
-  margin: 0; background-color: var(--bg); background-image: var(--app-gradient);
-  background-attachment: fixed; color: var(--ink);
+  margin: 0; background: var(--bg); color: var(--ink);
   font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
-/* glass scrollbars — global, not opt-in */
+/* thin scrollbars — global, not opt-in */
 html { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.10) transparent; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
@@ -61,14 +56,9 @@ nav button.active::after {
 }
 #snapshot:hover { border-color: var(--accent); }
 main { padding: 1.2rem; }
-.view { display: grid; gap: 1rem; margin: 0 auto; width: 100%; max-width: var(--page-w, 1100px); }
+/* One shared content width for every page — no per-tab jumps. */
+.view { display: grid; gap: 1rem; margin: 0 auto; width: 100%; max-width: 1140px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
-/* Per-page width, normalized: every page is centered and capped, but the cap
-   matches the content — prose/stat pages read narrower, list pages standard,
-   the editor-heavy roadmap gets room for its textareas + doc rows. */
-#view-shells, #view-map, #view-scripts { --page-w: 920px; }
-#view-skills, #view-docs, #view-flags { --page-w: 1080px; }
-#view-roadmap { --page-w: 1240px; }
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
@@ -211,7 +201,7 @@ a { color: var(--accent); }
 .bar-fill { background: var(--accent); height: 100%; }
 .bar-n { text-align: right; color: var(--dim); font-size: .8rem; }
 
-/* ── Shells page (dos-arch port): sub-header, sub-tabs, glass viewers ─────── */
+/* ── Shells page (dos-arch port): sub-header, sub-tabs, panel viewers ─────── */
 .microlabel { font-size: 10px; text-transform: uppercase; letter-spacing: .15em; color: rgba(255,255,255,.35); flex: none; }
 .subbar {
   position: sticky; top: 52px; z-index: 4; background: var(--bg);
@@ -238,12 +228,12 @@ a { color: var(--accent); }
 }
 .shell-pane { display: grid; gap: .6rem; align-content: start; }
 .viewer-head { display: flex; align-items: center; gap: .9rem; padding: 0 .2rem; margin-top: .2rem; }
-.glass { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); }
+.vpanel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); }
 .viewer-panel { padding: 1rem 1.1rem; min-height: 12rem; }
 .desc-line { font-size: .8rem; margin-bottom: .8rem; line-height: 1.6; }
 .mono { font-family: ui-monospace, "Cascadia Mono", "Menlo", monospace; font-size: 12px; }
 
-/* accordions — grouped prompt/identity sections inside one glass panel */
+/* accordions — grouped prompt/identity sections inside one panel */
 .acc-panel { overflow: hidden; }
 .acc-group {
   padding: .45rem 1.1rem; font-size: 10px; text-transform: uppercase;
@@ -270,7 +260,7 @@ a { color: var(--accent); }
 }
 .pencil:hover { color: #fff; }
 
-/* glass dropdown + popover menus — solid medium-grey surface, no blur */
+/* pill dropdown + popover menus — solid medium-grey surface */
 .gdrop { position: relative; }
 .gdrop-btn {
   display: flex; align-items: center; gap: .5rem; min-width: 12rem; max-width: 100%;
@@ -299,7 +289,7 @@ button.gmenu-name:hover { color: #fff; }
 .gmenu-check:hover { color: #fff; }
 .gmenu-cap { color: rgba(255,255,255,.35); font-size: 10px; padding: 0 .7rem 0 .4rem; flex: none; }
 .active-row {
-  background: linear-gradient(90deg, rgba(110,168,254,.20), rgba(110,168,254,.03));
+  background: rgba(110, 168, 254, 0.12);
   box-shadow: inset 2px 0 0 0 var(--accent); color: #fff;
 }
 

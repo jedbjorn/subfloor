@@ -52,8 +52,8 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 
 // ── Shells ──────────────────────────────────────────────────────────────────
 // dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
-// identity sub-header (glass shell picker + role/mandate), then Harness |
-// Skills sub-tabs scoped to the selected shell. Glass panels, accordions,
+// identity sub-header (pill shell picker + role/mandate), then Harness |
+// Skills sub-tabs scoped to the selected shell. Flat panels, accordions,
 // popover pickers, and a unified edit modal.
 let selectedShell = null;
 let shellTab = "harness";     // 'harness' | 'skills'
@@ -218,7 +218,7 @@ function renderHarness(root, s) {
     statRow([["Char Count", fmt(all.reduce((n, x) => n + x.text.length, 0))],
              ["Est. Tokens", "~" + fmt(approxTokens(all.map((x) => x.text).join("")))]]));
 
-  const panel = el("div", { className: "glass acc-panel" });
+  const panel = el("div", { className: "vpanel acc-panel" });
   for (const g of groups) {
     panel.append(el("div", { className: "acc-group" }, g.title));
     for (const sec of g.items) panel.append(accordion(sec, s));
@@ -257,7 +257,7 @@ function accordion(sec, s) {
 
 // Skill Viewer — popover picker with inline grant toggles (☑/☐ — toggling
 // does not change the selection), then the selected skill's full content in a
-// glass panel with a char/token readout. Content lazy-loads per selection.
+// panel with a char/token readout. Content lazy-loads per selection.
 function renderSkillViewer(root, s) {
   const skills = s.skills;
   if (!skills.length) { root.append(el("div", { className: "muted" }, "No skills in the catalogue.")); return; }
@@ -296,7 +296,7 @@ function renderSkillViewer(root, s) {
 
   root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap));
   const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
-  const panel = el("div", { className: "glass viewer-panel" });
+  const panel = el("div", { className: "vpanel viewer-panel" });
   root.append(stats, panel);
 
   api("/skills/" + activeSkillId).then((full) => {
