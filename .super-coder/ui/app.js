@@ -452,9 +452,9 @@ function skillRow(s, shells) {
       } catch (e) { toast("error: " + e.message); cb.checked = !next; }
     });
     list.append(el("div", { className: "grant-row" },
+      sw,
       el("span", { className: "grant-name" }, sh.display_name,
-        el("span", { className: "muted", textContent: sh.shortname ? " /" + sh.shortname : "" })),
-      sw));
+        el("span", { className: "muted", textContent: sh.shortname ? " /" + sh.shortname : "" }))));
   }
   gr.append(list);
   body.append(gr);

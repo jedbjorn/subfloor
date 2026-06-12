@@ -195,7 +195,7 @@ details.feature[open] > .feature-preview { display: none; }
 .grants > .k { margin: 0 0 .2rem; }
 .grant-list { max-width: 320px; }
 .grant-row {
-  display: flex; align-items: center; justify-content: space-between; gap: .8rem;
+  display: flex; align-items: center; gap: .8rem;
   padding: .4rem 0; border-bottom: 1px solid var(--line-soft); font-size: .85rem;
 }
 .grant-row:last-child { border-bottom: none; }
