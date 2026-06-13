@@ -33,10 +33,18 @@ ENGINE_DB = ENGINE / "shell_db.db"  # legacy source of pre-split dr_section
 
 
 def ensure_schema(con: sqlite3.Connection) -> None:
-    """Apply map_schema.sql to a fresh map DB (idempotent — CREATE IF NOT EXISTS)."""
-    if MAP_SCHEMA.exists():
-        con.executescript(MAP_SCHEMA.read_text())
-        con.commit()
+    """Apply map_schema.sql to the map DB (idempotent — CREATE IF NOT EXISTS).
+
+    Fail loudly if the schema file is absent: it ships with the engine, so a
+    missing one means an incomplete materialize (e.g. a fork updated by an engine
+    that predates map_schema.sql being in ENGINE_PATHS). Better a clear error here
+    than a cryptic 'no such table: dr_section' downstream in seed_authored."""
+    if not MAP_SCHEMA.exists():
+        raise SystemExit(
+            f"map_db: {MAP_SCHEMA} missing — engine materialize is incomplete. "
+            "Re-run `./sc update` with an engine that materializes map_schema.sql.")
+    con.executescript(MAP_SCHEMA.read_text())
+    con.commit()
 
 
 def seed_authored(con: sqlite3.Connection) -> None:
