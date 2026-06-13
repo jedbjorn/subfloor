@@ -37,6 +37,11 @@
 # tracks all of .super-coder/ — the engine IS the project here; a *fork*
 # gitignores the whole engine dir (install.py writes that rule).
 /.sc-state/engine.ref.prev
+# The map DB is a derived cache of the repo (dr_*), rebuilt by `./sc map` from
+# the tree + its authored layer in .sc-state/map_content.sql (which IS tracked).
+/.sc-state/map.db
+/.sc-state/map.db-wal
+/.sc-state/map.db-shm
 
 # Python / tooling
 __pycache__/

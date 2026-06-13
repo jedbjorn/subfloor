@@ -1416,6 +1416,8 @@ through the router). Committing in a worktree prints that worktree''s preview UR
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
 
+DELETE FROM spec_tasks;
+
 DELETE FROM projects;
 INSERT INTO projects (project_id, shortname, title, purpose, standing, status, is_deleted, created_at) VALUES (1, 'super-coder', 'super-coder', 'Forkable shell substrate for a single repo — DB-backed identity, memory, roadmap, content; harness-agnostic boot.', NULL, 'active', 0, '2026-06-04 10:30:53');
 
@@ -1464,8 +1466,5 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='surface_catalogue';
 
 DELETE FROM shell_messages;
-
-DELETE FROM dr_section;
-INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (2, '.super-coder', '.super-coder/', NULL, 0);
 
 COMMIT;

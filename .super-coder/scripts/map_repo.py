@@ -28,9 +28,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for script + importers)
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-DB_PATH = ENGINE / "shell_db.db"
 # Per-fork map tuning, authored by the cartographer (see the `cartographer`
 # skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
 # so a wholesale engine refresh never touches it. Absent → built-in defaults
@@ -231,9 +232,10 @@ def seed_sections(con: sqlite3.Connection) -> None:
 
 
 def main() -> int:
-    if not DB_PATH.exists():
-        sys.exit("map_repo: no DB — run `./sc rebuild` (or `./sc install`) first.")
-    con = sqlite3.connect(DB_PATH)
+    # The map lives in its OWN db (.sc-state/map.db), not shell_db.db. connect()
+    # creates + schema-applies a fresh one and seeds its authored layer (sections
+    # from map_content.sql, or the pre-split engine DB on first run post-split).
+    con = map_db.connect()
     cfg = load_config()
     # Config EXTENDS the defaults (never shrinks them); .super-coder stays mapped
     # only in the source repo. role_overrides retag files after default inference.

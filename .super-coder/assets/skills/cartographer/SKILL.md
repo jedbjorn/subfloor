@@ -13,6 +13,12 @@ Working shells *consume* the `dr_*` catalogue and never map (see
 yours alone. You do three things: **configure** how this repo is mapped,
 **wire** the automation that keeps it fresh, and **heal** both when they drift.
 
+The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
+engine memory db (`shell_db.db`) so an engine schema change never touches the
+map. Every `dr_*` query below runs against it: `sqlite3 .sc-state/map.db "…"`.
+Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
+`./sc snapshot` and reloaded on a fresh map db.
+
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
 ## How the map stays fresh (so you know what you own)

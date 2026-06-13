@@ -16,6 +16,21 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
+# The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
+MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
+
+
+def open_map_ro() -> "sqlite3.Connection | None":
+    """Read-only handle to the map DB, or None if the repo isn't mapped yet
+    (callers degrade to an empty CONNECTIONS block / 'not mapped' status)."""
+    if not MAP_DB_PATH.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{MAP_DB_PATH}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        return con
+    except sqlite3.OperationalError:
+        return None
 
 
 def _cell(v) -> str:
@@ -89,11 +104,16 @@ def render_connections(con) -> str:
     (`dr_section`, prefix-joined to live file counts). The shell sees *where to
     start* here, then queries one section's leaves on demand. (The old authored
     `shells.connections` free-text layer was retired — nothing prompted shells to
-    fill it, so it sat empty; the map is the surface now.)"""
-    repo = con.execute(
-        "SELECT root, default_branch, mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+    fill it, so it sat empty; the map is the surface now.)
+
+    `con` is the MAP DB (.sc-state/map.db), or None when the repo isn't mapped
+    yet — then only the standing pointer renders."""
     lines = ["**Need to find something? Look here first** — read the `dr_*` map via "
              "the `surface_catalogue` skill; don't grep the tree blind."]
+    if con is None:
+        return "\n".join(lines + ["", "_Repo not mapped yet — the cartographer maps it._"])
+    repo = con.execute(
+        "SELECT root, default_branch, mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
     if repo and repo["root"]:
         branch = f" · `{repo['default_branch']}`" if repo["default_branch"] else ""
         mapped = f" · mapped {repo['mapped_at']}" if repo["mapped_at"] else ""
@@ -186,8 +206,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     bootstrapped = con.execute(
         "SELECT bootstrapped FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
     flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
-    map_count = con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0]
-    mapped_at_row = con.execute("SELECT mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+    # The repo catalogue lives in its own db now; open it read-only for the
+    # CONNECTIONS block + map status. None when the repo isn't mapped yet.
+    map_con = open_map_ro()
+    map_count = map_con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0] if map_con else 0
+    mapped_at_row = (map_con.execute("SELECT mapped_at FROM dr_repo WHERE repo_id=1").fetchone()
+                     if map_con else None)
     # Working shells never map — an unmapped repo is the cartographer's to fix.
     map_status = (f"{map_count} files, mapped {mapped_at_row[0]}"
                   if map_count and mapped_at_row and mapped_at_row[0]
@@ -261,7 +285,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## SYSTEM PROMPT", "", system_prompt,
         "", "---", "",
-        "## CONNECTIONS", "", render_connections(con),
+        "## CONNECTIONS", "", render_connections(map_con),
         "", "---", "",
         "## CURRENT STATE", "", current_state,
         "", "---", "",
@@ -283,4 +307,6 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         f"- **Docs:** {docs_status}",
         "",
     ]
+    if map_con is not None:
+        map_con.close()
     return "\n".join(parts)

@@ -286,8 +286,13 @@ _GITIGNORE_BLOCK = f"""
 # Shell worktrees — one per shell, linked inside the repo root.
 /.sc-worktrees/
 # .sc-state/ is TRACKED (content.sql + engine.ref). Only the ephemeral
-# pre-update restore pointer is ignored.
+# pre-update restore pointer and the derived map cache are ignored.
 /.sc-state/engine.ref.prev
+# Map DB — derived cache of the repo (dr_*), rebuilt by `./sc map`. Its authored
+# layer (sections) is tracked in .sc-state/map_content.sql.
+/.sc-state/map.db
+/.sc-state/map.db-wal
+/.sc-state/map.db-shm
 """
 
 

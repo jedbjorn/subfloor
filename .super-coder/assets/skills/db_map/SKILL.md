@@ -13,12 +13,15 @@ memory, and content live in tables — never flat files. **The `.db` is a cache:
 after any content write, `./sc snapshot` re-serializes to text (see the
 `snapshot` skill). Lazy-load: query for what you need, don't bulk-read.
 
+The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
+(see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
+memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
+
 ## Tables
 
 | Table | Holds | Write rule |
 |---|---|---|
 | `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `lineage_seed`, `active_archive_id`. (`connections`/`workspace` retired — boot `## CONNECTIONS` is derived from the `dr_*` map, not authored here) | UPDATE in place |
-| `dr_section` | the navigation index — `name`, `path_prefix`, `description`; rendered in boot `## CONNECTIONS`. Cartographer-authored | INSERT/UPDATE (cartographer) |
 | `shell_identity_entries` | seed (cap 10) + L&S (`kind='lns'`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
 | `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
