@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Seed a fork's FIRST shell — the one-time fork-identity step.
+"""Seed a fork's STARTING TEAM — the one-time fork-identity step.
 
 A fresh fork's `.db` carries the *system* (schema + migrations: the skill
 catalogue, the render chain) but **no per-instance content** — a fork inherits
 the system, never super-coder's memory or roadmap. So a just-installed fork has
 no users and no shells, and `./sc launch` has nothing to authenticate or boot.
-This provisions the local user, then creates the first shell via the shared
-shell factory (a flavor template — default `dev`).
+This provisions the local user, then seeds the starting team via the shared
+shell factory: your primary shell (default `planner`) plus an `admin`, two
+`dev`, a `reviewer`, and the singleton `cartographer` — the full roster out of
+the box.
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
-exists. After it runs: `./sc snapshot`, then `./sc launch`. Additional shells are
-created later via the GUI (also through the factory).
+exists. After it runs: `./sc snapshot`, then `./sc launch`. More shells (or
+fewer) are managed later via the GUI (also through the factory).
 
 Usage:
     python3 .super-coder/scripts/init_fork.py            # interactive
     python3 .super-coder/scripts/init_fork.py \
-        --username Jed --name Dev --shortname dev --flavor dev
+        --username Jed --name Lead --shortname lead --flavor planner
 """
 from __future__ import annotations
 
@@ -26,6 +28,11 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
+
+# The starting team seeded at install, besides the singleton cartographer (added
+# separately below). Your interviewed primary shell — default planner — fills one
+# of these slots; the rest are auto-named team members (ADM1, DEV1, DEV2, REV1).
+TEAM_ROSTER = ["admin", "planner", "dev", "dev", "reviewer"]
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 from shell_factory import create_shell, flavors  # noqa: E402
@@ -83,8 +90,9 @@ def main(argv: list[str]) -> int:
                      "(non-interactive run needs the flag)")
 
         username = need(a.username, "Your username")
-        # The first shell is a PLANNER shell — every fork needs a planner to
-        # scope the work. (--flavor overrides; the GUI creates other flavors.)
+        # Your primary shell — default planner (every fork needs a planner to
+        # scope the work). --flavor picks which roster slot is *yours* (the one
+        # interviewed for name/role/mandate); the rest of the team seeds with it.
         flavor = a.flavor or "planner"
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
@@ -96,29 +104,47 @@ def main(argv: list[str]) -> int:
         con.execute(
             "INSERT INTO users (user_id, username, is_active) VALUES (1, ?, 1)",
             (username,))
+        # Your interviewed primary shell.
         shell_id = create_shell(
             con, flavor=flavor, name=name, shortname=shortname,
             partner=a.partner or username, repo=repo,
             role=a.role, mandate=a.mandate)
-        # Every fork also gets a dedicated Cartographer: it owns the repo map so
-        # no working shell ever maps. Configured + wired by `./sc map-setup`
-        # (install runs it); re-bootable to heal the map automation later.
-        cart_id = create_shell(
-            con, flavor="cartographer", name="Cartographer",
-            partner=a.partner or username, repo=repo)
+        # The rest of the starting team — the full roster minus the slot your
+        # primary already fills — auto-named by the factory (ADM1/DEV1/DEV2/REV1).
+        rest = list(TEAM_ROSTER)
+        if flavor in rest:
+            rest.remove(flavor)
+        team = []
+        for fl in rest:
+            sid = create_shell(con, flavor=fl, name=fl.capitalize(),
+                               partner=a.partner or username, repo=repo)
+            team.append((fl, sid))
+        # The singleton Cartographer owns the repo map so no working shell ever
+        # maps; configured + wired by `./sc map-setup` (install runs it). Skip if
+        # your primary already is the cartographer.
+        cart_id = None
+        if flavor != "cartographer":
+            cart_id = create_shell(
+                con, flavor="cartographer", name="Cartographer",
+                partner=a.partner or username, repo=repo)
         con.commit()
-        shortname = con.execute(
-            "SELECT shortname FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
-        cart_sn = con.execute(
-            "SELECT shortname FROM shells WHERE shell_id=?", (cart_id,)).fetchone()[0]
+
+        def _sn(sid):
+            return con.execute(
+                "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
 
         n = con.execute(
             "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?", (shell_id,)).fetchone()[0]
-        print(f"init_fork: created '{shortname}' ({flavor}, shell_id={shell_id}) "
-              f"for user '{username}' — {n} skills, lineage + genesis seed, session opened.")
-        print(f"init_fork: created '{cart_sn}' (cartographer, shell_id={cart_id}) "
-              "— owns the repo map.")
-        print("init_fork: next -> `./sc snapshot` (serialize), then `./sc launch`.")
+        print(f"init_fork: created '{_sn(shell_id)}' ({flavor}, shell_id={shell_id}) "
+              f"for user '{username}' — your primary, {n} skills, lineage + genesis seed.")
+        for fl, sid in team:
+            print(f"init_fork: created '{_sn(sid)}' ({fl}, shell_id={sid}).")
+        if cart_id:
+            print(f"init_fork: created '{_sn(cart_id)}' (cartographer, shell_id={cart_id}) "
+                  "— owns the repo map.")
+        total = 1 + len(team) + (1 if cart_id else 0)
+        print(f"init_fork: seeded a {total}-shell team. "
+              "next -> `./sc snapshot` (serialize), then `./sc launch`.")
     finally:
         con.close()
     return 0
