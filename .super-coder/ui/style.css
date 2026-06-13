@@ -66,6 +66,18 @@ main { padding: 1.2rem; }
 .view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
 
+/* ── 1px card rhythm (Skills / Roadmap / Docs / Flags) ──────────────────────
+   Stacked card panels on these tabs sit a hairline apart. Section headers
+   (funnel stages, skill categories) keep enough room to read as group labels;
+   only the card-to-card spacing tightens. */
+#view-roadmap .bucket > details.feature + details.feature { margin-top: 1px; }
+#view-docs .card + .card { margin-top: 1px; }
+#view-flags { gap: 1px; }
+#view-flags .flagbar { margin-bottom: calc(1rem - 1px); }   /* restore bar→cards spacing */
+#view-skills { gap: 1px; }
+#view-skills > .muted:first-child { margin-bottom: calc(1rem - 1px); }  /* intro keeps room */
+#view-skills .bucket > h2 { margin-top: 0; }                 /* header rides on its own card */
+
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
   padding: 1rem 1.1rem;
