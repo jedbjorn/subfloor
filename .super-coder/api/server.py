@@ -39,6 +39,7 @@ DB_PATH = ENGINE / "shell_db.db"
 UI_DIR = ENGINE / "ui"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
@@ -550,6 +551,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f.read_text(), ctype)
         if not path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
+        # git-hygiene is a live filesystem/git read — no DB, computed on demand
+        # (the UI refresh button is the only trigger). `?fetch=1` does the network
+        # fetch for accurate behind-counts + fresh PR state; the default skips it
+        # so the initial tab load is snappy.
+        if urlparse(self.path).path == "/api/git-state":
+            from urllib.parse import parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            fetch = q.get("fetch", ["0"])[0] in ("1", "true", "yes")
+            try:
+                return self._send(200, git_hygiene.compute(fetch=fetch))
+            except Exception as e:
+                return self._fail(e)
         con = db()
         try:
             if path == "/api/health":

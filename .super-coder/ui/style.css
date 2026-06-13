@@ -447,3 +447,30 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .toast { animation: toast-in .18s ease-out; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(.4rem); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ── Worktrees / git-hygiene tab ─────────────────────────────────────────────
+   Report-only repo state. Status dot carries the colour: green=clean,
+   yellow-orange (--warn) = dirty working tree, sunset (--task-open) = stale
+   merged branch. Tight card-to-card rhythm to match the list tabs. */
+#view-worktrees { gap: 5px; }
+.wt-summary { display: flex; gap: .5rem; flex-wrap: wrap; margin: .1rem 0 .5rem; }
+.wt-prov { font-size: .78rem; margin: .15rem 0; }
+.wt-row { display: flex; align-items: flex-start; gap: .7rem; padding: .5rem 0; border-top: 1px solid var(--line-soft); }
+.wt-row:first-of-type { border-top: none; }
+.wt-dot { flex: none; width: 9px; height: 9px; border-radius: 99px; margin-top: .35rem; background: var(--dim); }
+.wt-dot.clean { background: var(--ok); }
+.wt-dot.dirty { background: var(--warn); box-shadow: 0 0 0 3px rgba(212,145,74,.18); }   /* yellow-orange */
+.wt-dot.stale { background: var(--task-open); }
+.wt-main { min-width: 0; flex: 1; }
+.wt-top { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.wt-path { font-weight: 600; }
+.wt-branch { color: var(--dim); }
+.wt-meta { font-size: .8rem; margin-top: .1rem; }
+.wt-files { margin-top: .3rem; }
+.wt-files summary { color: var(--dim); font-size: .8rem; }
+.wt-files pre { margin: .3rem 0 0; padding: .5rem .6rem; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; overflow-x: auto;
+  font: 12px/1.5 ui-monospace, monospace; color: rgba(255,255,255,.78); }
+.wt-cmd { display: inline-block; margin-top: .25rem; padding: .15rem .5rem;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+  font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
