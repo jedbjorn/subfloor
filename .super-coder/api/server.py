@@ -188,9 +188,18 @@ def get_roadmap(con) -> dict:
             "SELECT flag_id, feature_id, display_name, description FROM flags "
             "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 AND feature_id IS NOT NULL")):
         flags_by.setdefault(f["feature_id"], []).append(f)
+    # Spec tasks (implementation plan) attach per feature, ordered by spec then
+    # seq so a multi-spec feature lists each spec's plan in order. Drives the
+    # feature card's task checklist + side-bar colour in the UI.
+    tasks_by: dict[int, list] = {}
+    for t in rows(con.execute(
+            "SELECT task_id, feature_id, document_id, seq, title, status "
+            "FROM spec_tasks ORDER BY feature_id, document_id, seq")):
+        tasks_by.setdefault(t["feature_id"], []).append(t)
     for f in feats:
         f["documents"] = docs_by.get(f["feature_id"], [])
         f["open_flags"] = flags_by.get(f["feature_id"], [])
+        f["tasks"] = tasks_by.get(f["feature_id"], [])
     buckets = [{"status": s, "label": _LABEL[s],
                 "features": [f for f in feats if f["roadmap_status"] == s]}
                for s in _ORDER]

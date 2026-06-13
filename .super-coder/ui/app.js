@@ -510,6 +510,11 @@ function featureCard(f) {
   // Expandable box: collapsed shows title + status/owner pills + a one-line
   // summary preview; expanded reveals the editable fields, docs, and blockers.
   const c = el("details", { className: "card feature" });
+  // Spec tasks (implementation plan) → side-bar colour: all done = green,
+  // any still open = sunset orange. No tasks = no side bar.
+  const tasks = f.tasks || [];
+  const doneCount = tasks.filter((t) => t.status === "done").length;
+  if (tasks.length) c.classList.add("has-tasks", doneCount === tasks.length ? "tasks-done" : "tasks-open");
   const sum = el("summary", { className: "feature-head" });
   sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)"));
   const meta = el("span", { className: "feature-meta" });
@@ -536,6 +541,20 @@ function featureCard(f) {
     el("span", { className: "k" }, "title"), title,
     el("span", { className: "k" }, "status"), status,
     el("span", { className: "k" }, "summary"), summary), save);
+
+  // tasks — the spec's implementation plan, in order; done = checked + struck
+  if (tasks.length) {
+    body.append(el("label", { className: "k", textContent: `tasks (${doneCount}/${tasks.length})` }));
+    const ul = el("ul", { className: "task-list" });
+    for (const t of tasks) {
+      const done = t.status === "done";
+      const li = el("li", { className: done ? "done" : (t.status === "in_progress" ? "wip" : "") });
+      li.append(el("span", { className: "box", textContent: done ? "☑" : "☐" }));
+      li.append(el("span", { className: "t" }, t.title || ""));
+      ul.append(li);
+    }
+    body.append(ul);
+  }
 
   // documents — specs (editable/frozen per state) then docs (read-only here;
   // the Docs tab is where docs are edited)
