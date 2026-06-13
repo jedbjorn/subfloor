@@ -324,6 +324,43 @@ If this fork ships no database of its own, there is nothing to tag — skip it.
 After a curation pass, `./sc snapshot` (sections are snapshotted; descriptions
 ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
 
+## Extending the map — semantic extractors
+
+The engine maps the generic 80% on every repo: files, languages, roles, deps,
+env. The **semantic** dimensions — HTTP endpoints (`dr_endpoint`), the app DB
+schema (`dr_db_table`/`dr_db_column`), UI routes/components (`dr_route`/
+`dr_component`) — vary by stack, so the engine can''t extract them generically.
+That is your job, via **extractors**: drop-in Python modules in
+`.sc-state/map_extractors/*.py` that `./sc map` discovers and runs after the core
+pass. They are fork-owned (outside the gitignored engine dir, so `./sc update`
+never clobbers them); the table *columns* are standardized in the engine
+(`map_schema.sql`), so a working shell''s queries have a stable shape everywhere.
+
+**Adopt one per stack:**
+
+1. **Detect the stack** from the map: `SELECT manager, name FROM dr_dependency;`
+   (fastapi? flask? svelte? next?) and the file mix
+   (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
+2. **Copy the matching reference** from the engine''s
+   `.super-coder/templates/map_extractors/` into `.sc-state/map_extractors/`:
+   - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
+   - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
+   - `sveltekit_routes.py` — filesystem routes + `*.svelte` → `dr_route`/`dr_component`
+   Adapt the `framework` label and file filter to this repo. For a stack none
+   cover (Django URLs, Express, Spring, Rails), copy the closest as a skeleton
+   and rewrite the match — aim for the dominant pattern, not 100%.
+3. **Run + verify:** `./sc map`, then check the table populated and the rows look
+   right (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
+4. **Commit** `.sc-state/map_extractors/` + `./sc snapshot`.
+
+**The contract** (full version in `templates/map_extractors/README.md`): each
+module defines `extract(con, repo_root, cfg) -> str`. `con` is the live map db
+(dr_filepath is already populated — query it for inputs); the module DELETEs +
+repopulates only its own `dr_*` table(s); returns a one-line summary for the map
+log. Be defensive — `map_repo` guards each extractor, but a module that needs the
+map should never assume a file parses. Static extraction is best-effort: log what
+you skip (dynamic routes, computed paths), never imply full coverage.
+
 ## Shape-change notices — the curation trigger
 
 The git hooks keep the *mechanical* catalogue fresh on their own (paths, langs,
@@ -1815,6 +1852,15 @@ don''t map it yourself.
 | `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
 | `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
 | `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
+| `dr_endpoint` | HTTP routes: `method`, `path`, `handler` (file:line), `framework`, `source_file` |
+| `dr_db_table` / `dr_db_column` | the app DB schema: tables/views + their columns (`type`, `pk`, `not_null`) |
+| `dr_route` / `dr_component` | UI routes (`path`, `kind`) + components (`name`, `path`) |
+
+The first five are mapped on **every** repo. The last three are the **semantic
+layer** — populated only when the cartographer has wired an extractor for this
+repo''s stack (see the `cartographer` skill). An empty `dr_endpoint` means *no
+extractor wired*, not "no endpoints" — check before relying on it, and flag the
+cartographer if a dimension you need is missing.
 
 ## Orient fast
 
@@ -1848,6 +1894,12 @@ SELECT path FROM dr_filepath WHERE path LIKE ''%auth%'';
 -- stack + config surface:
 SELECT manager, name, version FROM dr_dependency ORDER BY manager, name;
 SELECT name, source_file FROM dr_env ORDER BY name;
+
+-- semantic layer (only if an extractor is wired for this repo — see cartographer):
+SELECT method, path, handler FROM dr_endpoint ORDER BY path;            -- the API surface
+SELECT name, kind, source_file FROM dr_db_table ORDER BY name;          -- the app DB schema
+SELECT name, type, pk, not_null FROM dr_db_column WHERE table_name=''users'';
+SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI routes
 ```
 
 ## Stance
@@ -1860,9 +1912,11 @@ SELECT name, source_file FROM dr_env ORDER BY name;
   mis-classified — that''s the cartographer''s to fix. Raise it; don''t re-map.
   A file under "other / unsectioned", or a `desc IS NULL` where you needed one,
   is also a cartographer worklist item — flag it, don''t author the map yourself.
-- Maps files / deps / env + the navigation layer (sections + per-file
-  descriptions). Symbol-level semantics (functions/classes) are a later pass —
-  until then, read the code the section + descriptions point you at.',
+- Always maps files / deps / env + the navigation layer (sections + per-file
+  descriptions). The semantic layer (endpoints / DB schema / UI routes) is there
+  when the cartographer wired an extractor for this stack — query it to jump
+  straight to the API surface or schema; fall back to section + descriptions when
+  a dimension is empty. Symbol-level semantics (functions/classes) are a later pass.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
