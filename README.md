@@ -144,8 +144,8 @@ it owns:
 | Flavor | Flavor skills | Owns |
 |---|---|---|
 | **cartographer** | `cartographer` | map · re-map |
-| **planner** | `docs` · `blueprint` · `flags` · `api-design` · `onboard` | spec · plan · freeze + docs |
-| **dev** | `dev_kit` · `test_authoring` · `database-migrations` · `redline_review` · `docs` · `flags` | implement · patch + test |
+| **planner** | `docs` · `blueprint` · `flags` · `api-design` · `onboard` | spec doc · approach · freeze + docs |
+| **dev** | `spec` · `dev_kit` · `test_authoring` · `database-migrations` · `redline_review` · `docs` · `flags` | break into tasks · implement · patch + test |
 | **reviewer** | `test_authoring` · `database-migrations` · `redline_review` · `api-design` · `flags` | review |
 | **admin** | `git_cleanup` · `self_update` · `migration_management` · `local_skill_management` | engine · verify-clean |
 
@@ -157,19 +157,19 @@ it owns:
    It's infrastructure working shells *read* via `surface_catalogue`.
    *(cartographer · `cartographer` · UI: Map)*
 3. **Spec it** — the **planner** authors a spec document against a roadmap
-   feature — viability, blockers, the staged plan. (Specs ride the `docs` skill,
-   which owns both docs and specs; there's no separate grant.)
-   *(planner · `docs`, `flags` · UI: Roadmap)*
-4. **Plan the build** — the planner decomposes the spec into an ordered task
-   list (Prep → steps → Verification gates) — `blueprint` is a **planner** skill,
-   so the plan is cut before the hand-off to dev. *(planner · `blueprint` · UI: Roadmap)*
-5. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
+   feature — viability, blockers, the done-condition. `blueprint` shapes the
+   approach in a single session (no DB writes); both the spec and the docs ride
+   the `docs` skill. *(planner · `docs`, `blueprint`, `flags` · UI: Roadmap)*
+4. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
    worktree on `shell/dev`, a base pinned to `origin/main`.
    *(dev · `bootstrap`, `memory` · UI: Shells)*
-6. **Implement across sessions** — dev cuts a feature branch off `shell/dev`,
-   writes code, schema, and tests, and runs `./sc test`. `memory` carries
-   `current_state` ("last / next task") across sessions so they resume cleanly.
-   *(dev · `dev_kit`, `test_authoring`, `database-migrations`, `redline_review`, `git`, `memory` · UI: Shells)*
+5. **Break it into tasks** — dev reads the spec and uses `spec` to decompose it
+   into `spec_tasks` (Preparation → steps → Verification), then works one task
+   per session. `memory` rolls `current_state` ("last / next task") so sessions
+   resume cleanly. *(dev · `spec`, `memory` · UI: Roadmap)*
+6. **Implement** — within each task, dev cuts a feature branch off `shell/dev`,
+   writes code, schema, and tests, and runs `./sc test`.
+   *(dev · `dev_kit`, `test_authoring`, `database-migrations`, `redline_review`, `git` · UI: Shells)*
 7. **Send to review** — dev pushes and opens a PR (the `git` skill is
    branch → commit → push → **PR → stop**; dev never merges), then messages the
    reviewer. *(dev · `git`, `messaging` · UI: Flags)*
