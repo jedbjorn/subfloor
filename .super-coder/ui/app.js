@@ -840,6 +840,91 @@ async function renderMap(root) {
   }
 }
 
+// ── Worktrees (git hygiene) ──────────────────────────────────────────────────
+// Live, report-only view of the repo: which worktrees are dirty (yellow/orange),
+// which local branches are stale (PR merged → prunable), what's clean. The
+// server computes it on demand from disk in one pass — no shell is ever polled.
+// The refresh button is the ONLY trigger; it does the network fetch (origin +
+// `gh`) for fresh behind-counts and PR state. Nothing here mutates the repo.
+async function renderWorktrees(root, opts = {}) {
+  if (!opts.fetch) root.replaceChildren(el("div", { className: "card muted" }, "Reading repo state…"));
+  let d;
+  try { d = await api("/git-state?fetch=" + (opts.fetch ? "1" : "0")); }
+  catch (e) { root.replaceChildren(el("div", { className: "card" }, "error: " + e.message)); return; }
+  root.replaceChildren();
+
+  // header: repo + summary pills + provenance + the one trigger (refresh)
+  const s = d.summary;
+  const head = el("div", { className: "card" });
+  head.append(el("h2", {}, d.repo.name));
+  head.append(el("div", { className: "wt-summary" },
+    el("span", { className: "pill" + (s.dirty_worktrees ? " warn" : " ok") }, `${s.dirty_worktrees} dirty`),
+    el("span", { className: "pill" }, `${s.stale_branches} stale`),
+    el("span", { className: "pill" + (s.all_clean ? " ok" : "") },
+      s.all_clean ? "all clean" : `${s.worktrees} worktree${s.worktrees !== 1 ? "s" : ""}`)));
+  head.append(el("div", { className: "muted wt-prov" },
+    [`default: ${d.repo.default_branch}`,
+     `fetch: ${d.fetched ? "fresh" : "skipped — click refresh"}`,
+     `gh: ${d.gh_available ? "ok" : "unavailable — merge state best-effort"}`].join("  ·  ")));
+  const refresh = el("button", { className: "act", textContent: "refresh ↻" });
+  refresh.title = "re-scan worktrees + fetch origin & gh for fresh behind-counts and PR state";
+  refresh.onclick = async () => {
+    refresh.disabled = true; setStatus("scanning…");
+    try { await renderWorktrees(root, { fetch: true }); setStatus("scanned"); }
+    catch { setStatus("scan failed"); }
+  };
+  head.append(refresh);
+  root.append(head);
+
+  // worktrees — dot is green (clean) or yellow/orange (dirty)
+  const wc = el("div", { className: "card" });
+  wc.append(el("h2", {}, "Worktrees"));
+  for (const w of d.worktrees) {
+    const dirty = w.dirty > 0;
+    const main = el("div", { className: "wt-main" });
+    const top = el("div", { className: "wt-top" });
+    top.append(el("span", { className: "wt-path" }, w.path === "." ? ".  (main)" : w.path));
+    top.append(el("span", { className: "mono wt-branch" }, w.branch || "(detached)"));
+    main.append(top);
+    const bits = [dirty ? `✎ ${w.dirty} uncommitted` : "clean"];
+    if (w.behind) bits.push(`${w.behind} behind`);
+    if (w.ahead) bits.push(`${w.ahead} ahead`);
+    main.append(el("div", { className: "wt-meta muted" }, bits.join("  ·  ")));
+    if (dirty && w.dirty_files.length) {
+      const det = el("details", { className: "wt-files" });
+      det.append(el("summary", {}, `${w.dirty} changed file${w.dirty !== 1 ? "s" : ""}`));
+      const extra = w.dirty > w.dirty_files.length ? `\n… +${w.dirty - w.dirty_files.length} more` : "";
+      det.append(el("pre", {}, w.dirty_files.join("\n") + extra));
+      main.append(det);
+    }
+    wc.append(el("div", { className: "wt-row" },
+      el("span", { className: "wt-dot " + (dirty ? "dirty" : "clean") }), main));
+  }
+  root.append(wc);
+
+  // stale branches — report only, copy-paste prune command, never auto-deleted
+  const stale = d.branches.filter((b) => b.stale);
+  const sc = el("div", { className: "card" });
+  sc.append(el("h2", {}, `Stale branches — ${stale.length}`));
+  sc.append(el("div", { className: "muted wt-prov" },
+    "Local branches whose PR is merged. Reported only — copy a command to prune. Nothing is deleted for you."));
+  if (!stale.length) sc.append(el("div", { className: "muted" }, "None — no merged branches lingering."));
+  for (const b of stale) {
+    const main = el("div", { className: "wt-main" });
+    const top = el("div", { className: "wt-top" });
+    top.append(el("span", { className: "mono wt-branch" }, b.name));
+    if (b.pr) top.append(el("span", { className: "pill" }, "PR #" + b.pr.number));
+    main.append(top);
+    main.append(el("code", { className: "wt-cmd" }, "git branch -D " + b.name));
+    sc.append(el("div", { className: "wt-row" },
+      el("span", { className: "wt-dot stale" }), main));
+  }
+  const unknown = d.branches.filter((b) => b.merged === null);
+  if (unknown.length) sc.append(el("div", { className: "muted wt-prov" },
+    `${unknown.length} branch(es) with unknown merge state (gh unavailable): ${unknown.map((b) => b.name).join(", ")}`));
+  root.append(sc);
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
@@ -847,6 +932,7 @@ const VIEWS = {
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
+  worktrees: ["#view-worktrees", renderWorktrees],
   map: ["#view-map", renderMap],
   scripts: ["#view-scripts", renderScripts],
 };
