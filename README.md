@@ -114,10 +114,12 @@ arc from a fresh repo through ship-and-loop, see *The loop*, next.
 > [!class2]
 > **UI** Roadmap → Flags → Docs → Worktrees → Map · **Shells** cartographer · planner · dev · reviewer · admin
 
-The everyday cycle a fork runs once it's installed. Each role is a **shell**
-(its flavor sets its model defaults — see *Harnesses & models*); you move between
-them with `./sc enter-<shortname>`. Work flows dev → review → operator-merge,
-then freezes into specs and docs, and the cartographer re-maps the new shape.
+The everyday cycle a fork runs once it's installed. Each step is owned by a
+**shell flavor**, and the work is done by the **skills** that flavor is granted
+(its flavor also sets its model defaults — see *Harnesses & models*). You move
+between flavors with `./sc enter-<shortname>`. Every flavor carries a common kit
+— `git`, `db_map`, `memory`, `messaging`, `snapshot`, `surface_catalogue`,
+`bootstrap` — so only the *flavor-specific* skills are called out per step below.
 
 ```linear
 Install :::class1 -> Map :::class2 -> Spec :::class1 -> Build :::class1 -> Review :::class2 -> Freeze :::class3 -> Verify :::class3
@@ -136,47 +138,63 @@ graph TD
   V --> C
 ```
 
+Each flavor's flavor-specific skills (on top of that common kit) and the steps
+it owns:
+
+| Flavor | Flavor skills | Owns |
+|---|---|---|
+| **cartographer** | `cartographer` | map · re-map |
+| **planner** | `docs` · `blueprint` · `flags` · `api-design` · `onboard` | spec · plan · freeze + docs |
+| **dev** | `dev_kit` · `test_authoring` · `database-migrations` · `redline_review` · `docs` · `flags` | implement · patch + test |
+| **reviewer** | `test_authoring` · `database-migrations` · `redline_review` · `api-design` · `flags` | review |
+| **admin** | `git_cleanup` · `self_update` · `migration_management` · `local_skill_management` | engine · verify-clean |
+
 1. **Install** — `./sc install` seeds your first shell (planner-flavor by
    default) plus the **Cartographer**, and stands up the `admin` shell that owns
-   `main`. *(UI: Shells)*
+   `main` and the engine thereafter. *(admin · `self_update`, `migration_management` · UI: Shells)*
 2. **Map the repo** — the cartographer configures the index once with
    `./sc map-setup`, then `./sc map` builds it; git hooks re-map on every pull.
-   The map is infrastructure working shells *consume*. *(UI: Map)*
-3. **Spec it** — in the **planner** shell, the `spec` skill turns a roadmap
-   feature into a spec document and a checklist of `spec_tasks`: viability,
-   blockers, the staged plan. *(UI: Roadmap)*
-4. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
-   worktree on `shell/dev`, a base pinned to `origin/main`. *(UI: Shells)*
-5. **Plan the build** — dev loads `blueprint` to decompose the spec into an
-   ordered task list (Prep → steps → Verification gates) written back as
-   `spec_tasks`. *(UI: Roadmap)*
+   It's infrastructure working shells *read* via `surface_catalogue`.
+   *(cartographer · `cartographer` · UI: Map)*
+3. **Spec it** — the **planner** authors a spec document against a roadmap
+   feature — viability, blockers, the staged plan. (Specs ride the `docs` skill,
+   which owns both docs and specs; there's no separate grant.)
+   *(planner · `docs`, `flags` · UI: Roadmap)*
+4. **Plan the build** — the planner decomposes the spec into an ordered task
+   list (Prep → steps → Verification gates) — `blueprint` is a **planner** skill,
+   so the plan is cut before the hand-off to dev. *(planner · `blueprint` · UI: Roadmap)*
+5. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
+   worktree on `shell/dev`, a base pinned to `origin/main`.
+   *(dev · `bootstrap`, `memory` · UI: Shells)*
 6. **Implement across sessions** — dev cuts a feature branch off `shell/dev`,
-   writes code + tests, runs `./sc test`, and commits. `current_state` carries
-   "last task / next task" across session boundaries, so successive sessions
-   resume cleanly. *(UI: Shells)*
+   writes code, schema, and tests, and runs `./sc test`. `memory` carries
+   `current_state` ("last / next task") across sessions so they resume cleanly.
+   *(dev · `dev_kit`, `test_authoring`, `database-migrations`, `redline_review`, `git`, `memory` · UI: Shells)*
 7. **Send to review** — dev pushes and opens a PR (the `git` skill is
    branch → commit → push → **PR → stop**; dev never merges), then messages the
-   reviewer. *(UI: Flags)*
-8. **Review, send back** — the **reviewer** shell (a *different lineage* than the
-   code — defaults to Opus — so it isn't blind to the author's mistakes) reads
-   the diff against the spec, opens flags for failures, and messages dev back.
-   *(UI: Flags)*
-9. **Patch notes + test** — dev addresses the flags, re-runs `./sc test`, and
-   re-pushes; the review thread closes when it's clean.
+   reviewer. *(dev · `git`, `messaging` · UI: Flags)*
+8. **Review, send back** — the **reviewer** (a *different lineage* than the code
+   — defaults to Opus — so it isn't blind to the author's mistakes) reads the diff
+   against the spec through its review lenses, opens flags for failures, and
+   messages dev back. *(reviewer · `test_authoring`, `database-migrations`, `api-design`, `flags`, `messaging` · UI: Flags)*
+9. **Patch + test** — dev addresses the flags, re-runs `./sc test`, and
+   re-pushes; the thread closes when it's clean.
+   *(dev · `dev_kit`, `test_authoring`, `flags`, `git` · UI: Flags)*
 10. **Operator merges** — merging is the FnB's gate, never a shell's. On dev's
     next boot the launcher auto-syncs the base onto `origin/main` and prunes the
-    merged branch. *(UI: Worktrees)*
+    merged branch. *(operator gate; no shell skill · UI: Worktrees)*
 11. **Freeze spec + write docs** — on ship, the spec freezes (`frozen=1`,
     immutable; the next stage opens a fresh `seq`) and the feature doc is authored
-    via the `docs` skill. `./sc render` writes read-only `specs_sc/` + `docs_sc/`.
-    *(UI: Docs)*
-12. **Verify git trees clean** — `./sc snapshot` + `./sc render`, then
-    `./sc render-check` (committed `_sc` must match the DB render) and
-    `./sc verify` (rebuild + headless boot). The admin shell's git-hygiene pass
-    confirms every worktree is clean and merged branches are pruned. *(UI: Worktrees)*
+    — both via `docs`. `snapshot` + `./sc render` write read-only `specs_sc/` +
+    `docs_sc/`. *(planner / dev · `docs`, `snapshot` · UI: Docs)*
+12. **Verify git trees clean** — the admin's `git_cleanup` triages every worktree
+    (clean trees, prunable merged branches, preserved work); `./sc render-check`
+    (committed `_sc` must match the DB render) and `./sc verify` (rebuild +
+    headless boot) are the operator-run proofs.
+    *(admin · `git_cleanup`, `snapshot` · UI: Worktrees)*
 13. **Re-map** — the cartographer re-runs (auto on pull, or `./sc map`) so the
     index reflects the new shape — and the loop turns to the next feature.
-    *(UI: Map)*
+    *(cartographer · `cartographer` · UI: Map)*
 
 ## Install
 
