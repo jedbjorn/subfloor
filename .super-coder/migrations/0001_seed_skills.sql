@@ -1030,18 +1030,38 @@ The governing asymmetry — internalize it before you touch anything:
 > So: delete only on evidence; **preserve by default; discard only on the
 > FnB''s explicit per-item OK.** When unsure, surface — never guess destructively.
 
+## How to investigate — scripts first, always
+
+The two read-only scripts compute the whole state in one efficient pass. Lean on
+them in this order, cheapest-and-most-authoritative first:
+
+1. **The scripts** — `git_hygiene.py` (git state) + `shell_liveness.py` (who''s
+   live). Run them first and *read their output*; don''t re-derive by hand what a
+   single pass already gives you.
+2. **Git history** — when a script''s verdict is ambiguous (a branch''s merge state
+   is `null`, an unexpected dirty file): `git -C <path> log`, `reflog`,
+   `show` to settle it.
+3. **The code / files** — read the working-tree contents last, only when history
+   doesn''t explain what you''re looking at.
+
 ## Step 1 — Read the state (never skip)
 
 ```bash
-python3 .super-coder/scripts/git_hygiene.py --text     # human table
-python3 .super-coder/scripts/git_hygiene.py            # JSON, to drive decisions
+python3 .super-coder/scripts/git_hygiene.py --text       # git: dirty/stale/clean
+python3 .super-coder/scripts/shell_liveness.py --text     # who has a live session
 ```
+(Both have a JSON mode — no `--text` — to drive decisions programmatically.)
 
-This gives you, in one pass: every worktree (path, branch, dirty count, sample
-files, ahead/behind) and every local branch''s staleness (`merged` = true /
+`git_hygiene` gives you, in one pass: every worktree (path, branch, dirty count,
+sample files, ahead/behind) and every local branch''s staleness (`merged` = true /
 false / null-unknown, with PR number). Do not re-derive any of this by hand —
 consume it. If `gh` was unavailable the JSON says so (`gh_available: false`);
 treat every `merged: null` as **unknown**, not safe.
+
+`shell_liveness` tells you which shells have a live harness session *right now*
+(read from `/proc` cwd — instant, self-cleaning, no staleness). You are running
+this, so your OWN session shows up as the repo-root session (`is_self`) — that is
+**expected, not a blocker**. The gate is about *other* shells (see Tier C).
 
 ## Step 2 — Triage into three tiers
 
@@ -1099,17 +1119,16 @@ make this the careful tier:
    Use it in the trailer: `Co-Authored-By: <display_name> (super-coder) <noreply@…>`.
 2. **Liveness.** Committing files is itself non-destructive, but moving a
    *mid-session* shell''s worktree onto a new feature branch underneath it stomps
-   that live session. There is **no reliable liveness timestamp in the DB**
-   (`shell_memory_archives` carries only a date). So:
-   - Best-effort process probe (hint, not proof):
-     ```bash
-     ls -la /proc/*/cwd 2>/dev/null | grep ''.sc-worktrees/<shortname>''
-     ```
-   - The real gate is the **FnB''s confirmation that the shell is idle.** Ask,
-     per worktree. If unconfirmed or the probe shows a live process → **surface
-     only, do not act.**
+   that live session. `shell_liveness.py` settles this authoritatively — read its
+   verdict for the worktree''s shell:
+   - **`safe_to_clean_all: true`** — you are the only live shell; every worktree
+     is dormant → clear to act on all of them.
+   - **shortname in `active_other_shells`** — that shell is LIVE → **surface
+     only, do not touch its tree.** The others remain safe.
+   - **`indeterminate > 0`** — a harness process whose cwd you couldn''t read
+     (another OS user, say). Do **not** assume all-clear → surface.
 
-When cleared to preserve another shell''s worktree (idle-confirmed):
+When the verdict clears a worktree (its shell is not live), preserve it:
 ```bash
 WT=.sc-worktrees/<shortname>
 git -C $WT checkout -b <type>/<short-desc>           # feature branch off its HEAD
@@ -1119,8 +1138,21 @@ Co-Authored-By: <display_name> (super-coder) <noreply@…>"
 git -C $WT push -u origin <type>/<short-desc>
 gh pr create --repo <owner/repo> --head <type>/<short-desc> --fill   # open, never merge
 ```
-Then tell the FnB what branch the worktree now sits on, so the owning shell
-isn''t surprised on its next boot.
+
+3. **Tell the shell what you did in its tree.** A shell must never boot to find
+   its worktree silently rearranged. After acting, message the owning shell (see
+   the `messaging` skill) so it discovers the change on its next boot:
+   ```bash
+   sqlite3 .super-coder/shell_db.db <<''SQL''
+   PRAGMA foreign_keys=ON;
+   INSERT INTO shell_messages (from_shell_id, to_shell_id, body)
+   VALUES (<admin shell_id>,
+           (SELECT shell_id FROM shells WHERE shortname=''<shortname>'' AND COALESCE(is_deleted,0)=0),
+           ''git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.'');
+   SQL
+   ```
+   Also report the same to the FnB. If the worktree could not be acted on (shell
+   was live, or indeterminate), no message — it was left untouched.
 
 ## Hard nevers
 
