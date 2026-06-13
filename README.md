@@ -475,11 +475,15 @@ per-launch and never written back — so two terminals can run the **same** shel
 different harnesses at once (one Claude Code, one OpenCode). A fork with a single
 harness on `PATH` skips the prompt.
 
-**`make`.** The source repo ships a thin root `Makefile` that delegates to
-`./sc` (`make launch` / `make enter` / `make enter s=cc` / `make down`). It is
-source-repo ergonomics only — `install.py` checks out `.super-coder` + `sc`, not
-the `Makefile`, so it never propagates to a fork or clobbers a fork's own
-`Makefile`. In a fork, use `./sc <cmd>` (or alias it in your own `Makefile`).
+**`make`.** Every command has a `make sc-<name>` alias; the hot ones also get a
+letter — `sc-e` (enter), `sc-l` (launch), `sc-r` (restart), `sc-d` (down),
+`sc-u` (update), `sc-t` (test) — and `sc-h` / `sc-help` list / describe them.
+`make sc-e s=cc` boots one shell directly; `make sc ARGS=<cmd>` is the
+passthrough. The targets live in `.super-coder/aliases.mk`, which **travels with
+the engine** — install wires a fork to `include` it, and because **every target
+is `sc-`prefixed it can't collide** with the fork's own `test` / `build` /
+`install`. The source repo's thin root `Makefile` just includes the same file;
+`./sc <cmd>` is always identical.
 
 ## Dev kit
 

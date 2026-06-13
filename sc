@@ -279,6 +279,7 @@ case "$cmd" in
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running" ;;
+  restart)      "$0" down; exec "$0" launch "$@" ;;
   build)        dcheck; dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
@@ -315,6 +316,7 @@ super-coder — forkable shell substrate
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
   ./sc down                stop + remove the sandbox container
+  ./sc restart             down + launch — recreate the sandbox fresh
   ./sc build               (re)build the sandbox image
   ./sc logs                tail the sandbox server logs
 

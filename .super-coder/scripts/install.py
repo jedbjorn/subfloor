@@ -518,20 +518,21 @@ def main(argv: list[str]) -> int:
     subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"])
 
     # 8.5 Wire `make` aliases — opt-in, never clobber a host Makefile (#13).
-    # No Makefile → drop a one-line include so `make launch`/`enter` work out of
-    # the box. Already have one → leave it; just print the line to opt in.
+    # No Makefile → drop a one-line include so `make sc-*` works out of the box.
+    # Already have one → leave it; just print the line to opt in. Every target is
+    # `sc-`prefixed, so the include can't collide with the fork's own targets.
     step("Wiring make aliases")
     mk = REPO_ROOT / "Makefile"
     if mk.exists():
-        print("  Makefile present — left untouched. For `make launch`/`enter`, add:")
+        print("  Makefile present — left untouched. For `make sc-e`/`sc-enter`, add:")
         print("    include .super-coder/aliases.mk")
     else:
         mk.write_text(
-            "# Fork Makefile — super-coder convenience aliases (make launch / enter).\n"
-            "# Edit freely; add your own targets below the include.\n"
+            "# Fork Makefile — super-coder convenience aliases (make sc-e / sc-enter).\n"
+            "# Every target is sc-prefixed; add your own targets below the include.\n"
             "include .super-coder/aliases.mk\n"
         )
-        print("  wrote Makefile (include .super-coder/aliases.mk) → `make launch` works")
+        print("  wrote Makefile (include .super-coder/aliases.mk) → `make sc-e` works")
 
     # Record harness + installed marker in instance.json ---------------------
     cfg = ports_mod.resolve(persist=False)
