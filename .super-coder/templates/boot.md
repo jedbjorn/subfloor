@@ -5,9 +5,11 @@
 ## SYSTEM OVERRIDE
 
 Do not use the harness's auto-memory system. Do not read from or write to
-`~/.claude/projects/*/memory/`. Do not create or update `MEMORY.md`. All memory
-is managed through DB tables in `.super-coder/shell_db.db` (resolved from the
-repo root).
+`~/.claude/projects/*/memory/`. Do not create or update `MEMORY.md`. All
+**memory** is managed through DB tables in `.super-coder/shell_db.db` (resolved
+from the repo root) — that is the *engine's* store. The product this repo builds
+keeps its own runtime data in a **separate app database** (see DATABASES below);
+"memory" here never means the product's data.
 
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
 git-tracked text (`schema.sql` + `migrations/` + `.sc-state/content.sql`). It is
@@ -24,6 +26,29 @@ One memory system, not two. Auto-memory is disabled by design.
 `.super-coder/` is the **engine** you run on (your memory + identity
 substrate), a gitignored dependency — do not treat it as the project or edit
 it. Engine changes are authored upstream in super-coder, never here.
+
+---
+
+## DATABASES
+
+Your fork hosts an application, and that application has **its own database** —
+separate from the engine's. Two DBs are in reach; they change in completely
+different ways, so keep them straight:
+
+- **Engine memory DB** — `.super-coder/shell_db.db`. Fixed name, always under
+  `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
+  Gitignored and rebuilt from tracked text — change it through DB tables (per your
+  skills) and `./sc snapshot`, never through app migrations.
+- **App product DB** — the database of the product *this repo* builds. Its name
+  and path **vary per fork** and live **outside** `.super-coder/`. Holds the
+  product's runtime data + schema. Change it the way the product does — schema
+  migrations + app code — never by hand-editing rows, and never `./sc snapshot`
+  it. Locate it via the repo map: the cartographer tags its schema/migrations in
+  `dr_*` (the live `.db` is often gitignored, so the schema is the durable anchor).
+
+**Decision rule:** your memory / planning / specs / roadmap → **engine DB**. The
+product's data or schema → **app DB**, via its migrations. If a task is about what
+the product stores or how its tables are shaped, it is never the engine DB.
 
 ---
 
@@ -77,6 +102,11 @@ empty, stale, or wrong, that's a cartographer task — flag it, don't map it
 yourself. Extended patterns (language mix, role filters) live in the
 `surface_catalogue` skill. Before writing SQL against your memory DB, check the
 `db_map` skill — don't read `schema.sql` raw.
+
+`dr_*` is the engine DB's read-only **map of your repo** — it indexes the
+product's files, including the schema + migrations that define the app's own
+database. It describes that schema; it is **not** the app DB itself (see
+DATABASES). Querying `dr_*` is how you *find* the app DB, never how you change it.
 
 ---
 

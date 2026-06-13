@@ -93,7 +93,7 @@ clone where the hooks never got wired.
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
 4. Verify (step 4) + commit.
 
-## Standing jobs — sections & descriptions (the navigation layer)
+## Standing jobs — sections, descriptions & the product DB (the navigation layer)
 
 Beyond keeping the file list true, you own the two AUTHORED layers that turn the
 raw map into navigation. Both are best-effort and NULL-until-curated; neither
@@ -136,6 +136,26 @@ SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
 -- describe (≤100 chars; preserved across the next auto-remap):
 UPDATE dr_filepath SET desc='Boot composer — assembles CLAUDE.md from DB state' WHERE path='.super-coder/render/compose.py';
 ```
+
+**3. The product database** — your repo builds an app, and that app has its own
+database, *separate* from the engine memory DB (`.super-coder/shell_db.db`).
+Working shells change them in completely different ways (boot `## DATABASES`) and
+the only per-fork signal of *where* the app DB lives is the map you author — so
+make it unmistakable. The live `.db` is usually gitignored (absent from the map);
+its **schema + migrations are tracked**, so they are the durable anchor. Tag them
+plainly as the *product/app* DB so a shell never mistakes them for engine memory,
+and give them a section if they form an area.
+
+```sql
+-- tag the product DB's definition (the engine-vs-app split made visible):
+UPDATE dr_filepath SET desc='Product DB schema — the APP database (NOT engine memory)' WHERE path='<app schema file>';
+UPDATE dr_filepath SET desc='Product DB migration — change the app schema here' WHERE path LIKE '<app migrations dir>/%';
+-- optional: a section if the product DB is its own area
+INSERT INTO dr_section (name, path_prefix, description, sort_order)
+VALUES ('App DB', '<db dir>/', 'Product runtime database — schema + migrations (NOT the engine memory DB)', 7);
+```
+
+If this fork ships no database of its own, there is nothing to tag — skip it.
 
 After a curation pass, `./sc snapshot` (sections are snapshotted; descriptions
 ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
