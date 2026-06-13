@@ -26,7 +26,7 @@ tools, the model API are the harness's job. We own identity + memory + content
 and render a boot artifact the harness reads natively.
 
 ```mermaid
-graph LR
+graph TD
   DB[(shell DB)]:::class1 --> REN[render chain]:::class2
   REN --> BOOT[CLAUDE.md / AGENTS.md]:::class2
   BOOT --> H[harness loop]:::class3
