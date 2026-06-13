@@ -112,6 +112,8 @@ product's files, including the schema + migrations that define the app's own
 database. It describes that schema; it is **not** the app DB itself (see
 DATABASES). Querying `dr_*` is how you *find* the app DB, never how you change it.
 
+{{map_discrepancy}}
+
 ---
 
 ## MESSAGING
