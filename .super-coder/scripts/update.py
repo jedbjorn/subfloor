@@ -72,6 +72,7 @@ ENGINE_PATHS = [
     ".super-coder/aliases.mk",
     ".super-coder/Dockerfile",
     ".super-coder/schema.sql",
+    ".super-coder/map_schema.sql",
     ".super-coder/ecosystem.config.cjs",
     ".super-coder/README.md",
     ".super-coder/migrations",
