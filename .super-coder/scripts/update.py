@@ -250,6 +250,11 @@ def main(argv: list[str]) -> int:
         no_fetch = True
     else:
         migrate_engine_untrack()  # one-time B7: untrack the engine (idempotent)
+        # Top up the fork's .gitignore with any engine ignore rules added since it
+        # was installed (e.g. the map DB cache /.sc-state/map.db) — line-additive,
+        # so an already-installed fork never silently commits a new derived cache.
+        if install_mod.ensure_gitignore():
+            print("→ .gitignore: added engine ignore rule(s) for this release")
 
     if no_fetch:
         print("→ --no-fetch: reconciling against the current working tree "
