@@ -16,6 +16,22 @@ from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
+
+# Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
+# map and heals discrepancies directly — telling it to report them to itself is
+# nonsense). Mirrors the cartographer skill's "shape:" notice contract, but for a
+# map that is *wrong* rather than newly-grown. Substituted into the
+# `{{map_discrepancy}}` slot in boot.md; stripped clean for the cartographer.
+MAP_DISCREPANCY_BLOCK = (
+    "**If the map is wrong, you report it — you never fix it (you don't map).** A "
+    "discrepancy is the map being stale, missing a file, mis-sectioning an area, or "
+    "contradicting the repo. On finding one: (1) surface the gap to the FnB; (2) "
+    "message the cartographer naming what's off and where — `--message send "
+    "cartographer \"map gap: <what's off> — paths: <region/>. heal.\"`; (3) tell the "
+    "FnB to **boot the cartographer shell** to update the map. Then keep working "
+    "from what the map *does* show — healing it is the cartographer's job, on its "
+    "next boot."
+)
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 
@@ -206,6 +222,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     bootstrapped = con.execute(
         "SELECT bootstrapped FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
     flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
+    # Map-discrepancy protocol: every working shell reports a wrong map (it never
+    # maps); the cartographer owns the fix, so the block is stripped from its boot.
+    if flavor == "cartographer":
+        template = template.replace("\n{{map_discrepancy}}\n", "")
+    else:
+        template = template.replace("{{map_discrepancy}}", MAP_DISCREPANCY_BLOCK)
     # The repo catalogue lives in its own db now; open it read-only for the
     # CONNECTIONS block + map status. None when the repo isn't mapped yet.
     map_con = open_map_ro()
