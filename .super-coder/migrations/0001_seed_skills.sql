@@ -193,9 +193,16 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
   that `./sc map-setup` wires. This is the routine refresh; no shell touches it.
 - **`./sc rebuild`** re-maps too (the map is a derived cache; rebuilding the DB
   rebuilds it). So a fresh rebuild never leaves an empty map.
-- **You** set the per-repo *config*, install the hook wiring, and repair it.
-  Hooks can''t catch uncommitted local restructuring, and `core.hooksPath` is
-  unset on a fresh clone until `map-setup` runs — that gap is what you heal.
+- **Hourly cron** — pm2 runs `sc-map-<repo>` on a `cron_restart` schedule
+  (`.super-coder/ecosystem.config.cjs`), re-mapping every hour while the stack is
+  up (`./sc up`). This is the belt to the hooks'' suspenders: it catches
+  uncommitted local restructuring the git hooks can''t see, so the map stays live
+  unattended. Verify it: `pm2 list | grep sc-map` (state cycles stopped→online on
+  each tick — that''s the one-shot pattern, not a crash).
+- **You** set the per-repo *config*, install the hook wiring, build the
+  extractors, and repair all of it. `core.hooksPath` is unset on a fresh clone
+  until `map-setup` runs, and a fork that doesn''t run pm2 has no cron — the git
+  hooks still cover those, and a manual `./sc map` always works.
 
 ## First boot — configure mapping for THIS repo
 

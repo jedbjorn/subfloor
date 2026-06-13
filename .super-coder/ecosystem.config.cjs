@@ -36,5 +36,21 @@ module.exports = {
       max_restarts: 5,
       env: { PYTHONUNBUFFERED: "1" },
     },
+    {
+      // Hourly repo remap — keeps the map (.sc-state/map.db) live between the
+      // git-hook remaps (which only fire on pull / checkout / rebase). The belt
+      // to the hooks' suspenders: it catches uncommitted local restructuring the
+      // hooks can't see. One-shot per tick — autorestart:false so pm2 runs
+      // map_repo, lets it exit, and cron_restart relaunches it on schedule. The
+      // cartographer owns the map; this keeps it fresh unattended while the stack
+      // is up (the hooks still cover forks that don't run pm2).
+      name: `sc-map-${cfg.repo}`,
+      script: path.join(ENGINE, "scripts/map_repo.py"),
+      interpreter: py,
+      cwd: REPO_ROOT,
+      autorestart: false,
+      cron_restart: "7 * * * *",
+      env: { PYTHONUNBUFFERED: "1" },
+    },
   ],
 };
