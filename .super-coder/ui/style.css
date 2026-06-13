@@ -10,6 +10,7 @@
   --ink: #e8e8ec; --dim: #9a9aa5;
   --accent: #6ea8fe; --accent2: #26262e;
   --ok: #4caf7d; --warn: #d4914a; --lock: #6a6a75;
+  --task-open: #c46a1a;                          /* dark sunset yellow-orange — feature has open spec tasks */
   --menu-bg: #2e2e35; --menu-border: #3a3a42;
   --menu-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   --r: 14px; font-synthesis: none;
@@ -64,6 +65,18 @@ main { padding: 1.2rem; }
    cards — past the max-width instead of truncating. Clamp the track to 0. */
 .view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
+
+/* ── Tight card rhythm (Skills / Roadmap / Docs / Flags) ────────────────────
+   Stacked card panels on these tabs sit a small 5px apart. Section headers
+   (funnel stages, skill categories) keep enough room to read as group labels;
+   only the card-to-card spacing tightens. */
+#view-roadmap .bucket > details.feature + details.feature { margin-top: 5px; }
+#view-docs .card + .card { margin-top: 5px; }
+#view-flags { gap: 5px; }
+#view-flags .flagbar { margin-bottom: calc(1rem - 5px); }   /* restore bar→cards spacing */
+#view-skills { gap: 5px; }
+#view-skills > .muted:first-child { margin-bottom: calc(1rem - 5px); }  /* intro keeps room */
+#view-skills .bucket > h2 { margin-top: 0; }                 /* header rides on its own card */
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
@@ -129,6 +142,18 @@ details.feature > summary:hover { background: var(--accent2); }
 details.feature[open] > .feature-preview { display: none; }
 .feature-body { padding: 0 1.1rem 1.1rem; }
 .feature-body > .act:first-of-type { margin-top: .2rem; }
+
+/* spec-task side bar — colours the card's left edge by plan completion. These
+   sit after the [open] rule above so they win the border-color cascade. */
+details.feature.has-tasks { border-left-width: 4px; }
+details.feature.tasks-done { border-left-color: var(--ok); }
+details.feature.tasks-open { border-left-color: var(--task-open); }
+.task-list { list-style: none; margin: .2rem 0 .4rem; padding: 0; }
+.task-list li { display: flex; gap: .5rem; align-items: baseline; padding: .2rem 0; font-size: .85rem; }
+.task-list li .box { flex: none; color: var(--dim); }
+.task-list li.wip .box { color: var(--task-open); }
+.task-list li.done { color: var(--dim); text-decoration: line-through; }
+.task-list li.done .box { color: var(--ok); text-decoration: none; }
 .search { margin: 0 0 1rem; }
 .filters { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
 .chip {
