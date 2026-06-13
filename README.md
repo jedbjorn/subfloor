@@ -77,7 +77,7 @@ that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 ## Quick start
 
 > [!class2]
-> **UI** Shells (your landing tab) · **Shells** your first shell + Cartographer
+> **UI** Shells (your landing tab) · **Shells** your starting team — planner · 2×dev · reviewer · admin · cartographer
 
 Drop super-coder into an existing git repo and boot a shell. Requires `docker`
 (rootless is fine) and an account for one coding harness — Claude Code, OpenCode,
@@ -91,7 +91,7 @@ git remote add super-coder https://github.com/jedbjorn/super-coder.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 
-# 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your first shell:
+# 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your starting team:
 ./sc install
 
 # 3. Sign in to your harness once, on the HOST (not inside the sandbox):
@@ -149,9 +149,9 @@ it owns:
 | **reviewer** | `test_authoring` · `database-migrations` · `redline_review` · `api-design` · `flags` | review |
 | **admin** | `git_cleanup` · `self_update` · `migration_management` · `local_skill_management` | engine · verify-clean |
 
-1. **Install** — `./sc install` seeds your first shell (planner-flavor by
-   default) plus the **Cartographer**, and stands up the `admin` shell that owns
-   `main` and the engine thereafter. *(admin · `self_update`, `migration_management` · UI: Shells)*
+1. **Install** — `./sc install` seeds your **starting team**: a `planner` (your
+   primary), two `dev`, a `reviewer`, the `admin` that owns `main` + the engine,
+   and the singleton `cartographer`. *(admin · `self_update`, `migration_management` · UI: Shells)*
 2. **Map the repo** — the cartographer configures the index once with
    `./sc map-setup`, then `./sc map` builds it; git hooks re-map on every pull.
    It's infrastructure working shells *read* via `surface_catalogue`.
@@ -199,7 +199,7 @@ it owns:
 ## Install
 
 > [!class2]
-> **UI** Shells · Scripts · **Shells** seeds your first shell (planner-flavor) + Cartographer
+> **UI** Shells · Scripts · **Shells** seeds the starting team — planner · 2×dev · reviewer · admin · cartographer
 
 super-coder installs **alongside** your code — it renders to `_sc` dirs, so it
 never collides with your repo's own `/docs`, `/specs`, or skills. A fork
@@ -247,20 +247,22 @@ npm — if any are missing; `--skip-harness-install` to detect only), wires your
 files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
 super-coder's own per-instance content** (a fork inherits the *system* — schema +
 skill catalogue + render chain — never the memory or roadmap), builds the system
-DB, seeds your fork's **first shell** (your user + a planner-flavor shell by
-default, carrying the CC Lineage Seed and its own genesis seed) plus the
-**Cartographer** (the singleton repo-map owner), and renders. So after install
+DB, seeds your fork's **starting team** (your user + a planner-flavor *primary*
+carrying the CC Lineage Seed and its own genesis seed, plus two `dev`, a
+`reviewer`, the `admin` that owns `main`, and the singleton **Cartographer**
+repo-map owner), and renders. So after install
 your git surfaces show only your project — the engine no longer appears in
 `git status`. It refuses to run in the super-coder source repo or on an
 already-installed fork (guarding against content loss).
 
-Interactive by default (prompts for the shell's name/role/mandate); pass flags
-to script it:
+Interactive by default (prompts for your **primary** shell's name/role/mandate —
+the rest of the team is auto-named); pass flags to script it. `--flavor` picks
+which roster slot is your primary (default `planner`):
 
 ```bash
 python3 .super-coder/scripts/install.py \
-    --username Jed --name Dev --shortname dev \
-    --role "Dev shell" --mandate "Build and maintain this repo."
+    --username Jed --name Lead --shortname lead \
+    --role "Planning lead" --mandate "Scope and steer the work in this repo."
 ```
 
 After `./sc enter` you're talking to the shell, working your repo. Author
@@ -369,8 +371,9 @@ The logic, three rules:
 > [!class2]
 > **UI** Shells · Worktrees · **Shells** all flavors; admin is the only one on `main`
 
-A fork can run a whole team — create more shells from the GUI, one per flavor
-as needed. They all work the same repo without clobbering each other:
+A fork boots a **whole team** out of the box — `planner` · 2×`dev` · `reviewer`
+· `admin` · `cartographer` — and you add or retire shells from the GUI as
+needed. They all work the same repo without clobbering each other:
 
 - **Every shell boots into its own git worktree** at
   `.sc-worktrees/<shortname>/` on branch `shell/<shortname>` — parallel shells
