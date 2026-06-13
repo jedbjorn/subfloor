@@ -101,7 +101,9 @@ sqlite3 .sc-state/map.db "SELECT manager, name, version FROM dr_dependency;"
 
 Map first, grep second; lazy-load only what the map points at. If the map looks
 empty, stale, or wrong, that's a cartographer task — flag it, don't map it
-yourself. Extended patterns (language mix, role filters) live in the
+yourself. Extended patterns (language mix, role filters) and the
+semantic layer — `dr_endpoint` / `dr_db_table` / `dr_route`, present when the
+cartographer has wired an extractor for this stack — live in the
 `surface_catalogue` skill. Before writing SQL against your memory DB, check the
 `db_map` skill — don't read `schema.sql` raw.
 

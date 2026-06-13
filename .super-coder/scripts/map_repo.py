@@ -20,6 +20,7 @@ descriptions + sections are the B5 navigation layer.
 from __future__ import annotations
 
 import fnmatch
+import importlib.util
 import json
 import re
 import sqlite3
@@ -231,6 +232,45 @@ def seed_sections(con: sqlite3.Connection) -> None:
             "VALUES (?, ?, NULL, ?)", (d, d + "/", i))
 
 
+def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[str]:
+    """Run fork-owned extractor plug-ins after the core map pass.
+
+    The engine maps the generic 80% (files/deps/env). The semantic, per-repo
+    dimensions — HTTP endpoints, the app DB schema, UI routes — vary by stack, so
+    a fork owns them as drop-in modules in `.sc-state/map_extractors/*.py` (kept
+    outside the gitignored engine dir, so `./sc update` never clobbers them). The
+    cartographer adopts the right one for this repo's stack (reference extractors
+    ship in the engine's `templates/map_extractors/`).
+
+    Contract: each module defines `extract(con, repo_root, cfg) -> str`. `con` is
+    the live MAP db (dr_filepath is already populated + committed, so an extractor
+    reads it to find its inputs); it DELETEs + repopulates its own dr_* table(s),
+    like the core does for derived tables. The returned string is a short summary
+    for the map log. Each call is guarded — a broken extractor is logged and
+    skipped, never failing the map (the auto-remap hook must stay robust)."""
+    ext_dir = repo_root / ".sc-state" / "map_extractors"
+    if not ext_dir.is_dir():
+        return []
+    summaries: list[str] = []
+    for path in sorted(ext_dir.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"map_ext_{path.stem}", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            fn = getattr(mod, "extract", None)
+            if fn is None:
+                summaries.append(f"{path.stem}: no extract() — skipped")
+                continue
+            result = fn(con, repo_root, cfg) or "ok"
+            con.commit()
+            summaries.append(f"{path.stem}: {result}")
+        except Exception as e:  # noqa: BLE001 — an extractor must never fail the map
+            summaries.append(f"{path.stem}: FAILED ({e})")
+    return summaries
+
+
 def main() -> int:
     # The map lives in its OWN db (.sc-state/map.db), not shell_db.db. connect()
     # creates + schema-applies a fresh one and seeds its authored layer (sections
@@ -312,10 +352,14 @@ def main() -> int:
              git("rev-parse", "--abbrev-ref", "HEAD"), files,
              datetime.now().isoformat(timespec="seconds")))
         con.commit()
+        # Fork-owned semantic extractors (endpoints / db schema / routes), if any.
+        ext_summaries = run_extractors(con, REPO_ROOT, cfg)
         msg = f"map_repo: {files} files, {deps} deps, {envs} env vars → dr_* ({REPO_ROOT.name})"
         if truncated:
             msg += f"  ⚠ stopped at MAX_FILES={MAX_FILES}"
         print(msg)
+        for s in ext_summaries:
+            print(f"map_repo: extractor {s}")
     finally:
         con.close()
     return 0

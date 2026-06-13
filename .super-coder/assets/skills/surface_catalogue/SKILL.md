@@ -25,6 +25,15 @@ don't map it yourself.
 | `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
 | `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
 | `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
+| `dr_endpoint` | HTTP routes: `method`, `path`, `handler` (file:line), `framework`, `source_file` |
+| `dr_db_table` / `dr_db_column` | the app DB schema: tables/views + their columns (`type`, `pk`, `not_null`) |
+| `dr_route` / `dr_component` | UI routes (`path`, `kind`) + components (`name`, `path`) |
+
+The first five are mapped on **every** repo. The last three are the **semantic
+layer** — populated only when the cartographer has wired an extractor for this
+repo's stack (see the `cartographer` skill). An empty `dr_endpoint` means *no
+extractor wired*, not "no endpoints" — check before relying on it, and flag the
+cartographer if a dimension you need is missing.
 
 ## Orient fast
 
@@ -58,6 +67,12 @@ SELECT path FROM dr_filepath WHERE path LIKE '%auth%';
 -- stack + config surface:
 SELECT manager, name, version FROM dr_dependency ORDER BY manager, name;
 SELECT name, source_file FROM dr_env ORDER BY name;
+
+-- semantic layer (only if an extractor is wired for this repo — see cartographer):
+SELECT method, path, handler FROM dr_endpoint ORDER BY path;            -- the API surface
+SELECT name, kind, source_file FROM dr_db_table ORDER BY name;          -- the app DB schema
+SELECT name, type, pk, not_null FROM dr_db_column WHERE table_name='users';
+SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI routes
 ```
 
 ## Stance
@@ -70,6 +85,8 @@ SELECT name, source_file FROM dr_env ORDER BY name;
   mis-classified — that's the cartographer's to fix. Raise it; don't re-map.
   A file under "other / unsectioned", or a `desc IS NULL` where you needed one,
   is also a cartographer worklist item — flag it, don't author the map yourself.
-- Maps files / deps / env + the navigation layer (sections + per-file
-  descriptions). Symbol-level semantics (functions/classes) are a later pass —
-  until then, read the code the section + descriptions point you at.
+- Always maps files / deps / env + the navigation layer (sections + per-file
+  descriptions). The semantic layer (endpoints / DB schema / UI routes) is there
+  when the cartographer wired an extractor for this stack — query it to jump
+  straight to the API surface or schema; fall back to section + descriptions when
+  a dimension is empty. Symbol-level semantics (functions/classes) are a later pass.
