@@ -124,7 +124,7 @@ Install :::class1 -> Map :::class2 -> Spec :::class1 -> Build :::class1 -> Revie
 ```
 
 ```mermaid
-graph LR
+graph TD
   I[Install]:::class1 --> C[Map the repo]:::class2
   C --> S[Spec it]:::class1
   S --> D[Build in dev]:::class1
