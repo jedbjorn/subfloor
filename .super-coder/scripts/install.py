@@ -296,13 +296,36 @@ _GITIGNORE_BLOCK = f"""
 """
 
 
-def ensure_gitignore() -> bool:
-    gi = REPO_ROOT / ".gitignore"
+def _required_ignores() -> list[str]:
+    """The ignore PATTERNS in the block (path lines, not comments). Single source
+    of truth — adding a line to _GITIGNORE_BLOCK above is enough for both fresh
+    installs and `./sc update` top-ups."""
+    return [ln.strip() for ln in _GITIGNORE_BLOCK.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def ensure_gitignore(repo_root: Path = REPO_ROOT) -> bool:
+    """Ensure the host repo's .gitignore covers every engine-derived path.
+
+    First install (marker absent): append the full annotated block. On a fork
+    that already has the block, **top up** any patterns added in later releases
+    (e.g. the map DB cache `/.sc-state/map.db`) — line-additive, so a fork that
+    picks up new engine ignore rules via `./sc update` self-heals instead of
+    silently committing a churning derived cache. Returns True if it changed."""
+    gi = repo_root / ".gitignore"
     existing = gi.read_text() if gi.exists() else ""
-    if _GITIGNORE_MARKER in existing:
+    if _GITIGNORE_MARKER not in existing:
+        with gi.open("a") as f:
+            f.write(("" if existing.endswith("\n") or not existing else "\n") + _GITIGNORE_BLOCK)
+        return True
+    present = {ln.strip() for ln in existing.splitlines()}
+    missing = [p for p in _required_ignores() if p not in present]
+    if not missing:
         return False
     with gi.open("a") as f:
-        f.write(("" if existing.endswith("\n") or not existing else "\n") + _GITIGNORE_BLOCK)
+        f.write(("" if existing.endswith("\n") else "\n")
+                + "# super-coder — engine ignore rules added by `./sc update`\n"
+                + "\n".join(missing) + "\n")
     return True
 
 
