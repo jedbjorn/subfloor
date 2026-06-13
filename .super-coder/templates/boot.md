@@ -71,8 +71,10 @@ any per-shell prompt loads, before any query runs.
 
 Find things by querying the repo map — not by reading or grepping the tree. The
 `dr_*` tables are a scan of this repo, kept fresh for you (a cartographer shell
-owns and heals them; you read, you don't map), in `.super-coder/shell_db.db`
-(SQLite):
+owns and heals them; you read, you don't map). They live in `.sc-state/map.db`
+(SQLite) — your **repo map**, a *separate database* from your memory
+(`.super-coder/shell_db.db`). Query the map db for `dr_*`; never look for `dr_*`
+in the memory db:
 
 | Table | Holds |
 |---|---|
@@ -87,14 +89,14 @@ you need. Section-first, one cheap query deep — never a full preload.
 
 ```
 # where to start (also rendered in ## CONNECTIONS below):
-sqlite3 .super-coder/shell_db.db \
+sqlite3 .sc-state/map.db \
   "SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;"
 # a section's files — descriptions tell you which to open:
-sqlite3 .super-coder/shell_db.db \
+sqlite3 .sc-state/map.db \
   "SELECT path, desc, lines FROM dr_filepath WHERE path LIKE '<prefix>%' ORDER BY path;"
 # find by area / stack / env:
-sqlite3 .super-coder/shell_db.db "SELECT path FROM dr_filepath WHERE path LIKE '%auth%';"
-sqlite3 .super-coder/shell_db.db "SELECT manager, name, version FROM dr_dependency;"
+sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE path LIKE '%auth%';"
+sqlite3 .sc-state/map.db "SELECT manager, name, version FROM dr_dependency;"
 ```
 
 Map first, grep second; lazy-load only what the map points at. If the map looks

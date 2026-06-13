@@ -22,6 +22,7 @@ only (or the drift we're killing comes back). `<self>` = your shell_id.
 
 ## 1. List what exists (from the map, not a blind walk)
 ```sql
+-- the map is its own db: sqlite3 .sc-state/map.db "<query>"
 SELECT path, lang, lines FROM dr_filepath WHERE role='doc' ORDER BY path;
 ```
 These are the repo's real docs (README, `docs/`, `specs/`, guides). The `_sc`

@@ -286,12 +286,14 @@ CREATE TABLE project_shells (
     UNIQUE (project_id, shell_id)
 );
 
--- ── Repo catalogue (dr_*) — the host repo, mapped ───────────────────────────
--- super-coder is dropped INTO a host repo; these tables are how the shell reads
--- that repo without grepping blind. Structure is system (ships in the baseline);
--- the ROWS are a derived cache of the host repo, populated by scripts/map_repo.py
--- (`make map`, run at install) — NOT snapshotted, re-mappable when the repo
--- changes. v1 maps files / deps / env; semantic tables (api/db/page) come later.
+-- ── Repo catalogue (dr_*) — VESTIGIAL, transition-only ──────────────────────
+-- The map moved to its OWN db (`.sc-state/map.db`, schema in `map_schema.sql`)
+-- so engine memory-schema changes never touch it. These definitions remain in
+-- shell_db.db for ONE release purely so a pre-split `.sc-state/content.sql`
+-- (which still carries `INSERT INTO dr_section …`) can load on a rebuild without
+-- erroring. map_repo no longer writes here; map_db.seed_authored() lifts any
+-- rows that land here into map.db on the first post-split map. Remove in a later
+-- release once all forks have re-snapshotted (dr_section → map_content.sql).
 
 CREATE TABLE dr_repo (
     repo_id        INTEGER PRIMARY KEY,

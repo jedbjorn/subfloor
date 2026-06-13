@@ -120,6 +120,7 @@ cartographer''s automation (see `surface_catalogue`). You read it.
    code lives, dependencies, env surface. Form a one-paragraph picture of what
    this repo *is* and how it''s built.
    ```sql
+   -- the repo map is its own db: sqlite3 .sc-state/map.db "<query>"
    SELECT name, default_branch, file_count FROM dr_repo;
    SELECT lang, COUNT(*) n FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
    SELECT path, lang, lines FROM dr_filepath WHERE role=''code'' ORDER BY lines DESC LIMIT 15;
@@ -175,6 +176,12 @@ Working shells *consume* the `dr_*` catalogue and never map (see
 `surface_catalogue`). Mapping — keeping that catalogue true to the repo — is
 yours alone. You do three things: **configure** how this repo is mapped,
 **wire** the automation that keeps it fresh, and **heal** both when they drift.
+
+The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
+engine memory db (`shell_db.db`) so an engine schema change never touches the
+map. Every `dr_*` query below runs against it: `sqlite3 .sc-state/map.db "…"`.
+Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
+`./sc snapshot` and reloaded on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
@@ -434,12 +441,15 @@ memory, and content live in tables — never flat files. **The `.db` is a cache:
 after any content write, `./sc snapshot` re-serializes to text (see the
 `snapshot` skill). Lazy-load: query for what you need, don''t bulk-read.
 
+The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
+(see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
+memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
+
 ## Tables
 
 | Table | Holds | Write rule |
 |---|---|---|
 | `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `lineage_seed`, `active_archive_id`. (`connections`/`workspace` retired — boot `## CONNECTIONS` is derived from the `dr_*` map, not authored here) | UPDATE in place |
-| `dr_section` | the navigation index — `name`, `path_prefix`, `description`; rendered in boot `## CONNECTIONS`. Cartographer-authored | INSERT/UPDATE (cartographer) |
 | `shell_identity_entries` | seed (cap 10) + L&S (`kind=''lns''`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
 | `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
@@ -595,8 +605,8 @@ In super-coder the **DB owns document bodies** — never loose `.md` files. A
 
 Before writing, see what exists — don''t duplicate:
 ```sql
-SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;
-SELECT path FROM dr_filepath WHERE role=''doc'';   -- the repo''s own docs (surface_catalogue)
+SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;  -- shell_db.db
+sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- repo''s own docs (map db)
 ```
 
 ## Author
@@ -1358,6 +1368,7 @@ only (or the drift we''re killing comes back). `<self>` = your shell_id.
 
 ## 1. List what exists (from the map, not a blind walk)
 ```sql
+-- the map is its own db: sqlite3 .sc-state/map.db "<query>"
 SELECT path, lang, lines FROM dr_filepath WHERE role=''doc'' ORDER BY path;
 ```
 These are the repo''s real docs (README, `docs/`, `specs/`, guides). The `_sc`
@@ -1787,7 +1798,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# surface_catalogue — read the repo from the map, not by grepping
 
 super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
-repo — query them first to orient, instead of walking the tree blind.
+repo — query them first to orient, instead of walking the tree blind. They live
+in the **map db**, `.sc-state/map.db` — a *separate* file from your memory db
+(`.super-coder/shell_db.db`). Query that file: `sqlite3 .sc-state/map.db "…"`.
 
 You do **not** map the repo. The map is kept fresh for you automatically (git
 hooks re-map on pull / branch-switch / rebase) and is owned by the
@@ -1811,6 +1824,7 @@ names + descriptions) → read the one or two files you need. Section-first, one
 cheap query deep — never a full preload.
 
 ```sql
+-- all of these run against the map db:  sqlite3 .sc-state/map.db "<query>"
 -- the section index (same as boot CONNECTIONS) — where to start:
 SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
 

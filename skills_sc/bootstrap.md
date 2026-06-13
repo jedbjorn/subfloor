@@ -30,6 +30,7 @@ cartographer's automation (see `surface_catalogue`). You read it.
    code lives, dependencies, env surface. Form a one-paragraph picture of what
    this repo *is* and how it's built.
    ```sql
+   -- the repo map is its own db: sqlite3 .sc-state/map.db "<query>"
    SELECT name, default_branch, file_count FROM dr_repo;
    SELECT lang, COUNT(*) n FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
    SELECT path, lang, lines FROM dr_filepath WHERE role='code' ORDER BY lines DESC LIMIT 15;

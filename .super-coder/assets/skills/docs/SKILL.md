@@ -22,8 +22,8 @@ In super-coder the **DB owns document bodies** — never loose `.md` files. A
 
 Before writing, see what exists — don't duplicate:
 ```sql
-SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;
-SELECT path FROM dr_filepath WHERE role='doc';   -- the repo's own docs (surface_catalogue)
+SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;  -- shell_db.db
+sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
 ```
 
 ## Author
