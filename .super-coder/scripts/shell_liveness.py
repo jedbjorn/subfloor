@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Shell-liveness snapshot — which shells have a LIVE harness session right now,
+read straight from the OS in one pass from a single vantage. The read-side
+companion to git_cleanup: before the admin touches another shell's worktree it
+must know that shell is dormant.
+
+Why the OS and not the DB: there is no liveness flag in shell_db.db
+(shell_memory_archives carries only a date), and run.py ends in
+`os.chdir(work_dir); os.execvpe(...)` — the launcher BECOMES the harness, cwd
+pinned to the shell's worktree, leaving no exit hook to clear a bool. A persisted
+flag would go stale on `kill -9` or reboot. That same exec hands us a clean,
+self-cleaning signal instead: a live harness process is one whose cwd sits inside
+a worktree. The process dies → the signal vanishes. No cron, no persistence, no
+staleness window. Reporting only, by design — like git_hygiene.py, it surfaces
+state and never mutates.
+
+Mechanism (Linux): scan /proc/<pid>/{comm,cwd}. A process whose comm is one of the
+fork's harness binaries (adapters/*/adapter.json `launch[0]`) and whose cwd is
+under THIS repo is a live shell session:
+  • cwd == repo root            → the admin itself (the one shell that boots in
+                                  root, not a worktree)
+  • cwd under .sc-worktrees/<n> → the shell whose shortname.lower() == <n>
+
+The admin runs this (directly or as a child of its own harness), so its OWN
+session always appears — identified by `is_self` (PPID walk from our pid up to a
+harness ancestor) and by the repo-root cwd. The admin being active is EXPECTED;
+the gate is about OTHER shells. `active_other_shells == []` ⇒ the admin is the
+only live shell ⇒ every worktree is dormant ⇒ safe to clean all.
+
+Permissions: /proc/<pid>/cwd is readable only for same-user processes. A harness
+owned by another OS user is counted but unreadable → `indeterminate`. When
+`indeterminate > 0` the admin must NOT assume all-clear — surface instead.
+
+Non-Linux: /proc is absent; compute() returns supported=False. Fall back to
+`lsof -a +D <worktree>` / `ps`. The substrate host is Linux.
+
+Run standalone:
+    python3 .super-coder/scripts/shell_liveness.py            # JSON
+    python3 .super-coder/scripts/shell_liveness.py --text     # human table
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+ENGINE = Path(__file__).resolve().parents[1]
+REPO_ROOT = ENGINE.parent
+ADAPTERS = ENGINE / "adapters"
+DB_PATH = ENGINE / "shell_db.db"
+PROC = Path("/proc")
+
+_FALLBACK_BINS = {"claude", "codex", "opencode", "vibe"}
+
+
+def harness_binaries() -> set[str]:
+    """The fork's harness launch binaries, from adapters/*/adapter.json `launch[0]`.
+    /proc/<pid>/comm is truncated to 15 chars — harness names are short, but we
+    truncate the expected set to match so a long name would still compare."""
+    bins: set[str] = set()
+    if ADAPTERS.is_dir():
+        for d in ADAPTERS.iterdir():
+            cfg = d / "adapter.json"
+            if not cfg.is_file():
+                continue
+            try:
+                launch = json.loads(cfg.read_text()).get("launch") or []
+            except (json.JSONDecodeError, OSError):
+                continue
+            if launch:
+                bins.add(Path(launch[0]).name)
+    bins |= _FALLBACK_BINS
+    return {b[:15] for b in bins}
+
+
+def _read(p: Path) -> str:
+    try:
+        return p.read_text()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _ppid(pid: int) -> int | None:
+    """Parent pid from /proc/<pid>/stat. comm (field 2) may contain spaces and
+    parens, so split after the final ')': state, ppid, ... follow."""
+    data = _read(PROC / str(pid) / "stat")
+    rp = data.rfind(")")
+    if rp == -1:
+        return None
+    rest = data[rp + 2:].split()
+    try:
+        return int(rest[1])              # rest[0]=state, rest[1]=ppid
+    except (IndexError, ValueError):
+        return None
+
+
+def _self_harness_pid(harness_pids: set[int]) -> int | None:
+    """Walk the PPID chain from this process up to the first harness ancestor —
+    that is the admin's own session driving this scan."""
+    pid: int | None = os.getpid()
+    seen: set[int] = set()
+    while pid and pid not in seen and pid > 1:
+        seen.add(pid)
+        if pid in harness_pids:
+            return pid
+        pid = _ppid(pid)
+    return None
+
+
+def _shell_labels() -> dict[str, dict]:
+    """shortname.lower() → {shortname, flavor, display_name} from the DB, for
+    friendlier output. Best-effort: missing/locked DB just means no labels."""
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT shortname, flavor, display_name FROM shells "
+            "WHERE COALESCE(is_deleted,0)=0 AND shortname IS NOT NULL").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return {}
+    return {r["shortname"].lower(): dict(r) for r in rows}
+
+
+def compute() -> dict:
+    """Live shell-liveness snapshot. Pure read — never mutates."""
+    if not PROC.is_dir():
+        return {
+            "supported": False,
+            "note": "/proc unavailable (non-Linux) — fall back to "
+                    "`lsof -a +D <worktree>` / `ps`.",
+            "repo": {"name": REPO_ROOT.name, "root": str(REPO_ROOT)},
+        }
+
+    bins = harness_binaries()
+    root = REPO_ROOT.resolve()
+    wt_base = (REPO_ROOT / ".sc-worktrees").resolve()
+    labels = _shell_labels()
+
+    # First pass: every harness process and its raw pid/comm (cwd resolved next).
+    harness_pids: set[int] = set()
+    raw: list[tuple[int, str]] = []
+    for entry in PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        comm = _read(entry / "comm").strip()
+        if comm and comm in bins:
+            pid = int(entry.name)
+            harness_pids.add(pid)
+            raw.append((pid, comm))
+
+    self_pid = _self_harness_pid(harness_pids)
+
+    processes: list[dict] = []
+    worktree_sessions: dict[str, list[int]] = {}
+    indeterminate_pids: list[int] = []
+    admin_root_pids: list[int] = []
+
+    for pid, comm in raw:
+        try:
+            cwd = os.readlink(PROC / str(pid) / "cwd")        # absolute target
+        except (PermissionError, FileNotFoundError, OSError):
+            indeterminate_pids.append(pid)                    # foreign user / gone
+            continue
+        cwdp = Path(cwd).resolve()
+        try:
+            rel = cwdp.relative_to(root)                      # in THIS repo?
+        except ValueError:
+            continue                                          # another repo — ignore
+        parts = rel.parts
+        if len(parts) >= 2 and parts[0] == ".sc-worktrees":
+            shortname = parts[1]                              # worktree dir = shortname.lower()
+            region = "worktree"
+            worktree_sessions.setdefault(shortname, []).append(pid)
+        else:
+            shortname = None                                  # repo root (or a subdir of it)
+            region = "root"
+            admin_root_pids.append(pid)
+        processes.append({
+            "pid": pid,
+            "comm": comm,
+            "cwd": str(cwdp),
+            "region": region,
+            "shortname": shortname,
+            "display_name": (labels.get(shortname or "", {}).get("display_name")),
+            "is_self": pid == self_pid,
+        })
+
+    active_other = sorted(worktree_sessions)
+    indeterminate = len(indeterminate_pids)
+    return {
+        "supported": True,
+        "repo": {"name": REPO_ROOT.name, "root": str(REPO_ROOT)},
+        "harness_binaries": sorted(bins),
+        "self_pid": self_pid,
+        "processes": processes,
+        "worktree_sessions": worktree_sessions,
+        "active_other_shells": active_other,
+        "admin_root_pids": admin_root_pids,
+        "indeterminate": indeterminate,
+        "indeterminate_pids": indeterminate_pids,
+        # The gate: only the admin is live AND nothing is unreadable.
+        "safe_to_clean_all": not active_other and indeterminate == 0,
+    }
+
+
+def is_active(shortname: str, snap: dict | None = None) -> bool:
+    """Convenience for the admin gate: is THIS shell's worktree live right now?"""
+    snap = snap or compute()
+    return shortname.lower() in {s.lower() for s in snap.get("active_other_shells", [])}
+
+
+def _print_text(d: dict) -> None:
+    if not d.get("supported"):
+        print(f"{d['repo']['name']}: liveness unsupported — {d.get('note','')}")
+        return
+    print(f"{d['repo']['name']}   harnesses={','.join(d['harness_binaries'])}"
+          f"   self_pid={d['self_pid']}")
+    print("\nLIVE HARNESS SESSIONS")
+    if not d["processes"]:
+        print("  (none — no harness cwd'd inside this repo)")
+    for p in d["processes"]:
+        who = (f"{p['display_name']} ({p['shortname']})" if p["shortname"]
+               else "admin / repo root")
+        tags = []
+        if p["is_self"]:
+            tags.append("SELF")
+        tag = f"  [{', '.join(tags)}]" if tags else ""
+        print(f"  pid {p['pid']:<7} {p['comm']:<9} {p['region']:<9} {who}{tag}")
+        print(f"            {p['cwd']}")
+    if d["indeterminate"]:
+        print(f"\n⚠ {d['indeterminate']} harness process(es) with unreadable cwd "
+              f"(other OS user?): pids {d['indeterminate_pids']} — liveness "
+              f"INDETERMINATE; do not assume all-clear.")
+    print("\nVERDICT")
+    if d["active_other_shells"]:
+        print(f"  Live OTHER shells: {', '.join(d['active_other_shells'])}"
+              f"  → surface those worktrees; do NOT act on them.")
+        if not d["indeterminate"]:
+            print("  All other worktrees are dormant → safe to clean.")
+    elif d["indeterminate"]:
+        print("  No live other shells seen, but indeterminate>0 → surface, "
+              "do not assume safe.")
+    else:
+        print("  Admin is the only live shell → safe to clean ALL worktrees.")
+
+
+def main(argv: list[str]) -> int:
+    d = compute()
+    if "--text" in argv:
+        _print_text(d)
+    else:
+        print(json.dumps(d, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
