@@ -1,4 +1,19 @@
+---
+title: super-coder
+tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
+date: 2026-06-13
+project: super-coder
+purpose: Forkable shell substrate for a repo
+---
+
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/main/README.md)
+
 # super-coder
+
+## Overview
+
+> [!class2]
+> **UI** all eight Review-GUI tabs · **Shells** planner · reviewer · dev · cartographer · admin
 
 A **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
@@ -10,10 +25,36 @@ The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
 and render a boot artifact the harness reads natively.
 
+```mermaid
+graph LR
+  DB[(shell DB)]:::class1 --> REN[render chain]:::class2
+  REN --> BOOT[CLAUDE.md / AGENTS.md]:::class2
+  BOOT --> H[harness loop]:::class3
+  H --> REPO[your repo]:::class4
+  DB -.serialize.-> SQL[.sc-state/content.sql]:::class2
+```
+
 This repo is also **dogfood**: super-coder maintains super-coder. Its own
 `.super-coder/` engine manages the maintainer shell that builds it.
 
-## Layout
+```stats
+:::class1
+value: 4
+label: Coding harnesses
+description: Claude · Codex · OpenCode · Vibe
+:::class3
+value: 5
+label: Shell flavors
+description: planner · reviewer · dev · cartographer · admin
+:::class2
+value: 8
+label: Review-GUI tabs
+:::class2
+value: 88xx
+label: Per-repo port band
+```
+
+### Layout
 
 ```
 .super-coder/         the engine — a gitignored, materialized DEPENDENCY in a
@@ -34,6 +75,9 @@ not committed source, exactly like `node_modules/`. The one fork-owned artifact
 that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 
 ## Quick start
+
+> [!class2]
+> **UI** Shells (your landing tab) · **Shells** your first shell + Cartographer
 
 Drop super-coder into an existing git repo and boot a shell. Requires `docker`
 (rootless is fine) and an account for one coding harness — Claude Code, OpenCode,
@@ -62,21 +106,90 @@ git add -A && git commit -m "chore: install super-coder"
 ```
 
 That's the happy path. Each step is covered in depth below — installer internals,
-harness sign-in, the docker modes, and the localhost review GUI.
+harness sign-in, the docker modes, and the localhost review GUI. For the full
+arc from a fresh repo through ship-and-loop, see *The loop*, next.
 
-## Install into an existing repo
+## The loop
+
+> [!class2]
+> **UI** Roadmap → Flags → Docs → Worktrees → Map · **Shells** cartographer · planner · dev · reviewer · admin
+
+The everyday cycle a fork runs once it's installed. Each role is a **shell**
+(its flavor sets its model defaults — see *Harnesses & models*); you move between
+them with `./sc enter-<shortname>`. Work flows dev → review → operator-merge,
+then freezes into specs and docs, and the cartographer re-maps the new shape.
+
+```linear
+Install :::class1 -> Map :::class2 -> Spec :::class1 -> Build :::class1 -> Review :::class2 -> Freeze :::class3 -> Verify :::class3
+```
+
+```mermaid
+graph LR
+  I[Install]:::class1 --> C[Map the repo]:::class2
+  C --> S[Spec it]:::class1
+  S --> D[Build in dev]:::class1
+  D --> R[Send to review]:::class2
+  R -->|issues| D
+  R -->|clean| M[Operator merges]:::class4
+  M --> F[Freeze + docs]:::class3
+  F --> V[Verify clean]:::class3
+  V --> C
+```
+
+1. **Install** — `./sc install` seeds your first shell (planner-flavor by
+   default) plus the **Cartographer**, and stands up the `admin` shell that owns
+   `main`. *(UI: Shells)*
+2. **Map the repo** — the cartographer configures the index once with
+   `./sc map-setup`, then `./sc map` builds it; git hooks re-map on every pull.
+   The map is infrastructure working shells *consume*. *(UI: Map)*
+3. **Spec it** — in the **planner** shell, the `spec` skill turns a roadmap
+   feature into a spec document and a checklist of `spec_tasks`: viability,
+   blockers, the staged plan. *(UI: Roadmap)*
+4. **Switch to dev** — `./sc enter-dev` boots the **dev** shell into its own git
+   worktree on `shell/dev`, a base pinned to `origin/main`. *(UI: Shells)*
+5. **Plan the build** — dev loads `blueprint` to decompose the spec into an
+   ordered task list (Prep → steps → Verification gates) written back as
+   `spec_tasks`. *(UI: Roadmap)*
+6. **Implement across sessions** — dev cuts a feature branch off `shell/dev`,
+   writes code + tests, runs `./sc test`, and commits. `current_state` carries
+   "last task / next task" across session boundaries, so successive sessions
+   resume cleanly. *(UI: Shells)*
+7. **Send to review** — dev pushes and opens a PR (the `git` skill is
+   branch → commit → push → **PR → stop**; dev never merges), then messages the
+   reviewer. *(UI: Flags)*
+8. **Review, send back** — the **reviewer** shell (a *different lineage* than the
+   code — defaults to Opus — so it isn't blind to the author's mistakes) reads
+   the diff against the spec, opens flags for failures, and messages dev back.
+   *(UI: Flags)*
+9. **Patch notes + test** — dev addresses the flags, re-runs `./sc test`, and
+   re-pushes; the review thread closes when it's clean.
+10. **Operator merges** — merging is the FnB's gate, never a shell's. On dev's
+    next boot the launcher auto-syncs the base onto `origin/main` and prunes the
+    merged branch. *(UI: Worktrees)*
+11. **Freeze spec + write docs** — on ship, the spec freezes (`frozen=1`,
+    immutable; the next stage opens a fresh `seq`) and the feature doc is authored
+    via the `docs` skill. `./sc render` writes read-only `specs_sc/` + `docs_sc/`.
+    *(UI: Docs)*
+12. **Verify git trees clean** — `./sc snapshot` + `./sc render`, then
+    `./sc render-check` (committed `_sc` must match the DB render) and
+    `./sc verify` (rebuild + headless boot). The admin shell's git-hygiene pass
+    confirms every worktree is clean and merged branches are pruned. *(UI: Worktrees)*
+13. **Re-map** — the cartographer re-runs (auto on pull, or `./sc map`) so the
+    index reflects the new shape — and the loop turns to the next feature.
+    *(UI: Map)*
+
+## Install
+
+> [!class2]
+> **UI** Shells · Scripts · **Shells** seeds your first shell (planner-flavor) + Cartographer
 
 super-coder installs **alongside** your code — it renders to `_sc` dirs, so it
 never collides with your repo's own `/docs`, `/specs`, or skills. A fork
 inherits the **system** (schema + the skill catalogue + the render chain), never
 super-coder's own memory or roadmap.
 
-> Requirements: `docker` — the default run mode is a sandbox container, so the
-> harness's "allow everything" is safe (the kernel is the boundary; the
-> container sees only this repo + your harness creds). The image bakes the rest:
-> `python3`, `sqlite3`, `git`, `curl`, and the four harness CLIs. No docker? The
-> `./sc serve` + `./sc boot` primitives run on the host with only `python3` +
-> `sqlite3` (and a harness on `PATH`).
+> [!class4]
+> **Requirements: `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the four harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with only `python3` + `sqlite3` (and a harness on `PATH`).
 
 **Docker mode — rootless is the default.** `./sc doctor` checks your docker.
 Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen
@@ -136,7 +249,10 @@ After `./sc enter` you're talking to the shell, working your repo. Author
 memory, roadmap, and specs into the DB; `./sc snapshot` (+ `./sc render`)
 serializes back to the text git tracks.
 
-## Sign in to your harness (on the host)
+## Harness sign-in
+
+> [!class2]
+> **UI** — host auth, no GUI · **Shells** any (the harness is a per-launch pick)
 
 The harnesses are just CLIs — `./sc install` (and `./sc update`, `./sc
 ensure-harness`) install the binaries, but you authenticate each **once, on the
@@ -154,30 +270,23 @@ vibe --setup                # Mistral Vibe — stores the API key (or export MIS
 `~/.codex`, `~/.vibe`), so host auth flows straight into the container — **you
 never sign in inside the sandbox.** Authenticate on the host, then `./sc enter`.
 
-> **Vibe creds.** `vibe --setup` stores your key under `~/.vibe`, which the
-> sandbox now mounts — so Vibe works inside the container like the others. If you
-> instead use the env-var path, `export MISTRAL_API_KEY` on the host before
-> `./sc launch` and it's forwarded in (only when set). Re-run `./sc launch` after
-> first authenticating, so the mount picks up `~/.vibe`.
+> [!class4]
+> **Sign in on the host, not inside the sandbox.** OAuth logins spin up a localhost callback server (Codex uses `:1455`). Run the login on the **host** so your browser's callback reaches it — from *inside* the sandbox that port isn't published, so the browser gets `ERR_CONNECTION_REFUSED`.
 
-> **⚠ Sign in on the host, not inside the sandbox.** OAuth logins spin up a
-> localhost callback server (Codex uses `:1455`). Run the login on the **host** so
-> your browser's callback reaches it. Logging in from *inside* the sandbox fails —
-> that port isn't published, so the browser gets `ERR_CONNECTION_REFUSED`.
+> [!class2]
+> **Vibe creds.** `vibe --setup` stores your key under `~/.vibe`, which the sandbox now mounts — so Vibe works inside the container like the others. Prefer the env-var path? `export MISTRAL_API_KEY` on the host before `./sc launch` and it's forwarded in (only when set). Re-run `./sc launch` after first authenticating, so the mount picks up `~/.vibe`.
 
-> **OpenCode is the exception.** Its `opencode auth login` for **API-key**
-> providers is a paste-the-key prompt, not an OAuth callback, so it works at
-> **either level** — run it on the host *or* from inside the container (`./sc
-> enter`). Because `~/.config/opencode` + `~/.local/share/opencode` are bind-mounted
-> read-write, a key entered on either side lands in the same `auth.json` and is
-> available to both. (OAuth-based OpenCode providers still follow the host rule
-> above.)
+> [!class2]
+> **OpenCode is the exception.** Its `opencode auth login` for **API-key** providers is a paste-the-key prompt, not an OAuth callback, so it works at **either level** — host or inside the container (`./sc enter`). Because `~/.config/opencode` + `~/.local/share/opencode` are bind-mounted read-write, a key entered on either side lands in the same `auth.json`. (OAuth-based OpenCode providers still follow the host rule above.)
 
 A note on Codex models: driven by a **ChatGPT account** (not an API key), Codex
 exposes `gpt-5.5` and `gpt-5.4-mini` — the flavor defaults are set to those.
 Plain API-only ids (e.g. `gpt-5.4`) return a 400 on a ChatGPT account.
 
-## Harnesses, plans & model choice
+## Harnesses & models
+
+> [!class2]
+> **UI** Shells (flavor model defaults) · **Shells** all five flavors
 
 ### Prefer a subscription plan over a raw API key
 
@@ -234,12 +343,13 @@ The logic, three rules:
   one shell that maintains `main` (see *How shells share one repo*, next)
   defaults premium on Codex.
 
-> **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch
-> seam — it selects its own via `active_model` in `~/.vibe/config.toml`
-> (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a
-> fourth column here.
+> [!class2]
+> **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch seam — it selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a fourth column here.
 
 ## How shells share one repo
+
+> [!class2]
+> **UI** Shells · Worktrees · **Shells** all flavors; admin is the only one on `main`
 
 A fork can run a whole team — create more shells from the GUI, one per flavor
 as needed. They all work the same repo without clobbering each other:
@@ -267,6 +377,9 @@ as needed. They all work the same repo without clobbering each other:
   — and the post-commit hook prints the shell's URL after each commit.
 
 ## Update a fork
+
+> [!class2]
+> **UI** Scripts (migrate · rebuild) · **Shells** admin
 
 Ship an improvement to super-coder, pull it into each fork — **in place**, with
 no loss of memory. The shell updates its own substrate: it pulls the new engine,
@@ -310,12 +423,13 @@ from the most recent pre-update backup, and re-materializes the engine at
 `.sc-state/engine.ref.prev`. Whole-restore, not a per-step schema reversal; the
 only data lost is anything written between the update and the rollback.
 
-**The contract:** every schema change *after* a fork exists ships as a
-`migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration
-ledger is what carries a delta across to an existing fork. Additive where you
-can make it.
+> [!class4]
+> **The contract:** every schema change *after* a fork exists ships as a `migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration ledger is what carries a delta across to an existing fork. Additive where you can make it.
 
 ## Run (everyday)
+
+> [!class2]
+> **UI** Scripts · Map (via `./sc preview`) · **Shells** all
 
 ```bash
 ./sc launch              # build + start the sandbox container (server + GUI), 127.0.0.1 only
@@ -351,6 +465,9 @@ the `Makefile`, so it never propagates to a fork or clobbers a fork's own
 
 ## Dev kit
 
+> [!class2]
+> **UI** Scripts · **Shells** dev (and any builder)
+
 Every sandbox bakes a **toolchain** — `rg`, `sqlite3`, `curl`, Node 22 / `npm`,
 and a Playwright + Chromium browser for E2E — but deliberately **not** your
 project's dependencies. Those you install per fork with `./sc deps`, which builds
@@ -381,11 +498,26 @@ instance instead. (The boot doc's `RUNNING THE APP` section and the `dev_kit` sk
 carry the full detail. For the FnB-facing review of a shell's UI changes, use
 `./sc preview` — see *How shells share one repo*.)
 
-## Review layer (localhost GUI)
+## Review GUI
+
+> [!class2]
+> **UI** this IS the GUI — Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Scripts · **Shells** reviewer (every shell reads it)
 
 A zero-dependency localhost GUI to review the substrate — shells, roadmap,
 flags. One stdlib Python server serves both the JSON API and a static UI; no
-venv, no npm, no build step.
+venv, no npm, no build step. Its eight tabs are the windows the workflow above
+refers to:
+
+| Tab | What it shows |
+|---|---|
+| **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
+| **Skills** | The skill catalogue (Repo · Substrate · Craft), with per-shell grant toggles and full content in a modal. |
+| **Roadmap** | Features in funnel buckets (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. |
+| **Docs** | Read-only `kind='doc'` documents; opens in md-converter for reading. |
+| **Flags** | The blocker / follow-up tracker, grouped by feature, filterable Open/Resolved/All. |
+| **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
+| **Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
+| **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it;
@@ -399,11 +531,8 @@ the one bind-mounted repo + creds. The port publishes to `127.0.0.1` only.
 ./sc ports     # show this fork's derived port
 ```
 
-**Ports are derived per repo**, never fixed — because a fork runs *inside* a
-host repo that may have its own dev server, and several forks can run at once.
-Each fork hashes its path to a stable port in the `88xx` band (clear of superCC
-8000 / dos-arch 8001 and common host ports), persisted to a gitignored
-`.super-coder/instance.json` you can hand-edit. Two forks won't collide.
+> [!class2]
+> **Ports are derived per repo**, never fixed — a fork runs *inside* a host repo that may have its own dev server, and several forks can run at once. Each fork hashes its path to a stable port in the `88xx` band (clear of superCC 8000 / dos-arch 8001 and common host ports), persisted to a gitignored `.super-coder/instance.json` you can hand-edit. Two forks won't collide.
 
 What you can do in the GUI: read everything; **create shells** (pick a flavor —
 the factory grants its skill set and opens its first session); edit a shell's
@@ -424,8 +553,8 @@ since it discards un-snapshotted DB edits).
 The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
 git-tracked text. See `.super-coder/README.md` for the full model.
 
-> Spec: the founding design lives in the roadmap (`super-coder` feature row) and
-> renders to `specs_sc/`.
+> [!class2]
+> **Spec:** the founding design lives in the roadmap (`super-coder` feature row) and renders to `specs_sc/`.
 
 ## License
 
