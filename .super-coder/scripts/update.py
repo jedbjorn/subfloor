@@ -282,8 +282,16 @@ def main(argv: list[str]) -> int:
     print("→ snapshot the live state")
     run_script("snapshot.py")
 
+    # Self-heal the make wiring: forks installed before the engine scripted this
+    # (or whose include was removed) get the `dos-*` aliases appended now. Source
+    # repo manages its own Makefile — skip it. Idempotent; a no-op if already wired.
+    if not source:
+        print("→ wire make aliases (dos- command standard)")
+        print(f"  {install_mod.wire_make_aliases()}")
+
     print("\nupdate: done — new floor laid in place; your rows are intact.")
-    print("  Review + commit: .sc-state/ (content.sql + engine.ref) + _sc renders.")
+    print("  Review + commit: .sc-state/ (content.sql + engine.ref) + _sc renders")
+    print("  (+ Makefile if the wiring step just appended the alias include).")
     print("  (The engine is gitignored — nothing under .super-coder/ to commit.)")
     print("  A bad update? `./sc rollback` restores the DB + engine together.")
     print("  Restart your session to boot onto the new floor.")

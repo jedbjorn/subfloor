@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,53 @@ IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs s
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import ports as ports_mod  # noqa: E402
+
+
+# --- make-alias wiring (shared by install + update) -------------------------
+ALIASES_INCLUDE = "-include .super-coder/aliases.mk"
+# Matches an existing include of the alias file in any form: hard `include` or
+# soft `-include`, with arbitrary surrounding whitespace.
+_ALIASES_RE = re.compile(r"^\s*-?include\s+\.super-coder/aliases\.mk\s*$", re.M)
+
+
+def wire_make_aliases(repo_root: Path | None = None) -> str:
+    """Ensure the fork's Makefile pulls in the engine's `dos-*` aliases.
+
+    The house `dos-` prefix is collision-proof by design — every alias target is
+    `dos-`prefixed — so wiring is safe to script rather than leave to the
+    operator. A fork almost always already has its own Makefile; #13 ("never
+    clobber a host Makefile") forbids *overwriting* it, not *appending* a single
+    additive, non-colliding `-include` line. So:
+
+      - no Makefile      → write a one-line one;
+      - Makefile present → append the include if missing, else leave it alone.
+
+    `-include` (not hard `include`) so a not-yet-materialized engine (fresh fork
+    clone before the first `./sc update`) is a silent no-op, never a fatal `make`
+    error. Idempotent — safe to call on every install AND every update. Returns a
+    one-line status for the caller to print.
+    """
+    mk = (repo_root or REPO_ROOT) / "Makefile"
+    if not mk.exists():
+        mk.write_text(
+            "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
+            "# Every target is dos--prefixed; add your own targets below the include.\n"
+            f"{ALIASES_INCLUDE}\n"
+        )
+        return "wrote Makefile (-include .super-coder/aliases.mk) → `make dos-e` works"
+    text = mk.read_text()
+    if _ALIASES_RE.search(text):
+        return "Makefile already wired (-include .super-coder/aliases.mk) — left as-is"
+    sep = "" if text.endswith("\n") else "\n"
+    mk.write_text(
+        text + sep
+        + "\n# super-coder convenience aliases (designs-OS 'dos-' command standard).\n"
+        + "# Appended by ./sc; every target is dos--prefixed so it can't collide with\n"
+        + "# this Makefile's own targets. Delete this line to opt out — `./sc <cmd>`\n"
+        + "# stays equivalent.\n"
+        + f"{ALIASES_INCLUDE}\n"
+    )
+    return "appended -include .super-coder/aliases.mk to existing Makefile → `make dos-e` works"
 
 # super-coder's own per-instance content — present in a freshly-pulled fork
 # because the git checkout brought it along. A fork must not inherit it.
@@ -584,22 +632,11 @@ def main(argv: list[str]) -> int:
     subprocess.run([PY, str(ENGINE / "scripts/snapshot.py")])
     subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"])
 
-    # 8.5 Wire `make` aliases — opt-in, never clobber a host Makefile (#13).
-    # No Makefile → drop a one-line include so `make dos-*` works out of the box.
-    # Already have one → leave it; just print the line to opt in. Every target is
-    # `dos-`prefixed, so the include can't collide with the fork's own targets.
+    # 8.5 Wire `make` aliases. The `dos-` prefix can't collide with the fork's own
+    # targets, so we append the include rather than leave it to the operator (#13
+    # forbids clobbering a host Makefile, not appending one non-colliding line).
     step("Wiring make aliases")
-    mk = REPO_ROOT / "Makefile"
-    if mk.exists():
-        print("  Makefile present — left untouched. For `make dos-e`/`dos-enter`, add:")
-        print("    include .super-coder/aliases.mk")
-    else:
-        mk.write_text(
-            "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
-            "# Every target is dos-prefixed; add your own targets below the include.\n"
-            "include .super-coder/aliases.mk\n"
-        )
-        print("  wrote Makefile (include .super-coder/aliases.mk) → `make dos-e` works")
+    print(f"  {wire_make_aliases()}")
 
     # Record harness + installed marker in instance.json ---------------------
     cfg = ports_mod.resolve(persist=False)
