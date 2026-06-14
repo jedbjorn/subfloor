@@ -74,7 +74,12 @@ RUN pip install --no-cache-dir "playwright==1.60.0" \
  && chmod -R a+rX /opt/ms-playwright
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
-RUN groupadd -g ${SC_GID} ${SC_USER} \
+# A host GID may already exist in the base image — notably macOS's primary GID 20
+# (`staff`) collides with Debian's pre-existing `dialout` group — so creating it
+# unconditionally fails the build there. Reuse an existing GID; only create when
+# absent. The group's *name* is irrelevant; only the numeric GID must match the
+# host for bind-mounted ownership to line up.
+RUN if ! getent group ${SC_GID} >/dev/null; then groupadd -g ${SC_GID} ${SC_USER}; fi \
  && useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}
 
 USER ${SC_USER}
