@@ -40,6 +40,7 @@ UI_DIR = ENGINE / "ui"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
+import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
@@ -217,25 +218,37 @@ def get_docs(con) -> dict:
         "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
 
 
-def get_map(con) -> dict:
+_EMPTY_MAP = {"repo": None, "total_files": 0, "by_lang": [],
+              "by_role": [], "deps": [], "env": []}
+
+
+def get_map() -> dict:
     """The dr_* repo catalogue, summarized — how the shell (and the FnB) sees
-    what's in the host repo."""
-    repo = con.execute("SELECT * FROM dr_repo WHERE repo_id=1").fetchone()
-    total = con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0]
-    return {
-        "repo": dict(repo) if repo else None,
-        "total_files": total,
-        "by_lang": rows(con.execute(
-            "SELECT lang, COUNT(*) AS n, COALESCE(SUM(lines),0) AS lines "
-            "FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC")),
-        "by_role": rows(con.execute(
-            "SELECT role, COUNT(*) AS n FROM dr_filepath GROUP BY role ORDER BY n DESC")),
-        "deps": rows(con.execute(
-            "SELECT manager, name, version, kind, source_file FROM dr_dependency "
-            "ORDER BY manager, name")),
-        "env": rows(con.execute(
-            "SELECT name, source_file FROM dr_env ORDER BY name")),
-    }
+    what's in the host repo. The catalogue lives in its OWN db (.sc-state/map.db),
+    separate from shell_db.db, so read it read-only there; degrade to an empty
+    'not mapped yet' shape when the fork hasn't been mapped."""
+    con = map_db.open_ro()
+    if con is None:
+        return dict(_EMPTY_MAP)
+    try:
+        repo = con.execute("SELECT * FROM dr_repo WHERE repo_id=1").fetchone()
+        total = con.execute("SELECT COUNT(*) FROM dr_filepath").fetchone()[0]
+        return {
+            "repo": dict(repo) if repo else None,
+            "total_files": total,
+            "by_lang": rows(con.execute(
+                "SELECT lang, COUNT(*) AS n, COALESCE(SUM(lines),0) AS lines "
+                "FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC")),
+            "by_role": rows(con.execute(
+                "SELECT role, COUNT(*) AS n FROM dr_filepath GROUP BY role ORDER BY n DESC")),
+            "deps": rows(con.execute(
+                "SELECT manager, name, version, kind, source_file FROM dr_dependency "
+                "ORDER BY manager, name")),
+            "env": rows(con.execute(
+                "SELECT name, source_file FROM dr_env ORDER BY name")),
+        }
+    finally:
+        con.close()
 
 
 def get_flags(con) -> dict:
@@ -610,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/docs":
                 return self._send(200, get_docs(con))
             if path == "/api/map":
-                return self._send(200, get_map(con))
+                return self._send(200, get_map())
             if path.startswith("/api/documents/"):
                 parts = path.strip("/").split("/")   # api documents {id} [open]
                 did = int(parts[2])
