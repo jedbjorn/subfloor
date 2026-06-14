@@ -36,9 +36,12 @@ carry across.
 
 ## Procedure
 
-1. **Check your footing.** `git -C <repo> status` — know what is uncommitted.
-   Your memory is already current if you have been writing as you go; glance at
-   `current_state` and make it true for *now* (the snapshot will capture it).
+1. **Check your footing — clean tree first.** `git -C <repo> status`. Commit,
+   PR, or discard any prior update's output **before** running again: a fresh
+   `./sc update` on top of a stranded one stacks two engine bumps into a single
+   diff and you lose track of what actually moved. Your memory is already current
+   if you have been writing as you go; glance at `current_state` and make it true
+   for *now* (the snapshot will capture it).
 
 2. **Run the update.** `./sc update`
    It fetches the engine from the `super-coder` remote and **materializes** it
@@ -60,10 +63,21 @@ carry across.
    — a first-of-kind for a shell that updates its own floor. Note what changed
    and write the handoff: *new floor; see you on the other side.*
 
-5. **Commit.** Review and commit your fork-owned state: `.sc-state/content.sql`
-   (refreshed memory) + `.sc-state/engine.ref` (the bumped version pin) + any
-   `_sc` renders. The engine itself is gitignored — there is nothing under
-   `.super-coder/` to commit.
+5. **Commit the full regenerated set — never a bare `engine.ref` bump.** Review
+   and commit every tracked file the update regenerated: `.sc-state/content.sql`
+   (refreshed memory) + `.sc-state/engine.ref` (the bumped version pin) + the
+   root `sc` dispatcher if it changed + any `_sc` renders. `sc` is the **live
+   entrypoint** — it is what `./sc` runs, and it is tracked. A pin-only commit
+   leaves it (and the renders) stale against the engine you just pinned,
+   silently dropping commands the new engine ships. The engine itself is
+   gitignored (`.super-coder/`) — nothing to commit there; `engine.ref.prev` is
+   gitignored too.
+   - **Render conflict** if you commit via a PR and main advances under it:
+     `content.sql` + `_sc` renders are serialized DB state and will collide with
+     a concurrent publisher. Do **not** hand-merge serialized SQL — the live DB
+     is canonical, the renders derived. Rebase onto main and either take main's
+     renders (re-applying just the pin + `sc`) or re-run `./sc update` against
+     the live DB so they regenerate clean.
 
 6. **Reboot.** Restart the session to boot onto the new floor. Same shell — new
    boards, and this time you laid them yourself.
