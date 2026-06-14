@@ -1,7 +1,7 @@
 ---
 title: super-coder
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
-date: 2026-06-13
+date: 2026-06-14
 project: super-coder
 purpose: Forkable shell substrate for a repo
 ---
@@ -79,9 +79,27 @@ that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 > [!class2]
 > **UI** Shells (your landing tab) · **Shells** your starting team — planner · 2×dev · reviewer · admin · cartographer
 
-Drop super-coder into an existing git repo and boot a shell. Requires `docker`
-(rootless is fine) and an account for one coding harness — Claude Code, OpenCode,
-Codex, or Mistral Vibe.
+### Preparation
+
+One-time host setup — get this right and the rest is `./sc install`. super-coder
+runs the harness in a **docker sandbox**; the installer bootstraps everything
+else. The host needs a container engine, a few base tools, and one signed-in
+coding harness.
+
+| Need | Arch Linux | macOS |
+|---|---|---|
+| **Container engine** | `sudo pacman -S docker`, then start a daemon — rootless default: `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker` | `brew install colima docker && colima start` (or Docker Desktop) |
+| **Base tools** | `sudo pacman -S git curl python sqlite` (usually already present) | `xcode-select --install` (git/curl); python3 + sqlite3 ship with macOS |
+| **Harness CLI** | installed for you by `./sc install` (`claude` · `opencode` · `codex` · `vibe`, native installers). Repair by hand: `curl -fsSL https://claude.ai/install.sh \| bash` | same — **and put `~/.local/bin` on your PATH** (a fresh macOS shell omits it) |
+| **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe; sign in once on the host (step 3) | same |
+
+> [!class4]
+> **The bar: a reachable docker daemon + a harness CLI on PATH.** `./sc doctor` reports the docker mode it finds (rootless / rootful) and the exact next command; `python3` + `sqlite3` are the only *hard* requirements (the engine runtime). **macOS PATH gotcha:** if `claude` reports *"missing or broken — run claude install to repair"*, the CLI installed fine but `~/.local/bin` isn't on your PATH. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc`), open a new shell, then `claude install`. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the host.
+
+### Install & launch
+
+With the prerequisites in place, drop super-coder into an existing git repo and
+boot a shell:
 
 ```bash
 cd your-repo                                                  # an existing git repo
