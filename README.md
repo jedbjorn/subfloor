@@ -501,15 +501,17 @@ per-launch and never written back — so two terminals can run the **same** shel
 different harnesses at once (one Claude Code, one OpenCode). A fork with a single
 harness on `PATH` skips the prompt.
 
-**`make`.** Every command has a `make sc-<name>` alias; the hot ones also get a
-letter — `sc-e` (enter), `sc-l` (launch), `sc-r` (restart), `sc-d` (down),
-`sc-u` (update), `sc-t` (test) — and `sc-h` / `sc-help` list / describe them.
-`make sc-e s=cc` boots one shell directly; `make sc ARGS=<cmd>` is the
-passthrough. The targets live in `.super-coder/aliases.mk`, which **travels with
-the engine** — install wires a fork to `include` it, and because **every target
-is `sc-`prefixed it can't collide** with the fork's own `test` / `build` /
-`install`. The source repo's thin root `Makefile` just includes the same file;
-`./sc <cmd>` is always identical.
+**`make`.** One prefix across the whole designs-OS family — `dos-` — so switching
+repos never changes the muscle memory. Every command has a `make dos-<name>`
+alias; the hot ones also get a letter — `dos-e` (enter), `dos-l` (launch),
+`dos-r` (restart), `dos-d` (down), `dos-u` (update), `dos-t` (test) — and
+`dos-h` / `dos-help` list / describe them. `make dos-e s=cc` boots one shell
+directly; `make dos ARGS=<cmd>` is the passthrough. The targets live in
+`.super-coder/aliases.mk`, which **travels with the engine** — install wires a
+fork to `include` it, and because **every target is `dos-`prefixed it can't
+collide** with the fork's own `test` / `build` / `install`. The source repo's
+thin root `Makefile` just includes the same file; the `./sc <cmd>` binary keeps
+its name and is always identical.
 
 ## Dev kit
 
