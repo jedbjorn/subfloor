@@ -198,8 +198,8 @@ quote only the inner *text*, not the shape brackets.
 Step 1 :::class1 -> Step 2 :::class2 -> Step 3 :::class3
 ```
 ````
-Steps separated by `->`, optional class via `:::classN`. Step text cap ≤24
-(fixed-size cards).
+Steps separated by `->`, optional class via `:::classN`. Steps render
+**vertically** — one per row, top→bottom (never horizontal). Step text cap ≤48.
 
 ## Never
 
