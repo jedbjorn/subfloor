@@ -405,9 +405,25 @@ def git_publish() -> dict:
     # 1. serialize the DB → git-tracked text + render the flat files.
     out.append(run_snapshot_render())
 
-    # 2. land on the rolling branch (created from HEAD on first publish; the
-    #    operator stays on it — editing lives on gui-content, main stays clean).
+    # publish borrows gui-content to commit/push, then returns the operator to
+    # the branch they started on. Parking them on gui-content silently was a
+    # footgun — later terminal/code work landed there unnoticed. main stays
+    # clean either way (the content commit lives on gui-content + its PR).
     cur = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    result = _git_publish_on_branch(cur, out)
+    now = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if now != cur:
+        back = _git("checkout", cur)
+        if back.returncode == 0:
+            result["output"] += f"\n\n↩ back on {cur}"
+        else:
+            result["output"] += (f"\n\n⚠ left on {now} — couldn't return to "
+                                  f"{cur}:\n{back.stderr.strip()}")
+    return result
+
+
+def _git_publish_on_branch(cur: str, out: list) -> dict:
+    # 2. land on the rolling branch (created from HEAD on first publish).
     if cur != PUBLISH_BRANCH:
         exists = _git("rev-parse", "--verify", "--quiet",
                       f"refs/heads/{PUBLISH_BRANCH}").returncode == 0
