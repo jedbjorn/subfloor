@@ -14,10 +14,15 @@ Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell alread
 exists. After it runs: `./sc snapshot`, then `./sc launch`. More shells (or
 fewer) are managed later via the GUI (also through the factory).
 
+Shells ship pre-named out of the box, so install asks for your username and
+nothing else — no shell-naming interview. Rename or add more flavored shells
+later via the GUI / create_shell.
+
 Usage:
-    python3 .super-coder/scripts/init_fork.py            # interactive
-    python3 .super-coder/scripts/init_fork.py \
-        --username Jed --name Lead --shortname lead --flavor planner
+    python3 .super-coder/scripts/init_fork.py                  # interactive: asks username only
+    python3 .super-coder/scripts/init_fork.py --username Jed   # fully non-interactive
+        # optional overrides (never prompted): --name --shortname --flavor
+        #                                       --role --mandate --partner
 """
 from __future__ import annotations
 
@@ -91,14 +96,16 @@ def main(argv: list[str]) -> int:
 
         username = need(a.username, "Your username")
         # Your primary shell — default planner (every fork needs a planner to
-        # scope the work). --flavor picks which roster slot is *yours* (the one
-        # interviewed for name/role/mandate); the rest of the team seeds with it.
+        # scope the work + carry the lineage seed). --flavor picks which roster
+        # slot is *yours*; the rest of the team seeds alongside it.
         flavor = a.flavor or "planner"
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
-        name = need(a.name, "Shell display name", flavor.capitalize())
-        # shortname is optional — omit it and create_shell auto-names <ABBR><n>
-        # from the flavor (e.g. PLN1). --shortname still overrides.
+        # Pre-named out of the box — no naming interview. The primary takes the
+        # flavor's default display name (e.g. "Planner"), exactly like the rest of
+        # the roster; create_shell auto-names the shortname <ABBR><n> (e.g. PLN1).
+        # --name/--shortname remain optional scripted overrides, never prompted.
+        name = a.name or flavor.capitalize()
         shortname = a.shortname or None
 
         con.execute(
