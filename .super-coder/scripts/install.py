@@ -32,6 +32,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -113,6 +115,67 @@ def _harness_installed(name: str) -> bool:
     return bool(shutil.which(name)) or HARNESS_BIN.get(name, Path("/nonexistent")).exists()
 
 
+# ── Harness install progress ─────────────────────────────────────────────────
+# A real %-bar isn't possible: the work is third-party installer scripts
+# (curl | bash) whose duration + byte counts we don't know. Instead, run each
+# with a live spinner + elapsed seconds so it never looks frozen, capture the
+# installer's (noisy) output, and surface it only on failure. TTY-gated: under
+# a pipe / CI we drop to plain "installing… / done" lines (no escape codes).
+
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _spin(name: str, label: str, stop: threading.Event, t0: float) -> None:
+    """Animate one spinner line in place until `stop` is set. TTY only."""
+    i = 0
+    while not stop.is_set():
+        frame = _SPIN_FRAMES[i % len(_SPIN_FRAMES)]
+        elapsed = int(time.monotonic() - t0)
+        sys.stdout.write(f"\r  {frame} {name:9} {label}…  {elapsed}s ")
+        sys.stdout.flush()
+        i += 1
+        stop.wait(0.1)
+
+
+def _run_harness_install(name: str, cmd: str, label: str) -> tuple[int, str, int]:
+    """Run one installer with a spinner (TTY) or a plain line (non-TTY). Captures
+    combined stdout+stderr (drained safely via communicate, so a chatty installer
+    can't deadlock on a full pipe). Returns (rc, captured_output, elapsed_s).
+    Prints no outcome line — the caller decides success and reports it."""
+    tty = sys.stdout.isatty()
+    t0 = time.monotonic()
+    if not tty:
+        print(f"  · {name:9} {label}…  ($ {cmd})", flush=True)
+    proc = subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    stop = threading.Event()
+    spinner = None
+    if tty:
+        spinner = threading.Thread(target=_spin, args=(name, label, stop, t0), daemon=True)
+        spinner.start()
+    out, _ = proc.communicate()
+    stop.set()
+    if spinner:
+        spinner.join()
+        sys.stdout.write("\r" + " " * 48 + "\r")  # wipe the spinner line
+        sys.stdout.flush()
+    return proc.returncode, out or "", int(time.monotonic() - t0)
+
+
+def _report_install(name: str, ok: bool, rc: int, out: str, elapsed: int,
+                    done: str, cmd: str) -> None:
+    """Print the per-harness outcome: a ✓ line on success, or a ✗ line plus the
+    tail of the captured installer output (the error usually lands last) + a
+    by-hand retry hint on failure."""
+    if ok:
+        print(f"  ✓ {name:9} {done}   {elapsed}s")
+        return
+    print(f"  ✗ {name:9} failed (rc={rc}) — installer output:")
+    for line in out.strip().splitlines()[-20:]:
+        print(f"  | {line}")
+    print(f"    ↪ retry by hand: {cmd}")
+
+
 def update_harnesses() -> dict[str, str]:
     """Force-update all harness CLIs by re-running their official native
     installers regardless of whether they're already present. Unlike
@@ -122,19 +185,16 @@ def update_harnesses() -> dict[str, str]:
     have_curl = bool(shutil.which("curl"))
     for name, cmd in HARNESS_INSTALL.items():
         if not have_curl:
-            print(f"  {name:9} ⚠ curl unavailable — update by hand: {cmd}")
+            print(f"  ⚠ {name:9} curl unavailable — update by hand: {cmd}")
             status[name] = "no-curl"
             continue
         present = _harness_installed(name)
         label = "updating" if present else "installing"
-        print(f"  {name:9} … {label}  ($ {cmd})")
-        rc = subprocess.run(["bash", "-c", cmd]).returncode
-        if rc == 0:
-            print(f"  {name:9} ✓ {'updated' if present else 'installed'}")
-            status[name] = "updated" if present else "installed"
-        else:
-            print(f"  {name:9} ⚠ installer returned rc={rc} — retry by hand: {cmd}")
-            status[name] = "failed"
+        done = "updated" if present else "installed"
+        rc, out, elapsed = _run_harness_install(name, cmd, label)
+        ok = rc == 0
+        _report_install(name, ok, rc, out, elapsed, done, cmd)
+        status[name] = done if ok else "failed"
     return status
 
 
@@ -147,21 +207,17 @@ def ensure_harnesses() -> dict[str, str]:
     have_curl = bool(shutil.which("curl"))
     for name, cmd in HARNESS_INSTALL.items():
         if _harness_installed(name):
-            print(f"  {name:9} ✓ already installed")
+            print(f"  ✓ {name:9} already installed")
             status[name] = "present"
             continue
         if not have_curl:
-            print(f"  {name:9} ⚠ missing, and curl is unavailable — install by hand: {cmd}")
+            print(f"  ⚠ {name:9} missing, and curl is unavailable — install by hand: {cmd}")
             status[name] = "no-curl"
             continue
-        print(f"  {name:9} … not found — installing  ($ {cmd})")
-        rc = subprocess.run(["bash", "-c", cmd]).returncode
-        if rc == 0 and _harness_installed(name):
-            print(f"  {name:9} ✓ installed")
-            status[name] = "installed"
-        else:
-            print(f"  {name:9} ⚠ install failed (rc={rc}) — retry by hand: {cmd}")
-            status[name] = "failed"
+        rc, out, elapsed = _run_harness_install(name, cmd, "installing")
+        ok = rc == 0 and _harness_installed(name)
+        _report_install(name, ok, rc, out, elapsed, "installed", cmd)
+        status[name] = "installed" if ok else "failed"
     fresh = [n for n, s in status.items() if s == "installed"]
     if fresh:
         dirs = sorted({str(HARNESS_BIN[n].parent) for n in fresh})
