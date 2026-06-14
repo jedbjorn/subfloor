@@ -337,11 +337,11 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 
 | Flavor | Job | Codex | Claude | OpenCode (open-weights) |
 |---|---|---|---|---|
-| **planner** | architecture, plans | `gpt-5.5` ★ | `opus` | `deepseek-v4-pro` |
-| **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `kimi-k2.6` |
-| **dev** | write the code | `gpt-5.4-mini` ★ | `sonnet` | `qwen3-coder:480b` |
+| **planner** | architecture, plans | `gpt-5.5` | `sonnet` ★ | `deepseek-v4-pro` |
+| **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `glm-5.1` |
+| **dev** | write the code | `gpt-5.4-mini` ★ | `sonnet` | `qwen3-coder-next` |
 | **cartographer** | map the repo | `gpt-5.4-mini` ★ | `haiku` | `gpt-oss:20b` |
-| **admin** | own the substrate, maintain `main` | `gpt-5.5` ★ | `sonnet` | `qwen3-coder:480b` |
+| **admin** | own the substrate, maintain `main` | `gpt-5.5` ★ | `sonnet` | `deepseek-v4-pro` |
 
 ★ = the harness the picker pre-selects for that flavor.
 
@@ -352,13 +352,18 @@ The logic, three rules:
   premium model. Dev and cartographer are *high-volume mechanical work* (bulk
   code, file mapping), where a fast, cheap, coding-tuned model wins on
   cost-per-token because the volume is highest.
-- **The reviewer runs a different lineage than the code it reviews.** It defaults
-  to **Claude (Opus)** so it isn't blind to the same mistakes a GPT model made
-  authoring the code — adversarial *diversity*, not a second opinion from the same
-  brain.
+- **Bookends default to Claude.** Planner (`sonnet`) and reviewer (`opus`) are the
+  two roles whose picker default is Claude, not Codex — these are the reasoning
+  bookends, and Claude is preferred for planning and adversarial review. The
+  reviewer in particular runs a *different lineage than the code it reviews*, so it
+  isn't blind to the same mistakes a GPT model made authoring it — adversarial
+  *diversity*, not a second opinion from the same brain.
 - **Three lineages, always.** Every flavor offers Codex (OpenAI), Claude
-  (Anthropic), and OpenCode (open-weights via Ollama) — pick any provider for any
-  role at launch.
+  (Anthropic), and OpenCode (open-weights via Ollama Cloud) — pick any provider for
+  any role at launch. The OpenCode column is constrained to **MIT- or
+  Apache-licensed** weights only (e.g. DeepSeek V4, GLM-5.1, Qwen3-Coder, gpt-oss);
+  Modified-MIT / unresolved-license models (Kimi, MiniMax) are excluded even when
+  available on the provider.
 - **Admin decisions carry real risk** (a wrong rollback is data loss), so the
   one shell that maintains `main` (see *How shells share one repo*, next)
   defaults premium on Codex.
