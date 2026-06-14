@@ -35,7 +35,7 @@ header {
   border-bottom: 1px solid var(--line); position: sticky; top: 0;
   background: var(--bg); z-index: 5;
 }
-h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: .2px; }
+h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: .2px; flex: 1 1 0; }
 h1 span { color: var(--dim); font-weight: 400; }
 h1 span::before { content: " / "; color: var(--line); }
 nav { display: flex; gap: 1.1rem; align-items: center; align-self: stretch; }
@@ -51,7 +51,9 @@ nav button.active::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
   background: var(--accent);
 }
-.tools { margin-left: auto; display: flex; align-items: center; gap: .8rem; }
+/* brand + tools are equal-flex side zones so nav centers on the window
+   midpoint — i.e. over the centered .view content column below it. */
+.tools { flex: 1 1 0; justify-content: flex-end; display: flex; align-items: center; gap: .8rem; }
 .status { color: var(--dim); font-size: .8rem; }
 #snapshot {
   background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
