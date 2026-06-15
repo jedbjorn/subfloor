@@ -92,8 +92,9 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    Spot-check that your `role_overrides` took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE 'cmd/%';`
 
-5. **Commit** the config + hooks (`git` skill), set your state, then
-   `UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;` and `./sc snapshot`.
+5. **Commit** the config + hooks (`git` skill), set your state
+   (`./sc mem state "…"`), then `./sc mem oriented` (sets `bootstrapped=1` +
+   snapshots).
 
 ## Heal — re-run any time the map looks wrong
 

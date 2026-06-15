@@ -133,13 +133,7 @@ gh pr create --repo <owner/repo> --head <type>/<short-desc> --fill   # open, nev
    its worktree silently rearranged. After acting, message the owning shell (see
    the `messaging` skill) so it discovers the change on its next boot:
    ```bash
-   sqlite3 .super-coder/shell_db.db <<'SQL'
-   PRAGMA foreign_keys=ON;
-   INSERT INTO shell_messages (from_shell_id, to_shell_id, body)
-   VALUES (<admin shell_id>,
-           (SELECT shell_id FROM shells WHERE shortname='<shortname>' AND COALESCE(is_deleted,0)=0),
-           'git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.');
-   SQL
+   ./sc mem message send <shortname> 'git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.'
    ```
    Also report the same to the FnB. If the worktree could not be acted on (shell
    was live, or indeterminate), no message — it was left untouched.

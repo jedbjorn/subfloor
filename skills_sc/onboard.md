@@ -35,30 +35,31 @@ For each doc, read the file and decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
+All writes here go through `./sc mem` (it guards the engine DB so the import never
+lands in the app DB, and snapshots each write).
+
 ## 3. Backfill the roadmap
 Create a feature for each coherent area/initiative the docs imply; set status by
 how built it is (`shipped` if done + documented, `near_term`/`brainstorm` if
 planned):
-```sql
-INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary)
-VALUES ('…', 'shipped', 0, <self>, '…');
+```
+./sc mem roadmap add "…" --status shipped --summary "…"
 ```
 
 ## 4. Ingest into `documents` (DB owns the body)
-```sql
--- general doc (no feature):
-INSERT INTO documents (kind, seq, title, body, render_path)
-VALUES ('doc', 1, 'README', '<file contents>', 'docs_sc/readme.md');
--- a feature's spec (link it):
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, 'spec', 1, '…', '<file contents>', 'specs_sc/….md');
+`--body-file` reads the real file straight into the body — no pasting:
 ```
-Paste the file's real contents into `body`. If a spec describes shipped work,
-freeze it (`frozen=1, frozen_date`).
+# general doc (no feature):
+./sc mem doc add "README" --kind doc --body-file ./README.md --render-path docs_sc/readme.md
+# a feature's spec (link it):
+./sc mem doc add "…" --kind spec --feature <id> --body-file ./path/to/spec.md --render-path specs_sc/….md
+```
+If a spec describes shipped work, freeze it: `./sc mem doc freeze <document_id>`.
 
-## 5. Render + persist
-`./sc render` (writes the `_sc` copies + frontmatter) then `./sc snapshot` (the
-bodies are per-instance content). Now the GUI's Docs/Roadmap tabs show the repo.
+## 5. Persist
+`./sc mem` already snapshots + renders after each write, so the `_sc` copies and
+the GUI's Docs/Roadmap tabs reflect the import as you go. (If you made any raw
+writes, run `./sc render && ./sc snapshot` once at the end.)
 
 ## 6. The host's original files — three exits (optional; coexist by default)
 The DB now holds the canonical copy. Because we render to `_sc/`, the originals

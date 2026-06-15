@@ -63,10 +63,8 @@ List these and ask the FnB before writing the plan.
 Hard stops — prior work not shipped, missing environment state, unresolved
 external dependency. Open a flag for each:
 
-```sql
-INSERT INTO flags (display_name, description, priority, feature_id, shell_id)
-VALUES ('<SC-###>', '[Spec] <what is blocked> | Blocker for: <feature title>',
-        'High', <feature_id>, <self>);
+```
+./sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
 ```
 
 Don't open flags for unclear items you can resolve by asking — ask first.
@@ -84,20 +82,20 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-```sql
-INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id)
-VALUES
-  (<feature_id>, <doc_id>, 0,   'Preparation',  'Read all relevant code paths, verify DB state, confirm entry points', <self>),
-  (<feature_id>, <doc_id>, 1,   '<Step 1>',     '<what it does>',                                                     <self>),
-  (<feature_id>, <doc_id>, 2,   '<Step 2>',     '<what it does>',                                                     <self>),
-  (<feature_id>, <doc_id>, <N>, 'Verification', 'Run tests, smoke-test against done-condition, snapshot + render',    <self>);
+Add each task with `./sc mem task add` (one per seq). For a multi-task plan, pass
+`--no-sync` on all but the last so you snapshot once at the end:
+
+```
+./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points" --no-sync
+./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>" --no-sync
+./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>" --no-sync
+./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
-Then update `current_state` — no last-done yet, next is Preparation:
+Then set `current_state` — no last-done yet, next is Preparation:
 
-```sql
-UPDATE shells SET current_state='[<feature_title>] — last: —. next: Preparation.'
-WHERE shell_id = <self>;
+```
+./sc mem state "[<feature_title>] — last: —. next: Preparation."
 ```
 
 ---
@@ -115,31 +113,32 @@ ORDER BY seq;
 
 Find the first `pending` task. Mark it `in_progress`:
 
-```sql
-UPDATE spec_tasks SET status='in_progress' WHERE task_id=<id>;
+```
+./sc mem task start <task_id>
 ```
 
-Work only that task. When done, mark it complete and advance `current_state`:
+Work only that task. When done, mark it complete, then resolve last-done / next-up
+with a read:
 
+```
+./sc mem task done <task_id>
+```
 ```sql
-UPDATE spec_tasks
-SET status='done', completed_date=date('now')
-WHERE task_id=<id>;
-
--- resolve last-done and next-pending in one query:
+-- resolve last-done and next-pending in one query (raw read):
 SELECT
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status='done'
    ORDER BY seq DESC LIMIT 1) AS last_done,
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status='pending'
    ORDER BY seq ASC LIMIT 1) AS next_up;
-
-UPDATE shells
-SET current_state='[<feature_title>] — last: <last_done>. next: <next_up>.'
-WHERE shell_id=<self>;
 ```
 
-If `next_up` is NULL, all tasks are done — set current_state to reflect that
-and run `./sc snapshot`.
+Then advance `current_state`:
+
+```
+./sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
+```
+
+If `next_up` is NULL, all tasks are done — set current_state to reflect that.
 
 ---
 

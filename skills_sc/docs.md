@@ -35,24 +35,23 @@ sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role='doc';"  -- re
 
 ## Author
 
-```sql
--- a doc against a feature (kind='doc'); DB owns the body:
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, 'doc', 1, '…', '…', 'docs_sc/….md');
-
--- a feature's next spec stage (kind='spec', new seq):
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, 'spec', 2, '…', '…', 'specs_sc/….md');
+Write through `./sc mem doc add` — it guards the engine DB, `--body-file` reads
+the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
+within `(feature, kind)`, and it renders + snapshots for you:
 ```
-Then `./sc render` (writes the `_sc` file + injects feature/roadmap_status/frozen
-into its frontmatter) and `./sc snapshot` (the body is per-instance content).
+# a doc against a feature (kind='doc'); DB owns the body:
+./sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
+
+# a feature's next spec stage (kind='spec'); seq auto-advances:
+./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
+```
 
 ## Freeze on ship
 
 A spec freezes when its stage ships — immutable thereafter; open the **next** seq
 for the next stage, never edit a frozen one:
-```sql
-UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?;
+```
+./sc mem doc freeze <document_id>
 ```
 The GUI and the render layer both refuse edits to frozen docs.
 

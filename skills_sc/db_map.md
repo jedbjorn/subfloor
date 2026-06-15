@@ -16,9 +16,15 @@ Schema map + reusable SQL for super-coder's shell_db.db. Check before composing 
 
 Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 `schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
-memory, and content live in tables — never flat files. **The `.db` is a cache:**
-after any content write, `./sc snapshot` re-serializes to text (see the
-`snapshot` skill). Lazy-load: query for what you need, don't bulk-read.
+memory, and content live in tables — never flat files. Lazy-load: query for what
+you need, don't bulk-read.
+
+**Reads use raw `sqlite3` SELECT; writes go through `./sc mem`.** Two DBs are in
+reach (this engine DB + the app's product DB) with overlapping table names, so a
+raw INSERT against the wrong one succeeds silently. `./sc mem` resolves + guards
+*this* DB and snapshots for you (the `.db` is a cache — un-snapshotted writes are
+lost on rebuild). Table below = the schema for your SELECTs; `## Common writes` =
+the `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
@@ -42,42 +48,53 @@ memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
 
 ## Common writes
 
-```sql
--- current_state (rolling status, not a log — rewrite in place):
-UPDATE shells SET current_state='…' WHERE shell_id=<self>;
+Each guards the engine DB and snapshots for you. `./sc mem which` orients;
+`./sc mem <cmd> -h` shows flags. Writes target your shell by default (`--shell` to override).
 
--- plant a seed / L&S entry (date in the column, not the body):
-INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
-VALUES (<self>, 'seed', date('now'), '…');     -- kind='lns' for a lesson
-
--- curate one out (preserves the row, frees a cap slot):
-UPDATE shell_identity_entries SET retired_at=datetime('now') WHERE entry_id=?;
-
--- record a decision:
-INSERT INTO shell_decisions (shell_id, decision_date, title, body)
-VALUES (<self>, date('now'), '…', '…');
-
--- roadmap: move a feature's horizon / add one / retire one off the board:
-UPDATE roadmap SET roadmap_status='next' WHERE feature_id=?;
-UPDATE roadmap SET roadmap_status='retired' WHERE feature_id=?;  -- decided-against / split / absorbed; keeps the row
-INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary)
-VALUES ('…', 'brainstorm', 0, <self>, '…');
-
--- author a spec body (DB owns it; render_path points at the flat file):
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, 'spec', 1, '…', '…', 'specs_sc/….md');
--- freeze on ship (immutable thereafter):
-UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?;
-
--- open / close a flag:
-INSERT INTO flags (display_name, description, shell_id, feature_id)
-VALUES ('CC-001', '[Area] … | Blocker for: …', <self>, ?);
-UPDATE flags SET resolved=1, resolved_date=date('now'), resolution_notes='…'
-WHERE flag_id=?;
 ```
+# current_state (rolling status, not a log — replaces in place):
+./sc mem state "…"
+
+# plant a seed / L&S entry (date stamped for you):
+./sc mem seed "…"            # ./sc mem lns "…" for a lesson
+./sc mem retire <entry_id>   # curate one out (frees a cap slot)
+
+# record a Major decision (supersede with --parent <id>):
+./sc mem decision "…" --rationale "…"
+
+# roadmap: add a feature / move its horizon:
+./sc mem roadmap add "…" --status brainstorm --summary "…"
+./sc mem roadmap status <feature_id> shipped
+
+# author a spec/doc body (--body-file reads the markdown), then freeze on ship:
+./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
+./sc mem doc freeze <document_id>
+
+# spec_tasks (the plan): add a task / advance it:
+./sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
+./sc mem task start <task_id>     # ./sc mem task done <task_id>
+
+# open / close a flag:
+./sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
+./sc mem flag close <flag_id> --notes "…"
+
+# projects (standing + linkage):
+./sc mem project add <shortname> "<title>" --purpose "…" --standing "…"
+./sc mem project standing <shortname|id> "…"     # ./sc mem project status <…> paused
+
+# inbox + first-run:
+./sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
+./sc mem oriented                          # mark first-run done (bootstrapped=1)
+```
+
+Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
+reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
+existing shell to a project — are rare; do them with raw `sqlite3` after
+`./sc mem which`, then `./sc snapshot`.)
 
 ## After writing
 
-Content lives in the `.db` until you serialize it. Run `./sc snapshot` (and
-`./sc render` if you changed documents/roadmap/skills), then commit the text —
-see the `snapshot` skill for the full lifecycle.
+`./sc mem` snapshots (and renders) for you — nothing more to run; just commit the
+text it serialized. A rare raw `sqlite3` write needs a manual `./sc snapshot` (and
+`./sc render` if you changed documents/roadmap/skills). See the `snapshot` skill
+for the full lifecycle.

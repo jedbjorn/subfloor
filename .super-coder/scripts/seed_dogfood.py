@@ -57,8 +57,10 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
-Write as it happens, not at close. The `.db` is a cache: after content edits,
-`./sc snapshot` re-serializes to text, which is what git tracks.
+Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
+lns · decision · flag · roadmap · doc · narrative): it resolves + guards this
+engine DB and snapshots the change for you. Raw `sqlite3` is for SELECT only; run
+`./sc snapshot` after any non-`mem` edit. See the `memory` skill.
 
 ## MANDATE
 

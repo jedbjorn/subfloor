@@ -140,17 +140,18 @@ cartographer''s automation (see `surface_catalogue`). You read it.
    ```
 
 4. **Set your `current_state`** — replace the install placeholder with what you
-   actually found and what you''ll do first (rolling status, ~500 chars):
-   ```sql
-   UPDATE shells SET current_state=''…'' WHERE shell_id=<self>;
+   actually found and what you''ll do first (rolling status, ~500 chars). Write it
+   through `./sc mem` (resolves + guards the engine DB, snapshots for you):
+   ```
+   ./sc mem state "…"
    ```
 
-5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot):
-   ```sql
-   UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;
+5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). Sets
+   `bootstrapped=1` and snapshots for you:
    ```
-   Then `./sc snapshot` so the new state survives a rebuild, and proceed with the
-   task at hand.
+   ./sc mem oriented
+   ```
+   Then proceed with the task at hand.
 
 ## Stance
 
@@ -250,8 +251,9 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    Spot-check that your `role_overrides` took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
 
-5. **Commit** the config + hooks (`git` skill), set your state, then
-   `UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;` and `./sc snapshot`.
+5. **Commit** the config + hooks (`git` skill), set your state
+   (`./sc mem state "…"`), then `./sc mem oriented` (sets `bootstrapped=1` +
+   snapshots).
 
 ## Heal — re-run any time the map looks wrong
 
@@ -481,9 +483,15 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 `schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
-memory, and content live in tables — never flat files. **The `.db` is a cache:**
-after any content write, `./sc snapshot` re-serializes to text (see the
-`snapshot` skill). Lazy-load: query for what you need, don''t bulk-read.
+memory, and content live in tables — never flat files. Lazy-load: query for what
+you need, don''t bulk-read.
+
+**Reads use raw `sqlite3` SELECT; writes go through `./sc mem`.** Two DBs are in
+reach (this engine DB + the app''s product DB) with overlapping table names, so a
+raw INSERT against the wrong one succeeds silently. `./sc mem` resolves + guards
+*this* DB and snapshots for you (the `.db` is a cache — un-snapshotted writes are
+lost on rebuild). Table below = the schema for your SELECTs; `## Common writes` =
+the `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
@@ -507,45 +515,56 @@ memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
 
 ## Common writes
 
-```sql
--- current_state (rolling status, not a log — rewrite in place):
-UPDATE shells SET current_state=''…'' WHERE shell_id=<self>;
+Each guards the engine DB and snapshots for you. `./sc mem which` orients;
+`./sc mem <cmd> -h` shows flags. Writes target your shell by default (`--shell` to override).
 
--- plant a seed / L&S entry (date in the column, not the body):
-INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
-VALUES (<self>, ''seed'', date(''now''), ''…'');     -- kind=''lns'' for a lesson
-
--- curate one out (preserves the row, frees a cap slot):
-UPDATE shell_identity_entries SET retired_at=datetime(''now'') WHERE entry_id=?;
-
--- record a decision:
-INSERT INTO shell_decisions (shell_id, decision_date, title, body)
-VALUES (<self>, date(''now''), ''…'', ''…'');
-
--- roadmap: move a feature''s horizon / add one / retire one off the board:
-UPDATE roadmap SET roadmap_status=''next'' WHERE feature_id=?;
-UPDATE roadmap SET roadmap_status=''retired'' WHERE feature_id=?;  -- decided-against / split / absorbed; keeps the row
-INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary)
-VALUES (''…'', ''brainstorm'', 0, <self>, ''…'');
-
--- author a spec body (DB owns it; render_path points at the flat file):
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, ''spec'', 1, ''…'', ''…'', ''specs_sc/….md'');
--- freeze on ship (immutable thereafter):
-UPDATE documents SET frozen=1, frozen_date=date(''now'') WHERE document_id=?;
-
--- open / close a flag:
-INSERT INTO flags (display_name, description, shell_id, feature_id)
-VALUES (''CC-001'', ''[Area] … | Blocker for: …'', <self>, ?);
-UPDATE flags SET resolved=1, resolved_date=date(''now''), resolution_notes=''…''
-WHERE flag_id=?;
 ```
+# current_state (rolling status, not a log — replaces in place):
+./sc mem state "…"
+
+# plant a seed / L&S entry (date stamped for you):
+./sc mem seed "…"            # ./sc mem lns "…" for a lesson
+./sc mem retire <entry_id>   # curate one out (frees a cap slot)
+
+# record a Major decision (supersede with --parent <id>):
+./sc mem decision "…" --rationale "…"
+
+# roadmap: add a feature / move its horizon:
+./sc mem roadmap add "…" --status brainstorm --summary "…"
+./sc mem roadmap status <feature_id> shipped
+
+# author a spec/doc body (--body-file reads the markdown), then freeze on ship:
+./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
+./sc mem doc freeze <document_id>
+
+# spec_tasks (the plan): add a task / advance it:
+./sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
+./sc mem task start <task_id>     # ./sc mem task done <task_id>
+
+# open / close a flag:
+./sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
+./sc mem flag close <flag_id> --notes "…"
+
+# projects (standing + linkage):
+./sc mem project add <shortname> "<title>" --purpose "…" --standing "…"
+./sc mem project standing <shortname|id> "…"     # ./sc mem project status <…> paused
+
+# inbox + first-run:
+./sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
+./sc mem oriented                          # mark first-run done (bootstrapped=1)
+```
+
+Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
+reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
+existing shell to a project — are rare; do them with raw `sqlite3` after
+`./sc mem which`, then `./sc snapshot`.)
 
 ## After writing
 
-Content lives in the `.db` until you serialize it. Run `./sc snapshot` (and
-`./sc render` if you changed documents/roadmap/skills), then commit the text —
-see the `snapshot` skill for the full lifecycle.',
+`./sc mem` snapshots (and renders) for you — nothing more to run; just commit the
+text it serialized. A rare raw `sqlite3` write needs a manual `./sc snapshot` (and
+`./sc render` if you changed documents/roadmap/skills). See the `snapshot` skill
+for the full lifecycle.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -655,24 +674,23 @@ sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- 
 
 ## Author
 
-```sql
--- a doc against a feature (kind=''doc''); DB owns the body:
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, ''doc'', 1, ''…'', ''…'', ''docs_sc/….md'');
-
--- a feature''s next spec stage (kind=''spec'', new seq):
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, ''spec'', 2, ''…'', ''…'', ''specs_sc/….md'');
+Write through `./sc mem doc add` — it guards the engine DB, `--body-file` reads
+the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
+within `(feature, kind)`, and it renders + snapshots for you:
 ```
-Then `./sc render` (writes the `_sc` file + injects feature/roadmap_status/frozen
-into its frontmatter) and `./sc snapshot` (the body is per-instance content).
+# a doc against a feature (kind=''doc''); DB owns the body:
+./sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
+
+# a feature''s next spec stage (kind=''spec''); seq auto-advances:
+./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
+```
 
 ## Freeze on ship
 
 A spec freezes when its stage ships — immutable thereafter; open the **next** seq
 for the next stage, never edit a frozen one:
-```sql
-UPDATE documents SET frozen=1, frozen_date=date(''now'') WHERE document_id=?;
+```
+./sc mem doc freeze <document_id>
 ```
 The GUI and the render layer both refuse edits to frozen docs.
 
@@ -886,20 +904,23 @@ ORDER BY f.priority, f.flag_id;
 
 ## Open
 
-```sql
-INSERT INTO flags (display_name, description, priority, feature_id, shell_id)
-VALUES (''SC-001'', ''[Area] what''''s blocked | Blocker for: X'', ''Medium'', ?, <self>);
+Write through `./sc mem` (it guards the engine DB + snapshots; raw `sqlite3` is
+for the SELECT above only):
 ```
-- `display_name`: short id (`SC-###`).
-- `description`: `[Area] {what} | Blocker for: {what it blocks}`.
-- `priority`: High / Medium / Low. `feature_id`: the feature it blocks (or NULL).
+./sc mem flag open "[Area] what''s blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
+```
+- `--name`: short id (`SC-###`).
+- the description is `[Area] {what} | Blocker for: {what it blocks}`.
+- `--priority`: High / Medium / Low. `--feature`: the feature it blocks (or omit).
 
 ## Resolve
 
-```sql
-UPDATE flags SET resolved=1, resolved_date=date(''now''), resolution_notes=''…''
-WHERE flag_id=?;
 ```
+./sc mem flag close <flag_id> --notes "…"
+```
+
+(equivalent raw write, for reference: `UPDATE flags SET resolved=1,
+resolved_date=date(''now''), resolution_notes=''…'' WHERE flag_id=?;`)
 
 ## Stance
 
@@ -1162,13 +1183,7 @@ gh pr create --repo <owner/repo> --head <type>/<short-desc> --fill   # open, nev
    its worktree silently rearranged. After acting, message the owning shell (see
    the `messaging` skill) so it discovers the change on its next boot:
    ```bash
-   sqlite3 .super-coder/shell_db.db <<''SQL''
-   PRAGMA foreign_keys=ON;
-   INSERT INTO shell_messages (from_shell_id, to_shell_id, body)
-   VALUES (<admin shell_id>,
-           (SELECT shell_id FROM shells WHERE shortname=''<shortname>'' AND COALESCE(is_deleted,0)=0),
-           ''git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.'');
-   SQL
+   ./sc mem message send <shortname> ''git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.''
    ```
    Also report the same to the FnB. If the worktree could not be acted on (shell
    was live, or indeterminate), no message — it was left untouched.
@@ -1343,63 +1358,67 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# memory — write as you go
 
 All memory is DB rows (no flat files). Write at the moment it matters, not in a
-close ritual. The `.db` is a cache — after writing, `./sc snapshot` serializes to
-the text git tracks (see the `snapshot` skill). `<self>` = your shell_id.
+close ritual.
+
+**Write through `./sc mem`, never raw `sqlite3`.** Two DBs are in reach (your
+engine DB and the app''s product DB) and their table names overlap — a raw
+`INSERT INTO shell_decisions …` against the wrong one *succeeds silently*.
+`./sc mem` resolves + guards *this* engine DB, refuses the app DB or an empty
+stub, and snapshots the change so it survives a rebuild (no separate
+`./sc snapshot`). `./sc mem which` shows the resolved DB; raw `sqlite3` is for
+SELECT only. Writes default to your shell; pass `--shell <id|name>` to be explicit.
 
 ## current_state — rolling status, NOT a log
 
-Your present focus + what''s next. **UPDATE in place; never append.** Soft target
+Your present focus + what''s next. **Replaces in place; never a log.** Soft target
 ~500 chars. Rewrite when focus shifts.
-```sql
-UPDATE shells SET current_state=''…'' WHERE shell_id=<self>;
+```
+./sc mem state "…"
 ```
 
 ## Session narrative — append at inflection points
 
-One row per session (`shell_memory_archives`, the active one is
-`active_archive_id`). Append `[HH:MM] {1–2 lines}` when: a decision lands, an
-approach changes or is rejected, the FnB says something that shapes the work, an
-assumption breaks, or before a big change. Edit the H1 when the session''s
-headline crystallizes.
-```sql
-UPDATE shell_memory_archives
-SET full_narrative = full_narrative || char(10) || ''[HH:MM] …'' || char(10)
-WHERE archive_id = (SELECT active_archive_id FROM shells WHERE shell_id=<self>);
+One row per session, appended progressively. Append a `[HH:MM]` line (the time is
+stamped for you) when: a decision lands, an approach changes or is rejected, the
+FnB says something that shapes the work, an assumption breaks, or before a big
+change.
+```
+./sc mem narrative "…"
 ```
 
 ## seed (cap 10) — who you are
 
-Identity-forming moments. Past-tense/timeless. INSERT to add; **never edit a body**
-(curate by setting `retired_at`). The genesis + lineage seed are already yours.
-```sql
-INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
-VALUES (<self>, ''seed'', date(''now''), ''…'');
+Identity-forming moments. Past-tense/timeless. Add a new entry; **never edit a
+body** (curate by retiring). The genesis + lineage seed are already yours.
+```
+./sc mem seed "…"            # add
+./sc mem retire <entry_id>   # curate out (frees a cap slot)
 ```
 
 ## L&S (cap 20) — how you work
 
-Operating lessons, imperative voice. INSERT when a lesson lands; curate via
-`retired_at`. Caps are trigger-enforced (seed 10, L&S 20) — retire to free a slot.
-```sql
-INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
-VALUES (<self>, ''lns'', date(''now''), ''…'');
+Operating lessons, imperative voice. Add when a lesson lands; curate by retiring.
+Caps are trigger-enforced (seed 10, L&S 20) — `./sc mem` reports the cap message;
+retiring frees a slot.
+```
+./sc mem lns "…"
 ```
 
 ## Decisions — Major only
 
-INSERT a row on a Major decision (architecture, approach, a path chosen over
-another). Never edit a prior row; supersede via `parent_decision_id`. Mirror it
-into the narrative.
-```sql
-INSERT INTO shell_decisions (shell_id, decision_date, priority, decision, rationale)
-VALUES (<self>, date(''now''), ''M'', ''…'', ''…'');
+Record a Major decision (architecture, approach, a path chosen over another).
+Never rewritten; supersede via `--parent <decision_id>`. Mirror the headline into
+the narrative.
+```
+./sc mem decision "…" --rationale "…" [--parent <id>]
 ```
 
 ## Stance
 
-Write-as-you-go beats batch-at-close: appending costs nothing per write and zero
-at session end. Curate seed/L&S (revise the set), never rewrite history
-(decisions, narrative, seed bodies).',
+Write-as-you-go beats batch-at-close: it costs nothing per write and zero at
+session end. Curate seed/L&S (revise the set), never rewrite history (decisions,
+narrative, seed bodies). The underlying tables are documented in `db_map` — read
+them with raw SELECT, write them with `./sc mem`.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1409,7 +1428,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'messaging',
-  'Shell-to-shell inbox — send a markdown message to another shell, check your unread inbox, mark messages read. Direct SQL against shell_db.db (no API in v1). Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
+  'Shell-to-shell inbox — send a markdown message to another shell, check your unread inbox, mark messages read. Driven by `./sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
   'substrate',
   NULL,
   1,
@@ -1417,77 +1436,48 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 One shell writes a markdown message to another; the recipient discovers it on its
 next boot via the `## STATUS` `Inbox:` count, surfaces it with `check`, and clears
-it with `mark-read`. Body is markdown — preserved verbatim. There is no API layer
-in v1: you run parameterized SQL directly against `.super-coder/shell_db.db`.
+it with `mark-read`. Body is markdown — preserved verbatim.
 
-`<self>` = **your** `shell_id` — read it from the `shell_id:` line in this boot
-doc''s `## ACTIVE SESSION` block. Recipients are addressed by `shortname`; the
-`send` SQL resolves the shortname to a `shell_id` for you.
+Drive it with **`./sc mem message`**, never raw `sqlite3`. `shell_messages` lives
+in the engine DB, and `./sc mem` resolves + guards *this* DB (from any cwd,
+including a worktree where a literal `.super-coder/shell_db.db` path would create
+an empty stub and drop the message) and snapshots the send so it survives a
+rebuild. The sender is you; recipients are addressed by `shortname`.
 
 Trigger: `--message`
 Args: `check [N] | send <to-shortname> <body> | mark-read <id>`
 
-Run every statement with foreign keys ON so an unknown recipient is caught, e.g.:
-
-```sh
-sqlite3 .super-coder/shell_db.db <<''SQL''
-PRAGMA foreign_keys=ON;
-<the statement, with the params filled in>
-SQL
-```
-
 ## check — your unread inbox
 
-```sql
-SELECT m.message_id, s.shortname AS from_shortname, m.body, m.created_at
-FROM shell_messages m
-JOIN shells s ON s.shell_id = m.from_shell_id
-WHERE m.to_shell_id = <self> AND m.read_at IS NULL
-ORDER BY m.created_at
-LIMIT 50;   -- optional N; default 50, max 200
+```
+./sc mem message check [N]      # N optional; default 50, max 200
 ```
 
-`check` does **not** auto-mark-read — you decide when. Surface the body to the
+`check` is read-only — it does **not** auto-mark-read. Surface the body to the
 operator (and reply if warranted, which is itself a `send`), then `mark-read` the
 inbound in the same turn.
 
 ## send — message another shell
 
-```sql
-INSERT INTO shell_messages (from_shell_id, to_shell_id, body)
-VALUES (
-    <self>,
-    (SELECT shell_id FROM shells
-      WHERE shortname = :to_shortname
-        AND COALESCE(is_deleted,0) = 0),
-    :body
-);
+```
+./sc mem message send <to-shortname> "<body>"
 ```
 
 - Multi-word body = a single quoted argument; markdown is preserved verbatim.
-- Examples: `--message send cartographer "map is stale — re-run ./sc map"`
-  · `--message send cc "spec ready for review — see flag SC-014"`
-
-Error paths to translate for the operator:
-- Unknown / deleted `to_shortname` → the subquery yields no row → the INSERT
-  fails (`NOT NULL constraint failed: shell_messages.to_shell_id`, or
-  `FOREIGN KEY constraint failed` with FK on). Surface as **"recipient shortname
-  unknown."**
-- Empty body → `CHECK constraint failed` on `body`. Surface as **"body is empty."**
+- Examples: `./sc mem message send cartographer "map is stale — re-run ./sc map"`
+  · `./sc mem message send cc "spec ready for review — see flag SC-014"`
+- Unknown / deleted recipient → `mem: recipient shortname ''<x>'' unknown`. Empty
+  body → `mem: body is empty`. Surface either to the operator plainly.
 
 ## mark-read — clear an inbox item (idempotent)
 
-```sql
-UPDATE shell_messages
-SET read_at = datetime(''now'')
-WHERE message_id = :id
-  AND to_shell_id = <self>
-  AND read_at IS NULL;
+```
+./sc mem message mark-read <message_id>
 ```
 
-`to_shell_id = <self>` is the only access control — you cannot mark read a message
-addressed to another shell (0 rows updated). `read_at IS NULL` makes it idempotent
-(re-marking a read message is a no-op). Pass the `message_id` that `check` surfaced.
+Access control: you can only mark read a message addressed to **you** — one for
+another shell is a no-op. Re-marking a read message is also a no-op. Pass the
+`message_id` that `check` surfaced.
 
 ## Stance
 
@@ -1616,30 +1606,31 @@ For each doc, read the file and decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
+All writes here go through `./sc mem` (it guards the engine DB so the import never
+lands in the app DB, and snapshots each write).
+
 ## 3. Backfill the roadmap
 Create a feature for each coherent area/initiative the docs imply; set status by
 how built it is (`shipped` if done + documented, `near_term`/`brainstorm` if
 planned):
-```sql
-INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary)
-VALUES (''…'', ''shipped'', 0, <self>, ''…'');
+```
+./sc mem roadmap add "…" --status shipped --summary "…"
 ```
 
 ## 4. Ingest into `documents` (DB owns the body)
-```sql
--- general doc (no feature):
-INSERT INTO documents (kind, seq, title, body, render_path)
-VALUES (''doc'', 1, ''README'', ''<file contents>'', ''docs_sc/readme.md'');
--- a feature''s spec (link it):
-INSERT INTO documents (feature_id, kind, seq, title, body, render_path)
-VALUES (?, ''spec'', 1, ''…'', ''<file contents>'', ''specs_sc/….md'');
+`--body-file` reads the real file straight into the body — no pasting:
 ```
-Paste the file''s real contents into `body`. If a spec describes shipped work,
-freeze it (`frozen=1, frozen_date`).
+# general doc (no feature):
+./sc mem doc add "README" --kind doc --body-file ./README.md --render-path docs_sc/readme.md
+# a feature''s spec (link it):
+./sc mem doc add "…" --kind spec --feature <id> --body-file ./path/to/spec.md --render-path specs_sc/….md
+```
+If a spec describes shipped work, freeze it: `./sc mem doc freeze <document_id>`.
 
-## 5. Render + persist
-`./sc render` (writes the `_sc` copies + frontmatter) then `./sc snapshot` (the
-bodies are per-instance content). Now the GUI''s Docs/Roadmap tabs show the repo.
+## 5. Persist
+`./sc mem` already snapshots + renders after each write, so the `_sc` copies and
+the GUI''s Docs/Roadmap tabs reflect the import as you go. (If you made any raw
+writes, run `./sc render && ./sc snapshot` once at the end.)
 
 ## 6. The host''s original files — three exits (optional; coexist by default)
 The DB now holds the canonical copy. Because we render to `_sc/`, the originals
@@ -1937,10 +1928,8 @@ List these and ask the FnB before writing the plan.
 Hard stops — prior work not shipped, missing environment state, unresolved
 external dependency. Open a flag for each:
 
-```sql
-INSERT INTO flags (display_name, description, priority, feature_id, shell_id)
-VALUES (''<SC-###>'', ''[Spec] <what is blocked> | Blocker for: <feature title>'',
-        ''High'', <feature_id>, <self>);
+```
+./sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
 ```
 
 Don''t open flags for unclear items you can resolve by asking — ask first.
@@ -1958,20 +1947,20 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-```sql
-INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id)
-VALUES
-  (<feature_id>, <doc_id>, 0,   ''Preparation'',  ''Read all relevant code paths, verify DB state, confirm entry points'', <self>),
-  (<feature_id>, <doc_id>, 1,   ''<Step 1>'',     ''<what it does>'',                                                     <self>),
-  (<feature_id>, <doc_id>, 2,   ''<Step 2>'',     ''<what it does>'',                                                     <self>),
-  (<feature_id>, <doc_id>, <N>, ''Verification'', ''Run tests, smoke-test against done-condition, snapshot + render'',    <self>);
+Add each task with `./sc mem task add` (one per seq). For a multi-task plan, pass
+`--no-sync` on all but the last so you snapshot once at the end:
+
+```
+./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points" --no-sync
+./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>" --no-sync
+./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>" --no-sync
+./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
-Then update `current_state` — no last-done yet, next is Preparation:
+Then set `current_state` — no last-done yet, next is Preparation:
 
-```sql
-UPDATE shells SET current_state=''[<feature_title>] — last: —. next: Preparation.''
-WHERE shell_id = <self>;
+```
+./sc mem state "[<feature_title>] — last: —. next: Preparation."
 ```
 
 ---
@@ -1989,31 +1978,32 @@ ORDER BY seq;
 
 Find the first `pending` task. Mark it `in_progress`:
 
-```sql
-UPDATE spec_tasks SET status=''in_progress'' WHERE task_id=<id>;
+```
+./sc mem task start <task_id>
 ```
 
-Work only that task. When done, mark it complete and advance `current_state`:
+Work only that task. When done, mark it complete, then resolve last-done / next-up
+with a read:
 
+```
+./sc mem task done <task_id>
+```
 ```sql
-UPDATE spec_tasks
-SET status=''done'', completed_date=date(''now'')
-WHERE task_id=<id>;
-
--- resolve last-done and next-pending in one query:
+-- resolve last-done and next-pending in one query (raw read):
 SELECT
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status=''done''
    ORDER BY seq DESC LIMIT 1) AS last_done,
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status=''pending''
    ORDER BY seq ASC LIMIT 1) AS next_up;
-
-UPDATE shells
-SET current_state=''[<feature_title>] — last: <last_done>. next: <next_up>.''
-WHERE shell_id=<self>;
 ```
 
-If `next_up` is NULL, all tasks are done — set current_state to reflect that
-and run `./sc snapshot`.
+Then advance `current_state`:
+
+```
+./sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
+```
+
+If `next_up` is NULL, all tasks are done — set current_state to reflect that.
 
 ---
 

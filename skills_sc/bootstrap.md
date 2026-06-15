@@ -50,17 +50,18 @@ cartographer's automation (see `surface_catalogue`). You read it.
    ```
 
 4. **Set your `current_state`** — replace the install placeholder with what you
-   actually found and what you'll do first (rolling status, ~500 chars):
-   ```sql
-   UPDATE shells SET current_state='…' WHERE shell_id=<self>;
+   actually found and what you'll do first (rolling status, ~500 chars). Write it
+   through `./sc mem` (resolves + guards the engine DB, snapshots for you):
+   ```
+   ./sc mem state "…"
    ```
 
-5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot):
-   ```sql
-   UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;
+5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). Sets
+   `bootstrapped=1` and snapshots for you:
    ```
-   Then `./sc snapshot` so the new state survives a rebuild, and proceed with the
-   task at hand.
+   ./sc mem oriented
+   ```
+   Then proceed with the task at hand.
 
 ## Stance
 
