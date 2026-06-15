@@ -216,6 +216,7 @@ case "$cmd" in
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
+  mem)          exec "$PY" "$S/mem.py" "$@" ;;
   render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
   render-check) exec "$PY" "$S/render_check.py" ;;
   map)          exec "$PY" "$S/map_repo.py" ;;
@@ -301,6 +302,8 @@ super-coder — forkable shell substrate
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
+  ./sc mem <cmd> [args]    safe engine-DB writes for a shell's own memory (state/seed/lns/decision/flag/roadmap/doc/narrative);
+                             resolves + guards the engine DB (refuses product DBs & 0-byte stubs), then snapshots+renders. `./sc mem which` to orient
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
