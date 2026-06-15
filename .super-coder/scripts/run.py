@@ -37,6 +37,7 @@ import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
+import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 
 ADAPTERS = ENGINE / "adapters"
 
@@ -528,6 +529,20 @@ def main() -> None:
         ensure_worktree(work_dir, chosen["shortname"])
         sync_note = sync_worktree(work_dir, chosen["shortname"])
 
+    # Repo-global branch hygiene: delete local branches whose PR is provably
+    # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
+    # checked-out branch). The unattended subset of the git_cleanup skill, run
+    # once per boot from whichever shell launches next. Best-effort and silent:
+    # soft-fails so it never blocks a launch, and surfaces a line only when it
+    # actually removed something. Skipped under RENDER_ONLY (headless verify must
+    # not mutate) and opt-out-able per fork via SC_NO_AUTOPRUNE=1.
+    prune_note = None
+    if not os.environ.get("SC_NO_AUTOPRUNE") and not os.environ.get("RENDER_ONLY"):
+        try:
+            prune_note = git_prune.status_line(git_prune.prune(fetch=False))
+        except Exception:
+            prune_note = None
+
     content = compose_boot(con, full, user, session_id, archive_id,
                            work_dir=work_dir if work_dir != REPO_ROOT else None,
                            sync_note=sync_note)
@@ -549,6 +564,8 @@ def main() -> None:
         print(f"→ sync: {sync_note}")
     elif chosen["flavor"] == "admin":
         print("→ working dir: repo root (admin — maintains main directly)")
+    if prune_note:
+        print(f"→ prune: {prune_note}")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
     print(f"→ skills: {len(skills['written'])} written, "
