@@ -16,15 +16,16 @@
 # commit and prints it.
 #
 # TWO checks, in order of authority:
-#   1. TARGET FILE (claude only) — claude passes the edit's PreToolUse JSON on
-#      stdin (tool_input.file_path/notebook_path). We resolve the branch of the
-#      repo that OWNS that file and block if it is protected. This catches the
+#   1. TARGET FILE (claude + opencode) — the edited path arrives as $1 (opencode
+#      plugin) or in claude's PreToolUse JSON on stdin. We resolve the branch of
+#      the repo that OWNS that file and block if it is protected. This catches the
 #      foot-gun a cwd-only check misses: a worktree shell editing files in the
 #      stale main checkout (a DIFFERENT repo dir on `main`) — the cwd is a clean
 #      feature branch, so the old cwd check waved it through. If the target is
 #      outside the shell's own worktree but NOT on a protected branch, we ALLOW
-#      but emit a loud warning (claude additionalContext + stderr).
-#   2. CWD (all consumers, and the fallback when there is no stdin target) — the
+#      but emit a loud warning (claude additionalContext + stderr). codex's
+#      apply_patch hook supplies no usable target → it uses Check 2 only.
+#   2. CWD (all consumers, and the fallback when there is no target) — the
 #      original behavior: block if HEAD of the cwd's repo is a protected branch.
 #
 # The harness hooks locate this script env-independently, the same way `sc` does:
@@ -76,14 +77,19 @@ feature_branch_hint() {
   echo "then retry. One branch per unit of work — see the 'git' skill (branch -> commit -> push -> PR -> stop)." >&2
 }
 
-# ── Check 1: the target file (claude PreToolUse stdin) ──────────────────────
-# Read any JSON on stdin; other consumers pass nothing → target stays empty and
-# we fall through to the cwd check. python3 is an engine dependency wherever the
-# claude hook runs; if it is somehow absent we simply skip the target check.
-payload="$(cat 2>/dev/null || true)"
-target=""
-if [ -n "$payload" ] && command -v python3 >/dev/null 2>&1; then
-  target="$(printf '%s' "$payload" | python3 -c '
+# ── Check 1: the target file ────────────────────────────────────────────────
+# Resolve the edited file, in priority order:
+#   1. an explicit $1 arg — the opencode plugin extracts the path from the tool
+#      args and passes it here (it has the path structured; nothing to pipe).
+#   2. a PreToolUse JSON payload on stdin — claude pipes tool_input.file_path /
+#      notebook_path. (codex's apply_patch hook pipes no usable target, so it
+#      falls through to the cwd check — see the codex adapter README.)
+#   3. neither → empty → fall through to the cwd check (Check 2).
+target="${1:-}"
+if [ -z "$target" ]; then
+  payload="$(cat 2>/dev/null || true)"
+  if [ -n "$payload" ] && command -v python3 >/dev/null 2>&1; then
+    target="$(printf '%s' "$payload" | python3 -c '
 import sys, json
 try:
     ti = (json.load(sys.stdin).get("tool_input") or {})
@@ -91,6 +97,7 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || echo "")"
+  fi
 fi
 
 if [ -n "$target" ]; then

@@ -69,6 +69,39 @@ def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     return written
 
 
+def resolve_opencode_plugins(work_dir: Path) -> None:
+    """Rewrite opencode.json `plugin` entries that point into the engine to
+    ABSOLUTE paths. The template registers
+    `./.super-coder/adapters/opencode/protect-default-branch.js` — relative to the
+    opencode.json location (the worktree root). A fork gitignores .super-coder/,
+    so from a shell worktree that path does not exist and opencode silently loads
+    NO plugin → the branch-guard never runs. Same trap the hooks fell into;
+    resolve to the installed engine (verified: opencode loads plugins by absolute
+    path). No-op when no engine-relative plugin entry is present (e.g. the source
+    repo, where the relative path already resolves)."""
+    cfg_path = work_dir / "opencode.json"
+    if not cfg_path.exists():
+        return
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    plugins = cfg.get("plugin")
+    if not isinstance(plugins, list):
+        return
+    changed = False
+    resolved = []
+    for p in plugins:
+        if isinstance(p, str) and ".super-coder/" in p:
+            resolved.append(str(ENGINE / p.split(".super-coder/", 1)[1]))
+            changed = True
+        else:
+            resolved.append(p)
+    if changed:
+        cfg["plugin"] = resolved
+        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+
+
 def _deep_merge(base: dict, patch: dict) -> dict:
     """Recursively merge patch into base (patch wins on scalar conflicts);
     mutates and returns base. Nested dicts merge key-wise so a fork's other
@@ -614,6 +647,7 @@ def main() -> None:
     # seam owns the launch command + any harness-specific config to emit.
     adapter = load_adapter(harness)
     emitted = emit_adapter(adapter, work_dir)
+    resolve_opencode_plugins(work_dir)  # engine-relative plugin path → absolute (loads in worktrees)
     print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
