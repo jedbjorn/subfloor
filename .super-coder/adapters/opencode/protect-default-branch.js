@@ -13,13 +13,19 @@ const WRITE_TOOLS = new Set(["write", "edit", "patch"]);
 export const ProtectDefaultBranch = async ({ $, worktree }) => ({
   "tool.execute.before": async (input) => {
     if (!WRITE_TOOLS.has(input.tool)) return;
-    // Resolve the guard via $SC_ENGINE_DIR (absolute path to the installed
-    // engine, exported by run.py). A fork gitignores .super-coder/, so it is
-    // absent from the worktree — a worktree-relative path found nothing. Fall
-    // back to the worktree-relative path for a non-engine launch.
-    const guard = process.env.SC_ENGINE_DIR
-      ? `${process.env.SC_ENGINE_DIR}/scripts/branch-guard.sh`
-      : `${worktree}/.super-coder/scripts/branch-guard.sh`;
+    // Resolve the installed engine the same env-independent way `sc` does: a
+    // fork gitignores .super-coder/, so it is absent from the worktree — walk to
+    // the MAIN worktree root via git's common dir (its parent owns the engine).
+    // $SC_ENGINE_DIR (exported by run.py) is an optional fast-path override; we
+    // do NOT depend on it, so a manual `opencode` launch still guards.
+    let eng = process.env.SC_ENGINE_DIR;
+    if (!eng) {
+      const r = await $`bash -c 'cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd'`
+        .cwd(worktree).quiet().nothrow();
+      const root = (r.stdout?.toString() || "").trim();
+      eng = root ? `${root}/.super-coder` : `${worktree}/.super-coder`;
+    }
+    const guard = `${eng}/scripts/branch-guard.sh`;
     // Bun shell: run the guard at the worktree root; .nothrow() so we read the
     // exit code, .quiet() so its output doesn't leak into the TUI.
     const res = await $`bash ${guard}`
