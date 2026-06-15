@@ -209,3 +209,22 @@ Steps separated by `->`, optional class via `:::classN`. Steps render
 - Comma-separated `tags` (must be a YAML list)
 - `classDef` / `fill:` / style directives inside Mermaid
 - Unquoted Mermaid labels containing special characters
+
+## Open in md-converter
+
+A doc whose `body` lives in the DB already opens in the app from the GUI
+("open in md-converter ↗" on the Roadmap/Docs card) — nothing to author there.
+
+When you instead **commit a standalone themed-markdown file** to the repo (a
+README, or a rendered `docs_sc/` page meant to be read on GitHub), drop a
+one-click badge in its preamble — between `# Title` and the first `##`, so it
+shows on GitHub but is dropped from the render (preamble rule):
+
+```markdown
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/<owner>/<repo>/blob/<branch>/<path>)
+```
+
+Fill `<owner>/<repo>/<branch>/<path>` with the file's GitHub location (any
+subdirectory depth). Public repos only — the badge fetches the raw file in the
+reader's browser (no server/auth). Destination unknown → keep the placeholders
+and tell the user to fill them.
