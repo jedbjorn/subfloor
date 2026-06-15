@@ -21,10 +21,12 @@ the launch command. No extra config file to emit at v1.
 `merge_json` deep-merges a `PreToolUse` hook into **`.claude/settings.local.json`**
 (the gitignored personal layer — never the fork's tracked `.claude/settings.json`,
 so fork-owned config is untouched). The hook runs the shared branch-guard before
-every `Edit`/`Write`/`NotebookEdit`/`MultiEdit`. It resolves the script via
-**`$SC_ENGINE_DIR`** (absolute path to the installed engine, exported by run.py)
-— a fork gitignores `.super-coder/`, so a worktree-relative path found nothing
-and the hook failed open in exactly the shell worktrees it protects. It blocks
+every `Edit`/`Write`/`NotebookEdit`/`MultiEdit`. It resolves the script
+env-independently (walking to the main worktree root via `git rev-parse
+--git-common-dir`, the same way `sc` does; `$SC_ENGINE_DIR` is an optional
+fast-path override) — a fork gitignores `.super-coder/`, so a worktree-relative
+path found nothing and the hook failed open in exactly the shell worktrees it
+protects. It blocks
 the edit (exit 2) when the **target file's** repo HEAD is a protected default
 branch — so a worktree shell writing to the stale repo-root checkout is caught,
 not just one whose own cwd is on `main`; an out-of-worktree edit to a feature

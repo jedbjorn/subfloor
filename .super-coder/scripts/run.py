@@ -625,12 +625,11 @@ def main() -> None:
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
-    # Absolute path to the installed engine, so the branch-guard hook resolves
-    # the script regardless of cwd. A fork gitignores .super-coder/, so it is
-    # ABSENT from every shell worktree (git checks out only tracked files) — a
-    # worktree-relative path (the old $CLAUDE_PROJECT_DIR/.super-coder/...) found
-    # nothing and the hook failed open. The engine is installed once at the repo
-    # root; pin to it. All three adapters reference $SC_ENGINE_DIR.
+    # Optional fast-path for the branch-guard hooks: the absolute engine path, so
+    # they skip the `git rev-parse --git-common-dir` walk. NOT load-bearing — the
+    # hooks resolve the engine env-independently (a fork gitignores .super-coder/,
+    # so it is absent from worktrees; a worktree-relative path failed open). This
+    # just saves a subshell per edit on the normal launch path.
     env["SC_ENGINE_DIR"] = str(ENGINE)
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")

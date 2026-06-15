@@ -27,12 +27,13 @@
 #   2. CWD (all consumers, and the fallback when there is no stdin target) — the
 #      original behavior: block if HEAD of the cwd's repo is a protected branch.
 #
-# The harness hooks find this script via $SC_ENGINE_DIR (absolute path to the
-# installed engine, exported by run.py at launch). A fork gitignores
-# .super-coder/, so it is ABSENT from every shell worktree — a worktree-relative
-# path resolved to nothing and the hook failed open. The pre-commit hook can't
-# rely on that env (the FnB may commit from a plain terminal); it resolves the
-# script by its own $0 path instead.
+# The harness hooks locate this script env-independently, the same way `sc` does:
+# walk to the MAIN worktree root via `git rev-parse --git-common-dir`/.. and read
+# its .super-coder/. A fork gitignores the engine, so it is ABSENT from every
+# shell worktree — a worktree-relative path resolved to nothing and the hook
+# failed open; $SC_ENGINE_DIR (exported by run.py) is only an optional fast-path
+# override, never a dependency. The pre-commit hook resolves the script by its own
+# $0 path (it runs outside run.py's env).
 set -euo pipefail
 
 # Not a git work tree (rare for a fork, but be safe) → nothing to guard.
