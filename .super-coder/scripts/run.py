@@ -147,6 +147,44 @@ def ensure_worktree(work_dir: Path, shortname: str) -> None:
         sys.exit(f"FATAL: could not create worktree at {work_dir}:\n{result.stderr.strip()}")
 
 
+def link_worktree_map(work_dir: Path) -> None:
+    """Point a shell worktree's .sc-state/map.db at the ROOT's map DB.
+
+    The dr_* repo map is a single derived cache at the main repo root (built by
+    `./sc map`; read by map_db.py / compose.py via __file__, so writers + the
+    renderer already resolve the root correctly). But boot.md and the map skills
+    tell shells to query `sqlite3 .sc-state/map.db` — a CWD-relative path. From a
+    worktree that file doesn't exist, and the sqlite3 CLI CREATES an empty one on
+    open, which then shadows the root map for that worktree ('no such table:
+    dr_section'). A symlink makes the documented path resolve to the real root DB
+    from every worktree; sqlite keeps its -wal/-shm next to the resolved (root)
+    file, so no stray sidecars land in the worktree. We do NOT commit the cache
+    (it's a derived binary; the authored layer is tracked as map_content.sql).
+
+    Healed every boot: an empty/stale shadow left by a pre-fix session — or stray
+    -wal/-shm sidecars — are cleared and replaced with the symlink. A dangling
+    link (root not mapped yet) is fine: the first query creates the DB at the
+    root, where `./sc map` then populates it."""
+    sc_state = work_dir / ".sc-state"
+    link = sc_state / "map.db"
+    target = REPO_ROOT / ".sc-state" / "map.db"
+    try:
+        sc_state.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            if link.readlink() == target:
+                return
+            link.unlink()
+        elif link.exists():
+            link.unlink()  # empty/stale per-worktree shadow — root is canonical
+        for sidecar in ("map.db-wal", "map.db-shm"):
+            p = sc_state / sidecar
+            if p.exists() and not p.is_symlink():
+                p.unlink()
+        link.symlink_to(target)
+    except OSError as e:
+        print(f"→ map link: skipped ({e})")
+
+
 def _git(work_dir: Path, *args: str, timeout: int = 15) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(["git", "-C", str(work_dir), *args],
                           capture_output=True, text=True, timeout=timeout)
@@ -528,6 +566,7 @@ def main() -> None:
         work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
         ensure_worktree(work_dir, chosen["shortname"])
         sync_note = sync_worktree(work_dir, chosen["shortname"])
+        link_worktree_map(work_dir)  # .sc-state/map.db -> root's map DB (heals shadows)
 
     # Repo-global branch hygiene: delete local branches whose PR is provably
     # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
