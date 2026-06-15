@@ -8,7 +8,18 @@ set -e
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$here"
 
-ENGINE=.super-coder
+# The engine (`.super-coder/`) and its gitignored live DB sit at the MAIN worktree
+# root. A linked worktree (a shell's `.sc-worktrees/<name>/`) has a tracked copy of
+# THIS script — and, in the canonical repo where `.super-coder/` is tracked, even a
+# DB-less engine copy — but never the live DB. So always resolve the engine at the
+# main root via git's common dir (its parent is the main worktree), so `./sc` works
+# from any worktree. We do NOT cd there: cwd stays the caller's worktree so git ops
+# + shell inference see it. Fall back to $here outside a git checkout.
+ROOT="$here"
+_root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || true)"
+[ -n "$_root" ] && [ -d "$_root/.super-coder" ] && ROOT="$_root"
+
+ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"

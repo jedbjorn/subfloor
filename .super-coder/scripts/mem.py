@@ -109,8 +109,12 @@ def connect(path: Path) -> sqlite3.Connection:
 # ── shell resolution ──────────────────────────────────────────────────────────
 
 def git_branch() -> str | None:
-    r = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse",
-                        "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    # Read the branch of the CALLER's cwd, not the engine root: a shell runs from
+    # its `.sc-worktrees/<name>/` worktree (on `shell/<name>`), while the engine
+    # root sits on the default branch. Inferring the shell needs the worktree's
+    # branch, so don't pin `-C` to REPO_ROOT.
+    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                       capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
