@@ -12,6 +12,8 @@ purpose: Forkable shell substrate for a repo
 
 ## Overview
 
+![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cover.png)
+
 > [!class2]
 > **UI** all eight Review-GUI tabs · **Shells** planner · reviewer · dev · cartographer · admin
 
