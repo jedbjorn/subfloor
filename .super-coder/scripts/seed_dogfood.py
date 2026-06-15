@@ -58,9 +58,12 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
 Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
-lns · decision · flag · roadmap · doc · narrative): it resolves + guards this
-engine DB and snapshots the change for you. Raw `sqlite3` is for SELECT only; run
-`./sc snapshot` after any non-`mem` edit. See the `memory` skill.
+lns · decision · flag · roadmap · doc · narrative): it resolves + guards *this*
+engine DB — refusing the app DB or a stray empty file, whose overlapping table
+names would let a raw `sqlite3` INSERT hit the wrong DB silently — and snapshots
+the change for you. Raw `sqlite3` is for SELECT only. `./sc mem which` to orient;
+`./sc snapshot` (+ `./sc render` for docs/roadmap/skills) after any non-`mem`
+edit. See the `memory`, `db_map`, and `snapshot` skills.
 
 ## MANDATE
 
