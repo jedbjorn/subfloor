@@ -33,6 +33,9 @@ Run from the repo root, like every engine command:
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc freeze <document_id>
     ./sc mem narrative "<line>"      [--shell …]
+    ./sc mem message check [N]       [--shell …]      # your unread inbox (read-only)
+    ./sc mem message send <to-shortname> "<body>"     # from = you
+    ./sc mem message mark-read <message_id>
 
 Common flags: --no-sync (skip snapshot+render), --db <path> (override target;
 still guarded — used by tests).
@@ -338,6 +341,51 @@ def _doc_freeze(args) -> int:
     return finish(args, f"mem: document #{args.document_id} frozen")
 
 
+def cmd_message(args) -> int:
+    con = connect(Path(args.db))
+    try:
+        sid = resolve_shell(con, args.shell)
+        if args.message_cmd == "check":
+            n = min(args.limit, 200)
+            rows_ = con.execute(
+                "SELECT m.message_id, s.shortname AS frm, m.body, m.created_at "
+                "FROM shell_messages m JOIN shells s ON s.shell_id = m.from_shell_id "
+                "WHERE m.to_shell_id=? AND m.read_at IS NULL "
+                "ORDER BY m.created_at LIMIT ?", (sid, n)).fetchall()
+            if not rows_:
+                print(f"mem: inbox empty for shell #{sid}")
+                return 0
+            print(f"mem: {len(rows_)} unread for shell #{sid}:")
+            for r in rows_:
+                print(f"  [#{r['message_id']}] from {r['frm']} · {r['created_at']}")
+                print("    " + r["body"].replace("\n", "\n    "))
+            return 0  # read-only: no sync
+        if args.message_cmd == "send":
+            to = con.execute("SELECT shell_id FROM shells WHERE LOWER(shortname)=LOWER(?) "
+                             "AND COALESCE(is_deleted,0)=0", (args.to,)).fetchone()
+            if not to:
+                die(f"recipient shortname '{args.to}' unknown")
+            if not args.body.strip():
+                die("body is empty")
+            cur = con.execute(
+                "INSERT INTO shell_messages (from_shell_id, to_shell_id, body) VALUES (?, ?, ?)",
+                (sid, to["shell_id"], args.body))
+            con.commit()
+            return finish(args, f"mem: message #{cur.lastrowid} sent from #{sid} to {args.to}")
+        # mark-read
+        cur = con.execute(
+            "UPDATE shell_messages SET read_at=datetime('now') "
+            "WHERE message_id=? AND to_shell_id=? AND read_at IS NULL",
+            (args.message_id, sid))
+        con.commit()
+        if cur.rowcount == 0:
+            return finish(args, f"mem: message #{args.message_id} already read or not yours "
+                                f"(no-op)")
+        return finish(args, f"mem: message #{args.message_id} marked read")
+    finally:
+        con.close()
+
+
 def cmd_narrative(args) -> int:
     con = connect(Path(args.db))
     try:
@@ -419,6 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("narrative", parents=[common],
                         help="append a [HH:MM] line to the active archive")
     sp.add_argument("line"); sp.set_defaults(fn=cmd_narrative)
+
+    sp = sub.add_parser("message", help="shell-to-shell inbox: check / send / mark-read")
+    msub = sp.add_subparsers(dest="message_cmd", required=True)
+    mc = msub.add_parser("check", parents=[common]); mc.add_argument("limit", type=int, nargs="?", default=50)
+    ms = msub.add_parser("send", parents=[common]); ms.add_argument("to"); ms.add_argument("body")
+    mm = msub.add_parser("mark-read", parents=[common]); mm.add_argument("message_id", type=int)
+    sp.set_defaults(fn=cmd_message)
 
     return p
 

@@ -146,6 +146,31 @@ class MemTest(unittest.TestCase):
                                      (did,)).fetchone()[0], 1)
         con.close()
 
+    def test_message_send_check_mark_read(self):
+        # second shell to send to
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO shells (display_name, shortname, mandate, system_prompt, "
+                    "user_id, is_shared, has_identity, bootstrapped) "
+                    "VALUES ('TD', 'td', 'm', 'sp', 1, 0, 1, 1)")
+        con.commit(); con.close()
+        # tc -> td
+        self._run("message", "send", "td", "hello td")
+        # unknown recipient rejected
+        with self.assertRaises(SystemExit):
+            self._run("message", "send", "ghost", "x")
+        # td sees it; tc does not
+        con = sqlite3.connect(self.db)
+        mid = con.execute("SELECT message_id FROM shell_messages WHERE body='hello td'").fetchone()[0]
+        self.assertEqual(con.execute("SELECT to_shell_id FROM shell_messages "
+                                     "WHERE message_id=?", (mid,)).fetchone()[0], 2)
+        con.close()
+        # mark-read as td
+        mem.main(["message", "mark-read", str(mid), "--db", str(self.db), "--no-sync", "--shell", "td"])
+        con = sqlite3.connect(self.db)
+        self.assertIsNotNone(con.execute("SELECT read_at FROM shell_messages "
+                                         "WHERE message_id=?", (mid,)).fetchone()[0])
+        con.close()
+
     def test_seed_and_retire(self):
         self._run("seed", "a genesis line", "--tag", "tc")
         con = sqlite3.connect(self.db)
