@@ -20,6 +20,15 @@ the one vantage that sits in the repo root on `main`, sees every worktree on
 disk, and is exempted from the branch-guard. No working shell runs this; a
 working shell tidies only its own worktree via the `git` skill.
 
+**What the launcher already does for you.** Since #119, `git_prune.py` deletes
+the *provably-merged* branch subset automatically on every boot (the same
+`stale` set described in Tier A.1), repo-global across the fork's worktrees — so
+in practice you will often find that tier already clear. This pass remains the
+backstop for everything the automation deliberately won't touch: merges it could
+not prove (a `gh`-down boot keeps the branch), dirty worktrees, outstanding
+unpushed work, `main` fast-forward, and remote-ref pruning. Don't be surprised by
+an empty Tier A; do still run the report.
+
 The governing asymmetry — internalize it before you touch anything:
 
 > You can **prove** something is safe to **delete** (its PR shows MERGED).
@@ -75,6 +84,9 @@ Only these three. Each has hard proof of safety:
    ```bash
    git branch -D <branch>
    ```
+   `git_prune.py` already does exactly this at boot, so most of these are gone
+   before you look. What survives to here is the residue: branches merged since
+   the last boot, or merged during a `gh`-down boot that couldn't prove it.
 2. **Dead remote-tracking refs.**
    ```bash
    git fetch --prune
