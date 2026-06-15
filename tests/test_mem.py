@@ -171,6 +171,63 @@ class MemTest(unittest.TestCase):
                                          "WHERE message_id=?", (mid,)).fetchone()[0])
         con.close()
 
+    def test_roadmap_add_and_status(self):
+        self._run("roadmap", "add", "Feat X", "--status", "brainstorm")
+        con = sqlite3.connect(self.db)
+        fid = con.execute("SELECT feature_id FROM roadmap WHERE title='Feat X'").fetchone()[0]
+        con.close()
+        self._run("roadmap", "status", str(fid), "shipped")
+        con = sqlite3.connect(self.db)
+        self.assertEqual(con.execute("SELECT roadmap_status FROM roadmap WHERE feature_id=?",
+                                     (fid,)).fetchone()[0], "shipped")
+        con.close()
+
+    def test_project_add_standing_status(self):
+        self._run("project", "add", "proj1", "Project One", "--purpose", "p")
+        con = sqlite3.connect(self.db)
+        pid = con.execute("SELECT project_id FROM projects WHERE shortname='proj1'").fetchone()[0]
+        self.assertEqual(con.execute("SELECT count(*) FROM project_shells WHERE project_id=?",
+                                     (pid,)).fetchone()[0], 1)  # linked to the shell
+        con.close()
+        self._run("project", "standing", "proj1", "build + own")
+        self._run("project", "status", "proj1", "paused")
+        con = sqlite3.connect(self.db)
+        standing, status = con.execute("SELECT standing, status FROM projects WHERE project_id=?",
+                                       (pid,)).fetchone()
+        self.assertEqual((standing, status), ("build + own", "paused"))
+        con.close()
+
+    def test_task_add_start_done(self):
+        # prerequisites: a feature + a document
+        con = sqlite3.connect(self.db)
+        fid = con.execute("INSERT INTO roadmap (title, owning_shell) VALUES ('F', 1)").lastrowid
+        did = con.execute("INSERT INTO documents (feature_id, kind, seq, title) "
+                          "VALUES (?, 'spec', 1, 'S')", (fid,)).lastrowid
+        con.commit(); con.close()
+        self._run("task", "add", "Preparation", "--feature", str(fid), "--doc", str(did), "--seq", "0")
+        con = sqlite3.connect(self.db)
+        tid = con.execute("SELECT task_id FROM spec_tasks WHERE title='Preparation'").fetchone()[0]
+        con.close()
+        self._run("task", "start", str(tid))
+        con = sqlite3.connect(self.db)
+        self.assertEqual(con.execute("SELECT status FROM spec_tasks WHERE task_id=?",
+                                     (tid,)).fetchone()[0], "in_progress")
+        con.close()
+        self._run("task", "done", str(tid))
+        con = sqlite3.connect(self.db)
+        status, cd = con.execute("SELECT status, completed_date FROM spec_tasks WHERE task_id=?",
+                                 (tid,)).fetchone()
+        self.assertEqual(status, "done"); self.assertIsNotNone(cd)
+        con.close()
+
+    def test_oriented(self):
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE shells SET bootstrapped=0 WHERE shell_id=1"); con.commit(); con.close()
+        self._run("oriented")
+        con = sqlite3.connect(self.db)
+        self.assertEqual(con.execute("SELECT bootstrapped FROM shells WHERE shell_id=1").fetchone()[0], 1)
+        con.close()
+
     def test_seed_and_retire(self):
         self._run("seed", "a genesis line", "--tag", "tc")
         con = sqlite3.connect(self.db)

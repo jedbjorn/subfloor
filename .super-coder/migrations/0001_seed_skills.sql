@@ -146,15 +146,12 @@ cartographer''s automation (see `surface_catalogue`). You read it.
    ./sc mem state "…"
    ```
 
-5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). The
-   `bootstrapped` flag isn''t a memory write, so set it directly, then snapshot:
-   ```sql
-   UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;
+5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). Sets
+   `bootstrapped=1` and snapshots for you:
    ```
+   ./sc mem oriented
    ```
-   ./sc snapshot   # persist the bootstrapped flag across a rebuild
-   ```
-   Then proceed with the task at hand. `<self>` = your shell_id.
+   Then proceed with the task at hand.
 
 ## Stance
 
@@ -254,8 +251,9 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    Spot-check that your `role_overrides` took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
 
-5. **Commit** the config + hooks (`git` skill), set your state, then
-   `UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;` and `./sc snapshot`.
+5. **Commit** the config + hooks (`git` skill), set your state
+   (`./sc mem state "…"`), then `./sc mem oriented` (sets `bootstrapped=1` +
+   snapshots).
 
 ## Heal — re-run any time the map looks wrong
 
@@ -531,27 +529,40 @@ Each guards the engine DB and snapshots for you. `./sc mem which` orients;
 # record a Major decision (supersede with --parent <id>):
 ./sc mem decision "…" --rationale "…"
 
-# roadmap: add a feature:
+# roadmap: add a feature / move its horizon:
 ./sc mem roadmap add "…" --status brainstorm --summary "…"
+./sc mem roadmap status <feature_id> shipped
 
 # author a spec/doc body (--body-file reads the markdown), then freeze on ship:
 ./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ./sc mem doc freeze <document_id>
 
+# spec_tasks (the plan): add a task / advance it:
+./sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
+./sc mem task start <task_id>     # ./sc mem task done <task_id>
+
 # open / close a flag:
 ./sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
 ./sc mem flag close <flag_id> --notes "…"
+
+# projects (standing + linkage):
+./sc mem project add <shortname> "<title>" --purpose "…" --standing "…"
+./sc mem project standing <shortname|id> "…"     # ./sc mem project status <…> paused
+
+# inbox + first-run:
+./sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
+./sc mem oriented                          # mark first-run done (bootstrapped=1)
 ```
 
-**No `mem` verb yet** (raw `sqlite3` against the engine DB, then `./sc snapshot`):
-moving a roadmap feature''s horizon (`UPDATE roadmap SET roadmap_status=…`),
-project standing (`projects`), and `spec_tasks`. Confirm the target with
-`./sc mem which` before a raw write.
+Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
+reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
+existing shell to a project — are rare; do them with raw `sqlite3` after
+`./sc mem which`, then `./sc snapshot`.)
 
 ## After writing
 
 `./sc mem` snapshots (and renders) for you — nothing more to run; just commit the
-text it serialized. Only raw `sqlite3` writes need a manual `./sc snapshot` (and
+text it serialized. A rare raw `sqlite3` write needs a manual `./sc snapshot` (and
 `./sc render` if you changed documents/roadmap/skills). See the `snapshot` skill
 for the full lifecycle.',
   0
@@ -1936,17 +1947,14 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-`spec_tasks` has no `./sc mem` verb yet, so write it with raw `sqlite3` against
-the engine DB, then `./sc snapshot` (`./sc mem which` confirms you''re on the
-engine DB first):
+Add each task with `./sc mem task add` (one per seq). For a multi-task plan, pass
+`--no-sync` on all but the last so you snapshot once at the end:
 
-```sql
-INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id)
-VALUES
-  (<feature_id>, <doc_id>, 0,   ''Preparation'',  ''Read all relevant code paths, verify DB state, confirm entry points'', <self>),
-  (<feature_id>, <doc_id>, 1,   ''<Step 1>'',     ''<what it does>'',                                                     <self>),
-  (<feature_id>, <doc_id>, 2,   ''<Step 2>'',     ''<what it does>'',                                                     <self>),
-  (<feature_id>, <doc_id>, <N>, ''Verification'', ''Run tests, smoke-test against done-condition, snapshot + render'',    <self>);
+```
+./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points" --no-sync
+./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>" --no-sync
+./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>" --no-sync
+./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
 Then set `current_state` — no last-done yet, next is Preparation:
@@ -1970,19 +1978,18 @@ ORDER BY seq;
 
 Find the first `pending` task. Mark it `in_progress`:
 
-```sql
-UPDATE spec_tasks SET status=''in_progress'' WHERE task_id=<id>;
+```
+./sc mem task start <task_id>
 ```
 
-Work only that task. When done, mark it complete (raw write — `spec_tasks` has no
-`mem` verb — then snapshot), and resolve last-done / next-up:
+Work only that task. When done, mark it complete, then resolve last-done / next-up
+with a read:
 
+```
+./sc mem task done <task_id>
+```
 ```sql
-UPDATE spec_tasks
-SET status=''done'', completed_date=date(''now'')
-WHERE task_id=<id>;
-
--- resolve last-done and next-pending in one query:
+-- resolve last-done and next-pending in one query (raw read):
 SELECT
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status=''done''
    ORDER BY seq DESC LIMIT 1) AS last_done,
@@ -1990,7 +1997,7 @@ SELECT
    ORDER BY seq ASC LIMIT 1) AS next_up;
 ```
 
-Then advance `current_state` (this also snapshots, persisting the task update):
+Then advance `current_state`:
 
 ```
 ./sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."

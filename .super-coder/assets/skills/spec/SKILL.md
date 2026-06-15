@@ -82,17 +82,14 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-`spec_tasks` has no `./sc mem` verb yet, so write it with raw `sqlite3` against
-the engine DB, then `./sc snapshot` (`./sc mem which` confirms you're on the
-engine DB first):
+Add each task with `./sc mem task add` (one per seq). For a multi-task plan, pass
+`--no-sync` on all but the last so you snapshot once at the end:
 
-```sql
-INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id)
-VALUES
-  (<feature_id>, <doc_id>, 0,   'Preparation',  'Read all relevant code paths, verify DB state, confirm entry points', <self>),
-  (<feature_id>, <doc_id>, 1,   '<Step 1>',     '<what it does>',                                                     <self>),
-  (<feature_id>, <doc_id>, 2,   '<Step 2>',     '<what it does>',                                                     <self>),
-  (<feature_id>, <doc_id>, <N>, 'Verification', 'Run tests, smoke-test against done-condition, snapshot + render',    <self>);
+```
+./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points" --no-sync
+./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>" --no-sync
+./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>" --no-sync
+./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
 Then set `current_state` — no last-done yet, next is Preparation:
@@ -116,19 +113,18 @@ ORDER BY seq;
 
 Find the first `pending` task. Mark it `in_progress`:
 
-```sql
-UPDATE spec_tasks SET status='in_progress' WHERE task_id=<id>;
+```
+./sc mem task start <task_id>
 ```
 
-Work only that task. When done, mark it complete (raw write — `spec_tasks` has no
-`mem` verb — then snapshot), and resolve last-done / next-up:
+Work only that task. When done, mark it complete, then resolve last-done / next-up
+with a read:
 
+```
+./sc mem task done <task_id>
+```
 ```sql
-UPDATE spec_tasks
-SET status='done', completed_date=date('now')
-WHERE task_id=<id>;
-
--- resolve last-done and next-pending in one query:
+-- resolve last-done and next-pending in one query (raw read):
 SELECT
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status='done'
    ORDER BY seq DESC LIMIT 1) AS last_done,
@@ -136,7 +132,7 @@ SELECT
    ORDER BY seq ASC LIMIT 1) AS next_up;
 ```
 
-Then advance `current_state` (this also snapshots, persisting the task update):
+Then advance `current_state`:
 
 ```
 ./sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."

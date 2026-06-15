@@ -30,6 +30,13 @@ Run from the repo root, like every engine command:
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID] [--shell …]
     ./sc mem flag close <flag_id>    [--notes "…"]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--shell …]
+    ./sc mem roadmap status <feature_id> <status>
+    ./sc mem project add <shortname> "<title>" [--purpose …] [--standing …] [--status active] [--role …]
+    ./sc mem project standing <shortname|id> "<text>"
+    ./sc mem project status <shortname|id> active|inactive|paused
+    ./sc mem task add "<title>" --feature <id> --doc <id> --seq <n> [--desc "…"]
+    ./sc mem task start <task_id>    ./sc mem task done <task_id>
+    ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc freeze <document_id>
     ./sc mem narrative "<line>"      [--shell …]
@@ -289,6 +296,16 @@ def cmd_flag(args) -> int:
 def cmd_roadmap(args) -> int:
     con = connect(Path(args.db))
     try:
+        if args.roadmap_cmd == "status":
+            r = con.execute("SELECT title FROM roadmap WHERE feature_id=?",
+                            (args.feature_id,)).fetchone()
+            if r is None:
+                die(f"no roadmap feature #{args.feature_id}")
+            con.execute("UPDATE roadmap SET roadmap_status=?, updated_at=datetime('now') "
+                        "WHERE feature_id=?", (args.status, args.feature_id))
+            con.commit()
+            return finish(args, f"mem: feature #{args.feature_id} ('{r['title']}') → {args.status}")
+        # add
         sid = resolve_shell(con, args.shell)
         cur = con.execute(
             "INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary) "
@@ -298,6 +315,94 @@ def cmd_roadmap(args) -> int:
     finally:
         con.close()
     return finish(args, f"mem: roadmap feature #{fid} added ('{args.title}', {args.status})")
+
+
+def _resolve_project(con, spec: str) -> sqlite3.Row:
+    if str(spec).isdigit():
+        r = con.execute("SELECT project_id, shortname FROM projects WHERE project_id=? "
+                        "AND COALESCE(is_deleted,0)=0", (int(spec),)).fetchone()
+    else:
+        r = con.execute("SELECT project_id, shortname FROM projects WHERE LOWER(shortname)=LOWER(?) "
+                        "AND COALESCE(is_deleted,0)=0", (spec,)).fetchone()
+    if r is None:
+        die(f"no project '{spec}'")
+    return r
+
+
+def cmd_project(args) -> int:
+    con = connect(Path(args.db))
+    try:
+        if args.project_cmd == "add":
+            sid = resolve_shell(con, args.shell)
+            try:
+                cur = con.execute(
+                    "INSERT INTO projects (shortname, title, purpose, standing, status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (args.shortname, args.title, args.purpose, args.standing, args.status))
+            except sqlite3.IntegrityError as e:
+                die(str(e))  # UNIQUE(shortname) etc.
+            pid = cur.lastrowid
+            con.execute("INSERT INTO project_shells (project_id, shell_id, role) VALUES (?, ?, ?)",
+                        (pid, sid, args.role))
+            con.commit()
+            return finish(args, f"mem: project #{pid} ('{args.shortname}') added + linked to shell #{sid}")
+        proj = _resolve_project(con, args.project)
+        if args.project_cmd == "standing":
+            con.execute("UPDATE projects SET standing=? WHERE project_id=?",
+                        (args.text, proj["project_id"]))
+            con.commit()
+            return finish(args, f"mem: standing updated for project '{proj['shortname']}'")
+        # status
+        con.execute("UPDATE projects SET status=? WHERE project_id=?",
+                    (args.status, proj["project_id"]))
+        con.commit()
+        return finish(args, f"mem: project '{proj['shortname']}' → {args.status}")
+    finally:
+        con.close()
+
+
+def cmd_task(args) -> int:
+    con = connect(Path(args.db))
+    try:
+        if args.task_cmd == "add":
+            sid = resolve_shell(con, args.shell)
+            try:
+                cur = con.execute(
+                    "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (args.feature, args.doc, args.seq, args.title, args.desc, sid))
+            except sqlite3.IntegrityError as e:
+                die(str(e))  # UNIQUE(document_id, seq) / FK
+            con.commit()
+            return finish(args, f"mem: task #{cur.lastrowid} added (seq {args.seq}, '{args.title}')")
+        r = con.execute("SELECT title, status FROM spec_tasks WHERE task_id=?",
+                        (args.task_id,)).fetchone()
+        if r is None:
+            die(f"no task #{args.task_id}")
+        if args.task_cmd == "start":
+            con.execute("UPDATE spec_tasks SET status='in_progress' WHERE task_id=?", (args.task_id,))
+            con.commit()
+            return finish(args, f"mem: task #{args.task_id} ('{r['title']}') → in_progress")
+        # done
+        con.execute("UPDATE spec_tasks SET status='done', completed_date=date('now') "
+                    "WHERE task_id=?", (args.task_id,))
+        con.commit()
+        return finish(args, f"mem: task #{args.task_id} ('{r['title']}') → done")
+
+
+    finally:
+        con.close()
+
+
+def cmd_oriented(args) -> int:
+    con = connect(Path(args.db))
+    try:
+        sid = resolve_shell(con, args.shell)
+        con.execute("UPDATE shells SET bootstrapped=1 WHERE shell_id=?", (sid,))
+        con.commit()
+    finally:
+        con.close()
+    return finish(args, f"mem: shell #{sid} marked oriented (bootstrapped=1)")
 
 
 def cmd_doc(args) -> int:
@@ -446,14 +551,38 @@ def build_parser() -> argparse.ArgumentParser:
     fc = fsub.add_parser("close", parents=[common]); fc.add_argument("flag_id", type=int); fc.add_argument("--notes")
     sp.set_defaults(fn=cmd_flag)
 
-    sp = sub.add_parser("roadmap", help="add a roadmap feature")
+    ROADMAP_STATUSES = ["brainstorm", "in_progress", "next", "near_term",
+                        "long_term", "shipped", "retired"]
+    sp = sub.add_parser("roadmap", help="add a feature or move its status")
     rsub = sp.add_subparsers(dest="roadmap_cmd", required=True)
     ra = rsub.add_parser("add", parents=[common]); ra.add_argument("title")
-    ra.add_argument("--status", default="brainstorm",
-                    choices=["brainstorm", "in_progress", "next", "near_term",
-                             "long_term", "shipped", "retired"])
+    ra.add_argument("--status", default="brainstorm", choices=ROADMAP_STATUSES)
     ra.add_argument("--summary")
+    rt = rsub.add_parser("status", parents=[common])
+    rt.add_argument("feature_id", type=int); rt.add_argument("status", choices=ROADMAP_STATUSES)
     sp.set_defaults(fn=cmd_roadmap)
+
+    sp = sub.add_parser("project", help="add a project or update its standing/status")
+    psub = sp.add_subparsers(dest="project_cmd", required=True)
+    pa = psub.add_parser("add", parents=[common]); pa.add_argument("shortname"); pa.add_argument("title")
+    pa.add_argument("--purpose"); pa.add_argument("--standing"); pa.add_argument("--role")
+    pa.add_argument("--status", default="active", choices=["active", "inactive", "paused"])
+    pst = psub.add_parser("standing", parents=[common]); pst.add_argument("project"); pst.add_argument("text")
+    pss = psub.add_parser("status", parents=[common]); pss.add_argument("project")
+    pss.add_argument("status", choices=["active", "inactive", "paused"])
+    sp.set_defaults(fn=cmd_project)
+
+    sp = sub.add_parser("task", help="spec_tasks: add / start / done")
+    tsub = sp.add_subparsers(dest="task_cmd", required=True)
+    ta = tsub.add_parser("add", parents=[common]); ta.add_argument("title")
+    ta.add_argument("--feature", type=int, required=True); ta.add_argument("--doc", type=int, required=True)
+    ta.add_argument("--seq", type=int, required=True); ta.add_argument("--desc")
+    tst = tsub.add_parser("start", parents=[common]); tst.add_argument("task_id", type=int)
+    tdn = tsub.add_parser("done", parents=[common]); tdn.add_argument("task_id", type=int)
+    sp.set_defaults(fn=cmd_task)
+
+    sub.add_parser("oriented", parents=[common],
+                   help="mark this shell oriented (bootstrapped=1)").set_defaults(fn=cmd_oriented)
 
     sp = sub.add_parser("doc", help="add or freeze a spec/doc document")
     dsub = sp.add_subparsers(dest="doc_cmd", required=True)

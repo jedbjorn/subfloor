@@ -62,26 +62,39 @@ Each guards the engine DB and snapshots for you. `./sc mem which` orients;
 # record a Major decision (supersede with --parent <id>):
 ./sc mem decision "…" --rationale "…"
 
-# roadmap: add a feature:
+# roadmap: add a feature / move its horizon:
 ./sc mem roadmap add "…" --status brainstorm --summary "…"
+./sc mem roadmap status <feature_id> shipped
 
 # author a spec/doc body (--body-file reads the markdown), then freeze on ship:
 ./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ./sc mem doc freeze <document_id>
 
+# spec_tasks (the plan): add a task / advance it:
+./sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
+./sc mem task start <task_id>     # ./sc mem task done <task_id>
+
 # open / close a flag:
 ./sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
 ./sc mem flag close <flag_id> --notes "…"
+
+# projects (standing + linkage):
+./sc mem project add <shortname> "<title>" --purpose "…" --standing "…"
+./sc mem project standing <shortname|id> "…"     # ./sc mem project status <…> paused
+
+# inbox + first-run:
+./sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
+./sc mem oriented                          # mark first-run done (bootstrapped=1)
 ```
 
-**No `mem` verb yet** (raw `sqlite3` against the engine DB, then `./sc snapshot`):
-moving a roadmap feature's horizon (`UPDATE roadmap SET roadmap_status=…`),
-project standing (`projects`), and `spec_tasks`. Confirm the target with
-`./sc mem which` before a raw write.
+Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
+reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
+existing shell to a project — are rare; do them with raw `sqlite3` after
+`./sc mem which`, then `./sc snapshot`.)
 
 ## After writing
 
 `./sc mem` snapshots (and renders) for you — nothing more to run; just commit the
-text it serialized. Only raw `sqlite3` writes need a manual `./sc snapshot` (and
+text it serialized. A rare raw `sqlite3` write needs a manual `./sc snapshot` (and
 `./sc render` if you changed documents/roadmap/skills). See the `snapshot` skill
 for the full lifecycle.

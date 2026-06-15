@@ -49,15 +49,12 @@ cartographer's automation (see `surface_catalogue`). You read it.
    ./sc mem state "…"
    ```
 
-5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). The
-   `bootstrapped` flag isn't a memory write, so set it directly, then snapshot:
-   ```sql
-   UPDATE shells SET bootstrapped=1 WHERE shell_id=<self>;
+5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). Sets
+   `bootstrapped=1` and snapshots for you:
    ```
+   ./sc mem oriented
    ```
-   ./sc snapshot   # persist the bootstrapped flag across a rebuild
-   ```
-   Then proceed with the task at hand. `<self>` = your shell_id.
+   Then proceed with the task at hand.
 
 ## Stance
 
