@@ -31,6 +31,7 @@ Run from the repo root, like every engine command:
     ./sc mem flag close <flag_id>    [--notes "…"]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--shell …]
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
+    ./sc mem doc freeze <document_id>
     ./sc mem narrative "<line>"      [--shell …]
 
 Common flags: --no-sync (skip snapshot+render), --db <path> (override target;
@@ -297,6 +298,8 @@ def cmd_roadmap(args) -> int:
 
 
 def cmd_doc(args) -> int:
+    if args.doc_cmd == "freeze":
+        return _doc_freeze(args)
     body = Path(args.body_file).read_text()
     con = connect(Path(args.db))
     try:
@@ -316,6 +319,23 @@ def cmd_doc(args) -> int:
         con.close()
     return finish(args, f"mem: {args.kind} document #{docid} added "
                         f"('{args.title}', seq {seq}, {len(body)} chars)")
+
+
+def _doc_freeze(args) -> int:
+    con = connect(Path(args.db))
+    try:
+        r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
+                        (args.document_id,)).fetchone()
+        if r is None:
+            die(f"no document #{args.document_id}")
+        if r["frozen"]:
+            die(f"document #{args.document_id} is already frozen")
+        con.execute("UPDATE documents SET frozen=1, frozen_date=date('now') "
+                    "WHERE document_id=?", (args.document_id,))
+        con.commit()
+    finally:
+        con.close()
+    return finish(args, f"mem: document #{args.document_id} frozen")
 
 
 def cmd_narrative(args) -> int:
@@ -387,12 +407,13 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--summary")
     sp.set_defaults(fn=cmd_roadmap)
 
-    sp = sub.add_parser("doc", help="add a spec/doc document")
+    sp = sub.add_parser("doc", help="add or freeze a spec/doc document")
     dsub = sp.add_subparsers(dest="doc_cmd", required=True)
     da = dsub.add_parser("add", parents=[common]); da.add_argument("title")
     da.add_argument("--body-file", required=True, dest="body_file")
     da.add_argument("--feature", type=int); da.add_argument("--kind", default="spec", choices=["spec", "doc"])
     da.add_argument("--seq", type=int); da.add_argument("--render-path", dest="render_path")
+    df = dsub.add_parser("freeze", parents=[common]); df.add_argument("document_id", type=int)
     sp.set_defaults(fn=cmd_doc)
 
     sp = sub.add_parser("narrative", parents=[common],

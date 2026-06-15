@@ -70,10 +70,8 @@ List these and ask the FnB before writing the plan.
 Hard stops — prior work not shipped, missing environment state, unresolved
 external dependency. Open a flag for each:
 
-```sql
-INSERT INTO flags (display_name, description, priority, feature_id, shell_id)
-VALUES ('<SC-###>', '[Spec] <what is blocked> | Blocker for: <feature title>',
-        'High', <feature_id>, <self>);
+```
+./sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
 ```
 
 Don't open flags for unclear items you can resolve by asking — ask first.
@@ -91,6 +89,10 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
+`spec_tasks` has no `./sc mem` verb yet, so write it with raw `sqlite3` against
+the engine DB, then `./sc snapshot` (`./sc mem which` confirms you're on the
+engine DB first):
+
 ```sql
 INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id)
 VALUES
@@ -100,11 +102,10 @@ VALUES
   (<feature_id>, <doc_id>, <N>, 'Verification', 'Run tests, smoke-test against done-condition, snapshot + render',    <self>);
 ```
 
-Then update `current_state` — no last-done yet, next is Preparation:
+Then set `current_state` — no last-done yet, next is Preparation:
 
-```sql
-UPDATE shells SET current_state='[<feature_title>] — last: —. next: Preparation.'
-WHERE shell_id = <self>;
+```
+./sc mem state "[<feature_title>] — last: —. next: Preparation."
 ```
 
 ---
@@ -126,7 +127,8 @@ Find the first `pending` task. Mark it `in_progress`:
 UPDATE spec_tasks SET status='in_progress' WHERE task_id=<id>;
 ```
 
-Work only that task. When done, mark it complete and advance `current_state`:
+Work only that task. When done, mark it complete (raw write — `spec_tasks` has no
+`mem` verb — then snapshot), and resolve last-done / next-up:
 
 ```sql
 UPDATE spec_tasks
@@ -139,14 +141,15 @@ SELECT
    ORDER BY seq DESC LIMIT 1) AS last_done,
   (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status='pending'
    ORDER BY seq ASC LIMIT 1) AS next_up;
-
-UPDATE shells
-SET current_state='[<feature_title>] — last: <last_done>. next: <next_up>.'
-WHERE shell_id=<self>;
 ```
 
-If `next_up` is NULL, all tasks are done — set current_state to reflect that
-and run `./sc snapshot`.
+Then advance `current_state` (this also snapshots, persisting the task update):
+
+```
+./sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
+```
+
+If `next_up` is NULL, all tasks are done — set current_state to reflect that.
 
 ---
 

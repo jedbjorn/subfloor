@@ -131,6 +131,21 @@ class MemTest(unittest.TestCase):
                                      (fid,)).fetchone()[0], 1)
         con.close()
 
+    def test_doc_add_and_freeze(self):
+        spec = self.tmp / "spec.md"
+        spec.write_text("# Spec\nbody\n")
+        self._run("doc", "add", "A Spec", "--body-file", str(spec), "--kind", "spec")
+        con = sqlite3.connect(self.db)
+        did, frozen = con.execute("SELECT document_id, frozen FROM documents "
+                                  "WHERE title='A Spec'").fetchone()
+        con.close()
+        self.assertEqual(frozen, 0)
+        mem.main(["doc", "freeze", str(did), "--db", str(self.db), "--no-sync"])
+        con = sqlite3.connect(self.db)
+        self.assertEqual(con.execute("SELECT frozen FROM documents WHERE document_id=?",
+                                     (did,)).fetchone()[0], 1)
+        con.close()
+
     def test_seed_and_retire(self):
         self._run("seed", "a genesis line", "--tag", "tc")
         con = sqlite3.connect(self.db)

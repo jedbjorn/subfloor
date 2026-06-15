@@ -23,20 +23,23 @@ ORDER BY f.priority, f.flag_id;
 
 ## Open
 
-```sql
-INSERT INTO flags (display_name, description, priority, feature_id, shell_id)
-VALUES ('SC-001', '[Area] what''s blocked | Blocker for: X', 'Medium', ?, <self>);
+Write through `./sc mem` (it guards the engine DB + snapshots; raw `sqlite3` is
+for the SELECT above only):
 ```
-- `display_name`: short id (`SC-###`).
-- `description`: `[Area] {what} | Blocker for: {what it blocks}`.
-- `priority`: High / Medium / Low. `feature_id`: the feature it blocks (or NULL).
+./sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
+```
+- `--name`: short id (`SC-###`).
+- the description is `[Area] {what} | Blocker for: {what it blocks}`.
+- `--priority`: High / Medium / Low. `--feature`: the feature it blocks (or omit).
 
 ## Resolve
 
-```sql
-UPDATE flags SET resolved=1, resolved_date=date('now'), resolution_notes='…'
-WHERE flag_id=?;
 ```
+./sc mem flag close <flag_id> --notes "…"
+```
+
+(equivalent raw write, for reference: `UPDATE flags SET resolved=1,
+resolved_date=date('now'), resolution_notes='…' WHERE flag_id=?;`)
 
 ## Stance
 

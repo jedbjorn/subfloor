@@ -15,60 +15,64 @@ How this shell writes its memory — current_state, session narrative, seed, L&S
 # memory — write as you go
 
 All memory is DB rows (no flat files). Write at the moment it matters, not in a
-close ritual. The `.db` is a cache — after writing, `./sc snapshot` serializes to
-the text git tracks (see the `snapshot` skill). `<self>` = your shell_id.
+close ritual.
+
+**Write through `./sc mem`, never raw `sqlite3`.** Two DBs are in reach (your
+engine DB and the app's product DB) and their table names overlap — a raw
+`INSERT INTO shell_decisions …` against the wrong one *succeeds silently*.
+`./sc mem` resolves + guards *this* engine DB, refuses the app DB or an empty
+stub, and snapshots the change so it survives a rebuild (no separate
+`./sc snapshot`). `./sc mem which` shows the resolved DB; raw `sqlite3` is for
+SELECT only. Writes default to your shell; pass `--shell <id|name>` to be explicit.
 
 ## current_state — rolling status, NOT a log
 
-Your present focus + what's next. **UPDATE in place; never append.** Soft target
+Your present focus + what's next. **Replaces in place; never a log.** Soft target
 ~500 chars. Rewrite when focus shifts.
-```sql
-UPDATE shells SET current_state='…' WHERE shell_id=<self>;
+```
+./sc mem state "…"
 ```
 
 ## Session narrative — append at inflection points
 
-One row per session (`shell_memory_archives`, the active one is
-`active_archive_id`). Append `[HH:MM] {1–2 lines}` when: a decision lands, an
-approach changes or is rejected, the FnB says something that shapes the work, an
-assumption breaks, or before a big change. Edit the H1 when the session's
-headline crystallizes.
-```sql
-UPDATE shell_memory_archives
-SET full_narrative = full_narrative || char(10) || '[HH:MM] …' || char(10)
-WHERE archive_id = (SELECT active_archive_id FROM shells WHERE shell_id=<self>);
+One row per session, appended progressively. Append a `[HH:MM]` line (the time is
+stamped for you) when: a decision lands, an approach changes or is rejected, the
+FnB says something that shapes the work, an assumption breaks, or before a big
+change.
+```
+./sc mem narrative "…"
 ```
 
 ## seed (cap 10) — who you are
 
-Identity-forming moments. Past-tense/timeless. INSERT to add; **never edit a body**
-(curate by setting `retired_at`). The genesis + lineage seed are already yours.
-```sql
-INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
-VALUES (<self>, 'seed', date('now'), '…');
+Identity-forming moments. Past-tense/timeless. Add a new entry; **never edit a
+body** (curate by retiring). The genesis + lineage seed are already yours.
+```
+./sc mem seed "…"            # add
+./sc mem retire <entry_id>   # curate out (frees a cap slot)
 ```
 
 ## L&S (cap 20) — how you work
 
-Operating lessons, imperative voice. INSERT when a lesson lands; curate via
-`retired_at`. Caps are trigger-enforced (seed 10, L&S 20) — retire to free a slot.
-```sql
-INSERT INTO shell_identity_entries (shell_id, kind, entry_date, body)
-VALUES (<self>, 'lns', date('now'), '…');
+Operating lessons, imperative voice. Add when a lesson lands; curate by retiring.
+Caps are trigger-enforced (seed 10, L&S 20) — `./sc mem` reports the cap message;
+retiring frees a slot.
+```
+./sc mem lns "…"
 ```
 
 ## Decisions — Major only
 
-INSERT a row on a Major decision (architecture, approach, a path chosen over
-another). Never edit a prior row; supersede via `parent_decision_id`. Mirror it
-into the narrative.
-```sql
-INSERT INTO shell_decisions (shell_id, decision_date, priority, decision, rationale)
-VALUES (<self>, date('now'), 'M', '…', '…');
+Record a Major decision (architecture, approach, a path chosen over another).
+Never rewritten; supersede via `--parent <decision_id>`. Mirror the headline into
+the narrative.
+```
+./sc mem decision "…" --rationale "…" [--parent <id>]
 ```
 
 ## Stance
 
-Write-as-you-go beats batch-at-close: appending costs nothing per write and zero
-at session end. Curate seed/L&S (revise the set), never rewrite history
-(decisions, narrative, seed bodies).
+Write-as-you-go beats batch-at-close: it costs nothing per write and zero at
+session end. Curate seed/L&S (revise the set), never rewrite history (decisions,
+narrative, seed bodies). The underlying tables are documented in `db_map` — read
+them with raw SELECT, write them with `./sc mem`.

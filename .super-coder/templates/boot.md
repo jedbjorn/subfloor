@@ -37,8 +37,12 @@ different ways, so keep them straight:
 
 - **Engine memory DB** — `.super-coder/shell_db.db`. Fixed name, always under
   `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
-  Gitignored and rebuilt from tracked text — change it through DB tables (per your
-  skills) and `./sc snapshot`, never through app migrations.
+  Gitignored and rebuilt from tracked text. **Write to it through `./sc mem`, not
+  raw `sqlite3`** — `./sc mem` resolves *this* DB for you, refuses to write to the
+  app DB or a stray empty file (their table names overlap, so a raw INSERT against
+  the wrong one silently succeeds), and snapshots the change so it survives a
+  rebuild. `./sc mem which` shows the resolved DB. Raw `sqlite3` is for SELECT
+  (reads can't corrupt); `./sc snapshot` re-serializes after any non-`mem` edit.
 - **App product DB** — the database of the product *this repo* builds. Its name
   and path **vary per fork** and live **outside** `.super-coder/`. Holds the
   product's runtime data + schema. Change it the way the product does — schema
@@ -46,9 +50,10 @@ different ways, so keep them straight:
   it. Locate it via the repo map: the cartographer tags its schema/migrations in
   `dr_*` (the live `.db` is often gitignored, so the schema is the durable anchor).
 
-**Decision rule:** your memory / planning / specs / roadmap → **engine DB**. The
-product's data or schema → **app DB**, via its migrations. If a task is about what
-the product stores or how its tables are shaped, it is never the engine DB.
+**Decision rule:** your memory / planning / specs / roadmap → **engine DB**,
+written via `./sc mem`. The product's data or schema → **app DB**, via its
+migrations. If a task is about what the product stores or how its tables are
+shaped, it is never the engine DB.
 
 ---
 
