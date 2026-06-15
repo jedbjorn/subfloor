@@ -12,16 +12,15 @@ purpose: Forkable shell substrate for a repo
 
 ## Overview
 
-![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cover.png)
-
-> [!class2]
-> **UI** all eight Review-GUI tabs · **Shells** planner · reviewer · dev · cartographer · admin
-
 A **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
 whatever coding harness you point at it — **Claude Code, OpenCode, Codex, and
 Mistral Vibe**, all sandbox-integrated (or run on the no-docker host path).
+
+
+![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cover.png)
+
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
