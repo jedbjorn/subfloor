@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.super-coder/scripts/branch-guard.sh\"",
+            "command": "bash \"$SC_ENGINE_DIR/scripts/branch-guard.sh\"",
             "statusMessage": "branch guard"
           }
         ]

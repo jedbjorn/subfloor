@@ -411,7 +411,9 @@ needed. They all work the same repo without clobbering each other:
   you before any work is touched.
 - **A branch-guard blocks work on `main`** in every harness — pre-tool hooks
   (Claude Code, Codex), an OpenCode plugin, and a git pre-commit backstop, all
-  one shared script.
+  one shared script. Under Claude Code it also inspects the **edit's target
+  path**, so a shell editing the stale repo-root checkout from inside its
+  worktree is blocked (and an out-of-worktree edit to a feature branch warns).
 - **The admin shell is the one exception.** It boots in the **repo root** on
   `main` and maintains it directly — engine updates, rollbacks, migrations,
   applying approved patches, fork-local skills. The branch-guard exempts it

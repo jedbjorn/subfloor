@@ -20,11 +20,16 @@ the launch command. No extra config file to emit at v1.
 
 `merge_json` deep-merges a `PreToolUse` hook into **`.claude/settings.local.json`**
 (the gitignored personal layer — never the fork's tracked `.claude/settings.json`,
-so fork-owned config is untouched). The hook runs the shared
-`../../scripts/branch-guard.sh` before
-every `Edit`/`Write`/`NotebookEdit`/`MultiEdit` and blocks the edit (exit 2) when
-HEAD is a protected default branch — forcing a feature branch before any work
-lands. Protected set defaults to `main master`; override per-fork with
+so fork-owned config is untouched). The hook runs the shared branch-guard before
+every `Edit`/`Write`/`NotebookEdit`/`MultiEdit`. It resolves the script via
+**`$SC_ENGINE_DIR`** (absolute path to the installed engine, exported by run.py)
+— a fork gitignores `.super-coder/`, so a worktree-relative path found nothing
+and the hook failed open in exactly the shell worktrees it protects. It blocks
+the edit (exit 2) when the **target file's** repo HEAD is a protected default
+branch — so a worktree shell writing to the stale repo-root checkout is caught,
+not just one whose own cwd is on `main`; an out-of-worktree edit to a feature
+branch is allowed with a warning. With no stdin target it falls back to the cwd's
+branch. Protected set defaults to `main master`; override per-fork with
 `SC_PROTECTED_BRANCHES` (space-separated). This is the enforcement behind the
 `git` skill and the boot-template VERSION CONTROL rule — a skill loads too late to
 stop the first edit; the hook fires before it. Re-emitted (idempotently) each
