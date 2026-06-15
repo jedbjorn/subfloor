@@ -492,6 +492,8 @@ only data lost is anything written between the update and the rollback.
 ./sc help                # all commands
 ```
 
+![The ./sc enter shell picker — authenticate, then choose a shell and its per-flavor harness and model defaults before boot](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cli-picker.png)
+
 **Choosing a harness.** The boot artifact is dual-written every launch
 (`CLAUDE.md` for Claude Code, `AGENTS.md` for the rest), so any installed harness
 can boot the same shell. At launch, after you pick a shell: `--harness <name>` or
@@ -568,6 +570,10 @@ refers to:
 | **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
 | **Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
+
+![Review GUI, Roadmap tab — features in funnel buckets, each expanded to its spec tasks, linked docs, and flag blockers](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-tab.png)
+
+![Review GUI, Worktrees tab — live git-hygiene report: dirty worktrees, each branch ahead/behind its base, and prunable merged branches](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/worktrees-tab.png)
 
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it;
