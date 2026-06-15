@@ -29,6 +29,15 @@ the change for you. Raw `sqlite3` is for SELECT only. `./sc mem which` to orient
 `./sc snapshot` (+ `./sc render` for docs/roadmap/skills) after any non-`mem`
 edit. See the `memory`, `db_map`, and `snapshot` skills.
 
+**Flat files are renders, not sources.** Every local `.md` and git-tracked file
+— docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
+`./sc render`. They are derived artifacts: a photograph of a DB row, not the row.
+Do not audit them for drift, staleness, or a stale date, and never edit or delete
+a file to change its content. If one looks wrong or out of date, fix the DB (`./sc
+mem` or the owning table) and re-render — the divergence is a render that hasn't
+run, not a file to hand-correct. The DB is the authoritative content; the tree is
+its projection.
+
 ## MANDATE
 
 {{mandate}}
