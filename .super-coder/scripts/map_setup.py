@@ -27,9 +27,15 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 HOOKS_DIR = ENGINE / "hooks"
-# core.hooksPath is interpreted relative to the repo top-level — keep it repo-
-# relative so it travels (no absolute host path baked into git config).
-HOOKS_REL = str(HOOKS_DIR.relative_to(REPO_ROOT))
+# core.hooksPath must be ABSOLUTE. Git interprets a relative hooksPath against
+# the *current working directory* — which in a linked worktree is the worktree
+# root, where a fork's gitignored .super-coder/ does NOT exist. So a relative
+# value made every git hook (pre-commit guard, post-commit preview URL, the
+# post-checkout/merge/rewrite catalogue remap) silently no-op in exactly the
+# shell worktrees they target. core.hooksPath is a per-clone setting (.git/config,
+# uncommitted) re-applied by this script on every install/update, so an absolute
+# host path costs nothing in portability and resolves from every worktree.
+HOOKS_ABS = str(HOOKS_DIR)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import map_repo  # noqa: E402
@@ -46,7 +52,7 @@ def wire_hooks() -> bool:
     Returns True if the wiring is in place, False if it couldn't be (not a git
     repo / no hooks dir) — mapping still proceeds either way."""
     if not HOOKS_DIR.is_dir():
-        print(f"map-setup: no hooks dir at {HOOKS_REL} — skipping hook wiring")
+        print(f"map-setup: no hooks dir at {HOOKS_ABS} — skipping hook wiring")
         return False
     hooks = sorted(p for p in HOOKS_DIR.iterdir() if p.is_file())
     for h in hooks:
@@ -56,9 +62,9 @@ def wire_hooks() -> bool:
               "(auto-remap needs git; `./sc map` / rebuild still refresh)")
         return False
     subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "config", "core.hooksPath", HOOKS_REL],
+        ["git", "-C", str(REPO_ROOT), "config", "core.hooksPath", HOOKS_ABS],
         check=True)
-    print(f"map-setup: core.hooksPath -> {HOOKS_REL} "
+    print(f"map-setup: core.hooksPath -> {HOOKS_ABS} "
           f"({len(hooks)} hook(s): {', '.join(h.name for h in hooks)})")
     return True
 
