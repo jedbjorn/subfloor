@@ -218,6 +218,38 @@ def link_worktree_map(work_dir: Path) -> None:
         print(f"→ map link: skipped ({e})")
 
 
+def trust_codex_worktree(work_dir: Path) -> None:
+    """Mark a codex shell's worktree as a trusted project in codex's config, so
+    its project-local .codex/hooks.json (the branch-guard) actually LOADS.
+
+    codex loads project-local hooks ONLY when the project's .codex/ layer is
+    trusted, and trust is keyed per-directory. Shells run in worktrees, which are
+    NOT the trusted main root — so without this the branch-guard never loads and
+    codex worktree shells run with NO edit-time guard. (Verified: interactive
+    codex fires the PreToolUse hook iff the project is trusted; `codex exec` runs
+    no hooks at all, and `--dangerously-bypass-hook-trust` only skips per-hook
+    hash review, not this layer-load trust.)
+
+    Idempotent text-append to $CODEX_HOME/config.toml (default ~/.codex). This is
+    the one place the engine writes under the codex home — additive project-trust
+    only, never auth/history (an FnB-approved deviation from the otherwise
+    hands-off ~/.codex policy)."""
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    cfg = home / "config.toml"
+    header = f'[projects."{work_dir}"]'
+    try:
+        text = cfg.read_text() if cfg.exists() else ""
+        if header in text:
+            return  # already trusted (codex writes exactly this stanza)
+        home.mkdir(parents=True, exist_ok=True)
+        sep = "" if (not text or text.endswith("\n")) else "\n"
+        with cfg.open("a") as f:
+            f.write(f'{sep}\n{header}\ntrust_level = "trusted"\n')
+        print(f"→ codex: trusted worktree layer (hooks load) → {cfg}")
+    except OSError as e:
+        print(f"→ codex trust: skipped ({e})")
+
+
 def _git(work_dir: Path, *args: str, timeout: int = 15) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(["git", "-C", str(work_dir), *args],
                           capture_output=True, text=True, timeout=timeout)
@@ -600,6 +632,8 @@ def main() -> None:
         ensure_worktree(work_dir, chosen["shortname"])
         sync_note = sync_worktree(work_dir, chosen["shortname"])
         link_worktree_map(work_dir)  # .sc-state/map.db -> root's map DB (heals shadows)
+        if harness == "codex":
+            trust_codex_worktree(work_dir)  # so codex loads the worktree's branch-guard hook
 
     # Repo-global branch hygiene: delete local branches whose PR is provably
     # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
