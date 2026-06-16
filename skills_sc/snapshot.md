@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # snapshot
 
-Persist DB work to git-tracked text — when and how to run ./sc snapshot / ./sc render before committing. The .db is a cache; text is the source of truth.
+Persist DB work to git-tracked text — when and how to run ./sc snapshot / ./sc render. The .db is a cache; text is the source of truth. Snapshot is durability; the GUI Publish button commits + PRs it.
 
 **Category:** substrate  ·  **Command:** `./sc snapshot`
 
@@ -46,10 +46,15 @@ shell is *granted* a skill is per-instance (snapshot).
 3. **Verify the rebuild reproduces:** `./sc rebuild && ./sc verify`. The DB
    should rebuild from text alone, byte-for-byte.
 
-4. **Commit** the text: `.sc-state/content.sql` + `.sc-state/engine.ref` and the
-   `_sc` files. Never commit the `.db` or anything under the gitignored
-   `.super-coder/` engine dir. (In the super-coder SOURCE repo only, `schema.sql`
-   + `migrations/` are tracked and committed here too.)
+4. **Publish** the text — don't hand-commit it. `./sc snapshot`/`render` write
+   `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
+   **main checkout root** (where the shared engine + DB live), not your worktree,
+   so they aren't yours to stage from a shell branch. The GUI **Publish** button
+   commits them and opens one PR (snapshot → render → commit → push → PR on
+   `sc_gui_content`); the admin shell on `main` can also commit them directly.
+   Never commit the `.db` or anything under the gitignored `.super-coder/` engine
+   dir. (In the super-coder SOURCE repo only, `schema.sql` + `migrations/` are
+   tracked and committed here too.)
 
 ## Authoring vs. snapshotting
 
@@ -59,5 +64,7 @@ shell is *granted* a skill is per-instance (snapshot).
   then `./sc seed-skills` to regenerate the seed migration — **not** the
   snapshot. See `seed_skills.py`.
 
-> The commit→PR automation (B6) will run snapshot → render → commit → PR
-> automatically per shell. Until then it is this manual ritual.
+> Steps 1–3 are durability — serialize so a `./sc rebuild` can't lose your work.
+> Step 4 is the GUI **Publish** button: it runs snapshot → render → commit →
+> push → PR on the `sc_gui_content` branch, so you rarely commit this text by
+> hand. The serialization lives at the main checkout root, not a worktree.

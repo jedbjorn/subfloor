@@ -1014,17 +1014,28 @@ work — a deleted branch with no PR is lost work.
 The whole engine dir is gitignored (`/.super-coder/`) — never force-add anything
 under it. Also gitignored + regenerated: `CLAUDE.md`, `AGENTS.md`,
 `opencode.json`, `.claude/skills/`, and `.sc-state/engine.ref.prev` (the
-ephemeral rollback pointer). **Do** commit your fork-owned state in `.sc-state/`:
-`content.sql` (the memory serialization the `.db` rebuilds from) and `engine.ref`
-(the engine version pin) — plus your project''s own files and any tracked `_sc`
-renders. (In the super-coder SOURCE repo only, `schema.sql` + `migrations/` are
-tracked too — there the engine *is* the project.)
+ephemeral rollback pointer). From a shell **worktree you commit your project''s
+own files** — the code/config you edited there. You do **not** hand-commit the
+serialized DB state: `.sc-state/content.sql` (the memory the `.db` rebuilds
+from), `.sc-state/engine.ref` (the engine pin), and the tracked `_sc` renders are
+written by `./sc` to the **main checkout root** (where the shared engine + DB
+live), not your worktree — so they aren''t even present to stage from your branch.
+Getting that text into the repo is the GUI **Publish** button (or the admin shell
+on `main`) — see ''After DB work'' below. (In the super-coder SOURCE repo only,
+`schema.sql` + `migrations/` are tracked too — there the engine *is* the project.)
 
-## After DB work, before committing
+## After DB work — snapshot persists it; Publish puts it in the repo
 
-Your DB edits live only in the `.db` until serialized. Run `./sc snapshot`
-(+ `./sc render` if docs/roadmap/skills changed) so the change is in git-tracked
-text, then commit that text. See the `snapshot` skill.
+Your DB edits live only in the live `.db` until serialized, so run `./sc
+snapshot` (+ `./sc render` if docs/roadmap/skills changed) — that''s the "save my
+work" step, so a `./sc rebuild` can''t lose it. But the serialization lands at the
+**main checkout root**, NOT your worktree (the shared engine + DB live there), so
+don''t try to commit `content.sql` or the `_sc` renders onto your branch — from a
+worktree they aren''t there. Committing that text to the repo is the GUI
+**Publish** button (snapshot → render → commit → push → PR on `sc_gui_content`),
+or the admin shell working in the repo root on `main`. Your feature-branch PRs
+carry your project files; the serialized DB content is published separately. See
+the `snapshot` skill.
 
 ## Notes
 
@@ -1816,7 +1827,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'snapshot',
-  'Persist DB work to git-tracked text — when and how to run ./sc snapshot / ./sc render before committing. The .db is a cache; text is the source of truth.',
+  'Persist DB work to git-tracked text — when and how to run ./sc snapshot / ./sc render. The .db is a cache; text is the source of truth. Snapshot is durability; the GUI Publish button commits + PRs it.',
   'substrate',
   './sc snapshot',
   1,
@@ -1854,10 +1865,15 @@ shell is *granted* a skill is per-instance (snapshot).
 3. **Verify the rebuild reproduces:** `./sc rebuild && ./sc verify`. The DB
    should rebuild from text alone, byte-for-byte.
 
-4. **Commit** the text: `.sc-state/content.sql` + `.sc-state/engine.ref` and the
-   `_sc` files. Never commit the `.db` or anything under the gitignored
-   `.super-coder/` engine dir. (In the super-coder SOURCE repo only, `schema.sql`
-   + `migrations/` are tracked and committed here too.)
+4. **Publish** the text — don''t hand-commit it. `./sc snapshot`/`render` write
+   `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
+   **main checkout root** (where the shared engine + DB live), not your worktree,
+   so they aren''t yours to stage from a shell branch. The GUI **Publish** button
+   commits them and opens one PR (snapshot → render → commit → push → PR on
+   `sc_gui_content`); the admin shell on `main` can also commit them directly.
+   Never commit the `.db` or anything under the gitignored `.super-coder/` engine
+   dir. (In the super-coder SOURCE repo only, `schema.sql` + `migrations/` are
+   tracked and committed here too.)
 
 ## Authoring vs. snapshotting
 
@@ -1867,8 +1883,10 @@ shell is *granted* a skill is per-instance (snapshot).
   then `./sc seed-skills` to regenerate the seed migration — **not** the
   snapshot. See `seed_skills.py`.
 
-> The commit→PR automation (B6) will run snapshot → render → commit → PR
-> automatically per shell. Until then it is this manual ritual.',
+> Steps 1–3 are durability — serialize so a `./sc rebuild` can''t lose your work.
+> Step 4 is the GUI **Publish** button: it runs snapshot → render → commit →
+> push → PR on the `sc_gui_content` branch, so you rarely commit this text by
+> hand. The serialization lives at the main checkout root, not a worktree.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
