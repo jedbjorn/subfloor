@@ -24,7 +24,7 @@
     <div class="tools">
       <span id="status" class="status"></span>
       <button id="snapshot" title="serialize the DB → content.sql + render the flat _sc files (local only, no git)">snapshot ⤓</button>
-      <button id="publish" class="primary" title="snapshot + render, then commit → push → open/update one PR on the gui-content branch">publish ⤴</button>
+      <button id="publish" class="primary" title="snapshot + render, then commit → force-push → open/update one PR from an ephemeral sc_gui_content branch (no merge; returns to main + cleans up)">publish ⤴</button>
     </div>
   </header>
   <main>

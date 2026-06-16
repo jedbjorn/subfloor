@@ -600,9 +600,10 @@ grants; edit the roadmap (linear status buckets, with toggle-filters) and
 **non-frozen** documents; create and resolve flags. **seed and L&S are
 read-only** — the laws say the shell curates them, so the API ships no endpoint
 to write them at all. A `snapshot ⤓` button re-serializes + renders after
-edits; **publish** goes one further — it snapshots, then lands your content
-edits as a commit on a rolling `gui-content` branch, so `main` stays clean and
-merging stays yours.
+edits; **publish** goes one further — it snapshots, then commits your content
+edits onto an ephemeral `sc_gui_content` branch, force-pushes it, and opens (or
+refreshes) one PR to `main` — then returns to `main` and drops the local branch.
+No merge: `main` stays clean and merging the PR stays yours.
 
 The **Scripts** tab lists the maintenance scripts (snapshot, render, seed-skills,
 migrate, rebuild) — each with a description and a **run** button, so the common
