@@ -24,23 +24,33 @@ billing. opencode stays as the universal metered catch-all.
 
 ## Branch-guard hook
 
-Codex reads project-local hooks from `<repo>/.codex/hooks.json`, layered above the
-host-global `~/.codex/config.toml` — so the engine installs the guard there and
-**never touches the host-mounted `~/.codex`** (auth/config/history stay clean). The
-hook is a `PreToolUse` matcher on `^apply_patch$` (codex's file-edit tool) that runs
-the shared `.super-coder/scripts/branch-guard.sh` and denies the edit (exit 2) while
-HEAD is a protected default branch. `.codex/hooks.json` is emitted (gitignored) each
-launch, kept apart from a fork's own tracked `.codex/config.toml`.
+Codex reads project-local hooks from `<repo>/.codex/hooks.json`. The hook is a
+`PreToolUse` matcher on `^apply_patch$` (codex's file-edit tool) that runs the
+shared `.super-coder/scripts/branch-guard.sh` and denies the edit (exit 2) while a
+protected default branch is in play. `.codex/hooks.json` is emitted (gitignored)
+each launch. Codex only delivers the apply_patch *patch text* (`tool_input.command`),
+not a file path, so the guard uses its cwd-branch check (not the target-file check
+claude/opencode get).
 
-`--dangerously-bypass-hook-trust` (base launch): project-local hooks otherwise
-require an interactive per-hook trust step. The flag runs the engine-authored hook
-without it — the launcher itself vetted the source. It bypasses *hook trust only*,
-not approvals/sandbox (that is the separate sandbox-only flag below).
+**Two things gate whether this hook actually enforces — both verified empirically:**
 
-`--dangerously-bypass-approvals-and-sandbox` is appended only in the container,
-where the container itself is the safety boundary (matches how claude/opencode
-get allow-all permissions in-sandbox). On the no-docker host path (`./sc boot`),
-codex keeps its normal approval prompts.
+1. **Trust (LOADING).** Codex loads project-local hooks only when the project's
+   `.codex/` layer is *trusted*, keyed per-directory. A shell runs in a worktree
+   (`.sc-worktrees/<name>`), which is NOT the trusted main root — so without help
+   the hook never loads. `run.py` (`trust_codex_worktree`) marks the worktree
+   trusted in `$CODEX_HOME/config.toml` at boot. This is the one place the engine
+   writes under the codex home — additive project-trust only, never auth/history.
+   (`--dangerously-bypass-hook-trust` only skips the per-hook hash review, NOT this
+   layer-load trust. And `codex exec` runs no hooks at all — interactive only.)
+
+2. **YOLO flag (ENFORCING).** `--dangerously-bypass-approvals-and-sandbox` is
+   appended only in the container (the container is the safety boundary). That flag
+   **ignores the hook's exit-2 deny** — verified: the hook fires and returns 2, but
+   the edit proceeds. So **in-sandbox, codex's edit-time branch-guard cannot block**;
+   the git **pre-commit backstop** is the real guard there (it blocks
+   protected-branch *commits* regardless of harness flags). On the no-docker host
+   path (`./sc boot`), the flag is absent, approvals are normal, and the exit-2 deny
+   IS honored — so the host edit-time guard blocks.
 
 **Host setup (one-time):** the binary is baked into the sandbox image, but auth is
 mounted from the host — so `codex` must be installed + logged in on the host once:
