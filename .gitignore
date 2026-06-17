@@ -26,6 +26,10 @@
 # propagates (re-derived from the repo path if absent). Hand-overridable.
 /.super-coder/instance.json
 
+# vm-broker runtime — the unix socket + pidfile + log it writes at start. Local,
+# ephemeral, host-only (the broker recreates them); never tracked.
+/.super-coder/run/
+
 # Shell worktrees — one per shell, at .sc-worktrees/<shortname>/. Git
 # worktrees inside the repo root; gitignored so the linked trees don't surface
 # as untracked content in the main working tree.
