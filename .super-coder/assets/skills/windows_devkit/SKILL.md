@@ -29,7 +29,27 @@ No `vm` block → no VM linked: stop and ask the operator to run the wizard. The
 admin `configure_winbox` skill must also have run, or the box has no toolchain
 (the `toolchain` check in the wizard is how you confirm it did).
 
-`ssh_key_path` is a **path**, never key material — read it, never echo it.
+`ssh_key_path` is a **path**, never key material — and your shell never reads it
+anyway: the key lives host-side with the broker (below). You never hold it.
+
+## You drive the VM through the host broker — not ssh/virsh directly
+
+You run inside the sandbox container. The VM lives on the host's libvirt NAT,
+unreachable from here, and the container has no `ssh`, no `virsh`, and no key.
+So you do **not** shell out — you call the **host-side vm-broker** over a unix
+socket in the bind-mounted repo. The broker holds the key + libvirt and does the
+work; nothing about your isolation changes. (See `docs/windows-vm-broker.md`.)
+
+The socket path comes from `./sc vm-broker-sock`. Every verb is a `curl`:
+
+```bash
+SOCK="$(./sc vm-broker-sock)"
+curl -s --unix-socket "$SOCK" http://vm/health      # liveness check first
+```
+
+If the curl fails with "not reachable", the broker isn't running — ask the
+operator to start it on the host: `./sc vm-broker-up`. You cannot start it
+yourself (it must run on the host, not in your sandbox).
 
 ## The loop — push → exec → capture → reset
 
@@ -37,16 +57,21 @@ Every run starts from the clean snapshot, so installer side-effects never leak
 between runs. That property is the whole point — without the reset, system-level
 testing isn't trustworthy.
 
-| Verb | How |
+| Verb | Call |
 |---|---|
-| **push** | drop the build artifact into `transfer_dir` (the host side of the guest's virtio-fs share, or scp to the guest) |
-| **exec** | `ssh -i <ssh_key_path> -p <ssh_port> <ssh_user>@<ssh_host> "<installer / test cmd>"` |
-| **capture** | collect stdout + exit code; `virsh screenshot <domain> /tmp/win.ppm` for installer GUI state |
-| **reset** | `virsh snapshot-revert <domain> <snapshot>` — back to clean before the next run |
+| **push** | `curl -s --unix-socket "$SOCK" http://vm/push -d '{"src":"<repo path to artifact>"}'` — stages it into `transfer_dir` (the guest's share) |
+| **exec** | `curl -s --unix-socket "$SOCK" http://vm/exec -d '{"command":"<installer / test cmd>"}'` → `{ok, exit, stdout, stderr}` |
+| **capture** | `curl -s --unix-socket "$SOCK" http://vm/capture -d '{"command":"<optional cmd>"}'` → stdout + a base64 `virsh screenshot` for GUI state |
+| **reset** | `curl -s --unix-socket "$SOCK" http://vm/reset -X POST` — `snapshot-revert … --running`, back to clean |
 
-SSH non-interactively: `-o BatchMode=yes -o ConnectTimeout=10`. A run that
-exec'd anything stateful **must** end with a reset, even on failure — leave the
-box clean for the next shell.
+The broker runs ssh non-interactively and uses the saved `vm` block — you name a
+command, never a host or a key. A run that exec'd anything stateful **must** end
+with a `/reset`, even on failure — leave the box clean for the next shell.
+
+> [!class4]
+> **`reset` reverts to an OFFLINE snapshot with `--running`** (the broker passes
+> it for you): the clean snapshot is powered-off because this CPU's
+> non-migratable `invtsc` flag refuses a live one, so the flag boots it back up.
 
 ## Stance
 

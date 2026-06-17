@@ -214,6 +214,31 @@ sc_typecheck() {
   else ( cd "$here" && "$venv/bin/mypy" . ); fi
 }
 
+# ── Windows VM broker (HOST-side; drives the test VM for sandboxed forks) ──────
+# A separate host process — the sandbox server can't hold the ssh key or reach
+# libvirt. It listens on a unix socket in the bind-mounted engine dir so
+# windows_devkit (in the container) can curl it without a route or a key. Refuses
+# to run in the sandbox (vm_broker.py guards on SC_SANDBOX). Supervise it however
+# the host prefers; vm-broker-up is a dependency-free nohup+pidfile default.
+VM_BROKER_PID="$ENGINE/run/vm-broker.pid"
+sc_vm_broker_up() {
+  mkdir -p "$ENGINE/run"
+  if [ -f "$VM_BROKER_PID" ] && kill -0 "$(cat "$VM_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
+    echo "→ vm-broker already running (pid $(cat "$VM_BROKER_PID"))"; return 0
+  fi
+  nohup "$PY" "$ENGINE/api/vm_broker.py" >"$ENGINE/run/vm-broker.log" 2>&1 &
+  echo $! > "$VM_BROKER_PID"
+  echo "→ vm-broker up (pid $!) · socket $("$PY" "$S/vm.py" sock) · log $ENGINE/run/vm-broker.log"
+}
+sc_vm_broker_down() {
+  if [ -f "$VM_BROKER_PID" ] && kill -0 "$(cat "$VM_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$VM_BROKER_PID")" && echo "→ vm-broker stopped"
+  else
+    echo "→ vm-broker not running"
+  fi
+  rm -f "$VM_BROKER_PID"
+}
+
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
@@ -237,6 +262,11 @@ case "$cmd" in
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
+  # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
+  vm-broker)      exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
+  vm-broker-up)   sc_vm_broker_up ;;
+  vm-broker-down) sc_vm_broker_down ;;
+  vm-broker-sock) exec "$PY" "$S/vm.py" sock ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   deps)         sc_deps "$@" ;;
@@ -342,6 +372,13 @@ super-coder — forkable shell substrate
   ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure
   ./sc lint [paths]        ruff check the fork's python (.venv ruff; honors [tool.ruff]) — available, not enforced
   ./sc typecheck [paths]   mypy the fork's python (.venv mypy; honors [tool.mypy]) — available, not enforced
+
+  Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
+  holds the ssh key + virsh so the fork never does. See docs/windows-vm-broker.md):
+  ./sc vm-broker           run the broker in the foreground (unix socket)
+  ./sc vm-broker-up        start it in the background (nohup + pidfile)
+  ./sc vm-broker-down      stop the backgrounded broker
+  ./sc vm-broker-sock      print the broker's socket path
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health

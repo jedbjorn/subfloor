@@ -8,7 +8,7 @@ purpose: Host-side broker so sandboxed forks can drive the test VM
 
 # Windows VM Broker — Spec
 
-[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/cc/windows-vm-broker-spec/docs/windows-vm-broker.md)
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/cc/windows-vm-broker/docs/windows-vm-broker.md)
 
 ## Overview
 
@@ -185,19 +185,50 @@ Open for the build, with leanings:
 MVP: exec + reset over socket :::class1 -> full: push + capture + validate :::class2 -> generalize: test-target interface :::class3
 ```
 
-1. **MVP** — socket + `exec` + `reset --running`. Proves the loop end-to-end
+1. **MVP** ✅ — socket + `exec` + `reset --running`. Proves the loop end-to-end
    from the container against the `clean` snapshot.
-2. **Full** — `push`, `capture` (incl. screenshot), relocate `validate`.
+2. **Full** ✅ — `push`, `capture` (incl. screenshot), `validate` relocated to
+   the broker (server proxies in-sandbox).
 3. **Generalize** — lift the four verbs into a provider-agnostic test-target
    interface; Windows-via-VM becomes provider #1, with containers/devices later.
 
+## Resolved (built)
+
+The build settled the four open questions:
+
+- **Where do the #129 `validate` endpoints run?** They lived in the in-container
+  server and presumed host access the sandbox lacks. The broker now owns the
+  live checks; the in-sandbox server **proxies** `/api/vm/validate/{check}` to
+  the broker socket (and on the no-docker host path calls `vm.validate` directly,
+  unchanged). `GET/PUT /api/vm` stay in the server — they are pure
+  `instance.json` I/O that works anywhere. So the wizard's test-before-save works
+  again from the dockerized default.
+- **Socket vs bridge-TCP.** Unix socket, as recommended:
+  `.super-coder/run/vm-broker.sock` in the bind-mounted engine dir. Unix sockets
+  are filesystem objects, not network-namespace objects, so a container process
+  connects to the host listener through the shared mount — no route, no firewall,
+  no network surface.
+- **Broker auth.** Filesystem permission is sufficient for now: the socket is
+  `chmod 0600`, reachable only by processes sharing the mount. No per-fork token
+  in MVP. (A token belongs only if the socket ever moves to TCP.)
+- **Artifact transfer.** Keep the virtio-fs share as the `push` fast path —
+  `/push` copies a host-visible (bind-mounted) artifact into `transfer_dir`. No
+  scp, no guest auth on the hot path.
+
+## Implementation
+
+Built per the architecture above:
+
+| Piece | Where |
+|---|---|
+| Broker process | `.super-coder/api/vm_broker.py` — AF_UNIX `ThreadingHTTPServer`, refuses to run under `SC_SANDBOX` |
+| Loop verbs + socket client | `.super-coder/scripts/vm.py` — `do_exec` / `do_reset` / `do_push` / `do_capture`, `broker_call` (unix-socket HTTP), `SOCKET` |
+| Supervision | `./sc vm-broker` (foreground), `./sc vm-broker-up` / `-down` (nohup + pidfile), `./sc vm-broker-sock` |
+| Server proxy | `.super-coder/api/server.py` — `/api/vm/validate/{check}` proxies to the broker in-sandbox |
+| Skill | `windows_devkit` — drives the four verbs via `curl --unix-socket`, holds no key |
+| Tests | `tests/test_vm_broker.py` — verb dispatch + live unix-socket transport |
+
 ## Open questions
 
-- **Where do the #129 `validate` endpoints actually run?** If they live in the
-  in-container server, they presume host access the sandbox lacks — and should
-  move into the broker. Confirm before building.
-- **Socket vs bridge-TCP** as the default transport (recommend socket).
-- **Broker auth** — is filesystem permission on the socket sufficient, or does a
-  per-fork token still belong on the call?
-- **Artifact transfer** — keep the virtio-fs share as the `push` fast path, or
-  route everything through `scp` for a single mechanism?
+- **Phase 3 generalization** — lifting the four verbs into a provider-agnostic
+  test-target interface (containers/devices as providers #2+) is still ahead.

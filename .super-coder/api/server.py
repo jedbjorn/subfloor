@@ -706,7 +706,24 @@ class Handler(BaseHTTPRequestHandler):
                 # Run ONE live check against the candidate config in the body, so
                 # the wizard can test-before-save. A failed check is a normal
                 # result the UI renders red — 200 with {ok:false}, not an error.
-                r = vm_mod.validate(path.rsplit("/", 1)[1], self._body().get("vm") or {})
+                #
+                # The checks run virsh/ssh, which only work on the HOST. In the
+                # sandbox we can't reach the VM, so proxy to the host vm-broker
+                # over its unix socket; on the no-docker host path, call directly.
+                check = path.rsplit("/", 1)[1]
+                cfg = self._body().get("vm") or {}
+                if os.environ.get("SC_SANDBOX"):
+                    try:
+                        r = vm_mod.broker_call("POST", f"/validate/{check}", {"vm": cfg})
+                    except ConnectionError:
+                        return self._send(503, {
+                            "ok": False, "check": check,
+                            "output": "live checks need the host vm-broker — start it "
+                                      "with `./sc vm-broker-up` on the host, then retry."})
+                    if r.get("error") == "no such check":
+                        return self._send(404, {"error": "no such check"})
+                    return self._send(200, r)
+                r = vm_mod.validate(check, cfg)
                 if r is None:
                     return self._send(404, {"error": "no such check"})
                 return self._send(200, r)
