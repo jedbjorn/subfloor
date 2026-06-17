@@ -98,7 +98,8 @@ Lives in the existing fork-level `instance.json` (where the port is already pers
     "ssh_user": "tester",
     "ssh_key_path": "~/.ssh/sc_win_test",
     "transfer_dir": "/var/sc/win-xfer",
-    "snapshot": "clean"
+    "snapshot": "clean",
+    "libvirt_uri": "qemu:///system"
   }
 }
 ```
@@ -110,6 +111,7 @@ Lives in the existing fork-level `instance.json` (where the port is already pers
 | `ssh_key_path` | **path** to the private key — never the key itself |
 | `transfer_dir` | host-side dir the guest sees (virtio-fs share) or scp target |
 | `snapshot` | named clean snapshot to revert to between runs |
+| `libvirt_uri` | **optional** — `virsh` connection. Set `qemu:///system` for a system-scope domain; the default `qemu:///session` can't see it. Omit otherwise. |
 
 > [!class3]
 > **Secrets posture matches the rest of the engine.** Super-coder stores zero credentials in the DB or on disk today — harness keys live in operator home, git uses the SSH agent. The `vm` block holds a key *path*, never key material. The wizard can generate a keypair into operator home and show the **public** key to install in the guest's `authorized_keys`; the DB/config never sees the private half.

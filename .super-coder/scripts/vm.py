@@ -81,6 +81,15 @@ def _missing(cfg: dict, *fields: str) -> str | None:
     return ("missing required field(s): " + ", ".join(absent)) if absent else None
 
 
+def _virsh(cfg: dict, *args: str) -> list[str]:
+    """A virsh argv against the configured connection. `libvirt_uri` in the vm
+    block selects the hypervisor — set it to `qemu:///system` for a system-scope
+    domain, which the default `qemu:///session` cannot see. Absent, virsh uses
+    its own default (the `LIBVIRT_DEFAULT_URI` env var, else `qemu:///session`)."""
+    uri = str(cfg.get("libvirt_uri", "")).strip()
+    return ["virsh", *(["--connect", uri] if uri else []), *args]
+
+
 def _ssh_argv(cfg: dict, remote: str) -> list[str]:
     """An ssh invocation against the configured guest. BatchMode keeps it
     non-interactive (no password/passphrase prompt can hang the server)."""
@@ -100,7 +109,7 @@ def _ssh_argv(cfg: dict, remote: str) -> list[str]:
 def _check_domain(cfg: dict) -> tuple[bool, str]:
     if m := _missing(cfg, "domain"):
         return False, m
-    return _run(["virsh", "dominfo", str(cfg["domain"])], timeout=15)
+    return _run(_virsh(cfg, "dominfo", str(cfg["domain"])), timeout=15)
 
 
 def _check_ssh(cfg: dict) -> tuple[bool, str]:
@@ -131,8 +140,8 @@ def _check_snapshot(cfg: dict) -> tuple[bool, str]:
     if m := _missing(cfg, "domain", "snapshot"):
         return False, m
     ok, out = _run(
-        ["virsh", "snapshot-info", str(cfg["domain"]),
-         "--snapshotname", str(cfg["snapshot"])], timeout=15)
+        _virsh(cfg, "snapshot-info", str(cfg["domain"]),
+               "--snapshotname", str(cfg["snapshot"])), timeout=15)
     if not ok and "Domain snapshot not found" in out:
         return False, (f"snapshot '{cfg['snapshot']}' not found on domain "
                        f"'{cfg['domain']}' — create the clean snapshot first.\n{out}")
@@ -203,8 +212,8 @@ def do_reset() -> dict:
     if m := _missing(cfg, "domain", "snapshot"):
         return {"ok": False, "output": m}
     ok, out = _run(
-        ["virsh", "snapshot-revert", str(cfg["domain"]),
-         "--snapshotname", str(cfg["snapshot"]), "--running"], timeout=60)
+        _virsh(cfg, "snapshot-revert", str(cfg["domain"]),
+               "--snapshotname", str(cfg["snapshot"]), "--running"), timeout=60)
     return {"ok": ok, "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' (running)"}
 
 
@@ -242,7 +251,7 @@ def do_capture(command: str | None = None) -> dict:
         result["screenshot_error"] = m
         return result
     shot = Path(tempfile.gettempdir()) / f"sc_vm_{cfg['domain']}.ppm"
-    ok, out = _run(["virsh", "screenshot", str(cfg["domain"]), str(shot)], timeout=30)
+    ok, out = _run(_virsh(cfg, "screenshot", str(cfg["domain"]), str(shot)), timeout=30)
     if ok and shot.exists():
         data = shot.read_bytes()
         result["screenshot_b64"] = base64.b64encode(data).decode()
