@@ -568,6 +568,16 @@ from the tool. It is **link-only**: it assumes a ready VM and captures + validat
 the connection to it, rather than building one for you. Off by default; nothing here
 touches forks that don't opt in.
 
+> [!class4]
+> **Host requirement: Linux + libvirt/KVM only. macOS is not supported yet.** The
+> broker, SSH, and unix-socket transport are portable, but `reset`, `capture`, and
+> the `domain`/`snapshot`/`transfer` checks are `virsh`/libvirt operations and the
+> `push` fast path is a virtio-fs share — none exist on macOS. Mac support means
+> swapping the `virsh` layer for a Mac hypervisor's CLI (`prlctl` / `vmrun` /
+> `utmctl`) behind a provider switch — the deferred provider-agnostic test-target
+> interface — and on Apple Silicon only Windows-on-ARM runs natively, so x86
+> installer fidelity is lost. Until then, link a VM from a Linux host.
+
 Config lives under a `vm` key in the gitignored `.super-coder/instance.json` —
 **no secrets**, only a key *path* (`ssh_key_path`), never key material. The setup
 card runs five live checks against the *candidate* config before you save, so what
