@@ -561,10 +561,11 @@ carry the full detail. For the FnB-facing review of a shell's UI changes, use
 A fork that builds Windows software needs to test on **real Windows** —
 installers, services, the registry, system-level behavior where Wine is useless.
 This is an **opt-in** capability: the engine ships the *orchestration* (a verified
-push → exec → capture → reset loop and a guided setup card in the Scripts tab); you
-bring the *VM* — license, image, and OS install are yours and unreachable from the
-tool. It is **link-only**: it assumes a ready VM and captures + validates the
-connection to it, rather than building one for you. Off by default; nothing here
+push → exec → capture → reset loop, a **host-side broker** that lets a sandboxed
+shell drive the VM without holding the key, and a guided setup card in the Scripts
+tab); you bring the *VM* — license, image, and OS install are yours and unreachable
+from the tool. It is **link-only**: it assumes a ready VM and captures + validates
+the connection to it, rather than building one for you. Off by default; nothing here
 touches forks that don't opt in.
 
 Config lives under a `vm` key in the gitignored `.super-coder/instance.json` —
@@ -587,23 +588,153 @@ can only act once the previous has:
 User: SSH foothold :::class4 -> Admin: install kit :::class1 -> Snapshot = clean :::class3 -> Dev+Rev: run loop :::class2
 ```
 
-1. **User (manual, once).** Install Windows, enable OpenSSH, authorize the key. The
-   engine can't reach inside a fresh OS install — this bootstrap is irreducible.
-2. **Admin — `configure_winbox` (once / on toolchain change).** SSH in,
-   `winget`-install the MSI toolchain from a fork-committed manifest, verify each
-   tool, **then** take the `clean` snapshot.
+1. **User (manual, once).** Bring up the VM, enable OpenSSH, authorize the key,
+   share a transfer dir. The engine can't reach inside a fresh OS install — this
+   bootstrap is irreducible.
+2. **Admin — `configure_winbox` (once / on toolchain change).** SSH in, install the
+   build toolchain, verify each tool, **then** take the `clean` snapshot.
 3. **Dev + reviewer — `windows_devkit` (every test).** push → exec → capture →
    reset against that snapshot.
 
 > [!class4]
-> **The one gotcha: `configure_winbox` runs *before* the snapshot, not after.** The
-> clean snapshot is *pristine OS + toolchain*, and every test reverts to it — so the
-> toolchain must already be baked in. Bump the toolchain → re-run `configure_winbox`
-> → re-snapshot. Provision after snapshotting and the first test hits an empty box.
+> **The one gotcha: provision *before* the snapshot, not after.** The clean snapshot
+> is *pristine OS + toolchain*, and every test reverts to it — so the toolchain must
+> already be baked in. Bump the toolchain → reinstall → re-snapshot. Provision after
+> snapshotting and the first test hits an empty box.
 
-Both skills are engine `common=0` — they propagate to every fork but **auto-grant to
-none**. Grant `windows_devkit` to the dev + reviewer shells and `configure_winbox` to
-admin, per fork, then snapshot to persist. Full design: [`docs/windows-test-vm.md`](docs/windows-test-vm.md).
+### Set up a Windows test box — step by step
+
+The one-time host setup the link-only design assumes. Everything below runs on the
+**host** (libvirt and the key live there); the fork only ever talks to the broker.
+
+**0 · Prereqs.** A Linux host with libvirt/KVM and `virsh`, your user in the
+`libvirt` group (so `virsh --connect qemu:///system` works without `sudo`), and a
+Windows ISO + license — yours to bring.
+
+**1 · Create the VM and install Windows.** Build a *system-scope* domain (survives
+reboots, shared across sessions) with `virt-manager`, or:
+
+```bash
+virt-install --connect qemu:///system --name win-test \
+  --osinfo win10 --ram 8192 --vcpus 4 --disk size=64 \
+  --cdrom /path/to/Windows.iso --network network=default
+```
+
+Note the domain name (`win-test`) and the NAT IP it lands on libvirt's `default`
+network (e.g. `192.168.122.x`) — you need both for the link.
+
+**2 · Enable OpenSSH + key auth in the guest.** In an elevated PowerShell *inside*
+Windows:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd; Set-Service -Name sshd -StartupType Automatic
+```
+
+On the **host**, make a dedicated keypair (the *path* is what goes in the link —
+never the key itself):
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/sc_win_test -N ''
+```
+
+Put `~/.ssh/sc_win_test.pub` into the guest at
+`C:\Users\<user>\.ssh\authorized_keys` (standard user) — or, for an **admin** user,
+`C:\ProgramData\ssh\administrators_authorized_keys` with its ACL locked to
+`Administrators`+`SYSTEM`. The default guest shell is `cmd.exe`; that's what `exec`
+runs under. Confirm from the host: `ssh -i ~/.ssh/sc_win_test <user>@<ip> "ver"`.
+
+**3 · Share a transfer dir (host → guest) for `push`.** `push` stages a build
+artifact into a host directory the guest can read. Map one in with **virtio-fs**: add
+a filesystem device to the domain pointing at your host `transfer_dir`, install the
+virtio-fs guest driver (from the `virtio-win` ISO), and mount it to a drive letter.
+Same-host only — cross-host `scp` is a later variant.
+
+**4 · Provision the toolchain, then bake `clean` — in that order.** Boot the VM,
+install your build kit (the admin `configure_winbox` skill does this from a committed
+manifest; or by hand — e.g. `dotnet tool install --global wix`), **verify** each tool
+over SSH, then **shut the guest down** and take the offline baseline every test
+reverts to:
+
+```bash
+virsh --connect qemu:///system shutdown win-test       # clean snapshot is OFFLINE
+virsh --connect qemu:///system snapshot-create-as win-test clean \
+  --description "pristine OS + toolchain"
+```
+
+Re-provisioning later is delete-then-recreate the `clean` snapshot — and nothing
+"sticks" until it's baked, so never run a test loop (which reverts) in between.
+
+**5 · Link it.** Fill the `vm` block — via the Scripts → **Windows Test VM** wizard
+(it live-tests every field before save) or by hand in `.super-coder/instance.json`:
+
+```json
+"vm": {
+  "domain": "win-test",
+  "ssh_host": "192.168.122.50", "ssh_port": 22, "ssh_user": "tester",
+  "ssh_key_path": "~/.ssh/sc_win_test",
+  "transfer_dir": "/var/sc/win-xfer",
+  "snapshot": "clean",
+  "libvirt_uri": "qemu:///system"
+}
+```
+
+`libvirt_uri` is **optional** — set `qemu:///system` for a system-scope domain (the
+default `qemu:///session` can't see it); omit it otherwise.
+
+**6 · Grant the skills + start the broker.** Both skills are engine `common=0` — they
+propagate to every fork but **auto-grant to none**. Grant `windows_devkit` to the dev
++ reviewer shells and `configure_winbox` to admin (per fork). The broker comes up
+automatically with `./sc launch` when a VM is linked; or drive it directly:
+
+```bash
+./sc vm-broker-up            # start in the background (also: auto-started by ./sc launch)
+./sc vm-broker-install       # optional: a systemd --user unit, survives logout/reboot
+```
+
+A dev shell can now run the loop — `push → exec → capture → reset` — ending each run
+with a `reset` that returns to `clean` and powers the VM **off**, so a multi-GB guest
+never idles on the host.
+
+### How the broker reaches the sandbox
+
+The piece that makes link-only work *from inside a container*. A fork's shells run in
+the **sandbox container**; the VM sits on the host's libvirt NAT. The container has
+**no route to it, no `virsh`, and no key** — and must never hold any of those. So it
+doesn't touch the VM at all: it calls a small **host-side broker** that does.
+
+```mermaid
+graph LR
+  subgraph C["sandbox container (no key, no virsh, no route)"]
+    W["windows_devkit"]:::class1
+  end
+  subgraph H["host"]
+    B["vm-broker<br/>(holds key + virsh)"]:::class2
+  end
+  V["Windows VM"]:::class3
+  W -->|"curl --unix-socket<br/>bind-mounted .sock"| B
+  B -->|"ssh / scp"| V
+  B -->|"virsh"| V
+```
+
+- The broker (`./sc vm-broker`) is a **host process** that holds the key path and has
+  libvirt access — the one authority that touches the guest or the hypervisor,
+  mirroring a credential broker.
+- It listens on a **unix socket** in the engine dir
+  (`.super-coder/run/vm-broker.sock`). The sandbox bind-mounts the whole repo at the
+  *same absolute path* (`-v "$here:$here"`), so that socket file exists identically on
+  both sides of the boundary.
+- **Unix sockets are filesystem objects, not network-namespace objects** — so a
+  process in the container `connect()`s to that socket path and reaches the host
+  listener *through the shared mount*. No published port, no route across the NAT, no
+  firewall hole, no token: the socket is `chmod 0600`, reachable only by processes
+  that share the mount.
+- `windows_devkit` simply `curl --unix-socket`s the four verbs. The key never enters
+  the fork and `virsh` runs only on the host — a compromised sandbox can *ask* for a
+  reset, but cannot script libvirt or read the credential.
+
+Full design: [`docs/windows-test-vm.md`](docs/windows-test-vm.md) ·
+[`docs/windows-vm-broker.md`](docs/windows-vm-broker.md).
 
 ## Review GUI
 
