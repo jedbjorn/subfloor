@@ -168,16 +168,24 @@ to `ssh`/`virsh` (which never worked from the container) and curls the socket.
 the broker too, or stay an explicit host-operator task. Either way its `virsh`
 snapshot step lives host-side.
 
-## Process & supervision
-
-Open for the build, with leanings:
+## Process & supervision (built)
 
 - **Separate process, not the in-container server.** The sandbox server cannot
-  hold the key or reach libvirt; the broker must be a distinct host process.
-- **Supervised like the rest of the host substrate** — pm2 alongside the fork's
-  other host-side processes (the credential broker is the model).
+  hold the key or reach libvirt, so the broker is a distinct host process
+  (`./sc vm-broker`).
+- **Tied to the sandbox lifecycle.** `./sc launch` brings the broker up when the
+  fork has linked a VM (it self-skips otherwise); `./sc down` stops it. So it
+  tracks the shells that need it with no separate step — the normal-workflow
+  default, dependency-free (nohup + pidfile).
+- **Reboot-survival is opt-in.** `./sc vm-broker-install` writes a systemd
+  `--user` unit (`Restart=on-failure`, `enable-linger`) so the broker comes back
+  after logout/reboot without a launch. The two mechanisms coexist: `vm-broker-up`
+  no-ops when the socket already answers (a launch after a systemd start is
+  harmless), and `vm-broker-down` only stops what it started, never the
+  systemd-managed broker. `vm-broker-uninstall` removes the unit.
 - **Per-fork.** One broker per fork, reading that fork's `instance.json.vm` and
-  socket path, so two forks never share a VM handle by accident.
+  socket path (the unit is named `sc-vm-broker-<repo>`), so two forks never share
+  a VM handle by accident.
 
 ## Phasing
 

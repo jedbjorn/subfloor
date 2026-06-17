@@ -309,6 +309,9 @@ def main(argv: list[str]) -> int:
     mode = argv[0] if argv else "sock"
     if mode == "sock":
         print(SOCKET)
+    elif mode == "configured":
+        # exit 0 if this fork has linked a VM (so the launch hook can self-skip)
+        return 0 if read() else 1
     elif mode == "exec":
         print(json.dumps(do_exec(" ".join(argv[1:]))))
     elif mode == "reset":
