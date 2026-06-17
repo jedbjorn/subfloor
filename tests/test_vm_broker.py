@@ -56,6 +56,13 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("missing required field", r["stderr"])
 
+    def test_configured_cli_reflects_a_linked_vm(self):
+        # `./sc vm-broker-up` calls `vm.py configured` to self-skip when unlinked.
+        with mock.patch.object(vm, "read", return_value=SAVED):
+            self.assertEqual(vm.main(["configured"]), 0)
+        with mock.patch.object(vm, "read", return_value=None):
+            self.assertEqual(vm.main(["configured"]), 1)
+
     def test_virsh_calls_honor_libvirt_uri(self):
         cfg = dict(SAVED, libvirt_uri="qemu:///system")
         with mock.patch.object(vm, "read", return_value=cfg), \
@@ -80,6 +87,18 @@ class VerbDispatchTests(unittest.TestCase):
         argv = run.call_args[0][0]
         self.assertEqual(argv[:3], ["virsh", "snapshot-revert", "win-test"])
         self.assertIn("--running", argv)  # else the box comes back powered-off
+
+    def test_reset_running_false_lands_clean_and_powered_off(self):
+        # End-of-loop: revert to the offline clean snapshot WITHOUT --running, so
+        # the box returns clean *and* powered off (frees the host's ~12 GB).
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+            r = vm.do_reset(running=False)
+        self.assertTrue(r["ok"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["virsh", "snapshot-revert", "win-test"])
+        self.assertNotIn("--running", argv)  # left powered off
+        self.assertIn("powered off", r["output"])
 
     def test_push_rejects_a_missing_source(self):
         with mock.patch.object(vm, "read", return_value=SAVED):

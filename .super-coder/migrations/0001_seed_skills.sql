@@ -2396,21 +2396,30 @@ testing isn''t trustworthy.
 | **push** | `curl -s --unix-socket "$SOCK" http://vm/push -d ''{"src":"<repo path to artifact>"}''` — stages it into `transfer_dir` (the guest''s share) |
 | **exec** | `curl -s --unix-socket "$SOCK" http://vm/exec -d ''{"command":"<installer / test cmd>"}''` → `{ok, exit, stdout, stderr}` |
 | **capture** | `curl -s --unix-socket "$SOCK" http://vm/capture -d ''{"command":"<optional cmd>"}''` → stdout + a base64 `virsh screenshot` for GUI state |
-| **reset** | `curl -s --unix-socket "$SOCK" http://vm/reset -X POST` — `snapshot-revert … --running`, back to clean |
+| **reset** (start) | `curl -s --unix-socket "$SOCK" http://vm/reset -X POST` — revert to clean and **boot** it; begin a run from a clean box |
+| **reset** (done) | `curl -s --unix-socket "$SOCK" http://vm/reset -d ''{"running":false}''` — revert to clean and leave it **powered OFF** |
 
 The broker runs ssh non-interactively and uses the saved `vm` block — you name a
-command, never a host or a key. A run that exec''d anything stateful **must** end
-with a `/reset`, even on failure — leave the box clean for the next shell.
+command, never a host or a key.
+
+**Bracket every run with reset.** Start with `/reset` (boots a clean box); when
+you''re done — even on failure — end with `/reset {"running":false}` so the box
+returns to clean **and powers off**. The VM is large (~12 GB RAM); leaving it
+running idles that on the host. Powering off at the end frees it, and the next
+run''s start-reset boots a fresh clean box anyway.
 
 > [!class4]
-> **`reset` reverts to an OFFLINE snapshot with `--running`** (the broker passes
-> it for you): the clean snapshot is powered-off because this CPU''s
-> non-migratable `invtsc` flag refuses a live one, so the flag boots it back up.
+> **Why a flag, not two verbs.** The clean snapshot is OFFLINE (this CPU''s
+> non-migratable `invtsc` flag refuses a live snapshot). So a bare revert already
+> lands powered-off; `--running` (the default, `{"running":true}`) boots it.
+> Ending with `{"running":false}` is therefore clean **and** off in a single op —
+> no wasteful boot-just-to-shut-down.
 
 ## Stance
 
-- **Reset is not optional.** Test from clean, return to clean. A dirty box makes
-  the next run''s result a lie.
+- **Reset is not optional.** Test from clean, return to clean — and powered off
+  when you''re done (`/reset {"running":false}`). A dirty box makes the next run''s
+  result a lie; an idle running box wastes ~12 GB of the host''s RAM.
 - **You drive, you don''t provision.** Missing toolchain → that''s the admin''s
   `configure_winbox` + re-snapshot, not an install from here. Never `winget
   install` from this loop; it would poison the clean snapshot.

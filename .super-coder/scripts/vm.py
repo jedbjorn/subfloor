@@ -204,17 +204,22 @@ def do_exec(command: str, timeout: int = 120) -> dict:
         return {"ok": False, "exit": 124, "stdout": "", "stderr": f"timed out (>{timeout}s)"}
 
 
-def do_reset() -> dict:
-    """Revert to the clean snapshot. `--running` because the clean snapshot is
-    OFFLINE (this CPU's non-migratable invtsc flag refuses a live snapshot), so a
-    bare revert lands powered-off — the flag boots it back."""
+def do_reset(running: bool = True) -> dict:
+    """Revert to the clean snapshot. The clean snapshot is OFFLINE (this CPU's
+    non-migratable invtsc flag refuses a live snapshot), so a bare revert lands
+    powered-off. `running=True` adds `--running` to boot it — START a run from a
+    clean booted box. `running=False` leaves it OFF — END a run clean *and*
+    powered down in one op, so the 12 GB guest doesn't idle on the host."""
     cfg = read() or {}
     if m := _missing(cfg, "domain", "snapshot"):
         return {"ok": False, "output": m}
-    ok, out = _run(
-        _virsh(cfg, "snapshot-revert", str(cfg["domain"]),
-               "--snapshotname", str(cfg["snapshot"]), "--running"), timeout=60)
-    return {"ok": ok, "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' (running)"}
+    argv = _virsh(cfg, "snapshot-revert", str(cfg["domain"]),
+                  "--snapshotname", str(cfg["snapshot"]))
+    if running:
+        argv.append("--running")
+    ok, out = _run(argv, timeout=60)
+    state = "running" if running else "powered off"
+    return {"ok": ok, "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' ({state})"}
 
 
 def do_push(src: str, dest: str | None = None) -> dict:
@@ -309,10 +314,14 @@ def main(argv: list[str]) -> int:
     mode = argv[0] if argv else "sock"
     if mode == "sock":
         print(SOCKET)
+    elif mode == "configured":
+        # exit 0 if this fork has linked a VM (so the launch hook can self-skip)
+        return 0 if read() else 1
     elif mode == "exec":
         print(json.dumps(do_exec(" ".join(argv[1:]))))
     elif mode == "reset":
-        print(json.dumps(do_reset()))
+        # `vm.py reset` boots clean; `vm.py reset off` lands clean + powered off
+        print(json.dumps(do_reset(running=(argv[1:2] != ["off"]))))
     elif mode == "push":
         print(json.dumps(do_push(argv[1] if len(argv) > 1 else "",
                                  argv[2] if len(argv) > 2 else None)))

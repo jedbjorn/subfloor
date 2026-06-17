@@ -218,14 +218,30 @@ sc_typecheck() {
 # A separate host process — the sandbox server can't hold the ssh key or reach
 # libvirt. It listens on a unix socket in the bind-mounted engine dir so
 # windows_devkit (in the container) can curl it without a route or a key. Refuses
-# to run in the sandbox (vm_broker.py guards on SC_SANDBOX). Supervise it however
-# the host prefers; vm-broker-up is a dependency-free nohup+pidfile default.
+# to run in the sandbox (vm_broker.py guards on SC_SANDBOX).
+#
+# Supervision: `launch` brings it up (and `down` stops it) automatically when the
+# fork has linked a VM, so it tracks the sandbox lifecycle with no extra step. For
+# reboot-survival independent of launch, `vm-broker-install` writes a systemd
+# --user unit. The two coexist: `up` no-ops when the socket already answers (so a
+# launch after a systemd start is harmless), and `down` only stops what IT started
+# (the pidfile) — it never kills a systemd-managed broker.
 VM_BROKER_PID="$ENGINE/run/vm-broker.pid"
+VM_BROKER_UNIT="sc-vm-broker-$(basename "$here").service"
+
+# Is the broker already answering on its socket? (true regardless of who started
+# it — pidfile nohup or systemd — so `up` is idempotent across both mechanisms.)
+sc_vm_broker_alive() {
+  sock="$("$PY" "$S/vm.py" sock)"
+  [ -S "$sock" ] || return 1
+  curl -s --unix-socket "$sock" http://vm/health 2>/dev/null | grep -q '"ok": true'
+}
 sc_vm_broker_up() {
-  mkdir -p "$ENGINE/run"
-  if [ -f "$VM_BROKER_PID" ] && kill -0 "$(cat "$VM_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
-    echo "→ vm-broker already running (pid $(cat "$VM_BROKER_PID"))"; return 0
+  if ! "$PY" "$S/vm.py" configured; then
+    echo "→ vm-broker: no VM linked (instance.json has no \`vm\` block) — nothing to serve"; return 0
   fi
+  if sc_vm_broker_alive; then echo "→ vm-broker already serving $("$PY" "$S/vm.py" sock)"; return 0; fi
+  mkdir -p "$ENGINE/run"
   nohup "$PY" "$ENGINE/api/vm_broker.py" >"$ENGINE/run/vm-broker.log" 2>&1 &
   echo $! > "$VM_BROKER_PID"
   echo "→ vm-broker up (pid $!) · socket $("$PY" "$S/vm.py" sock) · log $ENGINE/run/vm-broker.log"
@@ -233,10 +249,47 @@ sc_vm_broker_up() {
 sc_vm_broker_down() {
   if [ -f "$VM_BROKER_PID" ] && kill -0 "$(cat "$VM_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
     kill "$(cat "$VM_BROKER_PID")" && echo "→ vm-broker stopped"
+  elif sc_vm_broker_alive; then
+    echo "→ vm-broker is running but not from \`vm-broker-up\` (systemd?) — leaving it; use vm-broker-uninstall"
   else
     echo "→ vm-broker not running"
   fi
   rm -f "$VM_BROKER_PID"
+}
+# Install a systemd --user unit so the broker survives logout/reboot without a
+# launch. enable-linger lets it run with no active session; Restart=on-failure
+# covers crashes. Idempotent — rewrites + re-enables.
+sc_vm_broker_install() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ vm-broker-install: systemd (systemctl) not found on this host" >&2; return 1; }
+  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/$VM_BROKER_UNIT" <<UNIT
+[Unit]
+Description=super-coder vm-broker ($(basename "$here")) — host-side Windows VM broker
+After=network.target libvirtd.service
+
+[Service]
+ExecStart=$PY $ENGINE/api/vm_broker.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+  # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
+  sc_vm_broker_down >/dev/null 2>&1 || true
+  systemctl --user enable --now "$VM_BROKER_UNIT"
+  echo "→ vm-broker installed as systemd --user unit: $VM_BROKER_UNIT (enabled, started, linger on)"
+  echo "  status: systemctl --user status $VM_BROKER_UNIT   ·   logs: journalctl --user -u $VM_BROKER_UNIT"
+}
+sc_vm_broker_uninstall() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ vm-broker-uninstall: systemd not found" >&2; return 1; }
+  systemctl --user disable --now "$VM_BROKER_UNIT" 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$VM_BROKER_UNIT"
+  systemctl --user daemon-reload
+  echo "→ vm-broker systemd unit removed ($VM_BROKER_UNIT)"
 }
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
@@ -263,10 +316,12 @@ case "$cmd" in
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
-  vm-broker)      exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
-  vm-broker-up)   sc_vm_broker_up ;;
-  vm-broker-down) sc_vm_broker_down ;;
-  vm-broker-sock) exec "$PY" "$S/vm.py" sock ;;
+  vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
+  vm-broker-up)      sc_vm_broker_up ;;
+  vm-broker-down)    sc_vm_broker_down ;;
+  vm-broker-sock)    exec "$PY" "$S/vm.py" sock ;;
+  vm-broker-install)   sc_vm_broker_install ;;
+  vm-broker-uninstall) sc_vm_broker_uninstall ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   deps)         sc_deps "$@" ;;
@@ -317,10 +372,15 @@ case "$cmd" in
       "$IMG" ./sc serve --port "$p" >/dev/null
     echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
     echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
-    echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)" ;;
+    echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
+    # Bring the VM broker up alongside the sandbox when a VM is linked (self-skips
+    # otherwise, and no-ops if systemd already owns it). The shells need it to
+    # drive the VM; this keeps it from being a forgotten manual step.
+    sc_vm_broker_up || true ;;
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
-  down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running" ;;
+  down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
+                sc_vm_broker_down ;;
   restart)      "$0" down; exec "$0" launch "$@" ;;
   build)        dcheck; dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
@@ -374,11 +434,14 @@ super-coder — forkable shell substrate
   ./sc typecheck [paths]   mypy the fork's python (.venv mypy; honors [tool.mypy]) — available, not enforced
 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
-  holds the ssh key + virsh so the fork never does. See docs/windows-vm-broker.md):
+  holds the ssh key + virsh so the fork never does. See docs/windows-vm-broker.md).
+  `launch` brings it up automatically when a VM is linked; `down` stops it:
   ./sc vm-broker           run the broker in the foreground (unix socket)
-  ./sc vm-broker-up        start it in the background (nohup + pidfile)
+  ./sc vm-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
   ./sc vm-broker-down      stop the backgrounded broker
   ./sc vm-broker-sock      print the broker's socket path
+  ./sc vm-broker-install   supervise via a systemd --user unit (survives logout/reboot)
+  ./sc vm-broker-uninstall remove the systemd unit
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health

@@ -88,7 +88,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, vm.do_exec(b.get("command", ""),
                                                   int(b.get("timeout", 120))))
             if self.path == "/reset":
-                return self._send(200, vm.do_reset())
+                # {"running": false} ends a run clean + powered OFF (frees host
+                # RAM); default true boots a clean box to START a run.
+                return self._send(200, vm.do_reset(self._body().get("running", True)))
             if self.path == "/push":
                 b = self._body()
                 return self._send(200, vm.do_push(b.get("src", ""), b.get("dest")))
