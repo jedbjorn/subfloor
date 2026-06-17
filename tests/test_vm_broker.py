@@ -88,6 +88,18 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertEqual(argv[:3], ["virsh", "snapshot-revert", "win-test"])
         self.assertIn("--running", argv)  # else the box comes back powered-off
 
+    def test_reset_running_false_lands_clean_and_powered_off(self):
+        # End-of-loop: revert to the offline clean snapshot WITHOUT --running, so
+        # the box returns clean *and* powered off (frees the host's ~12 GB).
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+            r = vm.do_reset(running=False)
+        self.assertTrue(r["ok"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["virsh", "snapshot-revert", "win-test"])
+        self.assertNotIn("--running", argv)  # left powered off
+        self.assertIn("powered off", r["output"])
+
     def test_push_rejects_a_missing_source(self):
         with mock.patch.object(vm, "read", return_value=SAVED):
             r = vm.do_push("/no/such/artifact.msi")
