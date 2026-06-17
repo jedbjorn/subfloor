@@ -427,6 +427,75 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'configure_winbox',
+  'Provision the Windows Test VM — winget-install the fork''s toolchain from a committed manifest, verify each tool, then bake the clean snapshot every test reverts to. Admin-only; runs before the snapshot, re-runs on any toolchain change. Use when standing up or updating a fork''s Windows build/test box.',
+  'substrate',
+  NULL,
+  0,
+  '# configure_winbox — provisioning the Windows Test VM
+
+The admin half of the Windows Test VM capability. You install the build
+toolchain into the operator''s Windows VM and bake the **clean snapshot** that
+every `windows_devkit` run reverts to. Sibling to `self_update` /
+`migration_management` — infrastructure work only the admin shell does. Grant is
+explicit, per-fork (`common=0`).
+
+## Scope boundary — what you do NOT do
+
+You do **not** create the VM, install the guest OS, or enable OpenSSH inside it.
+That bootstrap is the operator''s, host-side, once (the engine can''t reach inside
+a fresh OS install). You assume a reachable guest with key auth already working,
+and you provision the *toolchain* on top of it.
+
+## Order is the design — provision BEFORE the snapshot
+
+```
+operator: OS + OpenSSH + key   →   YOU: winget toolchain + verify   →   snapshot = clean   →   devs run loop
+```
+
+The clean snapshot is **pristine OS + toolchain**. Every test reverts to it, so
+the toolchain must be baked in. Provision *after* snapshotting and the first
+test hits an empty box. Bump the toolchain → re-run this skill → **re-snapshot**.
+
+## Procedure
+
+1. **Read the link.** `.super-coder/instance.json` `vm` block gives the domain +
+   SSH coordinates. Confirm SSH works: `ssh -i <ssh_key_path> -p <ssh_port>
+   <ssh_user>@<ssh_host> "echo ok"`.
+
+2. **Install the toolchain from the fork''s committed manifest.** The fork commits
+   a `winget export` at a known path (e.g. `winget-manifest.json`); you supply
+   the *mechanism*, the fork supplies the *package list* — so this skill stays
+   generic across forks. Over SSH:
+   `winget import --import-file <manifest> --accept-package-agreements --accept-source-agreements`
+   (for dos-arch: WiX, .NET SDK, MSBuild.)
+
+3. **Verify each tool** over SSH — `dotnet --version`, `where.exe wix`, `msbuild
+   -version`. The `windows_devkit` wizard''s `toolchain` check (`dotnet
+   --version`) is the same probe; it must go green after this step.
+
+4. **Bake the clean snapshot.** `virsh snapshot-create-as <domain> <snapshot>
+   --description "pristine OS + toolchain"`. Use the `snapshot` name from the
+   `vm` block (default `clean`). If re-provisioning, delete the old snapshot
+   first (`virsh snapshot-delete <domain> <snapshot>`) so the name is reused.
+
+## Stance
+
+- **Toolchain-as-code.** Install from the committed manifest, never ad hoc —
+  the package set is reproducible and reviewable, and re-provisioning is a
+  re-import, not a memory of what you clicked.
+- **Re-provision means re-snapshot.** A toolchain bump that isn''t followed by a
+  fresh snapshot is invisible — every test still reverts to the old box.
+- **Verify before you snapshot.** A snapshot of a half-installed box is a clean
+  snapshot of a broken kit. Green checks first, snapshot second.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'database-migrations',
   'Database migration safety + how super-coder''s own migrations work (schema.sql baseline + ordered migrations/ deltas + ledger). Use when altering tables, adding columns, or running backfills — in the host repo''s DB or super-coder''s.',
   'craft',
@@ -2253,6 +2322,73 @@ to point back at this skill.
 - Let a count or status code stand in for "the right thing happened."
 - Test only the happy path for code that has error branches.
 - Ship a test whose assertions no realistic bug could violate.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'windows_devkit',
+  'Drive the linked Windows Test VM — push a build artifact, exec the installer/test over SSH, capture output + a screenshot, then reset to the clean snapshot. High-fidelity installer/system-level testing where Wine is useless. Use when building or verifying Windows software in a fork that has a configured VM.',
+  'substrate',
+  NULL,
+  0,
+  '# windows_devkit — driving the Windows Test VM
+
+Real Windows, for the testing Wine can''t fake: MSI installers, services, the
+registry, system-level behavior. This is **opt-in and link-only** — the operator
+runs the VM; you drive a verified loop against it. Devs build and test; the
+reviewer independently verifies a candidate build with **exec → capture →
+reset**. Grant is explicit, per-fork (`common=0`); you have it because someone
+granted it to your shell.
+
+## Precondition — the link is configured
+
+The VM lives in `.super-coder/instance.json` under the `vm` key (set via the GUI
+Scripts → **Windows Test VM** wizard, which live-tests every field before save):
+
+```json
+"vm": { "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
+        "ssh_user": "tester", "ssh_key_path": "~/.ssh/sc_win_test",
+        "transfer_dir": "/var/sc/win-xfer", "snapshot": "clean" }
+```
+
+No `vm` block → no VM linked: stop and ask the operator to run the wizard. The
+admin `configure_winbox` skill must also have run, or the box has no toolchain
+(the `toolchain` check in the wizard is how you confirm it did).
+
+`ssh_key_path` is a **path**, never key material — read it, never echo it.
+
+## The loop — push → exec → capture → reset
+
+Every run starts from the clean snapshot, so installer side-effects never leak
+between runs. That property is the whole point — without the reset, system-level
+testing isn''t trustworthy.
+
+| Verb | How |
+|---|---|
+| **push** | drop the build artifact into `transfer_dir` (the host side of the guest''s virtio-fs share, or scp to the guest) |
+| **exec** | `ssh -i <ssh_key_path> -p <ssh_port> <ssh_user>@<ssh_host> "<installer / test cmd>"` |
+| **capture** | collect stdout + exit code; `virsh screenshot <domain> /tmp/win.ppm` for installer GUI state |
+| **reset** | `virsh snapshot-revert <domain> <snapshot>` — back to clean before the next run |
+
+SSH non-interactively: `-o BatchMode=yes -o ConnectTimeout=10`. A run that
+exec''d anything stateful **must** end with a reset, even on failure — leave the
+box clean for the next shell.
+
+## Stance
+
+- **Reset is not optional.** Test from clean, return to clean. A dirty box makes
+  the next run''s result a lie.
+- **You drive, you don''t provision.** Missing toolchain → that''s the admin''s
+  `configure_winbox` + re-snapshot, not an install from here. Never `winget
+  install` from this loop; it would poison the clean snapshot.
+- **The reviewer verifies, doesn''t build.** Reviewer uses exec → capture → reset
+  on the dev''s candidate artifact to confirm the claim independently.
+- **Link-only stays link-only.** If a field is wrong, fix it in the wizard (it
+  re-validates); don''t hand-edit secrets into config.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
