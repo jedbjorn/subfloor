@@ -56,6 +56,22 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("missing required field", r["stderr"])
 
+    def test_virsh_calls_honor_libvirt_uri(self):
+        cfg = dict(SAVED, libvirt_uri="qemu:///system")
+        with mock.patch.object(vm, "read", return_value=cfg), \
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+            vm.do_reset()
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["virsh", "--connect", "qemu:///system"])
+
+    def test_virsh_omits_connect_when_no_uri(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+            vm.do_reset()
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "virsh")
+        self.assertNotIn("--connect", argv)  # default URI / env, unchanged behavior
+
     def test_reset_passes_running_for_the_offline_clean_snapshot(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch.object(vm, "_run", return_value=(True, "")) as run:

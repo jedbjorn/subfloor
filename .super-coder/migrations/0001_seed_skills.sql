@@ -2352,8 +2352,12 @@ Scripts → **Windows Test VM** wizard, which live-tests every field before save
 ```json
 "vm": { "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
         "ssh_user": "tester", "ssh_key_path": "~/.ssh/sc_win_test",
-        "transfer_dir": "/var/sc/win-xfer", "snapshot": "clean" }
+        "transfer_dir": "/var/sc/win-xfer", "snapshot": "clean",
+        "libvirt_uri": "qemu:///system" }
 ```
+
+`libvirt_uri` is optional — set it when the domain is system-scope (the default
+`qemu:///session` can''t see it); omit it otherwise.
 
 No `vm` block → no VM linked: stop and ask the operator to run the wizard. The
 admin `configure_winbox` skill must also have run, or the box has no toolchain

@@ -788,9 +788,9 @@ async function renderScripts(root) {
 }
 
 // Windows Test VM wizard — a single link-only modal (the house openModal/el
-// pattern). The seven fields map 1:1 to the instance.json `vm` block; the five
-// checks each hit POST /api/vm/validate/{check} with the IN-PROGRESS form, so
-// the operator tests before saving. No secrets here — ssh_key_path is a PATH.
+// pattern). The fields map 1:1 to the instance.json `vm` block; the five checks
+// each hit POST /api/vm/validate/{check} with the IN-PROGRESS form, so the
+// operator tests before saving. No secrets here — ssh_key_path is a PATH.
 const VM_FIELDS = [
   ["domain", "win-test", "libvirt domain name (virsh target)"],
   ["ssh_host", "127.0.0.1", "guest OpenSSH host"],
@@ -799,6 +799,7 @@ const VM_FIELDS = [
   ["ssh_key_path", "~/.ssh/sc_win_test", "PATH to the private key — never the key itself"],
   ["transfer_dir", "/var/sc/win-xfer", "host-side dir the guest sees (virtio-fs share / scp target)"],
   ["snapshot", "clean", "named clean snapshot to revert to between runs"],
+  ["libvirt_uri", "qemu:///system", "OPTIONAL — virsh connection; set for a system-scope domain (default: qemu:///session)"],
 ];
 const VM_CHECKS = [
   ["domain", "VM exists + visible to libvirt"],
