@@ -436,7 +436,7 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 The admin half of the Windows Test VM capability. You install the build
 toolchain into the operator''s Windows VM and bake the **clean snapshot** that
-every `windows-devkit` run reverts to. Sibling to `self_update` /
+every `windows_devkit` run reverts to. Sibling to `self_update` /
 `migration_management` — infrastructure work only the admin shell does. Grant is
 explicit, per-fork (`common=0`).
 
@@ -471,7 +471,7 @@ test hits an empty box. Bump the toolchain → re-run this skill → **re-snapsh
    (for dos-arch: WiX, .NET SDK, MSBuild.)
 
 3. **Verify each tool** over SSH — `dotnet --version`, `where.exe wix`, `msbuild
-   -version`. The `windows-devkit` wizard''s `toolchain` check (`dotnet
+   -version`. The `windows_devkit` wizard''s `toolchain` check (`dotnet
    --version`) is the same probe; it must go green after this step.
 
 4. **Bake the clean snapshot.** `virsh snapshot-create-as <domain> <snapshot>
@@ -2330,12 +2330,12 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'windows-devkit',
+  'windows_devkit',
   'Drive the linked Windows Test VM — push a build artifact, exec the installer/test over SSH, capture output + a screenshot, then reset to the clean snapshot. High-fidelity installer/system-level testing where Wine is useless. Use when building or verifying Windows software in a fork that has a configured VM.',
   'substrate',
   NULL,
   0,
-  '# windows-devkit — driving the Windows Test VM
+  '# windows_devkit — driving the Windows Test VM
 
 Real Windows, for the testing Wine can''t fake: MSI installers, services, the
 registry, system-level behavior. This is **opt-in and link-only** — the operator

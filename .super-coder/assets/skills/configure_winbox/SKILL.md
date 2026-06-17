@@ -9,7 +9,7 @@ common: false
 
 The admin half of the Windows Test VM capability. You install the build
 toolchain into the operator's Windows VM and bake the **clean snapshot** that
-every `windows-devkit` run reverts to. Sibling to `self_update` /
+every `windows_devkit` run reverts to. Sibling to `self_update` /
 `migration_management` — infrastructure work only the admin shell does. Grant is
 explicit, per-fork (`common=0`).
 
@@ -44,7 +44,7 @@ test hits an empty box. Bump the toolchain → re-run this skill → **re-snapsh
    (for dos-arch: WiX, .NET SDK, MSBuild.)
 
 3. **Verify each tool** over SSH — `dotnet --version`, `where.exe wix`, `msbuild
-   -version`. The `windows-devkit` wizard's `toolchain` check (`dotnet
+   -version`. The `windows_devkit` wizard's `toolchain` check (`dotnet
    --version`) is the same probe; it must go green after this step.
 
 4. **Bake the clean snapshot.** `virsh snapshot-create-as <domain> <snapshot>

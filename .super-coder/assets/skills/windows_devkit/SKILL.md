@@ -1,11 +1,11 @@
 ---
-name: windows-devkit
+name: windows_devkit
 description: Drive the linked Windows Test VM — push a build artifact, exec the installer/test over SSH, capture output + a screenshot, then reset to the clean snapshot. High-fidelity installer/system-level testing where Wine is useless. Use when building or verifying Windows software in a fork that has a configured VM.
 category: substrate
 common: false
 ---
 
-# windows-devkit — driving the Windows Test VM
+# windows_devkit — driving the Windows Test VM
 
 Real Windows, for the testing Wine can't fake: MSI installers, services, the
 registry, system-level behavior. This is **opt-in and link-only** — the operator

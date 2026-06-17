@@ -30,7 +30,7 @@ Two design forks, both settled:
 | Fidelity need | High-fidelity, pre-merge | A gated validation loop, not a per-iteration smoke test |
 | Config scope | **Per-fork**, per-shell grant | One VM config per install; the capability grant decides which shells may use it |
 | Wizard scope | **Link-only** | Assume a ready VM (SSH + snapshot exist). Capture + validate only — no prereqs automation |
-| Skill + assignment | **`windows-devkit`**, engine `common=0`, granted to **dev + reviewer** | Reusable across forks; explicit per-fork grant, not in the base flavor arrays |
+| Skill + assignment | **`windows_devkit`**, engine `common=0`, granted to **dev + reviewer** | Reusable across forks; explicit per-fork grant, not in the base flavor arrays |
 | Provisioning | Admin shell via **`configure_winbox`** (engine `common=0`) — **winget** + fork-committed manifest | Toolchain is defined-as-code; installed *before* the clean snapshot so reverts preserve it |
 
 The per-fork decision removes the need for any schema change: the VM is a host resource, so its config lives in the fork-level config file, not on the `shells` table.
@@ -42,7 +42,7 @@ Three independent layers — a per-shell *gate*, a per-fork *config*, and a runt
 ```mermaid
 graph TD
   AD["configure_winbox (admin)"]:::class4 --> PROV["provision + snapshot"]:::class4
-  G["windows-devkit (dev+rev)"]:::class1 --> R["runtime loop"]:::class3
+  G["windows_devkit (dev+rev)"]:::class1 --> R["runtime loop"]:::class3
   C["instance.json vm block"]:::class1 --> R
   PROV --> R
   R --> P["push"]:::class3
@@ -54,7 +54,7 @@ graph TD
 - **Provision** — admin's `configure_winbox` installs the toolchain and bakes the clean snapshot, once.
 - **Gate** — reuses the existing `common=0` opt-in grant model. No new mechanism.
 - **Config** — one JSON block per fork. No secrets in it.
-- **Loop** — `windows-devkit` drives the four verbs against the linked VM.
+- **Loop** — `windows_devkit` drives the four verbs against the linked VM.
 
 ## Capability gate
 
@@ -63,7 +63,7 @@ The capability is delivered as **two role-split skills**, both authored in the *
 | Skill | Granted to | Does |
 |---|---|---|
 | **`configure_winbox`** | **admin** | provisions the box (winget toolchain) + bakes the clean snapshot. Sibling to `self_update`/`migration_management`. |
-| **`windows-devkit`** | **dev + reviewer** | drives the test loop. Devs build + test; the reviewer verifies. Same dual-role pattern as `test_authoring`. |
+| **`windows_devkit`** | **dev + reviewer** | drives the test loop. Devs build + test; the reviewer verifies. Same dual-role pattern as `test_authoring`. |
 
 - **Grant:** explicit `shell_skills` insert (or the `PUT /api/shells/{id}/skills/{skill_id}` toggle), then snapshot to persist fork-local.
 - Config is fork-wide; **who may use it is per-shell**. Configure the VM once, grant each skill to the shells that should hold it.
@@ -78,7 +78,7 @@ User: SSH foothold :::class4 -> Admin: install kit :::class1 -> Snapshot = clean
 
 1. **User (manual, once).** Install Windows, enable OpenSSH, authorize the key. The engine cannot reach inside a fresh OS install — this is the irreducible bootstrap.
 2. **Admin — `configure_winbox` (once / on toolchain change).** SSH in, **winget**-install the MSI toolchain from a fork-committed manifest, verify each tool, then take the `clean` snapshot.
-3. **Dev + reviewer — `windows-devkit` (every test).** push → exec → capture → reset against that snapshot.
+3. **Dev + reviewer — `windows_devkit` (every test).** push → exec → capture → reset against that snapshot.
 
 > [!class4]
 > **`configure_winbox` runs before the snapshot, not after.** The clean snapshot is *pristine OS + toolchain*; every test reverts to it, so the toolchain must be baked in. Bump the toolchain → re-run `configure_winbox` → re-snapshot. Provision after snapshotting and the first test hits an empty box.
@@ -155,7 +155,7 @@ Fill fields :::class1 -> Run checks :::class2 -> Green :::class3 -> Save :::clas
 
 ## The skill
 
-`windows-devkit` reads `instance.json.vm`, then runs the high-fidelity, installer-grade loop. Dev shells use the full loop to build and test; the reviewer uses **exec → capture → reset** to independently verify a candidate build during review:
+`windows_devkit` reads `instance.json.vm`, then runs the high-fidelity, installer-grade loop. Dev shells use the full loop to build and test; the reviewer uses **exec → capture → reset** to independently verify a candidate build during review:
 
 | Verb | How |
 |---|---|
@@ -170,7 +170,7 @@ Every run starts from the clean snapshot, so installer side-effects never leak b
 
 dos-arch is the proving-ground fork and the immediate need. Wiring it on this box, once the engine feature lands:
 
-1. Grant `windows-devkit` to `Arch-dev-01` (2), `Arch-dev-02` (5), `Arch-review-01` (3); grant `configure_winbox` to `Arch-Admin` (6). Snapshot to persist fork-local.
+1. Grant `windows_devkit` to `Arch-dev-01` (2), `Arch-dev-02` (5), `Arch-review-01` (3); grant `configure_winbox` to `Arch-Admin` (6). Snapshot to persist fork-local.
 2. User: confirm the Windows VM under VMM has OpenSSH + key auth and a transfer dir.
 3. Generate `~/.ssh/sc_win_test`, install the pubkey in the guest.
 4. Admin runs `configure_winbox` → winget-installs WiX + .NET SDK + MSBuild from the dos-arch manifest, verifies, takes the `clean` snapshot.
