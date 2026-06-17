@@ -748,6 +748,22 @@ async function renderScripts(root) {
   root.replaceChildren();
   root.append(el("div", { className: "muted" },
     "Run a maintenance script. Output appears below it. Per-instance DB edits → run Snapshot, then Render flat, to persist them to git-tracked text."));
+
+  // Windows Test VM — opt-in, link-only. Links this fork to an operator-run
+  // Windows VM for installer/system-level testing. Config lives in instance.json
+  // (no secrets — a key PATH only); every field is live-tested before save.
+  const vmc = el("div", { className: "card" });
+  vmc.append(el("h2", {}, "Windows Test VM",
+    el("span", { className: "pill", textContent: " opt-in" })));
+  vmc.append(el("div", { className: "muted" },
+    "Link this fork to a Windows VM you already run, for high-fidelity installer/system-level testing. " +
+    "Link-only — the VM (OpenSSH, a clean snapshot, the transfer dir, the toolchain via the admin configure_winbox skill) is yours to set up. " +
+    "Every field is validated live before it saves."));
+  const vmbtn = el("button", { className: "act primary", textContent: "configure…" });
+  vmbtn.onclick = openWinVmModal;
+  vmc.append(vmbtn);
+  root.append(vmc);
+
   for (const s of scripts) {
     const c = el("div", { className: "card" });
     const h = el("h2", {}, s.name);
@@ -769,6 +785,104 @@ async function renderScripts(root) {
     c.append(run, out);
     root.append(c);
   }
+}
+
+// Windows Test VM wizard — a single link-only modal (the house openModal/el
+// pattern). The seven fields map 1:1 to the instance.json `vm` block; the five
+// checks each hit POST /api/vm/validate/{check} with the IN-PROGRESS form, so
+// the operator tests before saving. No secrets here — ssh_key_path is a PATH.
+const VM_FIELDS = [
+  ["domain", "win-test", "libvirt domain name (virsh target)"],
+  ["ssh_host", "127.0.0.1", "guest OpenSSH host"],
+  ["ssh_port", "22", "guest OpenSSH port"],
+  ["ssh_user", "tester", "guest SSH user"],
+  ["ssh_key_path", "~/.ssh/sc_win_test", "PATH to the private key — never the key itself"],
+  ["transfer_dir", "/var/sc/win-xfer", "host-side dir the guest sees (virtio-fs share / scp target)"],
+  ["snapshot", "clean", "named clean snapshot to revert to between runs"],
+];
+const VM_CHECKS = [
+  ["domain", "VM exists + visible to libvirt"],
+  ["ssh", "SSH auth + remote exec work"],
+  ["transfer", "artifact transfer dir reachable"],
+  ["snapshot", "named clean snapshot exists"],
+  ["toolchain", "box is provisioned (configure_winbox ran)"],
+];
+
+async function openWinVmModal() {
+  let saved = {};
+  try { saved = (await api("/vm")).vm || {}; } catch { /* none yet */ }
+
+  const inputs = {};
+  const form = el("div", { className: "modal-form" });
+  for (const [key, ph, hint] of VM_FIELDS) {
+    const inp = el("input", { type: "text", placeholder: ph, value: saved[key] ?? "", title: hint });
+    inputs[key] = inp;
+    form.append(el("span", { className: "k", title: hint }, key), inp);
+  }
+
+  const collect = () => {
+    const vm = {};
+    for (const [key] of VM_FIELDS) {
+      let v = inputs[key].value.trim();
+      if (key === "ssh_port") v = Number(v) || 22;
+      if (v !== "") vm[key] = v;
+    }
+    return vm;
+  };
+
+  // results panel: one row per check (✓/✗ + output), like the Scripts run block
+  const results = el("div", {});
+  const note = el("div", { className: "muted" },
+    "Your VM must already have OpenSSH, a clean snapshot, the transfer dir, and the toolchain " +
+    "(admin's configure_winbox). The wizard validates the link — it does not set the VM up.");
+
+  const runAll = el("button", { className: "act", textContent: "run all checks" });
+  runAll.onclick = async () => {
+    const vm = collect();
+    results.replaceChildren();
+    runAll.disabled = true;
+    for (const [check, label] of VM_CHECKS) {
+      const row = el("div", { className: "card" });
+      const head = el("div", {},
+        el("span", { className: "pill", textContent: "…" }),
+        el("span", {}, "  " + check + " — " + label));
+      const out = el("pre", { className: "doc-body", hidden: true });
+      row.append(head, out);
+      results.append(row);
+      try {
+        const r = await fetch("/api/vm/validate/" + check,
+          { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ vm }) });
+        const data = await r.json();
+        const pill = head.firstChild;
+        pill.textContent = data.ok ? "✓" : "✗";
+        pill.className = "pill " + (data.ok ? "ok" : "warn");
+        out.hidden = false; out.textContent = data.output || "(no output)";
+      } catch (e) {
+        const pill = head.firstChild;
+        pill.textContent = "✗"; pill.className = "pill warn";
+        out.hidden = false; out.textContent = "error: " + e.message;
+      }
+    }
+    runAll.disabled = false;
+  };
+
+  const save = el("button", { className: "act primary", textContent: "save" });
+  const cancel = el("button", { className: "act", textContent: "close" });
+  const close = openModal({
+    title: "Windows Test VM", width: 680, height: 760,
+    bodyNode: el("div", {}, form, el("div", { className: "modal-form-foot" }, runAll), note, results),
+    footNodes: [save, cancel],
+  });
+  save.onclick = async () => {
+    save.disabled = true; setStatus("saving VM config…");
+    try {
+      await api("/vm", "PUT", { vm: collect() });
+      setStatus("VM config saved");
+      close();
+    } catch (e) { toast("error: " + e.message); save.disabled = false; }
+  };
+  cancel.onclick = close;
 }
 
 // ── Map (dr_* repo catalogue) ───────────────────────────────────────────────────

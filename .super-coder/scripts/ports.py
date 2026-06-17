@@ -101,6 +101,12 @@ def resolve(persist: bool = False) -> dict:
     return cfg
 
 
+def save(cfg: dict) -> None:
+    """Persist the full config dict to instance.json verbatim. Preserves any
+    keys this module doesn't own (e.g. the `vm` block written by vm.py)."""
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
 def main(argv: list[str]) -> int:
     mode = argv[0] if argv else "show"
     if mode == "ensure":

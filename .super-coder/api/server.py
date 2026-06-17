@@ -44,6 +44,7 @@ import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
+import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -663,6 +664,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_flags(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
+            if path == "/api/vm":
+                return self._send(200, {"vm": vm_mod.read()})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
@@ -699,6 +702,14 @@ class Handler(BaseHTTPRequestHandler):
                 if r is None:
                     return self._send(404, {"error": "no such script"})
                 return self._send(200 if r["ok"] else 500, r)
+            if path.startswith("/api/vm/validate/"):
+                # Run ONE live check against the candidate config in the body, so
+                # the wizard can test-before-save. A failed check is a normal
+                # result the UI renders red — 200 with {ok:false}, not an error.
+                r = vm_mod.validate(path.rsplit("/", 1)[1], self._body().get("vm") or {})
+                if r is None:
+                    return self._send(404, {"error": "no such check"})
+                return self._send(200, r)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
@@ -740,6 +751,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         # grant toggle: PUT /api/shells/{id}/skills/{skill_id}  {granted: bool}
+        # vm block:     PUT /api/vm  {vm: {...}}  (persists to instance.json)
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         con = db()
@@ -748,6 +760,11 @@ class Handler(BaseHTTPRequestHandler):
                 set_grant(con, int(parts[2]), int(parts[4]),
                           bool(self._body().get("granted")))
                 return self._send(200, {"ok": True})
+            if path == "/api/vm":
+                vm = self._body().get("vm")
+                if vm is not None and not isinstance(vm, dict):
+                    return self._send(400, {"error": "vm must be an object"})
+                return self._send(200, {"ok": True, "vm": vm_mod.write(vm)})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
