@@ -553,6 +553,58 @@ instance instead. (The boot doc's `RUNNING THE APP` section and the `dev_kit` sk
 carry the full detail. For the FnB-facing review of a shell's UI changes, use
 `./sc preview` — see *How shells share one repo*.)
 
+## Windows Test VM (opt-in)
+
+> [!class2]
+> **UI** Scripts · **Shells** dev + reviewer (loop) · admin (provision)
+
+A fork that builds Windows software needs to test on **real Windows** —
+installers, services, the registry, system-level behavior where Wine is useless.
+This is an **opt-in** capability: the engine ships the *orchestration* (a verified
+push → exec → capture → reset loop and a guided setup card in the Scripts tab); you
+bring the *VM* — license, image, and OS install are yours and unreachable from the
+tool. It is **link-only**: it assumes a ready VM and captures + validates the
+connection to it, rather than building one for you. Off by default; nothing here
+touches forks that don't opt in.
+
+Config lives under a `vm` key in the gitignored `.super-coder/instance.json` —
+**no secrets**, only a key *path* (`ssh_key_path`), never key material. The setup
+card runs five live checks against the *candidate* config before you save, so what
+gets persisted is verified, not hopeful:
+
+| Check | Proves |
+|---|---|
+| `domain` | the VM exists and is visible to libvirt |
+| `ssh` | key auth + remote exec work |
+| `transfer` | artifact transfer works both ways |
+| `snapshot` | the named clean snapshot exists for reset |
+| `toolchain` | the box is provisioned (`configure_winbox` has run) |
+
+**Setup is a three-role lifecycle, and the ordering *is* the design** — each role
+can only act once the previous has:
+
+```linear
+User: SSH foothold :::class4 -> Admin: install kit :::class1 -> Snapshot = clean :::class3 -> Dev+Rev: run loop :::class2
+```
+
+1. **User (manual, once).** Install Windows, enable OpenSSH, authorize the key. The
+   engine can't reach inside a fresh OS install — this bootstrap is irreducible.
+2. **Admin — `configure_winbox` (once / on toolchain change).** SSH in,
+   `winget`-install the MSI toolchain from a fork-committed manifest, verify each
+   tool, **then** take the `clean` snapshot.
+3. **Dev + reviewer — `windows_devkit` (every test).** push → exec → capture →
+   reset against that snapshot.
+
+> [!class4]
+> **The one gotcha: `configure_winbox` runs *before* the snapshot, not after.** The
+> clean snapshot is *pristine OS + toolchain*, and every test reverts to it — so the
+> toolchain must already be baked in. Bump the toolchain → re-run `configure_winbox`
+> → re-snapshot. Provision after snapshotting and the first test hits an empty box.
+
+Both skills are engine `common=0` — they propagate to every fork but **auto-grant to
+none**. Grant `windows_devkit` to the dev + reviewer shells and `configure_winbox` to
+admin, per fork, then snapshot to persist. Full design: [`docs/windows-test-vm.md`](docs/windows-test-vm.md).
+
 ## Review GUI
 
 > [!class2]
