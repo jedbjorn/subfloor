@@ -1463,7 +1463,7 @@ DELETE FROM project_shells;
 INSERT INTO project_shells (project_shell_id, project_id, shell_id, role, added_date, is_deleted) VALUES (1, 1, 1, 'maintainer', '2026-06-04', 0);
 
 -- Project-local skills only. Engine-seeded skills come from migrations.
-DELETE FROM skills WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'database-migrations', 'db_map', 'dev_kit', 'docs', 'flags', 'git', 'git_cleanup', 'local_skill_management', 'memory', 'messaging', 'migration_management', 'onboard', 'redline_review', 'self_update', 'snapshot', 'spec', 'surface_catalogue', 'test_authoring');
+DELETE FROM skills WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'configure_winbox', 'database-migrations', 'db_map', 'dev_kit', 'docs', 'flags', 'git', 'git_cleanup', 'local_skill_management', 'memory', 'messaging', 'migration_management', 'onboard', 'redline_review', 'self_update', 'snapshot', 'spec', 'surface_catalogue', 'test_authoring', 'windows_devkit');
 
 DELETE FROM shell_skills;
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='api-design';
