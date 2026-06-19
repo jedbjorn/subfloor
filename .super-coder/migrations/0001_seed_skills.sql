@@ -728,10 +728,33 @@ In super-coder the **DB owns document bodies** — never loose `.md` files. A
 
 | kind | lives on | meaning |
 |---|---|---|
-| `spec` | the **Roadmap** (the dev cycle) | the working/founding spec for a feature; **freezes on ship** |
+| `spec` | the **Roadmap** (the dev cycle) | a working spec for a feature; a feature can hold several at once; **freezes on ship** |
 | `doc` | the **Docs** tab | documentation; not part of the spec lifecycle |
 
 `<self>` = your shell_id.
+
+## One feature, many specs
+
+A feature (the `roadmap` row) is the umbrella, and it exists from `brainstorm`
+onward — before any spec is written. **Specs hang off the feature, not off each
+other:** a feature can hold several unfrozen specs at once (the working pile),
+each a `documents (kind=''spec'')` row, ordered by `seq`. There are no
+feature-to-feature links and no second roadmap row for related work — related
+work is just another spec under the same feature.
+
+A spec stays unfrozen until it ships; freeze is the ship-time record of what we
+built to, and it never gates the feature''s other specs. So at any moment a
+feature''s specs are in one of three states:
+
+| state | how to tell | meaning |
+|---|---|---|
+| **shipped** | `frozen = 1` | delivered; immutable record |
+| **active** | unfrozen **and** has rows in `spec_tasks` | the spec being built now |
+| **backlog** | unfrozen, no task plan yet | the pile, ordered by `seq` |
+
+The **doc** (`kind=''doc''`) is the feature''s readable face — write it when the
+first spec ships, under the same `feature_id`. It is a sibling of the specs, not
+a parent they point at.
 
 ## Review first
 
@@ -756,8 +779,9 @@ within `(feature, kind)`, and it renders + snapshots for you:
 
 ## Freeze on ship
 
-A spec freezes when its stage ships — immutable thereafter; open the **next** seq
-for the next stage, never edit a frozen one:
+Freeze only at ship — it records what we built to, immutable thereafter. The
+feature''s other specs stay unfrozen and unaffected; never edit a frozen one (open
+a new spec under the same feature instead):
 ```
 ./sc mem doc freeze <document_id>
 ```
@@ -1981,15 +2005,24 @@ items you can''t resolve alone.
 
 ## Step 1: Load the spec
 
+A feature can hold several unfrozen specs at once (see the `docs` skill), so don''t
+auto-pick "the latest" — list the feature''s open specs and choose the target
+explicitly. The **active** spec is the unfrozen one that already has a task plan;
+the rest are backlog.
+
 ```sql
--- find a feature and its active (non-frozen) spec:
+-- a feature''s open (unfrozen) specs, newest seq first — pick the target by id:
 SELECT r.feature_id, r.title AS feature_title, r.roadmap_status,
-       d.document_id, d.seq, d.title AS spec_title, d.body, d.frozen
+       d.document_id, d.seq, d.title AS spec_title,
+       (SELECT COUNT(*) FROM spec_tasks t WHERE t.document_id = d.document_id) AS task_count
 FROM roadmap r
 JOIN documents d ON d.feature_id = r.feature_id AND d.kind = ''spec''
 WHERE (r.title LIKE ''%<keyword>%'' OR r.feature_id = <id>)
   AND d.frozen = 0
-ORDER BY d.seq DESC LIMIT 1;
+ORDER BY d.seq DESC;
+
+-- load the chosen spec body:
+SELECT document_id, seq, title, body FROM documents WHERE document_id = <doc_id>;
 
 -- check if a plan already exists for this spec:
 SELECT task_id, seq, title, status, completed_date
@@ -1997,6 +2030,10 @@ FROM spec_tasks
 WHERE document_id = <doc_id>
 ORDER BY seq;
 ```
+
+`task_count > 0` marks the active spec — resume that one; an empty spec is backlog,
+and starting it (Step 3) makes it active. If more than one open spec matches and
+which to work is unclear, ask the FnB.
 
 If tasks already exist, skip to **Step 4** (Track).
 
