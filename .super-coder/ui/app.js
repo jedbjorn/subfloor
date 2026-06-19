@@ -627,9 +627,12 @@ function buildFlowGraph(features, stageOf) {
   wrap.append(inner);
 
   // Dependency edges (prerequisite → dependent), endpoints both in this section.
+  // Skip edges whose prerequisite is already shipped: shipped is the rightmost
+  // stage, so the wire would point backward to earlier work — and a done
+  // prerequisite isn't worth drawing.
   const edgeList = [];
   for (const f of features) for (const b of (f.blockers || []))
-    if (shownIds.has(b)) edgeList.push([b, f.feature_id]);
+    if (shownIds.has(b) && stageOf[b] !== "shipped") edgeList.push([b, f.feature_id]);
 
   // Draw once the columns have laid out. Coordinates are relative to .flow-inner;
   // connect the source card's right edge to the target's left, horizontal-tangent.

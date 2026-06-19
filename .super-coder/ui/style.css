@@ -497,7 +497,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   align-items: flex-start; padding: 0 .2rem; }
 /* Columns share the window width evenly (flex:1); min-width keeps them legible
    and lets .flow-wrap scroll as a fallback when too many stages are present. */
-.flow-col { flex: 1 1 0; min-width: 150px; display: flex; flex-direction: column; gap: .7rem; }
+.flow-col { flex: 1 1 0; min-width: 150px; display: flex; flex-direction: column; gap: 1.4rem; }
 .flow-col-head { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
   color: var(--dim); padding-bottom: .35rem; border-bottom: 1px solid var(--line-soft); }
 
