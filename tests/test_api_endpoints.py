@@ -26,6 +26,7 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -133,10 +134,14 @@ class AssemblerSmokeTest(unittest.TestCase):
         out = server.get_shell(self.con, self.ids["shell_id"])
         self.assertTrue(all("origin" in k and "category" in k for k in out["skills"]))
 
-    def test_get_map_empty_catalogue(self) -> None:
-        # dr_* catalogue is empty in a fresh DB — must not crash.
-        out = server.get_map(self.con)
+    def test_get_map_unmapped_degrades_to_empty(self) -> None:
+        # get_map() reads the SEPARATE map.db via map_db.open_ro() — it takes no
+        # args and ignores shell_db. When the fork isn't mapped, open_ro() returns
+        # None and get_map must degrade to the empty shape, never crash.
+        with mock.patch.object(server.map_db, "open_ro", return_value=None):
+            out = server.get_map()
         self.assertEqual(out["total_files"], 0)
+        self.assertIsNone(out["repo"])
 
     def test_get_roadmap_includes_blockers_key(self) -> None:
         # Every feature dict must carry a `blockers` list (empty when none),
