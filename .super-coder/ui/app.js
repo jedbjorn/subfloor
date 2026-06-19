@@ -476,8 +476,7 @@ const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Ne
 const FLOW_STAGES = ["in_progress", "next", "near_term", "long_term", "shipped"];
 let roadmapFilter = null;            // null = show all (default); single-select
 let roadmapView = "board";           // "board" | "flow"
-const roadmapCollapsed = new Set();  // statuses whose section is collapsed (global, across boards)
-const projectCollapsed = new Set();  // project-board keys (project_id | null) collapsed
+const roadmapCollapsed = new Set();  // statuses whose section is collapsed
 
 // All features in the sequencing stages, flattened — the candidate pool for a
 // feature's "blocked by" picker and the node set of the Flow graph.
@@ -501,7 +500,7 @@ async function renderRoadmap(root) {
   }
   root.append(toggle);
 
-  if (roadmapView === "flow") { await renderRoadmapFlow(root, buckets); return; }
+  if (roadmapView === "flow") { await renderRoadmapFlow(root, buckets, projects); return; }
 
   const candidates = flowCandidates(buckets);
 
@@ -517,61 +516,33 @@ async function renderRoadmap(root) {
   }
   root.append(bar);
 
-  // buckets arrive linear from the API; filter to the single selected status,
-  // then flatten to features and group into one board per project (work-stream).
+  // buckets arrive linear from the API; filter to the single selected status.
+  // The Board is a workload-per-horizon view (status sections); work-stream
+  // grouping lives in the Flow view, not here.
   const shown = roadmapFilter ? buckets.filter((b) => b.status === roadmapFilter) : buckets;
-  const flat = shown.flatMap((b) => b.features);
-  if (!flat.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage.")); return; }
-
-  // Group features by project_id (null = unassigned).
-  const byProject = new Map();   // key (project_id | null) → { title, features }
-  for (const f of flat) {
-    const key = f.project_id ?? null;
-    if (!byProject.has(key)) byProject.set(key, { title: f.project_title || null, features: [] });
-    byProject.get(key).features.push(f);
-  }
-  // Board order: projects in payload order (sorted by title) first, any leftover
-  // project keys next, then the Unassigned board last.
-  const order = projects.map((p) => p.project_id).filter((id) => byProject.has(id));
-  for (const key of byProject.keys())
-    if (key !== null && !order.includes(key)) order.push(key);
-  if (byProject.has(null)) order.push(null);
-
-  for (const key of order) {
-    const grp = byProject.get(key);
-    const title = key === null ? "Unassigned" : (grp.title || ("project #" + key));
-    const board = el("div", { className: "project-board" + (projectCollapsed.has(key) ? " collapsed" : "") });
-    const bh = el("h2", { className: "project-board-head" }, title);
-    bh.append(el("span", { className: "count" }, String(grp.features.length)));
-    bh.onclick = () => {
-      projectCollapsed.has(key) ? projectCollapsed.delete(key) : projectCollapsed.add(key);
+  if (!shown.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage.")); return; }
+  for (const b of shown) {
+    const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(b.status) ? " collapsed" : "") });
+    const h = el("h2", {}, b.label);
+    h.onclick = () => {
+      roadmapCollapsed.has(b.status) ? roadmapCollapsed.delete(b.status) : roadmapCollapsed.add(b.status);
       renderRoadmap(root);
     };
-    board.append(bh);
-    // status sub-sections within the board, in funnel order; collapse is global per status
-    for (const s of STATUSES) {
-      const inStatus = grp.features.filter((f) => f.roadmap_status === s);
-      if (!inStatus.length) continue;
-      const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(s) ? " collapsed" : "") });
-      const h = el("h2", {}, SLABEL[s]);
-      h.onclick = () => {
-        roadmapCollapsed.has(s) ? roadmapCollapsed.delete(s) : roadmapCollapsed.add(s);
-        renderRoadmap(root);
-      };
-      sec.append(h);
-      for (const f of inStatus) sec.append(featureCard(f, candidates, projects));
-      board.append(sec);
-    }
-    root.append(board);
+    sec.append(h);
+    for (const f of b.features) sec.append(featureCard(f, candidates, projects));
+    root.append(sec);
   }
 }
 
-// Flow view: one column per sequencing stage, one card per feature, and an SVG
-// overlay drawing a wire blocker → blocked for every edge whose endpoints are
-// both shown. Pure DOM + measured coordinates — no diagram library.
+// Flow view: one section per work-stream (project). Inside a section the
+// work-stream's features lay out left→right by planning stage (the sequence),
+// and an SVG overlay wires dependencies (prerequisite → dependent). Pure DOM +
+// measured coordinates — no diagram library. Work-streams are the user's
+// "feature" (e.g. "Meeting Intelligence" = the mi-capture project); unassigned
+// features collect in a trailing "Ungrouped" section.
 const SVGNS = "http://www.w3.org/2000/svg";
-async function renderRoadmapFlow(root, buckets) {
-  const feats = flowCandidates(buckets);
+async function renderRoadmapFlow(root, buckets, projects = []) {
+  const feats = flowCandidates(buckets);   // features in the sequencing stages
   if (!feats.length) {
     root.append(el("div", { className: "muted" }, "No features in the sequencing stages yet."));
     return;
@@ -579,9 +550,40 @@ async function renderRoadmapFlow(root, buckets) {
   const stageOf = {};
   for (const b of buckets) if (FLOW_STAGES.includes(b.status))
     for (const f of b.features) stageOf[f.feature_id] = b.status;
-  const shownIds = new Set(feats.map((f) => f.feature_id));
 
-  // Scroll container → sized-to-content inner → { wires svg, columns }.
+  // Group the sequencing features by work-stream (project_id; null = ungrouped).
+  const byProj = new Map();   // key (project_id | null) → { title, features }
+  for (const f of feats) {
+    const key = f.project_id ?? null;
+    if (!byProj.has(key)) byProj.set(key, { title: f.project_title || null, features: [] });
+    byProj.get(key).features.push(f);
+  }
+  const order = projects.map((p) => p.project_id).filter((id) => byProj.has(id));
+  for (const key of byProj.keys()) if (key !== null && !order.includes(key)) order.push(key);
+  if (byProj.has(null)) order.push(null);
+
+  let anyEdge = false;
+  for (const key of order) {
+    const grp = byProj.get(key);
+    const title = key === null ? "Ungrouped" : (grp.title || ("project #" + key));
+    const section = el("div", { className: "flow-stream" });
+    section.append(el("h2", { className: "flow-stream-head" }, title));
+    const { wrap, edges } = buildFlowGraph(grp.features, stageOf);
+    anyEdge = anyEdge || edges > 0;
+    section.append(wrap);
+    root.append(section);
+  }
+
+  root.append(el("div", { className: "muted flow-hint" }, anyEdge
+    ? "Wires run prerequisite → dependent (what must come first). Set a feature's “depends on” in Board view."
+    : "No dependencies set — wire one by opening a feature in Board view and setting its “depends on”."));
+}
+
+// Build one work-stream's graph: stage columns scoped to `features`, plus an SVG
+// overlay wiring dependency edges (prerequisite → dependent) whose endpoints are
+// both in this set. Returns { wrap element, edges count }.
+function buildFlowGraph(features, stageOf) {
+  const shownIds = new Set(features.map((f) => f.feature_id));
   const wrap = el("div", { className: "flow-wrap" });
   const inner = el("div", { className: "flow-inner" });
   const svg = document.createElementNS(SVGNS, "svg");
@@ -590,7 +592,7 @@ async function renderRoadmapFlow(root, buckets) {
 
   const cardOf = {};   // feature_id → card element, for wire endpoints
   for (const s of FLOW_STAGES) {
-    const inStage = feats.filter((f) => stageOf[f.feature_id] === s);
+    const inStage = features.filter((f) => stageOf[f.feature_id] === s);
     if (!inStage.length) continue;
     const col = el("div", { className: "flow-col" });
     col.append(el("div", { className: "flow-col-head" }, SLABEL[s]));
@@ -621,11 +623,10 @@ async function renderRoadmapFlow(root, buckets) {
 
   inner.append(svg, cols);
   wrap.append(inner);
-  root.append(wrap);
 
-  // Edge list (blocker → blocked), endpoints both shown.
+  // Dependency edges (prerequisite → dependent), endpoints both in this section.
   const edgeList = [];
-  for (const f of feats) for (const b of (f.blockers || []))
+  for (const f of features) for (const b of (f.blockers || []))
     if (shownIds.has(b)) edgeList.push([b, f.feature_id]);
 
   // Draw once the columns have laid out. Coordinates are relative to .flow-inner;
@@ -666,7 +667,7 @@ async function renderRoadmapFlow(root, buckets) {
   };
   requestAnimationFrame(draw);
 
-  // Redraw on resize; the listener removes itself once this view is replaced.
+  // Redraw on resize; the listener removes itself once this section is replaced.
   const onResize = () => { inner.isConnected ? draw() : window.removeEventListener("resize", onResize); };
   window.addEventListener("resize", onResize);
 
@@ -690,9 +691,7 @@ async function renderRoadmapFlow(root, buckets) {
     };
   }
 
-  root.append(el("div", { className: "muted flow-hint" }, edgeList.length
-    ? "Wires run blocker → blocked. Edit a feature's “blocked by” in Board view."
-    : "No blocking relationships yet — open a feature in Board view and set its “blocked by”."));
+  return { wrap, edges: edgeList.length };
 }
 
 function featureCard(f, candidates = [], projects = []) {
@@ -746,7 +745,8 @@ function featureCard(f, candidates = [], projects = []) {
     } catch (e) { project.value = prevProject; toast("error: " + e.message); }
   };
 
-  // "blocked by" editor — a multi-select of OTHER sequencing-stage features.
+  // "depends on" editor — a multi-select of OTHER sequencing-stage features this
+  // one must come after (stored as blocker edges; the Flow view wires them).
   // Only shown for the five real stages; brainstorm/retired don't relate yet.
   const realStage = FLOW_STAGES.includes(f.roadmap_status);
   let blockerSelect = null;
@@ -782,7 +782,7 @@ function featureCard(f, candidates = [], projects = []) {
     el("span", { className: "k" }, "summary"), summary,
   ];
   if (blockerSelect) gridKids.push(
-    el("span", { className: "k" }, "blocked by"), blockerSelect);
+    el("span", { className: "k" }, "depends on"), blockerSelect);
   body.append(el("div", { className: "grid2" }, ...gridKids), save);
 
   // tasks — the spec's implementation plan, in order; done = checked + struck
