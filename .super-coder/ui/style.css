@@ -477,11 +477,39 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
 
-/* Roadmap Flow view — the feature dependency graph (mermaid) + its editor */
+/* Roadmap Flow view — feature dependency graph: cards in stage columns with an
+   SVG wire overlay (blocker → blocked). Replaces the old mermaid flowchart. */
 .view-toggle { margin-bottom: .6rem; }
 .blocker-select { min-height: 0; }
 .blocker-select option { padding: .15rem .2rem; }
-.flowchart { background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--r); padding: 1rem; margin: .4rem 0; overflow-x: auto; }
-.flowchart svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+
+.flow-wrap { overflow-x: auto; padding: .3rem 0 .5rem; }
+.flow-inner { position: relative; width: max-content; min-width: 100%; }
+.flow-wires { position: absolute; top: 0; left: 0; z-index: 0;
+  pointer-events: none; overflow: visible; }
+.flow-cols { position: relative; z-index: 1; display: flex; gap: 2.6rem;
+  align-items: flex-start; padding: 0 .2rem; }
+.flow-col { flex: none; width: 220px; display: flex; flex-direction: column; gap: .7rem; }
+.flow-col-head { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--dim); padding-bottom: .35rem; border-bottom: 1px solid var(--line-soft); }
+
+.flow-card { background: var(--panel); border: 1px solid var(--line);
+  border-left: 3px solid var(--line); border-radius: 10px; padding: .55rem .65rem;
+  transition: opacity .12s, border-color .12s, box-shadow .12s; }
+.flow-card.in_progress { border-left-color: var(--task-open); }
+.flow-card.next       { border-left-color: var(--accent); }
+.flow-card.near_term  { border-left-color: var(--lock); }
+.flow-card.long_term  { border-left-color: var(--lock); }
+.flow-card.shipped    { border-left-color: var(--ok); }
+.flow-card-title { font-weight: 600; font-size: .85rem; line-height: 1.3; }
+.flow-card-meta { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .45rem; }
+
+.flow-wire { fill: none; stroke: rgba(110,168,254,.42); stroke-width: 1.6px; }
+/* Spotlight on hover: dim everything, light the incident wires + their cards. */
+.flow-wrap.flow-hover .flow-card { opacity: .38; }
+.flow-wrap.flow-hover .flow-card.lit { opacity: 1; border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
+.flow-wrap.flow-hover .flow-wire { stroke: rgba(110,168,254,.1); }
+.flow-wrap.flow-hover .flow-wire.lit { stroke: var(--accent); stroke-width: 2px; }
+
 .flow-hint { font-size: .82rem; text-align: center; margin-top: .4rem; }

@@ -31,14 +31,6 @@ function mdBlock(text) {
   return div;
 }
 
-// Mermaid powers the roadmap Flow view (the feature dependency graph). We build
-// the diagram string from the /roadmap payload and call mermaid.render()
-// ourselves, so auto-scan is off. Dark theme to match the GUI palette.
-mermaid.initialize({
-  startOnLoad: false, theme: "dark", securityLevel: "loose",
-  flowchart: { useMaxWidth: true, htmlLabels: true, rankSpacing: 55, nodeSpacing: 35 },
-});
-
 async function api(path, method = "GET", body) {
   const r = await fetch("/api" + path, {
     method, headers: body ? { "Content-Type": "application/json" } : {},
@@ -495,14 +487,6 @@ function flowCandidates(buckets) {
   return out;
 }
 
-// Mermaid node labels live inside "...": escape the quote, collapse whitespace,
-// and cap length so a long title doesn't balloon the node.
-function mmLabel(t) {
-  let s = (t || "(untitled)").replace(/\s+/g, " ").trim();
-  if (s.length > 42) s = s.slice(0, 40) + "…";
-  return s.replace(/"/g, "#quot;");
-}
-
 async function renderRoadmap(root) {
   const { buckets } = await api("/roadmap");
   root.replaceChildren();
@@ -548,8 +532,10 @@ async function renderRoadmap(root) {
   }
 }
 
-// Flow view: one subgraph per sequencing stage, one arrow per blocker edge
-// (blocker → blocked) where both endpoints are shown. Rendered via mermaid.
+// Flow view: one column per sequencing stage, one card per feature, and an SVG
+// overlay drawing a wire blocker → blocked for every edge whose endpoints are
+// both shown. Pure DOM + measured coordinates — no diagram library.
+const SVGNS = "http://www.w3.org/2000/svg";
 async function renderRoadmapFlow(root, buckets) {
   const feats = flowCandidates(buckets);
   if (!feats.length) {
@@ -561,28 +547,106 @@ async function renderRoadmapFlow(root, buckets) {
     for (const f of b.features) stageOf[f.feature_id] = b.status;
   const shownIds = new Set(feats.map((f) => f.feature_id));
 
-  const lines = ["flowchart LR"];
+  // Scroll container → sized-to-content inner → { wires svg, columns }.
+  const wrap = el("div", { className: "flow-wrap" });
+  const inner = el("div", { className: "flow-inner" });
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("class", "flow-wires");
+  const cols = el("div", { className: "flow-cols" });
+
+  const cardOf = {};   // feature_id → card element, for wire endpoints
   for (const s of FLOW_STAGES) {
     const inStage = feats.filter((f) => stageOf[f.feature_id] === s);
     if (!inStage.length) continue;
-    lines.push(`  subgraph S_${s}["${SLABEL[s]}"]`);
-    for (const f of inStage) lines.push(`    F${f.feature_id}["${mmLabel(f.title)}"]`);
-    lines.push("  end");
+    const col = el("div", { className: "flow-col" });
+    col.append(el("div", { className: "flow-col-head" }, SLABEL[s]));
+    for (const f of inStage) {
+      const card = el("div", { className: "flow-card " + s });
+      card.dataset.fid = String(f.feature_id);
+      card.append(el("div", { className: "flow-card-title" }, f.title || "(untitled)"));
+      const m = el("div", { className: "flow-card-meta" });
+      if (f.owner) m.append(el("span", { className: "pill " + s }, f.owner));
+      if (f.open_flags?.length) m.append(el("span", { className: "pill warn" }, f.open_flags.length + " ⚑"));
+      if (m.childNodes.length) card.append(m);
+      col.append(card);
+      cardOf[f.feature_id] = card;
+    }
+    cols.append(col);
   }
-  let edges = 0;
-  for (const f of feats) for (const b of (f.blockers || []))
-    if (shownIds.has(b)) { lines.push(`  F${b} --> F${f.feature_id}`); edges++; }
 
-  const container = el("div", { className: "flowchart" });
-  root.append(container);
-  try {
-    const { svg } = await mermaid.render("roadmapFlow", lines.join("\n"));
-    container.innerHTML = svg;
-  } catch (e) {
-    container.append(el("div", { className: "muted" }, "flow render failed: " + (e?.message || e)));
+  inner.append(svg, cols);
+  wrap.append(inner);
+  root.append(wrap);
+
+  // Edge list (blocker → blocked), endpoints both shown.
+  const edgeList = [];
+  for (const f of feats) for (const b of (f.blockers || []))
+    if (shownIds.has(b)) edgeList.push([b, f.feature_id]);
+
+  // Draw once the columns have laid out. Coordinates are relative to .flow-inner;
+  // connect the source card's right edge to the target's left, horizontal-tangent.
+  const draw = () => {
+    if (!inner.isConnected) return;
+    const base = inner.getBoundingClientRect();
+    const w = inner.scrollWidth, h = inner.scrollHeight;
+    svg.setAttribute("width", w); svg.setAttribute("height", h);
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    const arrow = document.createElementNS(SVGNS, "marker");
+    arrow.setAttribute("id", "flowArrow");
+    arrow.setAttribute("viewBox", "0 0 8 8");
+    arrow.setAttribute("refX", "7"); arrow.setAttribute("refY", "4");
+    arrow.setAttribute("markerWidth", "6"); arrow.setAttribute("markerHeight", "6");
+    arrow.setAttribute("orient", "auto-start-reverse");
+    const head = document.createElementNS(SVGNS, "path");
+    head.setAttribute("d", "M0 0 L8 4 L0 8 z");
+    head.setAttribute("fill", "context-stroke");
+    arrow.append(head);
+    const defs = document.createElementNS(SVGNS, "defs");
+    defs.append(arrow);
+    svg.replaceChildren(defs);
+    for (const [from, to] of edgeList) {
+      const a = cardOf[from], z = cardOf[to];
+      if (!a || !z) continue;
+      const ra = a.getBoundingClientRect(), rz = z.getBoundingClientRect();
+      const x1 = ra.right - base.left, y1 = ra.top - base.top + ra.height / 2;
+      const x2 = rz.left  - base.left, y2 = rz.top - base.top + rz.height / 2;
+      const dx = Math.max(40, Math.abs(x2 - x1) * 0.4);
+      const path = document.createElementNS(SVGNS, "path");
+      path.setAttribute("d", `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
+      path.setAttribute("class", "flow-wire");
+      path.setAttribute("marker-end", "url(#flowArrow)");
+      path.dataset.from = String(from); path.dataset.to = String(to);
+      svg.append(path);
+    }
+  };
+  requestAnimationFrame(draw);
+
+  // Redraw on resize; the listener removes itself once this view is replaced.
+  const onResize = () => { inner.isConnected ? draw() : window.removeEventListener("resize", onResize); };
+  window.addEventListener("resize", onResize);
+
+  // Hover a card → spotlight its incident wires and the cards they touch.
+  for (const card of Object.values(cardOf)) {
+    card.onmouseenter = () => {
+      const fid = card.dataset.fid;
+      const lit = new Set([fid]);
+      wrap.classList.add("flow-hover");
+      for (const p of svg.querySelectorAll(".flow-wire")) {
+        const on = p.dataset.from === fid || p.dataset.to === fid;
+        p.classList.toggle("lit", on);
+        if (on) { lit.add(p.dataset.from); lit.add(p.dataset.to); }
+      }
+      for (const id in cardOf) cardOf[id].classList.toggle("lit", lit.has(id));
+    };
+    card.onmouseleave = () => {
+      wrap.classList.remove("flow-hover");
+      for (const p of svg.querySelectorAll(".flow-wire")) p.classList.remove("lit");
+      for (const id in cardOf) cardOf[id].classList.remove("lit");
+    };
   }
-  root.append(el("div", { className: "muted flow-hint" }, edges
-    ? "Arrows point blocker → blocked. Edit a feature's “blocked by” in Board view."
+
+  root.append(el("div", { className: "muted flow-hint" }, edgeList.length
+    ? "Wires run blocker → blocked. Edit a feature's “blocked by” in Board view."
     : "No blocking relationships yet — open a feature in Board view and set its “blocked by”."));
 }
 
