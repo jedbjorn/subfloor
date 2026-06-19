@@ -491,11 +491,13 @@ async function renderRoadmap(root) {
   const { buckets, projects = [] } = await api("/roadmap");
   root.replaceChildren();
 
-  // Board ⇄ Flow toggle. Board = bucketed cards; Flow = the dependency graph.
+  // Board ⇄ Flow toggle. The sub-view rides in the URL hash (#roadmap = board,
+  // #roadmap-flow = flow) so it's deep-linkable and refresh-stable; routeFromHash
+  // sets roadmapView and re-renders.
   const toggle = el("div", { className: "filters centered view-toggle" });
   for (const [mode, label] of [["board", "Board"], ["flow", "Flow"]]) {
     const b = el("button", { className: "chip" + (roadmapView === mode ? " on" : ""), textContent: label });
-    b.onclick = () => { roadmapView = mode; renderRoadmap(root); };
+    b.onclick = () => { location.hash = mode === "flow" ? "roadmap-flow" : "roadmap"; };
     toggle.append(b);
   }
   root.append(toggle);
@@ -1305,10 +1307,16 @@ function show(tab) {
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
 // put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
-// hash; hashchange drives show — back/forward and deep links work too.
+// hash; hashchange drives show — back/forward and deep links work too. The
+// roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
 function routeFromHash() {
-  const tab = location.hash.slice(1);
-  show(VIEWS[tab] ? tab : "shells");
+  const raw = location.hash.slice(1);
+  if (raw === "roadmap" || raw.startsWith("roadmap-")) {
+    roadmapView = raw === "roadmap-flow" ? "flow" : "board";
+    show("roadmap");
+    return;
+  }
+  show(VIEWS[raw] ? raw : "shells");
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
 window.addEventListener("hashchange", routeFromHash);
