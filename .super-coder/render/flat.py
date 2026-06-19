@@ -110,7 +110,9 @@ def _render_documents(con, written, skipped) -> None:
                           written, skipped)
 
 
-_ROADMAP_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"]
+# Board order: delivered first, then the committed funnel backward, with
+# brainstorm/retired as end caps (see server.py _ORDER for the rationale).
+_ROADMAP_ORDER = ["shipped", "in_progress", "next", "near_term", "long_term", "brainstorm", "retired"]
 _ROADMAP_LABEL = {
     "brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
     "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",

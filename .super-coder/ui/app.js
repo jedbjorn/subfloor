@@ -468,8 +468,9 @@ function skillRow(s, shells) {
 }
 
 // ── Roadmap ───────────────────────────────────────────────────────────────────
-// Funnel order: idea inlet → most-active committed work → done.
-const STATUSES = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"];
+// Board order: delivered first, then the committed funnel backward (items move
+// LEFT toward shipped); brainstorm/retired are the right-hand end caps.
+const STATUSES = ["shipped", "in_progress", "next", "near_term", "long_term", "brainstorm", "retired"];
 const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped", retired: "Retired" };
 // The five stages that sequence (carry dependency edges). brainstorm/retired are
 // excluded from the Flow graph and the blocker editor — they don't relate yet.

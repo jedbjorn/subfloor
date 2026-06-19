@@ -652,8 +652,10 @@ def build_parser() -> argparse.ArgumentParser:
     fc = fsub.add_parser("close", parents=[common]); fc.add_argument("flag_id", type=int); fc.add_argument("--notes")
     sp.set_defaults(fn=cmd_flag)
 
-    ROADMAP_STATUSES = ["brainstorm", "in_progress", "next", "near_term",
-                        "long_term", "shipped", "retired"]
+    # Board order (see api/server.py _ORDER). Order here only affects --help
+    # display; `add` still defaults to brainstorm (new items enter as ideas).
+    ROADMAP_STATUSES = ["shipped", "in_progress", "next", "near_term",
+                        "long_term", "brainstorm", "retired"]
     sp = sub.add_parser("roadmap", help="add a feature, move its status, set its work-stream or dependencies")
     rsub = sp.add_subparsers(dest="roadmap_cmd", required=True)
     ra = rsub.add_parser("add", parents=[common]); ra.add_argument("title")

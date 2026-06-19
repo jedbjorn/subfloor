@@ -163,9 +163,11 @@ def get_skills(con) -> dict:
     return {"skills": skills, "shells": get_shells(con)}
 
 
-# Funnel order: idea inlet → most-active committed work → done (shipped) →
-# taken-off-the-board (retired). shipped = delivered; retired = chose not to.
-_ORDER = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"]
+# Board order: delivered work first, then the committed funnel read backward
+# (most-active → farthest-out) — items move LEFT toward shipped as long_term
+# matures to near_term, next, in_progress, shipped. brainstorm (idea inlet) and
+# retired (taken off the board) are the right-hand end caps.
+_ORDER = ["shipped", "in_progress", "next", "near_term", "long_term", "brainstorm", "retired"]
 _LABEL = {"brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
           "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
           "retired": "Retired"}
