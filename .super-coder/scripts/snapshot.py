@@ -48,6 +48,10 @@ PER_INSTANCE_TABLES = [
     "documents",
     "flags",
     "spec_tasks",
+    # feature_blockers is per-instance roadmap content (the blocking edges
+    # between this fork's features), like roadmap/flags. Loads after `roadmap`
+    # (both its FK targets), so the edges resolve on rebuild.
+    "feature_blockers",
     "projects",
     "project_shells",
     "skills",

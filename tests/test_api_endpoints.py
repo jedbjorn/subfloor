@@ -138,6 +138,91 @@ class AssemblerSmokeTest(unittest.TestCase):
         out = server.get_map(self.con)
         self.assertEqual(out["total_files"], 0)
 
+    def test_get_roadmap_includes_blockers_key(self) -> None:
+        # Every feature dict must carry a `blockers` list (empty when none),
+        # so the UI can read f.blockers unconditionally.
+        out = server.get_roadmap(self.con)
+        feats = [f for b in out["buckets"] for f in b["features"]]
+        self.assertTrue(all(isinstance(f.get("blockers"), list) for f in feats))
+
+
+class FeatureBlockerTest(unittest.TestCase):
+    """server.set_blockers — replace-set semantics + the validations that keep
+    the blocker graph a DAG (self, unknown id, cycle)."""
+
+    def setUp(self) -> None:
+        self.con = build_db()
+        # three features in real (sequencing) stages
+        self.A = self.con.execute(
+            "INSERT INTO roadmap (title, roadmap_status) VALUES ('A','in_progress')").lastrowid
+        self.B = self.con.execute(
+            "INSERT INTO roadmap (title, roadmap_status) VALUES ('B','next')").lastrowid
+        self.C = self.con.execute(
+            "INSERT INTO roadmap (title, roadmap_status) VALUES ('C','near_term')").lastrowid
+        self.con.commit()
+
+    def tearDown(self) -> None:
+        self.con.close()
+
+    def _blockers_of(self, fid):
+        out = server.get_roadmap(self.con)
+        feats = {f["feature_id"]: f for b in out["buckets"] for f in b["features"]}
+        return sorted(feats[fid]["blockers"])
+
+    def test_replace_set(self) -> None:
+        ok, err = server.set_blockers(self.con, self.B, [self.A])
+        self.assertTrue(ok, err)
+        self.assertEqual(self._blockers_of(self.B), [self.A])
+        # replace (not append): C then A,C
+        ok, _ = server.set_blockers(self.con, self.C, [self.A])
+        self.assertTrue(ok)
+        ok, _ = server.set_blockers(self.con, self.C, [self.A, self.B])
+        self.assertTrue(ok)
+        self.assertEqual(self._blockers_of(self.C), sorted([self.A, self.B]))
+        # empty list clears
+        ok, _ = server.set_blockers(self.con, self.C, [])
+        self.assertTrue(ok)
+        self.assertEqual(self._blockers_of(self.C), [])
+
+    def test_dedup(self) -> None:
+        ok, _ = server.set_blockers(self.con, self.C, [self.A, self.A, self.B])
+        self.assertTrue(ok)
+        self.assertEqual(self._blockers_of(self.C), sorted([self.A, self.B]))
+
+    def test_self_block_rejected(self) -> None:
+        ok, err = server.set_blockers(self.con, self.A, [self.A])
+        self.assertFalse(ok)
+        self.assertIn("itself", err)
+        self.assertEqual(self._blockers_of(self.A), [])
+
+    def test_unknown_id_rejected(self) -> None:
+        ok, err = server.set_blockers(self.con, self.A, [999999])
+        self.assertFalse(ok)
+        self.assertIn("no such feature", err)
+        self.assertEqual(self._blockers_of(self.A), [])
+
+    def test_missing_feature_rejected(self) -> None:
+        ok, err = server.set_blockers(self.con, 999999, [self.A])
+        self.assertFalse(ok)
+        self.assertEqual(err, "no such feature")
+
+    def test_cycle_rejected_and_no_write(self) -> None:
+        ok, _ = server.set_blockers(self.con, self.B, [self.A])   # B ← A
+        self.assertTrue(ok)
+        ok, err = server.set_blockers(self.con, self.A, [self.B])  # A ← B would cycle
+        self.assertFalse(ok)
+        self.assertIn("cycle", err)
+        # the rejected set wrote nothing; the original edge stands
+        self.assertEqual(self._blockers_of(self.A), [])
+        self.assertEqual(self._blockers_of(self.B), [self.A])
+
+    def test_transitive_cycle_rejected(self) -> None:
+        self.assertTrue(server.set_blockers(self.con, self.B, [self.A])[0])  # B ← A
+        self.assertTrue(server.set_blockers(self.con, self.C, [self.B])[0])  # C ← B
+        ok, err = server.set_blockers(self.con, self.A, [self.C])  # A ← C closes A→B→C→A
+        self.assertFalse(ok)
+        self.assertIn("cycle", err)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

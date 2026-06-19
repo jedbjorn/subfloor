@@ -31,6 +31,14 @@ function mdBlock(text) {
   return div;
 }
 
+// Mermaid powers the roadmap Flow view (the feature dependency graph). We build
+// the diagram string from the /roadmap payload and call mermaid.render()
+// ourselves, so auto-scan is off. Dark theme to match the GUI palette.
+mermaid.initialize({
+  startOnLoad: false, theme: "dark", securityLevel: "loose",
+  flowchart: { useMaxWidth: true, htmlLabels: true, rankSpacing: 55, nodeSpacing: 35 },
+});
+
 async function api(path, method = "GET", body) {
   const r = await fetch("/api" + path, {
     method, headers: body ? { "Content-Type": "application/json" } : {},
@@ -471,12 +479,46 @@ function skillRow(s, shells) {
 // Funnel order: idea inlet → most-active committed work → done.
 const STATUSES = ["brainstorm", "in_progress", "next", "near_term", "long_term", "shipped", "retired"];
 const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped", retired: "Retired" };
+// The five stages that sequence (carry dependency edges). brainstorm/retired are
+// excluded from the Flow graph and the blocker editor — they don't relate yet.
+const FLOW_STAGES = ["in_progress", "next", "near_term", "long_term", "shipped"];
 let roadmapFilter = null;            // null = show all (default); single-select
+let roadmapView = "board";           // "board" | "flow"
 const roadmapCollapsed = new Set();  // statuses whose section is collapsed
+
+// All features in the sequencing stages, flattened — the candidate pool for a
+// feature's "blocked by" picker and the node set of the Flow graph.
+function flowCandidates(buckets) {
+  const out = [];
+  for (const b of buckets) if (FLOW_STAGES.includes(b.status))
+    for (const f of b.features) out.push(f);
+  return out;
+}
+
+// Mermaid node labels live inside "...": escape the quote, collapse whitespace,
+// and cap length so a long title doesn't balloon the node.
+function mmLabel(t) {
+  let s = (t || "(untitled)").replace(/\s+/g, " ").trim();
+  if (s.length > 42) s = s.slice(0, 40) + "…";
+  return s.replace(/"/g, "#quot;");
+}
 
 async function renderRoadmap(root) {
   const { buckets } = await api("/roadmap");
   root.replaceChildren();
+
+  // Board ⇄ Flow toggle. Board = bucketed cards; Flow = the dependency graph.
+  const toggle = el("div", { className: "filters centered view-toggle" });
+  for (const [mode, label] of [["board", "Board"], ["flow", "Flow"]]) {
+    const b = el("button", { className: "chip" + (roadmapView === mode ? " on" : ""), textContent: label });
+    b.onclick = () => { roadmapView = mode; renderRoadmap(root); };
+    toggle.append(b);
+  }
+  root.append(toggle);
+
+  if (roadmapView === "flow") { await renderRoadmapFlow(root, buckets); return; }
+
+  const candidates = flowCandidates(buckets);
 
   // separated pill filters, centered; re-click the active one to clear → show all
   const bar = el("div", { className: "filters centered" });
@@ -501,12 +543,50 @@ async function renderRoadmap(root) {
       renderRoadmap(root);
     };
     sec.append(h);
-    for (const f of b.features) sec.append(featureCard(f));
+    for (const f of b.features) sec.append(featureCard(f, candidates));
     root.append(sec);
   }
 }
 
-function featureCard(f) {
+// Flow view: one subgraph per sequencing stage, one arrow per blocker edge
+// (blocker → blocked) where both endpoints are shown. Rendered via mermaid.
+async function renderRoadmapFlow(root, buckets) {
+  const feats = flowCandidates(buckets);
+  if (!feats.length) {
+    root.append(el("div", { className: "muted" }, "No features in the sequencing stages yet."));
+    return;
+  }
+  const stageOf = {};
+  for (const b of buckets) if (FLOW_STAGES.includes(b.status))
+    for (const f of b.features) stageOf[f.feature_id] = b.status;
+  const shownIds = new Set(feats.map((f) => f.feature_id));
+
+  const lines = ["flowchart LR"];
+  for (const s of FLOW_STAGES) {
+    const inStage = feats.filter((f) => stageOf[f.feature_id] === s);
+    if (!inStage.length) continue;
+    lines.push(`  subgraph S_${s}["${SLABEL[s]}"]`);
+    for (const f of inStage) lines.push(`    F${f.feature_id}["${mmLabel(f.title)}"]`);
+    lines.push("  end");
+  }
+  let edges = 0;
+  for (const f of feats) for (const b of (f.blockers || []))
+    if (shownIds.has(b)) { lines.push(`  F${b} --> F${f.feature_id}`); edges++; }
+
+  const container = el("div", { className: "flowchart" });
+  root.append(container);
+  try {
+    const { svg } = await mermaid.render("roadmapFlow", lines.join("\n"));
+    container.innerHTML = svg;
+  } catch (e) {
+    container.append(el("div", { className: "muted" }, "flow render failed: " + (e?.message || e)));
+  }
+  root.append(el("div", { className: "muted flow-hint" }, edges
+    ? "Arrows point blocker → blocked. Edit a feature's “blocked by” in Board view."
+    : "No blocking relationships yet — open a feature in Board view and set its “blocked by”."));
+}
+
+function featureCard(f, candidates = []) {
   // Expandable box: collapsed shows title + status/owner pills + a one-line
   // summary preview; expanded reveals the editable fields, docs, and blockers.
   const c = el("details", { className: "card feature" });
@@ -532,15 +612,43 @@ function featureCard(f) {
   const status = el("select", {});
   for (const s of STATUSES) status.append(el("option", { value: s, selected: s === f.roadmap_status, textContent: s }));
   const summary = el("textarea", { value: f.summary || "", rows: 7 });
+
+  // "blocked by" editor — a multi-select of OTHER sequencing-stage features.
+  // Only shown for the five real stages; brainstorm/retired don't relate yet.
+  const realStage = FLOW_STAGES.includes(f.roadmap_status);
+  let blockerSelect = null;
+  if (realStage) {
+    const others = candidates.filter((c) => c.feature_id !== f.feature_id);
+    if (others.length) {
+      blockerSelect = el("select", { multiple: true, className: "blocker-select",
+        size: Math.min(6, others.length) });
+      const cur = new Set(f.blockers || []);
+      for (const c of others) blockerSelect.append(el("option", {
+        value: String(c.feature_id), selected: cur.has(c.feature_id),
+        textContent: c.title || ("#" + c.feature_id) }));
+    }
+  }
+
   const save = el("button", { className: "act", textContent: "save feature" });
   save.onclick = async () => {
-    try { await api("/roadmap/" + f.feature_id, "PATCH", { title: title.value, roadmap_status: status.value, summary: summary.value }); setStatus("feature saved"); load("roadmap"); }
-    catch (e) { toast("error: " + e.message); }
+    try {
+      await api("/roadmap/" + f.feature_id, "PATCH",
+                { title: title.value, roadmap_status: status.value, summary: summary.value });
+      if (blockerSelect) {
+        const ids = [...blockerSelect.selectedOptions].map((o) => Number(o.value));
+        await api("/roadmap/" + f.feature_id + "/blockers", "PUT", { blocked_by: ids });
+      }
+      setStatus("feature saved"); load("roadmap");
+    } catch (e) { toast("error: " + e.message); }
   };
-  body.append(el("div", { className: "grid2" },
+  const gridKids = [
     el("span", { className: "k" }, "title"), title,
     el("span", { className: "k" }, "status"), status,
-    el("span", { className: "k" }, "summary"), summary), save);
+    el("span", { className: "k" }, "summary"), summary,
+  ];
+  if (blockerSelect) gridKids.push(
+    el("span", { className: "k" }, "blocked by"), blockerSelect);
+  body.append(el("div", { className: "grid2" }, ...gridKids), save);
 
   // tasks — the spec's implementation plan, in order; done = checked + struck
   if (tasks.length) {

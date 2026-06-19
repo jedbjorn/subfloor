@@ -476,3 +476,12 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .wt-cmd { display: inline-block; margin-top: .25rem; padding: .15rem .5rem;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
+
+/* Roadmap Flow view — the feature dependency graph (mermaid) + its editor */
+.view-toggle { margin-bottom: .6rem; }
+.blocker-select { min-height: 0; }
+.blocker-select option { padding: .15rem .2rem; }
+.flowchart { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 1rem; margin: .4rem 0; overflow-x: auto; }
+.flowchart svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.flow-hint { font-size: .82rem; text-align: center; margin-top: .4rem; }
