@@ -168,6 +168,23 @@ CREATE TABLE roadmap (
     updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ── Feature blockers (the roadmap's sequencing edges) ───────────────────────
+-- A directed many-to-many self-relation on roadmap. One row = one dependency:
+-- `feature_id` is blocked by `blocked_by` (blocked_by must land first). A feature
+-- may be blocked by many. The flowchart view renders these as arrows. Cycle
+-- prevention is app-level (server.py) so the graph stays a DAG; the table guards
+-- only against self-blocks and duplicates. Edges among brainstorm/retired
+-- features are simply not drawn (those stages don't sequence yet).
+
+CREATE TABLE feature_blockers (
+    feature_id  INTEGER NOT NULL REFERENCES roadmap(feature_id),
+    blocked_by  INTEGER NOT NULL REFERENCES roadmap(feature_id),
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (feature_id, blocked_by),
+    CHECK (feature_id <> blocked_by)
+);
+CREATE INDEX idx_feature_blockers_blocked_by ON feature_blockers(blocked_by);
+
 -- ── Documents (NEW — the content store) ─────────────────────────────────────
 -- DB owns the body, always. A feature accumulates MULTIPLE specs over its life:
 -- each stage's spec freezes on ship (frozen=1, immutable), the feature lives on,

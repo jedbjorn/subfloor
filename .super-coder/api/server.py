@@ -55,6 +55,8 @@ _STATIC = {
     # local copies so the no-build UI renders sanitized GFM without a CDN.
     "/vendor/marked.umd.js": ("vendor/marked.umd.js", "application/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "application/javascript; charset=utf-8"),
+    # mermaid (MIT) — draws the roadmap Flow view (feature dependency graph).
+    "/vendor/mermaid.min.js": ("vendor/mermaid.min.js", "application/javascript; charset=utf-8"),
 }
 
 # md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`
@@ -199,10 +201,17 @@ def get_roadmap(con) -> dict:
             "SELECT task_id, feature_id, document_id, seq, title, status "
             "FROM spec_tasks ORDER BY feature_id, document_id, seq")):
         tasks_by.setdefault(t["feature_id"], []).append(t)
+    # Blocking edges: feature_id is blocked by each blocked_by. The Flow view
+    # draws these as arrows; the feature card's "blocked by" editor sets them.
+    blockers_by: dict[int, list] = {}
+    for e in rows(con.execute(
+            "SELECT feature_id, blocked_by FROM feature_blockers")):
+        blockers_by.setdefault(e["feature_id"], []).append(e["blocked_by"])
     for f in feats:
         f["documents"] = docs_by.get(f["feature_id"], [])
         f["open_flags"] = flags_by.get(f["feature_id"], [])
         f["tasks"] = tasks_by.get(f["feature_id"], [])
+        f["blockers"] = blockers_by.get(f["feature_id"], [])
     buckets = [{"status": s, "label": _LABEL[s],
                 "features": [f for f in feats if f["roadmap_status"] == s]}
                for s in _ORDER]
@@ -273,6 +282,58 @@ def patch_columns(con, table, pk_col, pk, body, allowed):
     sets = ", ".join(f"{k}=?" for k in fields)
     con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
                 (*fields.values(), pk))
+    con.commit()
+    return True, None
+
+
+def _reaches_via_blockers(adj, start, target) -> bool:
+    """Can `target` be reached from `start` by following blocked_by edges? Used
+    to keep the blocker graph acyclic: if a candidate blocker already depends
+    (transitively) on the feature, adding the edge would close a cycle."""
+    seen, stack = set(), [start]
+    while stack:
+        n = stack.pop()
+        if n == target:
+            return True
+        if n in seen:
+            continue
+        seen.add(n)
+        stack.extend(adj.get(n, ()))
+    return False
+
+
+def set_blockers(con, feature_id, blocked_by):
+    """Replace feature_id's entire blocker set (idempotent). Validates that every
+    id exists, none is the feature itself, and no edge closes a cycle (app-level,
+    since SQLite can't express it). Returns (ok, error)."""
+    if con.execute("SELECT 1 FROM roadmap WHERE feature_id=?",
+                   (feature_id,)).fetchone() is None:
+        return False, "no such feature"
+    try:
+        ids = list(dict.fromkeys(int(b) for b in (blocked_by or [])))
+    except (TypeError, ValueError):
+        return False, "blocked_by must be a list of feature ids"
+    if feature_id in ids:
+        return False, "a feature cannot block itself"
+    for b in ids:
+        if con.execute("SELECT 1 FROM roadmap WHERE feature_id=?",
+                       (b,)).fetchone() is None:
+            return False, f"no such feature: {b}"
+    # Cycle guard: rebuild adjacency WITHOUT feature_id's own edges (they're being
+    # replaced), then reject any new blocker that can already reach feature_id.
+    adj: dict[int, list] = {}
+    for e in rows(con.execute(
+            "SELECT feature_id, blocked_by FROM feature_blockers "
+            "WHERE feature_id<>?", (feature_id,))):
+        adj.setdefault(e["feature_id"], []).append(e["blocked_by"])
+    for b in ids:
+        if _reaches_via_blockers(adj, b, feature_id):
+            return False, (f"that would create a cycle — feature {b} already "
+                           f"depends on feature {feature_id}")
+    con.execute("DELETE FROM feature_blockers WHERE feature_id=?", (feature_id,))
+    con.executemany(
+        "INSERT INTO feature_blockers (feature_id, blocked_by) VALUES (?, ?)",
+        [(feature_id, b) for b in ids])
     con.commit()
     return True, None
 
@@ -782,6 +843,12 @@ class Handler(BaseHTTPRequestHandler):
                 if vm is not None and not isinstance(vm, dict):
                     return self._send(400, {"error": "vm must be an object"})
                 return self._send(200, {"ok": True, "vm": vm_mod.write(vm)})
+            # PUT /api/roadmap/{id}/blockers  {blocked_by: [ids]} — replace the
+            # feature's blocker set (empty list clears it).
+            if len(parts) == 4 and parts[1] == "roadmap" and parts[3] == "blockers":
+                ok, err = set_blockers(con, int(parts[2]),
+                                       self._body().get("blocked_by"))
+                return self._send(200 if ok else 400, {"ok": ok, "error": err})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)

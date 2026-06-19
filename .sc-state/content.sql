@@ -1454,6 +1454,8 @@ INSERT INTO flags (flag_id, display_name, priority, description, created_date, r
 
 DELETE FROM spec_tasks;
 
+DELETE FROM feature_blockers;
+
 DELETE FROM projects;
 INSERT INTO projects (project_id, shortname, title, purpose, standing, status, is_deleted, created_at) VALUES (1, 'super-coder', 'super-coder', 'Forkable shell substrate for a single repo — DB-backed identity, memory, roadmap, content; harness-agnostic boot.', NULL, 'active', 0, '2026-06-04 10:30:53');
 
