@@ -29,8 +29,10 @@ Run from the repo root, like every engine command:
     ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--shell …]
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID] [--shell …]
     ./sc mem flag close <flag_id>    [--notes "…"]
-    ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--shell …]
+    ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>] [--shell …]
     ./sc mem roadmap status <feature_id> <status>
+    ./sc mem roadmap project <feature_id> <shortname|id|none>   # set/clear the feature's work-stream
+    ./sc mem roadmap depends <feature_id> [--on <id> …]         # set dependencies (replaces; omit --on to clear)
     ./sc mem project add <shortname> "<title>" [--purpose …] [--standing …] [--status active] [--role …]
     ./sc mem project standing <shortname|id> "<text>"
     ./sc mem project status <shortname|id> active|inactive|paused
@@ -309,16 +311,79 @@ def cmd_roadmap(args) -> int:
                         "WHERE feature_id=?", (args.status, args.feature_id))
             con.commit()
             return finish(args, f"mem: feature #{args.feature_id} ('{r['title']}') → {args.status}")
+        if args.roadmap_cmd == "project":
+            # assign / clear the feature's work-stream (the Flow view groups on it)
+            feat = _resolve_feature(con, args.feature_id)
+            if str(args.project).lower() in ("none", "-", ""):
+                con.execute("UPDATE roadmap SET project_id=NULL, updated_at=datetime('now') "
+                            "WHERE feature_id=?", (args.feature_id,))
+                con.commit()
+                return finish(args, f"mem: feature #{args.feature_id} ('{feat['title']}') "
+                                    f"→ unassigned (no work-stream)")
+            proj = _resolve_project(con, args.project)
+            con.execute("UPDATE roadmap SET project_id=?, updated_at=datetime('now') "
+                        "WHERE feature_id=?", (proj["project_id"], args.feature_id))
+            con.commit()
+            return finish(args, f"mem: feature #{args.feature_id} ('{feat['title']}') "
+                                f"→ work-stream '{proj['shortname']}'")
+        if args.roadmap_cmd == "depends":
+            # replace the feature's dependency set (feature_blockers): each --on is a
+            # prerequisite that must land first. Validate before mutating; refuse cycles.
+            feat = _resolve_feature(con, args.feature_id)
+            ons: list[int] = []
+            for x in (args.on or []):
+                if x == args.feature_id:
+                    die("a feature can't depend on itself")
+                _resolve_feature(con, x)
+                if x in ons:
+                    continue
+                if args.feature_id in _depends_on(con, x):
+                    die(f"refusing: #{x} already depends on #{args.feature_id} — "
+                        f"this edge would create a cycle")
+                ons.append(x)
+            con.execute("DELETE FROM feature_blockers WHERE feature_id=?", (args.feature_id,))
+            for dep in ons:
+                con.execute("INSERT INTO feature_blockers (feature_id, blocked_by) "
+                            "VALUES (?, ?)", (args.feature_id, dep))
+            con.commit()
+            desc = ", ".join(f"#{d}" for d in ons) if ons else "— (cleared)"
+            return finish(args, f"mem: feature #{args.feature_id} ('{feat['title']}') "
+                                f"depends on {desc}")
         # add
         sid = resolve_shell(con, args.shell)
+        pid = _resolve_project(con, args.project)["project_id"] if args.project else None
         cur = con.execute(
-            "INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary) "
-            "VALUES (?, ?, 0, ?, ?)", (args.title, args.status, sid, args.summary))
+            "INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary, project_id) "
+            "VALUES (?, ?, 0, ?, ?, ?)", (args.title, args.status, sid, args.summary, pid))
         con.commit()
         fid = cur.lastrowid
     finally:
         con.close()
     return finish(args, f"mem: roadmap feature #{fid} added ('{args.title}', {args.status})")
+
+
+def _resolve_feature(con, fid: int) -> sqlite3.Row:
+    r = con.execute("SELECT feature_id, title FROM roadmap WHERE feature_id=?",
+                    (fid,)).fetchone()
+    if r is None:
+        die(f"no roadmap feature #{fid}")
+    return r
+
+
+def _depends_on(con, start: int) -> set:
+    """Features `start` (transitively) depends on, walking blocked_by edges. Used
+    to keep the dependency graph acyclic: an edge (F depends on D) closes a cycle
+    iff F is already in D's dependency set."""
+    seen, stack = set(), [start]
+    while stack:
+        n = stack.pop()
+        for row in con.execute(
+                "SELECT blocked_by FROM feature_blockers WHERE feature_id=?", (n,)):
+            b = row["blocked_by"]
+            if b not in seen:
+                seen.add(b)
+                stack.append(b)
+    return seen
 
 
 def _resolve_project(con, spec: str) -> sqlite3.Row:
@@ -557,13 +622,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     ROADMAP_STATUSES = ["brainstorm", "in_progress", "next", "near_term",
                         "long_term", "shipped", "retired"]
-    sp = sub.add_parser("roadmap", help="add a feature or move its status")
+    sp = sub.add_parser("roadmap", help="add a feature, move its status, set its work-stream or dependencies")
     rsub = sp.add_subparsers(dest="roadmap_cmd", required=True)
     ra = rsub.add_parser("add", parents=[common]); ra.add_argument("title")
     ra.add_argument("--status", default="brainstorm", choices=ROADMAP_STATUSES)
     ra.add_argument("--summary")
+    ra.add_argument("--project", help="assign to a work-stream (projects shortname|id)")
     rt = rsub.add_parser("status", parents=[common])
     rt.add_argument("feature_id", type=int); rt.add_argument("status", choices=ROADMAP_STATUSES)
+    rp = rsub.add_parser("project", parents=[common], help="set/clear a feature's work-stream")
+    rp.add_argument("feature_id", type=int)
+    rp.add_argument("project", help="work-stream shortname|id, or 'none' to clear")
+    rd = rsub.add_parser("depends", parents=[common], help="set a feature's dependencies (replaces the set)")
+    rd.add_argument("feature_id", type=int)
+    rd.add_argument("--on", type=int, action="append", metavar="FEATURE_ID",
+                    help="a prerequisite that must land first (repeatable); omit all to clear")
     sp.set_defaults(fn=cmd_roadmap)
 
     sp = sub.add_parser("project", help="add a project or update its standing/status")
