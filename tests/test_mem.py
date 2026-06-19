@@ -146,6 +146,30 @@ class MemTest(unittest.TestCase):
                                      (did,)).fetchone()[0], 1)
         con.close()
 
+    def test_doc_edit_unfrozen_then_refuse_frozen(self):
+        spec = self.tmp / "spec.md"
+        spec.write_text("# Spec\nv1\n")
+        self._run("doc", "add", "Editable", "--body-file", str(spec), "--kind", "spec")
+        con = sqlite3.connect(self.db)
+        did = con.execute("SELECT document_id FROM documents WHERE title='Editable'").fetchone()[0]
+        con.close()
+        # edit title + body while unfrozen
+        spec.write_text("# Spec\nv2\n")
+        self._run("doc", "edit", str(did), "--title", "Renamed", "--body-file", str(spec))
+        con = sqlite3.connect(self.db)
+        title, body = con.execute("SELECT title, body FROM documents WHERE document_id=?",
+                                  (did,)).fetchone()
+        con.close()
+        self.assertEqual(title, "Renamed")
+        self.assertEqual(body, "# Spec\nv2\n")
+        # no fields → error
+        with self.assertRaises(SystemExit):
+            self._run("doc", "edit", str(did))
+        # freeze, then editing is refused
+        self._run("doc", "freeze", str(did))
+        with self.assertRaises(SystemExit):
+            self._run("doc", "edit", str(did), "--title", "Nope")
+
     def test_message_send_check_mark_read(self):
         # second shell to send to
         con = sqlite3.connect(self.db)
