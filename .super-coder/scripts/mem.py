@@ -40,6 +40,7 @@ Run from the repo root, like every engine command:
     ./sc mem task start <task_id>    ./sc mem task done <task_id>
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
+    ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
     ./sc mem doc freeze <document_id>
     ./sc mem narrative "<line>"      [--shell …]
     ./sc mem message check [N]       [--shell …]      # your unread inbox (read-only)
@@ -477,6 +478,8 @@ def cmd_oriented(args) -> int:
 def cmd_doc(args) -> int:
     if args.doc_cmd == "freeze":
         return _doc_freeze(args)
+    if args.doc_cmd == "edit":
+        return _doc_edit(args)
     body = Path(args.body_file).read_text()
     con = connect(Path(args.db))
     try:
@@ -513,6 +516,35 @@ def _doc_freeze(args) -> int:
     finally:
         con.close()
     return finish(args, f"mem: document #{args.document_id} frozen")
+
+
+def _doc_edit(args) -> int:
+    sets, vals, what = [], [], []
+    if args.title is not None:
+        sets.append("title=?"); vals.append(args.title); what.append("title")
+    if args.body_file is not None:
+        body = Path(args.body_file).read_text()
+        sets.append("body=?"); vals.append(body); what.append(f"body ({len(body)} chars)")
+    if args.render_path is not None:
+        sets.append("render_path=?"); vals.append(args.render_path); what.append("render_path")
+    if not sets:
+        die("nothing to edit — pass at least one of --title / --body-file / --render-path")
+    con = connect(Path(args.db))
+    try:
+        r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
+                        (args.document_id,)).fetchone()
+        if r is None:
+            die(f"no document #{args.document_id}")
+        if r["frozen"]:
+            die(f"document #{args.document_id} is frozen — open a new spec under the "
+                "same feature instead of editing a frozen one")
+        sets.append("updated_at=datetime('now')")
+        con.execute(f"UPDATE documents SET {', '.join(sets)} WHERE document_id=?",
+                    (*vals, args.document_id))
+        con.commit()
+    finally:
+        con.close()
+    return finish(args, f"mem: document #{args.document_id} edited ({', '.join(what)})")
 
 
 def cmd_message(args) -> int:
@@ -661,12 +693,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("oriented", parents=[common],
                    help="mark this shell oriented (bootstrapped=1)").set_defaults(fn=cmd_oriented)
 
-    sp = sub.add_parser("doc", help="add or freeze a spec/doc document")
+    sp = sub.add_parser("doc", help="add, edit, or freeze a spec/doc document")
     dsub = sp.add_subparsers(dest="doc_cmd", required=True)
     da = dsub.add_parser("add", parents=[common]); da.add_argument("title")
     da.add_argument("--body-file", required=True, dest="body_file")
     da.add_argument("--feature", type=int); da.add_argument("--kind", default="spec", choices=["spec", "doc"])
     da.add_argument("--seq", type=int); da.add_argument("--render-path", dest="render_path")
+    de = dsub.add_parser("edit", parents=[common],
+                         help="revise an unfrozen doc's title/body/render-path"); de.add_argument("document_id", type=int)
+    de.add_argument("--title"); de.add_argument("--body-file", dest="body_file")
+    de.add_argument("--render-path", dest="render_path")
     df = dsub.add_parser("freeze", parents=[common]); df.add_argument("document_id", type=int)
     sp.set_defaults(fn=cmd_doc)
 

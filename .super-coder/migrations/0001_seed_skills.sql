@@ -782,6 +782,16 @@ within `(feature, kind)`, and it renders + snapshots for you:
 ./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
+## Revise before freeze
+
+While a doc is still unfrozen, revise it in place — no new row, no seq bump.
+Pass any of `--title` / `--body-file` / `--render-path`; it renders + snapshots
+like `add`. Refused once frozen (open a new spec instead — see below):
+```
+./sc mem doc edit <document_id> --body-file ./draft.md
+./sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
+```
+
 ## Freeze on ship
 
 Freeze only at ship — it records what we built to, immutable thereafter. The
