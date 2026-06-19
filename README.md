@@ -760,16 +760,39 @@ refers to:
 |---|---|
 | **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
 | **Skills** | The skill catalogue (Repo · Substrate · Craft), with per-shell grant toggles and full content in a modal. |
-| **Roadmap** | Features in funnel buckets (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. |
+| **Roadmap** | Features in a planning funnel (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. Two views — a **Board** for editing a feature inline, and a **Flow** that groups features by work-stream and wires their blocker dependencies (see below). |
 | **Docs** | Read-only `kind='doc'` documents; opens in md-converter for reading. |
 | **Flags** | The blocker / follow-up tracker, grouped by feature, filterable Open/Resolved/All. |
 | **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
 | **Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
-![Review GUI, Roadmap tab — features in funnel buckets, each expanded to its spec tasks, linked docs, and flag blockers](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-tab.png)
+![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-tab.png)
 
 ![Review GUI, Worktrees tab — live git-hygiene report: dirty worktrees, each branch ahead/behind its base, and prunable merged branches](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/worktrees-tab.png)
+
+### Roadmap views — Board & Flow
+
+The Roadmap tab renders the same feature rows two ways, toggled top-centre:
+
+- **Board** — the planning funnel. Features sit in status columns (Brainstorm →
+  In Progress → Next → Near Term → Long Term → Shipped, plus a Retired filter),
+  and clicking one expands its inline editor — title, status, summary, and the
+  spec-task checklist (the screenshot above).
+- **Flow** — a left-to-right read of *what's committed and in what order*.
+  Features are grouped into **work-streams** (a `projects` row doubles as a
+  work-stream; `roadmap.project_id` is the link, NULL = Ungrouped), and the
+  **blocker edges** between them (`feature_blockers`) draw as wires — a
+  prerequisite must land before what it blocks. The graph is kept acyclic, so it
+  reads cleanly stage by stage.
+
+![Review GUI, Roadmap tab — Flow view: features grouped by work-stream across the planning stages, with blocker dependencies wired between cards](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-flow.png)
+
+> [!class2]
+> **Drive it from the shell, too.** `./sc mem roadmap project <feature_id> <work-stream>`
+> assigns a feature's work-stream and `./sc mem roadmap depends <feature_id> --on <id>`
+> sets its blocker edges (cycles refused) — the Flow view is the same data the
+> CLI and the `db_map` skill write.
 
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it;
