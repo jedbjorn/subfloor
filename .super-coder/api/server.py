@@ -55,8 +55,6 @@ _STATIC = {
     # local copies so the no-build UI renders sanitized GFM without a CDN.
     "/vendor/marked.umd.js": ("vendor/marked.umd.js", "application/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "application/javascript; charset=utf-8"),
-    # mermaid (MIT) — draws the roadmap Flow view (feature dependency graph).
-    "/vendor/mermaid.min.js": ("vendor/mermaid.min.js", "application/javascript; charset=utf-8"),
 }
 
 # md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`
@@ -76,7 +74,7 @@ def mdc_url(markdown: str) -> str:
 # deliberately ABSENT — the law says the shell curates them, so there is no door.
 SHELL_EDITABLE = {"current_state"}  # workspace + connections both retired (B5) → current_state is the one writable surface; "where things live" is the derived dr_* map
 FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "priority"}
-ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order"}
+ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
 
 def db() -> sqlite3.Connection:
@@ -176,8 +174,11 @@ _LABEL = {"brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Nex
 def get_roadmap(con) -> dict:
     feats = rows(con.execute(
         "SELECT r.feature_id, r.title, r.roadmap_status, r.sort_order, r.summary, "
-        "s.shortname AS owner FROM roadmap r LEFT JOIN shells s "
-        "ON s.shell_id=r.owning_shell ORDER BY r.sort_order, r.feature_id"))
+        "r.project_id, p.title AS project_title, "
+        "s.shortname AS owner FROM roadmap r "
+        "LEFT JOIN shells s ON s.shell_id=r.owning_shell "
+        "LEFT JOIN projects p ON p.project_id=r.project_id "
+        "ORDER BY r.sort_order, r.feature_id"))
     # Roadmap tracks the development cycle = the SPECS, with each feature's DOCS
     # (kind='doc') listed underneath so specs and docs sit together. Docs are
     # read-only here (open-link only); the Docs tab is where they're edited.
@@ -215,7 +216,12 @@ def get_roadmap(con) -> dict:
     buckets = [{"status": s, "label": _LABEL[s],
                 "features": [f for f in feats if f["roadmap_status"] == s]}
                for s in _ORDER]
-    return {"buckets": [b for b in buckets if b["features"]]}
+    # Active work-streams, for the Board's per-project grouping + the feature
+    # card's project picker. Each feature already carries project_id/project_title.
+    projects = rows(con.execute(
+        "SELECT project_id, shortname, title FROM projects "
+        "WHERE COALESCE(is_deleted,0)=0 AND status='active' ORDER BY title"))
+    return {"buckets": [b for b in buckets if b["features"]], "projects": projects}
 
 
 def get_docs(con) -> dict:
@@ -360,6 +366,38 @@ def create_flag(con, body):
          body.get("shell_id")))
     con.commit()
     return cur.lastrowid, None
+
+
+def _slug(text: str) -> str:
+    """title → kebab shortname: keep alnum, fold spaces/_-/ to single dashes."""
+    out = []
+    for ch in (text or "").lower().strip():
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in " -_/":
+            out.append("-")
+    slug = "".join(out).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "project"
+
+
+def create_project(con, body):
+    """Create a work-stream (projects row) from a title. shortname is slugified
+    from the title, de-duped with a numeric suffix. Used by the roadmap Board's
+    inline '＋ new work-stream' so features can be grouped without leaving the UI."""
+    title = (body.get("title") or "").strip()
+    if not title:
+        return None, "title required"
+    base = _slug(title)
+    shortname, n = base, 2
+    while con.execute("SELECT 1 FROM projects WHERE shortname=?",
+                      (shortname,)).fetchone():
+        shortname, n = f"{base}-{n}", n + 1
+    cur = con.execute("INSERT INTO projects (shortname, title) VALUES (?, ?)",
+                      (shortname, title))
+    con.commit()
+    return {"project_id": cur.lastrowid, "shortname": shortname, "title": title}, None
 
 
 def set_grant(con, sid, skill_id, granted):
@@ -741,6 +779,10 @@ class Handler(BaseHTTPRequestHandler):
                 fid, err = create_flag(con, self._body())
                 return self._send(400 if err else 201,
                                   {"error": err} if err else {"flag_id": fid})
+            if path == "/api/projects":
+                proj, err = create_project(con, self._body())
+                return self._send(400 if err else 201,
+                                  {"error": err} if err else proj)
             if path == "/api/shells":
                 body = self._body()
                 if not body.get("name") or not body.get("flavor"):

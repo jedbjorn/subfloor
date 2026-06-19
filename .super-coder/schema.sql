@@ -166,6 +166,11 @@ CREATE TABLE roadmap (
     summary        TEXT,
     created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+    -- project_id INTEGER REFERENCES projects(project_id) — work-stream this
+    -- feature belongs to (NULL = unassigned), added by migration 0018. Kept out
+    -- of this baseline CREATE on purpose: ADD COLUMN can't be IF NOT EXISTS and
+    -- rebuild applies migrations after schema.sql, so inlining it would
+    -- double-define the column. See migrations/0018_roadmap_project.sql.
 );
 
 -- ── Feature blockers (the roadmap's sequencing edges) ───────────────────────
