@@ -476,7 +476,8 @@ const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Ne
 const FLOW_STAGES = ["in_progress", "next", "near_term", "long_term", "shipped"];
 let roadmapFilter = null;            // null = show all (default); single-select
 let roadmapView = "board";           // "board" | "flow"
-const roadmapCollapsed = new Set();  // statuses whose section is collapsed
+const roadmapCollapsed = new Set();  // statuses whose section is collapsed (global, across boards)
+const projectCollapsed = new Set();  // project-board keys (project_id | null) collapsed
 
 // All features in the sequencing stages, flattened — the candidate pool for a
 // feature's "blocked by" picker and the node set of the Flow graph.
@@ -488,7 +489,7 @@ function flowCandidates(buckets) {
 }
 
 async function renderRoadmap(root) {
-  const { buckets } = await api("/roadmap");
+  const { buckets, projects = [] } = await api("/roadmap");
   root.replaceChildren();
 
   // Board ⇄ Flow toggle. Board = bucketed cards; Flow = the dependency graph.
@@ -516,19 +517,52 @@ async function renderRoadmap(root) {
   }
   root.append(bar);
 
-  // buckets arrive linear from the API; filter to the single selected status
+  // buckets arrive linear from the API; filter to the single selected status,
+  // then flatten to features and group into one board per project (work-stream).
   const shown = roadmapFilter ? buckets.filter((b) => b.status === roadmapFilter) : buckets;
-  if (!shown.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage.")); return; }
-  for (const b of shown) {
-    const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(b.status) ? " collapsed" : "") });
-    const h = el("h2", {}, b.label);
-    h.onclick = () => {
-      roadmapCollapsed.has(b.status) ? roadmapCollapsed.delete(b.status) : roadmapCollapsed.add(b.status);
+  const flat = shown.flatMap((b) => b.features);
+  if (!flat.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage.")); return; }
+
+  // Group features by project_id (null = unassigned).
+  const byProject = new Map();   // key (project_id | null) → { title, features }
+  for (const f of flat) {
+    const key = f.project_id ?? null;
+    if (!byProject.has(key)) byProject.set(key, { title: f.project_title || null, features: [] });
+    byProject.get(key).features.push(f);
+  }
+  // Board order: projects in payload order (sorted by title) first, any leftover
+  // project keys next, then the Unassigned board last.
+  const order = projects.map((p) => p.project_id).filter((id) => byProject.has(id));
+  for (const key of byProject.keys())
+    if (key !== null && !order.includes(key)) order.push(key);
+  if (byProject.has(null)) order.push(null);
+
+  for (const key of order) {
+    const grp = byProject.get(key);
+    const title = key === null ? "Unassigned" : (grp.title || ("project #" + key));
+    const board = el("div", { className: "project-board" + (projectCollapsed.has(key) ? " collapsed" : "") });
+    const bh = el("h2", { className: "project-board-head" }, title);
+    bh.append(el("span", { className: "count" }, String(grp.features.length)));
+    bh.onclick = () => {
+      projectCollapsed.has(key) ? projectCollapsed.delete(key) : projectCollapsed.add(key);
       renderRoadmap(root);
     };
-    sec.append(h);
-    for (const f of b.features) sec.append(featureCard(f, candidates));
-    root.append(sec);
+    board.append(bh);
+    // status sub-sections within the board, in funnel order; collapse is global per status
+    for (const s of STATUSES) {
+      const inStatus = grp.features.filter((f) => f.roadmap_status === s);
+      if (!inStatus.length) continue;
+      const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(s) ? " collapsed" : "") });
+      const h = el("h2", {}, SLABEL[s]);
+      h.onclick = () => {
+        roadmapCollapsed.has(s) ? roadmapCollapsed.delete(s) : roadmapCollapsed.add(s);
+        renderRoadmap(root);
+      };
+      sec.append(h);
+      for (const f of inStatus) sec.append(featureCard(f, candidates, projects));
+      board.append(sec);
+    }
+    root.append(board);
   }
 }
 
@@ -650,7 +684,7 @@ async function renderRoadmapFlow(root, buckets) {
     : "No blocking relationships yet — open a feature in Board view and set its “blocked by”."));
 }
 
-function featureCard(f, candidates = []) {
+function featureCard(f, candidates = [], projects = []) {
   // Expandable box: collapsed shows title + status/owner pills + a one-line
   // summary preview; expanded reveals the editable fields, docs, and blockers.
   const c = el("details", { className: "card feature" });
@@ -677,6 +711,30 @@ function featureCard(f, candidates = []) {
   for (const s of STATUSES) status.append(el("option", { value: s, selected: s === f.roadmap_status, textContent: s }));
   const summary = el("textarea", { value: f.summary || "", rows: 7 });
 
+  // project (work-stream) picker — drives the Board's grouping. Options: none,
+  // each active work-stream, then "＋ new…" which creates one inline (POST) and
+  // selects it without a reload, so unsaved title/summary edits survive.
+  const project = el("select", { className: "project-select" });
+  const NEW = "__new__";
+  project.append(el("option", { value: "", selected: !f.project_id, textContent: "— none —" }));
+  for (const p of projects) project.append(el("option", {
+    value: String(p.project_id), selected: p.project_id === f.project_id, textContent: p.title }));
+  const newOpt = el("option", { value: NEW, textContent: "＋ new work-stream…" });
+  project.append(newOpt);
+  let prevProject = project.value;
+  project.onchange = async () => {
+    if (project.value !== NEW) { prevProject = project.value; return; }
+    const title = (prompt("New work-stream name:") || "").trim();
+    if (!title) { project.value = prevProject; return; }
+    try {
+      const p = await api("/projects", "POST", { title });
+      const opt = el("option", { value: String(p.project_id), textContent: p.title });
+      project.insertBefore(opt, newOpt);
+      project.value = String(p.project_id);
+      prevProject = project.value;
+    } catch (e) { project.value = prevProject; toast("error: " + e.message); }
+  };
+
   // "blocked by" editor — a multi-select of OTHER sequencing-stage features.
   // Only shown for the five real stages; brainstorm/retired don't relate yet.
   const realStage = FLOW_STAGES.includes(f.roadmap_status);
@@ -697,7 +755,8 @@ function featureCard(f, candidates = []) {
   save.onclick = async () => {
     try {
       await api("/roadmap/" + f.feature_id, "PATCH",
-                { title: title.value, roadmap_status: status.value, summary: summary.value });
+                { title: title.value, roadmap_status: status.value, summary: summary.value,
+                  project_id: project.value && project.value !== NEW ? Number(project.value) : null });
       if (blockerSelect) {
         const ids = [...blockerSelect.selectedOptions].map((o) => Number(o.value));
         await api("/roadmap/" + f.feature_id + "/blockers", "PUT", { blocked_by: ids });
@@ -708,6 +767,7 @@ function featureCard(f, candidates = []) {
   const gridKids = [
     el("span", { className: "k" }, "title"), title,
     el("span", { className: "k" }, "status"), status,
+    el("span", { className: "k" }, "project"), project,
     el("span", { className: "k" }, "summary"), summary,
   ];
   if (blockerSelect) gridKids.push(
