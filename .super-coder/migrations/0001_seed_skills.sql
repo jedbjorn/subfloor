@@ -773,7 +773,8 @@ sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- 
 
 Write through `./sc mem doc add` — it guards the engine DB, `--body-file` reads
 the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
-within `(feature, kind)`, and it renders + snapshots for you:
+within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
+pipeline this rides on is the `snapshot` skill):
 ```
 # a doc against a feature (kind=''doc''); DB owns the body:
 ./sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
@@ -1409,9 +1410,12 @@ The correct path: **file → seed → grant → snapshot → commit**.
    content.sql on rebuild. Without this step the skill is lost on next update.
 
 5. **Commit.**
-   Stage `.sc-state/content.sql` and `skills_sc/`. The asset file and
-   `0001_seed_skills.sql` are transient for local skills — don''t rely on them
-   across updates.
+   Run `./sc render-check` first — it rebuilds hermetically and fails if the
+   `skills_sc/` mirror drifts from the DB render (the same CI guard; see the
+   `snapshot` skill). Then stage `.sc-state/content.sql` and `skills_sc/`
+   together — the snapshot without the re-rendered mirror is the drift. The asset
+   file and `0001_seed_skills.sql` are transient for local skills — don''t rely on
+   them across updates.
 
 ## Assigning an existing skill to additional shells
 
@@ -1683,6 +1687,13 @@ and require no action from you.
    ./sc snapshot
    ```
    Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
+   - **Content-seed migration?** If the migration seeds *system content* that
+     renders (skills, flavor defaults), it also changes the flat `_sc` mirrors —
+     but only once the new rows are in the DB. After `./sc update --no-fetch`,
+     run `./sc render && ./sc render-check` and commit the re-rendered `_sc`
+     files alongside the migration. A render against a DB that predates the seed
+     passes locally while CI''s hermetic rebuild goes red. See the `snapshot`
+     skill (stale-mirror trap).
 
 ## What makes a good migration
 
@@ -1877,6 +1888,13 @@ carry across.
    Headless boot proof — confirm your shells, memory, and granted skills are
    intact and the schema is current. If a count looks wrong, **roll back**:
    `./sc rollback` (see below).
+   - **Then `./sc render && ./sc render-check`.** `./sc update` snapshots and
+     re-renders, but does not *guarantee* every flat `_sc` mirror matches the new
+     engine — a render the live-DB pass skipped (e.g. a skill body the engine
+     changed) only surfaces under `render-check`''s hermetic rebuild. Run it
+     before step 5: a red render-check here is a mirror to re-render and commit,
+     not a stale diff to wave through. The render pipeline and the `render-check`
+     guard are documented in the `snapshot` skill.
 
 4. **Record the crossing.** Append a narrative entry. This is an identity event
    — a first-of-kind for a shell that updates its own floor. Note what changed
@@ -1973,6 +1991,13 @@ shell is *granted* a skill is per-instance (snapshot).
 3. **Verify the rebuild reproduces:** `./sc rebuild && ./sc verify`. The DB
    should rebuild from text alone, byte-for-byte.
 
+   **Before committing any `_sc` render, run `./sc render-check`.** It rebuilds
+   the DB hermetically (from text) and fails if the committed flat mirror drifts
+   from that render — the CI guard, reproduced locally. A plain `./sc render`
+   renders from your *live* DB, which can lag the source you just edited (see the
+   skill-catalogue trap below); `render-check`''s rebuild-first is what catches
+   the stale mirror your live-DB render silently passed.
+
 4. **Publish** the text — don''t hand-commit it. `./sc snapshot`/`render` write
    `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
    **main checkout root** (where the shared engine + DB live), not your worktree,
@@ -1990,11 +2015,33 @@ shell is *granted* a skill is per-instance (snapshot).
 - **Skill catalogue** (system, propagates): edit `assets/skills/<name>/SKILL.md`,
   then `./sc seed-skills` to regenerate the seed migration — **not** the
   snapshot. See `seed_skills.py`.
+  - **The stale-mirror trap:** `seed-skills` writes the new body into the
+    *migration*, but your **live DB still holds the old body** until you apply
+    it. So `./sc render` now renders the *stale* skill into `skills_sc/<name>.md`
+    and passes — while CI''s hermetic rebuild (new body) drifts and goes red.
+    Sequence is **`./sc seed-skills && ./sc rebuild && ./sc render`, then
+    `./sc render-check`** before committing. Commit the regenerated
+    `migrations/0001_seed_skills.sql` *and* the re-rendered `skills_sc/` mirror
+    together — the migration without the mirror is the drift.
 
 > Steps 1–3 are durability — serialize so a `./sc rebuild` can''t lose your work.
 > Step 4 is the GUI **Publish** button: it runs snapshot → render → commit →
 > push → PR on the `sc_gui_content` branch, so you rarely commit this text by
-> hand. The serialization lives at the main checkout root, not a worktree.',
+> hand. The serialization lives at the main checkout root, not a worktree.
+
+## Related skills
+
+This skill owns the render/snapshot pipeline and the `render-check` guard; the
+skills that *feed* it link back here:
+
+- `self_update` — `./sc update` re-renders these same `_sc` files; its verify
+  step runs `render-check` (this skill) before committing the engine bump.
+- `local_skill_management` — fork-local skills persist via `./sc snapshot`; run
+  `render-check` before committing the `skills_sc/` mirror.
+- `migration_management` — a **content-seed** migration (skills, flavor
+  defaults) changes what renders; rebuild + render + `render-check` after.
+- `docs` / `spec` — document bodies live in the DB and render to `docs_sc/` /
+  `specs_sc/`; authored via `./sc mem doc`, serialized here.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

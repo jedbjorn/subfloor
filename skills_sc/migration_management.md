@@ -66,6 +66,13 @@ and require no action from you.
    ./sc snapshot
    ```
    Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
+   - **Content-seed migration?** If the migration seeds *system content* that
+     renders (skills, flavor defaults), it also changes the flat `_sc` mirrors —
+     but only once the new rows are in the DB. After `./sc update --no-fetch`,
+     run `./sc render && ./sc render-check` and commit the re-rendered `_sc`
+     files alongside the migration. A render against a DB that predates the seed
+     passes locally while CI's hermetic rebuild goes red. See the `snapshot`
+     skill (stale-mirror trap).
 
 ## What makes a good migration
 

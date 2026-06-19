@@ -46,6 +46,13 @@ shell is *granted* a skill is per-instance (snapshot).
 3. **Verify the rebuild reproduces:** `./sc rebuild && ./sc verify`. The DB
    should rebuild from text alone, byte-for-byte.
 
+   **Before committing any `_sc` render, run `./sc render-check`.** It rebuilds
+   the DB hermetically (from text) and fails if the committed flat mirror drifts
+   from that render — the CI guard, reproduced locally. A plain `./sc render`
+   renders from your *live* DB, which can lag the source you just edited (see the
+   skill-catalogue trap below); `render-check`'s rebuild-first is what catches
+   the stale mirror your live-DB render silently passed.
+
 4. **Publish** the text — don't hand-commit it. `./sc snapshot`/`render` write
    `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
    **main checkout root** (where the shared engine + DB live), not your worktree,
@@ -63,8 +70,30 @@ shell is *granted* a skill is per-instance (snapshot).
 - **Skill catalogue** (system, propagates): edit `assets/skills/<name>/SKILL.md`,
   then `./sc seed-skills` to regenerate the seed migration — **not** the
   snapshot. See `seed_skills.py`.
+  - **The stale-mirror trap:** `seed-skills` writes the new body into the
+    *migration*, but your **live DB still holds the old body** until you apply
+    it. So `./sc render` now renders the *stale* skill into `skills_sc/<name>.md`
+    and passes — while CI's hermetic rebuild (new body) drifts and goes red.
+    Sequence is **`./sc seed-skills && ./sc rebuild && ./sc render`, then
+    `./sc render-check`** before committing. Commit the regenerated
+    `migrations/0001_seed_skills.sql` *and* the re-rendered `skills_sc/` mirror
+    together — the migration without the mirror is the drift.
 
 > Steps 1–3 are durability — serialize so a `./sc rebuild` can't lose your work.
 > Step 4 is the GUI **Publish** button: it runs snapshot → render → commit →
 > push → PR on the `sc_gui_content` branch, so you rarely commit this text by
 > hand. The serialization lives at the main checkout root, not a worktree.
+
+## Related skills
+
+This skill owns the render/snapshot pipeline and the `render-check` guard; the
+skills that *feed* it link back here:
+
+- `self_update` — `./sc update` re-renders these same `_sc` files; its verify
+  step runs `render-check` (this skill) before committing the engine bump.
+- `local_skill_management` — fork-local skills persist via `./sc snapshot`; run
+  `render-check` before committing the `skills_sc/` mirror.
+- `migration_management` — a **content-seed** migration (skills, flavor
+  defaults) changes what renders; rebuild + render + `render-check` after.
+- `docs` / `spec` — document bodies live in the DB and render to `docs_sc/` /
+  `specs_sc/`; authored via `./sc mem doc`, serialized here.
