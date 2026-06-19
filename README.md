@@ -357,9 +357,9 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 | Flavor | Job | Codex | Claude | OpenCode (open-weights) |
 |---|---|---|---|---|
 | **planner** | architecture, plans | `gpt-5.5` | `sonnet` ★ | `deepseek-v4-pro` |
-| **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `glm-5.1` |
+| **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `glm-5.2` |
 | **dev** | write the code | `gpt-5.4-mini` ★ | `sonnet` | `qwen3-coder-next` |
-| **cartographer** | map the repo | `gpt-5.4-mini` ★ | `haiku` | `gpt-oss:20b` |
+| **cartographer** | map the repo | `gpt-5.4-mini` ★ | `haiku` | `qwen3-coder-next` |
 | **admin** | own the substrate, maintain `main` | `gpt-5.5` ★ | `sonnet` | `deepseek-v4-pro` |
 
 ★ = the harness the picker pre-selects for that flavor.
@@ -380,7 +380,7 @@ The logic, three rules:
 - **Three lineages, always.** Every flavor offers Codex (OpenAI), Claude
   (Anthropic), and OpenCode (open-weights via Ollama Cloud) — pick any provider for
   any role at launch. The OpenCode column is constrained to **MIT- or
-  Apache-licensed** weights only (e.g. DeepSeek V4, GLM-5.1, Qwen3-Coder, gpt-oss);
+  Apache-licensed** weights only (e.g. DeepSeek V4, GLM-5.2, Qwen3-Coder, gpt-oss);
   Modified-MIT / unresolved-license models (Kimi, MiniMax) are excluded even when
   available on the provider.
 - **Admin decisions carry real risk** (a wrong rollback is data loss), so the
