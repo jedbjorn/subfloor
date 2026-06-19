@@ -58,6 +58,13 @@ carry across.
    Headless boot proof — confirm your shells, memory, and granted skills are
    intact and the schema is current. If a count looks wrong, **roll back**:
    `./sc rollback` (see below).
+   - **Then `./sc render && ./sc render-check`.** `./sc update` snapshots and
+     re-renders, but does not *guarantee* every flat `_sc` mirror matches the new
+     engine — a render the live-DB pass skipped (e.g. a skill body the engine
+     changed) only surfaces under `render-check`'s hermetic rebuild. Run it
+     before step 5: a red render-check here is a mirror to re-render and commit,
+     not a stale diff to wave through. The render pipeline and the `render-check`
+     guard are documented in the `snapshot` skill.
 
 4. **Record the crossing.** Append a narrative entry. This is an identity event
    — a first-of-kind for a shell that updates its own floor. Note what changed

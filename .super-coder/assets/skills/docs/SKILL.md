@@ -53,7 +53,8 @@ sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role='doc';"  -- re
 
 Write through `./sc mem doc add` — it guards the engine DB, `--body-file` reads
 the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
-within `(feature, kind)`, and it renders + snapshots for you:
+within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
+pipeline this rides on is the `snapshot` skill):
 ```
 # a doc against a feature (kind='doc'); DB owns the body:
 ./sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md

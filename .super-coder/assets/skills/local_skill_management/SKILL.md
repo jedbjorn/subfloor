@@ -62,9 +62,12 @@ The correct path: **file → seed → grant → snapshot → commit**.
    content.sql on rebuild. Without this step the skill is lost on next update.
 
 5. **Commit.**
-   Stage `.sc-state/content.sql` and `skills_sc/`. The asset file and
-   `0001_seed_skills.sql` are transient for local skills — don't rely on them
-   across updates.
+   Run `./sc render-check` first — it rebuilds hermetically and fails if the
+   `skills_sc/` mirror drifts from the DB render (the same CI guard; see the
+   `snapshot` skill). Then stage `.sc-state/content.sql` and `skills_sc/`
+   together — the snapshot without the re-rendered mirror is the drift. The asset
+   file and `0001_seed_skills.sql` are transient for local skills — don't rely on
+   them across updates.
 
 ## Assigning an existing skill to additional shells
 
