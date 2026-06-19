@@ -8,10 +8,30 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 > Rendered from the DB. Status is a planning horizon; a feature's open flags are its blockers.
 
-## Brainstorm
+## Shipped
 
-### Fork to sibling repos · owner: `cc`
-Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.
+### B0 — Core spine · owner: `cc`
+Repo skeleton, schema, migrations, DB rebuild-from-text, render→boot (CLAUDE.md + AGENTS.md). PR #-/a1cc1e2.
+
+_No open flags._
+
+### Dev shell git worktrees · owner: `cc`
+Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).
+
+_No open flags._
+
+### B2 — Content & render · owner: `cc`
+Flat _sc render, per-shell SKILL.md, skill seed pipeline. PR #1.
+
+_No open flags._
+
+### B3 — Review layer · owner: `cc`
+Dependency-free localhost GUI (shells/roadmap/flags), per-fork ports. PR #3.
+
+_No open flags._
+
+### Dev shell live UI preview · owner: `cc`
+One router on the fork's dev_port fans out to each dev shell's worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.
 
 _No open flags._
 
@@ -51,29 +71,9 @@ Base dr_* code map shipped (files/deps/env, ./sc map, surface_catalogue). NEXT �
 
 _No open flags._
 
-## Shipped
+## Brainstorm
 
-### B0 — Core spine · owner: `cc`
-Repo skeleton, schema, migrations, DB rebuild-from-text, render→boot (CLAUDE.md + AGENTS.md). PR #-/a1cc1e2.
-
-_No open flags._
-
-### Dev shell git worktrees · owner: `cc`
-Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).
-
-_No open flags._
-
-### B2 — Content & render · owner: `cc`
-Flat _sc render, per-shell SKILL.md, skill seed pipeline. PR #1.
-
-_No open flags._
-
-### B3 — Review layer · owner: `cc`
-Dependency-free localhost GUI (shells/roadmap/flags), per-fork ports. PR #3.
-
-_No open flags._
-
-### Dev shell live UI preview · owner: `cc`
-One router on the fork's dev_port fans out to each dev shell's worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.
+### Fork to sibling repos · owner: `cc`
+Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.
 
 _No open flags._
