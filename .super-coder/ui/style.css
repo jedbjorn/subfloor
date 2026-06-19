@@ -181,23 +181,6 @@ details.feature.tasks-open { border-left-color: var(--task-open); }
 .bucket.collapsed > h2::before { transform: rotate(-90deg); }
 .bucket.collapsed > .card { display: none; }
 
-/* Project boards — the roadmap Board groups features into one board per
-   work-stream (projects row); status buckets nest inside each board. */
-.project-board { margin-top: 1.8rem; }
-.project-board:first-of-type { margin-top: .5rem; }
-.project-board > h2.project-board-head {
-  display: flex; align-items: center; gap: .5rem; cursor: pointer; user-select: none;
-  font-size: 1rem; font-weight: 650; color: var(--ink); letter-spacing: .01em;
-  margin: 0 0 .2rem; padding-bottom: .45rem; border-bottom: 1px solid var(--line);
-}
-.project-board-head::before { content: "▾"; width: 1em; color: var(--dim); transition: transform .12s; }
-.project-board.collapsed > .project-board-head::before { transform: rotate(-90deg); }
-.project-board.collapsed > .bucket { display: none; }
-.project-board-head .count {
-  font-size: .72rem; font-weight: 500; color: var(--dim); letter-spacing: 0;
-  background: var(--accent2); border: 1px solid var(--line); border-radius: 99px; padding: .02rem .5rem;
-}
-.project-board > .bucket:first-of-type > h2 { margin-top: .7rem; }
 .doc-body { white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: .8rem; max-height: 420px; overflow: auto; font: 12.5px/1.55 ui-monospace, monospace; }
 .flag { border-bottom: 1px solid var(--line); }
 .flag.resolved { opacity: .5; }
@@ -501,6 +484,11 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .blocker-select { min-height: 0; }
 .blocker-select option { padding: .15rem .2rem; }
 
+/* One section per work-stream; its features lay out by stage inside .flow-wrap. */
+.flow-stream { margin-top: 1.8rem; }
+.flow-stream:first-of-type { margin-top: .5rem; }
+.flow-stream-head { font-size: 1rem; font-weight: 650; color: var(--ink); letter-spacing: .01em;
+  margin: 0 0 .3rem; padding-bottom: .45rem; border-bottom: 1px solid var(--line); }
 .flow-wrap { overflow-x: auto; padding: .3rem 0 .5rem; }
 .flow-inner { position: relative; width: 100%; }
 .flow-wires { position: absolute; top: 0; left: 0; z-index: 0;
