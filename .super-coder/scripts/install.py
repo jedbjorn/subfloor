@@ -3,7 +3,7 @@
 
 Run once, in a host repo that has just pulled the engine
 (`git checkout super-coder/main -- .super-coder sc`). It takes that repo
-from "engine present" to "a shell you can launch":
+from "engine present" to "a team you can launch":
 
     1. Guard   — refuse to run in the super-coder SOURCE repo, or on a fork that
                  is already installed (both would destroy content). --force skips.
@@ -14,15 +14,20 @@ from "engine present" to "a shell you can launch":
     4. Strip   — super-coder's own per-instance content; a fork inherits the
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
-    6. Seed    — the fork's first user + shell (delegates to init_fork; CC lineage
-                 + genesis seed + skill grants).
-    7. Persist — `./sc snapshot` (serialize the new shell) + `./sc render` (flat _sc).
+    6. Seed    — the fork's first user + starting TEAM (delegates to init_fork:
+                 your primary planner plus an admin, two dev, a reviewer, and the
+                 singleton cartographer — each with the CC lineage + a genesis seed
+                 + skill grants). Shells ship pre-named, so install asks only for a
+                 username; no shell-naming interview.
+    7. Persist — `./sc snapshot` (serialize the team) + `./sc render` (flat _sc).
     8. Done    — print how to launch.
 
 Usage:
-    ./sc install                      # interactive (prompts for user/shell)
+    ./sc install                      # interactive (prompts for your username only)
     python3 .super-coder/scripts/install.py [init_fork flags] [--force]
-        e.g. … --username Sam --name Dev --shortname dev --role "Dev shell"
+        e.g. … --username Sam         # fully non-interactive
+        # The team ships pre-named; per-shell overrides (--name/--flavor/…) are
+        # optional and never prompted — see init_fork.py.
 """
 from __future__ import annotations
 
@@ -614,11 +619,11 @@ def main(argv: list[str]) -> int:
     if r.returncode != 0:
         sys.exit("install: rebuild failed.")
 
-    # 6. Seed the first shell (interactive unless flags were passed) ----------
-    step("Seeding this fork's first shell")
+    # 6. Seed the starting team (interactive: username only) ------------------
+    step("Seeding this fork's starting team")
     r = subprocess.run([PY, str(ENGINE / "scripts/init_fork.py"), *fork_args])
     if r.returncode != 0:
-        sys.exit("install: first-shell seeding failed (or was aborted).")
+        sys.exit("install: starting-team seeding failed (or was aborted).")
 
     # 7. Wire the auto-remap hooks + map the host repo --------------------------
     # map-setup points core.hooksPath at the tracked hooks so the dr_* catalogue
