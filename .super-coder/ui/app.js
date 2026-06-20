@@ -542,7 +542,8 @@ async function renderRoadmap(root) {
 // and an SVG overlay wires dependencies (prerequisite → dependent). Pure DOM +
 // measured coordinates — no diagram library. Work-streams are the user's
 // "feature" (e.g. "Meeting Intelligence" = the mi-capture project); unassigned
-// features collect in a trailing "Ungrouped" section.
+// features collect in a trailing "Ungrouped" section. Flows with no active steps
+// left (every feature shipped) are hidden here — they live on in Board view.
 const SVGNS = "http://www.w3.org/2000/svg";
 async function renderRoadmapFlow(root, buckets, projects = []) {
   const feats = flowCandidates(buckets);   // features in the sequencing stages
@@ -566,8 +567,14 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
   if (byProj.has(null)) order.push(null);
 
   let anyEdge = false;
+  let shown = 0;
   for (const key of order) {
     const grp = byProj.get(key);
+    // Hide a fully-shipped flow — it has no active steps left to sequence. Its
+    // shipped features stay visible in Board view; the Flow view is for what's
+    // still in play. (A flow with any non-shipped feature renders in full,
+    // shipped columns included, so you still see what's already delivered.)
+    if (grp.features.every((f) => stageOf[f.feature_id] === "shipped")) continue;
     const title = key === null ? "Ungrouped" : (grp.title || ("project #" + key));
     const section = el("div", { className: "flow-stream" });
     section.append(el("h2", { className: "flow-stream-head" }, title));
@@ -575,6 +582,13 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
     anyEdge = anyEdge || edges > 0;
     section.append(wrap);
     root.append(section);
+    shown++;
+  }
+
+  if (!shown) {
+    root.append(el("div", { className: "muted" },
+      "No flows with active steps — every work-stream is fully shipped. See Board view for shipped features."));
+    return;
   }
 
   root.append(el("div", { className: "muted flow-hint" }, anyEdge
