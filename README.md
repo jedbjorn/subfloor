@@ -215,7 +215,7 @@ it owns:
     index reflects the new shape — and the loop turns to the next feature.
     *(cartographer · `cartographer` · UI: Map)*
 
-    <img width="1669" height="1036" alt="roadamap" src="https://github.com/user-attachments/assets/36016883-35ad-42b8-8d70-da2eee899506" />
+![Review GUI, Roadmap tab — the full dev-cycle loop laid out across the planning stages](https://github.com/user-attachments/assets/36016883-35ad-42b8-8d70-da2eee899506)
 
 ## Install
 
