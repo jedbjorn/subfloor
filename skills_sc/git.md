@@ -22,7 +22,11 @@ everything except `.super-coder/`. The engine is a gitignored, materialized
 dependency (refreshed by `./sc update`); don't commit it or edit it as if it
 were your code. Engine changes are authored upstream in super-coder.
 
-## Sync before you start
+## Sync before you start — a hard pre-code gate
+
+**Before you touch code, reconcile your own tree.** Every session, and again
+before each new unit of work — not "when convenient." This is *your* job, not the
+admin's; a shell that self-syncs is a shell the admin never has to clean up after.
 
 Your `shell/<shortname>` branch is a **moving base pinned to `origin/main`**,
 not a content branch — work happens on feature branches cut from it. A worktree
@@ -30,9 +34,10 @@ is born at first-boot HEAD and drifts as other shells' PRs merge; a stale base
 means you read code that no longer exists and your PRs conflict on arrival.
 
 The launcher checks drift at every boot and **auto-syncs when provably nothing
-can be lost** (on the base branch, clean tree, no local-only commits). The
-result is the `sync:` line in ACTIVE SESSION above — read it. When it says
-**NOT auto-synced**, or mid-session before starting a new unit of work:
+can be lost** (on the base branch, clean tree, no local-only commits). Read the
+`sync:` line in ACTIVE SESSION above. If it auto-synced and you've done nothing
+since, you're current — carry on. Otherwise — it says **NOT auto-synced**, or
+you're mid-session about to start new work — run the gate yourself:
 
 1. `git fetch origin main && git rev-list --count HEAD..origin/main` — behind
    count. Zero → carry on.
@@ -63,6 +68,28 @@ result is the `sync:` line in ACTIVE SESSION above — read it. When it says
    ```
 3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
    directive from the FnB — opening is the default, merging is a separate gate.
+
+## Finish before you stop
+
+The bookend to "sync before you start." **Before you go dormant, land or surface
+your own work — don't leave a dirty or unpushed tree for the admin to adopt.** A
+worktree left with uncommitted or unpushed work is exactly what forces the admin's
+`git_cleanup` to map attribution, check your liveness, and commit on your behalf.
+Self-finish and that whole tier disappears.
+
+At end of session, take stock — `git status` (uncommitted), `git rev-list
+origin/<base>..HEAD` (unpushed) — and resolve it:
+
+1. **Real work** → commit it (attributed, see above), push, open the PR. That's
+   the normal flow; just don't skip it because the session is ending.
+2. **Throwaway / experiment** → discard it deliberately (`git restore` /
+   `git stash`), so the tree is clean.
+3. **Genuinely unsure** → surface to the FnB and leave it committed-and-pushed on
+   a branch (never just sitting uncommitted) — captured work is recoverable; an
+   abandoned dirty worktree is the admin's problem.
+
+Leave your tree either **clean** or **on a pushed branch with a PR**. Nothing
+half-done waiting for someone else to finish.
 
 ## After a merge — clean up local
 

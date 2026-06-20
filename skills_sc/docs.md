@@ -80,15 +80,38 @@ like `add`. Refused once frozen (open a new spec instead — see below):
 ./sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 ```
 
-## Freeze on ship
+## Freeze + document on ship — the planner's handoff
 
-Freeze only at ship — it records what we built to, immutable thereafter. The
-feature's other specs stay unfrozen and unaffected; never edit a frozen one (open
-a new spec under the same feature instead):
-```
-./sc mem doc freeze <document_id>
-```
-The GUI and the render layer both refuse edits to frozen docs.
+Shipping a feature is a **two-shell** act, and the split keeps `shipped` honest:
+
+- the **dev** flips the feature to `roadmap_status = shipped` and opens a
+  **docs-pending** flag (see the `spec` skill, Step 5) — so `shipped` never
+  silently claims a doc that doesn't exist yet;
+- the **planner** picks up that flag and does the paperwork: **freeze the spec,
+  write the doc, close the flag.**
+
+As the planner, on a docs-pending flag (it arrived in your inbox per the `flags`
+skill):
+
+1. **Freeze the shipped spec** — records what we built to, immutable thereafter.
+   The feature's other specs stay unfrozen and unaffected; never edit a frozen one
+   (open a new spec under the same feature instead). The GUI and render layer both
+   refuse edits to frozen docs:
+   ```
+   ./sc mem doc freeze <document_id>
+   ```
+2. **Write the doc** (`kind='doc'`) — the feature's readable face, under the same
+   `feature_id` (see Author, above):
+   ```
+   ./sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
+   ```
+3. **Close the docs-pending flag** with a note pointing at the doc:
+   ```
+   ./sc mem flag close <flag_id> --notes "Spec frozen; doc <document_id> written → docs_sc/<slug>.md"
+   ```
+
+Until step 3, `shipped` + the open flag is the truthful interim state: delivered,
+doc pending.
 
 ## View
 

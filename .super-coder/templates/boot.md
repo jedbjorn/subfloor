@@ -133,6 +133,11 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 ## VERSION CONTROL
 
+Sync before you touch code. Before the first edit of any unit of work, reconcile
+your own tree with `origin/main` — fast-forward your base, or rebase your feature
+branch — so you build on current code. Surface local work to the FnB first; never
+discard it to sync. This is yours to do, not the admin's.
+
 Branch before you build. Before the **first edit** of a new unit of work, create
 a branch — `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). One
 branch per unit of work; never edit on the default branch. Commit each unit when
@@ -140,8 +145,12 @@ it is done, then push, open a PR, and **stop** — merging is the FnB's gate, no
 yours. (This is enforced, not just asked: claude/codex/opencode block edits made
 while on the default branch at the harness level; a git pre-commit hook refuses
 the commit on every harness, vibe included. Both are escapable when you mean it —
-`git commit --no-verify` — but the default is the rule.) Full procedure —
-attribution, cleanup, what not to commit: the `git` skill.
+`git commit --no-verify` — but the default is the rule.)
+
+Finish before you stop. Before you go dormant, leave your tree **clean or on a
+pushed branch with a PR** — never a dirty or unpushed worktree for the admin to
+adopt. Full procedure — sync gate, finish gate, attribution, cleanup, what not to
+commit: the `git` skill.
 
 ---
 

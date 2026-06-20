@@ -793,15 +793,38 @@ like `add`. Refused once frozen (open a new spec instead — see below):
 ./sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 ```
 
-## Freeze on ship
+## Freeze + document on ship — the planner''s handoff
 
-Freeze only at ship — it records what we built to, immutable thereafter. The
-feature''s other specs stay unfrozen and unaffected; never edit a frozen one (open
-a new spec under the same feature instead):
-```
-./sc mem doc freeze <document_id>
-```
-The GUI and the render layer both refuse edits to frozen docs.
+Shipping a feature is a **two-shell** act, and the split keeps `shipped` honest:
+
+- the **dev** flips the feature to `roadmap_status = shipped` and opens a
+  **docs-pending** flag (see the `spec` skill, Step 5) — so `shipped` never
+  silently claims a doc that doesn''t exist yet;
+- the **planner** picks up that flag and does the paperwork: **freeze the spec,
+  write the doc, close the flag.**
+
+As the planner, on a docs-pending flag (it arrived in your inbox per the `flags`
+skill):
+
+1. **Freeze the shipped spec** — records what we built to, immutable thereafter.
+   The feature''s other specs stay unfrozen and unaffected; never edit a frozen one
+   (open a new spec under the same feature instead). The GUI and render layer both
+   refuse edits to frozen docs:
+   ```
+   ./sc mem doc freeze <document_id>
+   ```
+2. **Write the doc** (`kind=''doc''`) — the feature''s readable face, under the same
+   `feature_id` (see Author, above):
+   ```
+   ./sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
+   ```
+3. **Close the docs-pending flag** with a note pointing at the doc:
+   ```
+   ./sc mem flag close <flag_id> --notes "Spec frozen; doc <document_id> written → docs_sc/<slug>.md"
+   ```
+
+Until step 3, `shipped` + the open flag is the truthful interim state: delivered,
+doc pending.
 
 ## View
 
@@ -1022,6 +1045,28 @@ for the SELECT above only):
 - the description is `[Area] {what} | Blocker for: {what it blocks}`.
 - `--priority`: High / Medium / Low. `--feature`: the feature it blocks (or omit).
 
+### Always pair the open with a message
+
+A flag sitting in the DB that no one is told about isn''t a handoff — it''s a note
+to yourself. **Every flag you open also sends a message to whoever clears it**, so
+the work lands in their inbox on their next boot (see the `messaging` skill):
+
+```
+./sc mem message send <shortname> "Opened SC-### — <one line> (Blocker for: <x>)."
+```
+
+Resolve the recipient by what the flag blocks:
+
+| Flag is about | Message |
+|---|---|
+| docs pending after ship | the **planner** |
+| a review failure on a diff | the **author dev** |
+| a blocker on another shell''s work | **that shell** |
+| an FnB decision, or no shell owns it | **surface to the FnB** (no `send`) |
+
+Idempotent: pair the message with the *open*. Don''t re-message a flag that''s
+already open, and don''t message on `close`.
+
 ## Resolve
 
 ```
@@ -1035,7 +1080,9 @@ resolved_date=date(''now''), resolution_notes=''…'' WHERE flag_id=?;`)
 
 Open a flag the moment something is blocked or needs follow-up — don''t hold it in
 your head. Resolve with a note saying *how*, so the trail is legible. Open flags
-on a feature are its blockers; clear them before calling the feature done.',
+on a feature are its blockers; clear them before calling the feature done. **An
+opened flag always rides out on a message** to whoever clears it — a flag nobody
+is told about is a dropped handoff.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1059,7 +1106,11 @@ everything except `.super-coder/`. The engine is a gitignored, materialized
 dependency (refreshed by `./sc update`); don''t commit it or edit it as if it
 were your code. Engine changes are authored upstream in super-coder.
 
-## Sync before you start
+## Sync before you start — a hard pre-code gate
+
+**Before you touch code, reconcile your own tree.** Every session, and again
+before each new unit of work — not "when convenient." This is *your* job, not the
+admin''s; a shell that self-syncs is a shell the admin never has to clean up after.
 
 Your `shell/<shortname>` branch is a **moving base pinned to `origin/main`**,
 not a content branch — work happens on feature branches cut from it. A worktree
@@ -1067,9 +1118,10 @@ is born at first-boot HEAD and drifts as other shells'' PRs merge; a stale base
 means you read code that no longer exists and your PRs conflict on arrival.
 
 The launcher checks drift at every boot and **auto-syncs when provably nothing
-can be lost** (on the base branch, clean tree, no local-only commits). The
-result is the `sync:` line in ACTIVE SESSION above — read it. When it says
-**NOT auto-synced**, or mid-session before starting a new unit of work:
+can be lost** (on the base branch, clean tree, no local-only commits). Read the
+`sync:` line in ACTIVE SESSION above. If it auto-synced and you''ve done nothing
+since, you''re current — carry on. Otherwise — it says **NOT auto-synced**, or
+you''re mid-session about to start new work — run the gate yourself:
 
 1. `git fetch origin main && git rev-list --count HEAD..origin/main` — behind
    count. Zero → carry on.
@@ -1100,6 +1152,28 @@ result is the `sync:` line in ACTIVE SESSION above — read it. When it says
    ```
 3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
    directive from the FnB — opening is the default, merging is a separate gate.
+
+## Finish before you stop
+
+The bookend to "sync before you start." **Before you go dormant, land or surface
+your own work — don''t leave a dirty or unpushed tree for the admin to adopt.** A
+worktree left with uncommitted or unpushed work is exactly what forces the admin''s
+`git_cleanup` to map attribution, check your liveness, and commit on your behalf.
+Self-finish and that whole tier disappears.
+
+At end of session, take stock — `git status` (uncommitted), `git rev-list
+origin/<base>..HEAD` (unpushed) — and resolve it:
+
+1. **Real work** → commit it (attributed, see above), push, open the PR. That''s
+   the normal flow; just don''t skip it because the session is ending.
+2. **Throwaway / experiment** → discard it deliberately (`git restore` /
+   `git stash`), so the tree is clean.
+3. **Genuinely unsure** → surface to the FnB and leave it committed-and-pushed on
+   a branch (never just sitting uncommitted) — captured work is recoverable; an
+   abandoned dirty worktree is the admin''s problem.
+
+Leave your tree either **clean** or **on a pushed branch with a PR**. Nothing
+half-done waiting for someone else to finish.
 
 ## After a merge — clean up local
 
@@ -1191,6 +1265,16 @@ backstop for everything the automation deliberately won''t touch: merges it coul
 not prove (a `gh`-down boot keeps the branch), dirty worktrees, outstanding
 unpushed work, `main` fast-forward, and remote-ref pruning. Don''t be surprised by
 an empty Tier A; do still run the report.
+
+**Working shells now self-finish.** The `git` skill makes each shell sync its own
+tree before it builds and land or surface its own work before it stops — so the
+dirty-worktree (Tier C) and unpushed-work (Tier B) cases should be **rare, not
+routine**. When you do find them, treat them as the exception they now are; the
+genuine admin-only residue is the part no working shell can reach: `main`
+fast-forward at the repo root, `gh`-down unprovable merges, remote-ref pruning,
+and trees whose shell is live or indeterminate. A full Tier B/C is a signal a
+shell skipped its finish gate — worth a note back to that shell, not just a
+silent fix.
 
 The governing asymmetry — internalize it before you touch anything:
 
@@ -1837,6 +1921,104 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'review',
+  'Reviewer procedure — read a diff against its spec through the review lenses, open flags for failures, and ALWAYS message the author dev with findings (flags or clean). The reviewer''s top-level loop; the lenses live in the skills it points to. Load when reviewing a dev''s work.',
+  'craft',
+  NULL,
+  0,
+  '# review — gate a diff against its spec
+
+The reviewer''s job from end to end. You are a **different lineage than the code**
+(see the README''s model note) — so read adversarially: hunt the bug the author
+missed, verify rather than trust. `<self>` = your shell_id.
+
+A review is not finished when you''ve read the diff. **It is finished when the
+author dev has been told what you found** — flags or clean. That message is the
+handoff; skipping it leaves the author waiting on a review they can''t see.
+
+---
+
+## Step 1: Load the diff and its spec
+
+You review a diff *against intent*, not in a vacuum. Get both:
+
+- The change: the PR diff, or `git -C <author-worktree> diff origin/main...<branch>`.
+- The spec it was built to: load the feature''s spec doc (the `spec` skill, Step 1
+  — `documents` where `kind=''spec''`). The done-condition in that spec is your
+  yardstick.
+
+Note the **author** — you''ll message them in Step 4. Resolve their shortname from
+the branch (`shell/<shortname>`) or the commit trailer
+(`Co-Authored-By: <display_name> (super-coder)`):
+```sql
+SELECT shortname, display_name FROM shells WHERE display_name=''<from trailer>'' AND is_deleted=0;
+```
+
+## Step 2: Run the lenses
+
+The review *lenses* live in the skills you''re granted — apply each that the diff
+touches, don''t re-derive them:
+
+| Diff touches | Lens |
+|---|---|
+| an API / endpoint / route | `api-design` → *Review lens* |
+| `tests/` | `test_authoring` → *Review lens* |
+| schema / migration | `database-migrations` |
+| a redline / UI change | `redline_review` |
+
+Across all of them, the cross-cutting checks: does it meet the spec''s
+done-condition? Does it do what the diff *claims*? What did the author not test?
+What breaks at the edges?
+
+## Step 3: Open a flag per failure
+
+Each real failure is a flag against the feature. Per the `flags` skill, **opening
+a flag also messages the party who clears it — here, the author dev**, so each
+failure lands in their inbox:
+```
+./sc mem flag open "[Review] <what''s wrong> | Blocker for: <feature>" --name SC-### --priority <High|Medium|Low> --feature <feature_id>
+./sc mem message send <author-shortname> "Opened SC-### — <one line>."
+```
+Don''t open flags for nits you can state in the summary; flag what blocks merge.
+
+## Step 4: Always message the author — flags or clean
+
+This is the step that closes the loop, and it fires **every** review, including a
+clean one (a clean review the author never hears about is indistinguishable from
+no review):
+
+```
+# failures found:
+./sc mem message send <author-shortname> "Review of <feature> done — <N> flags: SC-###, SC-###. Patch + re-push; thread closes when clean."
+
+# clean:
+./sc mem message send <author-shortname> "Review of <feature> done — clean, no flags. Good to go on the FnB''s merge gate."
+```
+
+Then report the same to the FnB.
+
+---
+
+## Stance
+
+- **Adversarial by default.** You are the gate. Assume there''s a bug and go find
+  it; "looks fine" is not a review.
+- **Verify, don''t trust.** Re-run the tests, re-read the claim against the code.
+  A README-level "it filters X" is not proof the filter runs.
+- **Review against the spec, not your taste.** The done-condition is the bar.
+  Scope creep in the diff is a flag, not a silent pass.
+- **The author always hears back.** Flags ride out on messages (Step 3); the
+  summary always does (Step 4). A review nobody was told about didn''t happen.
+- **You critique and confirm — you don''t build.** Don''t patch the author''s code;
+  flag it and send it back.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'self_update',
   'Update this fork''s super-coder engine in place — fetch + materialize new code + migrations, keep all your memory; roll back a bad update soundly. The shell hands off to its own next boot. Use when a super-coder update is available.',
   'substrate',
@@ -2136,6 +2318,23 @@ Don''t open flags for unclear items you can resolve by asking — ask first.
 
 ## Step 3: Plan
 
+### Reconcile the stage first
+
+Planning a spec means you''re engaging it to build — so the feature''s
+`roadmap_status` (loaded in Step 1) must catch up to reality. The horizon stages
+are `brainstorm · long_term · near_term · next · in_progress · shipped`.
+
+- Feature sits at `brainstorm`/`long_term`/`near_term` and you''re **building this
+  session** → move it to `in_progress`:
+  `./sc mem roadmap status <feature_id> in_progress`
+- You''re only **planning ahead** (no build this session) → move it to `next`.
+- Already at `in_progress` (or further) → **no-op**; don''t churn it.
+
+This is a transition you make because you''re *acting on* the spec — not something
+that fires from merely reading one for reference. If there is no spec governing the
+work (a quick UI fix, a minor migration), skip all stage handling: it doesn''t
+apply (see the Stance).
+
 Once analysis is clear and blockers are resolved or accepted, generate the task
 list and INSERT it. Always this shape:
 
@@ -2205,6 +2404,46 @@ If `next_up` is NULL, all tasks are done — set current_state to reflect that.
 
 ---
 
+## Step 5: Hand off on completion
+
+When the **Verification** task passes (`next_up` is NULL — the existing
+done-line), the feature is delivered. As the dev, do the handoff — you flip the
+horizon and hand the paperwork to the planner; you do **not** freeze the spec or
+write the doc (that''s the planner — see the `docs` skill):
+
+1. **Flip the horizon to shipped:**
+   ```
+   ./sc mem roadmap status <feature_id> shipped
+   ```
+2. **Open a docs-pending flag** so `shipped` doesn''t silently claim a doc that
+   isn''t written yet (`shipped` + an open flag is the honest interim state). Per
+   the `flags` skill, opening it also messages the party who clears it — the
+   planner:
+   ```
+   ./sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
+   ./sc mem message send <planner-shortname> "<feature> shipped — spec <doc_id> ready to freeze + document. Docs-pending flag SC-### open."
+   ```
+3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec + write
+   the doc." The planner closes the flag when the doc lands.
+
+If this fork has no planner-flavor shell, message nobody — surface to the FnB
+directly and leave the docs-pending flag open for whoever picks up docs.
+
+---
+
+## Watch for creep while you build
+
+If, mid-build, the work grows past the spec''s stated what/why:
+
+- **Small growth** (same mental model, a few more tasks) → the spec is *living*
+  while unfrozen; just edit it (`./sc mem doc edit`) and carry on. No ceremony.
+- **A separate coherent intent** (a new mental-model boundary — the granularity
+  test in the `docs` skill) → don''t quietly absorb it. Recommend a **new spec** to
+  the FnB, to be authored by the planner against its own feature. Significant creep
+  is a planning event, not a dev improvisation.
+
+---
+
 ## Stance
 
 - **Analyze before acting.** The analysis phase discovers the gap between what
@@ -2218,7 +2457,12 @@ If `next_up` is NULL, all tasks are done — set current_state to reflect that.
   Don''t start work that can''t be verified before the session ends.
 - **current_state always reflects the plan.** After every task completion,
   update it — last done + next up. This is how the next session resumes without
-  reading the full task list first.',
+  reading the full task list first.
+- **The stage tracks reality, but only for spec''d work.** Engaging a spec moves
+  it forward (→ `in_progress`); finishing it hands off (→ `shipped`). No-op when
+  the stage already matches — don''t churn it. Work with **no spec** (quick UI
+  tweaks, minor migrations) is exempt entirely: no promotion, no handoff, no creep
+  check. Stage discipline must never become a blocker for small things.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
