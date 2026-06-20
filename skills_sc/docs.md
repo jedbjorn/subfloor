@@ -48,6 +48,37 @@ The **doc** (`kind='doc'`) is the feature's readable face — write it when the
 first spec ships, under the same `feature_id`. It is a sibling of the specs, not
 a parent they point at.
 
+## Every feature belongs to a work-stream — assess it
+
+A feature attaches to a **work-stream** (a `projects` row) via
+`roadmap.project_id`; the GUI **Flow view groups on it**, and `NULL` shows as
+**Ungrouped**. An unassigned feature is invisible to the Flow view's grouping —
+so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
+create a feature or author/update a spec, assess the work-stream** as part of the
+same act (it's a planning decision, like the stage):
+
+```sql
+-- existing work-streams (pick the one this feature belongs to):
+SELECT project_id, shortname, title, status FROM projects WHERE COALESCE(is_deleted,0)=0;
+-- is this feature already assigned?
+SELECT feature_id, title, project_id FROM roadmap WHERE feature_id=<id>;
+```
+
+Then:
+- **New feature** → create it already assigned:
+  `./sc mem roadmap add "<title>" --project <shortname>`
+- **Existing + Ungrouped** → assign it:
+  `./sc mem roadmap project <feature_id> <shortname>`
+- **No fitting work-stream exists yet** → create one, then assign:
+  `./sc mem project add <shortname> "<title>" --purpose "…"`
+- **Already correctly assigned** → **no-op**; don't churn it.
+
+**Auto-assign when the stream is obvious** (only one plausible fit, or it clearly
+belongs to an existing stream). **Surface to the FnB only when ambiguous** —
+several streams could fit, or the feature implies a new stream you're unsure how
+to name. Exempt, as with stages: work that isn't a feature/spec (a quick fix)
+needs no work-stream.
+
 ## Review first
 
 Before writing, see what exists — don't duplicate:
@@ -80,15 +111,38 @@ like `add`. Refused once frozen (open a new spec instead — see below):
 ./sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 ```
 
-## Freeze on ship
+## Freeze + document on ship — the planner's handoff
 
-Freeze only at ship — it records what we built to, immutable thereafter. The
-feature's other specs stay unfrozen and unaffected; never edit a frozen one (open
-a new spec under the same feature instead):
-```
-./sc mem doc freeze <document_id>
-```
-The GUI and the render layer both refuse edits to frozen docs.
+Shipping a feature is a **two-shell** act, and the split keeps `shipped` honest:
+
+- the **dev** flips the feature to `roadmap_status = shipped` and opens a
+  **docs-pending** flag (see the `spec` skill, Step 5) — so `shipped` never
+  silently claims a doc that doesn't exist yet;
+- the **planner** picks up that flag and does the paperwork: **freeze the spec,
+  write the doc, close the flag.**
+
+As the planner, on a docs-pending flag (it arrived in your inbox per the `flags`
+skill):
+
+1. **Freeze the shipped spec** — records what we built to, immutable thereafter.
+   The feature's other specs stay unfrozen and unaffected; never edit a frozen one
+   (open a new spec under the same feature instead). The GUI and render layer both
+   refuse edits to frozen docs:
+   ```
+   ./sc mem doc freeze <document_id>
+   ```
+2. **Write the doc** (`kind='doc'`) — the feature's readable face, under the same
+   `feature_id` (see Author, above):
+   ```
+   ./sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
+   ```
+3. **Close the docs-pending flag** with a note pointing at the doc:
+   ```
+   ./sc mem flag close <flag_id> --notes "Spec frozen; doc <document_id> written → docs_sc/<slug>.md"
+   ```
+
+Until step 3, `shipped` + the open flag is the truthful interim state: delivered,
+doc pending.
 
 ## View
 

@@ -86,6 +86,38 @@ Don't open flags for unclear items you can resolve by asking — ask first.
 
 ## Step 3: Plan
 
+### Reconcile the stage first
+
+Planning a spec means you're engaging it to build — so the feature's
+`roadmap_status` (loaded in Step 1) must catch up to reality. The horizon stages
+are `brainstorm · long_term · near_term · next · in_progress · shipped`.
+
+- Feature sits at `brainstorm`/`long_term`/`near_term` and you're **building this
+  session** → move it to `in_progress`:
+  `./sc mem roadmap status <feature_id> in_progress`
+- You're only **planning ahead** (no build this session) → move it to `next`.
+- Already at `in_progress` (or further) → **no-op**; don't churn it.
+
+This is a transition you make because you're *acting on* the spec — not something
+that fires from merely reading one for reference. If there is no spec governing the
+work (a quick UI fix, a minor migration), skip all stage handling: it doesn't
+apply (see the Stance).
+
+### Confirm the work-stream too
+
+While you're reconciling the stage, check the same feature's **work-stream**
+(`roadmap.project_id` — the Flow-view grouping). If it's Ungrouped, assign it now
+so the feature shows up in a flow, not the Ungrouped pile:
+
+```
+./sc mem roadmap project <feature_id> <shortname>   # 'none' to clear
+```
+
+Assign when the stream is obvious; surface to the FnB when it's ambiguous. No-op
+if already assigned. The full create/assess procedure (new streams, new features)
+lives in the `docs` skill — this is just the engage-time confirmation so drift
+doesn't accumulate.
+
 Once analysis is clear and blockers are resolved or accepted, generate the task
 list and INSERT it. Always this shape:
 
@@ -155,6 +187,46 @@ If `next_up` is NULL, all tasks are done — set current_state to reflect that.
 
 ---
 
+## Step 5: Hand off on completion
+
+When the **Verification** task passes (`next_up` is NULL — the existing
+done-line), the feature is delivered. As the dev, do the handoff — you flip the
+horizon and hand the paperwork to the planner; you do **not** freeze the spec or
+write the doc (that's the planner — see the `docs` skill):
+
+1. **Flip the horizon to shipped:**
+   ```
+   ./sc mem roadmap status <feature_id> shipped
+   ```
+2. **Open a docs-pending flag** so `shipped` doesn't silently claim a doc that
+   isn't written yet (`shipped` + an open flag is the honest interim state). Per
+   the `flags` skill, opening it also messages the party who clears it — the
+   planner:
+   ```
+   ./sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
+   ./sc mem message send <planner-shortname> "<feature> shipped — spec <doc_id> ready to freeze + document. Docs-pending flag SC-### open."
+   ```
+3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec + write
+   the doc." The planner closes the flag when the doc lands.
+
+If this fork has no planner-flavor shell, message nobody — surface to the FnB
+directly and leave the docs-pending flag open for whoever picks up docs.
+
+---
+
+## Watch for creep while you build
+
+If, mid-build, the work grows past the spec's stated what/why:
+
+- **Small growth** (same mental model, a few more tasks) → the spec is *living*
+  while unfrozen; just edit it (`./sc mem doc edit`) and carry on. No ceremony.
+- **A separate coherent intent** (a new mental-model boundary — the granularity
+  test in the `docs` skill) → don't quietly absorb it. Recommend a **new spec** to
+  the FnB, to be authored by the planner against its own feature. Significant creep
+  is a planning event, not a dev improvisation.
+
+---
+
 ## Stance
 
 - **Analyze before acting.** The analysis phase discovers the gap between what
@@ -169,3 +241,8 @@ If `next_up` is NULL, all tasks are done — set current_state to reflect that.
 - **current_state always reflects the plan.** After every task completion,
   update it — last done + next up. This is how the next session resumes without
   reading the full task list first.
+- **The stage tracks reality, but only for spec'd work.** Engaging a spec moves
+  it forward (→ `in_progress`); finishing it hands off (→ `shipped`). No-op when
+  the stage already matches — don't churn it. Work with **no spec** (quick UI
+  tweaks, minor migrations) is exempt entirely: no promotion, no handoff, no creep
+  check. Stage discipline must never become a blocker for small things.

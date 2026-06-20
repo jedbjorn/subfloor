@@ -29,6 +29,16 @@ not prove (a `gh`-down boot keeps the branch), dirty worktrees, outstanding
 unpushed work, `main` fast-forward, and remote-ref pruning. Don't be surprised by
 an empty Tier A; do still run the report.
 
+**Working shells now self-finish.** The `git` skill makes each shell sync its own
+tree before it builds and land or surface its own work before it stops — so the
+dirty-worktree (Tier C) and unpushed-work (Tier B) cases should be **rare, not
+routine**. When you do find them, treat them as the exception they now are; the
+genuine admin-only residue is the part no working shell can reach: `main`
+fast-forward at the repo root, `gh`-down unprovable merges, remote-ref pruning,
+and trees whose shell is live or indeterminate. A full Tier B/C is a signal a
+shell skipped its finish gate — worth a note back to that shell, not just a
+silent fix.
+
 The governing asymmetry — internalize it before you touch anything:
 
 > You can **prove** something is safe to **delete** (its PR shows MERGED).
