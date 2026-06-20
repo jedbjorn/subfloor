@@ -110,6 +110,21 @@ that fires from merely reading one for reference. If there is no spec governing 
 work (a quick UI fix, a minor migration), skip all stage handling: it doesn't
 apply (see the Stance).
 
+### Confirm the work-stream too
+
+While you're reconciling the stage, check the same feature's **work-stream**
+(`roadmap.project_id` — the Flow-view grouping). If it's Ungrouped, assign it now
+so the feature shows up in a flow, not the Ungrouped pile:
+
+```
+./sc mem roadmap project <feature_id> <shortname>   # 'none' to clear
+```
+
+Assign when the stream is obvious; surface to the FnB when it's ambiguous. No-op
+if already assigned. The full create/assess procedure (new streams, new features)
+lives in the `docs` skill — this is just the engage-time confirmation so drift
+doesn't accumulate.
+
 Once analysis is clear and blockers are resolved or accepted, generate the task
 list and INSERT it. Always this shape:
 

@@ -48,6 +48,37 @@ The **doc** (`kind='doc'`) is the feature's readable face — write it when the
 first spec ships, under the same `feature_id`. It is a sibling of the specs, not
 a parent they point at.
 
+## Every feature belongs to a work-stream — assess it
+
+A feature attaches to a **work-stream** (a `projects` row) via
+`roadmap.project_id`; the GUI **Flow view groups on it**, and `NULL` shows as
+**Ungrouped**. An unassigned feature is invisible to the Flow view's grouping —
+so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
+create a feature or author/update a spec, assess the work-stream** as part of the
+same act (it's a planning decision, like the stage):
+
+```sql
+-- existing work-streams (pick the one this feature belongs to):
+SELECT project_id, shortname, title, status FROM projects WHERE COALESCE(is_deleted,0)=0;
+-- is this feature already assigned?
+SELECT feature_id, title, project_id FROM roadmap WHERE feature_id=<id>;
+```
+
+Then:
+- **New feature** → create it already assigned:
+  `./sc mem roadmap add "<title>" --project <shortname>`
+- **Existing + Ungrouped** → assign it:
+  `./sc mem roadmap project <feature_id> <shortname>`
+- **No fitting work-stream exists yet** → create one, then assign:
+  `./sc mem project add <shortname> "<title>" --purpose "…"`
+- **Already correctly assigned** → **no-op**; don't churn it.
+
+**Auto-assign when the stream is obvious** (only one plausible fit, or it clearly
+belongs to an existing stream). **Surface to the FnB only when ambiguous** —
+several streams could fit, or the feature implies a new stream you're unsure how
+to name. Exempt, as with stages: work that isn't a feature/spec (a quick fix)
+needs no work-stream.
+
 ## Review first
 
 Before writing, see what exists — don't duplicate:

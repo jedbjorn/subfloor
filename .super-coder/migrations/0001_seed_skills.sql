@@ -761,6 +761,37 @@ The **doc** (`kind=''doc''`) is the feature''s readable face — write it when t
 first spec ships, under the same `feature_id`. It is a sibling of the specs, not
 a parent they point at.
 
+## Every feature belongs to a work-stream — assess it
+
+A feature attaches to a **work-stream** (a `projects` row) via
+`roadmap.project_id`; the GUI **Flow view groups on it**, and `NULL` shows as
+**Ungrouped**. An unassigned feature is invisible to the Flow view''s grouping —
+so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
+create a feature or author/update a spec, assess the work-stream** as part of the
+same act (it''s a planning decision, like the stage):
+
+```sql
+-- existing work-streams (pick the one this feature belongs to):
+SELECT project_id, shortname, title, status FROM projects WHERE COALESCE(is_deleted,0)=0;
+-- is this feature already assigned?
+SELECT feature_id, title, project_id FROM roadmap WHERE feature_id=<id>;
+```
+
+Then:
+- **New feature** → create it already assigned:
+  `./sc mem roadmap add "<title>" --project <shortname>`
+- **Existing + Ungrouped** → assign it:
+  `./sc mem roadmap project <feature_id> <shortname>`
+- **No fitting work-stream exists yet** → create one, then assign:
+  `./sc mem project add <shortname> "<title>" --purpose "…"`
+- **Already correctly assigned** → **no-op**; don''t churn it.
+
+**Auto-assign when the stream is obvious** (only one plausible fit, or it clearly
+belongs to an existing stream). **Surface to the FnB only when ambiguous** —
+several streams could fit, or the feature implies a new stream you''re unsure how
+to name. Exempt, as with stages: work that isn''t a feature/spec (a quick fix)
+needs no work-stream.
+
 ## Review first
 
 Before writing, see what exists — don''t duplicate:
@@ -2334,6 +2365,21 @@ This is a transition you make because you''re *acting on* the spec — not somet
 that fires from merely reading one for reference. If there is no spec governing the
 work (a quick UI fix, a minor migration), skip all stage handling: it doesn''t
 apply (see the Stance).
+
+### Confirm the work-stream too
+
+While you''re reconciling the stage, check the same feature''s **work-stream**
+(`roadmap.project_id` — the Flow-view grouping). If it''s Ungrouped, assign it now
+so the feature shows up in a flow, not the Ungrouped pile:
+
+```
+./sc mem roadmap project <feature_id> <shortname>   # ''none'' to clear
+```
+
+Assign when the stream is obvious; surface to the FnB when it''s ambiguous. No-op
+if already assigned. The full create/assess procedure (new streams, new features)
+lives in the `docs` skill — this is just the engage-time confirmation so drift
+doesn''t accumulate.
 
 Once analysis is clear and blockers are resolved or accepted, generate the task
 list and INSERT it. Always this shape:
