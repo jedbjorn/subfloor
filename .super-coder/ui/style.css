@@ -196,7 +196,20 @@ details.feature.tasks-open { border-left-color: var(--task-open); }
 .flag[open] > summary::before { transform: rotate(90deg); }
 .flag > summary:hover { background: var(--accent2); }
 .flag .desc { flex: 1; }
+.flag .flag-num { color: var(--dim); font-weight: 400; }
+.pill.prio-high { color: var(--warn); border-color: var(--warn); }
+.pill.prio-medium { color: var(--accent); }
+.pill.prio-low { color: var(--dim); }
 .flag-body { padding: 0 .4rem .7rem 1.8rem; }
+.flag-desc { white-space: pre-wrap; font-size: .85rem; line-height: 1.55; margin-bottom: .6rem; }
+.flag-links { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .6rem; }
+.link-card {
+  display: inline-flex; flex-direction: column; gap: .1rem;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+  padding: .35rem .55rem; max-width: 22rem;
+}
+.link-card .link-k { font-size: .65rem; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+.link-card .link-v { font-size: .82rem; color: var(--ink); }
 .tag { font-size: .72rem; color: var(--dim); }
 
 /* ── Skills catalogue (Skills tab) — expandable rows, like flags ──────────── */

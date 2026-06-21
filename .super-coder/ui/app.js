@@ -978,17 +978,34 @@ async function renderFlags(root) {
 }
 
 function flagRow(f) {
-  // Expandable: collapsed row shows priority + name + description on one line;
-  // expanding reveals the resolution note (resolved) or the resolve action (open).
+  // Expandable: collapsed row shows the priority badge + title + #id;
+  // expanding reveals the full description, linked items as cards, and the
+  // resolution note (resolved) or the resolve action (open).
   const row = el("details", { className: "flag" + (f.resolved ? " resolved" : "") });
   const head = el("summary", { className: "flag-head" });
-  head.append(el("span", { className: "pill " + (f.priority || "").toLowerCase() }, f.priority || ""));
+  const prio = f.priority || "—";
+  head.append(el("span", { className: "pill prio-" + prio.toLowerCase() }, prio));
   const d = el("span", { className: "desc" });
-  d.append(el("b", {}, (f.display_name ? f.display_name + " " : "")), esc(f.description || ""));
+  d.append(el("b", {}, f.display_name || "Flag"),
+    el("span", { className: "flag-num" }, " #" + f.flag_id));
   head.append(d);
   row.append(head);
 
   const body = el("div", { className: "flag-body" });
+
+  // Longer description, full text (no longer shown on the collapsed row).
+  if (f.description) body.append(el("div", { className: "flag-desc" }, f.description));
+
+  // Linked items as small cards. Today a flag links to at most one feature.
+  const links = [];
+  if (f.feature_title) links.push(["feature", f.feature_title]);
+  if (links.length) {
+    const lc = el("div", { className: "flag-links" });
+    for (const [k, v] of links) lc.append(el("div", { className: "link-card" },
+      el("span", { className: "link-k" }, k), el("span", { className: "link-v" }, v)));
+    body.append(lc);
+  }
+
   if (f.resolved) {
     body.append(el("div", { className: "tag" }, `resolved ${f.resolved_date || ""} — ${f.resolution_notes || ""}`));
   } else {
