@@ -28,6 +28,11 @@
 #   2. CWD (all consumers, and the fallback when there is no target) — the
 #      original behavior: block if HEAD of the cwd's repo is a protected branch.
 #
+# SCRATCH EXEMPTION (before either check): a resolved target under /tmp,
+# /var/tmp, /dev/shm, or $TMPDIR is allowed outright — scratch writes never land
+# on a branch, and shells use /tmp heavily; without this they'd hit the cwd
+# fallback (Check 2) and get blocked whenever the cwd sits on a protected branch.
+#
 # The harness hooks locate this script env-independently, the same way `sc` does:
 # walk to the MAIN worktree root via `git rev-parse --git-common-dir`/.. and read
 # its .super-coder/. A fork gitignores the engine, so it is ABSENT from every
@@ -97,6 +102,25 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || echo "")"
+  fi
+fi
+
+# ── Scratch exemption: /tmp & friends ───────────────────────────────────────
+# A write whose target is a temp/scratch path can never land on a branch, so the
+# branch guard has nothing to protect. Shells lean on /tmp heavily for scratch
+# files, and without this such a write falls through to the cwd-branch check
+# (Check 2) and is blocked whenever the shell's cwd happens to sit on a protected
+# branch — a pure false positive. Exempt the standard scratch roots up front.
+# Only applies when we HAVE a resolved target: a no-target call (codex
+# apply_patch) carries no path and still uses the cwd check.
+if [ -n "$target" ]; then
+  case "$target" in
+    /tmp/* | /var/tmp/* | /dev/shm/* ) exit 0 ;;
+  esac
+  if [ -n "${TMPDIR:-}" ]; then
+    case "$target" in
+      "${TMPDIR%/}"/* ) exit 0 ;;
+    esac
   fi
 fi
 
