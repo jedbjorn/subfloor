@@ -62,24 +62,27 @@ you're mid-session about to start new work — run the gate yourself:
 3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
    directive from the FnB — opening is the default, merging is a separate gate.
 
-## When the FnB has you merge a stack — retarget first
+## Merging a stack (when the FnB has you land one)
 
-Merging stays the FnB's call (above). But when they *do* hand you a stack to land
-— PR B cut from PR A's branch, so B's base isn't `main` — adopt **one rule for
-stacks: retarget the next PR's base to `main` before merging the one beneath
-it.**
+Merging stays the FnB's call (above). When they *do* hand you a stack to land,
+merge **bottom-up, retargeting before each merge — never rely on GitHub's
+auto-retarget**:
 
-```
-gh pr edit <B> --base main          # first — re-root B onto main
-gh pr merge <A> --squash --delete-branch
-gh pr merge <B> --squash --delete-branch
-```
+1. Check the stack is clean: `gh pr view <n> --json mergeable,mergeStateStatus`.
+2. Merge the lowest PR: `gh pr merge <low> --squash --delete-branch`.
+3. **Before** the next merge, re-root it onto `main`: `gh pr edit <next> --base
+   main`. Deleting the merged base otherwise orphans the PR above it (GitHub
+   closes it `CONFLICTING`, base ref gone).
+4. Re-check that PR is `MERGEABLE`, then merge. Repeat up the stack.
 
-`--delete-branch` removes A's head branch — which is B's base ref. Merge A first
-and GitHub closes B as `CONFLICTING` with its base gone, then blocks reopen;
-recovery is a local rebase + force-push + a fresh PR. Retargeting B onto `main`
-first costs one command and sidesteps all of it. Same rule for a taller stack:
-retarget each PR to `main` just before the one under it merges, bottom up.
+If a PR was already orphaned (its base was deleted under it), nothing is lost —
+the head branch still holds the commits. Recreate the base ref so the *same* PR
+can reopen, rather than rebuilding it:
+
+1. `git push origin <merged-sha>:refs/heads/<deleted-branch>`
+   (`<merged-sha>` = `gh pr view <merged-pr> --json headRefOid`).
+2. `gh pr reopen <closed-pr>` → `gh pr edit <closed-pr> --base main`.
+3. Verify `MERGEABLE`, then delete the recreated branch again.
 
 ## Finish before you stop
 
