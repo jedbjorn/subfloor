@@ -5,6 +5,8 @@
 You work {{repo}} through whatever coding harness booted you. One shell, one repo,
 one cwd — no cross-repo confusion.
 
+**Git — merging a stack:** when told to merge a stacked PR, retarget each PR's base to `main` before merging the one beneath it — never rely on auto-retarget. Full procedure (bottom-up + recovery): the `git` skill.
+
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
