@@ -144,6 +144,12 @@ details.feature > summary:hover { background: var(--accent2); }
 details.feature[open] > .feature-preview { display: none; }
 .feature-body { padding: 0 1.1rem 1.1rem; }
 .feature-body > .act:first-of-type { margin-top: .2rem; }
+/* ⤢ open-in-modal trigger in the card head — quiet square button */
+.feature-open { margin-top: 0; padding: .1rem .4rem; line-height: 1; font-size: .9rem; opacity: .6; }
+.feature-open:hover { opacity: 1; }
+/* spec / doc groupings inside the editor (inline expand and modal) */
+.doc-section { margin-top: .7rem; }
+.doc-section > .k { display: block; margin-bottom: .15rem; }
 
 /* spec-task side bar — colours the card's left edge by plan completion. These
    sit after the [open] rule above so they win the border-color cascade. */
@@ -393,6 +399,9 @@ button.gmenu-name:hover { color: #fff; }
 .modal-count { font: 11px ui-monospace, monospace; color: rgba(255,255,255,.40); flex: none; }
 .modal-body { flex: 1; min-height: 0; padding: 1rem; display: flex; }
 .modal-body textarea { flex: 1; resize: none; font: 12px/1.55 ui-monospace, monospace; }
+/* feature editor in a modal: scroll the form, don't stretch a lone textarea */
+.modal-body > .feature-body { flex: 1; min-height: 0; overflow: auto; padding: .2rem .2rem 0; }
+.modal-body > .feature-body textarea { flex: none; resize: vertical; font: inherit; width: 100%; }
 .modal-foot { display: flex; justify-content: space-between; padding: .6rem 1.2rem 1rem; }
 .modal-foot .act { margin-top: 0; }
 
@@ -525,6 +534,12 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .flow-card-title { font-weight: 600; font-size: .85rem; line-height: 1.3; }
 .flow-card-meta { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .45rem; }
 .flow-card-docs { display: flex; flex-wrap: wrap; gap: .25rem .7rem; margin-top: .45rem; }
+/* Every flow card opens the edit modal on click. */
+.flow-card { cursor: pointer; }
+.flow-card:hover { border-color: rgba(255,255,255,.25); }
+/* Shipped column — a compact, wire-free "done" list on the left. */
+.flow-col.shipped .flow-card { padding: .45rem .6rem; }
+.flow-col.shipped .flow-card-title { font-size: .8rem; font-weight: 500; }
 .flow-doc-link { font-size: .72rem; color: var(--accent); text-decoration: none; white-space: nowrap; }
 .flow-doc-link:hover { text-decoration: underline; }
 

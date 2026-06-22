@@ -550,13 +550,14 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
   const stageOf = {};
   for (const b of buckets) if (FLOW_STAGES.includes(b.status))
     for (const f of b.features) stageOf[f.feature_id] = b.status;
-  // Candidate pool minus shipped — the Flow view never renders shipped cards.
-  const feats = flowCandidates(buckets).filter((f) => stageOf[f.feature_id] !== "shipped");
+  // Full sequencing pool including shipped — shipped renders as a wire-free
+  // "done" list in the leftmost column of each work-stream (see buildFlowGraph).
+  const feats = flowCandidates(buckets);
+  // The blocker/depends-on picker in the modal still spans every sequencing
+  // feature, shipped included.
+  const candidates = feats;
   if (!feats.length) {
-    const anyShipped = Object.values(stageOf).some((s) => s === "shipped");
-    root.append(el("div", { className: "muted" }, anyShipped
-      ? "No flows with active steps — every work-stream is fully shipped. See Board view for shipped features."
-      : "No features in the sequencing stages yet."));
+    root.append(el("div", { className: "muted" }, "No features in the sequencing stages yet."));
     return;
   }
 
@@ -577,7 +578,7 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
     const title = key === null ? "Ungrouped" : (grp.title || ("project #" + key));
     const section = el("div", { className: "flow-stream" });
     section.append(el("h2", { className: "flow-stream-head" }, title));
-    const { wrap, edges } = buildFlowGraph(grp.features, stageOf);
+    const { wrap, edges } = buildFlowGraph(grp.features, stageOf, candidates, projects);
     anyEdge = anyEdge || edges > 0;
     section.append(wrap);
     root.append(section);
@@ -591,7 +592,7 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
 // Build one work-stream's graph: stage columns scoped to `features`, plus an SVG
 // overlay wiring dependency edges (prerequisite → dependent) whose endpoints are
 // both in this set. Returns { wrap element, edges count }.
-function buildFlowGraph(features, stageOf) {
+function buildFlowGraph(features, stageOf, candidates = [], projects = []) {
   const shownIds = new Set(features.map((f) => f.feature_id));
   const wrap = el("div", { className: "flow-wrap" });
   const inner = el("div", { className: "flow-inner" });
@@ -599,16 +600,24 @@ function buildFlowGraph(features, stageOf) {
   svg.setAttribute("class", "flow-wires");
   const cols = el("div", { className: "flow-cols" });
 
+  // Column order puts shipped LEFT as a wire-free "done" list; the four
+  // sequencing stages follow left→right toward the horizon. (FLOW_STAGES keeps
+  // shipped last for the data model; this is purely the Flow column layout.)
+  const COL_ORDER = ["shipped", "in_progress", "next", "near_term", "long_term"];
   const cardOf = {};   // feature_id → card element, for wire endpoints
-  for (const s of FLOW_STAGES) {
+  for (const s of COL_ORDER) {
     const inStage = features.filter((f) => stageOf[f.feature_id] === s);
     if (!inStage.length) continue;
-    const col = el("div", { className: "flow-col" });
+    const col = el("div", { className: "flow-col " + s });
     col.append(el("div", { className: "flow-col-head" }, SLABEL[s]));
     for (const f of inStage) {
       const card = el("div", { className: "flow-card " + s });
       card.dataset.fid = String(f.feature_id);
-      card.append(el("div", { className: "flow-card-title" }, f.title || "(untitled)"));
+      // Shipped titles are concatenated to a reasonable length (full name in the
+      // tooltip) — these cards are a compact list, not the wired sequence.
+      const full = f.title || "(untitled)";
+      const shown = s === "shipped" && full.length > 32 ? full.slice(0, 31).trimEnd() + "…" : full;
+      card.append(el("div", { className: "flow-card-title", title: full }, shown));
       const m = el("div", { className: "flow-card-meta" });
       if (f.owner) m.append(el("span", { className: "pill " + s }, f.owner));
       if (f.open_flags?.length) m.append(el("span", { className: "pill warn" }, f.open_flags.length + " ⚑"));
@@ -624,6 +633,8 @@ function buildFlowGraph(features, stageOf) {
           textContent: (d.kind === "doc" ? "doc" : `${d.kind} v${d.seq}`) + " ↗" }));
         card.append(dl);
       }
+      // Click anywhere on the card (except a doc link) opens the edit modal.
+      card.onclick = (e) => { if (e.target.closest("a")) return; openFeatureModal(f, candidates, projects); };
       col.append(card);
       cardOf[f.feature_id] = card;
     }
@@ -634,12 +645,13 @@ function buildFlowGraph(features, stageOf) {
   wrap.append(inner);
 
   // Dependency edges (prerequisite → dependent), endpoints both in this section.
-  // Skip edges whose prerequisite is already shipped: shipped is the rightmost
-  // stage, so the wire would point backward to earlier work — and a done
-  // prerequisite isn't worth drawing.
+  // Shipped cards are a wire-free "done" list — skip any edge that touches a
+  // shipped node on EITHER end (a done prerequisite isn't worth drawing, and a
+  // shipped dependent would point backward from the left-hand list).
   const edgeList = [];
   for (const f of features) for (const b of (f.blockers || []))
-    if (shownIds.has(b) && stageOf[b] !== "shipped") edgeList.push([b, f.feature_id]);
+    if (shownIds.has(b) && stageOf[b] !== "shipped" && stageOf[f.feature_id] !== "shipped")
+      edgeList.push([b, f.feature_id]);
 
   // Draw once the columns have laid out. Coordinates are relative to .flow-inner;
   // connect the source card's right edge to the target's left, horizontal-tangent.
@@ -706,25 +718,13 @@ function buildFlowGraph(features, stageOf) {
   return { wrap, edges: edgeList.length };
 }
 
-function featureCard(f, candidates = [], projects = []) {
-  // Expandable box: collapsed shows title + status/owner pills + a one-line
-  // summary preview; expanded reveals the editable fields, docs, and blockers.
-  const c = el("details", { className: "card feature" });
-  // Spec tasks (implementation plan) → side-bar colour: all done = green,
-  // any still open = sunset orange. No tasks = no side bar.
-  const tasks = f.tasks || [];
-  const doneCount = tasks.filter((t) => t.status === "done").length;
-  if (tasks.length) c.classList.add("has-tasks", doneCount === tasks.length ? "tasks-done" : "tasks-open");
-  const sum = el("summary", { className: "feature-head" });
-  sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)"));
-  const meta = el("span", { className: "feature-meta" });
-  meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: SLABEL[f.roadmap_status] || f.roadmap_status }));
-  if (f.owner) meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: f.owner }));
-  if (f.open_flags?.length) meta.append(el("span", { className: "pill warn", textContent: f.open_flags.length + " ⚑" }));
-  sum.append(meta);
-  c.append(sum);
-  if (f.summary) c.append(el("div", { className: "feature-preview muted" }, f.summary));
-
+// The editable form for one feature: title / status / project / summary /
+// depends-on, then tasks, then specs and docs in their own sections, then open
+// flags. Returns { node, save } — `node` carries no Save button (the caller
+// supplies one: inline in the Board card, or the modal footer), and `save()`
+// performs the PATCH + blockers PUT. Shared by the Board card's inline expand
+// and the click-to-open edit modal so there is exactly one editor.
+function featureForm(f, candidates = [], projects = []) {
   const body = el("div", { className: "feature-body" });
 
   // editable: title / status / summary / sort
@@ -746,10 +746,10 @@ function featureCard(f, candidates = [], projects = []) {
   let prevProject = project.value;
   project.onchange = async () => {
     if (project.value !== NEW) { prevProject = project.value; return; }
-    const title = (prompt("New work-stream name:") || "").trim();
-    if (!title) { project.value = prevProject; return; }
+    const name = (prompt("New work-stream name:") || "").trim();
+    if (!name) { project.value = prevProject; return; }
     try {
-      const p = await api("/projects", "POST", { title });
+      const p = await api("/projects", "POST", { title: name });
       const opt = el("option", { value: String(p.project_id), textContent: p.title });
       project.insertBefore(opt, newOpt);
       project.value = String(p.project_id);
@@ -774,19 +774,6 @@ function featureCard(f, candidates = [], projects = []) {
     }
   }
 
-  const save = el("button", { className: "act", textContent: "save feature" });
-  save.onclick = async () => {
-    try {
-      await api("/roadmap/" + f.feature_id, "PATCH",
-                { title: title.value, roadmap_status: status.value, summary: summary.value,
-                  project_id: project.value && project.value !== NEW ? Number(project.value) : null });
-      if (blockerSelect) {
-        const ids = [...blockerSelect.selectedOptions].map((o) => Number(o.value));
-        await api("/roadmap/" + f.feature_id + "/blockers", "PUT", { blocked_by: ids });
-      }
-      setStatus("feature saved"); load("roadmap");
-    } catch (e) { toast("error: " + e.message); }
-  };
   const gridKids = [
     el("span", { className: "k" }, "title"), title,
     el("span", { className: "k" }, "status"), status,
@@ -795,9 +782,11 @@ function featureCard(f, candidates = [], projects = []) {
   ];
   if (blockerSelect) gridKids.push(
     el("span", { className: "k" }, "depends on"), blockerSelect);
-  body.append(el("div", { className: "grid2" }, ...gridKids), save);
+  body.append(el("div", { className: "grid2" }, ...gridKids));
 
   // tasks — the spec's implementation plan, in order; done = checked + struck
+  const tasks = f.tasks || [];
+  const doneCount = tasks.filter((t) => t.status === "done").length;
   if (tasks.length) {
     body.append(el("label", { className: "k", textContent: `tasks (${doneCount}/${tasks.length})` }));
     const ul = el("ul", { className: "task-list" });
@@ -811,9 +800,23 @@ function featureCard(f, candidates = [], projects = []) {
     body.append(ul);
   }
 
-  // documents — specs (editable/frozen per state) then docs (read-only here;
-  // the Docs tab is where docs are edited)
-  for (const d of f.documents || []) body.append(docBlock(d, { readOnly: d.kind === "doc" }));
+  // documents — specs (editable/frozen per state) and docs (read-only here; the
+  // Docs tab is where docs are edited) shown in their own labelled sections.
+  const docs = f.documents || [];
+  const specs = docs.filter((d) => d.kind !== "doc");
+  const reads = docs.filter((d) => d.kind === "doc");
+  if (specs.length) {
+    const sec = el("div", { className: "doc-section" });
+    sec.append(el("label", { className: "k", textContent: "specs" }));
+    for (const d of specs) sec.append(docBlock(d, { readOnly: false }));
+    body.append(sec);
+  }
+  if (reads.length) {
+    const sec = el("div", { className: "doc-section" });
+    sec.append(el("label", { className: "k", textContent: "docs" }));
+    for (const d of reads) sec.append(docBlock(d, { readOnly: true }));
+    body.append(sec);
+  }
 
   // open flags = blockers
   if (f.open_flags?.length) {
@@ -822,7 +825,72 @@ function featureCard(f, candidates = [], projects = []) {
     for (const x of f.open_flags) fl.append(el("div", { className: "tag" }, `${x.display_name || ""} ${x.description || ""}`));
     body.append(fl);
   }
-  c.append(body);
+
+  const save = async () => {
+    await api("/roadmap/" + f.feature_id, "PATCH",
+              { title: title.value, roadmap_status: status.value, summary: summary.value,
+                project_id: project.value && project.value !== NEW ? Number(project.value) : null });
+    if (blockerSelect) {
+      const ids = [...blockerSelect.selectedOptions].map((o) => Number(o.value));
+      await api("/roadmap/" + f.feature_id + "/blockers", "PUT", { blocked_by: ids });
+    }
+  };
+
+  return { node: body, save };
+}
+
+// Click-to-open edit modal — the same editor as the Board card's inline expand,
+// reachable from any card (small Flow cards, shipped cards, and the Board card's
+// ⤢ button). Save bottom-left / Cancel bottom-right; reloads the roadmap on save.
+function openFeatureModal(f, candidates = [], projects = []) {
+  const { node, save } = featureForm(f, candidates, projects);
+  const saveBtn = el("button", { className: "act primary", type: "button", textContent: "Save" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const close = openModal({
+    title: f.title || "(untitled)", bodyNode: node, footNodes: [saveBtn, cancel],
+    width: 680, height: 720,
+  });
+  saveBtn.onclick = async () => {
+    saveBtn.disabled = true; saveBtn.textContent = "Saving…";
+    try { await save(); close(); setStatus("feature saved"); load("roadmap"); }
+    catch (e) { toast("error: " + e.message); saveBtn.disabled = false; saveBtn.textContent = "Save"; }
+  };
+  cancel.onclick = close;
+}
+
+function featureCard(f, candidates = [], projects = []) {
+  // Expandable box: collapsed shows title + status/owner pills + a one-line
+  // summary preview; expanded reveals the editable fields, docs, and blockers.
+  // The ⤢ button in the head opens the same editor in a modal.
+  const c = el("details", { className: "card feature" });
+  // Spec tasks (implementation plan) → side-bar colour: all done = green,
+  // any still open = sunset orange. No tasks = no side bar.
+  const tasks = f.tasks || [];
+  const doneCount = tasks.filter((t) => t.status === "done").length;
+  if (tasks.length) c.classList.add("has-tasks", doneCount === tasks.length ? "tasks-done" : "tasks-open");
+  const sum = el("summary", { className: "feature-head" });
+  sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)"));
+  const meta = el("span", { className: "feature-meta" });
+  meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: SLABEL[f.roadmap_status] || f.roadmap_status }));
+  if (f.owner) meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: f.owner }));
+  if (f.open_flags?.length) meta.append(el("span", { className: "pill warn", textContent: f.open_flags.length + " ⚑" }));
+  // modal trigger — preventDefault/stopPropagation so it doesn't toggle <details>
+  const openBtn = el("button", { className: "act ghost feature-open", type: "button",
+    title: "open in editor", textContent: "⤢" });
+  openBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openFeatureModal(f, candidates, projects); };
+  meta.append(openBtn);
+  sum.append(meta);
+  c.append(sum);
+  if (f.summary) c.append(el("div", { className: "feature-preview muted" }, f.summary));
+
+  const { node, save } = featureForm(f, candidates, projects);
+  const saveBtn = el("button", { className: "act", textContent: "save feature" });
+  saveBtn.onclick = async () => {
+    try { await save(); setStatus("feature saved"); load("roadmap"); }
+    catch (e) { toast("error: " + e.message); }
+  };
+  node.append(saveBtn);
+  c.append(node);
   return c;
 }
 
