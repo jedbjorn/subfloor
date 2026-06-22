@@ -292,6 +292,77 @@ sc_vm_broker_uninstall() {
   echo "→ vm-broker systemd unit removed ($VM_BROKER_UNIT)"
 }
 
+# ── Tailnet broker (HOST-side; drives the tailnet for sandboxed forks) ─────────
+# Sibling of the vm-broker: the sandbox can't join the tailnet (no route, no TUN,
+# no NET_ADMIN) and must not hold a tailnet credential. This host process owns the
+# already-`tailscale up` node and listens on a unix socket in the bind-mounted
+# engine dir so the `tailscale` skill (in the container) can curl it without a
+# route or a key. Refuses to run in the sandbox (ts_broker.py guards on SC_SANDBOX).
+# Same supervision model as vm-broker: `launch` brings it up / `down` stops it when
+# a tailnet is linked; `ts-broker-install` writes a systemd --user unit for
+# reboot-survival. `up` no-ops when the socket already answers; `down` only stops
+# what IT started (the pidfile), never a systemd-managed broker.
+TS_BROKER_PID="$ENGINE/run/ts-broker.pid"
+TS_BROKER_UNIT="sc-ts-broker-$(basename "$here").service"
+
+sc_ts_broker_alive() {
+  sock="$("$PY" "$S/ts.py" sock)"
+  [ -S "$sock" ] || return 1
+  curl -s --unix-socket "$sock" http://ts/health 2>/dev/null | grep -q '"ok": true'
+}
+sc_ts_broker_up() {
+  if ! "$PY" "$S/ts.py" configured; then
+    echo "→ ts-broker: no tailnet linked (instance.json has no \`ts\` block) — nothing to serve"; return 0
+  fi
+  if sc_ts_broker_alive; then echo "→ ts-broker already serving $("$PY" "$S/ts.py" sock)"; return 0; fi
+  mkdir -p "$ENGINE/run"
+  nohup "$PY" "$ENGINE/api/ts_broker.py" >"$ENGINE/run/ts-broker.log" 2>&1 &
+  echo $! > "$TS_BROKER_PID"
+  echo "→ ts-broker up (pid $!) · socket $("$PY" "$S/ts.py" sock) · log $ENGINE/run/ts-broker.log"
+}
+sc_ts_broker_down() {
+  if [ -f "$TS_BROKER_PID" ] && kill -0 "$(cat "$TS_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$TS_BROKER_PID")" && echo "→ ts-broker stopped"
+  elif sc_ts_broker_alive; then
+    echo "→ ts-broker is running but not from \`ts-broker-up\` (systemd?) — leaving it; use ts-broker-uninstall"
+  else
+    echo "→ ts-broker not running"
+  fi
+  rm -f "$TS_BROKER_PID"
+}
+sc_ts_broker_install() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ ts-broker-install: systemd (systemctl) not found on this host" >&2; return 1; }
+  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/$TS_BROKER_UNIT" <<UNIT
+[Unit]
+Description=super-coder ts-broker ($(basename "$here")) — host-side tailnet broker
+After=network.target tailscaled.service
+
+[Service]
+ExecStart=$PY $ENGINE/api/ts_broker.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+  # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
+  sc_ts_broker_down >/dev/null 2>&1 || true
+  systemctl --user enable --now "$TS_BROKER_UNIT"
+  echo "→ ts-broker installed as systemd --user unit: $TS_BROKER_UNIT (enabled, started, linger on)"
+  echo "  status: systemctl --user status $TS_BROKER_UNIT   ·   logs: journalctl --user -u $TS_BROKER_UNIT"
+}
+sc_ts_broker_uninstall() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ ts-broker-uninstall: systemd not found" >&2; return 1; }
+  systemctl --user disable --now "$TS_BROKER_UNIT" 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$TS_BROKER_UNIT"
+  systemctl --user daemon-reload
+  echo "→ ts-broker systemd unit removed ($TS_BROKER_UNIT)"
+}
+
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
@@ -322,6 +393,13 @@ case "$cmd" in
   vm-broker-sock)    exec "$PY" "$S/vm.py" sock ;;
   vm-broker-install)   sc_vm_broker_install ;;
   vm-broker-uninstall) sc_vm_broker_uninstall ;;
+  # ── Tailnet broker (HOST-side primitive — runs where the tailnet node lives) ──
+  ts-broker)         exec "$PY" "$ENGINE/api/ts_broker.py" "$@" ;;
+  ts-broker-up)      sc_ts_broker_up ;;
+  ts-broker-down)    sc_ts_broker_down ;;
+  ts-broker-sock)    exec "$PY" "$S/ts.py" sock ;;
+  ts-broker-install)   sc_ts_broker_install ;;
+  ts-broker-uninstall) sc_ts_broker_uninstall ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   deps)         sc_deps "$@" ;;
@@ -376,11 +454,14 @@ case "$cmd" in
     # Bring the VM broker up alongside the sandbox when a VM is linked (self-skips
     # otherwise, and no-ops if systemd already owns it). The shells need it to
     # drive the VM; this keeps it from being a forgotten manual step.
-    sc_vm_broker_up || true ;;
+    sc_vm_broker_up || true
+    # Same for the tailnet broker — self-skips when no `ts` block is linked.
+    sc_ts_broker_up || true ;;
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
-                sc_vm_broker_down ;;
+                sc_vm_broker_down
+                sc_ts_broker_down ;;
   restart)      "$0" down; exec "$0" launch "$@" ;;
   build)        dcheck; dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
@@ -442,6 +523,16 @@ super-coder — forkable shell substrate
   ./sc vm-broker-sock      print the broker's socket path
   ./sc vm-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc vm-broker-uninstall remove the systemd unit
+
+  Tailnet broker (run on the HOST — drives the tailnet for sandboxed forks; holds
+  the already-`tailscale up` node so the fork never holds a tailnet credential.
+  See docs/tailscale-broker.md). `launch` brings it up when a tailnet is linked:
+  ./sc ts-broker           run the broker in the foreground (unix socket)
+  ./sc ts-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
+  ./sc ts-broker-down      stop the backgrounded broker
+  ./sc ts-broker-sock      print the broker's socket path
+  ./sc ts-broker-install   supervise via a systemd --user unit (survives logout/reboot)
+  ./sc ts-broker-uninstall remove the systemd unit
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health

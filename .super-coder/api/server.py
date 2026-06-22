@@ -45,6 +45,7 @@ import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
+import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -767,6 +768,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"scripts": script_list()})
             if path == "/api/vm":
                 return self._send(200, {"vm": vm_mod.read()})
+            if path == "/api/ts":
+                return self._send(200, {"ts": ts_mod.read()})
+            if path == "/api/ts/status":
+                # Live tailnet view. Needs the host node, so proxy to the
+                # ts-broker in the sandbox; call directly on the no-docker host.
+                if os.environ.get("SC_SANDBOX"):
+                    try:
+                        return self._send(200, ts_mod.broker_call("GET", "/status"))
+                    except ConnectionError:
+                        return self._send(503, {
+                            "ok": False,
+                            "output": "tailnet status needs the host ts-broker — "
+                                      "start it with `./sc ts-broker-up` on the host."})
+                return self._send(200, ts_mod.do_status())
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
@@ -832,6 +847,27 @@ class Handler(BaseHTTPRequestHandler):
                 if r is None:
                     return self._send(404, {"error": "no such check"})
                 return self._send(200, r)
+            if path.startswith("/api/ts/validate/"):
+                # One live tailnet check against the candidate `ts` block. The
+                # checks run the tailscale CLI, which only works on the HOST; in
+                # the sandbox, proxy to the ts-broker. Mirror of the vm path.
+                check = path.rsplit("/", 1)[1]
+                cfg = self._body().get("ts") or {}
+                if os.environ.get("SC_SANDBOX"):
+                    try:
+                        r = ts_mod.broker_call("POST", f"/validate/{check}", {"ts": cfg})
+                    except ConnectionError:
+                        return self._send(503, {
+                            "ok": False, "check": check,
+                            "output": "live checks need the host ts-broker — start it "
+                                      "with `./sc ts-broker-up` on the host, then retry."})
+                    if r.get("error") == "no such check":
+                        return self._send(404, {"error": "no such check"})
+                    return self._send(200, r)
+                r = ts_mod.validate(check, cfg)
+                if r is None:
+                    return self._send(404, {"error": "no such check"})
+                return self._send(200, r)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
@@ -874,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         # grant toggle: PUT /api/shells/{id}/skills/{skill_id}  {granted: bool}
         # vm block:     PUT /api/vm  {vm: {...}}  (persists to instance.json)
+        # ts block:     PUT /api/ts  {ts: {...}}  (persists to instance.json)
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         con = db()
@@ -887,6 +924,11 @@ class Handler(BaseHTTPRequestHandler):
                 if vm is not None and not isinstance(vm, dict):
                     return self._send(400, {"error": "vm must be an object"})
                 return self._send(200, {"ok": True, "vm": vm_mod.write(vm)})
+            if path == "/api/ts":
+                tsb = self._body().get("ts")
+                if tsb is not None and not isinstance(tsb, dict):
+                    return self._send(400, {"error": "ts must be an object"})
+                return self._send(200, {"ok": True, "ts": ts_mod.write(tsb)})
             # PUT /api/roadmap/{id}/blockers  {blocked_by: [ids]} — replace the
             # feature's blocker set (empty list clears it).
             if len(parts) == 4 and parts[1] == "roadmap" and parts[3] == "blockers":
