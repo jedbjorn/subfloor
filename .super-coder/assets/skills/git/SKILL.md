@@ -62,6 +62,25 @@ you're mid-session about to start new work — run the gate yourself:
 3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
    directive from the FnB — opening is the default, merging is a separate gate.
 
+## When the FnB has you merge a stack — retarget first
+
+Merging stays the FnB's call (above). But when they *do* hand you a stack to land
+— PR B cut from PR A's branch, so B's base isn't `main` — adopt **one rule for
+stacks: retarget the next PR's base to `main` before merging the one beneath
+it.**
+
+```
+gh pr edit <B> --base main          # first — re-root B onto main
+gh pr merge <A> --squash --delete-branch
+gh pr merge <B> --squash --delete-branch
+```
+
+`--delete-branch` removes A's head branch — which is B's base ref. Merge A first
+and GitHub closes B as `CONFLICTING` with its base gone, then blocks reopen;
+recovery is a local rebase + force-push + a fresh PR. Retargeting B onto `main`
+first costs one command and sidesteps all of it. Same rule for a taller stack:
+retarget each PR to `main` just before the one under it merges, bottom up.
+
 ## Finish before you stop
 
 The bookend to "sync before you start." **Before you go dormant, land or surface
