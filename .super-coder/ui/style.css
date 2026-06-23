@@ -538,6 +538,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .flow-card { cursor: pointer; }
 .flow-card:hover { border-color: rgba(255,255,255,.25); }
 /* Shipped column — a compact, wire-free "done" list on the left. */
+.flow-col.shipped { gap: 4px; }
 .flow-col.shipped .flow-card { padding: .45rem .6rem; }
 .flow-col.shipped .flow-card-title { font-size: .8rem; font-weight: 500; }
 .flow-doc-link { font-size: .72rem; color: var(--accent); text-decoration: none; white-space: nowrap; }
