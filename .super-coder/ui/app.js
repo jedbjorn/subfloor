@@ -618,20 +618,24 @@ function buildFlowGraph(features, stageOf, candidates = [], projects = []) {
       const full = f.title || "(untitled)";
       const shown = s === "shipped" && full.length > 32 ? full.slice(0, 31).trimEnd() + "…" : full;
       card.append(el("div", { className: "flow-card-title", title: full }, shown));
-      const m = el("div", { className: "flow-card-meta" });
-      if (f.owner) m.append(el("span", { className: "pill " + s }, f.owner));
-      if (f.open_flags?.length) m.append(el("span", { className: "pill warn" }, f.open_flags.length + " ⚑"));
-      if (m.childNodes.length) card.append(m);
-      // md-converter open-links, one per spec/doc (same /open redirect the Board
-      // card uses). Compact: "spec v1 ↗" / "doc ↗".
-      const docs = f.documents || [];
-      if (docs.length) {
-        const dl = el("div", { className: "flow-card-docs" });
-        for (const d of docs) dl.append(el("a", {
-          className: "flow-doc-link", href: "/api/documents/" + d.document_id + "/open",
-          target: "_blank", rel: "noopener",
-          textContent: (d.kind === "doc" ? "doc" : `${d.kind} v${d.seq}`) + " ↗" }));
-        card.append(dl);
+      // Shipped cards are a title-only "done" list — no owner pill, flag count,
+      // or doc links. The other stages carry the full meta + doc rows.
+      if (s !== "shipped") {
+        const m = el("div", { className: "flow-card-meta" });
+        if (f.owner) m.append(el("span", { className: "pill " + s }, f.owner));
+        if (f.open_flags?.length) m.append(el("span", { className: "pill warn" }, f.open_flags.length + " ⚑"));
+        if (m.childNodes.length) card.append(m);
+        // md-converter open-links, one per spec/doc (same /open redirect the Board
+        // card uses). Compact: "spec v1 ↗" / "doc ↗".
+        const docs = f.documents || [];
+        if (docs.length) {
+          const dl = el("div", { className: "flow-card-docs" });
+          for (const d of docs) dl.append(el("a", {
+            className: "flow-doc-link", href: "/api/documents/" + d.document_id + "/open",
+            target: "_blank", rel: "noopener",
+            textContent: (d.kind === "doc" ? "doc" : `${d.kind} v${d.seq}`) + " ↗" }));
+          card.append(dl);
+        }
       }
       // Click anywhere on the card (except a doc link) opens the edit modal.
       card.onclick = (e) => { if (e.target.closest("a")) return; openFeatureModal(f, candidates, projects); };
