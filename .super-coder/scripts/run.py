@@ -726,7 +726,16 @@ def main() -> None:
         print("→ RENDER_ONLY set — not exec'ing the harness.")
         return
 
-    cmd = (adapter.get("launch") or [harness]) + model_args + sandbox_flags
+    # --name labels the session in the harness prompt box, resume picker, and
+    # the terminal title — the cross-terminal way to show which shell you're in
+    # (Konsole's tab is patched separately, since it ignores the program title).
+    # Adapter-declared, so only harnesses that support it (claude) get the flag.
+    name_args: list[str] = []
+    ncfg = adapter.get("name") or {}
+    if ncfg.get("flag") and full["display_name"]:
+        name_args = [ncfg["flag"], full["display_name"]]
+
+    cmd = (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
     # The booted shell's flavor, inherited by everything the harness spawns.
     # branch-guard.sh reads it to exempt the admin shell (which works on main
@@ -738,9 +747,42 @@ def main() -> None:
     # so it is absent from worktrees; a worktree-relative path failed open). This
     # just saves a subshell per edit on the normal launch path.
     env["SC_ENGINE_DIR"] = str(ENGINE)
+    set_terminal_tab_title(full["display_name"])
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
     os.execvpe(cmd[0], cmd, env)
+
+
+def set_terminal_tab_title(name: str) -> None:
+    """Best-effort: pin this Konsole tab's title to the shell's name.
+
+    Konsole's default tab format is ``%d : %n`` (dir : program), which ignores
+    the window-title escapes the harness emits — so the tab never shows which
+    shell you're talking to. We run *inside* the shell's Konsole session, so we
+    set that session's tab title format to a literal over DBus (the same thing
+    the GUI "Rename Tab" does). It persists for the tab and survives the
+    harness's own title updates. No-op outside Konsole or if qdbus is absent.
+
+    Non-Konsole terminals get the name via the harness itself (e.g. claude's
+    ``--name`` writes it into the window title); this only patches Konsole's
+    tab, which the standard title escapes can't reach.
+    """
+    svc = os.environ.get("KONSOLE_DBUS_SERVICE")
+    sess = os.environ.get("KONSOLE_DBUS_SESSION")
+    if not (svc and sess and name):
+        return
+    qdbus = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus:
+        return
+    for ctx in ("0", "1"):  # 0 = local, 1 = remote (ssh) tab-title context
+        try:
+            subprocess.run(
+                [qdbus, svc, sess,
+                 "org.kde.konsole.Session.setTabTitleFormat", ctx, name],
+                check=False, capture_output=True, timeout=3,
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
