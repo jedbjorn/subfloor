@@ -5,6 +5,7 @@
   "emit": [],
   "env": {},
   "model": { "flag": "--model" },
+  "name": { "flag": "--name" },
   "merge_json": {
     ".claude/settings.local.json": {
       "hooks": {
