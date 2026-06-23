@@ -112,23 +112,27 @@ _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
     -name "$1" -type f -print
 }
 
-# Install the fork's deps into the bind-mounted repo: one repo-root .venv from every
-# requirements*.txt (fork pins win), then an engine baseline test kit layered on with
-# only-if-needed so `./sc test` works even if the fork's reqs omit pytest; plus
-# `npm ci` for each package.json. Discovery is a glob walk (map-independent — runs on
-# a fresh fork before `./sc map`). A map-backed fast path would read dr_filepath.path
-# (dr_dependency.source_file is basename-only, so it can't locate a manifest's dir).
+# Install the fork's deps into the bind-mounted repo: always a repo-root .venv with
+# the engine baseline dev kit (pytest/ruff/mypy/...), plus every requirements*.txt
+# layered in first with fork pins winning; plus `npm ci` for each package.json.
+# Discovery is a glob walk (map-independent — runs on a fresh fork before `./sc map`).
+# A map-backed fast path would read dr_filepath.path (dr_dependency.source_file is
+# basename-only, so it can't locate a manifest's dir).
 sc_deps() {
   rc=0
   venv="$here/.venv"
   reqs="$(_sc_find_manifests 'requirements*.txt')"
   base_reqs="$(printf '%s\n' "$reqs" | grep -v 'requirements-dev\.txt' || true)"
+  # The engine dev kit lives in this .venv, so create it unconditionally — a fork
+  # that declares no requirements*.txt still needs pytest on hand for `./sc test`
+  # and for shells writing tests. (Previously the venv + kit were gated on $base_reqs,
+  # which left pure-JS and undeclared-dep forks with no pytest at all.)
+  if [ ! -x "$venv/bin/python" ]; then
+    echo "→ deps: creating $venv"
+    "$PY" -m venv "$venv" || { echo "✗ deps: venv create failed" >&2; return 1; }
+  fi
+  # Fork pins first (authoritative), with a sibling requirements-dev.txt if present.
   if [ -n "$base_reqs" ]; then
-    if [ ! -x "$venv/bin/python" ]; then
-      echo "→ deps: creating $venv"
-      "$PY" -m venv "$venv" || { echo "✗ deps: venv create failed" >&2; return 1; }
-    fi
-    # Fork pins first (authoritative), with a sibling requirements-dev.txt if present.
     printf '%s\n' "$base_reqs" | while IFS= read -r req; do
       [ -n "$req" ] || continue
       echo "→ deps: pip install -r $req"
@@ -139,12 +143,12 @@ sc_deps() {
         "$venv/bin/pip" install -q -r "$dev" || exit 1
       fi
     done || rc=1
-    # Engine baseline dev kit — test (pytest/httpx/coverage), lint+format (ruff),
-    # type-check (mypy), SQLite GUI (datasette). only-if-needed never overrides a
-    # fork's pin or its [tool.ruff]/[tool.mypy] config — available, not enforced.
-    echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette, only-if-needed)"
-    "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette || rc=1
   fi
+  # Engine baseline dev kit — test (pytest/httpx/coverage), lint+format (ruff),
+  # type-check (mypy), SQLite GUI (datasette). only-if-needed never overrides a
+  # fork's pin or its [tool.ruff]/[tool.mypy] config — available, not enforced.
+  echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette, only-if-needed)"
+  "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette || rc=1
   pkgs="$(_sc_find_manifests 'package.json')"
   if [ -n "$pkgs" ]; then
     printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
@@ -158,7 +162,7 @@ sc_deps() {
     done || rc=1
   fi
   if [ -z "$base_reqs" ] && [ -z "$pkgs" ]; then
-    echo "→ deps: no requirements*.txt or package.json found — nothing to install"
+    echo "→ deps: no fork requirements*.txt or package.json found — engine dev kit only"
   fi
   [ "$rc" -eq 0 ] || { echo "✗ deps: one or more installs failed" >&2; return 1; }
   echo "✓ deps: done"
