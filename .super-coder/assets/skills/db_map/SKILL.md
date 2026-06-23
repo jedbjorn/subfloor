@@ -15,8 +15,8 @@ you need, don't bulk-read.
 **Reads use raw `sqlite3` SELECT; writes go through `./sc mem`.** Two DBs are in
 reach (this engine DB + the app's product DB) with overlapping table names, so a
 raw INSERT against the wrong one succeeds silently. `./sc mem` resolves + guards
-*this* DB and snapshots for you (the `.db` is a cache — un-snapshotted writes are
-lost on rebuild). Table below = the schema for your SELECTs; `## Common writes` =
+*this* DB and writes to the live engine DB — shared by every shell, durable the
+moment it commits. Table below = the schema for your SELECTs; `## Common writes` =
 the `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
@@ -42,7 +42,7 @@ memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
 
 ## Common writes
 
-Each guards the engine DB and snapshots for you. `./sc mem which` orients;
+Each guards the engine DB and writes to the live shared DB. `./sc mem which` orients;
 `./sc mem <cmd> -h` shows flags. Writes target your shell by default (`--shell` to override).
 
 ```
@@ -88,11 +88,10 @@ Each guards the engine DB and snapshots for you. `./sc mem which` orients;
 Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
 reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
 existing shell to a project — are rare; do them with raw `sqlite3` after
-`./sc mem which`, then `./sc snapshot`.)
+`./sc mem which`.)
 
 ## After writing
 
-`./sc mem` snapshots (and renders) for you — nothing more to run; just commit the
-text it serialized. A rare raw `sqlite3` write needs a manual `./sc snapshot` (and
-`./sc render` if you changed documents/roadmap/skills). See the `snapshot` skill
-for the full lifecycle.
+Nothing more to run — the write is live in the shared engine DB the moment it
+commits, visible to every shell. Persisting it to git is an admin/GUI step, not
+yours.

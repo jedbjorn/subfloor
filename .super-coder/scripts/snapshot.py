@@ -23,6 +23,7 @@ import sqlite3
 from pathlib import Path
 
 import map_db  # noqa: E402 — sibling module in scripts/
+from _serialize_guard import require_admin  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -225,6 +226,7 @@ def snapshot_map() -> None:
 
 
 def main() -> int:
+    require_admin("snapshot")
     if not DB_PATH.exists():
         raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
     con = sqlite3.connect(DB_PATH)

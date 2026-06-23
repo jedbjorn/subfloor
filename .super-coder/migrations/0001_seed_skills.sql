@@ -141,13 +141,14 @@ cartographer''s automation (see `surface_catalogue`). You read it.
 
 4. **Set your `current_state`** — replace the install placeholder with what you
    actually found and what you''ll do first (rolling status, ~500 chars). Write it
-   through `./sc mem` (resolves + guards the engine DB, snapshots for you):
+   through `./sc mem` (resolves + guards the engine DB; the write is live in the
+   shared DB at once):
    ```
    ./sc mem state "…"
    ```
 
 5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). Sets
-   `bootstrapped=1` and snapshots for you:
+   `bootstrapped=1` in the shared DB:
    ```
    ./sc mem oriented
    ```
@@ -558,8 +559,8 @@ you need, don''t bulk-read.
 **Reads use raw `sqlite3` SELECT; writes go through `./sc mem`.** Two DBs are in
 reach (this engine DB + the app''s product DB) with overlapping table names, so a
 raw INSERT against the wrong one succeeds silently. `./sc mem` resolves + guards
-*this* DB and snapshots for you (the `.db` is a cache — un-snapshotted writes are
-lost on rebuild). Table below = the schema for your SELECTs; `## Common writes` =
+*this* DB and writes to the live engine DB — shared by every shell, durable the
+moment it commits. Table below = the schema for your SELECTs; `## Common writes` =
 the `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
@@ -585,7 +586,7 @@ memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
 
 ## Common writes
 
-Each guards the engine DB and snapshots for you. `./sc mem which` orients;
+Each guards the engine DB and writes to the live shared DB. `./sc mem which` orients;
 `./sc mem <cmd> -h` shows flags. Writes target your shell by default (`--shell` to override).
 
 ```
@@ -631,14 +632,13 @@ Each guards the engine DB and snapshots for you. `./sc mem which` orients;
 Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
 reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
 existing shell to a project — are rare; do them with raw `sqlite3` after
-`./sc mem which`, then `./sc snapshot`.)
+`./sc mem which`.)
 
 ## After writing
 
-`./sc mem` snapshots (and renders) for you — nothing more to run; just commit the
-text it serialized. A rare raw `sqlite3` write needs a manual `./sc snapshot` (and
-`./sc render` if you changed documents/roadmap/skills). See the `snapshot` skill
-for the full lifecycle.',
+Nothing more to run — the write is live in the shared engine DB the moment it
+commits, visible to every shell. Persisting it to git is an admin/GUI step, not
+yours.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1636,9 +1636,10 @@ close ritual.
 engine DB and the app''s product DB) and their table names overlap — a raw
 `INSERT INTO shell_decisions …` against the wrong one *succeeds silently*.
 `./sc mem` resolves + guards *this* engine DB, refuses the app DB or an empty
-stub, and snapshots the change so it survives a rebuild (no separate
-`./sc snapshot`). `./sc mem which` shows the resolved DB; raw `sqlite3` is for
-SELECT only. Writes default to your shell; pass `--shell <id|name>` to be explicit.
+stub, and writes to the live engine DB — the single source of truth shared by
+every shell, so the change is durable + visible to all the moment it commits.
+`./sc mem which` shows the resolved DB; raw `sqlite3` is for SELECT only. Writes
+default to your shell; pass `--shell <id|name>` to be explicit.
 
 ## current_state — rolling status, NOT a log
 
@@ -1886,7 +1887,7 @@ For each doc, read the file and decide together:
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
 All writes here go through `./sc mem` (it guards the engine DB so the import never
-lands in the app DB, and snapshots each write).
+lands in the app DB, and writes to the live shared DB).
 
 ## 3. Backfill the roadmap
 Create a feature for each coherent area/initiative the docs imply; set status by
@@ -1907,9 +1908,9 @@ planned):
 If a spec describes shipped work, freeze it: `./sc mem doc freeze <document_id>`.
 
 ## 5. Persist
-`./sc mem` already snapshots + renders after each write, so the `_sc` copies and
-the GUI''s Docs/Roadmap tabs reflect the import as you go. (If you made any raw
-writes, run `./sc render && ./sc snapshot` once at the end.)
+Each `./sc mem` write is live in the shared engine DB immediately, so the GUI''s
+Docs/Roadmap tabs reflect the import as you go. The flat `_sc` copies and the git
+commit are an admin/GUI publish step — not part of onboarding.
 
 ## 6. The host''s original files — three exits (optional; coexist by default)
 The DB now holds the canonical copy. Because we render to `_sc/`, the originals
@@ -2201,15 +2202,26 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'snapshot',
-  'Persist DB work to git-tracked text — when and how to run ./sc snapshot / ./sc render. The .db is a cache; text is the source of truth. Snapshot is durability; the GUI Publish button commits + PRs it.',
+  'Persist DB work to git-tracked text — the admin/GUI step that runs ./sc snapshot / ./sc render. The .db is the live shared source of truth; serializing it to git writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.',
   'substrate',
   './sc snapshot',
-  1,
+  0,
   '# snapshot — serialize the DB back to text
 
-The live `shell_db.db` is **gitignored and disposable**. Everything in it
-reconstructs from git-tracked text. So a DB edit that is not serialized is lost
-on the next `./sc rebuild`. This skill is the "save my work" step.
+The live `shell_db.db` is the **single source of truth shared by every shell** —
+a `./sc mem` write is durable and visible to all shells the instant it commits.
+The `.db` is also **gitignored**, so it reconstructs from git-tracked text on
+`./sc rebuild`; an edit not yet serialized is discarded by a rebuild (like an
+uncommitted working tree on a hard reset).
+
+**Serializing is an admin/GUI operation, not a per-write shell step.** It writes
+`.sc-state/` + the flat `_sc` mirror into the **shared MAIN worktree** — running
+it from a shell''s linked worktree churns and collides with other shells. So
+`./sc snapshot` and `./sc render flat` **refuse unless `SC_ADMIN=1`** (the GUI/API,
+`install`, `update`, and `render-check` set it for you). A shell does not run them;
+its writes are captured when admin snapshots (GUI **Publish**/Snapshot button, or
+`SC_ADMIN=1 ./sc snapshot`) before a rebuild. The rest of this skill is for that
+admin/GUI path.
 
 ## The three text serializations
 
@@ -2223,14 +2235,16 @@ The split that matters: **system content propagates via migrations; per-instance
 content stays in the snapshot.** Skill *bodies* are system (migration); which
 shell is *granted* a skill is per-instance (snapshot).
 
-## After editing the DB
+## When admin serializes (the GUI Publish button does all of this)
 
-1. **`./sc snapshot`** — dumps the per-instance tables to
+All commands below require `SC_ADMIN=1` and are run from the **main checkout**.
+
+1. **`SC_ADMIN=1 ./sc snapshot`** — dumps the per-instance tables to
    `.sc-state/content.sql` (deterministic DELETE-then-INSERT in PK order, so
-   re-running is byte-identical → clean diffs). Do this after ANY change to
-   identity, memory, roadmap, documents, flags, projects, or grants.
+   re-running is byte-identical → clean diffs). Captures every shell''s accumulated
+   changes to identity, memory, roadmap, documents, flags, projects, or grants.
 
-2. **`./sc render`** — regenerates the tracked flat `_sc` visibility files
+2. **`SC_ADMIN=1 ./sc render`** — regenerates the tracked flat `_sc` visibility files
    (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run it
    when you changed a document body, the roadmap, or skills. Render is
    incremental — unchanged files aren''t rewritten. (`.claude/skills/` is

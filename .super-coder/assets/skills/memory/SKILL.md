@@ -14,9 +14,10 @@ close ritual.
 engine DB and the app's product DB) and their table names overlap — a raw
 `INSERT INTO shell_decisions …` against the wrong one *succeeds silently*.
 `./sc mem` resolves + guards *this* engine DB, refuses the app DB or an empty
-stub, and snapshots the change so it survives a rebuild (no separate
-`./sc snapshot`). `./sc mem which` shows the resolved DB; raw `sqlite3` is for
-SELECT only. Writes default to your shell; pass `--shell <id|name>` to be explicit.
+stub, and writes to the live engine DB — the single source of truth shared by
+every shell, so the change is durable + visible to all the moment it commits.
+`./sc mem which` shows the resolved DB; raw `sqlite3` is for SELECT only. Writes
+default to your shell; pass `--shell <id|name>` to be explicit.
 
 ## current_state — rolling status, NOT a log
 

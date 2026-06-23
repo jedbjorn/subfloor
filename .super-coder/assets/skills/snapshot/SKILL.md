@@ -1,16 +1,27 @@
 ---
 name: snapshot
-description: Persist DB work to git-tracked text — when and how to run ./sc snapshot / ./sc render. The .db is a cache; text is the source of truth. Snapshot is durability; the GUI Publish button commits + PRs it.
+description: Persist DB work to git-tracked text — the admin/GUI step that runs ./sc snapshot / ./sc render. The .db is the live shared source of truth; serializing it to git writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.
 category: substrate
 command: ./sc snapshot
-common: true
+common: false
 ---
 
 # snapshot — serialize the DB back to text
 
-The live `shell_db.db` is **gitignored and disposable**. Everything in it
-reconstructs from git-tracked text. So a DB edit that is not serialized is lost
-on the next `./sc rebuild`. This skill is the "save my work" step.
+The live `shell_db.db` is the **single source of truth shared by every shell** —
+a `./sc mem` write is durable and visible to all shells the instant it commits.
+The `.db` is also **gitignored**, so it reconstructs from git-tracked text on
+`./sc rebuild`; an edit not yet serialized is discarded by a rebuild (like an
+uncommitted working tree on a hard reset).
+
+**Serializing is an admin/GUI operation, not a per-write shell step.** It writes
+`.sc-state/` + the flat `_sc` mirror into the **shared MAIN worktree** — running
+it from a shell's linked worktree churns and collides with other shells. So
+`./sc snapshot` and `./sc render flat` **refuse unless `SC_ADMIN=1`** (the GUI/API,
+`install`, `update`, and `render-check` set it for you). A shell does not run them;
+its writes are captured when admin snapshots (GUI **Publish**/Snapshot button, or
+`SC_ADMIN=1 ./sc snapshot`) before a rebuild. The rest of this skill is for that
+admin/GUI path.
 
 ## The three text serializations
 
@@ -24,14 +35,16 @@ The split that matters: **system content propagates via migrations; per-instance
 content stays in the snapshot.** Skill *bodies* are system (migration); which
 shell is *granted* a skill is per-instance (snapshot).
 
-## After editing the DB
+## When admin serializes (the GUI Publish button does all of this)
 
-1. **`./sc snapshot`** — dumps the per-instance tables to
+All commands below require `SC_ADMIN=1` and are run from the **main checkout**.
+
+1. **`SC_ADMIN=1 ./sc snapshot`** — dumps the per-instance tables to
    `.sc-state/content.sql` (deterministic DELETE-then-INSERT in PK order, so
-   re-running is byte-identical → clean diffs). Do this after ANY change to
-   identity, memory, roadmap, documents, flags, projects, or grants.
+   re-running is byte-identical → clean diffs). Captures every shell's accumulated
+   changes to identity, memory, roadmap, documents, flags, projects, or grants.
 
-2. **`./sc render`** — regenerates the tracked flat `_sc` visibility files
+2. **`SC_ADMIN=1 ./sc render`** — regenerates the tracked flat `_sc` visibility files
    (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run it
    when you changed a document body, the roadmap, or skills. Render is
    incremental — unchanged files aren't rewritten. (`.claude/skills/` is

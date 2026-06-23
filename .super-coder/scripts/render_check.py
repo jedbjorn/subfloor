@@ -19,6 +19,7 @@ content.sql), so the check compares the committed mirror against the committed
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,7 @@ def main() -> int:
     rendered = subprocess.run(
         [sys.executable, str(ENGINE / "scripts" / "render.py"), "flat"],
         cwd=str(REPO_ROOT),
+        env={**os.environ, "SC_ADMIN": "1"},  # CI/admin verify — clear serialize guard
     )
     if rendered.returncode != 0:
         return rendered.returncode
