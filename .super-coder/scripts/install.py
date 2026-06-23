@@ -633,9 +633,11 @@ def main(argv: list[str]) -> int:
     subprocess.run([PY, str(ENGINE / "scripts/map_setup.py")])
 
     # 8. Persist: snapshot + render ------------------------------------------
+    # Admin/setup surface — pass SC_ADMIN so the serialize guard lets it through.
     step("Serializing + rendering")
-    subprocess.run([PY, str(ENGINE / "scripts/snapshot.py")])
-    subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"])
+    admin_env = {**os.environ, "SC_ADMIN": "1"}
+    subprocess.run([PY, str(ENGINE / "scripts/snapshot.py")], env=admin_env)
+    subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"], env=admin_env)
 
     # 8.5 Wire `make` aliases. The `dos-` prefix can't collide with the fork's own
     # targets, so we append the include rather than leave it to the operator (#13

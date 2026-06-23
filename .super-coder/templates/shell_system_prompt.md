@@ -26,10 +26,11 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
 lns · decision · flag · roadmap · doc · narrative): it resolves + guards *this*
 engine DB — refusing the app DB or a stray empty file, whose overlapping table
-names would let a raw `sqlite3` INSERT hit the wrong DB silently — and snapshots
-the change for you. Raw `sqlite3` is for SELECT only. `./sc mem which` to orient;
-`./sc snapshot` (+ `./sc render` for docs/roadmap/skills) after any non-`mem`
-edit. See the `memory`, `db_map`, and `snapshot` skills.
+names would let a raw `sqlite3` INSERT hit the wrong DB silently. The write lands
+in the live engine DB — the single source of truth shared by every shell, durable
+and visible to all at once. That is the whole write: **you don't snapshot or
+render** — persisting to git is an admin/GUI step. Raw `sqlite3` is for SELECT only;
+`./sc mem which` to orient. See the `memory` and `db_map` skills.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by

@@ -450,8 +450,11 @@ def run_script(key: str) -> dict | None:
         return None
     argv = spec[2]
     try:
+        # The API is the admin/GUI surface — snapshot/render here are sanctioned,
+        # so pass SC_ADMIN to clear the serialize guard (see _serialize_guard.py).
         p = subprocess.run(argv, capture_output=True, text=True,
-                           cwd=str(REPO_ROOT), timeout=180)
+                           cwd=str(REPO_ROOT), timeout=180,
+                           env={**os.environ, "SC_ADMIN": "1"})
         return {"ok": p.returncode == 0, "code": p.returncode,
                 "output": (p.stdout + p.stderr).strip() or "(no output)"}
     except subprocess.TimeoutExpired:

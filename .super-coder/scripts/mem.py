@@ -15,9 +15,13 @@ Every write here:
     cwd/worktree-proof — never a guess;
   • `assert_engine_db()` first — rejects 0-byte stubs and any DB lacking the
     engine sentinels / carrying product sentinels; fails LOUD with the path;
-  • snapshots + renders after the write (unless --no-sync) so the change
-    survives a `./sc rebuild` — the engine DB is gitignored + rebuilt-from-text,
-    so an un-snapshotted write is lost on the next rebuild.
+  • writes to the live engine DB and stops there — the DB is the single source of
+    truth shared by every shell, so the write is immediately durable + visible to
+    all. It does NOT serialize: persisting to git (`.sc-state/` + flat `_sc`) writes
+    the shared MAIN worktree and is an admin/GUI publish step, not a shell's job.
+    The DB is gitignored + rebuilt-from-text, so admin snapshots (GUI button or
+    `SC_ADMIN=1 ./sc snapshot`) to capture accumulated shell writes before a
+    `./sc rebuild` — like committing a working tree before a hard reset.
 
 Run from the repo root, like every engine command:
 
@@ -47,8 +51,9 @@ Run from the repo root, like every engine command:
     ./sc mem message send <to-shortname> "<body>"     # from = you
     ./sc mem message mark-read <message_id>
 
-Common flags: --no-sync (skip snapshot+render), --db <path> (override target;
-still guarded — used by tests).
+Common flags: --db <path> (override target; still guarded — used by tests).
+(`--no-sync` is accepted but now a no-op: mem never serializes — that is an
+admin/GUI step.)
 """
 from __future__ import annotations
 
@@ -154,29 +159,18 @@ def resolve_shell(con: sqlite3.Connection, spec: str | None) -> int:
     die(f"could not infer the shell — pass --shell <id|shortname>. candidates: {listing}")
 
 
-# ── snapshot + render (durability) ────────────────────────────────────────────
-
-def sync() -> None:
-    """Serialize the DB to text + re-render flat files, so the write persists a
-    rebuild. Same ritual as `./sc snapshot && ./sc render flat`, run for you."""
-    for name, sargs in (("snapshot.py", []), ("render.py", ["flat"])):
-        r = subprocess.run([sys.executable, str(SCRIPTS / name), *sargs],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"mem: {name} failed (write committed, NOT yet serialized):\n"
-                  f"{r.stderr.strip()}", file=sys.stderr)
-            return
-        tail = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
-        if tail:
-            print(f"  sync: {tail[-1]}")
+# ── write durability ──────────────────────────────────────────────────────────
+# A `./sc mem` write lands in the live engine DB, which is the single source of
+# truth shared by every shell. That is durable for the running system — the write
+# is immediately visible to all shells. Serializing it to git (`.sc-state/` +
+# flat `_sc` mirror) writes into the shared MAIN worktree, so it is an admin/GUI
+# publish step, NOT a per-write side-effect of a shell's work. See _serialize_guard.
 
 
 def finish(args, summary: str) -> int:
     print(summary)
-    if getattr(args, "no_sync", False):
-        print("  (--no-sync: not serialized — run `./sc snapshot && ./sc render flat` to persist)")
-    else:
-        sync()
+    print("  (live in the shared engine DB — serialize to git via the GUI Snapshot "
+          "button, or as admin: SC_ADMIN=1 ./sc snapshot && ./sc render flat)")
     return 0
 
 
@@ -619,7 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     # natural position (`./sc mem state "…" --shell cc`), not only before it.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=str(DEFAULT_DB), help="engine DB path (default: the fork's)")
-    common.add_argument("--no-sync", action="store_true", help="skip snapshot+render after the write")
+    common.add_argument("--no-sync", action="store_true",
+                        help="accepted for back-compat; no-op (mem never serializes — admin/GUI step)")
     common.add_argument("--shell", help="target shell id or shortname (default: inferred)")
 
     p = argparse.ArgumentParser(prog="sc mem", description="engine memory write surface")

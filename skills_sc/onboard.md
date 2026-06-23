@@ -36,7 +36,7 @@ For each doc, read the file and decide together:
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
 All writes here go through `./sc mem` (it guards the engine DB so the import never
-lands in the app DB, and snapshots each write).
+lands in the app DB, and writes to the live shared DB).
 
 ## 3. Backfill the roadmap
 Create a feature for each coherent area/initiative the docs imply; set status by
@@ -57,9 +57,9 @@ planned):
 If a spec describes shipped work, freeze it: `./sc mem doc freeze <document_id>`.
 
 ## 5. Persist
-`./sc mem` already snapshots + renders after each write, so the `_sc` copies and
-the GUI's Docs/Roadmap tabs reflect the import as you go. (If you made any raw
-writes, run `./sc render && ./sc snapshot` once at the end.)
+Each `./sc mem` write is live in the shared engine DB immediately, so the GUI's
+Docs/Roadmap tabs reflect the import as you go. The flat `_sc` copies and the git
+commit are an admin/GUI publish step — not part of onboarding.
 
 ## 6. The host's original files — three exits (optional; coexist by default)
 The DB now holds the canonical copy. Because we render to `_sc/`, the originals

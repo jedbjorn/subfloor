@@ -41,6 +41,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -96,7 +97,10 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def run_script(name: str) -> None:
-    if subprocess.run([PY, str(ENGINE / "scripts" / name)]).returncode != 0:
+    # update is an admin operation — pass SC_ADMIN so snapshot/render clear the
+    # serialize guard (harmless for non-serializing scripts like map_setup.py).
+    env = {**os.environ, "SC_ADMIN": "1"}
+    if subprocess.run([PY, str(ENGINE / "scripts" / name)], env=env).returncode != 0:
         sys.exit(f"update: {name} failed.")
 
 
