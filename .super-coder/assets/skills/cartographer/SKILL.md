@@ -86,7 +86,11 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    Spot-check that your `role_overrides` took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE 'cmd/%';`
 
-5. **Commit** the config + hooks (`git` skill), set your state
+5. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
+   and fill every `desc IS NULL` file before continuing. The worklist must be
+   empty when you leave.
+
+6. **Commit** the config + hooks (`git` skill), set your state
    (`./sc mem state "…"`), then `./sc mem oriented` (sets `bootstrapped=1` +
    snapshots).
 
@@ -99,16 +103,20 @@ clone where the hooks never got wired.
 1. Re-inspect (step 1) — what changed?
 2. Edit `.sc-state/map.config.json` to match (step 2).
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
-4. Verify (step 4) + commit.
+4. Verify (step 4).
+5. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
+   and fill every `desc IS NULL` file. The worklist must be empty when you leave.
+6. Commit.
 
 ## Standing jobs — sections, descriptions & the product DB (the navigation layer)
 
 Beyond keeping the file list true, you own the two AUTHORED layers that turn the
-raw map into navigation. Both are best-effort and NULL-until-curated; neither
-blocks the auto-remap hook the working shells trigger. Both survive the remap
-(`dr_section` is never touched by the mapper; `dr_filepath.desc` is preserved by
-its UPSERT). The boot `## CONNECTIONS` block renders the section index; the
-descriptions are the leaves a shell queries once it has narrowed to a section.
+raw map into navigation. Sections are curated as they emerge. Descriptions are
+**required — every run ends with an empty worklist**; neither blocks the
+auto-remap hook the working shells trigger. Both survive the remap (`dr_section`
+is never touched by the mapper; `dr_filepath.desc` is preserved by its UPSERT).
+The boot `## CONNECTIONS` block renders the section index; the descriptions are
+the leaves a shell queries once it has narrowed to a section.
 
 **1. Sections (`dr_section`)** — author/curate the navigational index. Seeded
 from top-level dirs on first map (one section per dir), so it is non-empty on day
@@ -133,8 +141,9 @@ SELECT path FROM dr_filepath f WHERE NOT EXISTS
 ORDER BY path;
 ```
 
-**2. Descriptions (`dr_filepath.desc`)** — fill per-file one-liners (≤100 chars),
-worklist-driven. They are queried by working shells *within a chosen section*
+**2. Descriptions (`dr_filepath.desc`)** — fill per-file one-liners (≤100 chars).
+Run the worklist every session and describe every NULL before you finish — this
+is not optional. They are queried by working shells *within a chosen section*
 (via `surface_catalogue`), never bulk-loaded at boot.
 
 ```sql
