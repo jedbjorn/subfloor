@@ -209,6 +209,10 @@ larger material.
 - Lists: `-` unordered · `1.` ordered · `- [ ]` / `- [x]` tasks
 - Tables: standard GFM pipe tables
 - Images: `![alt](https://url/img.png)` — absolute URLs only, descriptive alt
+- Video: a bare video URL **alone on its own line** renders as a player —
+  a `github.com/user-attachments/assets/<id>` URL (paste a video into a GitHub
+  issue/PR to mint one) or any absolute URL ending `.mp4`/`.webm`/`.mov`/`.ogg`.
+  Don't wrap it in `![]()` or `[]()` — bare is what triggers the player.
 - Code: fenced with a language hint (```` ```python ````)
 
 ## Color classes
