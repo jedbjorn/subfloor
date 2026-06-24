@@ -15,3 +15,12 @@
 #   make dos-d / dos-down    stop the sandbox
 #   make dos-h / dos-help    list / describe all commands
 include .super-coder/aliases.mk
+
+# Friendly default: bare `make` and `make help` print the command chart, instead
+# of running the first included target (dos-enter, which attaches a session).
+# Kept here rather than in aliases.mk so the bare `help` name never propagates
+# into a fork where it could collide with the fork's own targets. dos-h points on
+# to `make dos-help` for the full list.
+.DEFAULT_GOAL := help
+.PHONY: help
+help: dos-h
