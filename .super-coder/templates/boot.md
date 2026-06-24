@@ -149,11 +149,8 @@ the commit on every harness, vibe included. Both are escapable when you mean it 
 
 Finish before you stop. Before you go dormant, leave your tree **clean or on a
 pushed branch with a PR** — never a dirty or unpushed worktree for the admin to
-adopt. And **close the flags your work cleared**: an open flag is an open handoff,
-so resolve it (`./sc mem flag close <id> --notes "…"`) with a note on *how* —
-scoped to the feature you're on (`WHERE feature_id=<current>`), never a scan of
-the whole flag table. Full procedure — sync gate, finish gate, attribution,
-cleanup, what not to commit: the `git` skill; flag detail: the `flags` skill.
+adopt. Full procedure — sync gate, finish gate, attribution, cleanup, what not to
+commit: the `git` skill.
 
 ---
 
