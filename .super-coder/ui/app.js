@@ -9,6 +9,23 @@ const el = (t, props = {}, ...kids) => {
 };
 const esc = (s) => (s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
+// Unified list search box — identical look + placement (first element under the
+// header) on every page that filters a list (Roadmap board, Docs, Flags).
+// `onq(value)` fires on each keystroke; the caller owns the persisted query
+// string so the box keeps its value across re-renders.
+function searchBar(placeholder, value, onq) {
+  const input = el("input", { type: "text", className: "search", placeholder, value });
+  input.oninput = () => onq(input.value);
+  return input;
+}
+
+// Feature-less items group under this label on Docs and Flags; it always sorts
+// to the BOTTOM of the grouped list (linked groups first, in their natural
+// order). Array.sort is stable, so non-unlinked groups keep their order.
+const UNLINKED = "— unlinked —";
+const unlinkedLast = (entries) =>
+  entries.sort((a, b) => (a[0] === UNLINKED ? 1 : 0) - (b[0] === UNLINKED ? 1 : 0));
+
 // Markdown → sanitized HTML via the vendored marked + DOMPurify (the same
 // pipeline as dos-arch's MarkdownBlock). External links open in a new tab
 // with rel=noopener; the hook is global to the DOMPurify singleton, so it is
@@ -477,6 +494,7 @@ const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Ne
 const FLOW_STAGES = ["in_progress", "next", "near_term", "long_term", "shipped"];
 let roadmapFilter = null;            // null = show all (default); single-select
 let roadmapView = "board";           // "board" | "flow"
+let roadmapQuery = "";               // board search; persists across re-renders
 const roadmapCollapsed = new Set();  // statuses whose section is collapsed
 
 // All features in the sequencing stages, flattened — the candidate pool for a
@@ -492,10 +510,18 @@ async function renderRoadmap(root) {
   const { buckets, projects = [] } = await api("/roadmap");
   root.replaceChildren();
 
-  // Board ⇄ Flow toggle. The sub-view rides in the URL hash (#roadmap = board,
-  // #roadmap-flow = flow) so it's deep-linkable and refresh-stable; routeFromHash
-  // sets roadmapView and re-renders.
-  const toggle = el("div", { className: "filters centered view-toggle" });
+  // Search rides first under the header — but only on the Board sub-view. Flow
+  // is a dependency graph, not a list to scan, so it carries no search box.
+  // drawBoard (defined below, hoisted) repaints just the results on keystroke so
+  // the box keeps focus.
+  if (roadmapView === "board") {
+    root.append(searchBar("search features…", roadmapQuery, (v) => { roadmapQuery = v; drawBoard(); }));
+  }
+
+  // Board ⇄ Flow segmented toggle. The sub-view rides in the URL hash (#roadmap =
+  // board, #roadmap-flow = flow) so it's deep-linkable and refresh-stable;
+  // routeFromHash sets roadmapView and re-renders.
+  const toggle = el("div", { className: "filters centered seg view-toggle" });
   for (const [mode, label] of [["board", "Board"], ["flow", "Flow"]]) {
     const b = el("button", { className: "chip" + (roadmapView === mode ? " on" : ""), textContent: label });
     b.onclick = () => { location.hash = mode === "flow" ? "roadmap-flow" : "roadmap"; };
@@ -519,22 +545,40 @@ async function renderRoadmap(root) {
   }
   root.append(bar);
 
-  // buckets arrive linear from the API; filter to the single selected status.
-  // The Board is a workload-per-horizon view (status sections); work-stream
-  // grouping lives in the Flow view, not here.
-  const shown = roadmapFilter ? buckets.filter((b) => b.status === roadmapFilter) : buckets;
-  if (!shown.length) { root.append(el("div", { className: "muted" }, "No features in the selected stage.")); return; }
-  for (const b of shown) {
-    const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(b.status) ? " collapsed" : "") });
-    const h = el("h2", {}, b.label);
-    h.onclick = () => {
-      roadmapCollapsed.has(b.status) ? roadmapCollapsed.delete(b.status) : roadmapCollapsed.add(b.status);
-      renderRoadmap(root);
-    };
-    sec.append(h);
-    for (const f of b.features) sec.append(featureCard(f, candidates, projects));
-    root.append(sec);
+  // Results repaint in place: filter to the single selected status, then narrow
+  // by the search query (feature title / work-stream). The Board is a
+  // workload-per-horizon view (status sections); work-stream grouping lives in
+  // the Flow view, not here.
+  const results = el("div", {});
+  root.append(results);
+  function drawBoard() {
+    const q = roadmapQuery.trim().toLowerCase();
+    const byStatus = roadmapFilter ? buckets.filter((b) => b.status === roadmapFilter) : buckets;
+    const shown = q
+      ? byStatus
+          .map((b) => ({ ...b, features: b.features.filter((f) =>
+            `${f.title || ""} ${f.project_title || ""}`.toLowerCase().includes(q)) }))
+          .filter((b) => b.features.length)
+      : byStatus;
+    results.replaceChildren();
+    if (!shown.length) {
+      results.append(el("div", { className: "muted" },
+        q ? "No features match." : "No features in the selected stage."));
+      return;
+    }
+    for (const b of shown) {
+      const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(b.status) ? " collapsed" : "") });
+      const h = el("h2", {}, b.label);
+      h.onclick = () => {
+        roadmapCollapsed.has(b.status) ? roadmapCollapsed.delete(b.status) : roadmapCollapsed.add(b.status);
+        drawBoard();
+      };
+      sec.append(h);
+      for (const f of b.features) sec.append(featureCard(f, candidates, projects));
+      results.append(sec);
+    }
   }
+  drawBoard();
 }
 
 // Flow view: one section per work-stream (project). Inside a section the
@@ -946,16 +990,14 @@ let docsQuery = "";   // persists across re-renders so the search box keeps its 
 async function renderDocs(root) {
   const { docs } = await api("/docs");
   root.replaceChildren();
-  root.append(el("div", { className: "muted" },
-    "Documentation (kind=doc), separate from the spec dev-cycle on the Roadmap. Open renders in md-converter."));
   if (!docs.length) {
     root.append(el("div", { className: "card muted" },
       "No docs yet. A doc is a kind='doc' document against a feature — authored by the shell, viewable here."));
     return;
   }
 
-  // search bar — filters by doc title or feature on every keystroke
-  const search = el("input", { type: "text", className: "search", placeholder: "search docs…", value: docsQuery });
+  // unified search bar — first under the header; filters by doc title or feature
+  const search = searchBar("search docs…", docsQuery, (v) => { docsQuery = v; draw(); });
   const results = el("div", {});
   const draw = () => {
     const q = docsQuery.trim().toLowerCase();
@@ -965,21 +1007,21 @@ async function renderDocs(root) {
     results.replaceChildren();
     if (!matched.length) { results.append(el("div", { className: "muted" }, "No docs match.")); return; }
     const byFeat = {};
-    for (const d of matched) (byFeat[d.feature_title || "— unlinked —"] ||= []).push(d);
-    for (const [title, list] of Object.entries(byFeat)) {
+    for (const d of matched) (byFeat[d.feature_title || UNLINKED] ||= []).push(d);
+    for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
       const c = el("div", { className: "card" });
       c.append(el("h2", {}, title));
       for (const d of list) c.append(docBlock(d));
       results.append(c);
     }
   };
-  search.oninput = () => { docsQuery = search.value; draw(); };
   root.append(search, results);
   draw();
 }
 
 // ── Flags ──────────────────────────────────────────────────────────────────────
 let flagFilter = "open";   // open | resolved | all — persists across re-renders
+let flagQuery = "";        // flags search; persists across re-renders
 
 // New-flag form in a 600×400 modal — Create bottom-left, Cancel bottom-right.
 function openNewFlagModal(features) {
@@ -1016,7 +1058,12 @@ async function renderFlags(root) {
   const { flags, features } = await api("/flags");
   root.replaceChildren();
 
-  // open | resolved | all toggle (segmented) + the new-flag modal trigger
+  // unified search bar — first under the header; repaints results in place on
+  // keystroke (draw, below) so the box keeps focus
+  const search = searchBar("search flags…", flagQuery, (v) => { flagQuery = v; draw(); });
+  root.append(search);
+
+  // open | resolved | all segmented toggle + the new-flag modal trigger
   const bar = el("div", { className: "filters seg" });
   for (const [key, label] of [["open", "Open"], ["resolved", "Resolved"], ["all", "All"]]) {
     const chip = el("button", { className: "chip" + (flagFilter === key ? " on" : ""), textContent: label });
@@ -1027,18 +1074,34 @@ async function renderFlags(root) {
   newBtn.onclick = () => openNewFlagModal(features);
   root.append(el("div", { className: "flagbar" }, bar, newBtn));
 
-  // grouped by feature, filtered by the toggle
-  const shown = flags.filter((f) =>
-    flagFilter === "all" ? true : flagFilter === "resolved" ? f.resolved : !f.resolved);
-  if (!shown.length) { root.append(el("div", { className: "muted" }, "No flags in this view.")); return; }
-  const byFeat = {};
-  for (const f of shown) (byFeat[f.feature_title || "— unlinked —"] ||= []).push(f);
-  for (const [title, list] of Object.entries(byFeat)) {
-    const c = el("div", { className: "card" });
-    c.append(el("h2", {}, title));
-    for (const f of list) c.append(flagRow(f));
-    root.append(c);
+  // results repaint in place: filter by the toggle, then narrow by the query
+  // (name / #id / description / feature), grouped by feature with unlinked last
+  const results = el("div", {});
+  root.append(results);
+  function draw() {
+    const q = flagQuery.trim().toLowerCase();
+    const byToggle = flags.filter((f) =>
+      flagFilter === "all" ? true : flagFilter === "resolved" ? f.resolved : !f.resolved);
+    const shown = q
+      ? byToggle.filter((f) =>
+          `${f.display_name || ""} #${f.flag_id} ${f.description || ""} ${f.feature_title || ""}`
+            .toLowerCase().includes(q))
+      : byToggle;
+    results.replaceChildren();
+    if (!shown.length) {
+      results.append(el("div", { className: "muted" }, q ? "No flags match." : "No flags in this view."));
+      return;
+    }
+    const byFeat = {};
+    for (const f of shown) (byFeat[f.feature_title || UNLINKED] ||= []).push(f);
+    for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
+      const c = el("div", { className: "card" });
+      c.append(el("h2", {}, title));
+      for (const f of list) c.append(flagRow(f));
+      results.append(c);
+    }
   }
+  draw();
 }
 
 function flagRow(f) {

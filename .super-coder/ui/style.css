@@ -73,7 +73,9 @@ main { padding: 1.2rem; }
    (funnel stages, skill categories) keep enough room to read as group labels;
    only the card-to-card spacing tightens. */
 #view-roadmap .bucket > details.feature + details.feature { margin-top: 5px; }
-#view-docs .card + .card { margin-top: 5px; }
+/* Docs + Flags group cards inside a results wrapper, so card-to-card spacing
+   rides on the adjacent-sibling margin rather than the view grid gap. */
+#view-docs .card + .card, #view-flags .card + .card { margin-top: 5px; }
 #view-flags { gap: 5px; }
 #view-flags .flagbar { margin-bottom: calc(1rem - 5px); }   /* restore bar→cards spacing */
 #view-skills { gap: 5px; }
@@ -177,6 +179,9 @@ details.feature.tasks-open { border-left-color: var(--task-open); }
 .filters.seg .chip { border-radius: 0; border-left-width: 0; }
 .filters.seg .chip:first-child { border-top-left-radius: 99px; border-bottom-left-radius: 99px; border-left-width: 1px; }
 .filters.seg .chip:last-child { border-top-right-radius: 99px; border-bottom-right-radius: 99px; }
+/* a segmented group is fit-content, so justify-content can't center it — center
+   the block itself (Roadmap's Board|Flow toggle). */
+.filters.seg.centered { margin-inline: auto; }
 .bucket > h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 1.4rem 0 .5rem; cursor: pointer; user-select: none; }
 .bucket > h2 .count {
   font-size: .7rem; background: var(--accent2); border: 1px solid var(--line);
