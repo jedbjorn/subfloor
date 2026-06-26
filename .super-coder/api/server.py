@@ -38,6 +38,17 @@ REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 UI_DIR = ENGINE / "ui"
 
+# Rolling webapp event log — visibility into what the API actually did, since a
+# publish/snapshot that "looked done" gave no trace to inspect after the fact.
+# ONE file, last LOG_MAX_EVENTS end-to-end events, JSON-per-line so it's both
+# greppable and machine-parseable (the multi-line step trace rides in `detail`,
+# keeping each event a single physical line so the roll is a line-count trim).
+# Local + ephemeral: under the gitignored .super-coder/logs/, never committed.
+LOG_DIR = ENGINE / "logs"
+LOG_PATH = LOG_DIR / "webapp.log"
+LOG_MAX_EVENTS = 20
+_LOG_LOCK = threading.Lock()
+
 sys.path.insert(0, str(ENGINE / "scripts"))
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
@@ -69,6 +80,47 @@ def mdc_url(markdown: str) -> str:
     packed = base64.urlsafe_b64encode(
         gzip.compress((markdown or "").encode(), mtime=0)).rstrip(b"=").decode()
     return f"{MDC_BASE}/?c={packed}"
+
+
+def log_event(op: str, *, ok: bool, detail, **fields) -> None:
+    """Append one end-to-end event to the rolling webapp log, trimmed to the last
+    LOG_MAX_EVENTS. `op` names the operation (publish/snapshot/error/…), `detail`
+    is the step trace (a list, or a string we split on newlines), and **fields
+    carries op-specific keys (pushed, pr_url, path, …). Best-effort: a logging
+    failure must NEVER break the request it records — the log is for visibility,
+    not correctness, so any I/O error is swallowed."""
+    if isinstance(detail, str):
+        detail = detail.splitlines()
+    event = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+             "op": op, "ok": ok, **fields, "detail": detail}
+    line = json.dumps(event, ensure_ascii=False)
+    with _LOG_LOCK:
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            prev = LOG_PATH.read_text().splitlines() if LOG_PATH.exists() else []
+            prev.append(line)
+            LOG_PATH.write_text("\n".join(prev[-LOG_MAX_EVENTS:]) + "\n")
+        except OSError:
+            pass
+
+
+def read_log() -> list[dict]:
+    """The rolling log as a list of event dicts, oldest→newest. Tolerates a
+    partially-written or corrupt line rather than failing the whole read."""
+    out: list[dict] = []
+    try:
+        text = LOG_PATH.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            out.append({"op": "?", "ok": False, "detail": [line]})
+    return out
 
 
 # Shell fields the review layer may write. seed/L&S/system_prompt/mandate are
@@ -550,7 +602,22 @@ def _unexpected_dirty() -> list[str]:
 
 
 def _gh_token() -> str:
-    return (os.environ.get("SC_GH_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    env = (os.environ.get("SC_GH_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if env:
+        return env
+    # Host-run server (started directly, not via `./sc launch` which forwards
+    # GH_TOKEN into the sandbox): fall back to the host's gh login so a web-authed
+    # `gh auth login` "just works" with no token to export. Mirrors what `sc`
+    # itself does. In the sandbox gh usually isn't installed, so this fails to ""
+    # cleanly and the token simply comes from the forwarded env above.
+    try:
+        r = subprocess.run(["gh", "auth", "token"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
 
 
 def _origin_https() -> str | None:
@@ -597,6 +664,11 @@ def git_publish() -> dict:
         # if a step raised or returned early, so the tree never stays stranded on
         # the publish branch.
         _land_on_base(out, state)
+    # Record the full end-to-end trace (success OR failure) so a publish that
+    # "looked done" can be inspected after the fact — the gap that made the live
+    # incident unexplainable. _land_on_base above appends to `out`, so log here.
+    log_event("publish", ok=state["ok"], pushed=state["pushed"],
+              pr_url=state["pr_url"], detail=out)
     return {"ok": state["ok"], "output": "\n".join(out), "pr_url": state["pr_url"]}
 
 
@@ -812,6 +884,10 @@ class Handler(BaseHTTPRequestHandler):
         `{"error": "'feature_id'"}`, no stack, status 400). Log the full
         traceback to stderr and return 500 so it reads as a server fault."""
         traceback.print_exc()
+        # Also land it in the rolling log so a failed request is visible after the
+        # fact, not only in stderr that may have scrolled away / not been captured.
+        log_event("error", ok=False, path=getattr(self, "path", "?"),
+                  detail=traceback.format_exc().strip().splitlines()[-15:])
         return self._send(500, {"error": str(exc)})
 
     # -- static + GET --
@@ -837,6 +913,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, git_hygiene.compute(fetch=fetch))
             except Exception as e:
                 return self._fail(e)
+        # Rolling webapp event log — no DB, just the last LOG_MAX_EVENTS events.
+        # Newest-first for the reader; reachable from the browser/curl so you don't
+        # have to shell into the sandbox to see what a publish/snapshot did.
+        if path == "/api/logs":
+            return self._send(200, {"events": list(reversed(read_log())),
+                                    "max": LOG_MAX_EVENTS})
         con = db()
         try:
             if path == "/api/health":
@@ -932,7 +1014,15 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
                 return self._send(201, {"shell_id": sid, "shortname": sn})
             if path == "/api/snapshot":
-                return self._send(200, {"output": run_snapshot_render()})
+                try:
+                    out = run_snapshot_render()
+                except Exception as e:
+                    # run_snapshot_render raises on a failed serialize/render; log
+                    # the failure before re-raising so it's in the rolling log too.
+                    log_event("snapshot", ok=False, detail=str(e))
+                    raise
+                log_event("snapshot", ok=True, detail=out)
+                return self._send(200, {"output": out})
             if path == "/api/publish":
                 with _PUBLISH_LOCK:
                     r = git_publish()

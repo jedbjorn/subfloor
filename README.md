@@ -769,6 +769,12 @@ refers to:
 | **Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
+The header's **snapshot ⤓** / **publish ⤴** buttons serialize the DB and open a
+rolling content PR. How they authenticate to GitHub (`gh auth login` or a scoped
+`SC_GH_TOKEN`), and the rolling event log (`.super-coder/logs/webapp.log` /
+`GET /api/logs`, last 20 events) for seeing what a publish actually did:
+[`docs/publish-and-gh-auth.md`](docs/publish-and-gh-auth.md).
+
 ![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-tab.png)
 
 ![Review GUI, Worktrees tab — live git-hygiene report: dirty worktrees, each branch ahead/behind its base, and prunable merged branches](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/worktrees-tab.png)

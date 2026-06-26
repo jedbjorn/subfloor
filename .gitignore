@@ -30,6 +30,10 @@
 # ephemeral, host-only (the broker recreates them); never tracked.
 /.super-coder/run/
 
+# Webapp event log — rolling, last N end-to-end API events (publish/snapshot/
+# errors). Runtime visibility only; local + ephemeral, never tracked.
+/.super-coder/logs/
+
 # Shell worktrees — one per shell, at .sc-worktrees/<shortname>/. Git
 # worktrees inside the repo root; gitignored so the linked trees don't surface
 # as untracked content in the main working tree.
