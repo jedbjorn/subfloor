@@ -1,61 +1,110 @@
 #!/usr/bin/env python3
-"""Fail if the committed flat `_sc` mirror drifts from the DB render.
+"""Fail if the committed flat `_sc` mirror drifts from the committed SOURCE.
 
 `roadmap_sc.md` and everything under `specs_sc/`, `docs_sc/`, `skills_sc/` are
-RENDERED from the DB (documents/roadmap/skills tables; a skill's source is
+RENDERED from the DB (documents/roadmap/skills; a skill's source is
 `assets/skills/<name>/SKILL.md` → seed migration → DB). Editing that source
 without re-rendering and committing the mirror drifts it silently — the DB and
 every shell's per-boot load stay correct, but the git-tracked browsable copy
-goes stale, and nothing else catches it. This is that guard: render, then fail
-on any diff in those paths.
+goes stale, and nothing else catches it.
 
-Hermetic use (CI / clean checkout):
+HERMETIC by construction: this builds a throwaway DB from git-tracked text
+(schema + migrations + `.sc-state/content.sql`), renders the mirror from THAT
+into a temp tree, and diffs it against the committed `_sc` files. It never opens
+the live `shell_db.db` and never writes into the working tree. So — unlike the
+old version, which rendered from the live DB *into the tree* and then told you to
+`git add` whatever fell out — a stale or dirty local cache DB can no longer make
+this pass or fail wrongly, and can never trick you into committing a regression.
+A local `./sc render-check` is now byte-identical to CI; no `./sc rebuild` first.
 
-    ./sc rebuild && ./sc render-check
-
-`rebuild` materializes the DB from committed text (schema + migrations +
-content.sql), so the check compares the committed mirror against the committed
-*source*. Local use assumes a current DB — snapshot first if you edited it live.
+    ./sc render-check
 """
 from __future__ import annotations
 
-import os
-import subprocess
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
+SCHEMA = ENGINE / "schema.sql"
+CONTENT = REPO_ROOT / ".sc-state" / "content.sql"
+CONTENT_LEGACY = ENGINE / "snapshot" / "content.sql"   # pre-B7 fallback
 RENDERED = ["roadmap_sc.md", "specs_sc", "docs_sc", "skills_sc"]
+
+sys.path.insert(0, str(ENGINE / "render"))
+sys.path.insert(0, str(ENGINE / "scripts"))
+import flat  # noqa: E402
+import migrate as migrate_mod  # noqa: E402
+
+
+def _build_tracked_db(path: Path) -> None:
+    """Materialize a DB from committed text only: schema → migrations →
+    content.sql. No map step (the dr_* cache isn't part of the mirror) and no
+    touch of the live DB. This is what a fresh `./sc rebuild` would produce, so
+    its engine skills are always current — the mirror is a pure function of the
+    sources about to be committed."""
+    con = sqlite3.connect(path)
+    con.executescript(SCHEMA.read_text())
+    con.commit()
+    con.close()
+    migrate_mod.migrate(str(path))
+    content = CONTENT if CONTENT.exists() else CONTENT_LEGACY
+    if content.exists():
+        con = sqlite3.connect(path)
+        con.executescript(content.read_text())
+        con.commit()
+        con.close()
+
+
+def _rel_files(base: Path) -> set[str]:
+    """Tracked-mirror files present under `base`, as repo-relative paths."""
+    found: set[str] = set()
+    for r in RENDERED:
+        p = base / r
+        if p.is_file():
+            found.add(r)
+        elif p.is_dir():
+            found.update(str(f.relative_to(base)) for f in p.rglob("*") if f.is_file())
+    return found
 
 
 def main() -> int:
-    # Render from the current DB into the tree (no-op for paths already current).
-    rendered = subprocess.run(
-        [sys.executable, str(ENGINE / "scripts" / "render.py"), "flat"],
-        cwd=str(REPO_ROOT),
-        env={**os.environ, "SC_ADMIN": "1"},  # CI/admin verify — clear serialize guard
-    )
-    if rendered.returncode != 0:
-        return rendered.returncode
+    with tempfile.TemporaryDirectory(prefix="sc-render-check-") as td:
+        tmp = Path(td)
+        db = tmp / "hermetic.db"
+        _build_tracked_db(db)
 
-    paths = [p for p in RENDERED if (REPO_ROOT / p).exists()]
-    drifted = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "diff", "--quiet", "--", *paths]
-    ).returncode != 0
-    if drifted:
-        stat = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "diff", "--stat", "--", *paths],
-            capture_output=True, text=True,
-        ).stdout
-        sys.stderr.write(
-            "✗ render drift: the committed flat _sc mirror does not match the DB "
-            "render.\n  A source edit (asset/DB) was committed without re-rendering "
-            "the mirror.\n\n" + stat + "\n"
-            "  fix:  ./sc render flat && git add " + " ".join(paths) + "\n"
+        out = tmp / "tree"
+        out.mkdir()
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        try:
+            flat.render_visibility(con, root=out)
+        finally:
+            con.close()
+
+        # Drift = committed mirror != mirror rendered from committed source.
+        rendered = _rel_files(out)
+        committed = _rel_files(REPO_ROOT)
+        drifted = sorted(
+            rel for rel in rendered | committed
+            if not ((out / rel).is_file() and (REPO_ROOT / rel).is_file()
+                    and (out / rel).read_bytes() == (REPO_ROOT / rel).read_bytes())
         )
-        return 1
-    print("✓ render-check: flat _sc mirror matches the DB render")
+        if drifted:
+            sys.stderr.write(
+                "✗ render drift: the committed flat _sc mirror does not match the\n"
+                "  mirror rendered from the tracked sources (schema + migrations +\n"
+                "  .sc-state/content.sql). A source edit was committed without\n"
+                "  re-rendering the mirror.\n\n  drifted:\n"
+                + "".join(f"    {p}\n" for p in drifted)
+                + "\n  fix:  ./sc rebuild && ./sc render flat && git add "
+                + " ".join(RENDERED) + "\n"
+            )
+            return 1
+    print("✓ render-check: flat _sc mirror matches the render of the tracked sources")
     return 0
 
 

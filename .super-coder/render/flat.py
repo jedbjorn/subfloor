@@ -77,7 +77,7 @@ def _write_if_changed(path: Path, content: str, written: list, skipped: list) ->
 
 # ── Flat visibility render ────────────────────────────────────────────────────
 
-def _render_documents(con, written, skipped) -> None:
+def _render_documents(con, written, skipped, root: Path) -> None:
     """specs (kind='spec') → specs_sc/, docs (kind='doc') → docs_sc/.
 
     The document's own `render_path` is authoritative when set; otherwise we
@@ -106,7 +106,7 @@ def _render_documents(con, written, skipped) -> None:
             f"roadmap_status: {r['roadmap_status'] or ''}",
             f"frozen: {'true' if r['frozen'] else 'false'}",
         ]
-        _write_if_changed(REPO_ROOT / rel, with_banner(r["body"], extra),
+        _write_if_changed(root / rel, with_banner(r["body"], extra),
                           written, skipped)
 
 
@@ -120,7 +120,7 @@ _ROADMAP_LABEL = {
 }
 
 
-def _render_roadmap(con, written, skipped) -> None:
+def _render_roadmap(con, written, skipped, root: Path) -> None:
     """roadmap_sc.md — the static board for outsiders. Status is a planning
     horizon; a feature's open flags are listed as its blockers (joined on
     feature_id)."""
@@ -166,14 +166,14 @@ def _render_roadmap(con, written, skipped) -> None:
                 parts.append("_No open flags._")
             parts.append("")
     body = "\n".join(parts).rstrip()
-    _write_if_changed(REPO_ROOT / "roadmap_sc.md", with_banner(body), written, skipped)
+    _write_if_changed(root / "roadmap_sc.md", with_banner(body), written, skipped)
 
 
 def _skill_slug(name: str) -> str:
     return name.strip().lower().replace(" ", "-")
 
 
-def _render_skills_catalogue(con, written, skipped) -> None:
+def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
     """skills_sc/ — the substrate's skill catalogue for browsers: one file per
     skill plus a README index. This is the *catalogue* (every non-deleted
     skill), distinct from `.claude/skills/` which renders one shell's grants."""
@@ -200,20 +200,25 @@ def _render_skills_catalogue(con, written, skipped) -> None:
             parts += ["  ·  ".join(meta), ""]
         if r["content"]:
             parts += ["---", "", r["content"].strip()]
-        _write_if_changed(REPO_ROOT / "skills_sc" / f"{slug}.md",
+        _write_if_changed(root / "skills_sc" / f"{slug}.md",
                           with_banner("\n".join(parts).rstrip()), written, skipped)
-    _write_if_changed(REPO_ROOT / "skills_sc" / "README.md",
+    _write_if_changed(root / "skills_sc" / "README.md",
                       with_banner("\n".join(index).rstrip()), written, skipped)
 
 
-def render_visibility(con: sqlite3.Connection) -> dict:
+def render_visibility(con: sqlite3.Connection, root: "Path | None" = None) -> dict:
     """Render the tracked flat `_sc` visibility files. Returns a written/skipped
-    summary. Incremental: unchanged artifacts are not rewritten."""
+    summary. Incremental: unchanged artifacts are not rewritten.
+
+    `root` overrides the write base (defaults to the real REPO_ROOT). The
+    hermetic render-check passes a temp dir so it can render the committed
+    SOURCE and diff it against the committed mirror without touching the tree."""
+    root = root or REPO_ROOT
     written: list[Path] = []
     skipped: list[Path] = []
-    _render_documents(con, written, skipped)
-    _render_roadmap(con, written, skipped)
-    _render_skills_catalogue(con, written, skipped)
+    _render_documents(con, written, skipped, root)
+    _render_roadmap(con, written, skipped, root)
+    _render_skills_catalogue(con, written, skipped, root)
     return {"written": written, "skipped": skipped}
 
 
