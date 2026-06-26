@@ -38,6 +38,7 @@ import flat  # noqa: E402
 sys.path.insert(0, str(ENGINE / "scripts"))
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
+import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 
 ADAPTERS = ENGINE / "adapters"
 
@@ -581,6 +582,21 @@ def main() -> None:
     requested = positional[0] if positional else None
 
     con = open_db()
+    # Self-heal stale engine skills before anything this boot reads them
+    # (compose's SKILLS block, render_skill_md). A DB stranded by an in-place
+    # `0001` regen repairs itself from assets/skills/ instead of needing a manual
+    # `./sc rebuild`. Project-local skills are never touched (no upstream to lag).
+    # Skipped under RENDER_ONLY: headless verify must not mutate, and it rebuilds
+    # fresh anyway. Best-effort — a heal failure never blocks a launch.
+    heal_note = None
+    if not os.environ.get("RENDER_ONLY"):
+        try:
+            healed = seed_skills.sync_engine_skills(con)
+            if healed:
+                heal_note = f"{len(healed)} stale engine skill(s) → {', '.join(healed)}"
+        except Exception:
+            heal_note = None
+
     user = authenticate(con)
     fdefaults = flavor_defaults(con)
     chosen = pick_shell(list_shells(con, user["user_id"]), requested, first, fdefaults)
@@ -670,6 +686,8 @@ def main() -> None:
         print(f"→ sync: {sync_note}")
     elif chosen["flavor"] == "admin":
         print("→ working dir: repo root (admin — maintains main directly)")
+    if heal_note:
+        print(f"→ heal: {heal_note}")
     if prune_note:
         print(f"→ prune: {prune_note}")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")

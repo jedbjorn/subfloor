@@ -14,7 +14,8 @@ with assets/skills/. The tests then perturb it to prove the guard:
     even when its body differs from everything. This is the load-bearing
     property: admin-authored repo-local skills must be safe from a guard that
     only knows the engine catalogue.
-  • render flat refuses (SystemExit) when an engine skill is stale.
+  • the self-heal (sync_engine_skills / render._heal_fresh) repairs stale
+    engine skills from assets and leaves project-local skills untouched.
 
 Run:
     python3 tests/test_skills_freshness.py
@@ -95,13 +96,43 @@ class SkillsFreshnessTest(unittest.TestCase):
         self.assertNotIn("fork_only_skill", stale)
         self.assertEqual(stale, [])  # local skill didn't perturb the verdict
 
-    def test_render_flat_refuses_when_stale(self):
+    def test_sync_engine_skills_is_noop_when_fresh(self):
+        self.assertEqual(seed_skills.sync_engine_skills(self.con), [])
+
+    def test_sync_engine_skills_heals_stale(self):
         self.con.execute(
             "UPDATE skills SET content = 'WRONG' WHERE name=?", (self.engine_name,)
         )
         self.con.commit()
-        with self.assertRaises(SystemExit):
-            render_mod._guard_fresh(self.con)
+        healed = seed_skills.sync_engine_skills(self.con)
+        self.assertIn(self.engine_name, healed)
+        # After healing, the DB matches assets again — nothing left stale.
+        self.assertEqual(seed_skills.stale_engine_skills(self.con), [])
+
+    def test_render_heal_fresh_repairs_and_proceeds(self):
+        self.con.execute(
+            "UPDATE skills SET content = 'WRONG' WHERE name=?", (self.engine_name,)
+        )
+        self.con.commit()
+        render_mod._heal_fresh(self.con)          # heals, does not raise
+        self.assertEqual(seed_skills.stale_engine_skills(self.con), [])
+
+    def test_heal_never_touches_project_local_skill(self):
+        self.con.execute(
+            "INSERT INTO skills (name, description, category, command, common, "
+            "content, is_deleted) VALUES "
+            "('fork_only_skill', 'local', 'fork', NULL, 0, 'bespoke body', 0)"
+        )
+        # Force an engine skill stale so the heal actually runs.
+        self.con.execute(
+            "UPDATE skills SET content = 'WRONG' WHERE name=?", (self.engine_name,)
+        )
+        self.con.commit()
+        seed_skills.sync_engine_skills(self.con)
+        body = self.con.execute(
+            "SELECT content FROM skills WHERE name='fork_only_skill'"
+        ).fetchone()[0]
+        self.assertEqual(body, "bespoke body")    # local skill survived untouched
 
 
 if __name__ == "__main__":

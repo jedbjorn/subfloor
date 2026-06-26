@@ -23,7 +23,7 @@ sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import flat  # noqa: E402
 from _serialize_guard import require_admin  # noqa: E402
-from seed_skills import stale_engine_skills  # noqa: E402
+from seed_skills import sync_engine_skills  # noqa: E402
 
 
 def _open() -> sqlite3.Connection:
@@ -44,22 +44,18 @@ def _resolve_shell(con, shortname: str) -> int:
     return row["shell_id"]
 
 
-def _guard_fresh(con) -> None:
-    """Refuse to render the tracked mirror from a DB whose engine skills lag
-    assets/skills/. Rendering a stale cache here is exactly how a shipped skill
-    body silently gets DELETED from the committed `_sc` mirror — so we fail loud
-    and point at the cure instead of writing the regression."""
-    stale = stale_engine_skills(con)
-    if stale:
-        sys.exit(
-            "render: refusing — the live DB's engine skills lag assets/skills/.\n"
-            "  The DB is a cache built before a `seed-skills` change; the migrate\n"
-            "  ledger won't re-seed `0001` in place, so rendering the flat mirror\n"
-            "  now would write STALE content (and can DELETE shipped doc/skill text).\n"
-            f"  stale: {', '.join(stale)}\n"
-            "  fix:  ./sc rebuild   (or ./sc update — both re-sync the catalogue;\n"
-            "        run ./sc seed-skills first if you just edited assets/skills/)"
-        )
+def _heal_fresh(con) -> None:
+    """Self-heal stale engine skills BEFORE rendering the tracked mirror.
+
+    Rendering from a DB whose engine skills lag assets/skills/ is exactly how a
+    shipped skill body silently gets DELETED from the committed `_sc` mirror.
+    Rather than refuse, we repair the cache from assets first (the same heal the
+    launcher runs at boot), so the mirror is always rendered from current engine
+    skills. Project-local skills are untouched. A no-op on a fresh DB."""
+    healed = sync_engine_skills(con)
+    if healed:
+        print(f"render: self-healed {len(healed)} stale engine skill(s) "
+              f"from assets/skills/ → {', '.join(healed)}")
 
 
 def _report(label: str, summary: dict) -> None:
@@ -77,14 +73,14 @@ def main(argv: list[str]) -> int:
     try:
         if mode == "flat":
             require_admin("render flat")
-            _guard_fresh(con)
+            _heal_fresh(con)
             _report("flat", flat.render_visibility(con))
         elif mode in ("skills", "all"):
             if len(argv) < 2:
                 sys.exit(f"render: `{mode}` needs a shell shortname")
             if mode == "all":
                 require_admin("render flat")
-                _guard_fresh(con)
+                _heal_fresh(con)
                 _report("flat", flat.render_visibility(con))
             shell_id = _resolve_shell(con, argv[1])
             _report(f"skills[{argv[1]}]", flat.render_skill_md(con, shell_id))
