@@ -30,6 +30,11 @@ Dependency-free localhost GUI (shells/roadmap/flags), per-fork ports. PR #3.
 
 _No open flags._
 
+### B7 — Engine/Fork Separation & Update Lifecycle · owner: `cc`
+Engine becomes a gitignored downstream dependency (materialized from upstream, pinned by engine.ref); fork's DB is the one preserved artifact; update = snapshot→migrate, rollback = sound (DB+engine) pair-restore. Stops shells confusing the substrate for the project. See specs_sc/b7-engine-fork-separation.md.
+
+_No open flags._
+
 ### Dev shell live UI preview · owner: `cc`
 One router on the fork's dev_port fans out to each dev shell's worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.
 
@@ -51,11 +56,6 @@ _No open flags._
 
 ### B6 — Commit→PR automation · owner: `cc`
 edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapshot button is the manual precursor.
-
-_No open flags._
-
-### B7 — Engine/Fork Separation & Update Lifecycle · owner: `cc`
-Engine becomes a gitignored downstream dependency (materialized from upstream, pinned by engine.ref); fork's DB is the one preserved artifact; update = snapshot→migrate, rollback = sound (DB+engine) pair-restore. Stops shells confusing the substrate for the project. See specs_sc/b7-engine-fork-separation.md.
 
 _No open flags._
 

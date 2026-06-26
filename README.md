@@ -748,6 +748,38 @@ graph LR
 Full design: [`docs/windows-test-vm.md`](docs/windows-test-vm.md) ·
 [`docs/windows-vm-broker.md`](docs/windows-vm-broker.md).
 
+## Tailnet broker (opt-in)
+
+> [!class2]
+> **Shells** devops (reach hosts over the tailnet) · **UI** hand-edit the `ts` block (no wizard yet)
+
+Sibling of the Windows VM broker, same shape, different backend: a **host-side
+broker over a unix socket** that lets a sandboxed shell drive a **tailnet**
+without ever holding a tailnet credential. A fork's shells run bound to
+`sc-net`/127.0.0.1 only; a devops shell still needs to reach build/deploy hosts.
+Rather than bake `tailscaled` into every fork's image (a reusable node
+credential inside the sandbox + `CAP_NET_ADMIN`/`/dev/net/tun` — an isolation
+regression), `tailscaled` and the tailnet identity stay on the **host** (already
+`tailscale up`, authenticated once) and the broker exposes verbs over a
+`chmod 0600` socket in the bind-mounted engine dir. The container `curl`s the
+socket and holds nothing — no route, no firewall hole, no token.
+
+One difference from the VM broker: a tailnet has **many** hosts, so the verbs are
+parameterized by `{host, command}` and the `ts` block carries a fail-closed
+`allowed_hosts` scope — a compromised sandbox can only reach hosts the fork has
+declared. Config lives under a `ts` key in the gitignored
+`.super-coder/instance.json` (**no secrets** — the host node's identity is the
+credential and never leaves the host), coexisting with the `vm` block.
+
+```bash
+./sc ts-broker-up            # start backgrounded (also auto-started by ./sc launch when a tailnet is linked)
+./sc ts-broker-install       # optional: a systemd --user unit, survives logout/reboot
+SOCK="$(./sc ts-broker-sock)"
+curl -s --unix-socket "$SOCK" http://ts/exec -d '{"host":"build-box","command":"uptime"}'
+```
+
+Full design: [`docs/tailscale-broker.md`](docs/tailscale-broker.md).
+
 ## Review GUI
 
 > [!class2]

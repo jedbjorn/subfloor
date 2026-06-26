@@ -45,8 +45,8 @@ matches disk is skipped, so an unchanged DB renders to nothing):
 The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
 shell — gitignored caches, like `.db`. The flat `_sc` files are the tracked
 visibility surface for browsers without localhost; `./sc render` (and `make
-verify`) regenerate them, and the B6 commit→PR automation will refresh them on
-every content edit. Each rendered file carries the do-not-edit banner (spec
+dos-verify`) regenerate them, and the publish flow (`POST /api/publish`, B6)
+refreshes them on every content edit. Each rendered file carries the do-not-edit banner (spec
 §Content & Render); for bodies that already open with YAML frontmatter the
 banner keys are spliced into it rather than prepended, so the YAML stays valid.
 
@@ -81,6 +81,11 @@ is harness-blind. Each holds an `adapter.json`:
   slot). `env.OPENCODE_DISABLE_CLAUDE_CODE=1` avoids double-loading `CLAUDE.md`
   (we dual-write both). Edit the tracked `opencode.json` template to change a
   fork's config.
+- **`codex/`** — reads `AGENTS.md` natively; emits **`.codex/hooks.json`**.
+  Launches `codex --dangerously-bypass-hook-trust` (and, inside the sandbox,
+  `--dangerously-bypass-approvals-and-sandbox`); model is selected via `--model`.
+- **`vibe/`** — reads `AGENTS.md` natively; nothing to emit. Launches `vibe
+  --trust` (sandbox adds `--agent auto-approve`).
 
 The boot render dual-writes `CLAUDE.md` + `AGENTS.md` and the skills, so both
 harnesses consume the same substrate unchanged — that's the harness-agnostic bet.
@@ -100,8 +105,9 @@ and the static `ui/` (one page, vanilla JS) on a single per-fork port.
 - **Law enforcement is structural:** seed and L&S have *no write route* (Laws
   2–4, 7) — not a disabled control, an absent endpoint. Frozen documents reject
   edits server-side.
-- `POST /api/snapshot` runs `snapshot.py` + `render.py flat` — the manual
-  precursor to the B6 commit→PR automation.
+- `POST /api/snapshot` runs `snapshot.py` + `render.py flat` — the local-only
+  serialize + render. `POST /api/publish` (B6) extends it into the full
+  commit→force-push→PR cycle on the ephemeral `sc_gui_content` branch.
 
 `scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
 100`), bumping past anything occupied, and persists it to the gitignored
