@@ -3,7 +3,7 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: B7 — Engine/Fork Separation & Update Lifecycle
-roadmap_status: next
+roadmap_status: shipped
 frozen: false
 title: B7 — Engine / Fork Separation & Update Lifecycle
 tags: [super-coder, spec, B7, fork, engine, update, rollback, migrations, lifecycle]
