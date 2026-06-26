@@ -67,6 +67,81 @@ def parse_skill(path: Path) -> dict:
     }
 
 
+# Fields the seed UPSERT owns (seed_skills `main`'s ON CONFLICT DO UPDATE SET).
+# A live row that differs from its asset on any of these is stale.
+SEED_FIELDS = ("description", "category", "command", "common", "content")
+
+
+def engine_skill_specs() -> list[dict]:
+    """Parse every engine skill under assets/skills/ — the seed's source of
+    truth and, by name, the line between engine and project-local skills (the
+    same set snapshot.dump_local_skills uses to decide what is fork-local)."""
+    if not SKILLS_DIR.exists():
+        return []
+    return [parse_skill(d / "SKILL.md")
+            for d in sorted(SKILLS_DIR.iterdir())
+            if (d / "SKILL.md").exists()]
+
+
+def stale_engine_skills(con) -> list[str]:
+    """Engine skills whose live-DB row lags assets/skills/. Names only.
+
+    This is the drift the in-place `0001` regen can strand: a DB built before
+    `./sc seed-skills` ran carries the OLD body, and the migrate ledger marks
+    `0001` applied so `./sc migrate` never re-seeds it (currency is a per-update
+    sync — see update.sync_skills — or a `./sc rebuild`). Rendering the flat
+    mirror from such a DB writes STALE, possibly content-deleting, files.
+
+    Scoped to engine skills BY NAME: a project-local skill (name absent from
+    assets/skills/) has no upstream to lag, is never inspected here, and so can
+    never trip this guard — admin-authored repo-local skills are safe.
+    """
+    stale: list[str] = []
+    for want in engine_skill_specs():
+        row = con.execute(
+            "SELECT description, category, command, common, content "
+            "FROM skills WHERE name=?", (want["name"],),
+        ).fetchone()
+        if row is None:                       # engine skill missing from the DB
+            stale.append(want["name"])
+            continue
+        if any(row[i] != want[f] for i, f in enumerate(SEED_FIELDS)):
+            stale.append(want["name"])
+    return stale
+
+
+def sync_engine_skills(con) -> list[str]:
+    """Self-heal: bring the live DB's engine skills current with assets/skills/.
+
+    Idempotent UPSERT BY NAME of exactly the engine skills that lag (per
+    stale_engine_skills); returns the names healed, empty when already fresh.
+    This is the cure the tripwire used to only point at — a DB stranded by an
+    in-place `0001` regen repairs itself instead of needing a manual rebuild.
+
+    Project-local skills (name absent from assets/skills/) are never touched:
+    they aren't in the stale set, have no upstream to heal from, and stay
+    durable via content.sql. The caller owns the transaction boundary intent;
+    we commit our own writes."""
+    stale = stale_engine_skills(con)
+    if not stale:
+        return []
+    specs = {s["name"]: s for s in engine_skill_specs()}
+    for name in stale:                       # stale ⊆ asset names, so always hits
+        s = specs[name]
+        con.execute(
+            "INSERT INTO skills (name, description, category, command, common, "
+            "content, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "description=excluded.description, category=excluded.category, "
+            "command=excluded.command, common=excluded.common, "
+            "content=excluded.content, is_deleted=0",
+            (s["name"], s["description"], s["category"], s["command"],
+             s["common"], s["content"]),
+        )
+    con.commit()
+    return stale
+
+
 def main() -> int:
     if not SKILLS_DIR.exists():
         sys.exit(f"seed_skills: no {SKILLS_DIR}")
