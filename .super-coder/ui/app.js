@@ -485,9 +485,9 @@ function skillRow(s, shells) {
 }
 
 // ── Roadmap ───────────────────────────────────────────────────────────────────
-// Board order: delivered first, then the committed funnel backward (items move
-// LEFT toward shipped); brainstorm/retired are the right-hand end caps.
-const STATUSES = ["shipped", "in_progress", "next", "near_term", "long_term", "brainstorm", "retired"];
+// Board order: the committed funnel (in_progress → long_term), then brainstorm/
+// retired, with delivered (shipped) parked at the bottom of the list.
+const STATUSES = ["in_progress", "next", "near_term", "long_term", "brainstorm", "retired", "shipped"];
 const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Next", near_term: "Near Term", long_term: "Long Term", shipped: "Shipped", retired: "Retired" };
 // The five stages that sequence (carry dependency edges). brainstorm/retired are
 // excluded from the Flow graph and the blocker editor — they don't relate yet.
@@ -911,11 +911,13 @@ function featureCard(f, candidates = [], projects = []) {
   // summary preview; expanded reveals the editable fields, docs, and blockers.
   // The ⤢ button in the head opens the same editor in a modal.
   const c = el("details", { className: "card feature" });
-  // Spec tasks (implementation plan) → side-bar colour: all done = green,
-  // any still open = sunset orange. No tasks = no side bar.
+  // Side-bar colour: shipped specs are grey regardless of plan state. Otherwise
+  // by spec-task (implementation plan) completion — all done = green, any still
+  // open = sunset orange. No tasks (and not shipped) = no side bar.
   const tasks = f.tasks || [];
   const doneCount = tasks.filter((t) => t.status === "done").length;
-  if (tasks.length) c.classList.add("has-tasks", doneCount === tasks.length ? "tasks-done" : "tasks-open");
+  if (f.roadmap_status === "shipped") c.classList.add("shipped-bar");
+  else if (tasks.length) c.classList.add("has-tasks", doneCount === tasks.length ? "tasks-done" : "tasks-open");
   const sum = el("summary", { className: "feature-head" });
   sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)"));
   const meta = el("span", { className: "feature-meta" });

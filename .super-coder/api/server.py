@@ -220,7 +220,7 @@ def get_skills(con) -> dict:
 # (most-active → farthest-out) — items move LEFT toward shipped as long_term
 # matures to near_term, next, in_progress, shipped. brainstorm (idea inlet) and
 # retired (taken off the board) are the right-hand end caps.
-_ORDER = ["shipped", "in_progress", "next", "near_term", "long_term", "brainstorm", "retired"]
+_ORDER = ["in_progress", "next", "near_term", "long_term", "brainstorm", "retired", "shipped"]
 _LABEL = {"brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Next",
           "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
           "retired": "Retired"}
