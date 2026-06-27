@@ -155,9 +155,10 @@ details.feature[open] > .feature-preview { display: none; }
 
 /* spec-task side bar — colours the card's left edge by plan completion. These
    sit after the [open] rule above so they win the border-color cascade. */
-details.feature.has-tasks { border-left-width: 4px; }
+details.feature.has-tasks, details.feature.shipped-bar { border-left-width: 4px; }
 details.feature.tasks-done { border-left-color: var(--ok); }
 details.feature.tasks-open { border-left-color: var(--task-open); }
+details.feature.shipped-bar { border-left-color: var(--lock); }
 .task-list { list-style: none; margin: .2rem 0 .4rem; padding: 0; }
 .task-list li { display: flex; gap: .5rem; align-items: baseline; padding: .2rem 0; font-size: .85rem; }
 .task-list li .box { flex: none; color: var(--dim); }
@@ -535,7 +536,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .flow-card.next       { border-left-color: var(--accent); }
 .flow-card.near_term  { border-left-color: var(--lock); }
 .flow-card.long_term  { border-left-color: var(--lock); }
-.flow-card.shipped    { border-left-color: var(--ok); }
+.flow-card.shipped    { border-left-color: var(--lock); }
 .flow-card-title { font-weight: 600; font-size: .85rem; line-height: 1.3; }
 .flow-card-meta { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .45rem; }
 .flow-card-docs { display: flex; flex-wrap: wrap; gap: .25rem .7rem; margin-top: .45rem; }
