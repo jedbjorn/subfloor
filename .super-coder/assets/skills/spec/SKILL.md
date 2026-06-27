@@ -1,14 +1,16 @@
 ---
 name: spec
-description: Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step. Load when starting any feature spec.
+description: Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step. Load when starting, implementing, or building any feature, spec, or roadmap item — before writing code.
 category: craft
 common: false
 ---
 
 # spec — analyze and execute a spec
 
-Load this skill at the start of any session where you're working a feature spec.
-Run **Analyze** before touching any code. Pause for FnB on blockers or unclear
+Load this skill at the start of any session where you're building or implementing
+a feature — whether or not the work is framed out loud as a "spec." If a spec
+governs the work, this is how you execute it; if one should but doesn't yet, the
+`docs` skill authors it first. Run **Analyze** before touching any code. Pause for FnB on blockers or unclear
 items you can't resolve alone.
 
 `<self>` = your shell_id.
