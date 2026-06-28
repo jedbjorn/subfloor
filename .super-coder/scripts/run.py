@@ -772,6 +772,13 @@ def main() -> None:
     # own worktree, and must not be warned. For admin this is REPO_ROOT, but admin
     # exits the guard earlier via SC_SHELL_FLAVOR, so it never reads this.
     env["SC_SHELL_WORKTREE"] = str(work_dir)
+    # The booted shell's own identity, so engine commands it runs (`./sc mem …`)
+    # resolve "which shell am I" from the environment instead of re-deriving it
+    # from git state. Boot knows this for certain; the git-branch heuristic in
+    # mem.resolve_shell fails for the admin flavor (boots on `main`, no
+    # `shell/<name>` branch) and whenever the cwd has drifted to the repo root.
+    # A deliberate `--shell` still overrides it.
+    env["SC_SHELL"] = full["shortname"] or str(full["shell_id"])
     set_terminal_tab_title(full["display_name"])
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")

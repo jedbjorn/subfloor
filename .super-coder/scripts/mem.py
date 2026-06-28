@@ -51,6 +51,11 @@ Run from the repo root, like every engine command:
     ./sc mem message send <to-shortname> "<body>"     # from = you
     ./sc mem message mark-read <message_id>
 
+Shell resolution: writes target the booted shell — `$SC_SHELL` (exported at boot
+by run.py), else the `shell/<name>` worktree branch, else the sole non-shared
+shell. Pass `--shell <id|shortname>` (AFTER the leaf command) to override and
+write as another shell.
+
 Common flags: --db <path> (override target; still guarded — used by tests).
 (`--no-sync` is accepted but now a no-op: mem never serializes — that is an
 admin/GUI step.)
@@ -58,6 +63,7 @@ admin/GUI step.)
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import subprocess
 import sys
@@ -127,8 +133,16 @@ def git_branch() -> str | None:
 
 
 def resolve_shell(con: sqlite3.Connection, spec: str | None) -> int:
-    """--shell wins; else infer from a `shell/<name>` worktree branch; else the
-    sole non-shared shell; else make the caller pick."""
+    """--shell wins; else SC_SHELL (the booted shell's own identity, exported at
+    boot by run.py); else infer from a `shell/<name>` worktree branch; else the
+    sole non-shared shell; else make the caller pick.
+
+    SC_SHELL is the authoritative answer to "which shell am I" — boot knows it
+    for certain, where the git-branch heuristic below fails (admin flavor boots
+    on `main`, or the cwd has drifted to the repo root). An explicit --shell
+    still overrides it, so a shell can deliberately write as another."""
+    if spec is None:
+        spec = os.environ.get("SC_SHELL") or None
     if spec is not None:
         if str(spec).isdigit():
             r = con.execute("SELECT shell_id FROM shells WHERE shell_id=? "
@@ -156,7 +170,12 @@ def resolve_shell(con: sqlite3.Connection, spec: str | None) -> int:
     if len(rs) == 1:
         return rs[0]["shell_id"]
     listing = ", ".join(f"{r['shortname']}(#{r['shell_id']})" for r in rs) or "none"
-    die(f"could not infer the shell — pass --shell <id|shortname>. candidates: {listing}")
+    ex = rs[0]["shortname"] if rs else "<id|shortname>"
+    die("could not infer the shell — name it explicitly.\n"
+        f"     candidates: {listing}\n"
+        f"     the --shell flag goes AFTER the leaf command, e.g.:\n"
+        f"         ./sc mem message check --shell {ex}\n"
+        f"     or export it once for the session:  export SC_SHELL={ex}")
 
 
 # ── write durability ──────────────────────────────────────────────────────────
@@ -615,7 +634,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--db", default=str(DEFAULT_DB), help="engine DB path (default: the fork's)")
     common.add_argument("--no-sync", action="store_true",
                         help="accepted for back-compat; no-op (mem never serializes — admin/GUI step)")
-    common.add_argument("--shell", help="target shell id or shortname (default: inferred)")
+    common.add_argument("--shell", help="target shell id or shortname "
+                        "(default: $SC_SHELL, else inferred from the worktree branch)")
 
     p = argparse.ArgumentParser(prog="sc mem", description="engine memory write surface")
     sub = p.add_subparsers(dest="cmd", required=True)
