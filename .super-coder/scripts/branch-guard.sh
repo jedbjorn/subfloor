@@ -77,6 +77,21 @@ branch_of() {
 }
 toplevel_of() { git -C "$1" rev-parse --show-toplevel 2>/dev/null || echo ""; }
 
+# The shell's HOME worktree — the tree it is MEANT to edit in. run.py exports
+# SC_SHELL_WORKTREE (the dir it exec's the harness from) for every non-admin
+# shell. "Outside your worktree" is judged against THIS, not the live cwd: a
+# planner/dev/reviewer whose cwd has drifted to the repo root (to run a
+# root-level command) is still working correctly when it edits into its own
+# worktree, so it must not be warned. Falls back to the cwd for callers run.py
+# didn't launch — the git pre-commit backstop, which has no SC_SHELL_WORKTREE.
+home_toplevel() {
+  if [ -n "${SC_SHELL_WORKTREE:-}" ] && [ -d "${SC_SHELL_WORKTREE}" ]; then
+    toplevel_of "$SC_SHELL_WORKTREE"
+  else
+    toplevel_of .
+  fi
+}
+
 feature_branch_hint() {
   echo "    git checkout -b feat/<short-desc>   # or fix/ chore/ docs/" >&2
   echo "then retry. One branch per unit of work — see the 'git' skill (branch -> commit -> push -> PR -> stop)." >&2
@@ -138,9 +153,9 @@ if [ -n "$target" ]; then
     if is_protected "$tgt_branch"; then
       echo "Blocked: this edit targets '$target', which is in repo '$tgt_top' on protected branch '$tgt_branch'." >&2
       echo "You are about to write to a default-branch checkout (often the stale repo root, NOT your worktree)." >&2
-      cwd_top="$(toplevel_of .)"
-      if [ -n "$cwd_top" ] && [ "$cwd_top" != "$tgt_top" ]; then
-        echo "Your worktree is '$cwd_top' (on '$(branch_of .)'). Edit there, or create a feature branch:" >&2
+      home_top="$(home_toplevel)"
+      if [ -n "$home_top" ] && [ "$home_top" != "$tgt_top" ]; then
+        echo "Your worktree is '$home_top' (on '$(branch_of "$home_top")'). Edit there, or create a feature branch:" >&2
       else
         echo "Create a feature branch first:" >&2
       fi
@@ -151,9 +166,9 @@ if [ -n "$target" ]; then
     # allow with a loud warning (the chosen "block protected + warn out-of-tree"
     # policy). additionalContext puts the warning in claude's context; stderr
     # shows it to the human. Other harnesses never reach here (no stdin target).
-    cwd_top="$(toplevel_of .)"
-    if [ -n "$cwd_top" ] && [ "$tgt_top" != "$cwd_top" ]; then
-      warn="⚠ branch-guard: editing '$target' OUTSIDE your worktree. That file is in '$tgt_top' (on '$tgt_branch'); your worktree is '$cwd_top'. Allowed because it is not a protected branch — but cross-tree edits are how stale-tree/wrong-tree mistakes happen. Confirm this path is intentional."
+    home_top="$(home_toplevel)"
+    if [ -n "$home_top" ] && [ "$tgt_top" != "$home_top" ]; then
+      warn="⚠ branch-guard: editing '$target' OUTSIDE your worktree. That file is in '$tgt_top' (on '$tgt_branch'); your worktree is '$home_top'. Allowed because it is not a protected branch — but cross-tree edits are how stale-tree/wrong-tree mistakes happen. Confirm this path is intentional."
       printf '%s\n' "$warn" >&2
       python3 -c 'import json,sys; print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":sys.argv[1]}}))' "$warn" 2>/dev/null || true
       exit 0
