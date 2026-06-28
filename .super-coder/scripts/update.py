@@ -294,9 +294,30 @@ def main(argv: list[str]) -> int:
         print(f"  {install_mod.wire_make_aliases()}")
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
-    print("  Review + commit: .sc-state/ (content.sql + engine.ref) + _sc renders")
-    print("  (+ Makefile if the wiring step just appended the alias include).")
-    print("  (The engine is gitignored — nothing under .super-coder/ to commit.)")
+    if source:
+        # Source repo tracks the engine itself — no fork repin PR; just commit
+        # the reconciled tree on a branch as usual.
+        print("  Review + commit the reconciled tree (the engine is tracked here).")
+    else:
+        # Fork repin: the update edited tracked files in place but did NOT touch
+        # git — it never branches, commits, or changes branch, so a bare `./sc
+        # update` on `main` leaves the repin uncommitted on main. Spell out the
+        # full flow so the operator lands a PR and returns to main instead of
+        # sitting stranded on the repin branch (the engine is gitignored — only
+        # .sc-state/ + any _sc renders + a first-time Makefile include change).
+        try:
+            pin = ENGINE_REF.read_text().strip()[:12]
+        except Exception:
+            pin = ""
+        branch_hint = f"repin-{pin}" if pin else "repin-<sha>"
+        print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
+        print(f"    git checkout -b {branch_hint}")
+        print("    git add .sc-state/engine.ref .sc-state/content.sql   # + any _sc renders / Makefile")
+        print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")
+        print("    gh pr create")
+        print("    git checkout main        # return to main — don't stay stranded on the repin branch")
+        print("  After the PR merges:")
+        print("    git pull --ff-only       # brings the repin onto local main")
     print("  A bad update? `./sc rollback` restores the DB + engine together.")
     print("  Restart your session to boot onto the new floor.")
     return 0
