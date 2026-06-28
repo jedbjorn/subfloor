@@ -765,6 +765,13 @@ def main() -> None:
     # so it is absent from worktrees; a worktree-relative path failed open). This
     # just saves a subshell per edit on the normal launch path.
     env["SC_ENGINE_DIR"] = str(ENGINE)
+    # The shell's HOME worktree — the dir we exec the harness from (below). The
+    # branch-guard reads it to judge "outside your worktree" against the assigned
+    # tree, not the live cwd: a shell whose cwd has drifted to the repo root (to
+    # run a root-level command) is still working correctly when it edits into its
+    # own worktree, and must not be warned. For admin this is REPO_ROOT, but admin
+    # exits the guard earlier via SC_SHELL_FLAVOR, so it never reads this.
+    env["SC_SHELL_WORKTREE"] = str(work_dir)
     set_terminal_tab_title(full["display_name"])
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
