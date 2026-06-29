@@ -11,8 +11,10 @@ stays local. It never propagates to forks (that is migrations' job). Engine
 skills are seeded from assets/ via migrations. Project-local skills are dumped
 here so a fork can author its own skills without upstreaming them.
 
-FK checks are off during load (SQLite default), so dump order is for readability
-only, not correctness.
+The snapshot wraps its body in PRAGMA foreign_keys=OFF/ON so tables can be
+dumped in readability order (parents before children) rather than strict FK
+dependency order — useful when a self-referential or circular FK makes a strict
+ordering impossible, and the rebuild's db_driver.connect() sets FK enforcement ON.
 
 Usage:
     python3 .super-coder/scripts/snapshot.py
@@ -247,12 +249,13 @@ def main() -> int:
             "-- `./sc snapshot`.",
             "",
             "BEGIN;",
+            "PRAGMA foreign_keys=OFF;",
             "",
         ]
         for table in PER_INSTANCE_TABLES:
             if table_exists(con, table):
                 out.extend(dump_table(con, table))
-        out.append("COMMIT;")
+        out.extend(["PRAGMA foreign_keys=ON;", "COMMIT;"])
         OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         OUT_PATH.write_text("\n".join(out) + "\n")
     finally:
