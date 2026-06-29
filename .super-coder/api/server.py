@@ -1481,7 +1481,7 @@ def main(argv):
         port = int(argv[argv.index("--port") + 1])
     if port is None:
         port = ports_mod.resolve().get("port", 8800)
-    if not db_driver.is_postgres() and not DB_PATH.exists():
+    if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can

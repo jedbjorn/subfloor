@@ -390,8 +390,7 @@ def _configured_harness() -> str | None:
 
 
 def open_db():
-    if not db_driver.is_postgres() and (
-            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         sys.exit(
             f"FATAL: no usable DB at {DB_PATH}.\n"
             f"  Rebuild it from text:  ./sc rebuild"

@@ -83,11 +83,6 @@ def quote(v) -> str:
 
 
 def table_exists(con, name: str) -> bool:
-    if db_driver.is_postgres():
-        return con.execute(
-            "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_name=?", (name,)
-        ).fetchone() is not None
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
@@ -190,9 +185,7 @@ def dump_table(con, table: str) -> list[str]:
     if not cols:
         return []
     collist = ", ".join(cols)
-    # rowid is SQLite-only; sort by first column (the PK) for deterministic output
-    order = "1" if db_driver.is_postgres() else "rowid"
-    rows = con.execute(f"SELECT {collist} FROM {table} ORDER BY {order}").fetchall()
+    rows = con.execute(f"SELECT {collist} FROM {table} ORDER BY rowid").fetchall()
     lines = [f"DELETE FROM {table};"]
     for row in rows:
         vals = ", ".join(quote(v) for v in row)
@@ -238,7 +231,7 @@ def snapshot_map() -> None:
 
 def main() -> int:
     require_admin("snapshot")
-    if not db_driver.is_postgres() and not DB_PATH.exists():
+    if not DB_PATH.exists():
         raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
     con = db_driver.connect(DB_PATH)
     try:

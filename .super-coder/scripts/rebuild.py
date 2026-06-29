@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """Rebuild the super-coder DB from git-tracked text.
 
-SQLite mode (default):
   1. apply schema.sql            (the v1 baseline)
   2. apply migrations/*.sql      (ordered deltas, ledger-tracked)
   3. load .sc-state/content.sql  (per-instance content + memory)
-
-Postgres mode (DATABASE_URL set):
-  1. apply schema_pg.sql         (full current baseline — all migrations baked in)
-  2. load .sc-state/content.sql  (per-instance content + memory)
-  3. reset sequences              (sync SERIAL sequences with loaded data)
-  4. stamp all migration filenames as applied (so future updates run only new ones)
 
 The .db file is gitignored and disposable. Text serializations are the source
 of truth; the DB is a cache.
@@ -29,7 +22,6 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 SCHEMA_SQLITE = ENGINE / "schema.sql"
-SCHEMA_PG     = ENGINE / "schema_pg.sql"
 SNAPSHOT       = REPO_ROOT / ".sc-state" / "content.sql"
 SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
 BACKUP_DIR = Path.home() / "db_backups" / "super-coder"
@@ -64,49 +56,7 @@ def backup_existing() -> None:
     print(f"rebuild: backed up existing DB -> {dst}")
 
 
-def _rebuild_postgres(argv: list[str]) -> int:
-    schema = SCHEMA_PG
-    if not schema.exists():
-        sys.exit(f"rebuild: missing {schema}")
-
-    con = db_driver.connect()
-    try:
-        con.executescript(schema.read_text())
-        con.commit()
-        print("rebuild: schema_pg.sql applied")
-
-        snap = snapshot_path()
-        if snap.exists():
-            con.executescript(snap.read_text())
-            con.commit()
-            print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
-        else:
-            print("rebuild: no .sc-state/content.sql — built empty.")
-
-        db_driver.reset_sequences(con)
-        print("rebuild: sequences reset")
-
-        migrate_mod.stamp_all(con)
-        con.commit()
-        print("rebuild: all migrations stamped as applied")
-    finally:
-        con.close()
-
-    try:
-        map_repo.main()
-    except SystemExit as e:
-        print(f"rebuild: map skipped ({e}) — run `./sc map` once the repo is ready")
-    except Exception as e:  # noqa: BLE001
-        print(f"rebuild: map failed ({e}) — run `./sc map`")
-
-    print("rebuild: done (postgres)")
-    return 0
-
-
 def main(argv: list[str]) -> int:
-    if db_driver.is_postgres():
-        return _rebuild_postgres(argv)
-
     schema = SCHEMA_SQLITE
     if not schema.exists():
         sys.exit(f"rebuild: missing {schema}")

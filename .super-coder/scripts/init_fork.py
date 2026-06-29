@@ -71,8 +71,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--partner")
     a = ap.parse_args(argv)
 
-    if not db_driver.is_postgres() and (
-            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         sys.exit("init_fork: no DB — run `./sc rebuild` first to build the system DB.")
 
     con = db_driver.connect(DB_PATH)

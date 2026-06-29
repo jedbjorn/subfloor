@@ -27,8 +27,7 @@ from seed_skills import sync_engine_skills  # noqa: E402
 
 
 def _open():
-    if not db_driver.is_postgres() and (
-            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         sys.exit(f"render: no usable DB at {DB_PATH} — run `./sc rebuild` first.")
     return db_driver.connect(DB_PATH)
 
