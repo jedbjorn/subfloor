@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -57,6 +56,7 @@ ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_driver  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
@@ -189,11 +189,13 @@ def migrate_engine_untrack() -> None:
 
 
 def migrate_or_rebuild() -> None:
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+    if not db_driver.is_postgres() and (
+            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
-    rebuild_mod.backup_existing()  # restore point before any structural change
+    if not db_driver.is_postgres():
+        rebuild_mod.backup_existing()  # restore point before any structural change
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
 
@@ -213,7 +215,7 @@ def sync_skills() -> None:
     if not seed.exists():
         print("  (no skills seed to sync)")
         return
-    con = sqlite3.connect(DB_PATH)
+    con = db_driver.connect(DB_PATH)
     try:
         con.executescript(seed.read_text())
         con.commit()
@@ -223,7 +225,7 @@ def sync_skills() -> None:
 
 
 def regrant() -> int:
-    con = sqlite3.connect(DB_PATH)
+    con = db_driver.connect(DB_PATH)
     try:
         # Grant newly-added COMMON skills to every shell. Opt-in (common=0)
         # skills are per-shell assignments — left untouched so an update never

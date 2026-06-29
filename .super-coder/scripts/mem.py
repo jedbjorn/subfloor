@@ -64,11 +64,13 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db_driver  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -90,34 +92,43 @@ def die(msg: str) -> "NoReturn":  # noqa: F821
 
 def assert_engine_db(path: Path) -> None:
     """Refuse to write anything that is not THE engine DB. Loud, never silent."""
-    if not path.exists():
-        die(f"no DB at {path} — run `./sc rebuild` first.")
-    if path.stat().st_size == 0:
-        die(f"{path} is a 0-byte stub, not the engine DB. The engine DB is "
-            f"{DEFAULT_DB} — run `./sc rebuild` if it is missing.")
-    con = sqlite3.connect(path)
-    try:
-        names = {r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-    finally:
-        con.close()
+    if db_driver.is_postgres():
+        # In postgres mode, validate via the live connection (no file to check).
+        con = db_driver.connect()
+        try:
+            if db_driver.is_postgres():
+                names = {r[0] for r in con.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public'")}
+            else:
+                names = {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            con.close()
+    else:
+        if not path.exists():
+            die(f"no DB at {path} — run `./sc rebuild` first.")
+        if path.stat().st_size == 0:
+            die(f"{path} is a 0-byte stub, not the engine DB. The engine DB is "
+                f"{DEFAULT_DB} — run `./sc rebuild` if it is missing.")
+        import sqlite3 as _sq3
+        con = _sq3.connect(path)
+        try:
+            names = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            con.close()
     missing = ENGINE_SENTINELS - names
     product = PRODUCT_SENTINELS & names
     if missing or product:
-        die(f"{path} is NOT the super-coder engine DB — refusing to write.\n"
+        die(f"NOT the super-coder engine DB — refusing to write.\n"
             f"     missing engine tables: {sorted(missing) or '—'}\n"
-            f"     product tables present: {sorted(product) or '—'}\n"
-            f"     the engine DB is {DEFAULT_DB}")
+            f"     product tables present: {sorted(product) or '—'}")
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path):
     assert_engine_db(path)
-    con = sqlite3.connect(path, timeout=5)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
-    return con
+    return db_driver.connect(None if db_driver.is_postgres() else path)
 
 
 # ── shell resolution ──────────────────────────────────────────────────────────
@@ -132,7 +143,7 @@ def git_branch() -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def resolve_shell(con: sqlite3.Connection, spec: str | None) -> int:
+def resolve_shell(con, spec: str | None) -> int:
     """--shell wins; else SC_SHELL (the booted shell's own identity, exported at
     boot by run.py); else infer from a `shell/<name>` worktree branch; else the
     sole non-shared shell; else make the caller pick.
@@ -235,7 +246,7 @@ def _insert_identity(args, kind: str) -> int:
                 "INSERT INTO shell_identity_entries (shell_id, kind, entry_date, source_tag, body) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (sid, kind, args.date or str(date.today()), args.tag, args.body))
-        except sqlite3.IntegrityError as e:
+        except db_driver.IntegrityError as e:
             die(str(e))  # cap trigger fired with a clear message
         con.commit()
         eid = cur.lastrowid
@@ -263,7 +274,7 @@ def cmd_retire(args) -> int:
             die(f"no identity entry #{args.entry_id}")
         if r["retired_at"]:
             die(f"identity entry #{args.entry_id} is already retired ({r['retired_at']})")
-        con.execute("UPDATE shell_identity_entries SET retired_at=datetime('now') "
+        con.execute("UPDATE shell_identity_entries SET retired_at=CURRENT_TIMESTAMP "
                     "WHERE entry_id=?", (args.entry_id,))
         con.commit()
     finally:
@@ -305,7 +316,7 @@ def cmd_flag(args) -> int:
             die(f"no flag #{args.flag_id}")
         if r["resolved"]:
             die(f"flag #{args.flag_id} is already resolved")
-        con.execute("UPDATE flags SET resolved=1, resolved_date=date('now'), "
+        con.execute("UPDATE flags SET resolved=1, resolved_date=CURRENT_DATE, "
                     "resolution_notes=? WHERE flag_id=?", (args.notes, args.flag_id))
         con.commit()
         return finish(args, f"mem: flag #{args.flag_id} closed")
@@ -321,7 +332,7 @@ def cmd_roadmap(args) -> int:
                             (args.feature_id,)).fetchone()
             if r is None:
                 die(f"no roadmap feature #{args.feature_id}")
-            con.execute("UPDATE roadmap SET roadmap_status=?, updated_at=datetime('now') "
+            con.execute("UPDATE roadmap SET roadmap_status=?, updated_at=CURRENT_TIMESTAMP "
                         "WHERE feature_id=?", (args.status, args.feature_id))
             con.commit()
             return finish(args, f"mem: feature #{args.feature_id} ('{r['title']}') → {args.status}")
@@ -329,13 +340,13 @@ def cmd_roadmap(args) -> int:
             # assign / clear the feature's work-stream (the Flow view groups on it)
             feat = _resolve_feature(con, args.feature_id)
             if str(args.project).lower() in ("none", "-", ""):
-                con.execute("UPDATE roadmap SET project_id=NULL, updated_at=datetime('now') "
+                con.execute("UPDATE roadmap SET project_id=NULL, updated_at=CURRENT_TIMESTAMP "
                             "WHERE feature_id=?", (args.feature_id,))
                 con.commit()
                 return finish(args, f"mem: feature #{args.feature_id} ('{feat['title']}') "
                                     f"→ unassigned (no work-stream)")
             proj = _resolve_project(con, args.project)
-            con.execute("UPDATE roadmap SET project_id=?, updated_at=datetime('now') "
+            con.execute("UPDATE roadmap SET project_id=?, updated_at=CURRENT_TIMESTAMP "
                         "WHERE feature_id=?", (proj["project_id"], args.feature_id))
             con.commit()
             return finish(args, f"mem: feature #{args.feature_id} ('{feat['title']}') "
@@ -376,7 +387,7 @@ def cmd_roadmap(args) -> int:
     return finish(args, f"mem: roadmap feature #{fid} added ('{args.title}', {args.status})")
 
 
-def _resolve_feature(con, fid: int) -> sqlite3.Row:
+def _resolve_feature(con, fid: int):
     r = con.execute("SELECT feature_id, title FROM roadmap WHERE feature_id=?",
                     (fid,)).fetchone()
     if r is None:
@@ -400,7 +411,7 @@ def _depends_on(con, start: int) -> set:
     return seen
 
 
-def _resolve_project(con, spec: str) -> sqlite3.Row:
+def _resolve_project(con, spec: str):
     if str(spec).isdigit():
         r = con.execute("SELECT project_id, shortname FROM projects WHERE project_id=? "
                         "AND COALESCE(is_deleted,0)=0", (int(spec),)).fetchone()
@@ -422,7 +433,7 @@ def cmd_project(args) -> int:
                     "INSERT INTO projects (shortname, title, purpose, standing, status) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (args.shortname, args.title, args.purpose, args.standing, args.status))
-            except sqlite3.IntegrityError as e:
+            except db_driver.IntegrityError as e:
                 die(str(e))  # UNIQUE(shortname) etc.
             pid = cur.lastrowid
             con.execute("INSERT INTO project_shells (project_id, shell_id, role) VALUES (?, ?, ?)",
@@ -454,7 +465,7 @@ def cmd_task(args) -> int:
                     "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (args.feature, args.doc, args.seq, args.title, args.desc, sid))
-            except sqlite3.IntegrityError as e:
+            except db_driver.IntegrityError as e:
                 die(str(e))  # UNIQUE(document_id, seq) / FK
             con.commit()
             return finish(args, f"mem: task #{cur.lastrowid} added (seq {args.seq}, '{args.title}')")
@@ -467,7 +478,7 @@ def cmd_task(args) -> int:
             con.commit()
             return finish(args, f"mem: task #{args.task_id} ('{r['title']}') → in_progress")
         # done
-        con.execute("UPDATE spec_tasks SET status='done', completed_date=date('now') "
+        con.execute("UPDATE spec_tasks SET status='done', completed_date=CURRENT_DATE "
                     "WHERE task_id=?", (args.task_id,))
         con.commit()
         return finish(args, f"mem: task #{args.task_id} ('{r['title']}') → done")
@@ -523,7 +534,7 @@ def _doc_freeze(args) -> int:
             die(f"no document #{args.document_id}")
         if r["frozen"]:
             die(f"document #{args.document_id} is already frozen")
-        con.execute("UPDATE documents SET frozen=1, frozen_date=date('now') "
+        con.execute("UPDATE documents SET frozen=1, frozen_date=CURRENT_DATE "
                     "WHERE document_id=?", (args.document_id,))
         con.commit()
     finally:
@@ -551,7 +562,7 @@ def _doc_edit(args) -> int:
         if r["frozen"]:
             die(f"document #{args.document_id} is frozen — open a new spec under the "
                 "same feature instead of editing a frozen one")
-        sets.append("updated_at=datetime('now')")
+        sets.append("updated_at=CURRENT_TIMESTAMP")
         con.execute(f"UPDATE documents SET {', '.join(sets)} WHERE document_id=?",
                     (*vals, args.document_id))
         con.commit()
@@ -593,7 +604,7 @@ def cmd_message(args) -> int:
             return finish(args, f"mem: message #{cur.lastrowid} sent from #{sid} to {args.to}")
         # mark-read
         cur = con.execute(
-            "UPDATE shell_messages SET read_at=datetime('now') "
+            "UPDATE shell_messages SET read_at=CURRENT_TIMESTAMP "
             "WHERE message_id=? AND to_shell_id=? AND read_at IS NULL",
             (args.message_id, sid))
         con.commit()

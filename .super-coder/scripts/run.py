@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 from datetime import date, datetime
@@ -36,6 +35,7 @@ from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
@@ -388,25 +388,21 @@ def _configured_harness() -> str | None:
     return None
 
 
-def open_db() -> sqlite3.Connection:
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+def open_db():
+    if not db_driver.is_postgres() and (
+            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
         sys.exit(
             f"FATAL: no usable DB at {DB_PATH}.\n"
             f"  Rebuild it from text:  ./sc rebuild"
         )
-    con = sqlite3.connect(DB_PATH, timeout=5)
-    con.row_factory = sqlite3.Row
-    # Coexist with the review server writing the same file from another process
-    # (see server.py db()): WAL + a busy_timeout instead of "database is locked".
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
+    con = db_driver.connect(DB_PATH)
     con.execute("SELECT 1 FROM shells LIMIT 1")  # smoke
     return con
 
 
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
-def authenticate(con: sqlite3.Connection) -> sqlite3.Row:
+def authenticate(con):
     # SC_USER env wins; else prompt on a TTY; else (headless: `./sc verify`, CI)
     # default to the first active user so launch doesn't EOFError without a TTY.
     username = os.environ.get("SC_USER")
@@ -432,7 +428,7 @@ def authenticate(con: sqlite3.Connection) -> sqlite3.Row:
 
 # ── Shell selection ─────────────────────────────────────────────────────────
 
-def list_shells(con: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
+def list_shells(con, user_id: int) -> list:
     return con.execute(
         "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor FROM shells "
         "WHERE (user_id=? OR is_shared=1) AND COALESCE(is_deleted,0)=0 "
@@ -441,7 +437,7 @@ def list_shells(con: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def flavor_defaults(con: sqlite3.Connection) -> dict:
+def flavor_defaults(con) -> dict:
     """flavor -> {'default_harness', 'models': {harness: model}} launch defaults.
     The (flavor, harness) matrix: each flavor names a model per harness, and one
     harness is the picker default (is_default). Empty if the table is absent
@@ -450,7 +446,7 @@ def flavor_defaults(con: sqlite3.Connection) -> dict:
     try:
         rows = con.execute(
             "SELECT flavor, harness, model, is_default FROM flavor_defaults")
-    except sqlite3.OperationalError:
+    except db_driver.OperationalError:
         return {}
     out: dict = {}
     for r in rows:
@@ -473,8 +469,8 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
-def pick_shell(shells: list[sqlite3.Row], requested: str | None,
-               first: bool, defaults: dict | None = None) -> sqlite3.Row:
+def pick_shell(shells: list, requested: str | None,
+               first: bool, defaults: dict | None = None):
     defaults = defaults or {}
     if not shells:
         sys.exit("FATAL: no shells available to this user.")
@@ -517,7 +513,7 @@ def _is_unused(narrative: str) -> bool:
     return (narrative or "").count("\n[") <= 1
 
 
-def open_session(con: sqlite3.Connection, shell_id: int) -> tuple[str, int]:
+def open_session(con, shell_id: int) -> tuple[str, int]:
     # Reuse the active session if it was opened but never used (e.g. install
     # opened session 0001, or a prior launch did no work) — avoids phantom empty
     # sessions and the incidental first-snapshot diff.
