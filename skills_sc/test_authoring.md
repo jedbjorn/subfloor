@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # test_authoring
 
-Standards for writing and reviewing stringent pytest tests — tests that can actually fail. Use when authoring or reviewing any test under `tests/`.
+Principles for stringent pytest tests — tests that can actually fail. Pair with test_authoring_sqlite or test_authoring_pg for stack-specific infra context.
 
 **Category:** craft
 
@@ -19,19 +19,8 @@ The goal of a test is to **fail when the code is wrong**. A test that passes
 no matter what the code does is worse than no test — it reads as coverage while
 guarding nothing.
 
-## The foundation you build on
-
-`tests/conftest.py` builds a throwaway DB from the **real** `schema.sql` + the
-post-059 migrations, seeds two tenants (Alice / Bob) + a shared system shell,
-and drives the **real** app through `TestClient` with real auth (session cookie
-or shell bearer key). Use it:
-
-- Hit real endpoints through the `alice` / `bob` / `admin` / `anon` / `shell_a`
-  / `shell_b` callers — do not mock the router or the DB layer.
-- Assert against **real rows** in the test DB, not against the payload you just
-  sent back to yourself.
-- Mock only the true external boundary — outbound IMAP / HTTP / broker egress.
-  Never mock the function under test or the logic you're claiming to verify.
+Load `test_authoring_sqlite` or `test_authoring_pg` alongside this for the
+test infrastructure your stack uses (fixture setup, callers, DB access pattern).
 
 ## The rules (the floor)
 
