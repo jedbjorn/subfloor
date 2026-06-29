@@ -12,7 +12,6 @@ Usage:
 """
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -21,17 +20,17 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_driver  # noqa: E402
 import flat  # noqa: E402
 from _serialize_guard import require_admin  # noqa: E402
 from seed_skills import sync_engine_skills  # noqa: E402
 
 
-def _open() -> sqlite3.Connection:
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+def _open():
+    if not db_driver.is_postgres() and (
+            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
         sys.exit(f"render: no usable DB at {DB_PATH} — run `./sc rebuild` first.")
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    return db_driver.connect(DB_PATH)
 
 
 def _resolve_shell(con, shortname: str) -> int:

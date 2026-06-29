@@ -27,19 +27,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
 
+sys.path.insert(0, str(ENGINE / "scripts"))
+import db_driver  # noqa: E402
+
 # The starting team seeded at install, besides the singleton cartographer (added
 # separately below). Your interviewed primary shell — default planner — fills one
 # of these slots; the rest are auto-named team members (ADM1, DEV1, DEV2, REV1).
 TEAM_ROSTER = ["admin", "planner", "dev", "dev", "reviewer"]
 
-sys.path.insert(0, str(ENGINE / "scripts"))
 from shell_factory import create_shell, flavors  # noqa: E402
 
 
@@ -70,11 +71,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--partner")
     a = ap.parse_args(argv)
 
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+    if not db_driver.is_postgres() and (
+            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
         sys.exit("init_fork: no DB — run `./sc rebuild` first to build the system DB.")
 
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
+    con = db_driver.connect(DB_PATH)
     try:
         if already_seeded(con):
             sys.exit("init_fork: a shell already exists — this fork is already "

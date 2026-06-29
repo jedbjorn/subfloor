@@ -23,7 +23,6 @@ import base64
 import gzip
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -50,6 +49,7 @@ LOG_MAX_EVENTS = 20
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
@@ -130,17 +130,8 @@ FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "p
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
 
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, timeout=5)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    # The server and a harness session now write this DB from separate processes
-    # (both share the bind-mounted file in the sandbox). WAL lets a reader and a
-    # writer coexist; busy_timeout makes a contended write wait instead of raising
-    # "database is locked". WAL is a persistent DB property — set once, sticks.
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
-    return con
+def db():
+    return db_driver.connect(DB_PATH)
 
 
 def rows(cur) -> list[dict]:
@@ -1158,8 +1149,8 @@ def main(argv):
         port = int(argv[argv.index("--port") + 1])
     if port is None:
         port = ports_mod.resolve().get("port", 8800)
-    if not DB_PATH.exists():
-        sys.exit(f"server: no DB at {DB_PATH} — run `make rebuild` first.")
+    if not db_driver.is_postgres() and not DB_PATH.exists():
+        sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which

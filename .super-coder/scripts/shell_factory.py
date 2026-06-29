@@ -11,7 +11,7 @@ the FIRST RUN orientation), and has its first session opened.
 from __future__ import annotations
 
 import json
-import sqlite3
+import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -19,8 +19,8 @@ REPO_ROOT = ENGINE.parent
 SHELL_TEMPLATES = ENGINE / "templates" / "shells"
 PROMPT_TEMPLATE = ENGINE / "templates" / "shell_system_prompt.md"
 
-import sys  # noqa: E402
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_driver  # noqa: E402
 from seed_dogfood import LINEAGE_SEED  # noqa: E402  (canonical lineage, single source)
 from run import open_session  # noqa: E402
 
@@ -48,7 +48,7 @@ def load_flavor(flavor: str) -> dict:
     return json.loads(p.read_text())
 
 
-def _auto_shortname(con: sqlite3.Connection, abbr: str) -> str:
+def _auto_shortname(con, abbr: str) -> str:
     """Default shortname when the caller gives none: <ABBR><n> — the flavor's
     abbreviation + the next integer (e.g. DEV3, PLN1). Numbered max-suffix + 1
     over ALL shells with that abbr, deleted included, so a number is never
@@ -74,7 +74,7 @@ def render_prompt(name: str, role: str, repo: str, focus: str, mandate: str) -> 
     return text
 
 
-def create_shell(con: sqlite3.Connection, *, flavor: str, name: str,
+def create_shell(con, *, flavor: str, name: str,
                  shortname: str | None = None, partner: str | None = None,
                  repo: str | None = None, role: str | None = None,
                  mandate: str | None = None, user_id: int = 1,
@@ -112,7 +112,7 @@ def create_shell(con: sqlite3.Connection, *, flavor: str, name: str,
 
     con.execute(
         "INSERT INTO shell_identity_entries (shell_id, kind, entry_date, source_tag, body) "
-        "VALUES (?, 'seed', date('now'), 'fork', ?)",
+        "VALUES (?, 'seed', CURRENT_DATE, 'fork', ?)",
         (shell_id, GENESIS_TMPL.format(role_lc=role.lower(), repo=repo)))
 
     # COMMON catalogue (auto) + this flavor's opt-in skills, granted by name.
