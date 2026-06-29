@@ -149,8 +149,8 @@ sc_deps() {
   # Engine baseline dev kit — test (pytest/httpx/coverage), lint+format (ruff),
   # type-check (mypy), SQLite GUI (datasette). only-if-needed never overrides a
   # fork's pin or its [tool.ruff]/[tool.mypy] config — available, not enforced.
-  echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette psycopg2-binary, only-if-needed)"
-  "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette psycopg2-binary || rc=1
+  echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette psycopg[binary], only-if-needed)"
+  "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette "psycopg[binary]" || rc=1
   pkgs="$(_sc_find_manifests 'package.json')"
   if [ -n "$pkgs" ]; then
     printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
@@ -583,7 +583,7 @@ super-coder — forkable shell substrate
   ./sc serve               run the review layer (api + static UI) in the foreground
   ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
   ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
-                             (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette psycopg2-binary)
+                             (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette psycopg[binary])
   ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure
   ./sc lint [paths]        ruff check the fork's python (.venv ruff; honors [tool.ruff]) — available, not enforced
   ./sc typecheck [paths]   mypy the fork's python (.venv mypy; honors [tool.mypy]) — available, not enforced
