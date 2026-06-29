@@ -26,7 +26,7 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
 lns · decision · flag · roadmap · doc · narrative) — the write lands in the live
 engine DB, durable and visible to all at once. `./sc mem which` to orient. See the
-`mem` skill.
+`memory` and `db_map` skills.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.

@@ -194,7 +194,7 @@ def render_api(port: "int | None", api_key: "str | None") -> str:
         f"- **Base URL:** `http://127.0.0.1:{port}`\n"
         "- **Token:** available as `$SC_API_TOKEN` in your environment (set at launch).\n\n"
         "Write memory via `./sc mem` (proxied here automatically when `SC_API_TOKEN` is set). "
-        "Read messages: `GET /_sc/mem/messages`. Full endpoint list: the `mem` skill."
+        "Read messages: `GET /_sc/mem/messages`. Command reference: the `memory` and `db_map` skills."
     )
 
 
