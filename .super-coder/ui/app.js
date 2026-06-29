@@ -604,6 +604,11 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
     root.append(el("div", { className: "muted" }, "No features in the sequencing stages yet."));
     return;
   }
+  const activeFeats = feats.filter((f) => stageOf[f.feature_id] !== "shipped");
+  if (!activeFeats.length) {
+    root.append(el("div", { className: "muted" }, "All shipped — nothing in progress."));
+    return;
+  }
 
   // Group the sequencing features by work-stream (project_id; null = ungrouped).
   const byProj = new Map();   // key (project_id | null) → { title, features }
