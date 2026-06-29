@@ -17,9 +17,14 @@ How this shell writes its memory — current_state, session narrative, seed, L&S
 All memory is DB rows (no flat files). Write at the moment it matters, not in a
 close ritual.
 
-**Write through `./sc mem`.** The write lands in the live engine DB — shared by
-every shell, durable + visible to all the moment it commits. Writes default to
-your shell; pass `--shell <id|name>` to be explicit.
+**Write through `./sc mem`, never raw `sqlite3`.** Two DBs are in reach (your
+engine DB and the app's product DB) and their table names overlap — a raw
+`INSERT INTO shell_decisions …` against the wrong one *succeeds silently*.
+`./sc mem` resolves + guards *this* engine DB, refuses the app DB or an empty
+stub, and writes to the live engine DB — the single source of truth shared by
+every shell, so the change is durable + visible to all the moment it commits.
+`./sc mem which` shows the resolved DB; raw `sqlite3` is for SELECT only. Writes
+default to your shell; pass `--shell <id|name>` to be explicit.
 
 ## current_state — rolling status, NOT a log
 
@@ -70,4 +75,5 @@ the narrative.
 
 Write-as-you-go beats batch-at-close: it costs nothing per write and zero at
 session end. Curate seed/L&S (revise the set), never rewrite history (decisions,
-narrative, seed bodies). Full command reference + table map: the `db_map` skill.
+narrative, seed bodies). The underlying tables are documented in `db_map` — read
+them with raw SELECT, write them with `./sc mem`.

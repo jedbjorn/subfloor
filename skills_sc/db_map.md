@@ -19,9 +19,12 @@ Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 memory, and content live in tables — never flat files. Lazy-load: query for what
 you need, don't bulk-read.
 
-Query with `sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through
-`./sc mem`. Table below = the schema for your SELECTs; `## Common writes` = the
-`./sc mem` command for each change.
+**Reads use raw `sqlite3` SELECT; writes go through `./sc mem`.** Two DBs are in
+reach (this engine DB + the app's product DB) with overlapping table names, so a
+raw INSERT against the wrong one succeeds silently. `./sc mem` resolves + guards
+*this* DB and writes to the live engine DB — shared by every shell, durable the
+moment it commits. Table below = the schema for your SELECTs; `## Common writes` =
+the `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
@@ -39,7 +42,7 @@ memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
 | `feature_blockers` | the roadmap's dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite must land first). Directed, kept acyclic (the GUI Flow view wires them; the card's "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `./sc mem roadmap depends` |
 | `documents` | the content store — specs/docs bodies live here; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; never edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
-| `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | managed by engine |
+| `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | catalogue via migration; grants via snapshot |
 | `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a **work-stream** that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
 `<self>` = your `shell_id` (in the boot doc's ACTIVE SESSION block).
@@ -88,6 +91,11 @@ Each guards the engine DB and writes to the live shared DB. `./sc mem which` ori
 ./sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
 ./sc mem oriented                          # mark first-run done (bootstrapped=1)
 ```
+
+Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
+reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
+existing shell to a project — are rare; do them with raw `sqlite3` after
+`./sc mem which`.)
 
 ## After writing
 

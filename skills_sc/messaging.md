@@ -18,8 +18,11 @@ One shell writes a markdown message to another; the recipient discovers it on it
 next boot via the `## STATUS` `Inbox:` count, surfaces it with `check`, and clears
 it with `mark-read`. Body is markdown — preserved verbatim.
 
-Drive it with **`./sc mem message`**. The sender is you; recipients are addressed
-by `shortname`.
+Drive it with **`./sc mem message`**, never raw `sqlite3`. `shell_messages` lives
+in the engine DB, and `./sc mem` resolves + guards *this* DB (from any cwd,
+including a worktree where a literal `.super-coder/shell_db.db` path would create
+an empty stub and drop the message) and snapshots the send so it survives a
+rebuild. The sender is you; recipients are addressed by `shortname`.
 
 Trigger: `--message`
 Args: `check [N] | send <to-shortname> <body> | mark-read <id>`
