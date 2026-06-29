@@ -17,6 +17,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -51,8 +52,16 @@ class MemTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.db = self.tmp / "shell_db.db"
         build_engine_db(self.db)
+        # resolve_shell now consults SC_SHELL; a value inherited from the dev's
+        # own shell would make inference non-deterministic. Neutralize it here
+        # and let the env-path tests set it explicitly.
+        self._sc_shell = os.environ.pop("SC_SHELL", None)
 
     def tearDown(self):
+        if self._sc_shell is None:
+            os.environ.pop("SC_SHELL", None)
+        else:
+            os.environ["SC_SHELL"] = self._sc_shell
         for p in self.tmp.glob("*"):
             p.unlink()
         self.tmp.rmdir()
@@ -99,6 +108,32 @@ class MemTest(unittest.TestCase):
         try:
             with self.assertRaises(SystemExit):
                 mem.resolve_shell(con, "ghost")
+        finally:
+            con.close()
+
+    def _add_second_shell(self, con):
+        # A second non-shared shell makes the sole-shell fallback ambiguous, so
+        # resolution must come from SC_SHELL or an explicit --shell.
+        con.execute(
+            "INSERT INTO shells (display_name, shortname, mandate, system_prompt, "
+            "user_id, is_shared, has_identity, bootstrapped) "
+            "VALUES ('TD', 'td', 'test', 'sp', 1, 0, 1, 1)")
+        con.commit()
+
+    def test_resolve_from_env(self):
+        con = mem.connect(self.db)
+        try:
+            self._add_second_shell(con)
+            # Ambiguous with no signal — must fail rather than guess.
+            with self.assertRaises(SystemExit):
+                mem.resolve_shell(con, None)
+            # SC_SHELL names the shell, so inference succeeds.
+            os.environ["SC_SHELL"] = "td"
+            self.assertEqual(mem.resolve_shell(con, None),
+                             con.execute("SELECT shell_id FROM shells WHERE "
+                                         "shortname='td'").fetchone()[0])
+            # An explicit --shell still overrides SC_SHELL.
+            self.assertEqual(mem.resolve_shell(con, "tc"), 1)
         finally:
             con.close()
 
