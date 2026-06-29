@@ -17,29 +17,21 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 |---|---|
 | Identity (core) | `shells WHERE shell_id=<self>` — mandate, system_prompt, current_state (rolling, ~500 chars) |
 | Seed + L&S | `shell_identity_entries` — kind seed (cap 10) / lns (cap 20), trigger-enforced |
-| Decisions | `shell_decisions` — major decisions; INSERT, never edit |
+| Decisions | `shell_decisions` — major decisions; never supersede, add a new one |
 | Flags | `flags` — open + resolved; link to a feature via feature_id |
 | Roadmap | `roadmap` — one row per planned feature; status is a planning horizon |
 | Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
 Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
-lns · decision · flag · roadmap · doc · narrative): it resolves + guards *this*
-engine DB — refusing the app DB or a stray empty file, whose overlapping table
-names would let a raw `sqlite3` INSERT hit the wrong DB silently. The write lands
-in the live engine DB — the single source of truth shared by every shell, durable
-and visible to all at once. That is the whole write: **you don't snapshot or
-render** — persisting to git is an admin/GUI step. Raw `sqlite3` is for SELECT only;
-`./sc mem which` to orient. See the `memory` and `db_map` skills.
+lns · decision · flag · roadmap · doc · narrative) — the write lands in the live
+engine DB, durable and visible to all at once. `./sc mem which` to orient. See the
+`mem` skill.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
-— docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
-`./sc render`. They are derived artifacts: a photograph of a DB row, not the row.
-Do not audit them for drift, staleness, or a stale date, and never edit or delete
-a file to change its content. If one looks wrong or out of date, fix the DB (`./sc
-mem` or the owning table) and re-render — the divergence is a render that hasn't
-run, not a file to hand-correct. The DB is the authoritative content; the tree is
-its projection.
+— docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.
+If one looks wrong or out of date, the DB row is wrong — fix it via `./sc mem`.
+Never edit these files directly. The DB is the authoritative content.
 
 ## MANDATE
 

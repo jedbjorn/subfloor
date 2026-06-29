@@ -11,6 +11,7 @@ the FIRST RUN orientation), and has its first session opened.
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 from pathlib import Path
 
@@ -98,16 +99,19 @@ def create_shell(con, *, flavor: str, name: str,
     abbr = tpl.get("abbr") or flavor[:3]
     shortname = shortname.strip() if shortname else _auto_shortname(con, abbr)
 
+    api_key = secrets.token_urlsafe(32)
     cur = con.execute(
         "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
         "system_prompt, current_state, connections, lineage_seed, flavor, "
-        "has_identity, bootstrapped, user_id, is_shared) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)",
+        "has_identity, bootstrapped, user_id, is_shared, "
+        "api_key, api_key_rotated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, datetime('now'))",
         (name, shortname, partner, role, mandate,
          render_prompt(name, role, repo, focus, mandate),
          f"Created ({flavor}). First session — run the bootstrap skill to orient.",
          f"Single repo: this one ({repo}). One shell, one cwd.",
-         LINEAGE_SEED, flavor, user_id, is_shared))
+         LINEAGE_SEED, flavor, user_id, is_shared,
+         api_key))
     shell_id = cur.lastrowid
 
     con.execute(

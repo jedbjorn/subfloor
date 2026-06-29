@@ -37,18 +37,18 @@ different ways, so keep them straight:
 
 - **Engine memory DB** — `.super-coder/shell_db.db`. Fixed name, always under
   `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
-  Gitignored and rebuilt from tracked text. **Write to it through `./sc mem`, not
-  raw `sqlite3`** — `./sc mem` resolves *this* DB for you, refuses to write to the
-  app DB or a stray empty file (their table names overlap, so a raw INSERT against
-  the wrong one silently succeeds), and snapshots the change so it survives a
-  rebuild. `./sc mem which` shows the resolved DB. Raw `sqlite3` is for SELECT
-  (reads can't corrupt); `./sc snapshot` re-serializes after any non-`mem` edit.
+  Gitignored and rebuilt from tracked text. **Write through `./sc mem`** — the
+  write lands in the live engine DB, durable and visible to all. `./sc mem which`
+  shows the resolved DB. `./sc mem` routes through the engine API (no direct-DB
+  fallback). If it reports "API unreachable", the engine server is down — surface
+  this to FnB; they restart it with `./sc start` / `make dos-r`. Do not retry
+  silently; surface the error and stop.
 - **App product DB** — the database of the product *this repo* builds. Its name
   and path **vary per fork** and live **outside** `.super-coder/`. Holds the
   product's runtime data + schema. Change it the way the product does — schema
-  migrations + app code — never by hand-editing rows, and never `./sc snapshot`
-  it. Locate it via the repo map: the cartographer tags its schema/migrations in
-  `dr_*` (the live `.db` is often gitignored, so the schema is the durable anchor).
+  migrations + app code — never by hand-editing rows. Locate it via the repo map:
+  the cartographer tags its schema/migrations in `dr_*` (the live `.db` is often
+  gitignored, so the schema is the durable anchor).
 
 **Decision rule:** your memory / planning / specs / roadmap → **engine DB**,
 written via `./sc mem`. The product's data or schema → **app DB**, via its
