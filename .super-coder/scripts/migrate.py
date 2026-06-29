@@ -6,17 +6,13 @@ Each applied file is recorded in the `schema_migrations` ledger so it never
 runs twice. This is the path a *fork* takes when it pulls super-coder updates:
 new migration files appear, `migrate.py` applies only the unstamped ones.
 
-Contract: `schema.sql` / `schema_pg.sql` is the full current baseline. Every
-schema change *after* the baseline is an additive migration here — never folded
-back into the schema files (that would double-apply). A fresh build
-(`rebuild.py`) applies the schema then calls this to lay every migration down in
-order and stamp them all so future updates only run new ones.
+Contract: `schema.sql` is the full current baseline. Every schema change
+*after* the baseline is an additive migration here — never folded back into the
+schema file (that would double-apply). A fresh build (`rebuild.py`) applies the
+schema then calls this to lay every migration down in order.
 
 Usage:
     python3 .super-coder/scripts/migrate.py <path-to-db>
-
-In postgres mode (DATABASE_URL set) the <path-to-db> argument is accepted but
-ignored; the connection uses DATABASE_URL.
 """
 from __future__ import annotations
 
@@ -31,19 +27,11 @@ import db_driver  # noqa: E402
 
 
 def applied_set(con) -> set[str]:
-    if db_driver.is_postgres():
-        ddl = (
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            "  filename TEXT PRIMARY KEY,"
-            "  applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        )
-    else:
-        ddl = (
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            "  filename TEXT PRIMARY KEY,"
-            "  applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
-        )
-    con.execute(ddl)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "  filename TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
     return {r[0] for r in con.execute("SELECT filename FROM schema_migrations")}
 
 
@@ -58,24 +46,8 @@ def apply(con, path: Path) -> None:
     con.execute("INSERT INTO schema_migrations (filename) VALUES (?)", (path.name,))
 
 
-def stamp_all(con) -> None:
-    """Mark every existing migration file as applied without running them.
-
-    Used by rebuild.py in postgres mode: the schema_pg.sql baseline already
-    incorporates all migrations, so we stamp them so future `./sc update` only
-    runs genuinely new ones.
-    """
-    done = applied_set(con)
-    files = sorted(MIGRATIONS_DIR.glob("*.sql")) if MIGRATIONS_DIR.exists() else []
-    for path in files:
-        if path.name not in done:
-            con.execute(
-                "INSERT INTO schema_migrations (filename) VALUES (?)", (path.name,)
-            )
-
-
 def migrate(db_path: str) -> int:
-    con = db_driver.connect(None if db_driver.is_postgres() else db_path)
+    con = db_driver.connect(db_path)
     try:
         todo = pending(con)
         if not todo:

@@ -73,7 +73,6 @@ ENGINE_PATHS = [
     ".super-coder/aliases.mk",
     ".super-coder/Dockerfile",
     ".super-coder/schema.sql",
-    ".super-coder/schema_pg.sql",
     ".super-coder/map_schema.sql",
     ".super-coder/ecosystem.config.cjs",
     ".super-coder/README.md",
@@ -190,13 +189,11 @@ def migrate_engine_untrack() -> None:
 
 
 def migrate_or_rebuild() -> None:
-    if not db_driver.is_postgres() and (
-            not DB_PATH.exists() or DB_PATH.stat().st_size == 0):
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
-    if not db_driver.is_postgres():
-        rebuild_mod.backup_existing()  # restore point before any structural change
+    rebuild_mod.backup_existing()  # restore point before any structural change
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
 

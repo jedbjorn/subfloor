@@ -127,32 +127,18 @@ def die(msg: str) -> "NoReturn":  # noqa: F821
 
 def assert_engine_db(path: Path) -> None:
     """Refuse to write anything that is not THE engine DB. Loud, never silent."""
-    if db_driver.is_postgres():
-        # In postgres mode, validate via the live connection (no file to check).
-        con = db_driver.connect()
-        try:
-            if db_driver.is_postgres():
-                names = {r[0] for r in con.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema='public'")}
-            else:
-                names = {r[0] for r in con.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'")}
-        finally:
-            con.close()
-    else:
-        if not path.exists():
-            die(f"no DB at {path} — run `./sc rebuild` first.")
-        if path.stat().st_size == 0:
-            die(f"{path} is a 0-byte stub, not the engine DB. The engine DB is "
-                f"{DEFAULT_DB} — run `./sc rebuild` if it is missing.")
-        import sqlite3 as _sq3
-        con = _sq3.connect(path)
-        try:
-            names = {r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-        finally:
-            con.close()
+    if not path.exists():
+        die(f"no DB at {path} — run `./sc rebuild` first.")
+    if path.stat().st_size == 0:
+        die(f"{path} is a 0-byte stub, not the engine DB. The engine DB is "
+            f"{DEFAULT_DB} — run `./sc rebuild` if it is missing.")
+    import sqlite3 as _sq3
+    con = _sq3.connect(path)
+    try:
+        names = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
     missing = ENGINE_SENTINELS - names
     product = PRODUCT_SENTINELS & names
     if missing or product:
@@ -163,7 +149,7 @@ def assert_engine_db(path: Path) -> None:
 
 def connect(path: Path):
     assert_engine_db(path)
-    return db_driver.connect(None if db_driver.is_postgres() else path)
+    return db_driver.connect(path)
 
 
 # ── shell resolution ──────────────────────────────────────────────────────────

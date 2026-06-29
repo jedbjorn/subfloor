@@ -21,7 +21,7 @@ import db_driver  # noqa: E402
 
 
 def backfill(db_path: str) -> int:
-    con = db_driver.connect(None if db_driver.is_postgres() else db_path)
+    con = db_driver.connect(db_path)
     try:
         shells = con.execute(
             "SELECT shell_id FROM shells "
