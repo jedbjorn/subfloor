@@ -133,10 +133,10 @@ cartographer''s automation (see `surface_catalogue`). You read it.
    and role are in the boot doc. Re-read them with intent — this is who is doing
    the work here.
 
-3. **Skim the plan.** Open roadmap features + their blocking flags:
-   ```sql
-   SELECT feature_id, title, roadmap_status FROM roadmap ORDER BY sort_order;
-   SELECT display_name, description FROM flags WHERE resolved=0 AND is_deleted=0;
+3. **Skim the plan.** Open roadmap features + their blocking flags, via the API:
+   ```
+   ./sc mem get roadmap
+   ./sc mem get flags
    ```
 
 4. **Set your `current_state`** — replace the install placeholder with what you
@@ -577,8 +577,13 @@ Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 memory, and content live in tables — never flat files. Lazy-load: query for what
 you need, don''t bulk-read.
 
-Query with `sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through
-`./sc mem`. Table below = the schema for your SELECTs; `## Common writes` = the
+Read your own memory with `./sc mem get <surface>` — `state`, `seed`, `lns`,
+`decisions`, `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
+It goes through the engine API: no DB path, no SELECT, no fallback-to-direct-DB
+to think about. For ad-hoc reads of tables the `get` surfaces don''t cover
+(`documents`, `projects`, `feature_blockers`, `skills`), query read-only with
+`sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through `./sc mem`.
+Table below = the schema for those ad-hoc SELECTs; `## Common writes` = the
 `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
@@ -1258,18 +1263,20 @@ Flags tab). `<self>` = your shell_id.
 
 ## Surface
 
-```sql
--- your open flags (grouped by feature in the GUI):
-SELECT f.flag_id, f.display_name, f.priority, f.description, r.title AS feature
-FROM flags f LEFT JOIN roadmap r ON r.feature_id = f.feature_id
-WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-ORDER BY f.priority, f.flag_id;
 ```
+./sc mem get flags          # your open flags (id, name, priority, description) — via the API
+./sc mem get flags --json   # same, as JSON
+```
+
+(Need the roadmap-feature title joined in? That join isn''t in the `get` surface —
+fall back to a read-only `sqlite3 .super-coder/shell_db.db "SELECT f.flag_id,
+f.display_name, f.priority, f.description, r.title AS feature FROM flags f LEFT
+JOIN roadmap r ON r.feature_id=f.feature_id WHERE f.resolved=0 AND
+COALESCE(f.is_deleted,0)=0 ORDER BY f.priority, f.flag_id;"`.)
 
 ## Open
 
-Write through `./sc mem` (it guards the engine DB + snapshots; raw `sqlite3` is
-for the SELECT above only):
+Write through `./sc mem` (it guards the engine DB + snapshots):
 ```
 ./sc mem flag open "[Area] what''s blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```

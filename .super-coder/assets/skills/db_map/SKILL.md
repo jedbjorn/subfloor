@@ -12,8 +12,13 @@ Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 memory, and content live in tables — never flat files. Lazy-load: query for what
 you need, don't bulk-read.
 
-Query with `sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through
-`./sc mem`. Table below = the schema for your SELECTs; `## Common writes` = the
+Read your own memory with `./sc mem get <surface>` — `state`, `seed`, `lns`,
+`decisions`, `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
+It goes through the engine API: no DB path, no SELECT, no fallback-to-direct-DB
+to think about. For ad-hoc reads of tables the `get` surfaces don't cover
+(`documents`, `projects`, `feature_blockers`, `skills`), query read-only with
+`sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through `./sc mem`.
+Table below = the schema for those ad-hoc SELECTs; `## Common writes` = the
 `./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`

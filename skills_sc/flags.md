@@ -20,18 +20,20 @@ Flags tab). `<self>` = your shell_id.
 
 ## Surface
 
-```sql
--- your open flags (grouped by feature in the GUI):
-SELECT f.flag_id, f.display_name, f.priority, f.description, r.title AS feature
-FROM flags f LEFT JOIN roadmap r ON r.feature_id = f.feature_id
-WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-ORDER BY f.priority, f.flag_id;
 ```
+./sc mem get flags          # your open flags (id, name, priority, description) — via the API
+./sc mem get flags --json   # same, as JSON
+```
+
+(Need the roadmap-feature title joined in? That join isn't in the `get` surface —
+fall back to a read-only `sqlite3 .super-coder/shell_db.db "SELECT f.flag_id,
+f.display_name, f.priority, f.description, r.title AS feature FROM flags f LEFT
+JOIN roadmap r ON r.feature_id=f.feature_id WHERE f.resolved=0 AND
+COALESCE(f.is_deleted,0)=0 ORDER BY f.priority, f.flag_id;"`.)
 
 ## Open
 
-Write through `./sc mem` (it guards the engine DB + snapshots; raw `sqlite3` is
-for the SELECT above only):
+Write through `./sc mem` (it guards the engine DB + snapshots):
 ```
 ./sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```
