@@ -591,6 +591,10 @@ def main() -> None:
             if healed:
                 heal_note = f"{len(healed)} stale engine skill(s) → {', '.join(healed)}"
         except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
             heal_note = None
 
     user = authenticate(con)
