@@ -187,6 +187,17 @@ def render_skills(con, shell_id: int) -> str:
     return "\n".join(lines)
 
 
+def render_api(port: "int | None", api_key: "str | None") -> str:
+    if not port or not api_key:
+        return "(API not configured — run `./sc rebuild` to assign a key)"
+    return (
+        f"- **Base URL:** `http://127.0.0.1:{port}`\n"
+        "- **Token:** available as `$SC_API_TOKEN` in your environment (set at launch).\n\n"
+        "Write memory via `./sc mem` (proxied here automatically when `SC_API_TOKEN` is set). "
+        "Read messages: `GET /mem/messages`. Full endpoint list: the `mem` skill."
+    )
+
+
 def fetch_counts(con, shell_id: int) -> dict:
     def one(q):
         return con.execute(q, (shell_id,)).fetchone()[0]
@@ -200,7 +211,9 @@ def fetch_counts(con, shell_id: int) -> dict:
 
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  archive_id: int, work_dir: "Path | None" = None,
-                 sync_note: "str | None" = None) -> str:
+                 sync_note: "str | None" = None,
+                 api_key: "str | None" = None,
+                 api_port: "int | None" = None) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -318,6 +331,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "## ACTIVE PROJECTS", "", render_projects(con, shell_id),
         "", "---", "",
         "## SKILLS", "", render_skills(con, shell_id),
+        "", "---", "",
+        "## API", "", render_api(api_port, api_key),
         "", "---", "",
         "## STATUS", "",
         f"- **Session:** {session_id}",

@@ -38,6 +38,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
+import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 
 ADAPTERS = ENGINE / "adapters"
@@ -625,9 +626,10 @@ def main() -> None:
 
     full = con.execute(
         "SELECT shell_id, display_name, shortname, partner, role, mandate, "
-        "current_state, system_prompt, connections, flavor FROM shells WHERE shell_id=?",
+        "current_state, system_prompt, connections, flavor, api_key FROM shells WHERE shell_id=?",
         (chosen["shell_id"],),
     ).fetchone()
+    api_port = ports_mod.resolve().get("port")
 
     # Every shell gets an isolated git worktree so parallel shells can work on
     # separate branches without clobbering each other — planner/reviewer commit
@@ -663,7 +665,9 @@ def main() -> None:
 
     content = compose_boot(con, full, user, session_id, archive_id,
                            work_dir=work_dir if work_dir != REPO_ROOT else None,
-                           sync_note=sync_note)
+                           sync_note=sync_note,
+                           api_key=full["api_key"],
+                           api_port=api_port)
 
     # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
     # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
@@ -688,6 +692,8 @@ def main() -> None:
         print(f"→ prune: {prune_note}")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
+    if api_port and full["api_key"]:
+        print(f"→ api: http://127.0.0.1:{api_port} (SC_API_TOKEN set)")
     print(f"→ skills: {len(skills['written'])} written, "
           f"{len(skills['skipped'])} unchanged → .claude/skills/")
 
@@ -755,6 +761,8 @@ def main() -> None:
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
+    env["SC_API_TOKEN"] = full["api_key"] or ""
+    env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
     # Optional fast-path for the branch-guard hooks: the absolute engine path, so
     # they skip the `git rev-parse --git-common-dir` walk. NOT load-bearing — the
     # hooks resolve the engine env-independently (a fork gitignores .super-coder/,
