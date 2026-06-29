@@ -661,7 +661,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'dev_kit',
-  'What the sandbox dev kit provides + how to drive it — ./sc deps, ./sc test, ./sc lint, ./sc typecheck, the .venv tools, rg/sqlite3, the baked browser, container/host app boundary, and the optional postgres 17 sidecar (DATABASE_URL). Use when building or testing in a fork.',
+  'What the sandbox dev kit provides + how to drive it — ./sc deps, ./sc test, ./sc lint, ./sc typecheck, the .venv tools, rg/sqlite3, the baked browser, and the container/host app boundary. Use when building or testing in a fork.',
   'substrate',
   NULL,
   0,
@@ -718,34 +718,6 @@ Always present, no `./sc deps` needed:
 
 `svelte-check`, `tsc`, vitest come from the fork''s own `package.json` devDeps —
 installed by `./sc deps`'' `npm ci`, run via the fork''s npm scripts (or `./sc test`).
-
-## Postgres 17 sidecar
-
-When the sys-admin has configured the PG sidecar (`"pg": {}` in
-`.super-coder/instance.json`), `./sc launch` starts a `postgres:17` container
-on the shared network and injects `DATABASE_URL` into the sandbox. No setup
-needed inside the container.
-
-**What you get:**
-- `DATABASE_URL=postgresql://sc:sc@sc-pg-<repo>:5432/sc` is already in the environment
-- `db_driver` switches to PG mode automatically — sqlite3 code paths are inert
-- `psycopg[binary]` (psycopg3) is in the baseline dev kit (`./sc deps`), so `pytest`
-  connects to real postgres with zero extra install steps
-- Data persists in a named Docker volume across restarts and image rebuilds
-
-**Verifying it''s live:**
-```bash
-echo $DATABASE_URL          # should show postgresql://...
-```
-
-**Running pytest against real PG:**
-```bash
-./sc deps                   # installs psycopg2-binary if not already present
-.venv/bin/pytest tests/     # DATABASE_URL is already in the environment
-```
-
-If `DATABASE_URL` is not set, the sandbox is in SQLite mode — ask the
-sys-admin to run `./sc pg-init && ./sc restart` on the host.
 
 ## Stance
 
