@@ -269,10 +269,14 @@ clone where the hooks never got wired.
 1. Re-inspect (step 1) — what changed?
 2. Edit `.sc-state/map.config.json` to match (step 2).
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
-4. Verify (step 4).
-5. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
+4. Verify (step 4). `dr_filepath` stale entries are pruned automatically by the
+   remap — paths that vanished from the repo are deleted from the catalogue.
+5. **Check stale sections.** `dr_section` is authored and never auto-pruned.
+   After any migration or restructure, run the stale-section worklist
+   (see Standing jobs § 1) and DELETE or repath any sections that come back.
+6. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
    and fill every `desc IS NULL` file. The worklist must be empty when you leave.
-6. Commit.
+7. Commit.
 
 ## Standing jobs — sections, descriptions & the product DB (the navigation layer)
 
@@ -305,6 +309,14 @@ VALUES (''UI'', ''shell_core/ui/'', ''SvelteKit substrate UI'', 5);
 SELECT path FROM dr_filepath f WHERE NOT EXISTS
   (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || ''%'')
 ORDER BY path;
+
+-- STALE SECTIONS (run after any migration or restructure — dr_filepath pruning
+-- is automatic; dr_section is authored and never auto-pruned):
+SELECT s.name, s.path_prefix, s.description
+FROM dr_section s
+WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') = 0
+ORDER BY s.name;
+-- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
 **2. Descriptions (`dr_filepath.desc`)** — fill per-file one-liners (≤100 chars).
@@ -853,8 +865,11 @@ skill):
    ```
    ./sc mem doc freeze <document_id>
    ```
-2. **Write the doc** (`kind=''doc''`) — the feature''s readable face, under the same
-   `feature_id` (see Author, above):
+2. **Read the shipped code, then write the doc.** The doc is written from
+   interpretation of the code as it actually shipped — not from the spec body.
+   Drift happens during production: decisions get made, scope adjusts, edge cases
+   land differently than planned. The spec captures the intent; the code is the
+   truth. Read the implementation first, then write what it does:
    ```
    ./sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
    ```
@@ -2706,13 +2721,19 @@ write the doc (that''s the planner — see the `docs` skill):
    ```
    ./sc mem roadmap status <feature_id> shipped
    ```
-2. **Open a docs-pending flag** so `shipped` doesn''t silently claim a doc that
-   isn''t written yet (`shipped` + an open flag is the honest interim state). Per
-   the `flags` skill, opening it also messages the party who clears it — the
-   planner:
+2. **Open a docs-pending flag and message the planner with full instructions.**
+   `shipped` + an open flag is the honest interim state. The message carries
+   everything the planner needs to act without digging:
    ```
    ./sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
-   ./sc mem message send <planner-shortname> "<feature> shipped — spec <doc_id> ready to freeze + document. Docs-pending flag SC-### open."
+   ./sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
+
+   Spec <doc_id> shipped. Flag SC-### is open — your action required:
+
+   1. **Read the shipped code first.** Write the doc from what actually shipped, not from the spec. Drift happens and decisions get made in production — the spec captures the intent, the code is the truth.
+   2. Freeze the spec: \`./sc mem doc freeze <doc_id>\`
+   3. Write the doc (\`kind=''doc''\`) under feature <feature_id> (see the \`docs\` skill).
+   4. Close flag SC-### when the doc is live."
    ```
 3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec + write
    the doc." The planner closes the flag when the doc lands.

@@ -124,8 +124,11 @@ skill):
    ```
    ./sc mem doc freeze <document_id>
    ```
-2. **Write the doc** (`kind='doc'`) — the feature's readable face, under the same
-   `feature_id` (see Author, above):
+2. **Read the shipped code, then write the doc.** The doc is written from
+   interpretation of the code as it actually shipped — not from the spec body.
+   Drift happens during production: decisions get made, scope adjusts, edge cases
+   land differently than planned. The spec captures the intent; the code is the
+   truth. Read the implementation first, then write what it does:
    ```
    ./sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
    ```
