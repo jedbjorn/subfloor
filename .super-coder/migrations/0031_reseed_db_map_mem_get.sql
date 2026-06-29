@@ -1,36 +1,37 @@
--- 0031 — reseed db_map skill: memory reads via `./sc mem get` (was raw sqlite3).
+-- 0031 — reseed db_map skill: memory is read/written ONLY through the engine
+-- API (`./sc mem` / `./sc mem get`), never raw sqlite.
 --
--- db_map was last reseeded by 0028/0029, which pinned the pre-API read guidance
--- ("Query with sqlite3 ... SELECT"). The asset now leads reads with the
--- `./sc mem get <surface>` API client, so a full migration replay (0001 then
--- 0028/0029) would otherwise end on the stale body. Re-UPSERT the current asset
--- content as the last writer — generated from assets/skills/db_map via seed-skills,
--- so it is byte-identical to the regenerated 0001. flags/bootstrap are not
--- reseeded by any later migration, so 0001 already carries their new content.
+-- db_map was last reseeded by 0028/0029, which pinned the pre-API guidance
+-- ("Query with sqlite3 ... SELECT"). The asset now documents the API-only
+-- surface, so a full migration replay (0001 then 0028/0029) would otherwise end
+-- on the stale body. Re-UPSERT the current asset content as the last writer —
+-- generated from assets/skills/db_map via seed-skills, byte-identical to 0001.
 
 BEGIN;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'db_map',
-  'Schema map + reusable SQL for super-coder''s shell_db.db. Check before composing any DB query — identity, memory, roadmap, documents, flags, skills.',
+  'Data model behind the engine memory surfaces + the `./sc mem` command for each. Check before reading or writing memory — identity, decisions, roadmap, documents, flags. Reads/writes go through the API (`./sc mem`), never raw sqlite.',
   'substrate',
   NULL,
   1,
   '# db_map — super-coder''s DB at a glance
 
-Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
-`schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
-memory, and content live in tables — never flat files. Lazy-load: query for what
-you need, don''t bulk-read.
+All identity, memory, and content live in the engine DB
+(`.super-coder/shell_db.db`) — but you never touch that file. You read and write
+it **only through the engine API**, via `./sc mem`:
 
-Read your own memory with `./sc mem get <surface>` — `state`, `seed`, `lns`,
-`decisions`, `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
-It goes through the engine API: no DB path, no SELECT, no fallback-to-direct-DB
-to think about. For ad-hoc reads of tables the `get` surfaces don''t cover
-(`documents`, `projects`, `feature_blockers`, `skills`), query read-only with
-`sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through `./sc mem`.
-Table below = the schema for those ad-hoc SELECTs; `## Common writes` = the
-`./sc mem` command for each change.
+- **Read** — `./sc mem get <surface>`: `state`, `seed`, `lns`, `decisions`,
+  `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
+- **Write** — `./sc mem <cmd> …` (see `## Common writes` below).
+
+There is **no `sqlite3` path** — not as a fallback, not for "ad-hoc" reads.
+`./sc mem` goes through the API and only the API; if the API isn''t wired it
+fails loud rather than writing the DB behind its back. Your identity rides in
+your bearer token — the server resolves token → shell, so you never name a
+shell. The table below is the **data model** behind those surfaces (and what
+each `./sc mem` write touches), not a query cheatsheet. Lazy-load: `get` the one
+surface you need, don''t bulk-read.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your

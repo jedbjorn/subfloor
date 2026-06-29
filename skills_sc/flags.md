@@ -25,11 +25,8 @@ Flags tab). `<self>` = your shell_id.
 ./sc mem get flags --json   # same, as JSON
 ```
 
-(Need the roadmap-feature title joined in? That join isn't in the `get` surface —
-fall back to a read-only `sqlite3 .super-coder/shell_db.db "SELECT f.flag_id,
-f.display_name, f.priority, f.description, r.title AS feature FROM flags f LEFT
-JOIN roadmap r ON r.feature_id=f.feature_id WHERE f.resolved=0 AND
-COALESCE(f.is_deleted,0)=0 ORDER BY f.priority, f.flag_id;"`.)
+(Each flag carries its `feature_id`; cross-reference `./sc mem get roadmap` for
+the blocked feature's title. Reads go through the API — there is no `sqlite3`.)
 
 ## Open
 
@@ -68,9 +65,6 @@ already open, and don't message on `close`.
 ```
 ./sc mem flag close <flag_id> --notes "…"
 ```
-
-(equivalent raw write, for reference: `UPDATE flags SET resolved=1,
-resolved_date=date('now'), resolution_notes='…' WHERE flag_id=?;`)
 
 ## Stance
 

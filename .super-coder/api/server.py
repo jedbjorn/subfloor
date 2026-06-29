@@ -453,6 +453,17 @@ def create_project(con, body):
     return {"project_id": cur.lastrowid, "shortname": shortname, "title": title}, None
 
 
+def resolve_project(con, spec):
+    """shortname|id → projects row (or None). Shells assign work-streams by name."""
+    if str(spec).isdigit():
+        return con.execute(
+            "SELECT project_id, shortname FROM projects WHERE project_id=? "
+            "AND COALESCE(is_deleted,0)=0", (int(spec),)).fetchone()
+    return con.execute(
+        "SELECT project_id, shortname FROM projects WHERE LOWER(shortname)=LOWER(?) "
+        "AND COALESCE(is_deleted,0)=0", (spec,)).fetchone()
+
+
 def set_grant(con, sid, skill_id, granted):
     if granted:
         con.execute("INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
@@ -943,6 +954,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
+            if path == "/_sc/mem/whoami":
+                r = con.execute(
+                    "SELECT shell_id, shortname, display_name FROM shells WHERE shell_id=?",
+                    (sid,)).fetchone()
+                return self._send(200, dict(r) if r else {"shell_id": sid})
+
             if path == "/_sc/mem/state":
                 r = con.execute("SELECT current_state FROM shells WHERE shell_id=?",
                                 (sid,)).fetchone()
@@ -1063,14 +1080,20 @@ class Handler(BaseHTTPRequestHandler):
                 title = (body.get("title") or "").strip()
                 if not title:
                     return self._send(400, {"error": "title required"})
+                pid = None
+                if body.get("project"):  # optional work-stream by shortname|id
+                    pr = resolve_project(con, body["project"])
+                    if pr is None:
+                        return self._send(404, {"error": f"no project '{body['project']}'"})
+                    pid = pr["project_id"]
                 cur = con.execute(
-                    "INSERT INTO roadmap (title, summary, roadmap_status, sort_order, owning_shell) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO roadmap (title, summary, roadmap_status, sort_order, owning_shell, project_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (title,
                      body.get("summary") or None,
                      body.get("roadmap_status") or "brainstorm",
                      body.get("sort_order") or 0,
-                     sid))
+                     sid, pid))
                 con.commit()
                 return self._send(201, {"feature_id": cur.lastrowid})
 
@@ -1091,12 +1114,18 @@ class Handler(BaseHTTPRequestHandler):
                 fid = body.get("feature_id")
                 if fid is None:
                     return self._send(400, {"error": "feature_id required"})
+                kind = body.get("kind") or "spec"
+                seq = body.get("seq")
+                if seq is None:  # next seq for this (feature, kind) — mirrors the old CLI
+                    seq = con.execute(
+                        "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
+                        "WHERE feature_id IS ? AND kind=?", (int(fid), kind)).fetchone()[0]
                 cur = con.execute(
                     "INSERT INTO documents (feature_id, kind, seq, title, body, render_path) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (int(fid),
-                     body.get("kind") or "spec",
-                     body.get("seq") or 1,
+                     kind,
+                     seq,
                      (body.get("title") or "").strip() or None,
                      body.get("body") or None,
                      body.get("render_path") or None))
@@ -1123,15 +1152,42 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             if path == "/_sc/mem/messages":
-                to_sid = body.get("to_shell_id")
                 msg = (body.get("body") or "").strip()
+                to_sid = body.get("to_shell_id")
+                if to_sid is None and body.get("to"):
+                    r = con.execute(
+                        "SELECT shell_id FROM shells WHERE LOWER(shortname)=LOWER(?) "
+                        "AND COALESCE(is_deleted,0)=0", (body["to"],)).fetchone()
+                    if r is None:
+                        return self._send(404, {"error": f"recipient shortname '{body['to']}' unknown"})
+                    to_sid = r[0]
                 if to_sid is None or not msg:
-                    return self._send(400, {"error": "to_shell_id and body required"})
+                    return self._send(400, {"error": "to (shortname) or to_shell_id, and body, required"})
                 cur = con.execute(
                     "INSERT INTO shell_messages (from_shell_id, to_shell_id, body) VALUES (?, ?, ?)",
                     (sid, int(to_sid), msg))
                 con.commit()
                 return self._send(201, {"message_id": cur.lastrowid})
+
+            if path == "/_sc/mem/projects":
+                shortname = (body.get("shortname") or "").strip()
+                title = (body.get("title") or "").strip()
+                if not shortname or not title:
+                    return self._send(400, {"error": "shortname and title required"})
+                try:
+                    cur = con.execute(
+                        "INSERT INTO projects (shortname, title, purpose, standing, status) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (shortname, title, body.get("purpose"), body.get("standing"),
+                         body.get("status") or "active"))
+                except db_driver.IntegrityError as e:
+                    return self._send(409, {"error": str(e)})
+                pid = cur.lastrowid
+                con.execute(
+                    "INSERT INTO project_shells (project_id, shell_id, role) VALUES (?, ?, ?)",
+                    (pid, sid, body.get("role")))
+                con.commit()
+                return self._send(201, {"project_id": pid, "shortname": shortname})
 
             if path == "/_sc/mem/oriented":
                 con.execute("UPDATE shells SET bootstrapped=1 WHERE shell_id=?", (sid,))
@@ -1186,8 +1242,34 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT 1 FROM roadmap WHERE feature_id=? AND owning_shell=?",
                         (fid, sid)).fetchone():
                     return self._send(404, {"error": "no such feature"})
+                # work-stream assignment: shortname|id|none → project_id
+                if "project" in body:
+                    spec = body.pop("project")
+                    if str(spec).lower() in ("none", "-", ""):
+                        body["project_id"] = None
+                    else:
+                        pr = resolve_project(con, spec)
+                        if pr is None:
+                            return self._send(404, {"error": f"no project '{spec}'"})
+                        body["project_id"] = pr["project_id"]
+                # dependency set: replace via the cycle-checked helper
+                if "blocked_by" in body:
+                    ok, err = set_blockers(con, fid, body.pop("blocked_by"))
+                    if not ok:
+                        return self._send(400, {"ok": False, "error": err})
+                    if not body:
+                        return self._send(200, {"ok": True})
                 ok, err = patch_columns(con, "roadmap", "feature_id", fid,
-                                        body, ROADMAP_EDITABLE)
+                                        body, ROADMAP_EDITABLE | {"project_id"})
+                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+
+            # PATCH /_sc/mem/projects/{id|shortname}
+            if len(parts) == 4 and parts[2] == "projects":
+                pr = resolve_project(con, parts[3])
+                if pr is None:
+                    return self._send(404, {"error": f"no project '{parts[3]}'"})
+                ok, err = patch_columns(con, "projects", "project_id", pr["project_id"],
+                                        body, {"standing", "status"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/tasks/{id}
