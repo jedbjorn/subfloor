@@ -3002,7 +3002,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'test_authoring',
-  'Standards for writing and reviewing stringent pytest tests — tests that can actually fail. Use when authoring or reviewing any test under `tests/`.',
+  'Principles for stringent pytest tests — tests that can actually fail. Pair with test_authoring_sqlite or test_authoring_pg for stack-specific infra context.',
   'craft',
   NULL,
   0,
@@ -3013,19 +3013,8 @@ The goal of a test is to **fail when the code is wrong**. A test that passes
 no matter what the code does is worse than no test — it reads as coverage while
 guarding nothing.
 
-## The foundation you build on
-
-`tests/conftest.py` builds a throwaway DB from the **real** `schema.sql` + the
-post-059 migrations, seeds two tenants (Alice / Bob) + a shared system shell,
-and drives the **real** app through `TestClient` with real auth (session cookie
-or shell bearer key). Use it:
-
-- Hit real endpoints through the `alice` / `bob` / `admin` / `anon` / `shell_a`
-  / `shell_b` callers — do not mock the router or the DB layer.
-- Assert against **real rows** in the test DB, not against the payload you just
-  sent back to yourself.
-- Mock only the true external boundary — outbound IMAP / HTTP / broker egress.
-  Never mock the function under test or the logic you''re claiming to verify.
+Load `test_authoring_sqlite` or `test_authoring_pg` alongside this for the
+test infrastructure your stack uses (fixture setup, callers, DB access pattern).
 
 ## The rules (the floor)
 
@@ -3097,6 +3086,163 @@ to point back at this skill.
 - Let a count or status code stand in for "the right thing happened."
 - Test only the happy path for code that has error branches.
 - Ship a test whose assertions no realistic bug could violate.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'test_authoring_pg',
+  'Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg2 direct assertions. Read alongside test_authoring for the rules.',
+  'craft',
+  NULL,
+  0,
+  '# test_authoring_pg — Postgres test infra
+
+Read `test_authoring` for the foundational rules. This skill covers the
+test infrastructure for Postgres-backed forks.
+
+## Foundation
+
+`tests/conftest.py` creates a throwaway Postgres DB at session start, applies
+`schema.sql` + migrations, seeds two tenants (Alice / Bob) + a shared system
+shell, and drives the real app through `TestClient` with real auth.
+
+**Key identities (fixed rowids — address by literal in tests):**
+
+| Name | Kind | ID |
+|---|---|---|
+| `USER_ADMIN` | admin user | 1 |
+| `USER_A` / Alice | tenant user | 10 |
+| `USER_B` / Bob | tenant user | 20 |
+| `SHELL_SHARED` | shared system shell | 100 |
+| `SHELL_A` / `SHELL_B` | per-tenant shells | 101 / 102 |
+| `PROJ_A` / `PROJ_B` | per-tenant projects | 500 / 501 |
+| `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
+
+**Throwaway DB setup:**
+- An admin connection (`psycopg2.connect(DATABASE_URL_ADMIN)`) creates a
+  unique `dosarch_test_<uuid>` database at session start and drops it at
+  session teardown.
+- `DATABASE_URL` is injected via `os.environ["DATABASE_URL"]` **before**
+  importing the app; the app''s DB layer reads it at import time.
+- `schema.sql` (the postgres variant) + migrations are applied via
+  `cur.execute(SCHEMA.read_text())` on the throwaway DB connection.
+- A second throwaway database (or schema) isolates egress/spend rows
+  (`DISPATCH_DATABASE_URL`).
+
+**Callers:**
+```python
+alice   # session-cookie caller, USER_A identity
+bob     # session-cookie caller, USER_B identity
+admin   # session-cookie caller, USER_ADMIN identity
+anon    # no auth
+shell_a # bearer-key caller, KEY_A
+shell_b # bearer-key caller, KEY_B
+```
+Same `Caller` pattern as the SQLite variant — identity carried via cookie
+or `Authorization: Bearer` header.
+
+**TestClient:**
+- Created without a `with` block — skips startup hooks (catalogue / model
+  sync) that would hit the network.
+- Session-scoped (`scope="session"`) so the DB is shared across all tests
+  in a run; tests that need isolation seed their own fixture rows and
+  clean up explicitly.
+
+**Direct DB assertions:**
+```python
+import psycopg2, psycopg2.extras, os
+con = psycopg2.connect(os.environ["DATABASE_URL"])
+con.autocommit = True
+cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+cur.execute("SELECT * FROM table WHERE ...")
+rows = cur.fetchall()
+```
+Assert against real rows, not the response payload.
+
+**Mocking boundary:**
+Mock only true external egress — outbound HTTP, broker calls, third-party
+APIs. Never mock the router, the DB layer, or the function under test.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'test_authoring_sqlite',
+  'SQLite test infrastructure for super-coder-style forks — throwaway DB, Alice/Bob tenants, Caller/TestClient. Read alongside test_authoring for the rules.',
+  'craft',
+  NULL,
+  0,
+  '# test_authoring_sqlite — SQLite test infra
+
+Read `test_authoring` for the foundational rules. This skill covers the
+test infrastructure for SQLite-backed forks (super-coder, dos-arch).
+
+## Foundation
+
+`tests/conftest.py` builds a throwaway SQLite DB from `schema.sql` + the
+post-059 migration replay, seeds two tenants (Alice / Bob) + a shared system
+shell, and drives the real app through `TestClient` with real auth.
+
+**Key identities (fixed rowids — address by literal in tests):**
+
+| Name | Kind | ID |
+|---|---|---|
+| `USER_ADMIN` | admin user | 1 |
+| `USER_A` / Alice | tenant user | 10 |
+| `USER_B` / Bob | tenant user | 20 |
+| `SHELL_SHARED` | shared system shell | 100 |
+| `SHELL_A` / `SHELL_B` | per-tenant shells | 101 / 102 |
+| `PROJ_A` / `PROJ_B` | per-tenant projects | 500 / 501 |
+| `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
+
+**Throwaway DB setup:**
+- `tempfile.NamedTemporaryFile(suffix=".db")` → path injected via
+  `os.environ["SHELL_DB_PATH"]` **before** importing the app (the auth
+  middleware calls `db()` directly; a `Depends` override alone misses it).
+- `apply_schema_and_migrations(con)` builds the schema on the throwaway DB —
+  single source shared by all test harnesses; do not copy-paste it.
+- A second throwaway (`DISPATCH_DB_PATH`) isolates egress/spend rows.
+- `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` — plain `dsess` cookie,
+  no `__Host-` prefix in tests.
+
+**Callers:**
+```python
+alice   # session-cookie caller, USER_A identity
+bob     # session-cookie caller, USER_B identity
+admin   # session-cookie caller, USER_ADMIN identity
+anon    # no auth
+shell_a # bearer-key caller, KEY_A
+shell_b # bearer-key caller, KEY_B
+```
+All are pytest fixtures. `shell_a` / `shell_b` use `Authorization: Bearer`.
+
+**TestClient:**
+- Created without a `with` block — skips startup hooks (catalogue / model
+  sync) that would hit the network.
+- Session-scoped (`scope="session"`) so the DB is shared across all tests in a
+  run; tests must not depend on a clean DB unless they seed their own via
+  `build_substrate_db()` (in-memory, returns a `sqlite3.Connection`).
+
+**Direct DB assertions:**
+```python
+import sqlite3, os
+con = sqlite3.connect(os.environ["SHELL_DB_PATH"])
+con.row_factory = sqlite3.Row
+rows = con.execute("SELECT * FROM table WHERE ...").fetchall()
+```
+Assert against real rows, not the response payload. The throwaway path is
+stable for the lifetime of the test session.
+
+**Mocking boundary:**
+Mock only true external egress — outbound IMAP, HTTP, broker calls. Never
+mock the router, the DB layer, or the function under test.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
