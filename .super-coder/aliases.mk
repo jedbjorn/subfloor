@@ -26,13 +26,14 @@
 #
 #   LONG-ONLY: dos-build dos-logs dos-serve dos-health dos-ports dos-verify dos-map
 #              dos-render dos-snapshot dos-deps dos-install dos-rollback
-#              dos-update-harnesses · passthrough: make dos ARGS=health
+#              dos-update-harnesses dos-pg-init dos-pg-up dos-pg-down
+#              passthrough: make dos ARGS=health
 #
 SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
-        dos-update-harnesses dos
+        dos-update-harnesses dos-pg-init dos-pg-up dos-pg-down dos
 
 # Hot commands — long form, with a one-letter alias delegating to it.
 dos-enter:            ; $(SC) $(if $(s),enter-$(s),enter)
@@ -62,6 +63,9 @@ dos-deps:             ; $(SC) deps
 dos-install:          ; $(SC) install
 dos-rollback:         ; $(SC) rollback
 dos-update-harnesses: ; $(SC) update-harnesses
+dos-pg-init:          ; $(SC) pg-init
+dos-pg-up:            ; $(SC) pg-up
+dos-pg-down:          ; $(SC) pg-down
 
 # Passthrough: run any ./sc subcommand — make dos ARGS=health
 dos:                  ; $(SC) $(ARGS)
@@ -110,6 +114,9 @@ dos-help:
 	@echo "  │ dos-install          │ first-launch bootstrap for a fork                        │"
 	@echo "  │ dos-rollback         │ undo a bad update — restore DB + engine together         │"
 	@echo "  │ dos-update-harnesses │ update claude + opencode + codex + vibe to latest        │"
+	@echo "  │ dos-pg-init          │ enable the pg 17 sidecar (adds pg key to instance.json) │"
+	@echo "  │ dos-pg-up            │ start the postgres:17 container (self-skips if uncfg'd) │"
+	@echo "  │ dos-pg-down          │ stop the pg container (data volume retained)             │"
 	@echo "  ├──────────────────────┼──────────────────────────────────────────────────────────┤"
 	@echo "  │ dos ARGS=<cmd>       │ passthrough to any ./sc subcommand (make dos ARGS=doctor)│"
 	@echo "  └──────────────────────┴──────────────────────────────────────────────────────────┘"
