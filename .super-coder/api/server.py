@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import base64
 import gzip
-import hashlib
 import json
 import os
 import subprocess
@@ -329,12 +328,14 @@ def get_flags(con) -> dict:
 # ── Mutations ─────────────────────────────────────────────────────────────────
 
 def patch_columns(con, table, pk_col, pk, body, allowed):
-    fields = {k: v for k, v in body.items() if k in allowed}
-    if not fields:
+    # Iterate `allowed` (caller-supplied hardcoded set) so column names never
+    # derive from user input — guards against SQL injection via key names.
+    pairs = [(col, body[col]) for col in sorted(allowed) if col in body]
+    if not pairs:
         return False, "no editable fields in payload"
-    sets = ", ".join(f"{k}=?" for k in fields)
+    sets = ", ".join(f"{col}=?" for col, _ in pairs)
     cur = con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
-                      (*fields.values(), pk))
+                      tuple(v for _, v in pairs) + (pk,))
     if cur.rowcount == 0:
         return False, "not found"
     con.commit()
@@ -904,13 +905,12 @@ class Handler(BaseHTTPRequestHandler):
         token = self._bearer_token()
         if not token:
             return None, False
-        digest = hashlib.sha256(token.encode()).hexdigest()
         con = db()
         try:
             row = con.execute(
                 "SELECT shell_id FROM shells "
-                "WHERE api_key_hash=? AND COALESCE(is_deleted,0)=0",
-                (digest,)).fetchone()
+                "WHERE api_key=? AND COALESCE(is_deleted,0)=0",
+                (token,)).fetchone()
         finally:
             con.close()
         if row is None:

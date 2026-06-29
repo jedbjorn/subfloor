@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Backfill api_key + api_key_hash + api_key_rotated_at for shells that have none.
+"""Backfill api_key + api_key_rotated_at for shells that have none.
 
-Run once after migration 0026 on an existing fork. New shells get keys at
+Run once after migration 0027 on an existing fork. New shells get keys at
 creation time via shell_factory.py. The admin shell (flavor='admin') is
 included — it interacts with the API too.
 
@@ -10,7 +10,6 @@ Usage:
 """
 from __future__ import annotations
 
-import hashlib
 import secrets
 import sys
 from datetime import datetime, timezone
@@ -26,7 +25,7 @@ def backfill(db_path: str) -> int:
     try:
         shells = con.execute(
             "SELECT shell_id FROM shells "
-            "WHERE api_key_hash IS NULL AND COALESCE(is_deleted,0)=0"
+            "WHERE api_key IS NULL AND COALESCE(is_deleted,0)=0"
         ).fetchall()
         if not shells:
             print("backfill_shell_api_keys: nothing to do — all shells already keyed.")
@@ -35,11 +34,10 @@ def backfill(db_path: str) -> int:
         for row in shells:
             sid = row[0]
             key = secrets.token_urlsafe(32)
-            khash = hashlib.sha256(key.encode()).hexdigest()
             con.execute(
-                "UPDATE shells SET api_key=?, api_key_hash=?, api_key_rotated_at=? "
+                "UPDATE shells SET api_key=?, api_key_rotated_at=? "
                 "WHERE shell_id=?",
-                (key, khash, now, sid),
+                (key, now, sid),
             )
             print(f"  keyed shell_id={sid}")
         con.commit()
