@@ -1,28 +1,32 @@
----
-rendered_by: super-coder
-source: db
-edit: changes here are overwritten — author via the shell or localhost GUI
----
+-- 0031 — reseed db_map skill: memory reads via `./sc mem get` (was raw sqlite3).
+--
+-- db_map was last reseeded by 0028/0029, which pinned the pre-API read guidance
+-- ("Query with sqlite3 ... SELECT"). The asset now leads reads with the
+-- `./sc mem get <surface>` API client, so a full migration replay (0001 then
+-- 0028/0029) would otherwise end on the stale body. Re-UPSERT the current asset
+-- content as the last writer — generated from assets/skills/db_map via seed-skills,
+-- so it is byte-identical to the regenerated 0001. flags/bootstrap are not
+-- reseeded by any later migration, so 0001 already carries their new content.
 
-# db_map
+BEGIN;
 
-Schema map + reusable SQL for super-coder's shell_db.db. Check before composing any DB query — identity, memory, roadmap, documents, flags, skills.
-
-**Category:** substrate
-
----
-
-# db_map — super-coder's DB at a glance
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'db_map',
+  'Schema map + reusable SQL for super-coder''s shell_db.db. Check before composing any DB query — identity, memory, roadmap, documents, flags, skills.',
+  'substrate',
+  NULL,
+  1,
+  '# db_map — super-coder''s DB at a glance
 
 Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 `schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
 memory, and content live in tables — never flat files. Lazy-load: query for what
-you need, don't bulk-read.
+you need, don''t bulk-read.
 
 Read your own memory with `./sc mem get <surface>` — `state`, `seed`, `lns`,
 `decisions`, `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
 It goes through the engine API: no DB path, no SELECT, no fallback-to-direct-DB
-to think about. For ad-hoc reads of tables the `get` surfaces don't cover
+to think about. For ad-hoc reads of tables the `get` surfaces don''t cover
 (`documents`, `projects`, `feature_blockers`, `skills`), query read-only with
 `sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through `./sc mem`.
 Table below = the schema for those ad-hoc SELECTs; `## Common writes` = the
@@ -30,24 +34,24 @@ Table below = the schema for those ad-hoc SELECTs; `## Common writes` = the
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
-memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
+memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
 
 ## Tables
 
 | Table | Holds | Write rule |
 |---|---|---|
 | `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `lineage_seed`, `active_archive_id`. (`connections`/`workspace` retired — boot `## CONNECTIONS` is derived from the `dr_*` map, not authored here) | UPDATE in place |
-| `shell_identity_entries` | seed (cap 10) + L&S (`kind='lns'`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
+| `shell_identity_entries` | seed (cap 10) + L&S (`kind=''lns''`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
 | `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
 | `roadmap` | one row per planned feature; `roadmap_status` is a planning horizon (`brainstorm`→`in_progress`→`next`→`near_term`→`long_term`→`shipped`→`retired`), `sort_order` within a bucket. `shipped` = delivered; `retired` = taken off the board (decided-against / split / absorbed / replaced) without shipping — keep the row. `project_id` (nullable) = the work-stream the feature belongs to; the GUI Flow view groups on it (NULL = Ungrouped) | INSERT/UPDATE |
-| `feature_blockers` | the roadmap's dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite must land first). Directed, kept acyclic (the GUI Flow view wires them; the card's "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `./sc mem roadmap depends` |
+| `feature_blockers` | the roadmap''s dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite must land first). Directed, kept acyclic (the GUI Flow view wires them; the card''s "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `./sc mem roadmap depends` |
 | `documents` | the content store — specs/docs bodies live here; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; never edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
 | `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | managed by engine |
 | `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a **work-stream** that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
-`<self>` = your `shell_id` (in the boot doc's ACTIVE SESSION block).
+`<self>` = your `shell_id` (in the boot doc''s ACTIVE SESSION block).
 
 ## Common writes
 
@@ -70,7 +74,7 @@ Each guards the engine DB and writes to the live shared DB. `./sc mem which` ori
 ./sc mem roadmap status <feature_id> shipped
 
 # roadmap grouping + sequencing (drive the GUI Flow view):
-./sc mem roadmap project <feature_id> <shortname|id>   # assign a work-stream (or 'none' to clear)
+./sc mem roadmap project <feature_id> <shortname|id>   # assign a work-stream (or ''none'' to clear)
 ./sc mem roadmap depends <feature_id> --on <id> [--on <id>]   # set dependencies (replaces; omit --on to clear; refuses cycles)
 
 # author a spec/doc body (--body-file reads the markdown), then freeze on ship:
@@ -98,4 +102,12 @@ Each guards the engine DB and writes to the live shared DB. `./sc mem which` ori
 
 Nothing more to run — the write is live in the shared engine DB the moment it
 commits, visible to every shell. Persisting it to git is an admin/GUI step, not
-yours.
+yours.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

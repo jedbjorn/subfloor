@@ -36,10 +36,10 @@ cartographer's automation (see `surface_catalogue`). You read it.
    and role are in the boot doc. Re-read them with intent — this is who is doing
    the work here.
 
-3. **Skim the plan.** Open roadmap features + their blocking flags:
-   ```sql
-   SELECT feature_id, title, roadmap_status FROM roadmap ORDER BY sort_order;
-   SELECT display_name, description FROM flags WHERE resolved=0 AND is_deleted=0;
+3. **Skim the plan.** Open roadmap features + their blocking flags, via the API:
+   ```
+   ./sc mem get roadmap
+   ./sc mem get flags
    ```
 
 4. **Set your `current_state`** — replace the install placeholder with what you

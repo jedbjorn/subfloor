@@ -246,6 +246,144 @@ def cmd_which(args) -> int:
     return 0
 
 
+GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
+                "roadmap", "narrative", "messages")
+
+
+def _get_db(con, sid: int, surface: str) -> dict:
+    """Direct-DB read mirroring the server's /_sc/mem/<surface> GET payloads —
+    the fallback when the API isn't configured (SC_API_TOKEN/BASE unset)."""
+    if surface == "state":
+        r = con.execute("SELECT current_state FROM shells WHERE shell_id=?",
+                        (sid,)).fetchone()
+        return {"current_state": (r["current_state"] if r else None)}
+    if surface in ("seed", "lns"):
+        rs = con.execute(
+            "SELECT entry_id, kind, body, entry_date, source_tag "
+            "FROM shell_identity_entries "
+            "WHERE shell_id=? AND kind=? AND COALESCE(is_deleted,0)=0 "
+            "AND retired_at IS NULL ORDER BY entry_date, entry_id",
+            (sid, surface)).fetchall()
+        return {"entries": [dict(r) for r in rs]}
+    if surface == "decisions":
+        rs = con.execute(
+            "SELECT decision_id, decision, rationale, priority, decision_date, "
+            "parent_decision_id FROM shell_decisions "
+            "WHERE shell_id=? AND COALESCE(is_deleted,0)=0 "
+            "ORDER BY decision_date, decision_id", (sid,)).fetchall()
+        return {"decisions": [dict(r) for r in rs]}
+    if surface == "flags":
+        rs = con.execute(
+            "SELECT flag_id, display_name, priority, description, feature_id, "
+            "created_date FROM flags "
+            "WHERE shell_id=? AND COALESCE(resolved,0)=0 AND COALESCE(is_deleted,0)=0 "
+            "ORDER BY created_date, flag_id", (sid,)).fetchall()
+        return {"flags": [dict(r) for r in rs]}
+    if surface == "roadmap":
+        rs = con.execute(
+            "SELECT feature_id, title, roadmap_status, summary, project_id, "
+            "sort_order FROM roadmap WHERE roadmap_status != 'retired' "
+            "ORDER BY sort_order, feature_id").fetchall()
+        return {"roadmap": [dict(r) for r in rs]}
+    if surface == "narrative":
+        r = con.execute(
+            "SELECT a.full_narrative AS n FROM shells s "
+            "JOIN shell_memory_archives a ON a.archive_id = s.active_archive_id "
+            "WHERE s.shell_id=?", (sid,)).fetchone()
+        return {"narrative": (r["n"] if r else None)}
+    if surface == "messages":
+        rs = con.execute(
+            "SELECT message_id, from_shell_id, body, created_at, read_at "
+            "FROM shell_messages WHERE to_shell_id=? "
+            "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
+            (sid,)).fetchall()
+        return {"messages": [dict(r) for r in rs]}
+    die(f"unknown surface '{surface}'")
+
+
+def _render_get(surface: str, data: dict) -> int:
+    if surface == "state":
+        print(data.get("current_state") or "(current_state empty)")
+        return 0
+    if surface in ("seed", "lns"):
+        es = data.get("entries", [])
+        label = "seed" if surface == "seed" else "L&S"
+        if not es:
+            print(f"mem: no {label} entries")
+            return 0
+        for e in es:
+            tag = f" [{e['source_tag']}]" if e.get("source_tag") else ""
+            print(f"#{e['entry_id']} {e.get('entry_date') or ''}{tag}")
+            print("  " + (e.get("body") or "").replace("\n", "\n  "))
+        return 0
+    if surface == "decisions":
+        ds = data.get("decisions", [])
+        if not ds:
+            print("mem: no decisions")
+            return 0
+        for d in ds:
+            par = f" (supersedes #{d['parent_decision_id']})" if d.get("parent_decision_id") else ""
+            print(f"#{d['decision_id']} [{d.get('priority') or 'M'}] {d.get('decision_date') or ''}{par}")
+            print("  " + (d.get("decision") or ""))
+            if d.get("rationale"):
+                print("  rationale: " + d["rationale"])
+        return 0
+    if surface == "flags":
+        fs = data.get("flags", [])
+        if not fs:
+            print("mem: no open flags")
+            return 0
+        for f in fs:
+            nm = f.get("display_name") or f"#{f['flag_id']}"
+            print(f"[{nm}] ({f.get('priority') or 'Medium'}) {f.get('description') or ''}")
+        return 0
+    if surface == "roadmap":
+        rm = data.get("roadmap", [])
+        if not rm:
+            print("mem: roadmap empty")
+            return 0
+        for x in rm:
+            print(f"#{x['feature_id']} [{x.get('roadmap_status')}] {x.get('title')}")
+            if x.get("summary"):
+                print("  " + x["summary"])
+        return 0
+    if surface == "narrative":
+        print(data.get("narrative") or "(no active narrative)")
+        return 0
+    if surface == "messages":
+        msgs = data.get("messages", [])
+        if not msgs:
+            print("mem: inbox empty")
+            return 0
+        unread = [m for m in msgs if not m.get("read_at")]
+        print(f"mem: {len(msgs)} message(s), {len(unread)} unread:")
+        for m in msgs:
+            mark = "" if m.get("read_at") else " *unread*"
+            print(f"  [#{m['message_id']}] from shell #{m['from_shell_id']} · {m['created_at']}{mark}")
+            print("    " + (m.get("body") or "").replace("\n", "\n    "))
+        return 0
+    die(f"unknown surface '{surface}'")
+
+
+def cmd_get(args) -> int:
+    """Read a memory surface through the engine API (sqlite fallback when the
+    API isn't wired). The read counterpart to the `./sc mem` write commands —
+    so a shell never needs a raw `sqlite3 SELECT` to see its own memory."""
+    surface = args.surface
+    if SC_API_TOKEN and SC_API_BASE:
+        data = _api("GET", f"/_sc/mem/{surface}")
+    else:
+        con = connect(Path(args.db))
+        try:
+            data = _get_db(con, resolve_shell(con, args.shell), surface)
+        finally:
+            con.close()
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+        return 0
+    return _render_get(surface, data)
+
+
 def cmd_state(args) -> int:
     if SC_API_TOKEN and SC_API_BASE:
         _api("POST", "/_sc/mem/state", {"body": args.text})
@@ -783,6 +921,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("which", parents=[common],
                    help="show resolved DB + guard verdict + active shell").set_defaults(fn=cmd_which)
+
+    sp = sub.add_parser("get", parents=[common],
+                        help="read a memory surface via the API "
+                             f"({'/'.join(GET_SURFACES)})")
+    sp.add_argument("surface", choices=GET_SURFACES)
+    sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
+    sp.set_defaults(fn=cmd_get)
 
     sp = sub.add_parser("state", parents=[common], help="set current_state")
     sp.add_argument("text"); sp.set_defaults(fn=cmd_state)

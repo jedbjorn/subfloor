@@ -49,6 +49,7 @@ LOG_MAX_EVENTS = 20
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
@@ -942,6 +943,52 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
+            if path == "/_sc/mem/state":
+                r = con.execute("SELECT current_state FROM shells WHERE shell_id=?",
+                                (sid,)).fetchone()
+                return self._send(200, {"current_state": (r[0] if r else None)})
+
+            if path in ("/_sc/mem/seed", "/_sc/mem/lns"):
+                kind = "seed" if path.endswith("/seed") else "lns"
+                entries = rows(con.execute(
+                    "SELECT entry_id, kind, body, entry_date, source_tag "
+                    "FROM shell_identity_entries "
+                    "WHERE shell_id=? AND kind=? AND COALESCE(is_deleted,0)=0 "
+                    "AND retired_at IS NULL ORDER BY entry_date, entry_id",
+                    (sid, kind)))
+                return self._send(200, {"entries": entries})
+
+            if path == "/_sc/mem/decisions":
+                ds = rows(con.execute(
+                    "SELECT decision_id, decision, rationale, priority, decision_date, "
+                    "parent_decision_id FROM shell_decisions "
+                    "WHERE shell_id=? AND COALESCE(is_deleted,0)=0 "
+                    "ORDER BY decision_date, decision_id", (sid,)))
+                return self._send(200, {"decisions": ds})
+
+            if path == "/_sc/mem/flags":
+                fs = rows(con.execute(
+                    "SELECT flag_id, display_name, priority, description, feature_id, "
+                    "created_date FROM flags "
+                    "WHERE shell_id=? AND COALESCE(resolved,0)=0 AND COALESCE(is_deleted,0)=0 "
+                    "ORDER BY created_date, flag_id", (sid,)))
+                return self._send(200, {"flags": fs})
+
+            if path == "/_sc/mem/roadmap":
+                # The board is shared, not per-shell — return all live features.
+                rm = rows(con.execute(
+                    "SELECT feature_id, title, roadmap_status, summary, project_id, "
+                    "sort_order FROM roadmap WHERE roadmap_status != 'retired' "
+                    "ORDER BY sort_order, feature_id"))
+                return self._send(200, {"roadmap": rm})
+
+            if path == "/_sc/mem/narrative":
+                r = con.execute(
+                    "SELECT a.full_narrative FROM shells s "
+                    "JOIN shell_memory_archives a ON a.archive_id = s.active_archive_id "
+                    "WHERE s.shell_id=?", (sid,)).fetchone()
+                return self._send(200, {"narrative": (r[0] if r else None)})
+
             if path == "/_sc/mem/messages":
                 msgs = rows(con.execute(
                     "SELECT message_id, from_shell_id, body, created_at, read_at "
@@ -1483,6 +1530,14 @@ def main(argv):
         port = ports_mod.resolve().get("port", 8800)
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
+    # Provision API keys at startup: every shell needs an api_key to reach this
+    # server's token-scoped routes, but shells created before migration 0027 (or
+    # on a fork that never ran the one-off backfill) come up NULL-keyed and would
+    # silently fall back to direct-DB. The running API owns key provisioning — so
+    # ensure it here, idempotently, on every boot. Reuses the same minting the
+    # auth path resolves against; a `make launch/restart` thus self-heals keys
+    # (no separate `./sc update` step). New shells are still keyed at creation.
+    backfill_shell_api_keys.backfill(str(DB_PATH))
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
