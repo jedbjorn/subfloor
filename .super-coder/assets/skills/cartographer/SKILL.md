@@ -103,10 +103,14 @@ clone where the hooks never got wired.
 1. Re-inspect (step 1) — what changed?
 2. Edit `.sc-state/map.config.json` to match (step 2).
 3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
-4. Verify (step 4).
-5. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
+4. Verify (step 4). `dr_filepath` stale entries are pruned automatically by the
+   remap — paths that vanished from the repo are deleted from the catalogue.
+5. **Check stale sections.** `dr_section` is authored and never auto-pruned.
+   After any migration or restructure, run the stale-section worklist
+   (see Standing jobs § 1) and DELETE or repath any sections that come back.
+6. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
    and fill every `desc IS NULL` file. The worklist must be empty when you leave.
-6. Commit.
+7. Commit.
 
 ## Standing jobs — sections, descriptions & the product DB (the navigation layer)
 
@@ -139,6 +143,14 @@ VALUES ('UI', 'shell_core/ui/', 'SvelteKit substrate UI', 5);
 SELECT path FROM dr_filepath f WHERE NOT EXISTS
   (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || '%')
 ORDER BY path;
+
+-- STALE SECTIONS (run after any migration or restructure — dr_filepath pruning
+-- is automatic; dr_section is authored and never auto-pruned):
+SELECT s.name, s.path_prefix, s.description
+FROM dr_section s
+WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') = 0
+ORDER BY s.name;
+-- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
 **2. Descriptions (`dr_filepath.desc`)** — fill per-file one-liners (≤100 chars).
