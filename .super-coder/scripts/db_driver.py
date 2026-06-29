@@ -48,13 +48,13 @@ def connect(path=None):
 
 if is_postgres():
     try:
-        import psycopg2 as _pg
-        IntegrityError = _pg.IntegrityError
+        import psycopg as _pg
+        IntegrityError = _pg.errors.IntegrityError
         OperationalError = _pg.OperationalError
     except ImportError:
         raise SystemExit(
-            "DATABASE_URL is set but psycopg2 is not installed.\n"
-            "  pip install psycopg2-binary"
+            "DATABASE_URL is set but psycopg is not installed.\n"
+            "  pip install 'psycopg[binary]'"
         )
 else:
     import sqlite3 as _sq3
@@ -180,7 +180,7 @@ class _PgRow:
 # ── Cursor wrapper ────────────────────────────────────────────────────────────
 
 class _PgCursor:
-    """Wraps a psycopg2 cursor to look like sqlite3.Cursor."""
+    """Wraps a psycopg cursor to look like sqlite3.Cursor."""
 
     def __init__(self, cur: Any, lastrowid: Any = None) -> None:
         self._cur = cur
@@ -217,11 +217,11 @@ class _PgCursor:
 # ── Connection wrapper ────────────────────────────────────────────────────────
 
 class _PgConn:
-    """Wraps a psycopg2 connection to look like sqlite3.Connection."""
+    """Wraps a psycopg connection to look like sqlite3.Connection."""
 
     def __init__(self, url: str) -> None:
-        import psycopg2
-        self._conn = psycopg2.connect(url)
+        import psycopg
+        self._conn = psycopg.connect(url)
         self._conn.autocommit = False
 
     def execute(self, sql: str, params: Any = ()) -> _PgCursor:

@@ -737,7 +737,7 @@ needed inside the container.
 **What you get:**
 - `DATABASE_URL=postgresql://sc:sc@sc-pg-<repo>:5432/sc` is already in the environment
 - `db_driver` switches to PG mode automatically — sqlite3 code paths are inert
-- `psycopg2-binary` is in the baseline dev kit (`./sc deps`), so `pytest`
+- `psycopg[binary]` (psycopg3) is in the baseline dev kit (`./sc deps`), so `pytest`
   connects to real postgres with zero extra install steps
 - Data persists in a named Docker volume across restarts and image rebuilds
 
