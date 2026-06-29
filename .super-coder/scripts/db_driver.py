@@ -65,12 +65,14 @@ else:
 # ── SQL translation (postgres only) ──────────────────────────────────────────
 
 _RE_NOOP_PRAGMA = re.compile(
-    r"^\s*PRAGMA\s+(journal_mode|busy_timeout|foreign_keys|wal_autocheckpoint)"
-    r"(\s*[=;].*)?$",
+    r"^PRAGMA[ \t]+(journal_mode|busy_timeout|foreign_keys|wal_autocheckpoint)"
+    r"([ \t]*[=;][^;]*)?$",
     re.IGNORECASE,
 )
+# Applied to already-stripped input: no leading/trailing \s* needed.
+# Avoids polynomial backtracking on inputs with many trailing spaces.
 _RE_TABLE_INFO = re.compile(
-    r"^\s*PRAGMA\s+table_info\s*\(\s*(\w+)\s*\)\s*;?\s*$", re.IGNORECASE
+    r"^PRAGMA[ \t]+table_info[ \t]*\([ \t]*(\w+)[ \t]*\);?$", re.IGNORECASE
 )
 _RE_INSERT_OR_IGNORE = re.compile(r"\bINSERT\s+OR\s+IGNORE\b", re.IGNORECASE)
 _RE_INSERT = re.compile(r"^\s*INSERT\b", re.IGNORECASE)
