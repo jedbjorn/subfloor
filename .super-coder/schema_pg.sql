@@ -310,7 +310,7 @@ CREATE TABLE IF NOT EXISTS dr_filepath (
     role     TEXT,
     bytes    INTEGER,
     lines    INTEGER,
-    desc     TEXT
+    "desc"   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dr_section (
