@@ -938,7 +938,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
-            if path == "/mem/messages":
+            if path == "/_sc/mem/messages":
                 msgs = rows(con.execute(
                     "SELECT message_id, from_shell_id, body, created_at, read_at "
                     "FROM shell_messages WHERE to_shell_id=? "
@@ -957,14 +957,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
-            if path == "/mem/state":
+            if path == "/_sc/mem/state":
                 con.execute("UPDATE shells SET current_state=? WHERE shell_id=?",
                             ((body.get("body") or ""), sid))
                 con.commit()
                 return self._send(200, {"ok": True})
 
-            if path in ("/mem/seed", "/mem/lns"):
-                kind = "seed" if path == "/mem/seed" else "lns"
+            if path in ("/_sc/mem/seed", "/_sc/mem/lns"):
+                kind = "seed" if path == "/_sc/mem/seed" else "lns"
                 b = (body.get("body") or "").strip()
                 if not b:
                     return self._send(400, {"error": "body required"})
@@ -977,7 +977,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"entry_id": cur.lastrowid})
 
-            if path == "/mem/decisions":
+            if path == "/_sc/mem/decisions":
                 d = (body.get("decision") or "").strip()
                 if not d:
                     return self._send(400, {"error": "decision required"})
@@ -993,7 +993,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"decision_id": cur.lastrowid})
 
-            if path == "/mem/flags":
+            if path == "/_sc/mem/flags":
                 desc = (body.get("description") or "").strip()
                 if not desc:
                     return self._send(400, {"error": "description required"})
@@ -1008,7 +1008,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"flag_id": cur.lastrowid})
 
-            if path == "/mem/roadmap":
+            if path == "/_sc/mem/roadmap":
                 title = (body.get("title") or "").strip()
                 if not title:
                     return self._send(400, {"error": "title required"})
@@ -1023,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"feature_id": cur.lastrowid})
 
-            if path == "/mem/tasks":
+            if path == "/_sc/mem/tasks":
                 title = (body.get("title") or "").strip()
                 fid, did, seq = body.get("feature_id"), body.get("document_id"), body.get("seq")
                 if not title or fid is None or did is None or seq is None:
@@ -1036,7 +1036,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"task_id": cur.lastrowid})
 
-            if path == "/mem/docs":
+            if path == "/_sc/mem/docs":
                 fid = body.get("feature_id")
                 if fid is None:
                     return self._send(400, {"error": "feature_id required"})
@@ -1052,7 +1052,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"document_id": cur.lastrowid})
 
-            if path == "/mem/narrative":
+            if path == "/_sc/mem/narrative":
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._send(400, {"error": "text required"})
@@ -1071,7 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(200, {"ok": True})
 
-            if path == "/mem/messages":
+            if path == "/_sc/mem/messages":
                 to_sid = body.get("to_shell_id")
                 msg = (body.get("body") or "").strip()
                 if to_sid is None or not msg:
@@ -1082,7 +1082,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(201, {"message_id": cur.lastrowid})
 
-            if path == "/mem/oriented":
+            if path == "/_sc/mem/oriented":
                 con.execute("UPDATE shells SET bootstrapped=1 WHERE shell_id=?", (sid,))
                 con.commit()
                 return self._send(200, {"ok": True})
@@ -1098,12 +1098,12 @@ class Handler(BaseHTTPRequestHandler):
         if sid is None:
             return
         body = self._body()
-        parts = path.strip("/").split("/")  # parts[0]='mem'
+        parts = path.strip("/").split("/")  # parts[0]='_sc', parts[1]='mem'
         con = db()
         try:
-            # PATCH /mem/identity-entries/{id}/retire
-            if len(parts) == 4 and parts[1] == "identity-entries" and parts[3] == "retire":
-                eid = int(parts[2])
+            # PATCH /_sc/mem/identity-entries/{id}/retire
+            if len(parts) == 5 and parts[2] == "identity-entries" and parts[4] == "retire":
+                eid = int(parts[3])
                 if not con.execute(
                         "SELECT 1 FROM shell_identity_entries "
                         "WHERE entry_id=? AND shell_id=? AND is_deleted=0",
@@ -1115,9 +1115,9 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(200, {"ok": True})
 
-            # PATCH /mem/flags/{id}
-            if len(parts) == 3 and parts[1] == "flags":
-                fid = int(parts[2])
+            # PATCH /_sc/mem/flags/{id}
+            if len(parts) == 4 and parts[2] == "flags":
+                fid = int(parts[3])
                 if not con.execute(
                         "SELECT 1 FROM flags WHERE flag_id=? AND shell_id=? "
                         "AND COALESCE(is_deleted,0)=0", (fid, sid)).fetchone():
@@ -1128,23 +1128,23 @@ class Handler(BaseHTTPRequestHandler):
                                         FLAG_EDITABLE | {"resolved_date"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
-            # PATCH /mem/roadmap/{id}
-            if len(parts) == 3 and parts[1] == "roadmap":
-                ok, err = patch_columns(con, "roadmap", "feature_id", int(parts[2]),
+            # PATCH /_sc/mem/roadmap/{id}
+            if len(parts) == 4 and parts[2] == "roadmap":
+                ok, err = patch_columns(con, "roadmap", "feature_id", int(parts[3]),
                                         body, ROADMAP_EDITABLE)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
-            # PATCH /mem/tasks/{id}
-            if len(parts) == 3 and parts[1] == "tasks":
+            # PATCH /_sc/mem/tasks/{id}
+            if len(parts) == 4 and parts[2] == "tasks":
                 if body.get("status") == "done":
                     body.setdefault("completed_date", date.today().isoformat())
-                ok, err = patch_columns(con, "spec_tasks", "task_id", int(parts[2]),
+                ok, err = patch_columns(con, "spec_tasks", "task_id", int(parts[3]),
                                         body, {"status", "title", "description", "completed_date"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
-            # PATCH /mem/docs/{id}/freeze — must precede the bare /docs/{id} check
-            if len(parts) == 4 and parts[1] == "docs" and parts[3] == "freeze":
-                did = int(parts[2])
+            # PATCH /_sc/mem/docs/{id}/freeze — must precede the bare /docs/{id} check
+            if len(parts) == 5 and parts[2] == "docs" and parts[4] == "freeze":
+                did = int(parts[3])
                 r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
                                 (did,)).fetchone()
                 if r is None:
@@ -1157,14 +1157,14 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(200, {"ok": True})
 
-            # PATCH /mem/docs/{id}
-            if len(parts) == 3 and parts[1] == "docs":
-                ok, err = patch_document(con, int(parts[2]), body)
+            # PATCH /_sc/mem/docs/{id}
+            if len(parts) == 4 and parts[2] == "docs":
+                ok, err = patch_document(con, int(parts[3]), body)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
-            # PATCH /mem/messages/{id}/read
-            if len(parts) == 4 and parts[1] == "messages" and parts[3] == "read":
-                mid = int(parts[2])
+            # PATCH /_sc/mem/messages/{id}/read
+            if len(parts) == 5 and parts[2] == "messages" and parts[4] == "read":
+                mid = int(parts[3])
                 if not con.execute(
                         "SELECT 1 FROM shell_messages WHERE message_id=? AND to_shell_id=?",
                         (mid, sid)).fetchone():
@@ -1190,7 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
             if not f.exists():
                 return self._send(404, "not built", "text/plain")
             return self._send(200, f.read_text(), ctype)
-        if path.startswith("/mem/"):
+        if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
         if not path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
@@ -1285,7 +1285,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path.startswith("/mem/"):
+        if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
         con = db()
         try:
@@ -1381,7 +1381,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         path = urlparse(self.path).path
-        if path.startswith("/mem/"):
+        if path.startswith("/_sc/mem/"):
             return self._mem_patch(path)
         body = self._body()
         con = db()
