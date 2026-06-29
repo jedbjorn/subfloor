@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import subprocess
@@ -880,6 +881,54 @@ class Handler(BaseHTTPRequestHandler):
         log_event("error", ok=False, path=getattr(self, "path", "?"),
                   detail=traceback.format_exc().strip().splitlines()[-15:])
         return self._send(500, {"error": str(exc)})
+
+    # -- Bearer auth helpers --
+
+    def _bearer_token(self) -> str:
+        """Extract the raw Bearer token from the Authorization header, or ''."""
+        authz = self.headers.get("Authorization", "")
+        if authz[:7].lower() == "bearer ":
+            return authz[7:].strip()
+        return ""
+
+    def _resolve_shell(self) -> tuple:
+        """Resolve a Bearer token to a shell_id.
+
+        Returns (shell_id, bad) where:
+          bad=False, shell_id=None  — no token presented
+          bad=True,  shell_id=None  — token presented but matched no shell → 401
+          bad=False, shell_id=int   — valid token, shell resolved
+        """
+        token = self._bearer_token()
+        if not token:
+            return None, False
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        con = db()
+        try:
+            row = con.execute(
+                "SELECT shell_id FROM shells "
+                "WHERE api_key_hash=? AND COALESCE(is_deleted,0)=0",
+                (digest,)).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return None, True
+        return row[0], False
+
+    def _require_shell_auth(self):
+        """Enforce Bearer auth — call at the top of any token-scoped route.
+
+        Returns shell_id (int) on success. On failure, sends the 401 response
+        and returns None — the caller must return immediately without further
+        processing."""
+        shell_id, bad = self._resolve_shell()
+        if bad:
+            self._send(401, {"error": "invalid or unknown token"})
+            return None
+        if shell_id is None:
+            self._send(401, {"error": "Authorization: Bearer <token> required"})
+            return None
+        return shell_id
 
     # -- static + GET --
     def do_GET(self):
