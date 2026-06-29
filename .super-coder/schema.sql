@@ -55,14 +55,8 @@ CREATE TABLE shells (
     active_archive_id INTEGER,
     user_id           INTEGER REFERENCES users(user_id),
     is_shared         INTEGER NOT NULL DEFAULT 0,
-    is_deleted        INTEGER NOT NULL DEFAULT 0,
-
-    api_key           TEXT,                            -- plaintext Bearer token (see api_key_hash)
-    api_key_hash      TEXT,                            -- SHA-256 hex; middleware resolves shell_id via this
-    api_key_rotated_at TEXT                            -- ISO timestamp when key was last minted/rotated
+    is_deleted        INTEGER NOT NULL DEFAULT 0
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_shells_api_key_hash ON shells(api_key_hash);
 
 -- Singleton guard: a fork has exactly one cartographer — it owns the repo map
 -- and no other shell maps, so a second one is incoherent. Mirrors the seed/L&S
