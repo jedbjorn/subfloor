@@ -207,13 +207,19 @@ write the doc (that's the planner — see the `docs` skill):
    ```
    ./sc mem roadmap status <feature_id> shipped
    ```
-2. **Open a docs-pending flag** so `shipped` doesn't silently claim a doc that
-   isn't written yet (`shipped` + an open flag is the honest interim state). Per
-   the `flags` skill, opening it also messages the party who clears it — the
-   planner:
+2. **Open a docs-pending flag and message the planner with full instructions.**
+   `shipped` + an open flag is the honest interim state. The message carries
+   everything the planner needs to act without digging:
    ```
    ./sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
-   ./sc mem message send <planner-shortname> "<feature> shipped — spec <doc_id> ready to freeze + document. Docs-pending flag SC-### open."
+   ./sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
+
+   Spec <doc_id> shipped. Flag SC-### is open — your action required:
+
+   1. **Read the shipped code first.** Write the doc from what actually shipped, not from the spec. Drift happens and decisions get made in production — the spec captures the intent, the code is the truth.
+   2. Freeze the spec: \`./sc mem doc freeze <doc_id>\`
+   3. Write the doc (\`kind='doc'\`) under feature <feature_id> (see the \`docs\` skill).
+   4. Close flag SC-### when the doc is live."
    ```
 3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec + write
    the doc." The planner closes the flag when the doc lands.
