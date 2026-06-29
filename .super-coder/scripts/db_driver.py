@@ -20,7 +20,7 @@ import os
 import re
 from typing import Any
 
-_URL: str = os.environ.get("DATABASE_URL", "").strip()
+_URL: str = os.environ.get("SC_DATABASE_URL", "").strip()
 
 
 def is_postgres() -> bool:
