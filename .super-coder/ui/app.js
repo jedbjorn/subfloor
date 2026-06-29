@@ -604,11 +604,7 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
     root.append(el("div", { className: "muted" }, "No features in the sequencing stages yet."));
     return;
   }
-  const activeFeats = feats.filter((f) => stageOf[f.feature_id] !== "shipped");
-  if (!activeFeats.length) {
-    root.append(el("div", { className: "muted" }, "All shipped — nothing in progress."));
-    return;
-  }
+
 
   // Group the sequencing features by work-stream (project_id; null = ungrouped).
   const byProj = new Map();   // key (project_id | null) → { title, features }
@@ -624,6 +620,7 @@ async function renderRoadmapFlow(root, buckets, projects = []) {
   let anyEdge = false;
   for (const key of order) {
     const grp = byProj.get(key);
+    if (grp.features.every((f) => stageOf[f.feature_id] === "shipped")) continue;
     const title = key === null ? "Ungrouped" : (grp.title || ("project #" + key));
     const section = el("div", { className: "flow-stream" });
     section.append(el("h2", { className: "flow-stream-head" }, title));
