@@ -577,12 +577,9 @@ Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
 memory, and content live in tables — never flat files. Lazy-load: query for what
 you need, don''t bulk-read.
 
-**Reads use raw `sqlite3` SELECT; writes go through `./sc mem`.** Two DBs are in
-reach (this engine DB + the app''s product DB) with overlapping table names, so a
-raw INSERT against the wrong one succeeds silently. `./sc mem` resolves + guards
-*this* DB and writes to the live engine DB — shared by every shell, durable the
-moment it commits. Table below = the schema for your SELECTs; `## Common writes` =
-the `./sc mem` command for each change.
+Query with `sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through
+`./sc mem`. Table below = the schema for your SELECTs; `## Common writes` = the
+`./sc mem` command for each change.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
@@ -600,7 +597,7 @@ memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
 | `feature_blockers` | the roadmap''s dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite must land first). Directed, kept acyclic (the GUI Flow view wires them; the card''s "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `./sc mem roadmap depends` |
 | `documents` | the content store — specs/docs bodies live here; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; never edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
-| `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | catalogue via migration; grants via snapshot |
+| `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | managed by engine |
 | `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a **work-stream** that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
 `<self>` = your `shell_id` (in the boot doc''s ACTIVE SESSION block).
@@ -649,11 +646,6 @@ Each guards the engine DB and writes to the live shared DB. `./sc mem which` ori
 ./sc mem message send <shortname> "…"     # check / mark-read too (see `messaging`)
 ./sc mem oriented                          # mark first-run done (bootstrapped=1)
 ```
-
-Every engine-memory write now has a verb — there is no raw-`sqlite3` write path to
-reach for. (Edge cases beyond these — e.g. `sort_order` reordering, linking an
-existing shell to a project — are rare; do them with raw `sqlite3` after
-`./sc mem which`.)
 
 ## After writing
 
@@ -1869,14 +1861,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 All memory is DB rows (no flat files). Write at the moment it matters, not in a
 close ritual.
 
-**Write through `./sc mem`, never raw `sqlite3`.** Two DBs are in reach (your
-engine DB and the app''s product DB) and their table names overlap — a raw
-`INSERT INTO shell_decisions …` against the wrong one *succeeds silently*.
-`./sc mem` resolves + guards *this* engine DB, refuses the app DB or an empty
-stub, and writes to the live engine DB — the single source of truth shared by
-every shell, so the change is durable + visible to all the moment it commits.
-`./sc mem which` shows the resolved DB; raw `sqlite3` is for SELECT only. Writes
-default to your shell; pass `--shell <id|name>` to be explicit.
+**Write through `./sc mem`.** The write lands in the live engine DB — shared by
+every shell, durable + visible to all the moment it commits. Writes default to
+your shell; pass `--shell <id|name>` to be explicit.
 
 ## current_state — rolling status, NOT a log
 
@@ -1927,8 +1914,7 @@ the narrative.
 
 Write-as-you-go beats batch-at-close: it costs nothing per write and zero at
 session end. Curate seed/L&S (revise the set), never rewrite history (decisions,
-narrative, seed bodies). The underlying tables are documented in `db_map` — read
-them with raw SELECT, write them with `./sc mem`.',
+narrative, seed bodies). Full command reference + table map: the `db_map` skill.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1948,11 +1934,8 @@ One shell writes a markdown message to another; the recipient discovers it on it
 next boot via the `## STATUS` `Inbox:` count, surfaces it with `check`, and clears
 it with `mark-read`. Body is markdown — preserved verbatim.
 
-Drive it with **`./sc mem message`**, never raw `sqlite3`. `shell_messages` lives
-in the engine DB, and `./sc mem` resolves + guards *this* DB (from any cwd,
-including a worktree where a literal `.super-coder/shell_db.db` path would create
-an empty stub and drop the message) and snapshots the send so it survives a
-rebuild. The sender is you; recipients are addressed by `shortname`.
+Drive it with **`./sc mem message`**. The sender is you; recipients are addressed
+by `shortname`.
 
 Trigger: `--message`
 Args: `check [N] | send <to-shortname> <body> | mark-read <id>`
