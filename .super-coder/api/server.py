@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -930,6 +930,257 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return shell_id
 
+    # -- /mem/* token-scoped shell memory endpoints --
+
+    def _mem_get(self, path: str):
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            if path == "/mem/messages":
+                msgs = rows(con.execute(
+                    "SELECT message_id, from_shell_id, body, created_at, read_at "
+                    "FROM shell_messages WHERE to_shell_id=? "
+                    "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
+                    (sid,)))
+                return self._send(200, {"messages": msgs})
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
+    def _mem_post(self, path: str, body: dict):
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            if path == "/mem/state":
+                con.execute("UPDATE shells SET current_state=? WHERE shell_id=?",
+                            ((body.get("body") or ""), sid))
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            if path in ("/mem/seed", "/mem/lns"):
+                kind = "seed" if path == "/mem/seed" else "lns"
+                b = (body.get("body") or "").strip()
+                if not b:
+                    return self._send(400, {"error": "body required"})
+                cur = con.execute(
+                    "INSERT INTO shell_identity_entries "
+                    "(shell_id, kind, body, entry_date, source_tag) VALUES (?, ?, ?, ?, ?)",
+                    (sid, kind, b,
+                     body.get("entry_date") or None,
+                     body.get("source_tag") or None))
+                con.commit()
+                return self._send(201, {"entry_id": cur.lastrowid})
+
+            if path == "/mem/decisions":
+                d = (body.get("decision") or "").strip()
+                if not d:
+                    return self._send(400, {"error": "decision required"})
+                cur = con.execute(
+                    "INSERT INTO shell_decisions "
+                    "(shell_id, decision, rationale, priority, decision_date, parent_decision_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (sid, d,
+                     body.get("rationale") or None,
+                     body.get("priority") or "M",
+                     body.get("decision_date") or None,
+                     body.get("parent_decision_id") or None))
+                con.commit()
+                return self._send(201, {"decision_id": cur.lastrowid})
+
+            if path == "/mem/flags":
+                desc = (body.get("description") or "").strip()
+                if not desc:
+                    return self._send(400, {"error": "description required"})
+                cur = con.execute(
+                    "INSERT INTO flags (shell_id, display_name, description, priority, feature_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (sid,
+                     body.get("display_name") or None,
+                     desc,
+                     body.get("priority") or "Medium",
+                     body.get("feature_id") or None))
+                con.commit()
+                return self._send(201, {"flag_id": cur.lastrowid})
+
+            if path == "/mem/roadmap":
+                title = (body.get("title") or "").strip()
+                if not title:
+                    return self._send(400, {"error": "title required"})
+                cur = con.execute(
+                    "INSERT INTO roadmap (title, summary, roadmap_status, sort_order, owning_shell) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (title,
+                     body.get("summary") or None,
+                     body.get("roadmap_status") or "brainstorm",
+                     body.get("sort_order") or 0,
+                     sid))
+                con.commit()
+                return self._send(201, {"feature_id": cur.lastrowid})
+
+            if path == "/mem/tasks":
+                title = (body.get("title") or "").strip()
+                fid, did, seq = body.get("feature_id"), body.get("document_id"), body.get("seq")
+                if not title or fid is None or did is None or seq is None:
+                    return self._send(400, {"error": "feature_id, document_id, seq, title required"})
+                cur = con.execute(
+                    "INSERT INTO spec_tasks (feature_id, document_id, seq, title, description, shell_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(fid), int(did), int(seq), title,
+                     body.get("description") or None, sid))
+                con.commit()
+                return self._send(201, {"task_id": cur.lastrowid})
+
+            if path == "/mem/docs":
+                fid = body.get("feature_id")
+                if fid is None:
+                    return self._send(400, {"error": "feature_id required"})
+                cur = con.execute(
+                    "INSERT INTO documents (feature_id, kind, seq, title, body, render_path) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(fid),
+                     body.get("kind") or "spec",
+                     body.get("seq") or 1,
+                     (body.get("title") or "").strip() or None,
+                     body.get("body") or None,
+                     body.get("render_path") or None))
+                con.commit()
+                return self._send(201, {"document_id": cur.lastrowid})
+
+            if path == "/mem/narrative":
+                text = (body.get("text") or "").strip()
+                if not text:
+                    return self._send(400, {"error": "text required"})
+                r = con.execute("SELECT active_archive_id FROM shells WHERE shell_id=?",
+                                (sid,)).fetchone()
+                aid = r[0] if r else None
+                if not aid:
+                    return self._send(409, {"error": "no active session archive"})
+                row = con.execute(
+                    "SELECT full_narrative FROM shell_memory_archives WHERE archive_id=?",
+                    (aid,)).fetchone()
+                existing = (row[0] or "") if row else ""
+                con.execute(
+                    "UPDATE shell_memory_archives SET full_narrative=? WHERE archive_id=?",
+                    ((existing + "\n" + text) if existing else text, aid))
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            if path == "/mem/messages":
+                to_sid = body.get("to_shell_id")
+                msg = (body.get("body") or "").strip()
+                if to_sid is None or not msg:
+                    return self._send(400, {"error": "to_shell_id and body required"})
+                cur = con.execute(
+                    "INSERT INTO shell_messages (from_shell_id, to_shell_id, body) VALUES (?, ?, ?)",
+                    (sid, int(to_sid), msg))
+                con.commit()
+                return self._send(201, {"message_id": cur.lastrowid})
+
+            if path == "/mem/oriented":
+                con.execute("UPDATE shells SET bootstrapped=1 WHERE shell_id=?", (sid,))
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
+    def _mem_patch(self, path: str):
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        body = self._body()
+        parts = path.strip("/").split("/")  # parts[0]='mem'
+        con = db()
+        try:
+            # PATCH /mem/identity-entries/{id}/retire
+            if len(parts) == 4 and parts[1] == "identity-entries" and parts[3] == "retire":
+                eid = int(parts[2])
+                if not con.execute(
+                        "SELECT 1 FROM shell_identity_entries "
+                        "WHERE entry_id=? AND shell_id=? AND is_deleted=0",
+                        (eid, sid)).fetchone():
+                    return self._send(404, {"error": "no such entry"})
+                con.execute(
+                    "UPDATE shell_identity_entries SET retired_at=datetime('now') WHERE entry_id=?",
+                    (eid,))
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            # PATCH /mem/flags/{id}
+            if len(parts) == 3 and parts[1] == "flags":
+                fid = int(parts[2])
+                if not con.execute(
+                        "SELECT 1 FROM flags WHERE flag_id=? AND shell_id=? "
+                        "AND COALESCE(is_deleted,0)=0", (fid, sid)).fetchone():
+                    return self._send(404, {"error": "no such flag"})
+                if body.get("resolved"):
+                    body.setdefault("resolved_date", date.today().isoformat())
+                ok, err = patch_columns(con, "flags", "flag_id", fid, body,
+                                        FLAG_EDITABLE | {"resolved_date"})
+                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+
+            # PATCH /mem/roadmap/{id}
+            if len(parts) == 3 and parts[1] == "roadmap":
+                ok, err = patch_columns(con, "roadmap", "feature_id", int(parts[2]),
+                                        body, ROADMAP_EDITABLE)
+                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+
+            # PATCH /mem/tasks/{id}
+            if len(parts) == 3 and parts[1] == "tasks":
+                if body.get("status") == "done":
+                    body.setdefault("completed_date", date.today().isoformat())
+                ok, err = patch_columns(con, "spec_tasks", "task_id", int(parts[2]),
+                                        body, {"status", "title", "description", "completed_date"})
+                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+
+            # PATCH /mem/docs/{id}/freeze — must precede the bare /docs/{id} check
+            if len(parts) == 4 and parts[1] == "docs" and parts[3] == "freeze":
+                did = int(parts[2])
+                r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
+                                (did,)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such document"})
+                if r[0]:
+                    return self._send(409, {"error": "document is already frozen"})
+                con.execute(
+                    "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
+                    (did,))
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            # PATCH /mem/docs/{id}
+            if len(parts) == 3 and parts[1] == "docs":
+                ok, err = patch_document(con, int(parts[2]), body)
+                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+
+            # PATCH /mem/messages/{id}/read
+            if len(parts) == 4 and parts[1] == "messages" and parts[3] == "read":
+                mid = int(parts[2])
+                if not con.execute(
+                        "SELECT 1 FROM shell_messages WHERE message_id=? AND to_shell_id=?",
+                        (mid, sid)).fetchone():
+                    return self._send(404, {"error": "no such message"})
+                con.execute(
+                    "UPDATE shell_messages SET read_at=datetime('now') WHERE message_id=?",
+                    (mid,))
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
     # -- static + GET --
     def do_GET(self):
         path = urlparse(self.path).path
@@ -939,6 +1190,8 @@ class Handler(BaseHTTPRequestHandler):
             if not f.exists():
                 return self._send(404, "not built", "text/plain")
             return self._send(200, f.read_text(), ctype)
+        if path.startswith("/mem/"):
+            return self._mem_get(path)
         if not path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         # git-hygiene is a live filesystem/git read — no DB, computed on demand
@@ -1032,6 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path.startswith("/mem/"):
+            return self._mem_post(path, self._body())
         con = db()
         try:
             if path == "/api/flags":
@@ -1126,6 +1381,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         path = urlparse(self.path).path
+        if path.startswith("/mem/"):
+            return self._mem_patch(path)
         body = self._body()
         con = db()
         try:
