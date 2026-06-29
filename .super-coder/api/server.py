@@ -333,8 +333,10 @@ def patch_columns(con, table, pk_col, pk, body, allowed):
     if not fields:
         return False, "no editable fields in payload"
     sets = ", ".join(f"{k}=?" for k in fields)
-    con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
-                (*fields.values(), pk))
+    cur = con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
+                      (*fields.values(), pk))
+    if cur.rowcount == 0:
+        return False, "not found"
     con.commit()
     return True, None
 
@@ -1130,23 +1132,36 @@ class Handler(BaseHTTPRequestHandler):
 
             # PATCH /_sc/mem/roadmap/{id}
             if len(parts) == 4 and parts[2] == "roadmap":
-                ok, err = patch_columns(con, "roadmap", "feature_id", int(parts[3]),
+                fid = int(parts[3])
+                if not con.execute(
+                        "SELECT 1 FROM roadmap WHERE feature_id=? AND owning_shell=?",
+                        (fid, sid)).fetchone():
+                    return self._send(404, {"error": "no such feature"})
+                ok, err = patch_columns(con, "roadmap", "feature_id", fid,
                                         body, ROADMAP_EDITABLE)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/tasks/{id}
             if len(parts) == 4 and parts[2] == "tasks":
+                tid = int(parts[3])
+                if not con.execute(
+                        "SELECT 1 FROM spec_tasks WHERE task_id=? AND shell_id=?",
+                        (tid, sid)).fetchone():
+                    return self._send(404, {"error": "no such task"})
                 if body.get("status") == "done":
                     body.setdefault("completed_date", date.today().isoformat())
-                ok, err = patch_columns(con, "spec_tasks", "task_id", int(parts[3]),
+                ok, err = patch_columns(con, "spec_tasks", "task_id", tid,
                                         body, {"status", "title", "description", "completed_date"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/docs/{id}/freeze — must precede the bare /docs/{id} check
             if len(parts) == 5 and parts[2] == "docs" and parts[4] == "freeze":
                 did = int(parts[3])
-                r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
-                                (did,)).fetchone()
+                r = con.execute(
+                    "SELECT d.frozen FROM documents d "
+                    "JOIN roadmap r ON r.feature_id=d.feature_id "
+                    "WHERE d.document_id=? AND r.owning_shell=?",
+                    (did, sid)).fetchone()
                 if r is None:
                     return self._send(404, {"error": "no such document"})
                 if r[0]:
@@ -1159,7 +1174,14 @@ class Handler(BaseHTTPRequestHandler):
 
             # PATCH /_sc/mem/docs/{id}
             if len(parts) == 4 and parts[2] == "docs":
-                ok, err = patch_document(con, int(parts[3]), body)
+                did = int(parts[3])
+                if not con.execute(
+                        "SELECT 1 FROM documents d "
+                        "JOIN roadmap r ON r.feature_id=d.feature_id "
+                        "WHERE d.document_id=? AND r.owning_shell=?",
+                        (did, sid)).fetchone():
+                    return self._send(404, {"error": "no such document"})
+                ok, err = patch_document(con, did, body)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/messages/{id}/read
@@ -1176,6 +1198,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             return self._send(404, {"error": "not found"})
+        except ValueError:
+            return self._send(400, {"error": "invalid id"})
         except Exception as e:
             return self._fail(e)
         finally:

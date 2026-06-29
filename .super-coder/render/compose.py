@@ -188,7 +188,7 @@ def render_skills(con, shell_id: int) -> str:
 
 
 def render_api(port: "int | None", api_key: "str | None") -> str:
-    if not port or not api_key:
+    if port is None or not api_key:
         return "(API not configured — run `./sc rebuild` to assign a key)"
     return (
         f"- **Base URL:** `http://127.0.0.1:{port}`\n"
