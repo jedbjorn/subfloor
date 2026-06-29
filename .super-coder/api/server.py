@@ -328,14 +328,16 @@ def get_flags(con) -> dict:
 # ── Mutations ─────────────────────────────────────────────────────────────────
 
 def patch_columns(con, table, pk_col, pk, body, allowed):
-    # Iterate `allowed` (caller-supplied hardcoded set) so column names never
-    # derive from user input — guards against SQL injection via key names.
-    pairs = [(col, body[col]) for col in sorted(allowed) if col in body]
-    if not pairs:
+    # Column names come exclusively from `allowed` (caller-supplied hardcoded set).
+    # Values are kept in a separate list so taint from body never reaches the
+    # SQL string — only the parameterised bindings.
+    cols = [col for col in sorted(allowed) if col in body]
+    if not cols:
         return False, "no editable fields in payload"
-    sets = ", ".join(f"{col}=?" for col, _ in pairs)
+    vals = [body[col] for col in cols]
+    sets = ", ".join(f"{col}=?" for col in cols)
     cur = con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
-                      tuple(v for _, v in pairs) + (pk,))
+                      tuple(vals) + (pk,))
     if cur.rowcount == 0:
         return False, "not found"
     con.commit()
