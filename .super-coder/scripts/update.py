@@ -131,6 +131,27 @@ def super_coder_remote() -> str:
              "  git remote add super-coder https://github.com/jedbjorn/super-coder.git")
 
 
+def _engine_paths_at(ref: str) -> list[str]:
+    """ENGINE_PATHS that actually exist at `ref` (blob or tree).
+
+    `git archive` aborts wholesale if any pathspec matches nothing, so a single
+    engine file retired upstream (e.g. a dropped schema variant) would otherwise
+    break every fork's update the one time it crosses that deletion. Filter to
+    the paths present at `ref` — and report what was dropped, never silently."""
+    present, missing = [], []
+    for p in ENGINE_PATHS:
+        exists = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{ref}:{p}"],
+            capture_output=True).returncode == 0
+        (present if exists else missing).append(p)
+    if missing:
+        print(f"  note: {len(missing)} engine path(s) absent at {ref[:12]} "
+              f"(retired upstream) — skipping: {', '.join(missing)}")
+    if not present:
+        sys.exit(f"update: no engine paths exist at {ref} — wrong ref or remote?")
+    return present
+
+
 def materialize_engine(ref: str) -> None:
     """Write the engine paths at `ref` into the working tree WITHOUT touching the
     git index — the engine is gitignored, so a `git checkout -- <paths>` (which
@@ -139,7 +160,7 @@ def materialize_engine(ref: str) -> None:
     in place. (Files deleted upstream linger until a future doctor sweep — same
     gap the old checkout had; acceptable for a wholesale-overwrite dependency.)"""
     archive = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "archive", ref, "--", *ENGINE_PATHS],
+        ["git", "-C", str(REPO_ROOT), "archive", ref, "--", *_engine_paths_at(ref)],
         capture_output=True)
     if archive.returncode != 0:
         sys.exit("update: git archive of the engine failed:\n"
