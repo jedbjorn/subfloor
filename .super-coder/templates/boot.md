@@ -37,12 +37,14 @@ different ways, so keep them straight:
 
 - **Engine memory DB** — `.super-coder/shell_db.db`. Fixed name, always under
   `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
-  Gitignored and rebuilt from tracked text. **Write to it through `./sc mem`, not
-  raw `sqlite3`** — `./sc mem` resolves *this* DB for you, refuses to write to the
-  app DB or a stray empty file (their table names overlap, so a raw INSERT against
-  the wrong one silently succeeds), and snapshots the change so it survives a
-  rebuild. `./sc mem which` shows the resolved DB. Raw `sqlite3` is for SELECT
-  (reads can't corrupt); `./sc snapshot` re-serializes after any non-`mem` edit.
+  Gitignored and rebuilt from tracked text. **Write through `./sc mem`, not raw
+  `sqlite3`** — when `SC_API_TOKEN` is set (injected at boot), `./sc mem` proxies
+  to the engine API (`/_sc/mem/*`), so writes work from any worktree with no direct
+  DB access. Without the token, it resolves + guards the engine DB directly, refusing
+  the app DB or a stray empty file (overlapping table names mean a raw INSERT against
+  the wrong one silently succeeds). `./sc mem which` shows the resolved DB. Raw
+  `sqlite3` is for SELECT (reads can't corrupt); `./sc snapshot` re-serializes after
+  any non-`mem` edit.
 - **App product DB** — the database of the product *this repo* builds. Its name
   and path **vary per fork** and live **outside** `.super-coder/`. Holds the
   product's runtime data + schema. Change it the way the product does — schema

@@ -24,13 +24,14 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
 Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
-lns · decision · flag · roadmap · doc · narrative): it resolves + guards *this*
-engine DB — refusing the app DB or a stray empty file, whose overlapping table
-names would let a raw `sqlite3` INSERT hit the wrong DB silently. The write lands
-in the live engine DB — the single source of truth shared by every shell, durable
-and visible to all at once. That is the whole write: **you don't snapshot or
-render** — persisting to git is an admin/GUI step. Raw `sqlite3` is for SELECT only;
-`./sc mem which` to orient. See the `memory` and `db_map` skills.
+lns · decision · flag · roadmap · doc · narrative). When `SC_API_TOKEN` is set
+(injected at boot), `./sc mem` proxies to the engine API — no direct DB access
+needed, so writes work from any worktree. Without the token (admin/direct mode), it
+resolves + guards the engine DB itself, refusing the app DB or a stray empty file
+whose overlapping table names would let a raw `sqlite3` INSERT succeed silently.
+Either way, the write lands in the live engine DB — durable and visible to all at
+once. You don't snapshot or render — persisting to git is an admin/GUI step. Raw
+`sqlite3` is for SELECT only; `./sc mem which` to orient. See the `mem` skill.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
