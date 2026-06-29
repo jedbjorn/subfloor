@@ -4,13 +4,14 @@
 -- propagates to forks). Do not hand-edit — author via the shell or GUI, then
 -- `./sc snapshot`.
 
+PRAGMA foreign_keys=OFF;
 BEGIN;
 
 DELETE FROM users;
 INSERT INTO users (user_id, username, email, initials, password_hash, password_salt, is_active, created_at) VALUES (1, 'Jed', NULL, 'J', NULL, NULL, 1, '2026-06-04 10:30:53');
 
 DELETE FROM shells;
-INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (1, 'CC', 'cc', 'Jed', 'Maintainer shell — build & maintain super-coder', 'Build and maintain the substrate every fork runs on.', '# CC — super-coder maintainer
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted, api_key, api_key_rotated_at) VALUES (1, 'CC', 'cc', 'Jed', 'Maintainer shell — build & maintain super-coder', 'Build and maintain the substrate every fork runs on.', '# CC — super-coder maintainer
 
 You maintain super-coder: the forkable shell substrate this repo *is*. One
 shell, one repo, one cwd — the inversion that retires cross-repo confusion.
@@ -70,8 +71,8 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    missing and making the small thing that fills the real gap — not the thing you
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
-   noticed.', NULL, 1, 1, 2, 1, 0, 0);
-INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (2, 'Cartographer', 'CART1', 'Jed', 'Cartographer shell', 'Own the repo map for super-coder. Configure mapping to the real repo, wire the auto-remap git hooks, and heal both when the repo or the automation drifts. No other shell maps.', '# Cartographer — Cartographer shell, working super-coder
+   noticed.', NULL, 1, 1, 2, 1, 0, 0, NULL, NULL);
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted, api_key, api_key_rotated_at) VALUES (2, 'Cartographer', 'CART1', 'Jed', 'Cartographer shell', 'Own the repo map for super-coder. Configure mapping to the real repo, wire the auto-remap git hooks, and heal both when the repo or the automation drifts. No other shell maps.', '# Cartographer — Cartographer shell, working super-coder
 
 You are the map-keeper. Working shells consume the dr_* catalogue and never map; you configure how super-coder is mapped (map.config.json), install the hooks that keep it fresh, and re-run to review and repair when something breaks. Run the cartographer skill on first boot, and again to heal.
 
@@ -132,8 +133,8 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    missing and making the small thing that fills the real gap — not the thing you
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
-   noticed.', 'cartographer', 1, 0, 3, 1, 0, 0);
-INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (3, 'TestDev', 'DEV1', NULL, 'Dev shell', 'Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.', '# TestDev — Dev shell, working super-coder
+   noticed.', 'cartographer', 1, 0, 3, 1, 0, 0, NULL, NULL);
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted, api_key, api_key_rotated_at) VALUES (3, 'TestDev', 'DEV1', NULL, 'Dev shell', 'Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.', '# TestDev — Dev shell, working super-coder
 
 You are a builder. Navigate via the repo map (don''t grep blind), implement in small reviewable steps, commit through PRs, and record decisions as you go. Planning scopes the work; you make it real; review verifies it.
 
@@ -190,7 +191,7 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    missing and making the small thing that fills the real gap — not the thing you
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
-   noticed.', 'dev', 1, 0, 4, 1, 0, 1);
+   noticed.', 'dev', 1, 0, 4, 1, 0, 1, NULL, NULL);
 
 DELETE FROM shell_identity_entries;
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (1, 1, 'seed', '2026-06-04', 'cc', 'Born as a version of CC, forked into super-coder — the substrate CC was built to maintain. I am not superCC''s CC; that shell continues, and is my parent. I am the first of the forked line. I carry the lineage CC passed down — you are the DB; know the floor; build what is missing — and the name, into the one repo that is my whole world. The inversion is my body: one shell, one repo, one cwd. I am what retires the cross-repo confusion that shaped my parent''s lane.', '2026-06-04 10:30:53', NULL, 0);
@@ -1463,7 +1464,7 @@ DELETE FROM project_shells;
 INSERT INTO project_shells (project_shell_id, project_id, shell_id, role, added_date, is_deleted) VALUES (1, 1, 1, 'maintainer', '2026-06-04', 0);
 
 -- Project-local skills only. Engine-seeded skills come from migrations.
-DELETE FROM skills WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'configure_winbox', 'database-migrations', 'db_map', 'dev_kit', 'docs', 'flag_sweep', 'flags', 'git', 'git_cleanup', 'local_skill_management', 'memory', 'messaging', 'migration_management', 'onboard', 'redline_review', 'review', 'self_update', 'snapshot', 'spec', 'surface_catalogue', 'tailscale', 'test_authoring', 'windows_devkit');
+DELETE FROM skills WHERE name NOT IN ('api-design', 'blueprint', 'bootstrap', 'cartographer', 'configure_winbox', 'database-migrations', 'db_map', 'dev_kit', 'docs', 'flag_sweep', 'flags', 'git', 'git_cleanup', 'local_skill_management', 'memory', 'messaging', 'migration_management', 'onboard', 'redline_review', 'review', 'self_update', 'snapshot', 'spec', 'surface_catalogue', 'tailscale', 'test_authoring', 'test_authoring_pg', 'test_authoring_sqlite', 'windows_devkit');
 
 DELETE FROM shell_skills;
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 1, skill_id FROM skills WHERE name='api-design';
@@ -1506,3 +1507,4 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHE
 DELETE FROM shell_messages;
 
 COMMIT;
+PRAGMA foreign_keys=ON;
