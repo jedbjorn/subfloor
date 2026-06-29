@@ -787,6 +787,12 @@ def main() -> None:
     # `shell/<name>` branch) and whenever the cwd has drifted to the repo root.
     # A deliberate `--shell` still overrides it.
     env["SC_SHELL"] = full["shortname"] or str(full["shell_id"])
+    # Operator-declared shared dirs that all shells may write into without
+    # branch-guard warnings — host-level handoff/screenshot folders. Set
+    # SC_SHARED_DIRS (space-separated absolute paths) in the launch environment;
+    # run.py passes it through automatically (via {**os.environ} above), so no
+    # explicit assignment is needed. This comment documents it as a first-class
+    # supported env var alongside SC_PROTECTED_BRANCHES and SC_SHELL_WORKTREE.
     set_terminal_tab_title(full["display_name"])
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")

@@ -32,10 +32,13 @@ branch — so a worktree shell writing to the stale repo-root checkout is caught
 not just one whose own cwd is on `main`; an out-of-worktree edit to a feature
 branch is allowed with a warning. With no stdin target it falls back to the cwd's
 branch. Protected set defaults to `main master`; override per-fork with
-`SC_PROTECTED_BRANCHES` (space-separated). This is the enforcement behind the
-`git` skill and the boot-template VERSION CONTROL rule — a skill loads too late to
-stop the first edit; the hook fires before it. Re-emitted (idempotently) each
-launch, so it survives `./sc update`.
+`SC_PROTECTED_BRANCHES` (space-separated). Set `SC_SHARED_DIRS` (space-separated
+absolute paths) to declare host-level shared directories that all shells may write
+into without warnings — handoff folders, screenshot dirs, cross-shell scratch.
+These are fully exempt from both the branch block and the out-of-worktree warning.
+This is the enforcement behind the `git` skill and the boot-template VERSION
+CONTROL rule — a skill loads too late to stop the first edit; the hook fires
+before it. Re-emitted (idempotently) each launch, so it survives `./sc update`.
 
 `scripts/branch-guard.sh` is the **one** branch-decision script shared by all four
 harnesses (claude + codex hooks, the opencode plugin, the git pre-commit backstop)
