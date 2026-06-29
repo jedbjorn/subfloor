@@ -63,9 +63,12 @@ admin/GUI step.)
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
@@ -76,6 +79,38 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 SCRIPTS = ENGINE / "scripts"
 DEFAULT_DB = ENGINE / "shell_db.db"
+
+# API proxy — active when run.py injects these at boot.
+SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
+SC_API_BASE  = os.environ.get("SC_API_BASE", "")
+
+
+def _api(method: str, path: str, payload: "dict | None" = None) -> dict:
+    """POST/PATCH/GET to the engine API; die loud on any error."""
+    url = SC_API_BASE.rstrip("/") + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", e.reason)
+        except Exception:
+            msg = e.reason
+        die(f"API {method} {path} → HTTP {e.code}: {msg}")
+    except Exception as exc:
+        die(f"API unreachable ({SC_API_BASE}): {exc}")
+
+
+def _finish_api(summary: str) -> int:
+    print(summary)
+    print("  (via engine API — live in the shared engine DB)")
+    return 0
+
 
 # Tables that exist ONLY in the engine DB / ONLY in a product DB. The two sets
 # never overlap (verified against dos-arch's app.db), so they cleanly tell the
@@ -226,6 +261,9 @@ def cmd_which(args) -> int:
 
 
 def cmd_state(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        _api("POST", "/_sc/mem/state", {"body": args.text})
+        return _finish_api(f"mem: current_state updated ({len(args.text)} chars)")
     con = connect(Path(args.db))
     try:
         sid = resolve_shell(con, args.shell)
@@ -238,6 +276,13 @@ def cmd_state(args) -> int:
 
 
 def _insert_identity(args, kind: str) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        r = _api("POST", f"/_sc/mem/{kind}",
+                 {"body": args.body,
+                  "entry_date": args.date or str(date.today()),
+                  "source_tag": args.tag})
+        label = "seed" if kind == "seed" else "L&S"
+        return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added")
     con = connect(Path(args.db))
     try:
         sid = resolve_shell(con, args.shell)
@@ -265,6 +310,9 @@ def cmd_lns(args) -> int:
 
 
 def cmd_retire(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        _api("PATCH", f"/_sc/mem/identity-entries/{args.entry_id}/retire")
+        return _finish_api(f"mem: identity entry #{args.entry_id} retired (slot freed)")
     con = connect(Path(args.db))
     try:
         r = con.execute("SELECT kind, retired_at FROM shell_identity_entries "
@@ -283,6 +331,13 @@ def cmd_retire(args) -> int:
 
 
 def cmd_decision(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        r = _api("POST", "/_sc/mem/decisions",
+                 {"decision": args.decision,
+                  "rationale": args.rationale,
+                  "decision_date": args.date or str(date.today()),
+                  "parent_decision_id": args.parent})
+        return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded")
     con = connect(Path(args.db))
     try:
         sid = resolve_shell(con, args.shell)
@@ -298,6 +353,18 @@ def cmd_decision(args) -> int:
 
 
 def cmd_flag(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        if args.flag_cmd == "open":
+            r = _api("POST", "/_sc/mem/flags",
+                     {"display_name": args.name,
+                      "description": args.description,
+                      "priority": args.priority,
+                      "feature_id": args.feature})
+            return _finish_api(f"mem: flag #{r.get('flag_id', '')} opened"
+                               f"{f' ({args.name})' if args.name else ''}")
+        _api("PATCH", f"/_sc/mem/flags/{args.flag_id}",
+             {"resolved": True, "resolution_notes": args.notes})
+        return _finish_api(f"mem: flag #{args.flag_id} closed")
     con = connect(Path(args.db))
     try:
         if args.flag_cmd == "open":
@@ -325,6 +392,19 @@ def cmd_flag(args) -> int:
 
 
 def cmd_roadmap(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        if args.roadmap_cmd == "add":
+            r = _api("POST", "/_sc/mem/roadmap",
+                     {"title": args.title,
+                      "summary": args.summary,
+                      "roadmap_status": args.status})
+            return _finish_api(f"mem: roadmap feature #{r.get('feature_id', '')} added"
+                               f" ('{args.title}', {args.status})")
+        if args.roadmap_cmd == "status":
+            _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}",
+                 {"roadmap_status": args.status})
+            return _finish_api(f"mem: feature #{args.feature_id} → {args.status}")
+        # project / depends need DB-side resolution — fall through to direct-DB
     con = connect(Path(args.db))
     try:
         if args.roadmap_cmd == "status":
@@ -456,6 +536,19 @@ def cmd_project(args) -> int:
 
 
 def cmd_task(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        if args.task_cmd == "add":
+            r = _api("POST", "/_sc/mem/tasks",
+                     {"title": args.title,
+                      "feature_id": args.feature,
+                      "document_id": args.doc,
+                      "seq": args.seq,
+                      "description": args.desc})
+            return _finish_api(f"mem: task #{r.get('task_id', '')} added"
+                               f" (seq {args.seq}, '{args.title}')")
+        status = "in_progress" if args.task_cmd == "start" else "done"
+        _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", {"status": status})
+        return _finish_api(f"mem: task #{args.task_id} → {status}")
     con = connect(Path(args.db))
     try:
         if args.task_cmd == "add":
@@ -489,6 +582,9 @@ def cmd_task(args) -> int:
 
 
 def cmd_oriented(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        _api("POST", "/_sc/mem/oriented")
+        return _finish_api("mem: shell marked oriented (bootstrapped=1)")
     con = connect(Path(args.db))
     try:
         sid = resolve_shell(con, args.shell)
@@ -500,6 +596,33 @@ def cmd_oriented(args) -> int:
 
 
 def cmd_doc(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        if args.doc_cmd == "freeze":
+            _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze")
+            return _finish_api(f"mem: document #{args.document_id} frozen")
+        if args.doc_cmd == "edit":
+            payload: dict = {}
+            if args.title is not None:
+                payload["title"] = args.title
+            if args.body_file is not None:
+                payload["body"] = Path(args.body_file).read_text()
+            if args.render_path is not None:
+                payload["render_path"] = args.render_path
+            if not payload:
+                die("nothing to edit — pass at least one of --title / --body-file / --render-path")
+            _api("PATCH", f"/_sc/mem/docs/{args.document_id}", payload)
+            return _finish_api(f"mem: document #{args.document_id} edited")
+        # add
+        body_text = Path(args.body_file).read_text()
+        r = _api("POST", "/_sc/mem/docs",
+                 {"feature_id": args.feature,
+                  "kind": args.kind,
+                  "seq": args.seq,
+                  "title": args.title,
+                  "body": body_text,
+                  "render_path": args.render_path})
+        return _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
+                           f" ('{args.title}', {len(body_text)} chars)")
     if args.doc_cmd == "freeze":
         return _doc_freeze(args)
     if args.doc_cmd == "edit":
@@ -572,6 +695,23 @@ def _doc_edit(args) -> int:
 
 
 def cmd_message(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        if args.message_cmd == "check":
+            r = _api("GET", "/_sc/mem/messages")
+            msgs = r.get("messages", [])
+            unread = [m for m in msgs if not m.get("read_at")]
+            if not unread:
+                print("mem: inbox empty")
+                return 0
+            print(f"mem: {len(unread)} unread:")
+            for m in unread:
+                print(f"  [#{m['message_id']}] from shell #{m['from_shell_id']} · {m['created_at']}")
+                print("    " + (m["body"] or "").replace("\n", "\n    "))
+            return 0
+        if args.message_cmd == "mark-read":
+            _api("PATCH", f"/_sc/mem/messages/{args.message_id}/read")
+            return _finish_api(f"mem: message #{args.message_id} marked read")
+        # send: needs shortname→shell_id resolution — fall through to direct-DB
     con = connect(Path(args.db))
     try:
         sid = resolve_shell(con, args.shell)
@@ -617,6 +757,10 @@ def cmd_message(args) -> int:
 
 
 def cmd_narrative(args) -> int:
+    if SC_API_TOKEN and SC_API_BASE:
+        line = f"[{datetime.now().strftime('%H:%M')}] {args.line}"
+        _api("POST", "/_sc/mem/narrative", {"text": line})
+        return _finish_api("mem: narrative appended")
     con = connect(Path(args.db))
     try:
         sid = resolve_shell(con, args.shell)
