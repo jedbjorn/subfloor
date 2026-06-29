@@ -568,7 +568,7 @@ async function renderRoadmap(root) {
     }
     for (const b of shown) {
       const sec = el("div", { className: "bucket" + (roadmapCollapsed.has(b.status) ? " collapsed" : "") });
-      const h = el("h2", {}, b.label);
+      const h = el("h2", {}, b.label, el("span", { className: "count" }, String(b.features.length)));
       h.onclick = () => {
         roadmapCollapsed.has(b.status) ? roadmapCollapsed.delete(b.status) : roadmapCollapsed.add(b.status);
         drawBoard();
