@@ -139,6 +139,21 @@ if [ -n "$target" ]; then
   fi
 fi
 
+# ── Shared-dir exemption: SC_SHARED_DIRS ────────────────────────────────────
+# Operator-declared dirs that all shells may write into regardless of branch or
+# worktree — host-level shared folders used for handoffs, screenshots, drafts.
+# Set SC_SHARED_DIRS to a space-separated list of absolute paths in the launch
+# environment; run.py passes it through unchanged. Only applies when we have a
+# resolved target (no-target callers like codex apply_patch still use Check 2).
+if [ -n "$target" ] && [ -n "${SC_SHARED_DIRS:-}" ]; then
+  abs_target="$(realpath -m "$target" 2>/dev/null || echo "$target")"
+  for _sd in $SC_SHARED_DIRS; do
+    case "$abs_target" in
+      "${_sd%/}" | "${_sd%/}"/* ) exit 0 ;;
+    esac
+  done
+fi
+
 if [ -n "$target" ]; then
   # Deepest existing ancestor dir of the target (a new file's dir exists; its
   # path does not yet) so `git -C` has a real dir to resolve from.
