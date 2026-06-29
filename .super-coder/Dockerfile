@@ -73,6 +73,11 @@ RUN pip install --no-cache-dir "playwright==1.60.0" \
  && playwright install --with-deps chromium \
  && chmod -R a+rX /opt/ms-playwright
 
+# psycopg3 — installed system-wide so the server (system python3, not .venv)
+# can connect to postgres when DATABASE_URL is set. The [binary] extra bundles
+# libpq so no OS-level postgres-client package is needed.
+RUN pip install --no-cache-dir "psycopg[binary]"
+
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 # A host GID may already exist in the base image — notably macOS's primary GID 20
 # (`staff`) collides with Debian's pre-existing `dialout` group — so creating it
