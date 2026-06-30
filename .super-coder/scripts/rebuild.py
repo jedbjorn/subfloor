@@ -30,6 +30,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver    # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import map_repo     # noqa: E402
+import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
 
 
 def snapshot_path() -> Path:
@@ -89,6 +90,14 @@ def main(argv: list[str]) -> int:
             con.close()
     else:
         print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
+
+    # Re-provision api_keys. content.sql never carries api_key (it is a secret and
+    # content.sql is git-tracked — see snapshot.py's no-serialize set), so every
+    # shell comes back NULL-keyed from the load above. The server backfills NULL
+    # keys, but only at startup — a rebuild under an already-running server would
+    # otherwise leave the live DB NULL-keyed and 401 every shell's mem write until
+    # the API is bounced. Minting here makes a rebuilt DB self-sufficient.
+    backfill_shell_api_keys.backfill(str(DB_PATH))
 
     try:
         map_repo.main()
