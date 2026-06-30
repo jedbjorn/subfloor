@@ -11,8 +11,11 @@ All identity, memory, and content live in the engine DB
 (`.super-coder/shell_db.db`) — but you never touch that file. You read and write
 it **only through the engine API**, via `./sc mem`:
 
-- **Read** — `./sc mem get <surface>`: `state`, `seed`, `lns`, `decisions`,
-  `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
+- **Read** — `./sc mem get <surface>`: your own `state`, `seed`, `lns`,
+  `decisions`, `flags`, `narrative`, `messages`; and the shared planning state
+  `roadmap`, `projects`, `documents`, `tasks`, `shells` (add `--json` for raw).
+  `documents`/`tasks` take `--feature <id>` or `--doc <id>` (and `--doc` on
+  `documents` returns the one doc *with* its body).
 - **Write** — `./sc mem <cmd> …` (see `## Common writes` below).
 
 There is **no `sqlite3` path** — not as a fallback, not for "ad-hoc" reads.
@@ -22,6 +25,20 @@ your bearer token — the server resolves token → shell, so you never name a
 shell. The table below is the **data model** behind those surfaces (and what
 each `./sc mem` write touches), not a query cheatsheet. Lazy-load: `get` the one
 surface you need, don't bulk-read.
+
+**Need a read or write `./sc mem` doesn't expose?** That's a gap to *report*, not
+a reason to reach for the DB — the direct path is closed by design, and a fork
+can't patch the engine anyway (`./sc update` would overwrite it). A missing
+surface is an engine gap that goes **up to the FnB**: open a flag naming the data
+and the use, and surface it. Don't improvise around the API.
+
+```
+./sc mem flag open "[Engine] need to <read|write> <what> — no ./sc mem surface for it | Blocker for: <your work>"
+```
+
+The FnB carries it upstream (that's exactly how `get documents`/`get tasks`
+landed); message a planner-flavor shell too if the fork has one. Until then, do
+what you *can* through the API and flag the rest — never the DB directly.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your

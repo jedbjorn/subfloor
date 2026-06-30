@@ -38,9 +38,10 @@ You review a diff *against intent*, not in a vacuum. Get both:
 
 Note the **author** — you'll propose a handoff to them in Step 4. Resolve their
 shortname from the branch (`shell/<shortname>`) or the commit trailer
-(`Co-Authored-By: <display_name> (super-coder)`):
-```sql
-SELECT shortname, display_name FROM shells WHERE display_name='<from trailer>' AND is_deleted=0;
+(`Co-Authored-By: <display_name> (super-coder)`) — the roster maps display_name
+→ shortname:
+```
+./sc mem get shells
 ```
 
 ## Step 2: Review along the three axes

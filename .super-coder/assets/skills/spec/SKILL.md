@@ -24,28 +24,17 @@ auto-pick "the latest" — list the feature's open specs and choose the target
 explicitly. The **active** spec is the unfrozen one that already has a task plan;
 the rest are backlog.
 
-```sql
--- a feature's open (unfrozen) specs, newest seq first — pick the target by id:
-SELECT r.feature_id, r.title AS feature_title, r.roadmap_status,
-       d.document_id, d.seq, d.title AS spec_title,
-       (SELECT COUNT(*) FROM spec_tasks t WHERE t.document_id = d.document_id) AS task_count
-FROM roadmap r
-JOIN documents d ON d.feature_id = r.feature_id AND d.kind = 'spec'
-WHERE (r.title LIKE '%<keyword>%' OR r.feature_id = <id>)
-  AND d.frozen = 0
-ORDER BY d.seq DESC;
-
--- load the chosen spec body:
-SELECT document_id, seq, title, body FROM documents WHERE document_id = <doc_id>;
-
--- check if a plan already exists for this spec:
-SELECT task_id, seq, title, status, completed_date
-FROM spec_tasks
-WHERE document_id = <doc_id>
-ORDER BY seq;
+```
+# the feature's documents — pick an unfrozen spec (frozen=0) by id:
+./sc mem get documents --feature <id>
+# load the chosen spec body:
+./sc mem get documents --doc <doc_id>
+# the spec's task plan (empty = no plan yet):
+./sc mem get tasks --doc <doc_id>
 ```
 
-`task_count > 0` marks the active spec — resume that one; an empty spec is backlog,
+`get documents --feature <id>` lists every spec/doc under the feature with its
+`kind`, `seq`, `frozen`, and `task_count`. `task_count > 0` marks the active spec — resume that one; an empty spec is backlog,
 and starting it (Step 3) makes it active. If more than one open spec matches and
 which to work is unclear, ask the FnB.
 
@@ -151,11 +140,8 @@ Then set `current_state` — no last-done yet, next is Preparation:
 
 At the start of each work session, load the current plan state:
 
-```sql
-SELECT task_id, seq, title, description, status, completed_date
-FROM spec_tasks
-WHERE document_id = <doc_id>
-ORDER BY seq;
+```
+./sc mem get tasks --doc <doc_id>
 ```
 
 Find the first `pending` task. Mark it `in_progress`:
@@ -170,13 +156,12 @@ with a read:
 ```
 ./sc mem task done <task_id>
 ```
-```sql
--- resolve last-done and next-pending in one query (raw read):
-SELECT
-  (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status='done'
-   ORDER BY seq DESC LIMIT 1) AS last_done,
-  (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status='pending'
-   ORDER BY seq ASC LIMIT 1) AS next_up;
+
+Re-read the plan and resolve last-done / next-up from it — `last_done` is the
+highest-`seq` `done` task, `next_up` the lowest-`seq` `pending` one:
+
+```
+./sc mem get tasks --doc <doc_id>
 ```
 
 Then advance `current_state`:

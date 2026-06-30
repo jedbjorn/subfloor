@@ -197,8 +197,54 @@ class ApiMemTest(unittest.TestCase):
 
     # ── reads via the API ─────────────────────────────────────────────────────
     def test_get_surfaces_return_ok(self):
+        # `tasks` needs a scope (--doc/--feature); the rest list unscoped.
         for surface in mem.GET_SURFACES:
+            if surface == "tasks":
+                self.assertEqual(self.run_mem("get", "tasks", "--feature", "0"), 0, surface)
+                continue
             self.assertEqual(self.run_mem("get", surface), 0, surface)
+
+    def test_get_tasks_requires_scope(self):
+        with self.assertRaises(SystemExit):  # no --doc/--feature → fail loud
+            self.run_mem("get", "tasks")
+
+    # ── shared planning reads (the docs/spec/review surfaces) ─────────────────
+    def test_get_projects_documents_tasks_shells(self):
+        self.run_mem("project", "add", "wsr", "Read WS")
+        self.run_mem("roadmap", "add", "feat R")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat R'")[0]
+        body = self.tmp / "r.md"
+        body.write_text("# spec R\nthe body\n")
+        self.run_mem("doc", "add", "spec R", "--body-file", str(body), "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec R'")[0]
+        self.run_mem("task", "add", "task R", "--feature", str(fid),
+                     "--doc", str(did), "--seq", "0")
+
+        # projects roster includes the new work-stream
+        projs = mem._api("GET", "/_sc/mem/projects")["projects"]
+        self.assertIn("wsr", [p["shortname"] for p in projs])
+
+        # documents list (scoped to the feature) carries task_count
+        docs = mem._api("GET", f"/_sc/mem/documents?feature={fid}")["documents"]
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["task_count"], 1)
+
+        # single document returns the body
+        one = mem._api("GET", f"/_sc/mem/documents/{did}")["document"]
+        self.assertEqual(one["body"], "# spec R\nthe body\n")
+
+        # task plan by doc
+        tasks = mem._api("GET", f"/_sc/mem/tasks?doc={did}")["tasks"]
+        self.assertEqual([t["title"] for t in tasks], ["task R"])
+
+        # shells roster resolves shortname (review's display_name→shortname need)
+        shells = mem._api("GET", "/_sc/mem/shells")["shells"]
+        self.assertEqual(next(s["shortname"] for s in shells
+                              if s["display_name"] == "TC"), "tc")
+
+    def test_get_document_404(self):
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "documents", "--doc", "999999")
 
 
 if __name__ == "__main__":

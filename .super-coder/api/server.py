@@ -30,7 +30,7 @@ import traceback
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -952,6 +952,7 @@ class Handler(BaseHTTPRequestHandler):
         sid = self._require_shell_auth()
         if sid is None:
             return
+        parts = path.strip("/").split("/")  # e.g. ["_sc","mem","documents","7"]
         con = db()
         try:
             if path == "/_sc/mem/whoami":
@@ -1013,7 +1014,76 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
                     (sid,)))
                 return self._send(200, {"messages": msgs})
+
+            # ── shared planning reads (not per-shell, like /roadmap) ──────────
+            # The dev cycle is collaborative: a shell authoring a spec, planning
+            # tasks, or handing off a review needs to see the shared work-streams,
+            # documents, task plans, and the peer roster — none of which are its
+            # own private memory. These mirror the raw SELECTs the docs/spec/
+            # review skills used to run against shell_db.db, so no shell needs a
+            # direct DB path to do its job.
+
+            if path == "/_sc/mem/projects":
+                ps = rows(con.execute(
+                    "SELECT project_id, shortname, title, status, standing, purpose "
+                    "FROM projects WHERE COALESCE(is_deleted,0)=0 ORDER BY shortname"))
+                return self._send(200, {"projects": ps})
+
+            if path == "/_sc/mem/shells":
+                # Roster — resolve a peer's shortname (e.g. a commit trailer's
+                # display_name → shortname for a review handoff) or its flavor.
+                # Not secret: shells already address each other by shortname.
+                sh = rows(con.execute(
+                    "SELECT shell_id, shortname, display_name, flavor FROM shells "
+                    "WHERE COALESCE(is_deleted,0)=0 ORDER BY shell_id"))
+                return self._send(200, {"shells": sh})
+
+            if path == "/_sc/mem/documents":
+                # List documents (no body), with each doc's task_count so the
+                # spec skill can tell active (has tasks) from backlog. Optional
+                # ?feature=<id> scopes to one feature.
+                q = parse_qs(urlparse(self.path).query)
+                feat = q.get("feature", [None])[0]
+                sql = ("SELECT d.document_id, d.feature_id, d.kind, d.seq, d.title, "
+                       "d.frozen, (SELECT COUNT(*) FROM spec_tasks t "
+                       "WHERE t.document_id=d.document_id) AS task_count FROM documents d")
+                params: tuple = ()
+                if feat is not None:
+                    sql += " WHERE d.feature_id=?"
+                    params = (int(feat),)
+                sql += " ORDER BY d.feature_id, d.kind, d.seq"
+                return self._send(200, {"documents": rows(con.execute(sql, params))})
+
+            if len(parts) == 4 and parts[2] == "documents":
+                # Single document WITH body — the spec skill loads this to read.
+                did = int(parts[3])
+                r = con.execute(
+                    "SELECT document_id, feature_id, kind, seq, title, body, frozen, "
+                    "render_path FROM documents WHERE document_id=?", (did,)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such document"})
+                return self._send(200, {"document": dict(r)})
+
+            if path == "/_sc/mem/tasks":
+                # A spec's task plan, by ?doc=<id> (the spec skill) or ?feature=<id>.
+                q = parse_qs(urlparse(self.path).query)
+                doc = q.get("doc", [None])[0]
+                feat = q.get("feature", [None])[0]
+                if doc is not None:
+                    where, params = "document_id=?", (int(doc),)
+                elif feat is not None:
+                    where, params = "feature_id=?", (int(feat),)
+                else:
+                    return self._send(400, {"error": "tasks needs ?doc=<id> or ?feature=<id>"})
+                ts = rows(con.execute(
+                    "SELECT task_id, feature_id, document_id, seq, title, description, "
+                    "status, completed_date FROM spec_tasks WHERE " + where +
+                    " ORDER BY seq", params))
+                return self._send(200, {"tasks": ts})
+
             return self._send(404, {"error": "not found"})
+        except ValueError:
+            return self._send(400, {"error": "invalid id"})
         except Exception as e:
             return self._fail(e)
         finally:

@@ -119,7 +119,8 @@ def cmd_which(args) -> int:
 
 
 GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
-                "roadmap", "narrative", "messages")
+                "roadmap", "narrative", "messages",
+                "projects", "documents", "tasks", "shells")
 
 
 def _render_get(surface: str, data: dict) -> int:
@@ -171,6 +172,57 @@ def _render_get(surface: str, data: dict) -> int:
     if surface == "narrative":
         print(data.get("narrative") or "(no active narrative)")
         return 0
+    if surface == "projects":
+        ps = data.get("projects", [])
+        if not ps:
+            print("mem: no projects")
+            return 0
+        for p in ps:
+            print(f"#{p['project_id']} {p['shortname']} [{p.get('status') or 'active'}] "
+                  f"{p.get('title') or ''}")
+        return 0
+    if surface == "shells":
+        sh = data.get("shells", [])
+        if not sh:
+            print("mem: no shells")
+            return 0
+        for s in sh:
+            fl = f" ({s['flavor']})" if s.get("flavor") else ""
+            print(f"#{s['shell_id']} {s['shortname']} — {s.get('display_name') or ''}{fl}")
+        return 0
+    if surface == "documents":
+        # Single doc (with body) when --doc was passed; else the list.
+        if "document" in data:
+            d = data["document"]
+            fz = " [frozen]" if d.get("frozen") else ""
+            print(f"#{d['document_id']} {d.get('kind')} seq {d.get('seq')} · "
+                  f"feature {d.get('feature_id')}{fz} — {d.get('title') or ''}")
+            print()
+            print(d.get("body") or "(empty body)")
+            return 0
+        ds = data.get("documents", [])
+        if not ds:
+            print("mem: no documents")
+            return 0
+        for d in ds:
+            fz = " [frozen]" if d.get("frozen") else ""
+            tc = d.get("task_count")
+            tcs = f" · {tc} task(s)" if tc else ""
+            print(f"#{d['document_id']} {d.get('kind')} seq {d.get('seq')} · "
+                  f"feature {d.get('feature_id')}{fz}{tcs} — {d.get('title') or ''}")
+        return 0
+    if surface == "tasks":
+        ts = data.get("tasks", [])
+        if not ts:
+            print("mem: no tasks")
+            return 0
+        for t in ts:
+            done = f" ({t['completed_date']})" if t.get("completed_date") else ""
+            print(f"#{t['task_id']} seq {t.get('seq')} [{t.get('status')}]{done} "
+                  f"{t.get('title') or ''}")
+            if t.get("description"):
+                print("  " + t["description"])
+        return 0
     if surface == "messages":
         msgs = data.get("messages", [])
         if not msgs:
@@ -187,11 +239,25 @@ def _render_get(surface: str, data: dict) -> int:
 
 
 def cmd_get(args) -> int:
-    data = _api("GET", f"/_sc/mem/{args.surface}")
+    surface = args.surface
+    path = f"/_sc/mem/{surface}"
+    if surface == "documents":
+        if args.doc is not None:                  # single doc, with body
+            path = f"/_sc/mem/documents/{args.doc}"
+        elif args.feature is not None:            # one feature's docs
+            path = f"/_sc/mem/documents?feature={args.feature}"
+    elif surface == "tasks":
+        if args.doc is not None:
+            path = f"/_sc/mem/tasks?doc={args.doc}"
+        elif args.feature is not None:
+            path = f"/_sc/mem/tasks?feature={args.feature}"
+        else:
+            die("get tasks needs --doc <id> or --feature <id>")
+    data = _api("GET", path)
     if args.json:
         print(json.dumps(data, indent=2, default=str))
         return 0
-    return _render_get(args.surface, data)
+    return _render_get(surface, data)
 
 
 def cmd_state(args) -> int:
@@ -364,6 +430,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)})")
     sp.add_argument("surface", choices=GET_SURFACES)
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
+    sp.add_argument("--feature", type=int,
+                    help="scope to a feature (documents/tasks)")
+    sp.add_argument("--doc", type=int,
+                    help="documents: one doc WITH body; tasks: that doc's plan")
     sp.set_defaults(fn=cmd_get)
 
     sp = sub.add_parser("state", help="set current_state")
