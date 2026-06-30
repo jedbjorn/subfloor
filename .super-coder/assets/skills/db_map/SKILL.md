@@ -63,8 +63,9 @@ memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
 
 ## Common writes
 
-Each guards the engine DB and writes to the live shared DB. `./sc mem which` orients;
-`./sc mem <cmd> -h` shows flags. Writes target your shell by default (`--shell` to override).
+Each routes through the engine API and writes to the live shared DB. `./sc mem which`
+orients; `./sc mem <cmd> -h` shows flags. Writes always target your own shell —
+the server resolves it from your token; you never name a shell.
 
 ```
 # current_state (rolling status, not a log — replaces in place):

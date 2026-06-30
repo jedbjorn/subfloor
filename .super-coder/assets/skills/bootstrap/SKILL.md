@@ -44,7 +44,7 @@ cartographer's automation (see `surface_catalogue`). You read it.
 
 4. **Set your `current_state`** — replace the install placeholder with what you
    actually found and what you'll do first (rolling status, ~500 chars). Write it
-   through `./sc mem` (resolves + guards the engine DB; the write is live in the
+   through `./sc mem` (routes through the engine API; the write is live in the
    shared DB at once):
    ```
    ./sc mem state "…"

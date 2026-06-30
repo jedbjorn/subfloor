@@ -141,7 +141,7 @@ cartographer''s automation (see `surface_catalogue`). You read it.
 
 4. **Set your `current_state`** — replace the install placeholder with what you
    actually found and what you''ll do first (rolling status, ~500 chars). Write it
-   through `./sc mem` (resolves + guards the engine DB; the write is live in the
+   through `./sc mem` (routes through the engine API; the write is live in the
    shared DB at once):
    ```
    ./sc mem state "…"
@@ -628,8 +628,9 @@ memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
 
 ## Common writes
 
-Each guards the engine DB and writes to the live shared DB. `./sc mem which` orients;
-`./sc mem <cmd> -h` shows flags. Writes target your shell by default (`--shell` to override).
+Each routes through the engine API and writes to the live shared DB. `./sc mem which`
+orients; `./sc mem <cmd> -h` shows flags. Writes always target your own shell —
+the server resolves it from your token; you never name a shell.
 
 ```
 # current_state (rolling status, not a log — replaces in place):
@@ -839,7 +840,7 @@ sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- 
 
 ## Author
 
-Write through `./sc mem doc add` — it guards the engine DB, `--body-file` reads
+Write through `./sc mem doc add` — it routes through the engine API, `--body-file` reads
 the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
 within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
 pipeline this rides on is the `snapshot` skill):
@@ -1292,7 +1293,7 @@ the blocked feature''s title. Reads go through the API — there is no `sqlite3`
 
 ## Open
 
-Write through `./sc mem` (it guards the engine DB + snapshots):
+Write through `./sc mem` (routed through the engine API):
 ```
 ./sc mem flag open "[Area] what''s blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```
@@ -1854,8 +1855,9 @@ All memory is DB rows (no flat files). Write at the moment it matters, not in a
 close ritual.
 
 **Write through `./sc mem`.** The write lands in the live engine DB — shared by
-every shell, durable + visible to all the moment it commits. Writes default to
-your shell; pass `--shell <id|name>` to be explicit.
+every shell, durable + visible to all the moment it commits. It always targets
+your own shell: the server resolves your identity from your token, so you never
+name a shell.
 
 ## current_state — rolling status, NOT a log
 
@@ -2098,8 +2100,8 @@ For each doc, read the file and decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
-All writes here go through `./sc mem` (it guards the engine DB so the import never
-lands in the app DB, and writes to the live shared DB).
+All writes here go through `./sc mem` (routed through the engine API, which writes
+to the live shared DB — the import never touches the app DB).
 
 ## 3. Backfill the roadmap
 Create a feature for each coherent area/initiative the docs imply; set status by
@@ -2643,13 +2645,13 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-Add each task with `./sc mem task add` (one per seq). For a multi-task plan, pass
-`--no-sync` on all but the last so you snapshot once at the end:
+Add each task with `./sc mem task add` (one per seq) — each write is live in the
+shared DB immediately:
 
 ```
-./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points" --no-sync
-./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>" --no-sync
-./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>" --no-sync
+./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
+./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
+./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
 ./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
