@@ -1,6 +1,6 @@
 ---
 name: dev_kit
-description: What the sandbox dev kit provides + how to drive it — ./sc deps, ./sc test, ./sc lint, ./sc typecheck, the .venv tools, rg/sqlite3, the baked browser, and the container/host app boundary. Use when building or testing in a fork.
+description: What the sandbox dev kit provides + how to drive it — ./sc deps, ./sc test, ./sc lint, ./sc typecheck, the .venv tools, rg/sqlite3, the baked browser, the container/host app boundary, and the optional app-only Postgres sidecar (DATABASE_URL). Use when building or testing in a fork.
 category: substrate
 common: false
 ---
@@ -58,6 +58,26 @@ Always present, no `./sc deps` needed:
 
 `svelte-check`, `tsc`, vitest come from the fork's own `package.json` devDeps —
 installed by `./sc deps`' `npm ci`, run via the fork's npm scripts (or `./sc test`).
+
+## Postgres sidecar (app-only)
+
+When a fork sets `"pg": {}` in `.super-coder/instance.json` (`./sc pg-init` adds
+it), `./sc launch` starts a `postgres:17` sidecar (`sc-pg-<fork>` on `SC_NET`) and
+forwards `DATABASE_URL` into the sandbox — so you can develop + test the fork's
+**app** against real Postgres. This is for the *app only*: the engine DB is always
+SQLite and the engine never reads `DATABASE_URL`, so the sidecar can't point the
+review GUI at the wrong DB.
+
+- `DATABASE_URL=postgresql://sc:sc@sc-pg-<fork>:5432/sc` is in the sandbox env,
+  reachable by **container name** on `SC_NET` — *not* `127.0.0.1`, which inside
+  the sandbox is its own loopback. Override with `SC_DATABASE_URL` on the host.
+- Data persists in a named Docker volume across restarts + image rebuilds.
+- The **Postgres driver is the fork's own dependency**, not the engine dev kit:
+  declare `psycopg[binary]` (psycopg 3) in the fork's `requirements*.txt` so
+  `./sc deps` installs it. Then the app + `pytest` connect with no extra steps.
+
+Verify with `echo $DATABASE_URL`. Empty → the fork has no `pg` block; run
+`./sc pg-init && ./sc restart` on the host.
 
 ## Stance
 
