@@ -178,13 +178,15 @@ def dump_local_skills(con) -> list[str]:
 
 # Columns that must NEVER be serialized to content.sql — content.sql is
 # git-tracked, and these are live credentials managed at runtime, not memory to
-# preserve across a rebuild. `api_key` is (re)provisioned by the server's
-# startup backfill; `password_*` are launcher auth fields. Omitting them from the
-# INSERT means they load as NULL on rebuild, which is correct: the key is
-# re-minted at the next server start, and they never reach git. Without this, a
-# snapshot taken while keys are provisioned writes every shell's bearer token
-# into a committed file (the gitleaks default ruleset does not catch the bare
-# token format, so the gate would not flag it either).
+# preserve across a rebuild. `api_key` is (re)provisioned at rebuild time
+# (rebuild.py's final backfill step) and again at server startup; `password_*`
+# are launcher auth fields. Omitting them from the INSERT means they load as NULL
+# on rebuild, which is correct: the key is re-minted by rebuild itself (so a
+# rebuilt DB is never NULL-keyed, even under an already-running server) and they
+# never reach git. Without this, a snapshot taken while keys are provisioned
+# writes every shell's bearer token into a committed file (the gitleaks default
+# ruleset does not catch the bare token format, so the gate would not flag it
+# either).
 SENSITIVE_COLUMNS = {
     "shells": {"api_key", "api_key_rotated_at"},
     "users": {"password_hash", "password_salt"},
