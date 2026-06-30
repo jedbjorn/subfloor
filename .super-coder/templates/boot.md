@@ -48,7 +48,10 @@ different ways, so keep them straight:
   product's runtime data + schema. Change it the way the product does — schema
   migrations + app code — never by hand-editing rows. Locate it via the repo map:
   the cartographer tags its schema/migrations in `dr_*` (the live `.db` is often
-  gitignored, so the schema is the durable anchor).
+  gitignored, so the schema is the durable anchor). In a sandbox this may be a
+  Postgres sidecar at `$DATABASE_URL` (`./sc launch` starts it); a *set* but empty
+  `DATABASE_URL` means provision-me via the app's migrations — never "no DB" — see
+  the `dev_kit` skill.
 
 **Decision rule:** your memory / planning / specs / roadmap → **engine DB**,
 written via `./sc mem`. The product's data or schema → **app DB**, via its

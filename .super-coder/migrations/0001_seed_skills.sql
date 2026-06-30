@@ -761,15 +761,26 @@ review GUI at the wrong DB.
   declare `psycopg[binary]` (psycopg 3) in the fork''s `requirements*.txt` so
   `./sc deps` installs it. Then the app + `pytest` connect with no extra steps.
 
-Verify with `echo $DATABASE_URL`. Empty → the fork has no `pg` block; run
+Verify with `echo $DATABASE_URL`. *Unset* → the fork has no `pg` block; run
 `./sc pg-init && ./sc restart` on the host.
+
+**Empty ≠ unavailable.** A configured sidecar (`DATABASE_URL` *set*) whose schema
+is empty is a **provision-me** signal — not "no DB / out of scope / blocked." It
+is the fork''s real app DB, waiting to be migrated. Provision it the way the app
+does — the fork''s own schema migrations + bootstrap (e.g. its `make migrate` /
+`make bootstrap`, or whatever migration runner the repo map points to) — then
+verify against it. Never hand-roll a separate throwaway DB, and never write the
+task off as "no DB available." You have one.
 
 ## Stance
 
 `./sc deps` before anything else in a fresh sandbox — qwen''s "node missing" was
 just deps-not-installed. Lint/type-check are there when you want them, never
 forced; respect the fork''s config. To see the app, run a dev server in the
-container — never restart the FnB''s host stack.',
+container — never restart the FnB''s host stack. Before calling an app-DB task
+blocked on a missing/empty DB: check `DATABASE_URL`; if it''s set but empty,
+provision the sidecar with the fork''s own migrations. In a sandbox the DB is
+never the blocker.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
