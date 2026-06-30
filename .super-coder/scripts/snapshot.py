@@ -176,12 +176,28 @@ def dump_local_skills(con) -> list[str]:
     return lines
 
 
+# Columns that must NEVER be serialized to content.sql — content.sql is
+# git-tracked, and these are live credentials managed at runtime, not memory to
+# preserve across a rebuild. `api_key` is (re)provisioned by the server's
+# startup backfill; `password_*` are launcher auth fields. Omitting them from the
+# INSERT means they load as NULL on rebuild, which is correct: the key is
+# re-minted at the next server start, and they never reach git. Without this, a
+# snapshot taken while keys are provisioned writes every shell's bearer token
+# into a committed file (the gitleaks default ruleset does not catch the bare
+# token format, so the gate would not flag it either).
+SENSITIVE_COLUMNS = {
+    "shells": {"api_key", "api_key_rotated_at"},
+    "users": {"password_hash", "password_salt"},
+}
+
+
 def dump_table(con, table: str) -> list[str]:
     if table == "skills":
         return dump_local_skills(con)
     if table == "shell_skills":
         return dump_shell_skills(con)
     cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+    cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
     if not cols:
         return []
     collist = ", ".join(cols)
