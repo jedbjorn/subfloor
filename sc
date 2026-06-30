@@ -38,6 +38,12 @@ CNAME="sc-$(basename "$here")"   # unique per fork, like the pm2 name
 # can reach another fork's API by container name (http://sc-<repo>:<port>) — see
 # dnet(). Override with SC_NET to isolate a fork onto its own network.
 SC_NET="${SC_NET:-sc-net}"
+# Optional Postgres sidecar (per-fork, app-only). Named container + data volume
+# tied to this fork. The engine DB is SQLite always (db_driver is SQLite-only);
+# this sidecar exists purely so a shell can develop + test the fork's *app*
+# against real Postgres inside the sandbox, isolated from any host PG.
+PGNAME="sc-pg-$(basename "$here")"
+PGVOL="sc-pg-$(basename "$here")-data"
 
 # Fail fast with the fix if the docker daemon isn't reachable, instead of a
 # cryptic build/run error. Host setup is one-time and lives in `./sc doctor` /
@@ -383,6 +389,64 @@ sc_ts_broker_uninstall() {
   echo "→ ts-broker systemd unit removed ($TS_BROKER_UNIT)"
 }
 
+# ── Postgres sidecar (HOST-side Docker container on $SC_NET — APP-ONLY) ───────
+# A named postgres:17 container alongside the sandbox on SC_NET. The sandbox
+# reaches it by hostname ($PGNAME) with DATABASE_URL forwarded in, so the fork's
+# *app* (its own db layer) can run + be tested against real Postgres. The engine
+# never reads DATABASE_URL — its DB is SQLite, full stop — so this cannot affect
+# the review GUI (that was the #207 regression; it stays fixed). Data persists in
+# a named Docker volume ($PGVOL) across restarts + image rebuilds. Enabled
+# per-fork by a "pg" key in .super-coder/instance.json (./sc pg-init adds it).
+# Creds are local-sandbox-only (sc/sc/sc) — never published to the host.
+sc_pg_configured() {
+  test -f "$ENGINE/instance.json" || return 1
+  "$PY" -c "import json,sys; d=json.load(open('$ENGINE/instance.json')); sys.exit(0 if 'pg' in d else 1)" 2>/dev/null
+}
+sc_pg_alive() {
+  docker inspect --format '{{.State.Running}}' "$PGNAME" 2>/dev/null | grep -q true
+}
+sc_pg_up() {
+  if ! sc_pg_configured; then
+    echo "→ pg: no \`pg\` key in instance.json — skipping (run: ./sc pg-init)"; return 0
+  fi
+  if sc_pg_alive; then echo "→ pg already running ($PGNAME)"; return 0; fi
+  dnet
+  docker volume create "$PGVOL" >/dev/null
+  docker run -d --name "$PGNAME" --restart unless-stopped \
+    --network "$SC_NET" \
+    -e POSTGRES_USER=sc \
+    -e POSTGRES_PASSWORD=sc \
+    -e POSTGRES_DB=sc \
+    -v "$PGVOL:/var/lib/postgresql/data" \
+    postgres:17 >/dev/null
+  echo "→ pg 17 up ($PGNAME on $SC_NET) · DATABASE_URL=postgresql://sc:sc@$PGNAME:5432/sc"
+}
+sc_pg_down() {
+  if docker inspect "$PGNAME" >/dev/null 2>&1; then
+    docker rm -f "$PGNAME" >/dev/null 2>&1 && echo "→ pg stopped (volume $PGVOL retained)" || true
+  fi
+}
+sc_pg_init() {
+  f="$ENGINE/instance.json"
+  if [ -f "$f" ]; then
+    if "$PY" -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'pg' in d else 1)" 2>/dev/null; then
+      echo "→ pg: already configured in $f"; return 0
+    fi
+    "$PY" -c "
+import json,pathlib
+p=pathlib.Path('$f')
+d=json.loads(p.read_text())
+d['pg']={}
+p.write_text(json.dumps(d,indent=2)+'\n')
+print('-> pg: added to $f')
+"
+  else
+    printf '{\"pg\":{}}\n' > "$f"
+    echo "→ pg: created $f with pg block"
+  fi
+  echo "  next: ./sc pg-up   (or ./sc launch — pg starts automatically)"
+}
+
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
@@ -421,6 +485,10 @@ case "$cmd" in
   ts-broker-sock)    exec "$PY" "$S/ts.py" sock ;;
   ts-broker-install)   sc_ts_broker_install ;;
   ts-broker-uninstall) sc_ts_broker_uninstall ;;
+  # ── Postgres sidecar (app-only) ──
+  pg-init)      sc_pg_init ;;
+  pg-up)        sc_pg_up ;;
+  pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   deps)         sc_deps "$@" ;;
@@ -447,6 +515,16 @@ case "$cmd" in
     # key + .env there; the mount below carries them in like every other harness).
     mistral_env=""
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
+    # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
+    # the fork's APP can connect to it. Default tracks the sidecar's container
+    # name + baked sc/sc/sc creds (one source of truth); SC_DATABASE_URL overrides
+    # for a fork whose sidecar differs. The hostname is the CONTAINER name (DNS on
+    # SC_NET) — NOT 127.0.0.1, which inside the sandbox is its own loopback. The
+    # engine ignores this var (SQLite-only); only the app reads it. Sidecar is
+    # started after the sandbox (sc_pg_up below); the app connects lazily, so order
+    # doesn't matter.
+    pg_env=""
+    sc_pg_configured && pg_env="-e DATABASE_URL=${SC_DATABASE_URL:-postgresql://sc:sc@$PGNAME:5432/sc}"
     git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
     git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
     # Pinned-interpreter passthrough. When the fork's .venv was built from an
@@ -492,7 +570,7 @@ case "$cmd" in
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
       -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-      -e GH_TOKEN="$gh_token" $mistral_env \
+      -e GH_TOKEN="$gh_token" $mistral_env $pg_env \
       -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
       -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
       -w "$here" \
@@ -515,12 +593,15 @@ case "$cmd" in
     # drive the VM; this keeps it from being a forgotten manual step.
     sc_vm_broker_up || true
     # Same for the tailnet broker — self-skips when no `ts` block is linked.
-    sc_ts_broker_up || true ;;
+    sc_ts_broker_up || true
+    # Start the PG sidecar when configured — self-skips otherwise.
+    sc_pg_up || true ;;
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
   enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
-                sc_ts_broker_down ;;
+                sc_ts_broker_down
+                sc_pg_down ;;
   restart)      "$0" down; exec "$0" launch "$@" ;;
   build)        dcheck; dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
@@ -592,6 +673,14 @@ super-coder — forkable shell substrate
   ./sc ts-broker-sock      print the broker's socket path
   ./sc ts-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc ts-broker-uninstall remove the systemd unit
+
+  Postgres sidecar (app-only; docker container on SC_NET, data in a named volume).
+  For developing/testing the fork's APP against real Postgres in the sandbox — the
+  engine DB stays SQLite. One-time: ./sc pg-init (adds "pg" to instance.json).
+  `launch` starts it + forwards DATABASE_URL (override with SC_DATABASE_URL); `down` stops it:
+  ./sc pg-init             add the "pg" key to instance.json (enables the sidecar)
+  ./sc pg-up               start the postgres:17 container; self-skips if unconfigured/already up
+  ./sc pg-down             stop + remove the container (data volume retained)
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health
