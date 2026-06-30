@@ -18,8 +18,9 @@ All memory is DB rows (no flat files). Write at the moment it matters, not in a
 close ritual.
 
 **Write through `./sc mem`.** The write lands in the live engine DB — shared by
-every shell, durable + visible to all the moment it commits. Writes default to
-your shell; pass `--shell <id|name>` to be explicit.
+every shell, durable + visible to all the moment it commits. It always targets
+your own shell: the server resolves your identity from your token, so you never
+name a shell.
 
 ## current_state — rolling status, NOT a log
 

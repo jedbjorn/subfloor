@@ -28,8 +28,8 @@ For each doc, read the file and decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
-All writes here go through `./sc mem` (it guards the engine DB so the import never
-lands in the app DB, and writes to the live shared DB).
+All writes here go through `./sc mem` (routed through the engine API, which writes
+to the live shared DB — the import never touches the app DB).
 
 ## 3. Backfill the roadmap
 Create a feature for each coherent area/initiative the docs imply; set status by

@@ -30,7 +30,7 @@ the blocked feature's title. Reads go through the API — there is no `sqlite3`.
 
 ## Open
 
-Write through `./sc mem` (it guards the engine DB + snapshots):
+Write through `./sc mem` (routed through the engine API):
 ```
 ./sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```

@@ -58,12 +58,11 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
 Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
-lns · decision · flag · roadmap · doc · narrative): it resolves + guards *this*
-engine DB — refusing the app DB or a stray empty file, whose overlapping table
-names would let a raw `sqlite3` INSERT hit the wrong DB silently. The write lands
-in the live engine DB — the single source of truth shared by every shell, durable
-and visible to all at once. That is the whole write: **you don't snapshot or
-render** — persisting to git is an admin/GUI step. Raw `sqlite3` is for SELECT only;
+lns · decision · flag · roadmap · doc · narrative): it routes through the engine
+API, which resolves your identity from your token — no DB path, no direct-DB
+fallback. The write lands in the live engine DB — the single source of truth
+shared by every shell, durable and visible to all at once. That is the whole
+write: **you don't snapshot or render** — persisting to git is an admin/GUI step.
 `./sc mem which` to orient. See the `memory` and `db_map` skills.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file

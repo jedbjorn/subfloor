@@ -82,7 +82,7 @@ sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role='doc';"  -- re
 
 ## Author
 
-Write through `./sc mem doc add` — it guards the engine DB, `--body-file` reads
+Write through `./sc mem doc add` — it routes through the engine API, `--body-file` reads
 the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
 within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
 pipeline this rides on is the `snapshot` skill):

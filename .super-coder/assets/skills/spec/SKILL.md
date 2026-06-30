@@ -118,13 +118,13 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-Add each task with `./sc mem task add` (one per seq). For a multi-task plan, pass
-`--no-sync` on all but the last so you snapshot once at the end:
+Add each task with `./sc mem task add` (one per seq) — each write is live in the
+shared DB immediately:
 
 ```
-./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points" --no-sync
-./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>" --no-sync
-./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>" --no-sync
+./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
+./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
+./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
 ./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 

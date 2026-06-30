@@ -489,8 +489,8 @@ super-coder — forkable shell substrate
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
-  ./sc mem <cmd> [args]    safe engine-DB writes for a shell's own memory (state/seed/lns/decision/flag/roadmap/doc/narrative);
-                             resolves + guards the engine DB (refuses product DBs & 0-byte stubs), then snapshots+renders. `./sc mem which` to orient
+  ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
+                             identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
