@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # test_authoring_pg
 
-Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg2 direct assertions. Read alongside test_authoring for the rules.
+Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg 3 direct assertions. Read alongside test_authoring for the rules.
 
 **Category:** craft
 
@@ -36,9 +36,9 @@ shell, and drives the real app through `TestClient` with real auth.
 | `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
 
 **Throwaway DB setup:**
-- An admin connection (`psycopg2.connect(DATABASE_URL_ADMIN)`) creates a
-  unique `dosarch_test_<uuid>` database at session start and drops it at
-  session teardown.
+- An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
+  creates a unique `dosarch_test_<uuid>` database at session start and drops it
+  at session teardown.
 - `DATABASE_URL` is injected via `os.environ["DATABASE_URL"]` **before**
   importing the app; the app's DB layer reads it at import time.
 - `schema.sql` (the postgres variant) + migrations are applied via
@@ -67,10 +67,10 @@ or `Authorization: Bearer` header.
 
 **Direct DB assertions:**
 ```python
-import psycopg2, psycopg2.extras, os
-con = psycopg2.connect(os.environ["DATABASE_URL"])
-con.autocommit = True
-cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+import os, psycopg
+from psycopg.rows import dict_row
+con = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True, row_factory=dict_row)
+cur = con.cursor()
 cur.execute("SELECT * FROM table WHERE ...")
 rows = cur.fetchall()
 ```
