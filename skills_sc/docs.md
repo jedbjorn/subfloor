@@ -57,11 +57,11 @@ so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
 create a feature or author/update a spec, assess the work-stream** as part of the
 same act (it's a planning decision, like the stage):
 
-```sql
--- existing work-streams (pick the one this feature belongs to):
-SELECT project_id, shortname, title, status FROM projects WHERE COALESCE(is_deleted,0)=0;
--- is this feature already assigned?
-SELECT feature_id, title, project_id FROM roadmap WHERE feature_id=<id>;
+```
+# existing work-streams (pick the one this feature belongs to):
+./sc mem get projects
+# is this feature already assigned? — read its row's project_id:
+./sc mem get roadmap
 ```
 
 Then:
@@ -82,8 +82,8 @@ needs no work-stream.
 ## Review first
 
 Before writing, see what exists — don't duplicate:
-```sql
-SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;  -- shell_db.db
+```
+./sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
 sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
 ```
 

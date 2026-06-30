@@ -566,25 +566,44 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'db_map',
-  'Schema map + reusable SQL for super-coder''s shell_db.db. Check before composing any DB query — identity, memory, roadmap, documents, flags, skills.',
+  'Data model behind the engine memory surfaces + the `./sc mem` command for each. Check before reading or writing memory — identity, decisions, roadmap, documents, flags. Reads/writes go through the API (`./sc mem`), never raw sqlite.',
   'substrate',
   NULL,
   1,
   '# db_map — super-coder''s DB at a glance
 
-Source of truth: `.super-coder/shell_db.db` (gitignored; rebuilt from
-`schema.sql` + `migrations/*.sql` + `.sc-state/content.sql`). All identity,
-memory, and content live in tables — never flat files. Lazy-load: query for what
-you need, don''t bulk-read.
+All identity, memory, and content live in the engine DB
+(`.super-coder/shell_db.db`) — but you never touch that file. You read and write
+it **only through the engine API**, via `./sc mem`:
 
-Read your own memory with `./sc mem get <surface>` — `state`, `seed`, `lns`,
-`decisions`, `flags`, `roadmap`, `narrative`, `messages` (add `--json` for raw).
-It goes through the engine API: no DB path, no SELECT, no fallback-to-direct-DB
-to think about. For ad-hoc reads of tables the `get` surfaces don''t cover
-(`documents`, `projects`, `feature_blockers`, `skills`), query read-only with
-`sqlite3 .super-coder/shell_db.db "SELECT …"`. Writes go through `./sc mem`.
-Table below = the schema for those ad-hoc SELECTs; `## Common writes` = the
-`./sc mem` command for each change.
+- **Read** — `./sc mem get <surface>`: your own `state`, `seed`, `lns`,
+  `decisions`, `flags`, `narrative`, `messages`; and the shared planning state
+  `roadmap`, `projects`, `documents`, `tasks`, `shells` (add `--json` for raw).
+  `documents`/`tasks` take `--feature <id>` or `--doc <id>` (and `--doc` on
+  `documents` returns the one doc *with* its body).
+- **Write** — `./sc mem <cmd> …` (see `## Common writes` below).
+
+There is **no `sqlite3` path** — not as a fallback, not for "ad-hoc" reads.
+`./sc mem` goes through the API and only the API; if the API isn''t wired it
+fails loud rather than writing the DB behind its back. Your identity rides in
+your bearer token — the server resolves token → shell, so you never name a
+shell. The table below is the **data model** behind those surfaces (and what
+each `./sc mem` write touches), not a query cheatsheet. Lazy-load: `get` the one
+surface you need, don''t bulk-read.
+
+**Need a read or write `./sc mem` doesn''t expose?** That''s a gap to *report*, not
+a reason to reach for the DB — the direct path is closed by design, and a fork
+can''t patch the engine anyway (`./sc update` would overwrite it). A missing
+surface is an engine gap that goes **up to the FnB**: open a flag naming the data
+and the use, and surface it. Don''t improvise around the API.
+
+```
+./sc mem flag open "[Engine] need to <read|write> <what> — no ./sc mem surface for it | Blocker for: <your work>"
+```
+
+The FnB carries it upstream (that''s exactly how `get documents`/`get tasks`
+landed); message a planner-flavor shell too if the fork has one. Until then, do
+what you *can* through the API and flag the rest — never the DB directly.
 
 The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
 (see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
@@ -788,11 +807,11 @@ so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
 create a feature or author/update a spec, assess the work-stream** as part of the
 same act (it''s a planning decision, like the stage):
 
-```sql
--- existing work-streams (pick the one this feature belongs to):
-SELECT project_id, shortname, title, status FROM projects WHERE COALESCE(is_deleted,0)=0;
--- is this feature already assigned?
-SELECT feature_id, title, project_id FROM roadmap WHERE feature_id=<id>;
+```
+# existing work-streams (pick the one this feature belongs to):
+./sc mem get projects
+# is this feature already assigned? — read its row''s project_id:
+./sc mem get roadmap
 ```
 
 Then:
@@ -813,8 +832,8 @@ needs no work-stream.
 ## Review first
 
 Before writing, see what exists — don''t duplicate:
-```sql
-SELECT document_id, feature_id, kind, seq, title, frozen FROM documents ORDER BY feature_id, kind, seq;  -- shell_db.db
+```
+./sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
 sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- repo''s own docs (map db)
 ```
 
@@ -1268,11 +1287,8 @@ Flags tab). `<self>` = your shell_id.
 ./sc mem get flags --json   # same, as JSON
 ```
 
-(Need the roadmap-feature title joined in? That join isn''t in the `get` surface —
-fall back to a read-only `sqlite3 .super-coder/shell_db.db "SELECT f.flag_id,
-f.display_name, f.priority, f.description, r.title AS feature FROM flags f LEFT
-JOIN roadmap r ON r.feature_id=f.feature_id WHERE f.resolved=0 AND
-COALESCE(f.is_deleted,0)=0 ORDER BY f.priority, f.flag_id;"`.)
+(Each flag carries its `feature_id`; cross-reference `./sc mem get roadmap` for
+the blocked feature''s title. Reads go through the API — there is no `sqlite3`.)
 
 ## Open
 
@@ -1311,9 +1327,6 @@ already open, and don''t message on `close`.
 ```
 ./sc mem flag close <flag_id> --notes "…"
 ```
-
-(equivalent raw write, for reference: `UPDATE flags SET resolved=1,
-resolved_date=date(''now''), resolution_notes=''…'' WHERE flag_id=?;`)
 
 ## Stance
 
@@ -2205,9 +2218,10 @@ You review a diff *against intent*, not in a vacuum. Get both:
 
 Note the **author** — you''ll propose a handoff to them in Step 4. Resolve their
 shortname from the branch (`shell/<shortname>`) or the commit trailer
-(`Co-Authored-By: <display_name> (super-coder)`):
-```sql
-SELECT shortname, display_name FROM shells WHERE display_name=''<from trailer>'' AND is_deleted=0;
+(`Co-Authored-By: <display_name> (super-coder)`) — the roster maps display_name
+→ shortname:
+```
+./sc mem get shells
 ```
 
 ## Step 2: Review along the three axes
@@ -2535,28 +2549,17 @@ auto-pick "the latest" — list the feature''s open specs and choose the target
 explicitly. The **active** spec is the unfrozen one that already has a task plan;
 the rest are backlog.
 
-```sql
--- a feature''s open (unfrozen) specs, newest seq first — pick the target by id:
-SELECT r.feature_id, r.title AS feature_title, r.roadmap_status,
-       d.document_id, d.seq, d.title AS spec_title,
-       (SELECT COUNT(*) FROM spec_tasks t WHERE t.document_id = d.document_id) AS task_count
-FROM roadmap r
-JOIN documents d ON d.feature_id = r.feature_id AND d.kind = ''spec''
-WHERE (r.title LIKE ''%<keyword>%'' OR r.feature_id = <id>)
-  AND d.frozen = 0
-ORDER BY d.seq DESC;
-
--- load the chosen spec body:
-SELECT document_id, seq, title, body FROM documents WHERE document_id = <doc_id>;
-
--- check if a plan already exists for this spec:
-SELECT task_id, seq, title, status, completed_date
-FROM spec_tasks
-WHERE document_id = <doc_id>
-ORDER BY seq;
+```
+# the feature''s documents — pick an unfrozen spec (frozen=0) by id:
+./sc mem get documents --feature <id>
+# load the chosen spec body:
+./sc mem get documents --doc <doc_id>
+# the spec''s task plan (empty = no plan yet):
+./sc mem get tasks --doc <doc_id>
 ```
 
-`task_count > 0` marks the active spec — resume that one; an empty spec is backlog,
+`get documents --feature <id>` lists every spec/doc under the feature with its
+`kind`, `seq`, `frozen`, and `task_count`. `task_count > 0` marks the active spec — resume that one; an empty spec is backlog,
 and starting it (Step 3) makes it active. If more than one open spec matches and
 which to work is unclear, ask the FnB.
 
@@ -2662,11 +2665,8 @@ Then set `current_state` — no last-done yet, next is Preparation:
 
 At the start of each work session, load the current plan state:
 
-```sql
-SELECT task_id, seq, title, description, status, completed_date
-FROM spec_tasks
-WHERE document_id = <doc_id>
-ORDER BY seq;
+```
+./sc mem get tasks --doc <doc_id>
 ```
 
 Find the first `pending` task. Mark it `in_progress`:
@@ -2681,13 +2681,12 @@ with a read:
 ```
 ./sc mem task done <task_id>
 ```
-```sql
--- resolve last-done and next-pending in one query (raw read):
-SELECT
-  (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status=''done''
-   ORDER BY seq DESC LIMIT 1) AS last_done,
-  (SELECT title FROM spec_tasks WHERE document_id=<doc_id> AND status=''pending''
-   ORDER BY seq ASC LIMIT 1) AS next_up;
+
+Re-read the plan and resolve last-done / next-up from it — `last_done` is the
+highest-`seq` `done` task, `next_up` the lowest-`seq` `pending` one:
+
+```
+./sc mem get tasks --doc <doc_id>
 ```
 
 Then advance `current_state`:
