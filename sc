@@ -466,9 +466,24 @@ case "$cmd" in
       pybin="$(readlink -f "$here/.venv/bin/python" 2>/dev/null || true)"
       case "$pybin" in
         "$here"/*) : ;;                         # already under the repo bind-mount
-        "$HOME"/*)                              # e.g. ~/.local/share/uv/python/cpython-*/bin/python3
-          pyroot="$(dirname "$(dirname "$pybin")")"   # python-build-standalone root: <root>/bin/python3
-          [ -d "$pyroot" ] && py_mount="-v $pyroot:$pyroot:ro" ;;
+        "$HOME"/*)
+          # The venv's bin/python is symlinked to its interpreter by absolute
+          # path, but that path is usually a minor-version ALIAS dir that
+          # readlink -f collapses away (uv: cpython-3.14-… → cpython-3.14.5-…;
+          # the venv pins the alias so it floats across patch bumps). Mounting
+          # just the resolved dir leaves the alias path missing in the container
+          # and .venv/bin/python dangles. So mount the interpreter REGISTRY — the
+          # parent of the version dir, e.g. ~/.local/share/uv/python — so both the
+          # alias symlink and the real dir are present and every venv symlink
+          # resolves. A flat standalone (no version dir under $HOME) has no usable
+          # registry, so fall back to mounting its root directly.
+          pyver_dir="$(dirname "$(dirname "$pybin")")"   # <registry>/<versiondir>/bin/python → <versiondir>
+          pyreg="$(dirname "$pyver_dir")"                # <registry> (holds the alias + the real dir)
+          if [ -d "$pyreg" ] && [ "$pyreg" != "$HOME" ]; then
+            py_mount="-v $pyreg:$pyreg:ro"
+          elif [ -d "$pyver_dir" ]; then
+            py_mount="-v $pyver_dir:$pyver_dir:ro"
+          fi ;;
       esac
     fi
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
