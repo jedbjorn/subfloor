@@ -686,7 +686,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'dev_kit',
-  'What the sandbox dev kit provides + how to drive it — ./sc deps, ./sc test, ./sc lint, ./sc typecheck, the .venv tools, rg/sqlite3, the baked browser, and the container/host app boundary. Use when building or testing in a fork.',
+  'What the sandbox dev kit provides + how to drive it — ./sc deps, ./sc test, ./sc lint, ./sc typecheck, the .venv tools, rg/sqlite3, the baked browser, the container/host app boundary, and the optional app-only Postgres sidecar (DATABASE_URL). Use when building or testing in a fork.',
   'substrate',
   NULL,
   0,
@@ -743,6 +743,26 @@ Always present, no `./sc deps` needed:
 
 `svelte-check`, `tsc`, vitest come from the fork''s own `package.json` devDeps —
 installed by `./sc deps`'' `npm ci`, run via the fork''s npm scripts (or `./sc test`).
+
+## Postgres sidecar (app-only)
+
+When a fork sets `"pg": {}` in `.super-coder/instance.json` (`./sc pg-init` adds
+it), `./sc launch` starts a `postgres:17` sidecar (`sc-pg-<fork>` on `SC_NET`) and
+forwards `DATABASE_URL` into the sandbox — so you can develop + test the fork''s
+**app** against real Postgres. This is for the *app only*: the engine DB is always
+SQLite and the engine never reads `DATABASE_URL`, so the sidecar can''t point the
+review GUI at the wrong DB.
+
+- `DATABASE_URL=postgresql://sc:sc@sc-pg-<fork>:5432/sc` is in the sandbox env,
+  reachable by **container name** on `SC_NET` — *not* `127.0.0.1`, which inside
+  the sandbox is its own loopback. Override with `SC_DATABASE_URL` on the host.
+- Data persists in a named Docker volume across restarts + image rebuilds.
+- The **Postgres driver is the fork''s own dependency**, not the engine dev kit:
+  declare `psycopg[binary]` (psycopg 3) in the fork''s `requirements*.txt` so
+  `./sc deps` installs it. Then the app + `pytest` connect with no extra steps.
+
+Verify with `echo $DATABASE_URL`. Empty → the fork has no `pg` block; run
+`./sc pg-init && ./sc restart` on the host.
 
 ## Stance
 
@@ -3058,7 +3078,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'test_authoring_pg',
-  'Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg2 direct assertions. Read alongside test_authoring for the rules.',
+  'Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg 3 direct assertions. Read alongside test_authoring for the rules.',
   'craft',
   NULL,
   0,
@@ -3086,9 +3106,9 @@ shell, and drives the real app through `TestClient` with real auth.
 | `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
 
 **Throwaway DB setup:**
-- An admin connection (`psycopg2.connect(DATABASE_URL_ADMIN)`) creates a
-  unique `dosarch_test_<uuid>` database at session start and drops it at
-  session teardown.
+- An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
+  creates a unique `dosarch_test_<uuid>` database at session start and drops it
+  at session teardown.
 - `DATABASE_URL` is injected via `os.environ["DATABASE_URL"]` **before**
   importing the app; the app''s DB layer reads it at import time.
 - `schema.sql` (the postgres variant) + migrations are applied via
@@ -3117,10 +3137,10 @@ or `Authorization: Bearer` header.
 
 **Direct DB assertions:**
 ```python
-import psycopg2, psycopg2.extras, os
-con = psycopg2.connect(os.environ["DATABASE_URL"])
-con.autocommit = True
-cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+import os, psycopg
+from psycopg.rows import dict_row
+con = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True, row_factory=dict_row)
+cur = con.cursor()
 cur.execute("SELECT * FROM table WHERE ...")
 rows = cur.fetchall()
 ```
