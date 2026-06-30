@@ -190,18 +190,49 @@ sc_deps() {
   echo "✓ deps: done"
 }
 
+# True if the fork declares a pytest config — pytest.ini, a [tool.pytest…] table in
+# pyproject.toml, or [tool:pytest] in setup.cfg. The discriminator between "this
+# fork opted out of pytest" (→ stdlib unittest fallback) and "this fork needs
+# pytest but the .venv is unprovisioned" (→ hard error, never a silent downgrade).
+_sc_wants_pytest() {
+  [ -f "$here/pytest.ini" ] && return 0
+  [ -f "$here/pyproject.toml" ] && grep -q '\[tool\.pytest' "$here/pyproject.toml" 2>/dev/null && return 0
+  [ -f "$here/setup.cfg" ] && grep -q '\[tool:pytest\]' "$here/setup.cfg" 2>/dev/null && return 0
+  return 1
+}
+
 # Run the fork's test suites: backend (the .venv's pytest, honoring the fork's
 # pytest.ini; else the engine's own stdlib-unittest suite) + UI (npm run test /
 # vitest in any package.json dir that declares a test script). Non-zero if any fail.
 sc_test() {
-  rc=0
   venv="$here/.venv"
+  # Self-heal: a fork with python tests but no .venv/bin/pytest is an unprovisioned
+  # worktree (the .venv is only populated by the first `./sc deps`), NOT a fork that
+  # opted out of pytest. Provision the dev kit + fork deps rather than silently
+  # downgrading to stdlib unittest — under which a pytest-based suite fails with
+  # ModuleNotFoundError (pytest / the fork's own libs) that reads as a real test
+  # failure. We gate on the pytest binary, not sc_deps' exit code, so a partial
+  # provision (e.g. npm leg fails) still runs pytest if it landed.
+  if [ ! -x "$venv/bin/pytest" ] && ls "$here"/tests/test_*.py >/dev/null 2>&1; then
+    echo "→ test: $venv/bin/pytest missing — provisioning first (./sc deps)"
+    sc_deps || echo "→ test: provisioning incomplete — continuing" >&2
+  fi
+  rc=0
   if [ -x "$venv/bin/pytest" ]; then
     echo "→ test: $venv/bin/pytest"
     ( cd "$here" && "$venv/bin/pytest" "$@" ) || rc=1
   elif ls "$here"/tests/test_*.py >/dev/null 2>&1; then
-    echo "→ test: python3 -m unittest discover (stdlib)"
-    ( cd "$here" && "$PY" -m unittest discover -s tests -p 'test_*.py' ) || rc=1
+    # pytest still unavailable after provisioning (venv create failed, or a
+    # host-managed sandbox interpreter that skips pip). A fork that *declares*
+    # pytest must not be green-washed through stdlib unittest — fail loud with the
+    # fix. Only a fork with no pytest config keeps the legacy stdlib fallback.
+    if _sc_wants_pytest; then
+      echo "✗ test: pytest required (pytest config present) but unavailable in $venv — run ./sc deps to provision it" >&2
+      rc=1
+    else
+      echo "→ test: python3 -m unittest discover (stdlib)"
+      ( cd "$here" && "$PY" -m unittest discover -s tests -p 'test_*.py' ) || rc=1
+    fi
   else
     echo "→ test: no python tests found"
   fi
