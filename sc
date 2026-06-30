@@ -121,8 +121,23 @@ _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
 sc_deps() {
   rc=0
   venv="$here/.venv"
+  # In the sandbox, a .venv whose interpreter lives OUTSIDE the repo is host-built
+  # and host-managed — a pinned out-of-tree CPython (uv standalone) that `./sc
+  # launch` mounts in, with deps already installed against it. Recreating it with
+  # the image's python or pip-ing into it here would clobber that shared tree, so
+  # leave python deps to the host (`make install` / `uv`). Node deps still install.
+  skip_py=""
+  if [ -n "${SC_SANDBOX:-}" ] && [ -e "$venv/bin/python" ]; then
+    case "$(readlink -f "$venv/bin/python" 2>/dev/null || true)" in
+      "$here"/*) : ;;       # sandbox-built venv inside the repo — manage normally
+      *) skip_py=1 ;;       # host-managed pinned interpreter — don't touch it
+    esac
+  fi
   reqs="$(_sc_find_manifests 'requirements*.txt')"
   base_reqs="$(printf '%s\n' "$reqs" | grep -v 'requirements-dev\.txt' || true)"
+  if [ -n "$skip_py" ]; then
+    echo "→ deps: python deps are host-managed (pinned interpreter mounted by launch) — skipping venv/pip in the sandbox"
+  else
   # The engine dev kit lives in this .venv, so create it unconditionally — a fork
   # that declares no requirements*.txt still needs pytest on hand for `./sc test`
   # and for shells writing tests. (Previously the venv + kit were gated on $base_reqs,
@@ -149,6 +164,7 @@ sc_deps() {
   # fork's pin or its [tool.ruff]/[tool.mypy] config — available, not enforced.
   echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette, only-if-needed)"
   "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette || rc=1
+  fi
   pkgs="$(_sc_find_manifests 'package.json')"
   if [ -n "$pkgs" ]; then
     printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
@@ -433,6 +449,28 @@ case "$cmd" in
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
     git_name="$(git -C "$here" config user.name 2>/dev/null || true)"
     git_email="$(git -C "$here" config user.email 2>/dev/null || true)"
+    # Pinned-interpreter passthrough. When the fork's .venv was built from an
+    # out-of-tree interpreter — a uv-managed standalone CPython under $HOME, used
+    # to pin the app's Python independent of the host's rolling system python —
+    # the bind-mounted .venv's bin/python + script shebangs point at that
+    # interpreter by absolute path. Mount it read-only at the SAME path so the
+    # shared .venv runs end-to-end inside the sandbox on the *identical* binary:
+    # same ABI as the wheels the host installed (psycopg etc. import with zero
+    # rebuild), and .venv/bin/{python,pytest,ruff,mypy} all resolve. Engine
+    # python (the image's own python3, SQLite-only) is untouched — this is the
+    # product app's interpreter, a separate concern. Skipped when the venv's
+    # interpreter is a system path (don't shadow /usr) or already inside the repo
+    # mount; a fork with a plain `python3 -m venv` host venv gets nothing here.
+    py_mount=""
+    if [ -e "$here/.venv/bin/python" ]; then
+      pybin="$(readlink -f "$here/.venv/bin/python" 2>/dev/null || true)"
+      case "$pybin" in
+        "$here"/*) : ;;                         # already under the repo bind-mount
+        "$HOME"/*)                              # e.g. ~/.local/share/uv/python/cpython-*/bin/python3
+          pyroot="$(dirname "$(dirname "$pybin")")"   # python-build-standalone root: <root>/bin/python3
+          [ -d "$pyroot" ] && py_mount="-v $pyroot:$pyroot:ro" ;;
+      esac
+    fi
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
     docker run -d --name "$CNAME" --restart unless-stopped \
       --network "$SC_NET" \
@@ -444,6 +482,7 @@ case "$cmd" in
       -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
       -w "$here" \
       -v "$here:$here" \
+      $py_mount \
       -v "$HOME/.claude:$HOME/.claude" \
       -v "$HOME/.claude.json:$HOME/.claude.json" \
       -v "$HOME/.config/opencode:$HOME/.config/opencode" \
