@@ -157,7 +157,8 @@ def _render_get(surface: str, data: dict) -> int:
             return 0
         for f in fs:
             nm = f.get("display_name") or f"#{f['flag_id']}"
-            print(f"[{nm}] ({f.get('priority') or 'Medium'}) {f.get('description') or ''}")
+            who = f" @{f['owner']}" if f.get("owner") else ""
+            print(f"[{nm}]{who} ({f.get('priority') or 'Medium'}) {f.get('description') or ''}")
         return 0
     if surface == "roadmap":
         rm = data.get("roadmap", [])
