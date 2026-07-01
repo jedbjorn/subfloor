@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,13 @@ MIGRATIONS_DIR = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+
+# A migration file's own outermost transaction control (on its own line). A
+# trigger body's `BEGIN` (no trailing `;`) and `END;` (not `COMMIT;`/`END
+# TRANSACTION;`) are deliberately NOT matched, so a `CREATE TRIGGER … BEGIN …
+# END;` stays intact when we strip the file's outer BEGIN/COMMIT.
+_TXN_BEGIN = re.compile(r"^\s*BEGIN(\s+TRANSACTION)?\s*;\s*$", re.IGNORECASE)
+_TXN_COMMIT = re.compile(r"^\s*(COMMIT|END\s+TRANSACTION)\s*;\s*$", re.IGNORECASE)
 
 
 def applied_set(con) -> set[str]:
@@ -41,9 +49,43 @@ def pending(con) -> list[Path]:
     return [f for f in files if f.name not in done]
 
 
+def _strip_outer_txn(sql: str) -> str:
+    """Drop the file's own outermost BEGIN (first) and COMMIT (last) so the
+    runner can wrap body + ledger stamp in a single transaction without nesting
+    (SQLite has no nested transactions). Files that run bare are unchanged."""
+    lines = sql.splitlines()
+    for i, ln in enumerate(lines):
+        if _TXN_BEGIN.match(ln):
+            lines[i] = ""
+            break
+    for i in range(len(lines) - 1, -1, -1):
+        if _TXN_COMMIT.match(lines[i]):
+            lines[i] = ""
+            break
+    return "\n".join(lines)
+
+
 def apply(con, path: Path) -> None:
-    con.executescript(path.read_text())
-    con.execute("INSERT INTO schema_migrations (filename) VALUES (?)", (path.name,))
+    """Apply one migration file and stamp the ledger ATOMICALLY.
+
+    executescript() disregards isolation_level and autocommits each statement of
+    a bare file, so a mid-file failure used to leave earlier statements applied
+    with no ledger row — re-running then re-ran the file from the top and died
+    (`duplicate column …`), wedging the chain. Wrapping body + stamp in one
+    explicit transaction (with rollback on error) makes a partial failure revert
+    whole, leaving the migration unstamped and cleanly re-runnable."""
+    stamp = path.name.replace("'", "''")
+    script = (
+        "BEGIN;\n"
+        f"{_strip_outer_txn(path.read_text()).strip()}\n"
+        f"INSERT INTO schema_migrations (filename) VALUES ('{stamp}');\n"
+        "COMMIT;"
+    )
+    try:
+        con.executescript(script)
+    except Exception:
+        con.rollback()
+        raise
 
 
 def migrate(db_path: str) -> int:
@@ -54,9 +96,8 @@ def migrate(db_path: str) -> int:
             print("migrate: nothing pending — DB is current.")
             return 0
         for path in todo:
-            apply(con, path)
+            apply(con, path)  # each file self-commits atomically with its stamp
             print(f"migrate: applied {path.name}")
-        con.commit()
         print(f"migrate: {len(todo)} migration(s) applied.")
     finally:
         con.close()
