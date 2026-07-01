@@ -225,17 +225,32 @@ def do_reset(running: bool = True) -> dict:
 def do_push(src: str, dest: str | None = None) -> dict:
     """Stage a host-visible artifact into transfer_dir (the host side of the
     guest's virtio-fs share). `src` is a path in the bind-mounted repo; the guest
-    sees the copy under its mapped share. The fast path — no scp, no guest auth."""
+    sees the copy under its mapped share. The fast path — no scp, no guest auth.
+
+    Contained by design: `src` must resolve inside the repo and `dest` must stay
+    inside transfer_dir. The broker socket is reachable from the sandbox (same
+    uid, socket in the bind-mount), so without these an in-sandbox caller could
+    read host files (`src: ~/.ssh/...`) or write outside the share as the host
+    user (`dest: ../../..`) — a sandbox→host escape. fs-perm (0600) gates other
+    users, not the sandbox."""
     cfg = read() or {}
     if m := _missing(cfg, "transfer_dir"):
         return {"ok": False, "output": m}
+    repo_root = ports.ENGINE.parent.resolve()
     src_p = Path(os.path.expanduser(str(src)))
+    if not src_p.is_absolute():
+        src_p = repo_root / src_p
+    src_p = src_p.resolve()
+    if not src_p.is_relative_to(repo_root):
+        return {"ok": False, "output": f"push: src must be inside the repo: {src}"}
     if not src_p.is_file():
         return {"ok": False, "output": f"push: source not found: {src_p}"}
-    d = Path(os.path.expanduser(str(cfg["transfer_dir"])))
+    d = Path(os.path.expanduser(str(cfg["transfer_dir"]))).resolve()
     if not d.is_dir():
         return {"ok": False, "output": f"transfer_dir does not exist: {d}"}
-    target = d / (dest or src_p.name)
+    target = (d / (dest or src_p.name)).resolve()
+    if not target.is_relative_to(d):
+        return {"ok": False, "output": f"push: dest escapes transfer_dir: {dest}"}
     try:
         shutil.copy2(src_p, target)
     except OSError as e:
