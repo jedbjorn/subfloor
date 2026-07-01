@@ -131,8 +131,16 @@ def _gh_merged_prs() -> tuple[dict[str, dict] | None, bool]:
         by_branch: dict[str, dict] = {}
         for pr in json.loads(r.stdout or "[]"):
             ref = pr.get("headRefName")
-            # keep the most decisive: a MERGED PR wins over an older OPEN/CLOSED
-            if ref and (ref not in by_branch or pr.get("state") == "MERGED"):
+            if not ref:
+                continue
+            # A reused branch name carries several PRs; the NEWEST (highest
+            # number) is authoritative. MERGED-always-wins was unsafe: a new
+            # OPEN PR on a branch whose earlier PR merged got misread as merged,
+            # marking the branch stale -> `git branch -D` on live work. Newest-
+            # wins also handles reopen-then-merge (newest merged -> prunable).
+            num = pr.get("number") or 0
+            prev = by_branch.get(ref)
+            if prev is None or num > (prev.get("number") or 0):
                 by_branch[ref] = {"number": pr.get("number"), "state": pr.get("state")}
         return by_branch, True
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):

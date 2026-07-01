@@ -17,12 +17,14 @@ Run:
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -121,6 +123,48 @@ class PruneTest(unittest.TestCase):
         self.assertIn("pruned 2 merged branches", line)
         one = git_prune.status_line({"deleted": ["a"], "failed": []})
         self.assertIn("pruned 1 merged branch ", one)  # singular, no plural 'es'
+
+
+class MergedPrClassificationTests(unittest.TestCase):
+    """`_gh_merged_prs` must let the NEWEST PR per branch decide state, so a
+    reused branch name whose latest PR is OPEN is never misread as merged (which
+    would mark it stale and `git branch -D` live work)."""
+
+    def _run(self, prs: list[dict]) -> dict:
+        fake = mock.Mock(returncode=0, stdout=json.dumps(prs))
+        with mock.patch.object(git_hygiene.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(git_hygiene.subprocess, "run", return_value=fake):
+            by_branch, available = git_hygiene._gh_merged_prs()
+        self.assertTrue(available)
+        return by_branch
+
+    def test_open_pr_on_reused_branch_wins_over_older_merged(self):
+        # feat/x: #10 merged long ago, #20 open now on the same name.
+        by_branch = self._run([
+            {"number": 20, "headRefName": "feat/x", "state": "OPEN", "mergedAt": None},
+            {"number": 10, "headRefName": "feat/x", "state": "MERGED",
+             "mergedAt": "2026-01-01T00:00:00Z"},
+        ])
+        self.assertEqual(by_branch["feat/x"]["state"], "OPEN")   # not prunable
+        self.assertEqual(by_branch["feat/x"]["number"], 20)
+
+    def test_reopen_then_merge_is_still_prunable(self):
+        # newest PR is the merged one -> branch is genuinely done.
+        by_branch = self._run([
+            {"number": 30, "headRefName": "feat/y", "state": "MERGED",
+             "mergedAt": "2026-02-02T00:00:00Z"},
+            {"number": 12, "headRefName": "feat/y", "state": "CLOSED", "mergedAt": None},
+        ])
+        self.assertEqual(by_branch["feat/y"]["state"], "MERGED")
+
+    def test_order_independence(self):
+        # same inputs, merged-first ordering, must still pick the open #20.
+        by_branch = self._run([
+            {"number": 10, "headRefName": "feat/x", "state": "MERGED",
+             "mergedAt": "2026-01-01T00:00:00Z"},
+            {"number": 20, "headRefName": "feat/x", "state": "OPEN", "mergedAt": None},
+        ])
+        self.assertEqual(by_branch["feat/x"]["state"], "OPEN")
 
 
 if __name__ == "__main__":
