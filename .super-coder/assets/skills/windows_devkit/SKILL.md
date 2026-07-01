@@ -44,15 +44,15 @@ So you do **not** shell out — you call the **host-side vm-broker** over a unix
 socket in the bind-mounted repo. The broker holds the key + libvirt and does the
 work; nothing about your isolation changes. (See `docs/windows-vm-broker.md`.)
 
-The socket path comes from `./sc vm-broker-sock`. Every verb is a `curl`:
+The socket path comes from `sc vm-broker-sock`. Every verb is a `curl`:
 
 ```bash
-SOCK="$(./sc vm-broker-sock)"
+SOCK="$(sc vm-broker-sock)"
 curl -s --unix-socket "$SOCK" http://vm/health      # liveness check first
 ```
 
 If the curl fails with "not reachable", the broker isn't running — ask the
-operator to start it on the host: `./sc vm-broker-up`. You cannot start it
+operator to start it on the host: `sc vm-broker-up`. You cannot start it
 yourself (it must run on the host, not in your sandbox).
 
 ## The loop — push → exec → capture → reset

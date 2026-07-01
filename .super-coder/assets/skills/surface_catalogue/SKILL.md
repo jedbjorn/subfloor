@@ -10,7 +10,7 @@ common: true
 super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
 repo — query them first to orient, instead of walking the tree blind. They live
 in the **map db**, `.sc-state/map.db` — a *separate* file from your memory db
-(`.super-coder/shell_db.db`). Query that file: `sqlite3 .sc-state/map.db "…"`.
+(`.super-coder/shell_db.db`). Query that file: `sc map-sql "…"`.
 
 You do **not** map the repo. The map is kept fresh for you automatically (git
 hooks re-map on pull / branch-switch / rebase) and is owned by the
@@ -43,7 +43,7 @@ names + descriptions) → read the one or two files you need. Section-first, one
 cheap query deep — never a full preload.
 
 ```sql
--- all of these run against the map db:  sqlite3 .sc-state/map.db "<query>"
+-- all of these run against the map db:  sc map-sql "<query>"
 -- the section index (same as boot CONNECTIONS) — where to start:
 SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
 

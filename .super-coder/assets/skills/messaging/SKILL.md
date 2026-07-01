@@ -1,6 +1,6 @@
 ---
 name: messaging
-description: Shell-to-shell inbox — send a markdown message to another shell, check your unread inbox, mark messages read. Driven by `./sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.
+description: Shell-to-shell inbox — send a markdown message to another shell, check your unread inbox, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.
 category: substrate
 common: true
 ---
@@ -11,7 +11,7 @@ One shell writes a markdown message to another; the recipient discovers it on it
 next boot via the `## STATUS` `Inbox:` count, surfaces it with `check`, and clears
 it with `mark-read`. Body is markdown — preserved verbatim.
 
-Drive it with **`./sc mem message`**. The sender is you; recipients are addressed
+Drive it with **`sc mem message`**. The sender is you; recipients are addressed
 by `shortname`.
 
 Trigger: `--message`
@@ -20,7 +20,7 @@ Args: `check [N] | send <to-shortname> <body> | mark-read <id>`
 ## check — your unread inbox
 
 ```
-./sc mem message check [N]      # N optional; default 50, max 200
+sc mem message check [N]      # N optional; default 50, max 200
 ```
 
 `check` is read-only — it does **not** auto-mark-read. Surface the body to the
@@ -30,19 +30,19 @@ inbound in the same turn.
 ## send — message another shell
 
 ```
-./sc mem message send <to-shortname> "<body>"
+sc mem message send <to-shortname> "<body>"
 ```
 
 - Multi-word body = a single quoted argument; markdown is preserved verbatim.
-- Examples: `./sc mem message send cartographer "map is stale — re-run ./sc map"`
-  · `./sc mem message send cc "spec ready for review — see flag SC-014"`
+- Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
+  · `sc mem message send cc "spec ready for review — see flag SC-014"`
 - Unknown / deleted recipient → `mem: recipient shortname '<x>' unknown`. Empty
   body → `mem: body is empty`. Surface either to the operator plainly.
 
 ## mark-read — clear an inbox item (idempotent)
 
 ```
-./sc mem message mark-read <message_id>
+sc mem message mark-read <message_id>
 ```
 
 Access control: you can only mark read a message addressed to **you** — one for

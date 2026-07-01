@@ -33,11 +33,11 @@ the rest are backlog.
 
 ```
 # the feature's documents — pick an unfrozen spec (frozen=0) by id:
-./sc mem get documents --feature <id>
+sc mem get documents --feature <id>
 # load the chosen spec body:
-./sc mem get documents --doc <doc_id>
+sc mem get documents --doc <doc_id>
 # the spec's task plan (empty = no plan yet):
-./sc mem get tasks --doc <doc_id>
+sc mem get tasks --doc <doc_id>
 ```
 
 `get documents --feature <id>` lists every spec/doc under the feature with its
@@ -75,7 +75,7 @@ Hard stops — prior work not shipped, missing environment state, unresolved
 external dependency. Open a flag for each:
 
 ```
-./sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
+sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
 ```
 
 Don't open flags for unclear items you can resolve by asking — ask first.
@@ -92,7 +92,7 @@ are `brainstorm · long_term · near_term · next · in_progress · shipped`.
 
 - Feature sits at `brainstorm`/`long_term`/`near_term` and you're **building this
   session** → move it to `in_progress`:
-  `./sc mem roadmap status <feature_id> in_progress`
+  `sc mem roadmap status <feature_id> in_progress`
 - You're only **planning ahead** (no build this session) → move it to `next`.
 - Already at `in_progress` (or further) → **no-op**; don't churn it.
 
@@ -108,7 +108,7 @@ While you're reconciling the stage, check the same feature's **work-stream**
 so the feature shows up in a flow, not the Ungrouped pile:
 
 ```
-./sc mem roadmap project <feature_id> <shortname>   # 'none' to clear
+sc mem roadmap project <feature_id> <shortname>   # 'none' to clear
 ```
 
 Assign when the stream is obvious; surface to the FnB when it's ambiguous. No-op
@@ -125,20 +125,20 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-Add each task with `./sc mem task add` (one per seq) — each write is live in the
+Add each task with `sc mem task add` (one per seq) — each write is live in the
 shared DB immediately:
 
 ```
-./sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
-./sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
-./sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-./sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
+sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
+sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
+sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
 Then set `current_state` — no last-done yet, next is Preparation:
 
 ```
-./sc mem state "[<feature_title>] — last: —. next: Preparation."
+sc mem state "[<feature_title>] — last: —. next: Preparation."
 ```
 
 ---
@@ -148,33 +148,33 @@ Then set `current_state` — no last-done yet, next is Preparation:
 At the start of each work session, load the current plan state:
 
 ```
-./sc mem get tasks --doc <doc_id>
+sc mem get tasks --doc <doc_id>
 ```
 
 Find the first `pending` task. Mark it `in_progress`:
 
 ```
-./sc mem task start <task_id>
+sc mem task start <task_id>
 ```
 
 Work only that task. When done, mark it complete, then resolve last-done / next-up
 with a read:
 
 ```
-./sc mem task done <task_id>
+sc mem task done <task_id>
 ```
 
 Re-read the plan and resolve last-done / next-up from it — `last_done` is the
 highest-`seq` `done` task, `next_up` the lowest-`seq` `pending` one:
 
 ```
-./sc mem get tasks --doc <doc_id>
+sc mem get tasks --doc <doc_id>
 ```
 
 Then advance `current_state`:
 
 ```
-./sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
+sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
 ```
 
 If `next_up` is NULL, all tasks are done — set current_state to reflect that.
@@ -190,19 +190,19 @@ write the doc (that's the planner — see the `docs` skill):
 
 1. **Flip the horizon to shipped:**
    ```
-   ./sc mem roadmap status <feature_id> shipped
+   sc mem roadmap status <feature_id> shipped
    ```
 2. **Open a docs-pending flag and message the planner with full instructions.**
    `shipped` + an open flag is the honest interim state. The message carries
    everything the planner needs to act without digging:
    ```
-   ./sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
-   ./sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
+   sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
+   sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
 
    Spec <doc_id> shipped. Flag SC-### is open — your action required:
 
    1. **Read the shipped code first.** Write the doc from what actually shipped, not from the spec. Drift happens and decisions get made in production — the spec captures the intent, the code is the truth.
-   2. Freeze the spec: \`./sc mem doc freeze <doc_id>\`
+   2. Freeze the spec: \`sc mem doc freeze <doc_id>\`
    3. Write the doc (\`kind='doc'\`) under feature <feature_id> (see the \`docs\` skill).
    4. Close flag SC-### when the doc is live."
    ```
@@ -219,7 +219,7 @@ directly and leave the docs-pending flag open for whoever picks up docs.
 If, mid-build, the work grows past the spec's stated what/why:
 
 - **Small growth** (same mental model, a few more tasks) → the spec is *living*
-  while unfrozen; just edit it (`./sc mem doc edit`) and carry on. No ceremony.
+  while unfrozen; just edit it (`sc mem doc edit`) and carry on. No ceremony.
 - **A separate coherent intent** (a new mental-model boundary — the granularity
   test in the `docs` skill) → don't quietly absorb it. Recommend a **new spec** to
   the FnB, to be authored by the planner against its own feature. Significant creep

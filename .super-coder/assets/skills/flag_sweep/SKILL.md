@@ -42,13 +42,13 @@ evidence** — when in doubt, surface, don't close.
 
 ## Step 2: Auto-close the deterministic ones
 
-Close with `./sc mem flag close <flag_id> --notes "…"`. The note must cite the
+Close with `sc mem flag close <flag_id> --notes "…"`. The note must cite the
 evidence — that is the whole point of doing it here instead of guessing.
 
 **A. Docs-pending flag, doc now exists.** A `[Docs] … docs pending` flag on a
 feature whose `frozen_docs > 0`:
 ```
-./sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for feature #<id> (flag_sweep)."
+sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for feature #<id> (flag_sweep)."
 ```
 
 **B. Ship-blocker, feature now shipped.** A flag of the form `… | Blocker for: <X>`
@@ -56,7 +56,7 @@ whose linked feature's `roadmap_status` is `shipped` (or later) **and** whose te
 is about that feature shipping / becoming available (not a separate concern that
 merely happens to hang off the same feature):
 ```
-./sc mem flag close <flag_id> --notes "Auto: blocking feature #<id> (<title>) now shipped (flag_sweep)."
+sc mem flag close <flag_id> --notes "Auto: blocking feature #<id> (<title>) now shipped (flag_sweep)."
 ```
 
 **C. Ship-drift flag, now shipped *and* documented.** A `[Ship] … not marked
@@ -65,7 +65,7 @@ so only close it once **both** are true: `roadmap_status` is `shipped` (or later
 **and** `frozen_docs > 0`. Shipped-but-still-undocumented leaves it open (the doc
 half isn't done):
 ```
-./sc mem flag close <flag_id> --notes "Auto: feature #<id> (<title>) now shipped with a frozen doc (flag_sweep)."
+sc mem flag close <flag_id> --notes "Auto: feature #<id> (<title>) now shipped with a frozen doc (flag_sweep)."
 ```
 
 Do **not** message on close (per the `flags` skill — messages pair with `open`, not
@@ -109,8 +109,8 @@ For each row, open the flag and message the planner (or surface to the FnB if th
 is no planner) — same contract as the `flags` skill:
 
 ```
-./sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
-./sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) — Verification done but still <status>; SC-### opened to mark shipped + reconcile docs to spec."
+sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
+sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) — Verification done but still <status>; SC-### opened to mark shipped + reconcile docs to spec."
 ```
 
 ### 3B — Shipped but undocumented (docs-pending)
@@ -139,8 +139,8 @@ For each row, open the flag and message the planner (or surface to the FnB if th
 is no planner) — same contract as the `flags` skill:
 
 ```
-./sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
-./sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) is shipped with no doc — SC-### opened, ready to freeze + document."
+sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
+sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) is shipped with no doc — SC-### opened, ready to freeze + document."
 ```
 
 ---

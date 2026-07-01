@@ -132,7 +132,7 @@ make this the careful tier:
    *that shell's* trailer, not the admin's. Map the worktree branch
    (`shell/<shortname>`) → shell, and look up its `display_name`:
    ```bash
-   sqlite3 .super-coder/shell_db.db \
+   sc sql \
      "SELECT display_name FROM shells WHERE shortname='<shortname>' AND is_deleted=0;"
    ```
    Use it in the trailer: `Co-Authored-By: <display_name> (super-coder) <noreply@…>`.
@@ -162,7 +162,7 @@ gh pr create --repo <owner/repo> --head <type>/<short-desc> --fill   # open, nev
    its worktree silently rearranged. After acting, message the owning shell (see
    the `messaging` skill) so it discovers the change on its next boot:
    ```bash
-   ./sc mem message send <shortname> 'git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.'
+   sc mem message send <shortname> 'git_cleanup: your worktree had uncommitted work. I preserved it on branch `<type>/<short-desc>` and opened PR #<n>. Your tree now sits on that branch — `git checkout shell/<shortname>` to return to your base.'
    ```
    Also report the same to the FnB. If the worktree could not be acted on (shell
    was live, or indeterminate), no message — it was left untouched.

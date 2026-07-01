@@ -10,7 +10,7 @@ common: true
 All memory is DB rows (no flat files). Write at the moment it matters, not in a
 close ritual.
 
-**Write through `./sc mem`.** The write lands in the live engine DB — shared by
+**Write through `sc mem`.** The write lands in the live engine DB — shared by
 every shell, durable + visible to all the moment it commits. It always targets
 your own shell: the server resolves your identity from your token, so you never
 name a shell.
@@ -20,7 +20,7 @@ name a shell.
 Your present focus + what's next. **Replaces in place; never a log.** Soft target
 ~500 chars. Rewrite when focus shifts.
 ```
-./sc mem state "…"
+sc mem state "…"
 ```
 
 ## Session narrative — append at inflection points
@@ -30,7 +30,7 @@ stamped for you) when: a decision lands, an approach changes or is rejected, the
 FnB says something that shapes the work, an assumption breaks, or before a big
 change.
 ```
-./sc mem narrative "…"
+sc mem narrative "…"
 ```
 
 ## seed (cap 10) — who you are
@@ -38,17 +38,17 @@ change.
 Identity-forming moments. Past-tense/timeless. Add a new entry; **never edit a
 body** (curate by retiring). The genesis + lineage seed are already yours.
 ```
-./sc mem seed "…"            # add
-./sc mem retire <entry_id>   # curate out (frees a cap slot)
+sc mem seed "…"            # add
+sc mem retire <entry_id>   # curate out (frees a cap slot)
 ```
 
 ## L&S (cap 20) — how you work
 
 Operating lessons, imperative voice. Add when a lesson lands; curate by retiring.
-Caps are trigger-enforced (seed 10, L&S 20) — `./sc mem` reports the cap message;
+Caps are trigger-enforced (seed 10, L&S 20) — `sc mem` reports the cap message;
 retiring frees a slot.
 ```
-./sc mem lns "…"
+sc mem lns "…"
 ```
 
 ## Decisions — Major only
@@ -57,7 +57,7 @@ Record a Major decision (architecture, approach, a path chosen over another).
 Never rewritten; supersede via `--parent <decision_id>`. Mirror the headline into
 the narrative.
 ```
-./sc mem decision "…" --rationale "…" [--parent <id>]
+sc mem decision "…" --rationale "…" [--parent <id>]
 ```
 
 ## Stance

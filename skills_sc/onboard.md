@@ -22,7 +22,7 @@ only (or the drift we're killing comes back). `<self>` = your shell_id.
 
 ## 1. List what exists (from the map, not a blind walk)
 ```sql
--- the map is its own db: sqlite3 .sc-state/map.db "<query>"
+-- the map is its own db: sc map-sql "<query>"
 SELECT path, lang, lines FROM dr_filepath WHERE role='doc' ORDER BY path;
 ```
 These are the repo's real docs (README, `docs/`, `specs/`, guides). The `_sc`
@@ -35,7 +35,7 @@ For each doc, read the file and decide together:
   feature.
 Skip noise (changelogs, license, vendored docs) unless the FnB wants it.
 
-All writes here go through `./sc mem` (routed through the engine API, which writes
+All writes here go through `sc mem` (routed through the engine API, which writes
 to the live shared DB — the import never touches the app DB).
 
 ## 3. Backfill the roadmap
@@ -43,21 +43,21 @@ Create a feature for each coherent area/initiative the docs imply; set status by
 how built it is (`shipped` if done + documented, `near_term`/`brainstorm` if
 planned):
 ```
-./sc mem roadmap add "…" --status shipped --summary "…"
+sc mem roadmap add "…" --status shipped --summary "…"
 ```
 
 ## 4. Ingest into `documents` (DB owns the body)
 `--body-file` reads the real file straight into the body — no pasting:
 ```
 # general doc (no feature):
-./sc mem doc add "README" --kind doc --body-file ./README.md --render-path docs_sc/readme.md
+sc mem doc add "README" --kind doc --body-file ./README.md --render-path docs_sc/readme.md
 # a feature's spec (link it):
-./sc mem doc add "…" --kind spec --feature <id> --body-file ./path/to/spec.md --render-path specs_sc/….md
+sc mem doc add "…" --kind spec --feature <id> --body-file ./path/to/spec.md --render-path specs_sc/….md
 ```
-If a spec describes shipped work, freeze it: `./sc mem doc freeze <document_id>`.
+If a spec describes shipped work, freeze it: `sc mem doc freeze <document_id>`.
 
 ## 5. Persist
-Each `./sc mem` write is live in the shared engine DB immediately, so the GUI's
+Each `sc mem` write is live in the shared engine DB immediately, so the GUI's
 Docs/Roadmap tabs reflect the import as you go. The flat `_sc` copies and the git
 commit are an admin/GUI publish step — not part of onboarding.
 

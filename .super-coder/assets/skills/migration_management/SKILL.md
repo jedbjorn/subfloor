@@ -10,11 +10,11 @@ common: false
 Migrations live in `.super-coder/migrations/` and apply in numeric order,
 tracked by the `schema_migrations` ledger table. Engine updates apply pending
 migrations automatically; you can apply them locally without a fetch using
-`./sc update --no-fetch`.
+`sc update --no-fetch`.
 
 **Scope:** fork-specific schema changes — tables, columns, constraints, or
 system-content seeds (skills, flavor defaults) that this fork needs and that
-will not ship upstream. Upstream engine migrations arrive via `./sc update`
+will not ship upstream. Upstream engine migrations arrive via `sc update`
 and require no action from you.
 
 ## Authoring a migration
@@ -40,7 +40,7 @@ and require no action from you.
 
 3. **Apply locally.**
    ```bash
-   ./sc update --no-fetch
+   sc update --no-fetch
    ```
    Skips the upstream fetch; applies all pending local migrations in order.
    Confirm the migration landed:
@@ -50,19 +50,19 @@ and require no action from you.
 
 4. **Verify.**
    ```bash
-   ./sc verify
+   sc verify
    ```
    Headless boot proof — confirms shells, memory, and schema are intact.
 
 5. **Snapshot and commit.**
    ```bash
-   ./sc snapshot
+   sc snapshot
    ```
    Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
    - **Content-seed migration?** If the migration seeds *system content* that
      renders (skills, flavor defaults), it also changes the flat `_sc` mirrors —
-     but only once the new rows are in the DB. After `./sc update --no-fetch`,
-     run `./sc render && ./sc render-check` and commit the re-rendered `_sc`
+     but only once the new rows are in the DB. After `sc update --no-fetch`,
+     run `sc render && sc render-check` and commit the re-rendered `_sc`
      files alongside the migration. A render against a DB that predates the seed
      passes locally while CI's hermetic rebuild goes red. See the `snapshot`
      skill (stale-mirror trap).
@@ -80,7 +80,7 @@ and require no action from you.
 
 ## Rollback
 
-There is no per-migration rollback. `./sc rollback` restores the full DB +
+There is no per-migration rollback. `sc rollback` restores the full DB +
 engine to the prior update point (`engine.ref.prev`). Use it only when a
 migration is so broken the DB is corrupt or the app won't start. For logical
 errors, write a corrective migration instead.

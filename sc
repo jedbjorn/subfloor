@@ -22,6 +22,7 @@ _root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/n
 ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
+MAPDB="$ROOT/.sc-state/map.db"
 S="$ENGINE/scripts"
 
 port() { "$PY" "$S/ports.py" port; }
@@ -493,6 +494,12 @@ case "$cmd" in
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
+  # Raw read passthrough to the engine + map DBs, resolved by absolute path so no
+  # skill example ever needs a cwd-relative `sqlite3 .super-coder/…` (which pulls a
+  # shell into `cd`-ing to the root — the cwd trap). Writes still go via `sc mem`
+  # (triggers/caps); this is the read convenience for schema/catalogue queries.
+  sql)          exec sqlite3 "$DB" "$@" ;;
+  map-sql)      exec sqlite3 "$MAPDB" "$@" ;;
   render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
   render-check) exec "$PY" "$S/render_check.py" ;;
   map)          exec "$PY" "$S/map_repo.py" ;;
@@ -657,6 +664,8 @@ super-coder — forkable shell substrate
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
+  sc sql "<query>"         read passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
+  sc map-sql "<query>"     read passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)

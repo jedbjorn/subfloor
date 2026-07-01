@@ -779,6 +779,19 @@ def main() -> None:
     # own worktree, and must not be warned. For admin this is REPO_ROOT, but admin
     # exits the guard earlier via SC_SHELL_FLAVOR, so it never reads this.
     env["SC_SHELL_WORKTREE"] = str(work_dir)
+    # cwd-proofing (the recurring "my edits vanished" trap). The engine + its live
+    # DBs sit at the MAIN worktree root, but the harness is exec'd from the shell's
+    # own worktree (os.chdir(work_dir) below). Historically a shell would `cd` to the
+    # root for a convenient `./sc …` call — and because Bash cwd persists, every
+    # LATER bare git/grep then silently targeted the main tree (a different branch),
+    # so the shell's own worktree edits looked gone. Kill the trigger structurally:
+    # export the root and prepend it to PATH so `sc …` resolves bare from ANY cwd,
+    # and raw DB reads can address the engine by $SC_ROOT — no `cd` ever needed. One
+    # invariant ("never cd; address the engine by path") instead of per-command
+    # vigilance. Works in both the docker sandbox and the no-docker host path since
+    # run.py is the single exec chokepoint for every harness.
+    env["SC_ROOT"] = str(REPO_ROOT)
+    env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
     # Operator-declared shared dirs that all shells may write into without
     # branch-guard warnings — host-level handoff/screenshot folders. Set
     # SC_SHARED_DIRS (space-separated absolute paths) in the launch environment;

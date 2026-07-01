@@ -41,7 +41,7 @@ shortname from the branch (`shell/<shortname>`) or the commit trailer
 (`Co-Authored-By: <display_name> (super-coder)`) — the roster maps display_name
 → shortname:
 ```
-./sc mem get shells
+sc mem get shells
 ```
 
 ## Step 2: Review along the three axes
@@ -69,7 +69,7 @@ whichever area the diff touches:
 
 Each real failure is a flag against the feature — a record of what you found:
 ```
-./sc mem flag open "[Review] <what's wrong> | Blocker for: <feature>" --name SC-### --priority <High|Medium|Low> --feature <feature_id>
+sc mem flag open "[Review] <what's wrong> | Blocker for: <feature>" --name SC-### --priority <High|Medium|Low> --feature <feature_id>
 ```
 Unlike the `flags` skill's default, **do not pair an outbound message here.** The
 message is the handoff, and handoffs wait for the FnB (Step 4). Don't open flags
@@ -88,10 +88,10 @@ FnB rules on each finding — defect or intended — and approves what sends. Th
 and only then, send the approved handoff:
 ```
 # fixes (FnB-approved):
-./sc mem message send <author-shortname> "Review of <feature> done — <N> flags: SC-###, SC-###. Patch + re-push; thread closes when clean."
+sc mem message send <author-shortname> "Review of <feature> done — <N> flags: SC-###, SC-###. Patch + re-push; thread closes when clean."
 
 # new/updated spec (FnB-approved):
-./sc mem message send <planner-shortname> "Review of <feature> surfaced a spec gap — <one line>. Proposing a spec update; see SC-###."
+sc mem message send <planner-shortname> "Review of <feature> surfaced a spec gap — <one line>. Proposing a spec update; see SC-###."
 
 # clean: report to the FnB; no handoff to send.
 ```
