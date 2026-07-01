@@ -14,8 +14,8 @@ Run:
 """
 from __future__ import annotations
 
-import json
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -101,10 +101,40 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertIn("powered off", r["output"])
 
     def test_push_rejects_a_missing_source(self):
+        # In-repo but nonexistent → clean "source not found", not a crash.
         with mock.patch.object(vm, "read", return_value=SAVED):
-            r = vm.do_push("/no/such/artifact.msi")
+            r = vm.do_push(str(vm.ports.ENGINE / "no" / "such-artifact.msi"))
         self.assertFalse(r["ok"])
         self.assertIn("source not found", r["output"])
+
+    def test_push_rejects_a_src_outside_the_repo(self):
+        # A sandbox-reachable broker must not exfiltrate host files (~, absolute)
+        # into the guest share — src is contained to the bind-mounted repo.
+        with mock.patch.object(vm, "read", return_value=SAVED):
+            r = vm.do_push("~/.ssh/id_ed25519")
+        self.assertFalse(r["ok"])
+        self.assertIn("inside the repo", r["output"])
+
+    def test_push_rejects_a_dest_that_escapes_transfer_dir(self):
+        # `dest` with .. must not walk out of transfer_dir and clobber host files.
+        share = tempfile.mkdtemp(prefix="sc_share_")
+        cfg = dict(SAVED, transfer_dir=share)
+        src = str(vm.ports.ENGINE / "scripts" / "vm.py")  # a real in-repo file
+        with mock.patch.object(vm, "read", return_value=cfg):
+            r = vm.do_push(src, "../../etc/sc_escape_probe")
+        self.assertFalse(r["ok"])
+        self.assertIn("escapes transfer_dir", r["output"])
+        self.assertFalse(Path("/etc/sc_escape_probe").exists())  # nothing written
+
+    def test_push_stages_a_legit_repo_file_into_the_share(self):
+        # The contained happy path still works: in-repo src → inside the share.
+        share = tempfile.mkdtemp(prefix="sc_share_")
+        cfg = dict(SAVED, transfer_dir=share)
+        src = str(vm.ports.ENGINE / "scripts" / "vm.py")
+        with mock.patch.object(vm, "read", return_value=cfg):
+            r = vm.do_push(src, "staged.py")
+        self.assertTrue(r["ok"], r)
+        self.assertTrue((Path(share) / "staged.py").is_file())
 
     def test_capture_returns_a_base64_screenshot(self):
         def fake_run(argv, timeout=30):
