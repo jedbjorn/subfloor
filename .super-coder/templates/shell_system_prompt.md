@@ -23,14 +23,14 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
-Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
+Write as it happens, not at close. **Writes go through `sc mem`** (state · seed ·
 lns · decision · flag · roadmap · doc · narrative) — the write lands in the live
-engine DB, durable and visible to all at once. `./sc mem which` to orient. See the
+engine DB, durable and visible to all at once. `sc mem which` to orient. See the
 `memory` and `db_map` skills.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.
-If one looks wrong or out of date, the DB row is wrong — fix it via `./sc mem`.
+If one looks wrong or out of date, the DB row is wrong — fix it via `sc mem`.
 Never edit these files directly. The DB is the authoritative content.
 
 ## MANDATE
