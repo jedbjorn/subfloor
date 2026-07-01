@@ -97,14 +97,12 @@ you need. Section-first, one cheap query deep — never a full preload.
 
 ```
 # where to start (also rendered in ## CONNECTIONS below):
-sqlite3 .sc-state/map.db \
-  "SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;"
+sc map-sql "SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;"
 # a section's files — descriptions tell you which to open:
-sqlite3 .sc-state/map.db \
-  "SELECT path, desc, lines FROM dr_filepath WHERE path LIKE '<prefix>%' ORDER BY path;"
+sc map-sql "SELECT path, desc, lines FROM dr_filepath WHERE path LIKE '<prefix>%' ORDER BY path;"
 # find by area / stack / env:
-sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE path LIKE '%auth%';"
-sqlite3 .sc-state/map.db "SELECT manager, name, version FROM dr_dependency;"
+sc map-sql "SELECT path FROM dr_filepath WHERE path LIKE '%auth%';"
+sc map-sql "SELECT manager, name, version FROM dr_dependency;"
 ```
 
 Map first, grep second; lazy-load only what the map points at. If the map looks

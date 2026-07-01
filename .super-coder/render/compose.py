@@ -165,25 +165,25 @@ def render_skills(con, shell_id: int) -> str:
     ).fetchall()
     if not rows:
         return "(none)"
-    # Substrate skills load from the DB, not a harness skill dir — so they work
-    # on every harness (claude/codex/opencode/vibe), present and future, with no
-    # per-harness bridging. These are SEPARATE from and ADDITIONAL to whatever
-    # native skills your harness ships (codex's `.system` set, claude plugins,
-    # …; vibe ships none). Below: name, one-line description, and the exact query
-    # to load each skill's full procedure on demand.
+    # Each granted skill's full procedure is rendered to a flat file at
+    # `.claude/skills/<slug>/SKILL.md` (see flat.render_skill_md), rebuilt at
+    # every boot for whichever shell launches. These are SEPARATE from and
+    # ADDITIONAL to whatever native skills your harness ships (codex's `.system`
+    # set, claude plugins, …; vibe ships none). Below: name, one-line
+    # description, and the on-disk path to each skill's full procedure — a file
+    # read, never a DB query.
     lines = [
-        "Substrate skills granted to you — loaded from your memory DB, **in "
-        "addition to** any native skills your harness provides. Load a skill's "
-        "full procedure on demand with the query under it:",
+        "Substrate skills granted to you — **in addition to** any native skills "
+        "your harness provides. Each skill's full procedure is on disk at the "
+        "path under it; read that file to load the procedure — never query the "
+        "DB directly:",
         "",
     ]
     for r in rows:
         desc = (r["description"] or "").strip().splitlines()[0] if r["description"] else ""
+        slug = r["name"].strip().lower().replace(" ", "-")
         lines.append(f"- **{r['name']}** — {desc}")
-        lines.append(
-            "  - load: `sqlite3 .super-coder/shell_db.db \"SELECT content FROM "
-            f"skills WHERE name='{r['name']}' AND is_deleted=0;\"`"
-        )
+        lines.append(f"  - full procedure: `.claude/skills/{slug}/SKILL.md`")
     return "\n".join(lines)
 
 
