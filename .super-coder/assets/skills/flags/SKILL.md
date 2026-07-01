@@ -14,18 +14,18 @@ Flags tab). `<self>` = your shell_id.
 ## Surface
 
 ```
-./sc mem get flags          # your open flags (id, name, priority, description) — via the API
-./sc mem get flags --json   # same, as JSON
+sc mem get flags          # your open flags (id, name, priority, description) — via the API
+sc mem get flags --json   # same, as JSON
 ```
 
-(Each flag carries its `feature_id`; cross-reference `./sc mem get roadmap` for
+(Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
 the blocked feature's title. Reads go through the API — there is no `sqlite3`.)
 
 ## Open
 
-Write through `./sc mem` (routed through the engine API):
+Write through `sc mem` (routed through the engine API):
 ```
-./sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
+sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```
 - `--name`: short id (`SC-###`).
 - the description is `[Area] {what} | Blocker for: {what it blocks}`.
@@ -38,7 +38,7 @@ to yourself. **Every flag you open also sends a message to whoever clears it**, 
 the work lands in their inbox on their next boot (see the `messaging` skill):
 
 ```
-./sc mem message send <shortname> "Opened SC-### — <one line> (Blocker for: <x>)."
+sc mem message send <shortname> "Opened SC-### — <one line> (Blocker for: <x>)."
 ```
 
 Resolve the recipient by what the flag blocks:
@@ -56,7 +56,7 @@ already open, and don't message on `close`.
 ## Resolve
 
 ```
-./sc mem flag close <flag_id> --notes "…"
+sc mem flag close <flag_id> --notes "…"
 ```
 
 ## Stance

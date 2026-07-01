@@ -17,7 +17,7 @@ Create, persist, assign, and remove fork-specific skills — the correct authori
 Fork-specific skills live in the DB and are persisted via `.sc-state/content.sql`
 (the snapshot). The asset file under `.super-coder/assets/skills/` is used to
 **seed the skill initially** — but that directory is gitignored engine territory:
-`./sc update` materializes upstream engine files there, which removes any local
+`sc update` materializes upstream engine files there, which removes any local
 additions. After the first seed + snapshot, **content.sql is the durable form**.
 
 The correct path: **file → seed → grant → snapshot → commit**.
@@ -40,7 +40,7 @@ The correct path: **file → seed → grant → snapshot → commit**.
 
 2. **Seed the skill into the DB.**
    ```bash
-   cd <repo> && ./sc seed-skills
+   cd <repo> && sc seed-skills
    ```
    UPSERTs the skill row into the live DB by name (id-stable). Does not touch
    skills already in the DB that are absent from assets — those are other local
@@ -60,16 +60,16 @@ The correct path: **file → seed → grant → snapshot → commit**.
 
 4. **Snapshot — this is the persistence step.**
    ```bash
-   ./sc snapshot && ./sc render
+   sc snapshot && sc render
    ```
    `snapshot.py` serializes local skills (any skill whose name is not in the
    upstream engine assets) into `.sc-state/content.sql`. This is what survives
-   `./sc update` — when the engine materialize overwrites `.super-coder/assets/
+   `sc update` — when the engine materialize overwrites `.super-coder/assets/
    skills/`, the skill row and its full content are reconstructed from
    content.sql on rebuild. Without this step the skill is lost on next update.
 
 5. **Commit.**
-   Run `./sc render-check` first — it rebuilds hermetically and fails if the
+   Run `sc render-check` first — it rebuilds hermetically and fails if the
    `skills_sc/` mirror drifts from the DB render (the same CI guard; see the
    `snapshot` skill). Then stage `.sc-state/content.sql` and `skills_sc/`
    together — the snapshot without the re-rendered mirror is the drift. The asset
@@ -83,7 +83,7 @@ INSERT OR IGNORE INTO shell_skills (shell_id, skill_id)
 SELECT <shell_id>, skill_id FROM skills
 WHERE name = '<skill_name>' AND is_deleted = 0;
 ```
-Then `./sc snapshot && ./sc render` and commit.
+Then `sc snapshot && sc render` and commit.
 
 ## Removing a skill
 
@@ -96,10 +96,10 @@ Then `./sc snapshot && ./sc render` and commit.
 
 2. **Snapshot, render, commit.**
    ```bash
-   ./sc snapshot && ./sc render
+   sc snapshot && sc render
    ```
    The deletion serializes to content.sql. If the asset file still exists under
-   `.super-coder/assets/skills/`, remove it too so `./sc seed-skills` doesn't
+   `.super-coder/assets/skills/`, remove it too so `sc seed-skills` doesn't
    re-insert it.
 
 ## How the GUI organizes skills
@@ -118,21 +118,21 @@ by the same sections.
   frontmatter. A repo skill's `category` still displays as a label on its row,
   but never moves it out of the Repo section.
 - One transient caveat: while a repo skill's asset file still sits under
-  `assets/skills/` (between authoring and the next `./sc update` materialize),
+  `assets/skills/` (between authoring and the next `sc update` materialize),
   the derivation reads it as engine — it appears under its category section
   until the update wipes the asset. Harmless; the DB row is the durable thing.
 
 Grant toggles in the GUI hit the same DB table as the SQL in this skill —
-they still need a **snapshot** (header button or `./sc snapshot`) to survive
+they still need a **snapshot** (header button or `sc snapshot`) to survive
 a rebuild.
 
 ## What NOT to do
 
 - **Never skip the snapshot after creating a skill.** The asset file under
-  `.super-coder/assets/skills/` is overwritten by `./sc update`. If you seed
+  `.super-coder/assets/skills/` is overwritten by `sc update`. If you seed
   without snapshotting, the skill vanishes on the next engine update.
 - **Never edit `0001_seed_skills.sql` by hand.** It is generated; hand edits
-  are overwritten on the next `./sc seed-skills`.
+  are overwritten on the next `sc seed-skills`.
 - **Never use the GUI to create skills.** Toggling grants in the GUI is fine
   (snapshot after); creating is not — the GUI writes only to the DB and cannot
   write the asset file or seed it. Use this procedure instead.

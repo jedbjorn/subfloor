@@ -23,15 +23,15 @@ and does the work; the tailnet identity never enters the fork. (See
 `docs/tailscale-broker.md`. It is the sibling of the Windows VM broker —
 `windows_devkit` works the exact same way.)
 
-The socket path comes from `./sc ts-broker-sock`. Every verb is a `curl`:
+The socket path comes from `sc ts-broker-sock`. Every verb is a `curl`:
 
 ```bash
-SOCK="$(./sc ts-broker-sock)"
+SOCK="$(sc ts-broker-sock)"
 curl -s --unix-socket "$SOCK" http://ts/health      # liveness check first
 ```
 
 If the curl fails with "not reachable", the broker isn't running — ask the
-operator to start it on the host: `./sc ts-broker-up`. You cannot start it
+operator to start it on the host: `sc ts-broker-up`. You cannot start it
 yourself (it runs on the host, not in your sandbox).
 
 ## Precondition — the link is configured

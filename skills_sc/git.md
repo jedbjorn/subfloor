@@ -19,7 +19,7 @@ plain `git` (cwd = repo root) is safe. The discipline:
 
 **Operate on the project, never the engine.** Your project is this repo —
 everything except `.super-coder/`. The engine is a gitignored, materialized
-dependency (refreshed by `./sc update`); don't commit it or edit it as if it
+dependency (refreshed by `sc update`); don't commit it or edit it as if it
 were your code. Engine changes are authored upstream in super-coder.
 
 ## Sync before you start — a hard pre-code gate
@@ -139,7 +139,7 @@ ephemeral rollback pointer). From a shell **worktree you commit your project's
 own files** — the code/config you edited there. You do **not** hand-commit the
 serialized DB state: `.sc-state/content.sql` (the memory the `.db` rebuilds
 from), `.sc-state/engine.ref` (the engine pin), and the tracked `_sc` renders are
-written by `./sc` to the **main checkout root** (where the shared engine + DB
+written by `sc` to the **main checkout root** (where the shared engine + DB
 live), not your worktree — so they aren't even present to stage from your branch.
 Getting that text into the repo is the GUI **Publish** button (or the admin shell
 on `main`) — see 'After DB work' below. (In the super-coder SOURCE repo only,
@@ -147,9 +147,9 @@ on `main`) — see 'After DB work' below. (In the super-coder SOURCE repo only,
 
 ## After DB work — snapshot persists it; Publish puts it in the repo
 
-Your DB edits live only in the live `.db` until serialized, so run `./sc
-snapshot` (+ `./sc render` if docs/roadmap/skills changed) — that's the "save my
-work" step, so a `./sc rebuild` can't lose it. But the serialization lands at the
+Your DB edits live only in the live `.db` until serialized, so run `sc
+snapshot` (+ `sc render` if docs/roadmap/skills changed) — that's the "save my
+work" step, so a `sc rebuild` can't lose it. But the serialization lands at the
 **main checkout root**, NOT your worktree (the shared engine + DB live there), so
 don't try to commit `content.sql` or the `_sc` renders onto your branch — from a
 worktree they aren't there. Committing that text to the repo is the GUI
@@ -168,9 +168,9 @@ the `snapshot` skill.
   Parallel shells never share a cwd — worktree isolation is automatic. The
   admin shell is the one exception: it boots in the repo root on `main`.
 - Preview UI work: because you edit in your worktree, your changes do NOT show on
-  the fork's main dev server. `./sc preview` runs a router that serves every
+  the fork's main dev server. `sc preview` runs a router that serves every
   shell's worktree UI live (HMR) on the fork's `dev_port`, one subdomain each:
   `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your
   URL after each commit — surface that line to the FnB so they can eyeball the
   change. If preview isn't running, start it once from the main checkout:
-  `./sc preview`.
+  `sc preview`.

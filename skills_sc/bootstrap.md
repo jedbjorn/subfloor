@@ -30,7 +30,7 @@ cartographer's automation (see `surface_catalogue`). You read it.
    code lives, dependencies, env surface. Form a one-paragraph picture of what
    this repo *is* and how it's built.
    ```sql
-   -- the repo map is its own db: sqlite3 .sc-state/map.db "<query>"
+   -- the repo map is its own db: sc map-sql "<query>"
    SELECT name, default_branch, file_count FROM dr_repo;
    SELECT lang, COUNT(*) n FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
    SELECT path, lang, lines FROM dr_filepath WHERE role='code' ORDER BY lines DESC LIMIT 15;
@@ -45,22 +45,22 @@ cartographer's automation (see `surface_catalogue`). You read it.
 
 3. **Skim the plan.** Open roadmap features + their blocking flags, via the API:
    ```
-   ./sc mem get roadmap
-   ./sc mem get flags
+   sc mem get roadmap
+   sc mem get flags
    ```
 
 4. **Set your `current_state`** — replace the install placeholder with what you
    actually found and what you'll do first (rolling status, ~500 chars). Write it
-   through `./sc mem` (routes through the engine API; the write is live in the
+   through `sc mem` (routes through the engine API; the write is live in the
    shared DB at once):
    ```
-   ./sc mem state "…"
+   sc mem state "…"
    ```
 
 5. **Mark yourself oriented** (clears the FIRST RUN prompt for next boot). Sets
    `bootstrapped=1` in the shared DB:
    ```
-   ./sc mem oriented
+   sc mem oriented
    ```
    Then proceed with the task at hand.
 
@@ -68,4 +68,4 @@ cartographer's automation (see `surface_catalogue`). You read it.
 
 - Bootstrap once, then work — don't re-run it every session.
 - Read the map; never map. If the catalogue looks empty, stale, or wrong, that's
-  the cartographer's job to heal — raise it, don't reach for `./sc map`.
+  the cartographer's job to heal — raise it, don't reach for `sc map`.

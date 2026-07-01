@@ -8,7 +8,7 @@ common: false
 # docs — author & review documents
 
 In super-coder the **DB owns document bodies** — never loose `.md` files. A
-`documents` row is the source; `./sc render` writes the read-only flat copy to
+`documents` row is the source; `sc render` writes the read-only flat copy to
 `specs_sc/` / `docs_sc/`, and the GUI opens it rendered in md-converter.
 
 | kind | lives on | meaning |
@@ -52,18 +52,18 @@ same act (it's a planning decision, like the stage):
 
 ```
 # existing work-streams (pick the one this feature belongs to):
-./sc mem get projects
+sc mem get projects
 # is this feature already assigned? — read its row's project_id:
-./sc mem get roadmap
+sc mem get roadmap
 ```
 
 Then:
 - **New feature** → create it already assigned:
-  `./sc mem roadmap add "<title>" --project <shortname>`
+  `sc mem roadmap add "<title>" --project <shortname>`
 - **Existing + Ungrouped** → assign it:
-  `./sc mem roadmap project <feature_id> <shortname>`
+  `sc mem roadmap project <feature_id> <shortname>`
 - **No fitting work-stream exists yet** → create one, then assign:
-  `./sc mem project add <shortname> "<title>" --purpose "…"`
+  `sc mem project add <shortname> "<title>" --purpose "…"`
 - **Already correctly assigned** → **no-op**; don't churn it.
 
 **Auto-assign when the stream is obvious** (only one plausible fit, or it clearly
@@ -76,22 +76,22 @@ needs no work-stream.
 
 Before writing, see what exists — don't duplicate:
 ```
-./sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
-sqlite3 .sc-state/map.db "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
+sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
+sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
 ```
 
 ## Author
 
-Write through `./sc mem doc add` — it routes through the engine API, `--body-file` reads
+Write through `sc mem doc add` — it routes through the engine API, `--body-file` reads
 the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
 within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
 pipeline this rides on is the `snapshot` skill):
 ```
 # a doc against a feature (kind='doc'); DB owns the body:
-./sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
+sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
 
 # a feature's next spec stage (kind='spec'); seq auto-advances:
-./sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
+sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
 ## Revise before freeze
@@ -100,8 +100,8 @@ While a doc is still unfrozen, revise it in place — no new row, no seq bump.
 Pass any of `--title` / `--body-file` / `--render-path`; it renders + snapshots
 like `add`. Refused once frozen (open a new spec instead — see below):
 ```
-./sc mem doc edit <document_id> --body-file ./draft.md
-./sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
+sc mem doc edit <document_id> --body-file ./draft.md
+sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 ```
 
 ## Freeze + document on ship — the planner's handoff
@@ -122,7 +122,7 @@ skill):
    (open a new spec under the same feature instead). The GUI and render layer both
    refuse edits to frozen docs:
    ```
-   ./sc mem doc freeze <document_id>
+   sc mem doc freeze <document_id>
    ```
 2. **Read the shipped code, then write the doc.** The doc is written from
    interpretation of the code as it actually shipped — not from the spec body.
@@ -130,11 +130,11 @@ skill):
    land differently than planned. The spec captures the intent; the code is the
    truth. Read the implementation first, then write what it does:
    ```
-   ./sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
+   sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
    ```
 3. **Close the docs-pending flag** with a note pointing at the doc:
    ```
-   ./sc mem flag close <flag_id> --notes "Spec frozen; doc <document_id> written → docs_sc/<slug>.md"
+   sc mem flag close <flag_id> --notes "Spec frozen; doc <document_id> written → docs_sc/<slug>.md"
    ```
 
 Until step 3, `shipped` + the open flag is the truthful interim state: delivered,
@@ -183,7 +183,7 @@ purpose: Brief description
 | `project` | opt | ≤40 |
 | `purpose` | opt | ≤40 |
 
-`date`/`project`/`purpose` → footer meta cards. **`./sc render` injects
+`date`/`project`/`purpose` → footer meta cards. **`sc render` injects
 `feature`, `roadmap_status`, `frozen`, `rendered_by`, `source` on top of these
 — don't write those yourself.** Never use comma-separated tags (`tags: a, b`);
 always a YAML list.

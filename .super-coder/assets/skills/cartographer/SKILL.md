@@ -2,7 +2,7 @@
 name: cartographer
 description: Own the repo map. Configure mapping to THIS repo, wire the auto-remap git hooks, and heal both when the repo or automation drifts. The cartographer's job alone — no working shell maps. Run on first boot, and again whenever the map looks wrong.
 category: substrate
-command: ./sc map-setup
+command: sc map-setup
 common: false
 ---
 
@@ -15,30 +15,30 @@ yours alone. You do three things: **configure** how this repo is mapped,
 
 The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
 engine memory db (`shell_db.db`) so an engine schema change never touches the
-map. Every `dr_*` query below runs against it: `sqlite3 .sc-state/map.db "…"`.
+map. Every `dr_*` query below runs against it: `sc map-sql "…"`.
 Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
-`./sc snapshot` and reloaded on a fresh map db.
+`sc snapshot` and reloaded on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
 ## How the map stays fresh (so you know what you own)
 
-- **Git hooks** (`post-merge`, `post-checkout`, `post-rewrite`) re-run `./sc map`
+- **Git hooks** (`post-merge`, `post-checkout`, `post-rewrite`) re-run `sc map`
   on every pull / branch-switch / rebase. They live tracked in
   `.super-coder/hooks/` and fire via `core.hooksPath` — a per-clone git setting
-  that `./sc map-setup` wires. This is the routine refresh; no shell touches it.
-- **`./sc rebuild`** re-maps too (the map is a derived cache; rebuilding the DB
+  that `sc map-setup` wires. This is the routine refresh; no shell touches it.
+- **`sc rebuild`** re-maps too (the map is a derived cache; rebuilding the DB
   rebuilds it). So a fresh rebuild never leaves an empty map.
 - **Hourly cron** — pm2 runs `sc-map-<repo>` on a `cron_restart` schedule
   (`.super-coder/ecosystem.config.cjs`), re-mapping every hour while the stack is
-  up (`./sc up`). This is the belt to the hooks' suspenders: it catches
+  up (`sc up`). This is the belt to the hooks' suspenders: it catches
   uncommitted local restructuring the git hooks can't see, so the map stays live
   unattended. Verify it: `pm2 list | grep sc-map` (state cycles stopped→online on
   each tick — that's the one-shot pattern, not a crash).
 - **You** set the per-repo *config*, install the hook wiring, build the
   extractors, and repair all of it. `core.hooksPath` is unset on a fresh clone
   until `map-setup` runs, and a fork that doesn't run pm2 has no cron — the git
-  hooks still cover those, and a manual `./sc map` always works.
+  hooks still cover those, and a manual `sc map` always works.
 
 ## First boot — configure mapping for THIS repo
 
@@ -52,7 +52,7 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    generated/vendored dir being indexed that shouldn't be?
 
 2. **Author `.sc-state/map.config.json`** to fit what's actually here. It is
-   *authored content* (tracked, per-fork, survives `./sc update` — it lives in
+   *authored content* (tracked, per-fork, survives `sc update` — it lives in
    `.sc-state/`, outside the gitignored engine dir). All keys optional; each
    merges over `map_repo.py`'s built-in defaults:
    ```json
@@ -72,7 +72,7 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    Only add what the defaults get wrong — an empty/absent config is fine for a
    plain repo.
 
-3. **Wire + map:** `./sc map-setup` — points `core.hooksPath` at
+3. **Wire + map:** `sc map-setup` — points `core.hooksPath` at
    `.super-coder/hooks/`, marks the hooks executable, and runs the initial map.
 
 4. **Verify** the automation is real, not just the file:
@@ -91,7 +91,7 @@ Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
    empty when you leave.
 
 6. **Commit** the config + hooks (`git` skill), set your state
-   (`./sc mem state "…"`), then `./sc mem oriented` (sets `bootstrapped=1` +
+   (`sc mem state "…"`), then `sc mem oriented` (sets `bootstrapped=1` +
    snapshots).
 
 ## Heal — re-run any time the map looks wrong
@@ -102,7 +102,7 @@ clone where the hooks never got wired.
 
 1. Re-inspect (step 1) — what changed?
 2. Edit `.sc-state/map.config.json` to match (step 2).
-3. `./sc map-setup` — re-wires hooks (idempotent) + re-maps.
+3. `sc map-setup` — re-wires hooks (idempotent) + re-maps.
 4. Verify (step 4). `dr_filepath` stale entries are pruned automatically by the
    remap — paths that vanished from the repo are deleted from the catalogue.
 5. **Check stale sections.** `dr_section` is authored and never auto-pruned.
@@ -186,7 +186,7 @@ VALUES ('App DB', '<db dir>/', 'Product runtime database — schema + migrations
 
 If this fork ships no database of its own, there is nothing to tag — skip it.
 
-After a curation pass, `./sc snapshot` (sections are snapshotted; descriptions
+After a curation pass, `sc snapshot` (sections are snapshotted; descriptions
 ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
 
 ## Extending the map — semantic extractors
@@ -196,8 +196,8 @@ env. The **semantic** dimensions — HTTP endpoints (`dr_endpoint`), the app DB
 schema (`dr_db_table`/`dr_db_column`), UI routes/components (`dr_route`/
 `dr_component`) — vary by stack, so the engine can't extract them generically.
 That is your job, via **extractors**: drop-in Python modules in
-`.sc-state/map_extractors/*.py` that `./sc map` discovers and runs after the core
-pass. They are fork-owned (outside the gitignored engine dir, so `./sc update`
+`.sc-state/map_extractors/*.py` that `sc map` discovers and runs after the core
+pass. They are fork-owned (outside the gitignored engine dir, so `sc update`
 never clobbers them); the table *columns* are standardized in the engine
 (`map_schema.sql`), so a working shell's queries have a stable shape everywhere.
 
@@ -214,9 +214,9 @@ never clobbers them); the table *columns* are standardized in the engine
    Adapt the `framework` label and file filter to this repo. For a stack none
    cover (Django URLs, Express, Spring, Rails), copy the closest as a skeleton
    and rewrite the match — aim for the dominant pattern, not 100%.
-3. **Run + verify:** `./sc map`, then check the table populated and the rows look
+3. **Run + verify:** `sc map`, then check the table populated and the rows look
    right (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Commit** `.sc-state/map_extractors/` + `./sc snapshot`.
+4. **Commit** `.sc-state/map_extractors/` + `sc snapshot`.
 
 **The contract** (full version in `templates/map_extractors/README.md`): each
 module defines `extract(con, repo_root, cfg) -> str`. `con` is the live map db
@@ -259,7 +259,7 @@ WHERE desc IS NULL AND path LIKE 'region/%' ORDER BY role, path;
 -- 3. do they form / join a section? curate dr_section if the region is a new area.
 ```
 
-Then `./sc snapshot` and `--message mark-read <id>` (see the `messaging` skill).
+Then `sc snapshot` and `--message mark-read <id>` (see the `messaging` skill).
 The mechanical remap already ran via the hook; your job on the notice is purely
 the authored layer — describe the new leaves, section a new area. Scope is free:
 `desc IS NULL` already narrows to exactly the uncurated tail.
