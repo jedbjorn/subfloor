@@ -139,6 +139,16 @@ def rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def _json_default(o):
+    # SQLite hands back bytes for BLOB columns (and for TEXT rows written as
+    # bytes by some path); json.dumps can't serialize them and 500s the whole
+    # endpoint. Decode UTF-8 with a lossy fallback so one stray bytes value
+    # never takes down a read.
+    if isinstance(o, (bytes, bytearray)):
+        return bytes(o).decode("utf-8", "replace")
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 # ── Data assembly ─────────────────────────────────────────────────────────────
 
 def get_shells(con) -> list[dict]:
@@ -860,7 +870,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "super-coder/1.0"
 
     def _send(self, code, payload, ctype="application/json"):
-        body = (json.dumps(payload) if ctype.startswith("application/json")
+        body = (json.dumps(payload, default=_json_default)
+                if ctype.startswith("application/json")
                 else payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
