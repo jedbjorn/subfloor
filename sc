@@ -645,7 +645,7 @@ case "$cmd" in
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
     "$PY" "$S/rebuild.py"
-    "$PY" "$S/render.py" flat
+    SC_ADMIN=1 "$PY" "$S/render.py" flat
     RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
   clean-db)     rm -f "$DB" "$DB-wal" "$DB-shm" && echo "removed $DB (rebuild with: ./sc rebuild)" ;;
