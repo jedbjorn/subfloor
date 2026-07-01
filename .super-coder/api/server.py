@@ -996,11 +996,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"decisions": ds})
 
             if path == "/_sc/mem/flags":
+                # Shared: flags coordinate the project, not one shell's memory —
+                # return every open flag in the fleet, tagged with its author's
+                # shortname so a caller can tell whose blocker it is.
                 fs = rows(con.execute(
-                    "SELECT flag_id, display_name, priority, description, feature_id, "
-                    "created_date FROM flags "
-                    "WHERE shell_id=? AND COALESCE(resolved,0)=0 AND COALESCE(is_deleted,0)=0 "
-                    "ORDER BY created_date, flag_id", (sid,)))
+                    "SELECT f.flag_id, f.display_name, f.priority, f.description, "
+                    "f.feature_id, f.created_date, s.shortname AS owner FROM flags f "
+                    "LEFT JOIN shells s ON s.shell_id=f.shell_id "
+                    "WHERE COALESCE(f.resolved,0)=0 AND COALESCE(f.is_deleted,0)=0 "
+                    "ORDER BY f.created_date, f.flag_id"))
                 return self._send(200, {"flags": fs})
 
             if path == "/_sc/mem/roadmap":
@@ -1304,11 +1308,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             # PATCH /_sc/mem/flags/{id}
+            # Shared: flags coordinate a project, not one shell's memory — any
+            # authenticated shell may resolve/edit any flag. Authorship stays
+            # on the row's shell_id (set at open).
             if len(parts) == 4 and parts[2] == "flags":
                 fid = int(parts[3])
                 if not con.execute(
-                        "SELECT 1 FROM flags WHERE flag_id=? AND shell_id=? "
-                        "AND COALESCE(is_deleted,0)=0", (fid, sid)).fetchone():
+                        "SELECT 1 FROM flags WHERE flag_id=? "
+                        "AND COALESCE(is_deleted,0)=0", (fid,)).fetchone():
                     return self._send(404, {"error": "no such flag"})
                 if body.get("resolved"):
                     body.setdefault("resolved_date", date.today().isoformat())
@@ -1317,11 +1324,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/roadmap/{id}
+            # Shared board (matches the fleet-wide GET /roadmap): any shell may
+            # advance a feature it did not author — planner→dev handoff needs
+            # this. owning_shell records the author and is left untouched.
             if len(parts) == 4 and parts[2] == "roadmap":
                 fid = int(parts[3])
                 if not con.execute(
-                        "SELECT 1 FROM roadmap WHERE feature_id=? AND owning_shell=?",
-                        (fid, sid)).fetchone():
+                        "SELECT 1 FROM roadmap WHERE feature_id=?",
+                        (fid,)).fetchone():
                     return self._send(404, {"error": "no such feature"})
                 # work-stream assignment: shortname|id|none → project_id
                 if "project" in body:
@@ -1354,11 +1364,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/tasks/{id}
+            # Shared: a spec's task plan is collaborative (the builder starts/
+            # completes tasks the planner laid in). shell_id records who added
+            # the task and is left untouched.
             if len(parts) == 4 and parts[2] == "tasks":
                 tid = int(parts[3])
                 if not con.execute(
-                        "SELECT 1 FROM spec_tasks WHERE task_id=? AND shell_id=?",
-                        (tid, sid)).fetchone():
+                        "SELECT 1 FROM spec_tasks WHERE task_id=?",
+                        (tid,)).fetchone():
                     return self._send(404, {"error": "no such task"})
                 if body.get("status") == "done":
                     body.setdefault("completed_date", date.today().isoformat())
@@ -1367,13 +1380,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/docs/{id}/freeze — must precede the bare /docs/{id} check
+            # Shared: specs/docs are collaborative (matches the fleet-wide GET
+            # /documents); any shell may freeze/edit regardless of the feature's
+            # authoring shell.
             if len(parts) == 5 and parts[2] == "docs" and parts[4] == "freeze":
                 did = int(parts[3])
                 r = con.execute(
-                    "SELECT d.frozen FROM documents d "
-                    "JOIN roadmap r ON r.feature_id=d.feature_id "
-                    "WHERE d.document_id=? AND r.owning_shell=?",
-                    (did, sid)).fetchone()
+                    "SELECT frozen FROM documents WHERE document_id=?",
+                    (did,)).fetchone()
                 if r is None:
                     return self._send(404, {"error": "no such document"})
                 if r[0]:
@@ -1388,10 +1402,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[2] == "docs":
                 did = int(parts[3])
                 if not con.execute(
-                        "SELECT 1 FROM documents d "
-                        "JOIN roadmap r ON r.feature_id=d.feature_id "
-                        "WHERE d.document_id=? AND r.owning_shell=?",
-                        (did, sid)).fetchone():
+                        "SELECT 1 FROM documents WHERE document_id=?",
+                        (did,)).fetchone():
                     return self._send(404, {"error": "no such document"})
                 ok, err = patch_document(con, did, body)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
