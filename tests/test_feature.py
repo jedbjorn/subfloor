@@ -76,6 +76,17 @@ class RegistryIntegrityTest(unittest.TestCase):
                 self.assertTrue(f.get("link"),
                                 f"operator-linked feature '{name}' has no link steps")
 
+    def test_blockless_features_are_procedure_only(self):
+        # block: None = no infrastructure half — enable/disable must never
+        # touch instance.json for these, so block_auto cannot be True and the
+        # link steps are the whole how-to.
+        for name, f in feature.FEATURES.items():
+            if f["block"] is None:
+                self.assertFalse(f["block_auto"],
+                                 f"block-less feature '{name}' cannot auto-create a block")
+                self.assertTrue(f.get("link"),
+                                f"block-less feature '{name}' has no link steps")
+
     def test_pg_block_matches_pg_init(self):
         # `./sc pg-init` (in the sc dispatcher) and `feature enable pg` write the
         # same instance.json key — if this drifts, launch won't see the sidecar.

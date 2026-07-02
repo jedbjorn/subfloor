@@ -9,6 +9,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 > The substrate's skill catalogue, rendered from the DB. Per-shell grants live in `.claude/skills/` (rebuilt at boot).
 
 - [`api-design`](skills_sc/api-design.md) — REST/HTTP API design patterns — resource naming, status codes, pagination, filtering, errors, versioning, idempotency. Use when designing or reviewing API endpoints.
+- [`app_deploy_setup`](skills_sc/app_deploy_setup.md) — Admin-run, one-time scaffold — turn the shipped deploy template into this repo's own project-local `deploy` skill (migration dirs, DB backup, ff-only sync, apply + move migrations, restart), then grant it to every shell.
 - [`blueprint`](skills_sc/blueprint.md) — Turn a one-line objective into a sequenced construction plan — decompose into steps, find the dependency order, mark what can run in parallel, name the verification gate. Use before multi-step builds.
 - [`bootstrap`](skills_sc/bootstrap.md) — First-run orientation for a shell in a repo. Run ONCE when the boot doc shows "## FIRST RUN" (bootstrapped=0). Read the repo map + your identity, set your current_state, mark yourself oriented. Do this BEFORE other work on a fresh fork.
 - [`cartographer`](skills_sc/cartographer.md) — Own the repo map. Configure mapping to THIS repo, wire the auto-remap git hooks, and heal both when the repo or automation drifts. The cartographer's job alone — no working shell maps. Run on first boot, and again whenever the map looks wrong.

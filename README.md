@@ -558,7 +558,7 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
-./sc feature             # opt-in features: list / enable / disable (pg · windows · tailnet)
+./sc feature             # opt-in features: list / enable / disable (pg · windows · tailnet · app-deploy)
 ./sc eject               # ONE-WAY: own the engine — stop tracking upstream (confirm-gated)
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
 ./sc help                # all commands
@@ -646,6 +646,7 @@ front door to the pair:
 | **`pg`** | `pg` (auto-created) | `test_authoring_pg` → dev, reviewer | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — develop + test the fork's **app** against real Postgres (the engine DB stays SQLite, always) |
 | **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) |
 | **`tailnet`** | `ts` (operator-linked) | `tailscale` → devops | The tailnet broker — reach declared build/deploy hosts from the sandbox without holding a tailnet credential (section after) |
+| **`app-deploy`** | — (procedure-only) | `app_deploy_setup` → admin | A deploy-ritual scaffold for the fork's **app** (the engine deploys itself via `sc update`) — the admin fills the template (migration dirs, DB backup, ff-only sync, apply + move migrations, restart) and saves it as the repo's own project-local `deploy` skill, granted to every shell |
 
 `enable pg` is complete in one step — the sidecar needs no host input, so the
 block is auto-created and the next `./sc launch` starts it (data persists in a
@@ -653,6 +654,10 @@ named volume; `./sc pg-down` stops it, volume retained). `windows` and
 `tailnet` are **link-only**: their blocks carry host-specific, operator-verified
 config (a ready VM, a tailnet scope), so `enable` grants the skills and prints
 exactly how to link — the two sections below are the full setup guides.
+`app-deploy` has no config block at all: `enable` grants the scaffold skill to
+the admin shell, and the finished product is a **project-local** skill — engine
+skills self-heal to the shipped body on every `sc update`, so the fleshed-out
+ritual must live under a name the engine doesn't ship.
 
 Everything here can still be done by hand — the GUI's per-shell grant toggles
 and a hand-edited `instance.json` are the same mechanisms; `./sc feature` just
