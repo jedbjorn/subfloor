@@ -37,6 +37,7 @@ ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 BACKUP_DIR = Path.home() / "db_backups" / "super-coder"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import engine_manifest  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, prune_backups, KEEP_BACKUPS)
 import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
 
@@ -79,10 +80,17 @@ def restore_engine(prev_sha: str) -> None:
         update_mod.git("fetch", remote)
         update_mod.materialize_engine(prev_sha)
     ENGINE_REF.write_text(prev_sha + "\n")
+    # Re-baseline the hash manifest at the restored engine — without this, the
+    # next update would read every rolled-back file as a "local edit" and block.
+    engine_manifest.write_manifest(update_mod._engine_paths_at(prev_sha))
     print(f"→ engine re-materialized at {prev_sha[:12]} (engine.ref restored)")
 
 
 def main() -> int:
+    if update_mod.EJECTED_MARKER.exists() and not update_mod.is_source_repo():
+        sys.exit("rollback: this fork has EJECTED (.sc-state/ejected) — the "
+                 "engine is fork source now, so update/rollback no longer apply. "
+                 "Use plain git (revert/reset) on the tracked .super-coder/.")
     src = latest_db_restore_point()
     if src is None:
         sys.exit("rollback: no shell_db.prerebuild.*.db restore point found in "

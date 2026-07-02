@@ -489,6 +489,8 @@ case "$cmd" in
   update)            exec "$PY" "$S/update.py" "$@" ;;
   update-harnesses) exec "$PY" "$S/install.py" --update-harnesses ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
+  feature)      exec "$PY" "$S/feature.py" "$@" ;;
+  eject)        exec "$PY" "$S/eject.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
@@ -656,9 +658,13 @@ super-coder — forkable shell substrate
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
-  ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map); --no-fetch to skip fetch
+  ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
+                             --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
   ./sc update-harnesses    update claude + opencode + codex + vibe to latest (force-reruns official installers)
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
+  ./sc feature             list the opt-in features (pg · windows · tailnet) and the state of both halves (config block + skill grants)
+  ./sc feature enable <f>  enable one: grant its skills to the owning flavors + create/point-at its instance.json block (disable reverses)
+  ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql

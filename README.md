@@ -456,8 +456,19 @@ new floor.
 
 - `./sc update --no-fetch` reconciles against the current working tree (offline /
   dev) — engine + `engine.ref` unchanged. `--branch <name>` to track a non-`main`
-  engine branch.
+  engine branch. `--ref <tag|sha>` pins the materialize to a specific upstream
+  version instead of the branch head — hold a fork at a known-good engine and
+  move deliberately.
 - Missing remote? `git remote add super-coder https://github.com/jedbjorn/super-coder.git`
+
+> [!class4]
+> **Local engine edits block the update — never silently overwritten.** The
+> materialize is a wholesale overwrite, so the engine keeps a hash manifest
+> (written at install and after every materialize) and `./sc update` refuses
+> when an engine file was locally modified since — listing the files and the
+> real options: revert the edit, **upstream it** (PR super-coder — the strong
+> default), `--force` to knowingly discard it, or `./sc eject` to own the
+> engine outright (see *Customize a fork vs diverge from it*, next).
 
 ### Roll back a bad update
 
@@ -475,6 +486,59 @@ only data lost is anything written between the update and the rollback.
 > [!class4]
 > **The contract:** every schema change *after* a fork exists ships as a `migrations/NNNN_*.sql` file, never an edit to `schema.sql` — the migration ledger is what carries a delta across to an existing fork. Additive where you can make it.
 
+## Customize a fork vs diverge from it
+
+> [!class2]
+> **UI** — a policy, not a tab · **Shells** admin (owns the engine boundary)
+
+The engine/fork boundary draws a clean decision rule for the question every
+fork operator eventually asks: *"the engine doesn't do what I need — now what?"*
+
+**Customize (the default — track upstream forever).** As long as what you need
+fits the **fork-owned extension points**, you never touch engine files, and
+`./sc update` keeps delivering fixes, migrations, and new skills indefinitely:
+
+| Extension point | What it carries |
+|---|---|
+| **Local skills** | Fork-authored procedures (GUI → Skills) — serialized in `content.sql`, survive every update |
+| **`instance.json`** | Per-fork config: ports, harness default, the `pg` / `vm` / `ts` opt-in blocks |
+| **`.sc-state/`** | Your memory (content.sql), map tuning, engine pin — the fork's one tracked artifact |
+| **Per-shell identity** | `current_state`, connections, decisions, seed — all DB rows, all yours |
+| **Your project** | Everything outside `.super-coder/` — the engine never touches it |
+
+**Upstream (when the extension points don't reach).** Need an actual engine
+change? **PR it to super-coder first.** If one fork needs it, the next fork
+probably does too — that's how the engine grows (dos-arch is exactly this
+proving-ground loop). Your fork then picks the change up through a normal
+`./sc update`, still on the lifeline.
+
+**Diverge (`./sc eject` — the one-way door).** Only when the change is
+genuinely yours and upstream would rightly not take it. Eject flips the model:
+`.super-coder/` becomes **fork source** — un-gitignored, committed, edited like
+any other code — and the upstream lifeline is cut for good:
+
+```linear
+Extension points fit :::class3 -> Upstream the change :::class1 -> Eject :::class4
+```
+
+```bash
+./sc eject          # interactive warning + typed confirmation, then stages the flip
+```
+
+What it does: drops the `/.super-coder/` gitignore rule (engine runtime files —
+DB, `instance.json`, `run/`, `logs/` — stay ignored), deletes the engine pin
+(`engine.ref`), writes a `.sc-state/ejected` marker recording the SHA you
+diverged at, removes the `super-coder` remote (`--keep-remote` to keep it for
+reference), and stages everything. **Committing stays yours** — review the diff
+first. After eject, `./sc update` and `./sc rollback` refuse (the marker);
+launch, enter, snapshot, render, and the GUI work unchanged.
+
+> [!class4]
+> **What you give up, permanently:** upstream fixes, schema migrations, and new
+> catalogue skills stop flowing — every engine change from here on is yours to
+> author and maintain. Re-adopting upstream later is a manual re-fork, not a
+> command. Exhaust the first two lanes before taking the third.
+
 ## Run (everyday)
 
 > [!class2]
@@ -491,8 +555,10 @@ only data lost is anything written between the update and the rollback.
 ./sc render-check        # fail if the committed _sc files drift from the DB render (CI guard)
 ./sc snapshot            # serialize per-instance tables → .sc-state/content.sql
 ./sc preview             # live worktree UI previews, one subdomain per shell
-./sc update              # fetch + materialize the engine, reconcile in place
+./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
+./sc feature             # opt-in features: list / enable / disable (pg · windows · tailnet)
+./sc eject               # ONE-WAY: own the engine — stop tracking upstream (confirm-gated)
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
 ./sc help                # all commands
 ```
@@ -554,6 +620,42 @@ a web GUI. Never restart the host stack from inside the sandbox; run your own
 instance instead. (The boot doc's `RUNNING THE APP` section and the `dev_kit` skill
 carry the full detail. For the FnB-facing review of a shell's UI changes, use
 `./sc preview` — see *How shells share one repo*.)
+
+## Opt-in features
+
+> [!class2]
+> **UI** Shells (skill grants) · Scripts (VM wizard) · **Shells** varies per feature
+
+Beyond the core loop, the engine ships **opt-in features** — capabilities every
+fork receives but none has on by default. Each one is the same pair underneath:
+a **config block** in the gitignored `.super-coder/instance.json` (enables the
+infrastructure — a sidecar container, a host-side broker) and **skill grants**
+(`common=0` — the skills ship to every fork's catalogue but auto-grant to no
+shell; the grant puts the procedure in the right hands). `./sc feature` is the
+front door to the pair:
+
+```bash
+./sc feature                 # list the features + the state of both halves
+./sc feature enable pg       # grant the skills to the owning flavors + wire the config
+./sc feature disable pg      # reverse it (other shells' grants untouched)
+```
+
+| Feature | Config block | Skills → flavors | What it gives the fork |
+|---|---|---|---|
+| **`pg`** | `pg` (auto-created) | `test_authoring_pg` → dev, reviewer | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — develop + test the fork's **app** against real Postgres (the engine DB stays SQLite, always) |
+| **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) |
+| **`tailnet`** | `ts` (operator-linked) | `tailscale` → devops | The tailnet broker — reach declared build/deploy hosts from the sandbox without holding a tailnet credential (section after) |
+
+`enable pg` is complete in one step — the sidecar needs no host input, so the
+block is auto-created and the next `./sc launch` starts it (data persists in a
+named volume; `./sc pg-down` stops it, volume retained). `windows` and
+`tailnet` are **link-only**: their blocks carry host-specific, operator-verified
+config (a ready VM, a tailnet scope), so `enable` grants the skills and prints
+exactly how to link — the two sections below are the full setup guides.
+
+Everything here can still be done by hand — the GUI's per-shell grant toggles
+and a hand-edited `instance.json` are the same mechanisms; `./sc feature` just
+makes the pair one visible, one-command surface.
 
 ## Windows Test VM (opt-in)
 
@@ -695,8 +797,9 @@ Re-provisioning later is delete-then-recreate the `clean` snapshot — and nothi
 default `qemu:///session` can't see it); omit it otherwise.
 
 **6 · Grant the skills + start the broker.** Both skills are engine `common=0` — they
-propagate to every fork but **auto-grant to none**. Grant `windows_devkit` to the dev
-+ reviewer shells and `configure_winbox` to admin (per fork). The broker comes up
+propagate to every fork but **auto-grant to none**. `./sc feature enable windows`
+grants them in one step (`windows_devkit` → dev + reviewer, `configure_winbox` →
+admin); or toggle them per shell in the GUI. The broker comes up
 automatically with `./sc launch` when a VM is linked; or drive it directly:
 
 ```bash
@@ -770,6 +873,8 @@ parameterized by `{host, command}` and the `ts` block carries a fail-closed
 declared. Config lives under a `ts` key in the gitignored
 `.super-coder/instance.json` (**no secrets** — the host node's identity is the
 credential and never leaves the host), coexisting with the `vm` block.
+`./sc feature enable tailnet` grants the `tailscale` skill to devops shells;
+the `ts` block itself is yours to fill (link-only, like the VM).
 
 ```bash
 ./sc ts-broker-up            # start backgrounded (also auto-started by ./sc launch when a tailnet is linked)

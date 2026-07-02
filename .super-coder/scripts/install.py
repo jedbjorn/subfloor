@@ -49,6 +49,7 @@ PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import engine_manifest  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
 
@@ -590,6 +591,11 @@ def main(argv: list[str]) -> int:
     pinned = pin_engine()
     print(f"  pinned engine.ref at {pinned[:12]}" if pinned
           else "  (could not resolve upstream ref — `./sc update` will pin it)")
+    # First engine hash manifest: the checkout just brought the engine in, so
+    # disk == upstream right now. From here, `./sc update` detects (and refuses
+    # to silently overwrite) any local edit to an engine file.
+    n = engine_manifest.write_manifest(engine_manifest.ENGINE_PATHS)
+    print(f"  engine manifest written ({n} files) — local engine edits now detected on update")
 
     # 3.6 Create the shared scratch / handoff dir -----------------------------
     # A host-repo dir for screenshots, drafts, quick handoffs. The CONNECTIONS
