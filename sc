@@ -450,6 +450,78 @@ sc_ts_broker_uninstall() {
   echo "→ ts-broker systemd unit removed ($TS_BROKER_UNIT)"
 }
 
+# ── pm2 broker (HOST-side; observes + manages the host's pm2 stack) ───────────
+# Third sibling of the vm/ts brokers: the sandbox has no pm2 binary and no route
+# to the host's 127.0.0.1-bound ports, but an admin shell owns the fork's infra
+# and needs to see + bounce the pm2-supervised app (deploy confirmation). This
+# host process owns pm2 and listens on a unix socket in the bind-mounted engine
+# dir so the `pm2` skill (in the container) can curl it. Every verb is
+# fail-closed on the `pm2` block's `processes` allowlist. Refuses to run in the
+# sandbox (pm2_broker.py guards on SC_SANDBOX). Same supervision model as its
+# siblings: `launch` brings it up / `down` stops it when a stack is linked;
+# `pm2-broker-install` writes a systemd --user unit for reboot-survival. `up`
+# no-ops when the socket already answers; `down` only stops what IT started.
+PM2_BROKER_PID="$ENGINE/run/pm2-broker.pid"
+PM2_BROKER_UNIT="sc-pm2-broker-$(basename "$here").service"
+
+sc_pm2_broker_alive() {
+  sock="$("$PY" "$S/pm2.py" sock)"
+  [ -S "$sock" ] || return 1
+  curl -s --unix-socket "$sock" http://pm2/health 2>/dev/null | grep -q '"ok": true'
+}
+sc_pm2_broker_up() {
+  if ! "$PY" "$S/pm2.py" configured; then
+    echo "→ pm2-broker: no process stack linked (instance.json has no \`pm2\` block) — nothing to serve"; return 0
+  fi
+  if sc_pm2_broker_alive; then echo "→ pm2-broker already serving $("$PY" "$S/pm2.py" sock)"; return 0; fi
+  mkdir -p "$ENGINE/run"
+  nohup "$PY" "$ENGINE/api/pm2_broker.py" >"$ENGINE/run/pm2-broker.log" 2>&1 &
+  echo $! > "$PM2_BROKER_PID"
+  echo "→ pm2-broker up (pid $!) · socket $("$PY" "$S/pm2.py" sock) · log $ENGINE/run/pm2-broker.log"
+}
+sc_pm2_broker_down() {
+  if [ -f "$PM2_BROKER_PID" ] && kill -0 "$(cat "$PM2_BROKER_PID" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$PM2_BROKER_PID")" && echo "→ pm2-broker stopped"
+  elif sc_pm2_broker_alive; then
+    echo "→ pm2-broker is running but not from \`pm2-broker-up\` (systemd?) — leaving it; use pm2-broker-uninstall"
+  else
+    echo "→ pm2-broker not running"
+  fi
+  rm -f "$PM2_BROKER_PID"
+}
+sc_pm2_broker_install() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ pm2-broker-install: systemd (systemctl) not found on this host" >&2; return 1; }
+  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/$PM2_BROKER_UNIT" <<UNIT
+[Unit]
+Description=super-coder pm2-broker ($(basename "$here")) — host-side pm2 broker
+After=network.target
+
+[Service]
+ExecStart=$PY $ENGINE/api/pm2_broker.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+  # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
+  sc_pm2_broker_down >/dev/null 2>&1 || true
+  systemctl --user enable --now "$PM2_BROKER_UNIT"
+  echo "→ pm2-broker installed as systemd --user unit: $PM2_BROKER_UNIT (enabled, started, linger on)"
+  echo "  status: systemctl --user status $PM2_BROKER_UNIT   ·   logs: journalctl --user -u $PM2_BROKER_UNIT"
+}
+sc_pm2_broker_uninstall() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ pm2-broker-uninstall: systemd not found" >&2; return 1; }
+  systemctl --user disable --now "$PM2_BROKER_UNIT" 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$PM2_BROKER_UNIT"
+  systemctl --user daemon-reload
+  echo "→ pm2-broker systemd unit removed ($PM2_BROKER_UNIT)"
+}
+
 # ── Postgres sidecar (HOST-side Docker container on $SC_NET — APP-ONLY) ───────
 # A named postgres:17 container alongside the sandbox on SC_NET. The sandbox
 # reaches it by hostname ($PGNAME) with DATABASE_URL forwarded in, so the fork's
@@ -558,6 +630,13 @@ case "$cmd" in
   ts-broker-sock)    exec "$PY" "$S/ts.py" sock ;;
   ts-broker-install)   sc_ts_broker_install ;;
   ts-broker-uninstall) sc_ts_broker_uninstall ;;
+  # ── pm2 broker (HOST-side primitive — runs where pm2 + the app live) ──
+  pm2-broker)         exec "$PY" "$ENGINE/api/pm2_broker.py" "$@" ;;
+  pm2-broker-up)      sc_pm2_broker_up ;;
+  pm2-broker-down)    sc_pm2_broker_down ;;
+  pm2-broker-sock)    exec "$PY" "$S/pm2.py" sock ;;
+  pm2-broker-install)   sc_pm2_broker_install ;;
+  pm2-broker-uninstall) sc_pm2_broker_uninstall ;;
   # ── Postgres sidecar (app-only) ──
   pg-init)      sc_pg_init ;;
   pg-up)        sc_pg_up ;;
@@ -667,6 +746,8 @@ case "$cmd" in
     sc_vm_broker_up || true
     # Same for the tailnet broker — self-skips when no `ts` block is linked.
     sc_ts_broker_up || true
+    # Same for the pm2 broker — self-skips when no `pm2` block is linked.
+    sc_pm2_broker_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
@@ -674,6 +755,7 @@ case "$cmd" in
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
+                sc_pm2_broker_down
                 sc_pg_down ;;
   restart)      "$0" down; exec "$0" launch "$@" ;;
   build)        dcheck; dbuild ;;
@@ -754,6 +836,17 @@ super-coder — forkable shell substrate
   ./sc ts-broker-sock      print the broker's socket path
   ./sc ts-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc ts-broker-uninstall remove the systemd unit
+
+  pm2 broker (run on the HOST — lets a sandboxed shell observe + manage the
+  host's pm2-supervised app stack: status, health, logs, restart — fail-closed
+  on the `pm2` block's `processes` allowlist. See .super-coder/docs/pm2-broker.md).
+  `launch` brings it up when a stack is linked:
+  ./sc pm2-broker          run the broker in the foreground (unix socket)
+  ./sc pm2-broker-up       start it in the background (nohup + pidfile); self-skips if unlinked/already up
+  ./sc pm2-broker-down     stop the backgrounded broker
+  ./sc pm2-broker-sock     print the broker's socket path
+  ./sc pm2-broker-install  supervise via a systemd --user unit (survives logout/reboot)
+  ./sc pm2-broker-uninstall remove the systemd unit
 
   Postgres sidecar (app-only; docker container on SC_NET, data in a named volume).
   For developing/testing the fork's APP against real Postgres in the sandbox — the
