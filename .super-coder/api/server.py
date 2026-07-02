@@ -1196,19 +1196,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, {"task_id": cur.lastrowid})
 
             if path == "/_sc/mem/docs":
+                # feature_id is OPTIONAL — standalone (feature-less) docs are part
+                # of the contract: the docs/onboard skills and `sc mem doc add`
+                # document them, and forks carry them. The seq scope is per
+                # (feature, kind), with NULL its own scope (`IS ?` matches NULL).
                 fid = body.get("feature_id")
-                if fid is None:
-                    return self._send(400, {"error": "feature_id required"})
+                fid = int(fid) if fid is not None else None
                 kind = body.get("kind") or "spec"
                 seq = body.get("seq")
                 if seq is None:  # next seq for this (feature, kind) — mirrors the old CLI
                     seq = con.execute(
                         "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
-                        "WHERE feature_id IS ? AND kind=?", (int(fid), kind)).fetchone()[0]
+                        "WHERE feature_id IS ? AND kind=?", (fid, kind)).fetchone()[0]
                 cur = con.execute(
                     "INSERT INTO documents (feature_id, kind, seq, title, body, render_path) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (int(fid),
+                    (fid,
                      kind,
                      seq,
                      (body.get("title") or "").strip() or None,
