@@ -17,7 +17,9 @@ orchestrates them, so everything here can still be done by hand.
 The vm/ts blocks are NOT auto-created: they carry host-specific, operator-
 verified config (a linked VM, a tailnet scope) that `enable` cannot invent —
 it grants the skills and prints exactly how to link. `pg` needs no host input
-(the sidecar is fully derived), so its block IS auto-created.
+(the sidecar is fully derived), so its block IS auto-created. A feature may
+also be procedure-only (`block: None`) — no infrastructure half at all, just
+grants; `app-deploy` is one.
 
 Grants land in shell_skills, which is fork memory — enable/disable therefore
 re-snapshots, so `.sc-state/content.sql` stays current and a rebuild keeps the
@@ -26,7 +28,7 @@ grants.
 Usage:
     ./sc feature                      # = list
     ./sc feature list
-    ./sc feature enable  <name>       # pg · windows · tailnet
+    ./sc feature enable  <name>       # pg · windows · tailnet · app-deploy
     ./sc feature disable <name>
 """
 from __future__ import annotations
@@ -46,10 +48,11 @@ PY = sys.executable
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
 
-# The registry. `block` is the instance.json key; `block_auto` says whether
-# enable may create it (only when it needs no operator-supplied host config).
-# `grants` maps skill name → the flavors whose shells own that procedure.
-# `link` is the printed how-to for the operator-supplied blocks.
+# The registry. `block` is the instance.json key (None = procedure-only, no
+# infrastructure half); `block_auto` says whether enable may create it (only
+# when it needs no operator-supplied host config). `grants` maps skill name →
+# the flavors whose shells own that procedure. `link` is the printed how-to
+# for the operator-supplied blocks / procedure-only next steps.
 FEATURES: dict[str, dict] = {
     "pg": {
         "title": "Postgres sidecar (app-only)",
@@ -79,6 +82,16 @@ FEATURES: dict[str, dict] = {
                  "(allowed_hosts is the fail-closed scope) — see README → "
                  "'Tailnet broker'",
                  "./sc launch   # brings the ts-broker up once a tailnet is linked"],
+    },
+    "app-deploy": {
+        "title": "App deploy ritual (admin-authored)",
+        "block": None,          # procedure-only — nothing to link in instance.json
+        "block_auto": False,
+        "grants": {"app_deploy_setup": ["admin"]},
+        "link": ["run the app_deploy_setup skill in your admin shell — it "
+                 "authors this repo's own project-local `deploy` skill "
+                 "(migration dirs, backup, ff-only sync, migrate, restart) "
+                 "and grants it to every shell"],
     },
 }
 
@@ -147,15 +160,18 @@ def cmd_list() -> int:
     print("opt-in features — enable with: ./sc feature enable <name>\n")
     for name, f in FEATURES.items():
         blk = f["block"]
-        linked = blk in cfg
-        blk_state = f"✓ `{blk}` linked" if linked else (
-            f"✗ `{blk}` block absent" + ("" if f["block_auto"] else " (operator-linked)"))
-        print(f"  {name:8} {f['title']}")
-        print(f"           config: {blk_state}")
+        if blk is None:
+            blk_state = "— none needed (procedure-only)"
+        else:
+            linked = blk in cfg
+            blk_state = f"✓ `{blk}` linked" if linked else (
+                f"✗ `{blk}` block absent" + ("" if f["block_auto"] else " (operator-linked)"))
+        print(f"  {name:10} {f['title']}")
+        print(f"             config: {blk_state}")
         for skill in f["grants"]:
             held = _grant_state(con, skill) if con else []
             state = " ".join(held) if held else "none"
-            print(f"           skill:  {skill} → {state}")
+            print(f"             skill:  {skill} → {state}")
         print()
     if con:
         con.close()
@@ -194,7 +210,11 @@ def cmd_enable(name: str) -> int:
 
     cfg = _instance()
     blk = f["block"]
-    if blk in cfg:
+    if blk is None:
+        print("  config: none needed (procedure-only) — next steps:")
+        for step in f.get("link", []):
+            print(f"    - {step}")
+    elif blk in cfg:
         print(f"  config `{blk}` already linked in instance.json")
     elif f["block_auto"]:
         cfg[blk] = {}
@@ -233,7 +253,9 @@ def cmd_disable(name: str) -> int:
 
     cfg = _instance()
     blk = f["block"]
-    if blk in cfg:
+    if blk is None:
+        print("  config: none to remove (procedure-only)")
+    elif blk in cfg:
         del cfg[blk]
         _write_instance(cfg)
         print(f"  config `{blk}` removed from instance.json")
