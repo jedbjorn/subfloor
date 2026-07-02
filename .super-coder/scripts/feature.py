@@ -3,7 +3,7 @@
 
 Opt-ins have always existed as two mechanisms that compose:
 
-    1. an `instance.json` block (pg / vm / ts) — enables the INFRASTRUCTURE
+    1. an `instance.json` block (pg / vm / ts / pm2) — enables the INFRASTRUCTURE
        (sidecar container, host-side broker) for this fork;
     2. `common=0` skill grants — puts the PROCEDURE in the right shells' hands
        (the skills ship to every fork's catalogue but auto-grant to none).
@@ -82,6 +82,17 @@ FEATURES: dict[str, dict] = {
                  "(allowed_hosts is the fail-closed scope) — see README → "
                  "'Tailnet broker'",
                  "./sc launch   # brings the ts-broker up once a tailnet is linked"],
+    },
+    "pm2": {
+        "title": "pm2 broker (host process stack)",
+        "block": "pm2",
+        "block_auto": False,
+        "grants": {"pm2": ["admin", "devops"]},
+        "link": ["hand-fill the `pm2` block in .super-coder/instance.json "
+                 "(processes is the fail-closed scope; health_url optional; "
+                 "stop/start stay gated behind allow_lifecycle) — see README "
+                 "→ 'pm2 broker'",
+                 "./sc launch   # brings the pm2-broker up once a stack is linked"],
     },
     "app-deploy": {
         "title": "App deploy ritual (admin-authored)",

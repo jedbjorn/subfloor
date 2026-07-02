@@ -646,14 +646,15 @@ front door to the pair:
 | **`pg`** | `pg` (auto-created) | `test_authoring_pg` → dev, reviewer | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — develop + test the fork's **app** against real Postgres (the engine DB stays SQLite, always) |
 | **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) |
 | **`tailnet`** | `ts` (operator-linked) | `tailscale` → devops | The tailnet broker — reach declared build/deploy hosts from the sandbox without holding a tailnet credential (section after) |
+| **`pm2`** | `pm2` (operator-linked) | `pm2` → admin, devops | The pm2 broker — observe + manage the host's pm2-supervised **app** stack (status, health, logs, scoped restarts) from the sandbox (section after) |
 | **`app-deploy`** | — (procedure-only) | `app_deploy_setup` → admin | A deploy-ritual scaffold for the fork's **app** (the engine deploys itself via `sc update`) — the admin fills the template (migration dirs, DB backup, ff-only sync, apply + move migrations, restart) and saves it as the repo's own project-local `deploy` skill, granted to every shell |
 
 `enable pg` is complete in one step — the sidecar needs no host input, so the
 block is auto-created and the next `./sc launch` starts it (data persists in a
-named volume; `./sc pg-down` stops it, volume retained). `windows` and
-`tailnet` are **link-only**: their blocks carry host-specific, operator-verified
+named volume; `./sc pg-down` stops it, volume retained). `windows`, `tailnet`, and
+`pm2` are **link-only**: their blocks carry host-specific, operator-verified
 config (a ready VM, a tailnet scope), so `enable` grants the skills and prints
-exactly how to link — the two sections below are the full setup guides.
+exactly how to link — the sections below are the full setup guides.
 `app-deploy` has no config block at all: `enable` grants the scaffold skill to
 the admin shell, and the finished product is a **project-local** skill — engine
 skills self-heal to the shipped body on every `sc update`, so the fleshed-out
@@ -895,6 +896,40 @@ curl -s --unix-socket "$SOCK" http://ts/exec -d '{"host":"build-box","command":"
 ```
 
 Full design: [`.super-coder/docs/tailscale-broker.md`](.super-coder/docs/tailscale-broker.md).
+
+## pm2 broker (opt-in)
+
+> [!class2]
+> **Shells** admin, devops (observe + manage the host app stack) · **UI** hand-edit the `pm2` block (no wizard yet)
+
+Third sibling of the VM and tailnet brokers, same shape, different backend: a
+**host-side broker over a unix socket** that lets a sandboxed shell observe and
+manage the host's **pm2-supervised app stack** — the one a host-run
+`make deploy` targets. From inside the sandbox there is no `pm2` binary and no
+route to the host's `127.0.0.1`-bound ports, so without this the live-app half
+of a deploy audit degrades to "ask the human to run `make status`". The broker
+runs pm2 and curls the app's health URL **where they work — on the host** — and
+exposes narrow verbs over a `chmod 0600` socket in the bind-mounted engine dir.
+
+Every verb — even `status` — is fail-closed on the `pm2` block's `processes`
+allowlist: the sandbox sees and bounces only what the fork declared, never the
+host's full process table. `restart` (the deploy verb — it heals) rides the
+allowlist alone; `stop`/`start` (an outage surface) additionally need
+`"allow_lifecycle": true`; `delete` is not a verb at all. Config lives under a
+`pm2` key in the gitignored `.super-coder/instance.json` (**no secrets**),
+coexisting with the `vm`/`ts` blocks. `./sc feature enable pm2` grants the
+`pm2` skill to admin + devops shells; the block itself is yours to fill
+(link-only, like the VM and the tailnet).
+
+```bash
+./sc pm2-broker-up           # start backgrounded (also auto-started by ./sc launch when a stack is linked)
+./sc pm2-broker-install      # optional: a systemd --user unit, survives logout/reboot
+SOCK="$(./sc pm2-broker-sock)"
+curl -s --unix-socket "$SOCK" http://pm2/status
+curl -s --unix-socket "$SOCK" http://pm2/restart -d '{"proc":"myapp-api"}'
+```
+
+Full design: [`.super-coder/docs/pm2-broker.md`](.super-coder/docs/pm2-broker.md).
 
 ## Review GUI
 

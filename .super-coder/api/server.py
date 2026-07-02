@@ -58,6 +58,7 @@ import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
+import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
 
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -1528,6 +1529,20 @@ class Handler(BaseHTTPRequestHandler):
                             "output": "tailnet status needs the host ts-broker — "
                                       "start it with `./sc ts-broker-up` on the host."})
                 return self._send(200, ts_mod.do_status())
+            if path == "/api/pm2":
+                return self._send(200, {"pm2": pm2_mod.read()})
+            if path == "/api/pm2/status":
+                # Live process view. Needs the host's pm2, so proxy to the
+                # pm2-broker in the sandbox; call directly on the no-docker host.
+                if os.environ.get("SC_SANDBOX"):
+                    try:
+                        return self._send(200, pm2_mod.broker_call("GET", "/status"))
+                    except ConnectionError:
+                        return self._send(503, {
+                            "ok": False,
+                            "output": "pm2 status needs the host pm2-broker — "
+                                      "start it with `./sc pm2-broker-up` on the host."})
+                return self._send(200, pm2_mod.do_status())
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
@@ -1624,6 +1639,27 @@ class Handler(BaseHTTPRequestHandler):
                 if r is None:
                     return self._send(404, {"error": "no such check"})
                 return self._send(200, r)
+            if path.startswith("/api/pm2/validate/"):
+                # One live check against the candidate `pm2` block. The checks
+                # run pm2 + curl the app's local port, which only work on the
+                # HOST; in the sandbox, proxy to the pm2-broker. Mirror of ts.
+                check = path.rsplit("/", 1)[1]
+                cfg = self._body().get("pm2") or {}
+                if os.environ.get("SC_SANDBOX"):
+                    try:
+                        r = pm2_mod.broker_call("POST", f"/validate/{check}", {"pm2": cfg})
+                    except ConnectionError:
+                        return self._send(503, {
+                            "ok": False, "check": check,
+                            "output": "live checks need the host pm2-broker — start it "
+                                      "with `./sc pm2-broker-up` on the host, then retry."})
+                    if r.get("error") == "no such check":
+                        return self._send(404, {"error": "no such check"})
+                    return self._send(200, r)
+                r = pm2_mod.validate(check, cfg)
+                if r is None:
+                    return self._send(404, {"error": "no such check"})
+                return self._send(200, r)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             return self._fail(e)
@@ -1669,6 +1705,7 @@ class Handler(BaseHTTPRequestHandler):
         # grant toggle: PUT /api/shells/{id}/skills/{skill_id}  {granted: bool}
         # vm block:     PUT /api/vm  {vm: {...}}  (persists to instance.json)
         # ts block:     PUT /api/ts  {ts: {...}}  (persists to instance.json)
+        # pm2 block:    PUT /api/pm2  {pm2: {...}}  (persists to instance.json)
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         con = db()
@@ -1687,6 +1724,11 @@ class Handler(BaseHTTPRequestHandler):
                 if tsb is not None and not isinstance(tsb, dict):
                     return self._send(400, {"error": "ts must be an object"})
                 return self._send(200, {"ok": True, "ts": ts_mod.write(tsb)})
+            if path == "/api/pm2":
+                pb = self._body().get("pm2")
+                if pb is not None and not isinstance(pb, dict):
+                    return self._send(400, {"error": "pm2 must be an object"})
+                return self._send(200, {"ok": True, "pm2": pm2_mod.write(pb)})
             # PUT /api/roadmap/{id}/blockers  {blocked_by: [ids]} — replace the
             # feature's blocker set (empty list clears it).
             if len(parts) == 4 and parts[1] == "roadmap" and parts[3] == "blockers":
