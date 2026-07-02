@@ -7,6 +7,22 @@ skills, so creating a shell is mostly just a name. Every shell carries the CC
 Lineage Seed (Law 6, shared) + its own genesis seed (Laws 2-4), is granted the
 COMMON skill catalogue plus the flavor's opt-ins, starts un-bootstrapped (gets
 the FIRST RUN orientation), and has its first session opened.
+
+Fork-local flavor OVERLAYS: the engine templates are materialized (overwritten
+on `./sc update`), so a fork cannot durably edit them — yet a fork legitimately
+changes what a new shell of a flavor gets (dos-arch replaced `test_authoring`
+with its own `test_authoring_dosarch`; every new dev/reviewer shell then booted
+with the wrong grant). A tracked, fork-owned overlay at
+`.sc-state/flavors/<flavor>.json` closes that:
+
+    {"skills_add": ["test_authoring_dosarch"],
+     "skills_remove": ["test_authoring", "test_authoring_pg"]}
+
+`skills_add` / `skills_remove` adjust the engine list (the durable form — the
+engine list keeps evolving upstream and the overlay rides it); any other key
+(role, mandate, focus, abbr — not `flavor` itself) overrides the template's.
+Applied by load_flavor()/flavors(), so shell creation AND the GUI's flavor
+listing both see the overlaid shape.
 """
 from __future__ import annotations
 
@@ -33,11 +49,43 @@ GENESIS_TMPL = (
     "floor I stand on. I curate my own seed from here.")
 
 
+FORK_FLAVOR_OVERLAYS = REPO_ROOT / ".sc-state" / "flavors"
+
+
+def _apply_overlay(tpl: dict, overlay: dict) -> dict:
+    """Merge a fork overlay over an engine flavor template (pure — see the
+    module docstring for the format). skills_add/skills_remove adjust the
+    engine skill list; other keys override, except `flavor` (the identity the
+    overlay is keyed BY — an overlay cannot rename it)."""
+    out = {**tpl}
+    add = overlay.get("skills_add", [])
+    remove = set(overlay.get("skills_remove", []))
+    if add or remove:
+        skills = [s for s in tpl.get("skills", []) if s not in remove]
+        out["skills"] = skills + [s for s in add if s not in skills]
+    for k, v in overlay.items():
+        if k not in ("skills_add", "skills_remove", "flavor"):
+            out[k] = v
+    return out
+
+
+def _overlay_for(flavor: str) -> dict | None:
+    p = FORK_FLAVOR_OVERLAYS / f"{flavor}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"fork flavor overlay {p} is not valid JSON: {e}") from e
+
+
 def flavors() -> list[dict]:
     out = []
     if SHELL_TEMPLATES.exists():
         for p in sorted(SHELL_TEMPLATES.glob("*.json")):
-            out.append(json.loads(p.read_text()))
+            tpl = json.loads(p.read_text())
+            ov = _overlay_for(tpl.get("flavor", p.stem))
+            out.append(_apply_overlay(tpl, ov) if ov else tpl)
     return out
 
 
@@ -46,7 +94,9 @@ def load_flavor(flavor: str) -> dict:
     if not p.exists():
         raise ValueError(f"unknown flavor '{flavor}' "
                          f"(have: {', '.join(f['flavor'] for f in flavors())})")
-    return json.loads(p.read_text())
+    tpl = json.loads(p.read_text())
+    ov = _overlay_for(flavor)
+    return _apply_overlay(tpl, ov) if ov else tpl
 
 
 def _auto_shortname(con, abbr: str) -> str:

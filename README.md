@@ -501,6 +501,7 @@ fits the **fork-owned extension points**, you never touch engine files, and
 | Extension point | What it carries |
 |---|---|
 | **Local skills** | Fork-authored procedures (GUI → Skills) — serialized in `content.sql`, survive every update |
+| **Flavor overlays** | `.sc-state/flavors/<flavor>.json` — what a NEW shell of a flavor gets: `skills_add` / `skills_remove` against the engine template's list, plus role/mandate/focus overrides (e.g. swap the engine's `test_authoring` for a fork's own testing skill) |
 | **`instance.json`** | Per-fork config: ports, harness default, the `pg` / `vm` / `ts` opt-in blocks |
 | **`.sc-state/`** | Your memory (content.sql), map tuning, engine pin — the fork's one tracked artifact |
 | **Per-shell identity** | `current_state`, connections, decisions, seed — all DB rows, all yours |
