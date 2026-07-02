@@ -766,19 +766,24 @@ virtio-fs guest driver (from the `virtio-win` ISO), and mount it to a drive lett
 Same-host only — cross-host `scp` is a later variant.
 
 **4 · Provision the toolchain, then bake `clean` — in that order.** Boot the VM,
-install your build kit (the admin `configure_winbox` skill does this from a committed
-manifest; or by hand — e.g. `dotnet tool install --global wix`), **verify** each tool
-over SSH, then **shut the guest down** and take the offline baseline every test
-reverts to:
+install your build kit (the admin `configure_winbox` skill does this **via the
+broker** from the fork's committed winget manifest, and verifies exactly what
+the manifest installs; or by hand — e.g. `dotnet tool install --global wix`).
+Then bake the offline baseline every test reverts to — one command, once the VM
+is linked (step 5):
 
 ```bash
-virsh --connect qemu:///system shutdown win-test       # clean snapshot is OFFLINE
-virsh --connect qemu:///system snapshot-create-as win-test clean \
-  --description "pristine OS + toolchain"
+./sc vm-bake      # graceful shutdown → delete old `clean` → re-bake OFFLINE, guest left off
 ```
 
-Re-provisioning later is delete-then-recreate the `clean` snapshot — and nothing
-"sticks" until it's baked, so never run a test loop (which reverts) in between.
+(Equivalent by hand: `virsh shutdown`, then `virsh snapshot-create-as <domain>
+clean --description "pristine OS + toolchain"` — the snapshot must be taken
+powered off.) Baking is **host-only, deliberately not a broker verb**: the
+snapshot is the trust anchor every test reverts to, so the sandbox may run
+*against* it but never redefine it — `configure_winbox` provisions + verifies,
+then hands you this one command. Re-provisioning later is re-run skill →
+re-run `./sc vm-bake` — and nothing "sticks" until it's baked, so never run a
+test loop (which reverts) in between.
 
 **5 · Link it.** Fill the `vm` block — via the Scripts → **Windows Test VM** wizard
 (it live-tests every field before save) or by hand in `.super-coder/instance.json`:
