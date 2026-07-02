@@ -33,6 +33,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import ports
@@ -222,6 +223,66 @@ def do_reset(running: bool = True) -> dict:
     return {"ok": ok, "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' ({state})"}
 
 
+def do_bake(shutdown_timeout: int = 180) -> dict:
+    """(Re)bake the CLEAN snapshot: graceful shutdown → delete the old snapshot
+    → snapshot-create-as OFFLINE. The one-command form of the deploy doc's
+    'provision, then bake' step, run AFTER configure_winbox has provisioned +
+    verified the toolchain.
+
+    HOST-side only, and deliberately NOT a broker verb: the snapshot is the
+    fork's trust anchor — every test run reverts to it. A sandboxed shell may
+    exec/reset AGAINST the snapshot, but must never redefine it; if a
+    compromised sandbox could re-bake, it could persist tampering across every
+    future reset. So baking stays with the operator, where virsh lives."""
+    if os.environ.get("SC_SANDBOX"):
+        return {"ok": False, "output":
+                "bake refuses to run in the sandbox — the clean snapshot is the "
+                "trust anchor every test reverts to; only the HOST may redefine "
+                "it. Ask the operator to run: ./sc vm-bake"}
+    cfg = read() or {}
+    if m := _missing(cfg, "domain", "snapshot"):
+        return {"ok": False, "output": m}
+    dom, snap = str(cfg["domain"]), str(cfg["snapshot"])
+    steps = []
+
+    ok, state = _run(_virsh(cfg, "domstate", dom), timeout=15)
+    if not ok:
+        return {"ok": False, "output": state}
+    if "shut off" not in state:
+        ok, out = _run(_virsh(cfg, "shutdown", dom), timeout=15)
+        if not ok:
+            return {"ok": False, "output": out}
+        steps.append("graceful shutdown sent")
+        deadline = time.monotonic() + shutdown_timeout
+        while time.monotonic() < deadline:
+            ok, state = _run(_virsh(cfg, "domstate", dom), timeout=15)
+            if ok and "shut off" in state:
+                break
+            time.sleep(3)
+        else:
+            return {"ok": False, "output":
+                    f"guest did not shut off within {shutdown_timeout}s (state: "
+                    f"{state.strip()}) — the clean snapshot must be OFFLINE. "
+                    f"Shut it down in the guest and re-run ./sc vm-bake"}
+
+    ok, _out = _run(_virsh(cfg, "snapshot-info", dom, "--snapshotname", snap),
+                    timeout=15)
+    if ok:  # an old bake exists — replace, never stack
+        ok, out = _run(_virsh(cfg, "snapshot-delete", dom,
+                              "--snapshotname", snap), timeout=120)
+        if not ok:
+            return {"ok": False, "output": out}
+        steps.append(f"deleted old '{snap}'")
+
+    ok, out = _run(_virsh(cfg, "snapshot-create-as", dom, snap, "--description",
+                          "pristine OS + toolchain (sc vm-bake)"), timeout=300)
+    if not ok:
+        return {"ok": False, "output": out}
+    steps.append(f"baked '{snap}' (offline)")
+    return {"ok": True,
+            "output": "; ".join(steps) + " — guest left powered off"}
+
+
 def do_push(src: str, dest: str | None = None) -> dict:
     """Stage a host-visible artifact into transfer_dir (the host side of the
     guest's virtio-fs share). `src` is a path in the bind-mounted repo; the guest
@@ -342,10 +403,14 @@ def main(argv: list[str]) -> int:
                                  argv[2] if len(argv) > 2 else None)))
     elif mode == "capture":
         print(json.dumps(do_capture(" ".join(argv[1:]) or None)))
+    elif mode == "bake":
+        r = do_bake()
+        print(json.dumps(r))
+        return 0 if r["ok"] else 1
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: vm.py [sock|exec <cmd>|reset|push <src> [dest]|capture [cmd]|validate <check>]")
+        sys.exit("usage: vm.py [sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]|validate <check>]")
     return 0
 
 

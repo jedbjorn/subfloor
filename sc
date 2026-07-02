@@ -513,6 +513,10 @@ case "$cmd" in
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
+  # Bake/re-bake the clean snapshot — HOST-side, deliberately NOT a broker verb:
+  # the snapshot is the trust anchor every test reverts to; a sandboxed shell may
+  # run against it but must never redefine it. vm.py bake self-guards on SC_SANDBOX.
+  vm-bake)           exec "$PY" "$S/vm.py" bake ;;
   vm-broker-up)      sc_vm_broker_up ;;
   vm-broker-down)    sc_vm_broker_down ;;
   vm-broker-sock)    exec "$PY" "$S/vm.py" sock ;;
@@ -704,6 +708,8 @@ super-coder — forkable shell substrate
   holds the ssh key + virsh so the fork never does. See docs/windows-vm-broker.md).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
   ./sc vm-broker           run the broker in the foreground (unix socket)
+  ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
+                             (deliberately NOT a broker verb — the sandbox must never redefine 'clean')
   ./sc vm-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
   ./sc vm-broker-down      stop the backgrounded broker
   ./sc vm-broker-sock      print the broker's socket path
