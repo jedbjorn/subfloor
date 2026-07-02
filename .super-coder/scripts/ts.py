@@ -22,7 +22,7 @@ verbs are parameterized by `{host, command}`, not a single saved target, and
 reach arbitrary nodes. tailscaled + the tailnet identity stay on the HOST; the
 sandbox names verbs over the broker's unix socket and holds nothing. The broker
 (api/ts_broker.py) is the sibling of the Windows VM broker; see
-docs/tailscale-broker.md.
+.super-coder/docs/tailscale-broker.md.
 """
 from __future__ import annotations
 

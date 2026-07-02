@@ -734,7 +734,7 @@ super-coder — forkable shell substrate
   ./sc typecheck [paths]   mypy the fork's python (.venv mypy; honors [tool.mypy]) — available, not enforced
 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
-  holds the ssh key + virsh so the fork never does. See docs/windows-vm-broker.md).
+  holds the ssh key + virsh so the fork never does. See .super-coder/docs/windows-vm-broker.md).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
   ./sc vm-broker           run the broker in the foreground (unix socket)
   ./sc vm-bake             HOST-side: graceful shutdown + (re)bake the clean snapshot after provisioning
@@ -747,7 +747,7 @@ super-coder — forkable shell substrate
 
   Tailnet broker (run on the HOST — drives the tailnet for sandboxed forks; holds
   the already-`tailscale up` node so the fork never holds a tailnet credential.
-  See docs/tailscale-broker.md). `launch` brings it up when a tailnet is linked:
+  See .super-coder/docs/tailscale-broker.md). `launch` brings it up when a tailnet is linked:
   ./sc ts-broker           run the broker in the foreground (unix socket)
   ./sc ts-broker-up        start it in the background (nohup + pidfile); self-skips if unlinked/already up
   ./sc ts-broker-down      stop the backgrounded broker

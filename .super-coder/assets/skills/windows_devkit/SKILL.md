@@ -42,7 +42,7 @@ You run inside the sandbox container. The VM lives on the host's libvirt NAT,
 unreachable from here, and the container has no `ssh`, no `virsh`, and no key.
 So you do **not** shell out — you call the **host-side vm-broker** over a unix
 socket in the bind-mounted repo. The broker holds the key + libvirt and does the
-work; nothing about your isolation changes. (See `docs/windows-vm-broker.md`.)
+work; nothing about your isolation changes. (See `.super-coder/docs/windows-vm-broker.md`.)
 
 The socket path comes from `sc vm-broker-sock`. Every verb is a `curl`:
 

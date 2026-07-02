@@ -20,7 +20,7 @@ route, no TUN, no `NET_ADMIN`) and **must not** hold a tailnet credential. So yo
 do **not** run `tailscale` — you call the **host-side ts-broker** over a unix
 socket in the bind-mounted repo. The broker owns the host's `tailscale up` node
 and does the work; the tailnet identity never enters the fork. (See
-`docs/tailscale-broker.md`. It is the sibling of the Windows VM broker —
+`.super-coder/docs/tailscale-broker.md`. It is the sibling of the Windows VM broker —
 `windows_devkit` works the exact same way.)
 
 The socket path comes from `sc ts-broker-sock`. Every verb is a `curl`:

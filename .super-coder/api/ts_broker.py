@@ -8,7 +8,7 @@ verbs over a unix socket inside the bind-mounted engine dir
 (`.super-coder/run/ts-broker.sock`). The `tailscale` skill curls that socket; the
 tailnet identity never enters the fork. It is the sibling of the Windows VM
 broker (api/vm_broker.py): one host process holds the credential so nothing
-downstream needs it. Spec: docs/tailscale-broker.md.
+downstream needs it. Spec: .super-coder/docs/tailscale-broker.md.
 
 Routes (all JSON `{ok, ...}`):
 
