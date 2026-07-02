@@ -73,6 +73,13 @@ RUN pip install --no-cache-dir "playwright==1.60.0" \
  && playwright install --with-deps chromium \
  && chmod -R a+rX /opt/ms-playwright
 
+# Dev-kit fallback tools. `./sc lint` / `./sc typecheck` prefer the fork's .venv
+# copy (its pins + config), but a host-managed .venv (pinned out-of-tree
+# interpreter mounted by launch) is pip-skipped in the sandbox — so bake the
+# PATH fallback here or the tools are unobtainable from inside the box
+# (dos-arch QAQC-02). _sc_devtool in ./sc resolves .venv → PATH in that order.
+RUN pip install --no-cache-dir ruff mypy
+
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 # A host GID may already exist in the base image — notably macOS's primary GID 20
 # (`staff`) collides with Debian's pre-existing `dialout` group — so creating it
