@@ -24,7 +24,13 @@ DB_PATH = ENGINE / "shell_db.db"
 SCHEMA_SQLITE = ENGINE / "schema.sql"
 SNAPSHOT       = REPO_ROOT / ".sc-state" / "content.sql"
 SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
-BACKUP_DIR = Path.home() / "db_backups" / "super-coder"
+# PER-FORK backup dir, keyed by the host repo's dir name. This was a fixed
+# "super-coder" for every fork, which pooled all forks' pre-update dumps in one
+# dir — and rollback restores the MOST RECENT dump, so a multi-fork update
+# sweep could roll one fork back onto ANOTHER FORK'S DB. In the source repo the
+# name IS super-coder, so its path is unchanged. Old pooled dumps stay where
+# they are: they cannot be attributed to a fork after the fact.
+BACKUP_DIR = Path.home() / "db_backups" / REPO_ROOT.name
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver    # noqa: E402
