@@ -1,0 +1,47 @@
+name: tests
+
+# The PR gate: the full engine suite + the headless end-to-end proof, on every
+# PR and every push to main. GitHub-hosted BY DESIGN — this repo is public, and
+# a self-hosted runner on a public repo lets any fork PR execute code on the
+# host (the same host that carries the substrates). The suite is hermetic
+# (stdlib + pytest, no docker, no network), so ubuntu-latest covers it free.
+# Anything that ever genuinely needs house hardware belongs in a separate
+# push-to-main-only workflow, never a PR-triggered one.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least-privilege GITHUB_TOKEN — both jobs only read the tree (CodeQL flags the
+# unbounded default). Nothing here pushes, comments, or releases.
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      # pytest is the runner; every other test import is stdlib or engine-local.
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run the suite
+        run: pytest tests/ -q
+
+  # The end-to-end proof `./sc verify` runs: rebuild the DB from committed text
+  # (schema + migrations + content.sql), flat-render, then a render-only boot —
+  # proving a fresh clone of this exact tree stands up. Complements
+  # render-check.yml (drift guard) with the boot half.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Rebuild + render + headless boot
+        run: ./sc verify
