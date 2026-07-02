@@ -34,12 +34,16 @@ DB_PATH = ENGINE / "shell_db.db"
 STATE_DIR = REPO_ROOT / ".sc-state"
 ENGINE_REF = STATE_DIR / "engine.ref"
 ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
-BACKUP_DIR = Path.home() / "db_backups" / "super-coder"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import engine_manifest  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, prune_backups, KEEP_BACKUPS)
 import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
+
+# One source of truth with rebuild.py — the PER-FORK dir. A restore point must
+# come from THIS fork's backups: a private copy of the path is exactly how the
+# pooled-dir hazard happened (rollback restoring another fork's dump).
+BACKUP_DIR = rebuild_mod.BACKUP_DIR
 
 
 def latest_db_restore_point() -> Path | None:
