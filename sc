@@ -111,12 +111,41 @@ dbuild() {
 # does: a vendored/submodule package.json (e.g. ui/vendor/md-converter) is built by
 # its parent, and a stray `npm ci`/`pip install` there runs third-party lifecycle
 # scripts we don't own. We install only the manifests the fork itself authors.
+# `.sc-worktrees/` is pruned too — each shell worktree is a sibling checkout of
+# the SAME repo, so descending it would install/test every manifest N× (QAQC-02).
 _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
   find "$here" \
     \( -name node_modules -o -name .venv -o -name venv -o -name .super-coder \
-       -o -name .sc-state -o -name .git -o -name __pycache__ \
+       -o -name .sc-state -o -name .sc-worktrees -o -name .git -o -name __pycache__ \
        -o -name dist -o -name build -o -name vendor \) -prune -o \
     -name "$1" -type f -print
+}
+
+# Resolve a dev-kit tool (ruff / mypy): the fork's .venv copy wins (its pins +
+# config), else the image/PATH copy (baked into the sandbox for exactly this
+# case), else fail with the honest fix. A host-managed .venv (pinned out-of-tree
+# interpreter mounted by launch) is pip-skipped in the sandbox BY DESIGN, so
+# "run ./sc deps first" was a closed loop there — the tool was unobtainable from
+# inside the box (dos-arch QAQC-02). Say what is actually wrong and where the
+# fix runs instead.
+_sc_devtool() {  # $1 = tool name → prints the executable path, or fails
+  venv="$here/.venv"
+  if [ -x "$venv/bin/$1" ]; then printf '%s\n' "$venv/bin/$1"; return 0; fi
+  if command -v "$1" >/dev/null 2>&1; then command -v "$1"; return 0; fi
+  hostmanaged=""
+  if [ -n "${SC_SANDBOX:-}" ] && [ -e "$venv/bin/python" ]; then
+    case "$(readlink -f "$venv/bin/python" 2>/dev/null || true)" in
+      "$here"/*) : ;;                       # sandbox-built venv — deps can provision it
+      *) hostmanaged=1 ;;                   # pinned host interpreter — pip skipped here
+    esac
+  fi
+  if [ -n "$hostmanaged" ]; then
+    echo "✗ $1: unavailable, and this .venv is host-managed (pinned out-of-tree interpreter) — in-sandbox pip is skipped by design, so \`./sc deps\` cannot provision it here." >&2
+    echo "  Fix on the HOST: install $1 into the pinned venv (e.g. uv pip install $1) — or \`./sc build\` to refresh the sandbox image, which bakes $1 as the PATH fallback." >&2
+  else
+    echo "✗ $1: not provisioned — run ./sc deps first" >&2
+  fi
+  return 1
 }
 
 # Install the fork's deps into the bind-mounted repo: always a repo-root .venv with
@@ -252,24 +281,24 @@ sc_test() {
   echo "✓ test: all suites passed"
 }
 
-# Lint + format-check the fork's python with the .venv's ruff (honors the fork's
-# [tool.ruff] config). Defaults to the repo root; pass paths/flags through. The
-# tool is available, not enforced — a fork opts in by running this. Needs `./sc deps`.
+# Lint + format-check the fork's python with ruff (the .venv copy when present —
+# honors the fork's [tool.ruff] config — else the image's baked fallback).
+# Defaults to the repo root; pass paths/flags through. The tool is available,
+# not enforced — a fork opts in by running this.
 sc_lint() {
-  venv="$here/.venv"
-  [ -x "$venv/bin/ruff" ] || { echo "✗ lint: no .venv/bin/ruff — run ./sc deps first" >&2; return 1; }
-  echo "→ lint: $venv/bin/ruff check"
-  ( cd "$here" && "$venv/bin/ruff" check "$@" )
+  tool="$(_sc_devtool ruff)" || return 1
+  echo "→ lint: $tool check"
+  ( cd "$here" && "$tool" check "$@" )
 }
 
-# Type-check the fork's python with the .venv's mypy (honors the fork's
-# [tool.mypy] config). Same available-not-enforced stance as lint. Needs `./sc deps`.
+# Type-check the fork's python with mypy (.venv copy → image fallback, same
+# resolution as lint; honors the fork's [tool.mypy] config when the .venv copy
+# runs). Same available-not-enforced stance as lint.
 sc_typecheck() {
-  venv="$here/.venv"
-  [ -x "$venv/bin/mypy" ] || { echo "✗ typecheck: no .venv/bin/mypy — run ./sc deps first" >&2; return 1; }
-  echo "→ typecheck: $venv/bin/mypy"
-  if [ $# -gt 0 ]; then ( cd "$here" && "$venv/bin/mypy" "$@" )
-  else ( cd "$here" && "$venv/bin/mypy" . ); fi
+  tool="$(_sc_devtool mypy)" || return 1
+  echo "→ typecheck: $tool"
+  if [ $# -gt 0 ]; then ( cd "$here" && "$tool" "$@" )
+  else ( cd "$here" && "$tool" . ); fi
 }
 
 # ── Windows VM broker (HOST-side; drives the test VM for sandboxed forks) ──────
