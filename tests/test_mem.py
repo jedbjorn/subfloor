@@ -187,6 +187,25 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("task", "done", str(tid))
         self.assertEqual(self.q("SELECT status FROM spec_tasks WHERE task_id=?", tid)[0], "done")
 
+    def test_doc_add_standalone_no_feature(self):
+        # feature_id is optional — standalone docs are contract (the docs +
+        # onboard skills and `sc mem doc add [--feature ID]` all say so; the
+        # server used to 400 on it, the QAQC-04 regression this pins).
+        body = self.tmp / "s.md"
+        body.write_text("# standalone\n")
+        self.assertEqual(
+            self.run_mem("doc", "add", "standalone D", "--kind", "doc",
+                         "--body-file", str(body)), 0)
+        fid, seq = self.q("SELECT feature_id, seq FROM documents WHERE title='standalone D'")
+        self.assertIsNone(fid)
+        self.assertEqual(seq, 1)  # NULL feature is its own seq scope
+        # a second standalone doc of the same kind seqs within that scope
+        self.assertEqual(
+            self.run_mem("doc", "add", "standalone E", "--kind", "doc",
+                         "--body-file", str(body)), 0)
+        self.assertEqual(
+            self.q("SELECT seq FROM documents WHERE title='standalone E'")[0], 2)
+
     # ── narrative + oriented ──────────────────────────────────────────────────
     def test_narrative_and_oriented(self):
         self.run_mem("narrative", "a beat")
