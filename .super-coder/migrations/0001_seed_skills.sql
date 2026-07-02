@@ -3081,7 +3081,7 @@ route, no TUN, no `NET_ADMIN`) and **must not** hold a tailnet credential. So yo
 do **not** run `tailscale` — you call the **host-side ts-broker** over a unix
 socket in the bind-mounted repo. The broker owns the host''s `tailscale up` node
 and does the work; the tailnet identity never enters the fork. (See
-`docs/tailscale-broker.md`. It is the sibling of the Windows VM broker —
+`.super-coder/docs/tailscale-broker.md`. It is the sibling of the Windows VM broker —
 `windows_devkit` works the exact same way.)
 
 The socket path comes from `sc ts-broker-sock`. Every verb is a `curl`:
@@ -3445,7 +3445,7 @@ You run inside the sandbox container. The VM lives on the host''s libvirt NAT,
 unreachable from here, and the container has no `ssh`, no `virsh`, and no key.
 So you do **not** shell out — you call the **host-side vm-broker** over a unix
 socket in the bind-mounted repo. The broker holds the key + libvirt and does the
-work; nothing about your isolation changes. (See `docs/windows-vm-broker.md`.)
+work; nothing about your isolation changes. (See `.super-coder/docs/windows-vm-broker.md`.)
 
 The socket path comes from `sc vm-broker-sock`. Every verb is a `curl`:
 

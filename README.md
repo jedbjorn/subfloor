@@ -859,8 +859,8 @@ graph LR
   the fork and `virsh` runs only on the host — a compromised sandbox can *ask* for a
   reset, but cannot script libvirt or read the credential.
 
-Full design: [`docs/windows-test-vm.md`](docs/windows-test-vm.md) ·
-[`docs/windows-vm-broker.md`](docs/windows-vm-broker.md).
+Full design: [`.super-coder/docs/windows-test-vm.md`](.super-coder/docs/windows-test-vm.md) ·
+[`.super-coder/docs/windows-vm-broker.md`](.super-coder/docs/windows-vm-broker.md).
 
 ## Tailnet broker (opt-in)
 
@@ -894,7 +894,7 @@ SOCK="$(./sc ts-broker-sock)"
 curl -s --unix-socket "$SOCK" http://ts/exec -d '{"host":"build-box","command":"uptime"}'
 ```
 
-Full design: [`docs/tailscale-broker.md`](docs/tailscale-broker.md).
+Full design: [`.super-coder/docs/tailscale-broker.md`](.super-coder/docs/tailscale-broker.md).
 
 ## Review GUI
 
@@ -921,7 +921,7 @@ The header's **snapshot ⤓** / **publish ⤴** buttons serialize the DB and ope
 rolling content PR. How they authenticate to GitHub (`gh auth login` or a scoped
 `SC_GH_TOKEN`), and the rolling event log (`.super-coder/logs/webapp.log` /
 `GET /api/logs`, last 20 events) for seeing what a publish actually did:
-[`docs/publish-and-gh-auth.md`](docs/publish-and-gh-auth.md).
+[`.super-coder/docs/publish-and-gh-auth.md`](.super-coder/docs/publish-and-gh-auth.md).
 
 ![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-tab.png)
 

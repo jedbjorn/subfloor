@@ -8,7 +8,7 @@ socket inside the bind-mounted engine dir (`.super-coder/run/vm-broker.sock`).
 `windows_devkit` curls that socket; the key never enters the fork and `virsh`
 runs where it works. It mirrors dos-arch's credential-broker precedent: one host
 process holds the secret so nothing downstream needs it. Spec:
-docs/windows-vm-broker.md.
+.super-coder/docs/windows-vm-broker.md.
 
 Routes (all JSON `{ok, ...}`):
 

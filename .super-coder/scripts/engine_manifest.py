@@ -52,6 +52,7 @@ ENGINE_PATHS = [
     ".super-coder/map_schema.sql",
     ".super-coder/ecosystem.config.cjs",
     ".super-coder/README.md",
+    ".super-coder/docs",
     ".super-coder/migrations",
     ".super-coder/scripts",
     ".super-coder/render",
