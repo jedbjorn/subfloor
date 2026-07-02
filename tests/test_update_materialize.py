@@ -26,6 +26,7 @@ import update  # noqa: E402
 # ENGINE_PATHS comment in update.py.
 PER_INSTANCE = {
     "instance.json", "shell_db.db", "shell_db.db-wal", "shell_db.db-shm", "map.db",
+    "engine.manifest",  # derived hash baseline — rewritten by each materialize
 }
 
 

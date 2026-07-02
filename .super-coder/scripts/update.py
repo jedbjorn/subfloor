@@ -35,9 +35,15 @@ Flow:
 Then review + commit (only `.sc-state/` — content.sql + engine.ref — moves; the
 engine is ignored). Restart the session to boot onto the new floor.
 
+The materialize is guarded by the engine hash manifest (engine_manifest.py):
+an engine file locally modified since the last materialize BLOCKS the update
+(instead of being silently overwritten) until the operator reverts it,
+upstreams it, or passes --force to discard it. `--ref <tag|sha>` pins the
+materialize to a specific upstream version instead of the branch head.
+
 Usage:
-    ./sc update [--no-fetch] [--branch <name>]
-    python3 .super-coder/scripts/update.py [--no-fetch] [--branch <name>]
+    ./sc update [--no-fetch] [--branch <name>] [--ref <tag|sha>] [--force]
+    python3 .super-coder/scripts/update.py [same flags]
 """
 from __future__ import annotations
 
@@ -57,35 +63,18 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 
-# The ENGINE = system content that propagates to every fork; all of it is safe
-# to materialize from the super-coder remote (it is wholesale-replaced, never
-# fork-edited). The per-instance set is deliberately NOT listed, so a materialize
-# never touches it: `.sc-state/` (this fork's content.sql + map tuning + engine
-# pin), shell_db.db* (gitignored), instance.json (gitignored). assets/seed/ is
-# super-coder-only (stripped on install); assets/shells/ is empty/vestigial.
-ENGINE_PATHS = [
-    "sc",
-    ".super-coder/aliases.mk",
-    ".super-coder/Dockerfile",
-    ".super-coder/schema.sql",
-    ".super-coder/map_schema.sql",
-    ".super-coder/ecosystem.config.cjs",
-    ".super-coder/README.md",
-    ".super-coder/migrations",
-    ".super-coder/scripts",
-    ".super-coder/render",
-    ".super-coder/templates",
-    ".super-coder/adapters",
-    ".super-coder/api",
-    ".super-coder/ui",
-    ".super-coder/assets/skills",
-    ".super-coder/hooks",
-]
+EJECTED_MARKER = STATE_DIR / "ejected"
+
+# The materialize set — canonical list lives in engine_manifest.py (shared with
+# install.py's first-manifest write); re-exported here as the name every caller
+# and test already knows.
+ENGINE_PATHS = engine_manifest.ENGINE_PATHS
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -170,11 +159,44 @@ def materialize_engine(ref: str) -> None:
         sys.exit("update: extracting the engine archive failed.")
 
 
-def fetch_and_materialize(branch: str) -> None:
+def check_local_edits(force: bool) -> None:
+    """Block the materialize when engine files were edited locally since the
+    last one — a wholesale overwrite would discard those edits silently. The
+    operator's real options are stated; --force is the explicit discard."""
+    edits = engine_manifest.local_edits()
+    if not edits:
+        return
+    print(f"✗ {len(edits)} engine file(s) locally modified since the last materialize:")
+    for rel, kind in sorted(edits.items()):
+        print(f"    {kind:8} {rel}")
+    if force:
+        print("  --force: discarding the local edits (overwritten by the new engine).")
+        return
+    sys.exit(
+        "update: refusing to overwrite local engine edits. Your options:\n"
+        "  - revert them (the engine is upstream-owned; see README →\n"
+        "    'Customize a fork vs diverge from it')\n"
+        "  - upstream them: PR the change to super-coder, then update normally\n"
+        "  - ./sc update --force   discard the local edits and take upstream's engine\n"
+        "  - ./sc eject            one-way: stop tracking upstream and own the engine")
+
+
+def fetch_and_materialize(branch: str, ref: str | None = None,
+                          force: bool = False) -> None:
     remote = super_coder_remote()
-    print(f"→ fetch {remote} + materialize engine ({remote}/{branch})")
-    git("fetch", remote, branch)
-    sha = git("rev-parse", f"{remote}/{branch}").stdout.strip()
+    if ref:
+        # Pin to an explicit upstream version. `git fetch <remote> <ref>` serves
+        # a branch, a tag, or (on GitHub) a reachable commit SHA; FETCH_HEAD is
+        # the one name that works for all three.
+        print(f"→ fetch {remote} + materialize engine (pinned ref: {ref})")
+        git("fetch", remote, ref)
+        sha = git("rev-parse", "FETCH_HEAD").stdout.strip()
+    else:
+        print(f"→ fetch {remote} + materialize engine ({remote}/{branch})")
+        git("fetch", remote, branch)
+        sha = git("rev-parse", f"{remote}/{branch}").stdout.strip()
+
+    check_local_edits(force)
 
     # Restore point (engine half): remember where we were before overwriting.
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -187,7 +209,8 @@ def fetch_and_materialize(branch: str) -> None:
 
     materialize_engine(sha)
     ENGINE_REF.write_text(sha + "\n")
-    print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref)")
+    n = engine_manifest.write_manifest(_engine_paths_at(sha))
+    print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
 
 
 def migrate_engine_untrack() -> None:
@@ -261,13 +284,28 @@ def regrant() -> int:
 
 def main(argv: list[str]) -> int:
     no_fetch = "--no-fetch" in argv
+    force = "--force" in argv
     branch = "main"
     if "--branch" in argv:
         i = argv.index("--branch")
         if i + 1 < len(argv):
             branch = argv[i + 1]
+    ref = None
+    if "--ref" in argv:
+        i = argv.index("--ref")
+        if i + 1 < len(argv):
+            ref = argv[i + 1]
+        if "--branch" in argv:
+            sys.exit("update: --ref and --branch are mutually exclusive — a ref "
+                     "IS the pin; a branch is what to track.")
 
     source = is_source_repo()
+    if EJECTED_MARKER.exists() and not source:
+        sys.exit("update: this fork has EJECTED — the engine is fork source now, "
+                 "not an upstream dependency (.sc-state/ejected). There is no "
+                 "upstream to update from; edit .super-coder/ directly and commit "
+                 "like any other code. (To re-adopt upstream, that's a manual "
+                 "re-fork — see README → 'Customize a fork vs diverge from it'.)")
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
@@ -286,7 +324,7 @@ def main(argv: list[str]) -> int:
         print("→ --no-fetch: reconciling against the current working tree "
               "(engine + engine.ref unchanged)")
     else:
-        fetch_and_materialize(branch)
+        fetch_and_materialize(branch, ref=ref, force=force)
 
     # Harnesses can be ADDED upstream between releases (e.g. codex landed after
     # dos-arch installed), so a fork that updates must pick up any newly-required
