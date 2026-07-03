@@ -15,9 +15,10 @@ steps, so the work has a shape before you start cutting.
 1. **Restate the objective** in one sentence + the done-condition (how you'll
    know it's finished).
 2. **Re-surface prior decisions** — `sc mem get decisions`: has any part of
-   this already been settled? A recorded decision constrains the plan; honor
-   it, or supersede it explicitly (`sc mem decision "…" --parent <old_id>`) —
-   never silently re-litigate.
+   this already been settled? (Index of active decisions; `sc mem get
+   decisions <id>` pulls one with its rationale.) A recorded decision
+   constrains the plan; honor it, or supersede it explicitly
+   (`sc mem decision "…" --parent <old_id>`) — never silently re-litigate.
 3. **Decompose** into concrete steps — each a unit you could verify on its own.
 4. **Order by dependency** — what must precede what. Mark steps with no
    dependency on each other as **parallelizable**.

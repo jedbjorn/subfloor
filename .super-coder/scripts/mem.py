@@ -22,6 +22,7 @@ Run from the repo root, like every engine command:
 
     ./sc mem which                                 # confirm API reachability + who your token resolves to
     ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
+    ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
     ./sc mem state "<text>"
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
     ./sc mem lns   "<body>"          [--date …] [--tag …]
@@ -143,16 +144,36 @@ def _render_get(surface: str, data: dict) -> int:
             print("  " + (e.get("body") or "").replace("\n", "\n  "))
         return 0
     if surface == "decisions":
+        def _line(d) -> None:
+            par = f" (supersedes #{d['parent_decision_id']})" if d.get("parent_decision_id") else ""
+            sup = f" (superseded by #{d['superseded_by']})" if d.get("superseded_by") else ""
+            print(f"#{d['decision_id']} [{d.get('priority') or 'M'}] "
+                  f"{d.get('decision_date') or ''}{par}{sup}")
+            print("  " + (d.get("decision") or ""))
+        if "decision" in data:                    # single decision, with rationale
+            d = data["decision"]
+            _line(d)
+            if d.get("rationale"):
+                print("  rationale: " + d["rationale"])
+            return 0
         ds = data.get("decisions", [])
         if not ds:
             print("mem: no decisions")
             return 0
         for d in ds:
-            par = f" (supersedes #{d['parent_decision_id']})" if d.get("parent_decision_id") else ""
-            print(f"#{d['decision_id']} [{d.get('priority') or 'M'}] {d.get('decision_date') or ''}{par}")
-            print("  " + (d.get("decision") or ""))
-            if d.get("rationale"):
-                print("  rationale: " + d["rationale"])
+            _line(d)
+        # Index mode: say exactly what the cap hid — never a silent truncation.
+        if not data.get("all"):
+            hidden = max(0, (data.get("total_active") or len(ds)) - len(ds))
+            superseded = data.get("superseded") or 0
+            if hidden or superseded:
+                bits = []
+                if hidden:
+                    bits.append(f"{hidden} older active")
+                if superseded:
+                    bits.append(f"{superseded} superseded")
+                print(f"({' + '.join(bits)} not shown — `--all` for the full log; "
+                      f"`get decisions <id>` for detail + rationale)")
         return 0
     if surface == "flags":
         fs = data.get("flags", [])
@@ -246,6 +267,13 @@ def _render_get(surface: str, data: dict) -> int:
 def cmd_get(args) -> int:
     surface = args.surface
     path = f"/_sc/mem/{surface}"
+    if surface == "decisions":
+        if args.id is not None:                   # single decision, with rationale
+            path = f"/_sc/mem/decisions/{args.id}"
+        elif args.all:                            # full log incl. superseded
+            path = "/_sc/mem/decisions?all=1"
+    elif args.id is not None:
+        die(f"get {surface} takes no <id> (only decisions)")
     if surface == "documents":
         if args.doc is not None:                  # single doc, with body
             path = f"/_sc/mem/documents/{args.doc}"
@@ -435,6 +463,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)}; doc/docs = documents)")
     sp.add_argument("surface", choices=GET_SURFACES,
                     type=lambda s: GET_SURFACE_ALIASES.get(s, s))
+    sp.add_argument("id", nargs="?", type=int,
+                    help="decisions: one decision WITH rationale")
+    sp.add_argument("--all", action="store_true",
+                    help="decisions: full log incl. superseded (default: active index)")
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
     sp.add_argument("--feature", type=int,
                     help="scope to a feature (documents/tasks)")

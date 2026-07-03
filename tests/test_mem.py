@@ -13,6 +13,8 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sqlite3
 import sys
@@ -120,6 +122,45 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("decision", "a call", "--rationale", "why")
         self.assertEqual(self.q("SELECT decision FROM shell_decisions "
                                 "WHERE rationale='why'")[0], "a call")
+
+    # ── decisions recall: index/library split (#274) ──────────────────────────
+    def test_decisions_index_excludes_superseded_and_rationale(self):
+        self.run_mem("decision", "use X", "--rationale", "r-old")
+        old = self.q("SELECT decision_id FROM shell_decisions WHERE decision='use X'")[0]
+        self.run_mem("decision", "use Y instead", "--parent", str(old))
+        data = mem._api("GET", "/_sc/mem/decisions")
+        ids = [d["decision_id"] for d in data["decisions"]]
+        self.assertNotIn(old, ids)                 # superseded → out of the index
+        self.assertGreaterEqual(data["superseded"], 1)
+        self.assertTrue(all("rationale" not in d for d in data["decisions"]))
+
+        # library half: by-id returns rationale + supersession links
+        one = mem._api("GET", f"/_sc/mem/decisions/{old}")["decision"]
+        self.assertEqual(one["rationale"], "r-old")
+        self.assertIsNotNone(one["superseded_by"])
+
+        # --all: the full log, superseded row present and marked
+        alld = mem._api("GET", "/_sc/mem/decisions?all=1")["decisions"]
+        row = next(d for d in alld if d["decision_id"] == old)
+        self.assertIsNotNone(row["superseded_by"])
+
+    def test_decisions_index_cap_with_loud_footer(self):
+        for i in range(server.DECISIONS_INDEX_CAP + 3):
+            self.run_mem("decision", f"bulk call {i}")
+        data = mem._api("GET", "/_sc/mem/decisions")
+        self.assertEqual(len(data["decisions"]), server.DECISIONS_INDEX_CAP)
+        self.assertGreater(data["total_active"], server.DECISIONS_INDEX_CAP)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.run_mem("get", "decisions")
+        self.assertIn("older active", buf.getvalue())   # cap is never silent
+        self.assertIn("--all", buf.getvalue())
+
+    def test_decisions_get_404_and_id_only_for_decisions(self):
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "decisions", "999999")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "1")          # <id> is decisions-only
 
     # ── flags ─────────────────────────────────────────────────────────────────
     def test_flag_open_then_close(self):

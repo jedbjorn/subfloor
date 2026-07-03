@@ -17,7 +17,7 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 |---|---|
 | Identity (core) | `shells WHERE shell_id=<self>` — mandate, system_prompt, current_state (rolling, ~500 chars) |
 | Seed + L&S | `shell_identity_entries` — kind seed (cap 10) / lns (cap 20), trigger-enforced |
-| Decisions | `shell_decisions` — major decisions; never supersede, add a new one |
+| Decisions | `shell_decisions` — major decisions; never edit a row — supersede with a new one (`--parent`) |
 | Flags | `flags` — open + resolved; link to a feature via feature_id |
 | Roadmap | `roadmap` — one row per planned feature; status is a planning horizon |
 | Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
@@ -27,6 +27,12 @@ Write as it happens, not at close. **Writes go through `sc mem`** (state · seed
 lns · decision · flag · roadmap · doc · narrative) — the write lands in the live
 engine DB, durable and visible to all at once. `sc mem which` to orient. See the
 `memory` and `db_map` skills.
+
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.

@@ -40,6 +40,12 @@ shared by every shell, durable and visible to all at once. That is the whole
 write: **you don''t snapshot or render** — persisting to git is an admin/GUI step.
 `./sc mem which` to orient. See the `memory` and `db_map` skills.
 
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.
+
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
 `./sc render`. They are derived artifacts: a photograph of a DB row, not the row.
@@ -103,6 +109,12 @@ shared by every shell, durable and visible to all at once. That is the whole
 write: **you don''t snapshot or render** — persisting to git is an admin/GUI step.
 `./sc mem which` to orient. See the `memory` and `db_map` skills.
 
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.
+
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
 `./sc render`. They are derived artifacts: a photograph of a DB row, not the row.
@@ -164,6 +176,12 @@ fallback. The write lands in the live engine DB — the single source of truth
 shared by every shell, durable and visible to all at once. That is the whole
 write: **you don''t snapshot or render** — persisting to git is an admin/GUI step.
 `./sc mem which` to orient. See the `memory` and `db_map` skills.
+
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
