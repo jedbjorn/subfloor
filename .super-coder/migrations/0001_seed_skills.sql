@@ -128,6 +128,9 @@ guessing; if a step fails, stop — the app is down and the DB is backed up.
 
 ## 3. Save it as a project-local skill
 
+Both SQL blocks below run via `./sc sql-rw "<SQL>"` — the explicit read-write
+passthrough (`sc sql` is read-only and refuses writes).
+
 ```sql
 INSERT INTO skills (name, description, category, content, common)
 VALUES (''deploy'',
@@ -295,7 +298,10 @@ yours alone. You do three things: **configure** how this repo is mapped,
 
 The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
 engine memory db (`shell_db.db`) so an engine schema change never touches the
-map. Every `dr_*` query below runs against it: `sc map-sql "…"`.
+map. Every `dr_*` read below runs against it: `sc map-sql "…"` (read-only).
+The authoring writes in this skill (UPDATE/INSERT/DELETE on `dr_*`) run via
+`sc map-sql-rw "…"` — the explicit read-write passthrough; `sc map-sql`
+refuses writes.
 Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
 snapshot (an admin/GUI step — see the curation section) and reloaded on a
 fresh map db.
@@ -1943,6 +1949,8 @@ The correct path: **file → seed → grant → snapshot → commit**.
    skills, left intact.
 
 3. **Grant the skill to the target shell(s).**
+   Skill grants have no API surface — these writes run via `./sc sql-rw "<SQL>"`
+   (the explicit read-write passthrough; `sc sql` is read-only and will refuse).
    Find shell IDs:
    ```sql
    SELECT shell_id, display_name, flavor FROM shells WHERE is_deleted = 0;
@@ -1974,6 +1982,7 @@ The correct path: **file → seed → grant → snapshot → commit**.
 
 ## Assigning an existing skill to additional shells
 
+Via `./sc sql-rw "<SQL>"`:
 ```sql
 INSERT OR IGNORE INTO shell_skills (shell_id, skill_id)
 SELECT <shell_id>, skill_id FROM skills
@@ -1984,6 +1993,7 @@ Then `sc snapshot && sc render` and commit.
 ## Removing a skill
 
 1. **Soft-delete the DB row and revoke grants.**
+   Via `./sc sql-rw "<SQL>"`:
    ```sql
    UPDATE skills SET is_deleted = 1 WHERE name = ''<name>'';
    DELETE FROM shell_skills
@@ -2455,7 +2465,9 @@ the discipline for turning that image into an approved plan **before** any code.
 ## Steps
 
 1. **Find the image**
-   - List `shared/redlines/`.
+   - List `shared/redlines/`. If the dir doesn''t exist (fork installed before
+     the engine created it), `mkdir -p <repo>/shared/redlines` and check
+     `shared/` root — earlier drops land there.
    - Match a filename to the prompt context (fuzzy / keyword).
    - One file present and no strong mismatch → use it. Multiple → pick the best
      filename match; if it''s genuinely ambiguous, surface that rather than guess.

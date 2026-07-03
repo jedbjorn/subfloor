@@ -40,6 +40,8 @@ The correct path: **file → seed → grant → snapshot → commit**.
    skills, left intact.
 
 3. **Grant the skill to the target shell(s).**
+   Skill grants have no API surface — these writes run via `./sc sql-rw "<SQL>"`
+   (the explicit read-write passthrough; `sc sql` is read-only and will refuse).
    Find shell IDs:
    ```sql
    SELECT shell_id, display_name, flavor FROM shells WHERE is_deleted = 0;
@@ -71,6 +73,7 @@ The correct path: **file → seed → grant → snapshot → commit**.
 
 ## Assigning an existing skill to additional shells
 
+Via `./sc sql-rw "<SQL>"`:
 ```sql
 INSERT OR IGNORE INTO shell_skills (shell_id, skill_id)
 SELECT <shell_id>, skill_id FROM skills
@@ -81,6 +84,7 @@ Then `sc snapshot && sc render` and commit.
 ## Removing a skill
 
 1. **Soft-delete the DB row and revoke grants.**
+   Via `./sc sql-rw "<SQL>"`:
    ```sql
    UPDATE skills SET is_deleted = 1 WHERE name = '<name>';
    DELETE FROM shell_skills

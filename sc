@@ -599,13 +599,24 @@ case "$cmd" in
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
   # Raw read passthrough to the engine + map DBs, resolved by absolute path so no
   # skill example ever needs a cwd-relative `sqlite3 .super-coder/…` (which pulls a
-  # shell into `cd`-ing to the root — the cwd trap). Writes still go via `sc mem`
-  # (triggers/caps); this is the read convenience for schema/catalogue queries.
-  sql)          exec sqlite3 "$DB" "$@" ;;
-  map-sql)      exec sqlite3 "$MAPDB" "$@" ;;
+  # shell into `cd`-ing to the root — the cwd trap). Read-only is ENFORCED
+  # (sqlite3 -readonly), matching the label: writes go via `sc mem`
+  # (triggers/caps). The -rw variants are the explicit escape hatch for the few
+  # procedures with no API surface (skill grants, cartographer map authoring) —
+  # only use one where a skill names it.
+  sql)          exec sqlite3 -readonly "$DB" "$@" ;;
+  map-sql)      exec sqlite3 -readonly "$MAPDB" "$@" ;;
+  sql-rw)       exec sqlite3 "$DB" "$@" ;;
+  map-sql-rw)   exec sqlite3 "$MAPDB" "$@" ;;
   render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
   render-check) exec "$PY" "$S/render_check.py" ;;
-  map)          exec "$PY" "$S/map_repo.py" ;;
+  map)          case "${1:-}" in
+                  -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue (.sc-state/map.db); takes no arguments"
+                             exit 0 ;;
+                  ?*)        echo "sc map: unknown argument '$1' (takes none; -h for usage)" >&2
+                             exit 2 ;;
+                esac
+                exec "$PY" "$S/map_repo.py" ;;
   map-setup)    exec "$PY" "$S/map_setup.py" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
@@ -789,8 +800,10 @@ super-coder — forkable shell substrate
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
-  sc sql "<query>"         read passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
-  sc map-sql "<query>"     read passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
+  sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
+  sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
+  sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
+                             Only for procedures with no API surface (skill grants, map authoring) where a skill names it
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
