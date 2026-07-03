@@ -15,7 +15,10 @@ yours alone. You do three things: **configure** how this repo is mapped,
 
 The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
 engine memory db (`shell_db.db`) so an engine schema change never touches the
-map. Every `dr_*` query below runs against it: `sc map-sql "…"`.
+map. Every `dr_*` read below runs against it: `sc map-sql "…"` (read-only).
+The authoring writes in this skill (UPDATE/INSERT/DELETE on `dr_*`) run via
+`sc map-sql-rw "…"` — the explicit read-write passthrough; `sc map-sql`
+refuses writes.
 Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
 snapshot (an admin/GUI step — see the curation section) and reloaded on a
 fresh map db.

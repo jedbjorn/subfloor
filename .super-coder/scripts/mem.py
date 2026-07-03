@@ -122,6 +122,10 @@ GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
                 "roadmap", "narrative", "messages",
                 "projects", "documents", "tasks", "shells")
 
+# The write surface is `sc mem doc …` and boot docs say "doc" — accept the
+# obvious short forms on the read side too instead of costing a round-trip.
+GET_SURFACE_ALIASES = {"doc": "documents", "docs": "documents"}
+
 
 def _render_get(surface: str, data: dict) -> int:
     if surface == "state":
@@ -428,8 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("which", help="confirm API reachability + who your token resolves to") \
        .set_defaults(fn=cmd_which)
 
-    sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)})")
-    sp.add_argument("surface", choices=GET_SURFACES)
+    sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)}; doc/docs = documents)")
+    sp.add_argument("surface", choices=GET_SURFACES,
+                    type=lambda s: GET_SURFACE_ALIASES.get(s, s))
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
     sp.add_argument("--feature", type=int,
                     help="scope to a feature (documents/tasks)")

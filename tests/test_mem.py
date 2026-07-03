@@ -227,6 +227,12 @@ class ApiMemTest(unittest.TestCase):
         with self.assertRaises(SystemExit):  # no --doc/--feature → fail loud
             self.run_mem("get", "tasks")
 
+    def test_get_surface_aliases(self):
+        # boot docs say "doc", the write surface is `mem doc` — the read
+        # surface accepts both short forms as `documents` (#242c).
+        for alias in mem.GET_SURFACE_ALIASES:
+            self.assertEqual(self.run_mem("get", alias), 0, alias)
+
     # ── shared planning reads (the docs/spec/review surfaces) ─────────────────
     def test_get_projects_documents_tasks_shells(self):
         self.run_mem("project", "add", "wsr", "Read WS")

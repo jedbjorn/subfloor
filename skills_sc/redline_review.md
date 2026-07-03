@@ -23,7 +23,9 @@ the discipline for turning that image into an approved plan **before** any code.
 ## Steps
 
 1. **Find the image**
-   - List `shared/redlines/`.
+   - List `shared/redlines/`. If the dir doesn't exist (fork installed before
+     the engine created it), `mkdir -p <repo>/shared/redlines` and check
+     `shared/` root — earlier drops land there.
    - Match a filename to the prompt context (fuzzy / keyword).
    - One file present and no strong mismatch → use it. Multiple → pick the best
      filename match; if it's genuinely ambiguous, surface that rather than guess.

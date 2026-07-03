@@ -79,6 +79,9 @@ guessing; if a step fails, stop — the app is down and the DB is backed up.
 
 ## 3. Save it as a project-local skill
 
+Both SQL blocks below run via `./sc sql-rw "<SQL>"` — the explicit read-write
+passthrough (`sc sql` is read-only and refuses writes).
+
 ```sql
 INSERT INTO skills (name, description, category, content, common)
 VALUES ('deploy',

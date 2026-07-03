@@ -609,6 +609,13 @@ def main(argv: list[str]) -> int:
         shared.mkdir()
         (shared / ".gitkeep").write_text("")
         print(f"  created {shared.relative_to(REPO_ROOT)}/")
+    # redline_review's documented drop dir — create it so the skill's Step 1
+    # ("list shared/redlines/") works as written on a fresh fork.
+    redlines = shared / "redlines"
+    if not redlines.exists():
+        redlines.mkdir()
+        (redlines / ".gitkeep").write_text("")
+        print(f"  created {redlines.relative_to(REPO_ROOT)}/")
 
     # 4. Strip super-coder's per-instance content -----------------------------
     step("Stripping super-coder's per-instance content (a fork inherits the system, not the memory)")
