@@ -86,7 +86,8 @@ def restore_engine(prev_sha: str) -> None:
     ENGINE_REF.write_text(prev_sha + "\n")
     # Re-baseline the hash manifest at the restored engine — without this, the
     # next update would read every rolled-back file as a "local edit" and block.
-    engine_manifest.write_manifest(update_mod._engine_paths_at(prev_sha))
+    engine_manifest.write_manifest(update_mod._engine_paths_at(prev_sha),
+                                   files=update_mod._engine_files_at(prev_sha))
     print(f"→ engine re-materialized at {prev_sha[:12]} (engine.ref restored)")
 
 

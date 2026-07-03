@@ -81,16 +81,12 @@ All commands below require `SC_ADMIN=1` and are run from the **main checkout**.
 - **Per-instance content** (your memory, this repo's roadmap/docs): edit the DB,
   then `sc snapshot`. The snapshot is the canonical reproducer.
 - **Skill catalogue** (system, propagates): edit `assets/skills/<name>/SKILL.md`,
-  then `sc seed-skills` to regenerate the seed migration — **not** the
-  snapshot. See `seed_skills.py`.
-  - **The stale-mirror trap:** `seed-skills` writes the new body into the
-    *migration*, but your **live DB still holds the old body** until you apply
-    it. So `sc render` now renders the *stale* skill into `skills_sc/<name>.md`
-    and passes — while CI's hermetic rebuild (new body) drifts and goes red.
-    Sequence is **`sc seed-skills && sc rebuild && sc render`, then
-    `sc render-check`** before committing. Commit the regenerated
-    `migrations/0001_seed_skills.sql` *and* the re-rendered `skills_sc/` mirror
-    together — the migration without the mirror is the drift.
+  then `sc seed-skills` — it upserts the live DB *and* (source repo only)
+  regenerates the seed migration. Not the snapshot. See `seed_skills.py`.
+  - Sequence is **`sc seed-skills && sc render`, then `sc render-check`**
+    before committing. Commit the regenerated `migrations/0001_seed_skills.sql`
+    *and* the re-rendered `skills_sc/` mirror together — the migration without
+    the mirror is the drift.
 
 > Steps 1–3 are durability — serialize so a `sc rebuild` can't lose your work.
 > Step 4 is the GUI **Publish** button: it runs snapshot → render → commit →

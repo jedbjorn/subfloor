@@ -95,10 +95,24 @@ def _iter_files(engine_paths: list[str]) -> list[Path]:
     return out
 
 
-def write_manifest(engine_paths: list[str]) -> int:
-    """Record the engine's current on-disk state (call right after a
-    materialize, when disk == upstream). Returns the file count."""
-    entries = {str(rel): _sha256(REPO_ROOT / rel) for rel in _iter_files(engine_paths)}
+def write_manifest(engine_paths: list[str], files: list[str] | None = None) -> int:
+    """Record the engine's materialized state (call right after a materialize,
+    when disk == upstream). Returns the file count.
+
+    `files` — update/rollback pass the `git ls-tree` listing at the
+    materialized ref — is the EXACT upstream file set, so the manifest never
+    absorbs files that merely sit under an engine dir without being
+    upstream-owned: a fork-local skill's SKILL.md added to assets/skills/
+    (#253), or an upstream-retired file lingering on disk. Neither may guard —
+    and later block — a future update. Without `files` (install: disk == a
+    pristine clone), the engine dirs are walked on disk."""
+    if files is None:
+        rels = _iter_files(engine_paths)
+    else:
+        rels = [Path(f) for f in files
+                if not (_SKIP_NAMES & set(Path(f).parts))
+                and (REPO_ROOT / f).is_file()]
+    entries = {str(rel): _sha256(REPO_ROOT / rel) for rel in rels}
     MANIFEST.write_text(json.dumps(entries, indent=0, sort_keys=True) + "\n")
     return len(entries)
 

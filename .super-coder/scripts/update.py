@@ -141,6 +141,17 @@ def _engine_paths_at(ref: str) -> list[str]:
     return present
 
 
+def _engine_files_at(ref: str) -> list[str]:
+    """The exact FILE list upstream ships at `ref` under the engine paths —
+    what a materialize writes, so what the manifest must cover and nothing
+    more. Locally-added files under engine dirs (e.g. a fork-local skill's
+    SKILL.md) and upstream-retired stragglers on disk stay out of the manifest:
+    they are not upstream-owned, so they must never guard — and later block —
+    a future update (see engine_manifest.write_manifest)."""
+    return git("ls-tree", "-r", "--name-only", ref,
+               "--", *_engine_paths_at(ref)).stdout.splitlines()
+
+
 def materialize_engine(ref: str) -> None:
     """Write the engine paths at `ref` into the working tree WITHOUT touching the
     git index — the engine is gitignored, so a `git checkout -- <paths>` (which
@@ -209,7 +220,8 @@ def fetch_and_materialize(branch: str, ref: str | None = None,
 
     materialize_engine(sha)
     ENGINE_REF.write_text(sha + "\n")
-    n = engine_manifest.write_manifest(_engine_paths_at(sha))
+    n = engine_manifest.write_manifest(_engine_paths_at(sha),
+                                       files=_engine_files_at(sha))
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
 
 

@@ -602,8 +602,9 @@ case "$cmd" in
   # shell into `cd`-ing to the root — the cwd trap). Read-only is ENFORCED
   # (sqlite3 -readonly), matching the label: writes go via `sc mem`
   # (triggers/caps). The -rw variants are the explicit escape hatch for the few
-  # procedures with no API surface (skill grants, cartographer map authoring) —
-  # only use one where a skill names it.
+  # procedures with no dedicated surface (direct skill INSERTs, cartographer
+  # map authoring) — only use one where a skill names it. Skill grants have
+  # their own surface now: `./sc skill`.
   sql)          exec sqlite3 -readonly "$DB" "$@" ;;
   map-sql)      exec sqlite3 -readonly "$MAPDB" "$@" ;;
   sql-rw)       exec sqlite3 "$DB" "$@" ;;
@@ -619,6 +620,9 @@ case "$cmd" in
                 exec "$PY" "$S/map_repo.py" ;;
   map-setup)    exec "$PY" "$S/map_setup.py" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
+  # Skill catalogue write surface — grants/retirement by name, loud on a miss
+  # (the raw-SQL grant's silent no-op class). Snapshot is still the persist step.
+  skill)        exec "$PY" "$S/skill.py" "$@" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
@@ -803,12 +807,14 @@ super-coder — forkable shell substrate
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
   sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
-                             Only for procedures with no API surface (skill grants, map authoring) where a skill names it
+                             Only for procedures with no API surface (map authoring) where a skill names it
+  ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name>
+                             shells by id or shortname; rm refuses engine skills; snapshot after writes to persist
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
-  ./sc seed-skills         regenerate the skills seed migration from assets/skills/
+  ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)
   ./sc init                seed a fresh fork's first user + shell (run once after install)
 
   Sandbox (docker — the default way to run; allow-everything is safe because the

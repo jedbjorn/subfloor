@@ -191,9 +191,10 @@ def tag_origin(skills: list[dict]) -> list[dict]:
     """Annotate skill rows with origin: 'engine' | 'repo'.
 
     Same rule snapshot.py uses to decide what serializes into content.sql —
-    a name under assets/skills/ is engine catalogue; anything else is a
-    repo-local skill. One rule, two consumers: the UI's "Repo skills" section
-    shows exactly what the snapshot will keep durable."""
+    a name the engine seed (0001) owns is engine catalogue; anything else is a
+    repo-local skill (asset-file presence is NOT the rule — a repo skill keeps
+    its authoring asset, #253). One rule, two consumers: the UI's "Repo skills"
+    section shows exactly what the snapshot will keep durable."""
     engine = set(snapshot_mod.engine_skill_names())
     for s in skills:
         s["origin"] = "engine" if s["name"] in engine else "repo"
@@ -497,8 +498,9 @@ _SCRIPTS = {
     "render": ("Render flat", "Regenerate the tracked flat _sc files "
                "(specs_sc / docs_sc / skills_sc / roadmap_sc.md) from the DB. Incremental.",
                [_PY, str(ENGINE / "scripts/render.py"), "flat"], False),
-    "seed_skills": ("Seed skills", "Recompile assets/skills/ into the skills seed migration "
-                    "(migrations/0001_seed_skills.sql). Run after editing a skill body.",
+    "seed_skills": ("Seed skills", "Upsert assets/skills/ into the live DB "
+                    "(+ regenerate the seed migration — source repo only). Run "
+                    "after authoring or editing a skill body.",
                     [_PY, str(ENGINE / "scripts/seed_skills.py")], False),
     "migrate": ("Migrate", "Apply any pending migrations to the live DB (ledger-tracked).",
                 [_PY, str(ENGINE / "scripts/migrate.py"), str(DB_PATH)], False),

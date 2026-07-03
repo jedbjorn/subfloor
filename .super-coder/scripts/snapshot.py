@@ -27,6 +27,7 @@ from pathlib import Path
 
 import db_driver  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/
+import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
 from _serialize_guard import require_admin  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -89,27 +90,16 @@ def table_exists(con, name: str) -> bool:
 
 
 def engine_skill_names() -> list[str]:
-    """Names authored by the engine seed assets.
+    """Names the ENGINE SEED owns (seed_skills.seeded_skill_names — i.e.
+    migrations/0001, upstream-materialized in a fork).
 
     Any live skill whose name is not in this set is project-local and belongs in
-    `.sc-state/content.sql`. This keeps local skills durable while engine
-    updates can still UPSERT their own catalogue rows.
+    `.sc-state/content.sql`. Keyed off the seed, NOT asset-file presence (#253):
+    a fork-authored skill keeps its SKILL.md under assets/skills/ as authoring
+    source, and classifying by asset presence would silently drop it from
+    content.sql — losing it on the next update's materialize.
     """
-    skills_dir = ENGINE / "assets" / "skills"
-    names: list[str] = []
-    for path in sorted(skills_dir.glob("*/SKILL.md")):
-        text = path.read_text()
-        if not text.startswith("---"):
-            continue
-        try:
-            _, fm, _ = text.split("---", 2)
-        except ValueError:
-            continue
-        for line in fm.strip().splitlines():
-            if line.startswith("name:"):
-                names.append(line.split(":", 1)[1].strip())
-                break
-    return names
+    return seed_skills.seeded_skill_names()
 
 
 def dump_shell_skills(con) -> list[str]:
