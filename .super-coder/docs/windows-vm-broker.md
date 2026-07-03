@@ -129,6 +129,9 @@ endpoints (which presume host access the container doesn't have). All return
 | `POST` | `/reset` | revert to the clean baseline | `virsh snapshot-revert <domain> clean --running` |
 | `POST` | `/validate/{check}` | the five setup checks | relocated from the host-presuming in-server endpoints |
 | `GET`/`PUT` | `/vm` | read / write the `vm` config block | `instance.json` |
+| `POST` | `/mcp/up` | open the GUI seam (idempotent) | broker-owned `ssh -N -L` unix-socket forward |
+| `POST` | `/mcp/down` | close it (idempotent) | SIGTERM the forward |
+| `GET` | `/mcp/status` | `{ok, running, pid, socket}` | pidfile + socket presence |
 
 > [!class4]
 > **`reset` uses `--running`.** The `clean` snapshot is **offline** — this CPU
@@ -167,6 +170,39 @@ to `ssh`/`virsh` (which never worked from the container) and curls the socket.
 `configure_winbox` (admin provisioning) is rare and host-weighted; it can call
 the broker too, or stay an explicit host-operator task. Either way its `virsh`
 snapshot step lives host-side.
+
+## MCP seam — GUI driving from the sandbox (#263)
+
+The `windows_vm_gui` skill drives the guest's **Windows-MCP** server (UIA
+tree, localhost-bound, baked into `clean`). A host-run seat just ssh-tunnels
+to it; a sandboxed seat cannot (no ssh, no key, no route — the gap above).
+The seam stays on the socket posture, and the broker never parses a byte of
+MCP traffic:
+
+```linear
+claude mcp add (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :::class1 -> run/vm-mcp.sock (bind mount) :::class2 -> ssh -N -L (broker-owned, host) :::class2 -> guest 127.0.0.1:8000 Windows-MCP :::class3
+```
+
+- **`POST /mcp/up`** — the broker spawns one `ssh -N -L run/vm-mcp.sock:127.0.0.1:<mcp_port>`
+  (OpenSSH forwards a *unix socket* to a remote TCP port; `StreamLocalBindMask=0177`
+  lands it 0600, `ExitOnForwardFailure` keeps a dead forward from lingering as a
+  live pid). The socket sits next to `vm-broker.sock` in the bind mount — no
+  network surface, no auth token, exactly the transport decision above. SSE /
+  chunked streaming is free: it is a byte pipe, not an HTTP proxy.
+- **`./sc vm-mcp-relay up`** — in-sandbox, stdlib-only TCP→socket relay on
+  `127.0.0.1:18000`, because `claude mcp add --transport http` only speaks TCP
+  URLs. The TCP listener exists *inside the container's own namespace*; nothing
+  is exposed on `sc-net` or the docker bridge.
+- **Port comes from the saved block** (`vm.mcp_port`, default 8000), never the
+  caller — the sandbox names an action, not a destination, same as every verb.
+- **Trust class:** raw access to guest UIA ≈ `/exec` (arbitrary commands in the
+  guest), which the sandbox already holds. The tunnel reaches one port on the
+  configured guest's loopback; hypervisor control still never leaves the host.
+
+The rejected alternatives from the design round: a tunnel sidecar container on
+`sc-net` (moves the key off the host process + needs an auth story on a shared
+network) and a gateway-bind TCP tunnel (re-opens the network-surface decision
+this spec closed).
 
 ## Process & supervision (built)
 
@@ -231,6 +267,7 @@ Built per the architecture above:
 |---|---|
 | Broker process | `.super-coder/api/vm_broker.py` — AF_UNIX `ThreadingHTTPServer`, refuses to run under `SC_SANDBOX` |
 | Loop verbs + socket client | `.super-coder/scripts/vm.py` — `do_exec` / `do_reset` / `do_push` / `do_capture`, `broker_call` (unix-socket HTTP), `SOCKET` |
+| MCP seam | `vm.py` — `do_mcp_up` / `do_mcp_down` / `mcp_status` (broker-owned ssh socket-forward); `.super-coder/scripts/vm_mcp_relay.py` — in-sandbox TCP→socket relay (`./sc vm-mcp-relay`) |
 | Supervision | `./sc vm-broker` (foreground), `./sc vm-broker-up` / `-down` (nohup + pidfile), `./sc vm-broker-sock` |
 | Server proxy | `.super-coder/api/server.py` — `/api/vm/validate/{check}` proxies to the broker in-sandbox |
 | Skill | `windows_devkit` — drives the four verbs via `curl --unix-socket`, holds no key |

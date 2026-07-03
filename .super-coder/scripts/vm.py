@@ -29,6 +29,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -45,6 +46,13 @@ CHECKS = ("domain", "ssh", "transfer", "snapshot", "toolchain")
 # sandbox (where windows_devkit curls it). No network surface; fs-perm gated.
 RUN_DIR = ports.ENGINE / "run"
 SOCKET = RUN_DIR / "vm-broker.sock"
+
+# The GUI seam (#263): a broker-owned `ssh -N -L` forwards this unix socket to
+# the guest's localhost-bound Windows-MCP port. Same posture as the broker
+# socket — lives in the bind mount, fs-perm gated (0600), no network surface.
+MCP_SOCKET = RUN_DIR / "vm-mcp.sock"
+MCP_PIDFILE = RUN_DIR / "vm-mcp-tunnel.pid"
+MCP_LOG = RUN_DIR / "vm-mcp-tunnel.log"
 
 
 # -- config (instance.json `vm` block) ---------------------------------------
@@ -348,6 +356,104 @@ def do_capture(command: str | None = None) -> dict:
     return result
 
 
+# -- MCP tunnel (the GUI seam — broker-owned ssh forward, #263) ---------------
+#
+# Sandboxed seats cannot hold a live MCP session against the guest's Windows-MCP
+# server: no ssh, no key, no route across libvirt NAT, and a host-loopback
+# tunnel is invisible to the container. The seam: the broker (host-side, where
+# the key lives) opens ONE `ssh -N -L` that forwards a UNIX SOCKET in the
+# bind-mounted run/ dir straight to the guest's localhost-bound Windows-MCP
+# port. OpenSSH does the byte plumbing — no HTTP proxying in the broker, so
+# SSE/chunked streaming passes through untouched. In-sandbox, vm_mcp_relay.py
+# bridges TCP→socket because `claude mcp add --transport http` only speaks TCP.
+
+def _tunnel_pid() -> int | None:
+    """The live tunnel's pid, or None (no pidfile / stale pidfile)."""
+    try:
+        pid = int(MCP_PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return None
+    return pid
+
+
+def mcp_status() -> dict:
+    pid = _tunnel_pid()
+    running = pid is not None and MCP_SOCKET.exists()
+    return {"ok": True, "running": running, "pid": pid,
+            "socket": str(MCP_SOCKET) if running else None}
+
+
+def do_mcp_up(wait: float = 15) -> dict:
+    """Open the MCP tunnel. Idempotent — an already-live tunnel is reported, not
+    doubled. The forward target is the SAVED block's `mcp_port` (default 8000,
+    what `windows_vm_gui`'s guest prep bakes), never a caller-named port — same
+    rule as every other verb: the sandbox names an action, not a destination."""
+    cfg = read() or {}
+    if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
+        return {"ok": False, "output": m}
+    if (pid := _tunnel_pid()) and MCP_SOCKET.exists():
+        return {"ok": True, "output": f"tunnel already up (pid {pid})",
+                "socket": str(MCP_SOCKET), "pid": pid}
+    do_mcp_down()  # clear any half-dead remnant (stale pid or orphaned socket)
+    port = int(cfg.get("mcp_port", 8000))
+    key = os.path.expanduser(str(cfg.get("ssh_key_path", "")))
+    argv = [
+        "ssh", "-i", key,
+        "-p", str(cfg.get("ssh_port", 22)),
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=yes",   # a dead forward must not linger as a live pid
+        "-o", "ServerAliveInterval=30",     # drop (and surface) a hung guest, don't wedge
+        "-o", "StreamLocalBindUnlink=yes",  # replace a stale socket file on reopen
+        "-o", "StreamLocalBindMask=0177",   # socket lands 0600, matching the broker's
+        "-N", "-L", f"{MCP_SOCKET}:127.0.0.1:{port}",
+        f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}",
+    ]
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(MCP_LOG, "wb") as log:
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=log, start_new_session=True)
+    except FileNotFoundError as e:
+        return {"ok": False,
+                "output": f"command not found: {e.filename} — is ssh installed on the host?"}
+    MCP_PIDFILE.write_text(str(p.pid))
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if p.poll() is not None:  # ssh died — auth/route/forward failure
+            err = MCP_LOG.read_text(errors="replace").strip()[-500:]
+            MCP_PIDFILE.unlink(missing_ok=True)
+            return {"ok": False,
+                    "output": f"ssh tunnel exited (rc {p.returncode}): {err or '(no output)'}"}
+        if MCP_SOCKET.exists():
+            return {"ok": True,
+                    "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
+                    "socket": str(MCP_SOCKET), "pid": p.pid, "port": port}
+        time.sleep(0.2)
+    p.terminate()
+    MCP_PIDFILE.unlink(missing_ok=True)
+    return {"ok": False, "output": f"tunnel socket did not appear within {wait}s"}
+
+
+def do_mcp_down() -> dict:
+    """Close the MCP tunnel. Idempotent — safe to call with nothing running."""
+    pid = _tunnel_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    MCP_PIDFILE.unlink(missing_ok=True)
+    MCP_SOCKET.unlink(missing_ok=True)
+    return {"ok": True,
+            "output": f"tunnel stopped (pid {pid})" if pid else "tunnel not running"}
+
+
 # -- client: HTTP over the broker's unix socket ------------------------------
 
 def broker_call(method: str, path: str, body: dict | None = None,
@@ -407,10 +513,21 @@ def main(argv: list[str]) -> int:
         r = do_bake()
         print(json.dumps(r))
         return 0 if r["ok"] else 1
+    elif mode == "mcp-sock":
+        print(MCP_SOCKET)
+    elif mode == "mcp-up":
+        r = do_mcp_up()
+        print(json.dumps(r))
+        return 0 if r["ok"] else 1
+    elif mode == "mcp-down":
+        print(json.dumps(do_mcp_down()))
+    elif mode == "mcp-status":
+        print(json.dumps(mcp_status()))
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: vm.py [sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]|validate <check>]")
+        sys.exit("usage: vm.py [sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]"
+                 "|mcp-sock|mcp-up|mcp-down|mcp-status|validate <check>]")
     return 0
 
 

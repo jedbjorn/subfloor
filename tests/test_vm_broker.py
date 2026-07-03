@@ -14,6 +14,8 @@ Run:
 """
 from __future__ import annotations
 
+import os
+import socket
 import sys
 import tempfile
 import threading
@@ -27,6 +29,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import vm  # noqa: E402
 import vm_broker  # noqa: E402
+import vm_mcp_relay  # noqa: E402
 
 SAVED = {
     "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
@@ -149,6 +152,165 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertEqual(r["screenshot_bytes"], len(b"P6 fake ppm bytes"))
 
 
+class McpTunnelTests(unittest.TestCase):
+    """The GUI seam's broker half (#263): a broker-owned `ssh -N -L` that
+    forwards a unix socket in run/ to the guest's Windows-MCP port."""
+
+    def setUp(self):
+        # Redirect every tunnel artifact into a temp dir so tests never touch
+        # (or depend on) the real run/ state.
+        d = Path(tempfile.mkdtemp(prefix="sc_mcp_"))
+        self._patches = [
+            mock.patch.object(vm, "MCP_SOCKET", d / "vm-mcp.sock"),
+            mock.patch.object(vm, "MCP_PIDFILE", d / "vm-mcp-tunnel.pid"),
+            mock.patch.object(vm, "MCP_LOG", d / "vm-mcp-tunnel.log"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def test_mcp_up_missing_config_is_a_clean_error(self):
+        with mock.patch.object(vm, "read", return_value={}):
+            r = vm.do_mcp_up()
+        self.assertFalse(r["ok"])
+        self.assertIn("missing required field", r["output"])
+
+    def test_mcp_up_forwards_a_unix_socket_to_the_saved_mcp_port(self):
+        # The ssh argv is the security posture: socket forward (not a TCP
+        # bind), 0600 socket, dead-forward = dead pid, target from the SAVED
+        # block only.
+        def fake_popen(argv, **kw):
+            vm.MCP_SOCKET.touch()  # "ssh" bound its forward socket
+            return mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        cfg = dict(SAVED, mcp_port=9000)
+        with mock.patch.object(vm, "read", return_value=cfg), \
+             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen:
+            r = vm.do_mcp_up(wait=5)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["pid"], 4242)
+        self.assertEqual(r["port"], 9000)
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[0], "ssh")
+        self.assertIn("-N", argv)
+        self.assertIn(f"{vm.MCP_SOCKET}:127.0.0.1:9000", argv)
+        self.assertIn("ExitOnForwardFailure=yes", argv)
+        self.assertIn("StreamLocalBindUnlink=yes", argv)
+        self.assertIn("StreamLocalBindMask=0177", argv)
+        self.assertIn("tester@127.0.0.1", argv)
+
+    def test_mcp_port_defaults_to_8000(self):
+        def fake_popen(argv, **kw):
+            vm.MCP_SOCKET.touch()
+            return mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen:
+            r = vm.do_mcp_up(wait=5)
+        self.assertTrue(r["ok"], r)
+        self.assertIn(f"{vm.MCP_SOCKET}:127.0.0.1:8000", popen.call_args[0][0])
+
+    def test_mcp_up_is_idempotent_when_already_live(self):
+        # A live pid + present socket → report it, never stack a second ssh.
+        vm.MCP_PIDFILE.write_text(str(os.getpid()))  # this test process: alive
+        vm.MCP_SOCKET.touch()
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch("subprocess.Popen") as popen:
+            r = vm.do_mcp_up()
+        self.assertTrue(r["ok"])
+        self.assertIn("already up", r["output"])
+        popen.assert_not_called()
+
+    def test_mcp_up_surfaces_a_dying_ssh_with_its_stderr(self):
+        def fake_popen(argv, **kw):
+            vm.MCP_LOG.write_bytes(b"Permission denied (publickey).")
+            return mock.Mock(pid=4242, returncode=255,
+                             poll=mock.Mock(return_value=255))
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch("subprocess.Popen", side_effect=fake_popen):
+            r = vm.do_mcp_up(wait=5)
+        self.assertFalse(r["ok"])
+        self.assertIn("Permission denied", r["output"])
+        self.assertIsNone(vm._tunnel_pid())  # no stale pidfile left behind
+
+    def test_mcp_down_is_idempotent(self):
+        r = vm.do_mcp_down()
+        self.assertTrue(r["ok"])
+        self.assertIn("not running", r["output"])
+
+    def test_mcp_status_reports_not_running_without_a_tunnel(self):
+        r = vm.mcp_status()
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["running"])
+        self.assertIsNone(r["socket"])
+
+
+class McpRelayTests(unittest.TestCase):
+    """The GUI seam's sandbox half: TCP 127.0.0.1 → the tunnel's unix socket,
+    exercised END TO END — a real unix echo server behind a real relay, driven
+    by a real TCP client. Bytes must survive both directions unmodified."""
+
+    def setUp(self):
+        self.upstream_path = Path(tempfile.mkdtemp(prefix="sc_relay_")) / "vm-mcp.sock"
+        self._patch = mock.patch.object(vm, "MCP_SOCKET", self.upstream_path)
+        self._patch.start()
+        # the stand-in for the guest's Windows-MCP behind the ssh forward
+        self.upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.upstream.bind(str(self.upstream_path))
+        self.upstream.listen(4)
+        threading.Thread(target=self._echo_forever, daemon=True).start()
+        # the relay under test, on an ephemeral port
+        self.srv = vm_mcp_relay.make_server(0)
+        self.port = self.srv.getsockname()[1]
+        threading.Thread(target=vm_mcp_relay.run, args=(self.srv,), daemon=True).start()
+
+    def tearDown(self):
+        self.srv.close()
+        self.upstream.close()
+        self._patch.stop()
+        self.upstream_path.unlink(missing_ok=True)
+
+    def _echo_forever(self):
+        while True:
+            try:
+                conn, _ = self.upstream.accept()
+            except OSError:
+                return
+            def echo(c):
+                while data := c.recv(65536):
+                    c.sendall(data)
+                c.close()
+            threading.Thread(target=echo, args=(conn,), daemon=True).start()
+
+    def test_bytes_round_trip_through_the_relay(self):
+        c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        payload = b"POST /mcp HTTP/1.1\r\n\r\n" + bytes(range(256))  # incl. non-UTF-8
+        c.sendall(payload)
+        got = b""
+        while len(got) < len(payload):
+            got += c.recv(65536)
+        c.close()
+        self.assertEqual(got, payload)
+
+    def test_concurrent_connections_do_not_cross_streams(self):
+        conns = [socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                 for _ in range(4)]
+        for i, c in enumerate(conns):
+            c.sendall(f"stream-{i}".encode())
+        for i, c in enumerate(conns):
+            self.assertEqual(c.recv(65536), f"stream-{i}".encode())
+            c.close()
+
+    def test_relay_closes_cleanly_when_upstream_is_absent(self):
+        # Tunnel not up yet → the client sees EOF, not a hang.
+        with mock.patch.object(vm, "MCP_SOCKET", self.upstream_path.with_name("absent.sock")):
+            c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            c.settimeout(5)
+            self.assertEqual(c.recv(1), b"")  # clean close
+            c.close()
+
+
 class SocketTransportTests(unittest.TestCase):
     """A live broker on a temp socket, driven by the real broker_call client —
     proves the unix-socket HTTP transport the container relies on actually works."""
@@ -189,6 +351,23 @@ class SocketTransportTests(unittest.TestCase):
             r = vm.broker_call("POST", "/exec", {"command": "exit 2"})
         self.assertEqual(r["exit"], 2)
         self.assertEqual(r["stdout"], "out")
+
+    def test_mcp_routes_dispatch_over_the_socket(self):
+        # The sandbox drives the GUI seam through exactly these routes.
+        with mock.patch.object(vm, "mcp_status",
+                               return_value={"ok": True, "running": False,
+                                             "pid": None, "socket": None}):
+            r = vm.broker_call("GET", "/mcp/status")
+        self.assertFalse(r["running"])
+        with mock.patch.object(vm, "do_mcp_up",
+                               return_value={"ok": True, "output": "tunnel up"}) as up:
+            r = vm.broker_call("POST", "/mcp/up")
+        self.assertTrue(r["ok"])
+        up.assert_called_once_with()
+        with mock.patch.object(vm, "do_mcp_down",
+                               return_value={"ok": True, "output": "tunnel stopped"}):
+            r = vm.broker_call("POST", "/mcp/down")
+        self.assertTrue(r["ok"])
 
     def test_broker_call_raises_when_nothing_listens(self):
         vm.SOCKET = self.sock.with_name("_absent.sock")
