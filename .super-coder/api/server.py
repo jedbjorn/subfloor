@@ -46,6 +46,10 @@ UI_DIR = ENGINE / "ui"
 LOG_DIR = ENGINE / "logs"
 LOG_PATH = LOG_DIR / "webapp.log"
 LOG_MAX_EVENTS = 20
+# mem get decisions default index size (#274) — active rows, newest-first.
+# A size backstop behind the semantic filter (superseded rows excluded); the
+# client footer names what was hidden, so the cap is never silent.
+DECISIONS_INDEX_CAP = 30
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -991,12 +995,64 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"entries": entries})
 
             if path == "/_sc/mem/decisions":
+                # Index, not library (#274): the log grows unbounded and the
+                # planning skills pull it every session. Default = ACTIVE rows
+                # only (superseded ones are history, not live constraints), no
+                # rationale, newest-first, capped — with counts so the client
+                # can say what was hidden. ?all=1 = full log incl. superseded
+                # (still no rationale); /decisions/<id> = the full row.
+                q = parse_qs(urlparse(self.path).query)
+                if q.get("all", ["0"])[0] in ("1", "true"):
+                    ds = rows(con.execute(
+                        "SELECT d.decision_id, d.decision, d.priority, d.decision_date, "
+                        "d.parent_decision_id, "
+                        "(SELECT c.decision_id FROM shell_decisions c "
+                        " WHERE c.parent_decision_id=d.decision_id "
+                        " AND COALESCE(c.is_deleted,0)=0 "
+                        " ORDER BY c.decision_id DESC LIMIT 1) AS superseded_by "
+                        "FROM shell_decisions d "
+                        "WHERE d.shell_id=? AND COALESCE(d.is_deleted,0)=0 "
+                        "ORDER BY d.decision_date, d.decision_id", (sid,)))
+                    return self._send(200, {"decisions": ds, "all": True})
+                active_sql = (
+                    "FROM shell_decisions d "
+                    "WHERE d.shell_id=? AND COALESCE(d.is_deleted,0)=0 "
+                    "AND NOT EXISTS (SELECT 1 FROM shell_decisions c "
+                    " WHERE c.parent_decision_id=d.decision_id "
+                    " AND COALESCE(c.is_deleted,0)=0)")
+                total_active = con.execute(
+                    "SELECT COUNT(*) " + active_sql, (sid,)).fetchone()[0]
+                superseded = con.execute(
+                    "SELECT COUNT(*) FROM shell_decisions d "
+                    "WHERE d.shell_id=? AND COALESCE(d.is_deleted,0)=0 "
+                    "AND EXISTS (SELECT 1 FROM shell_decisions c "
+                    " WHERE c.parent_decision_id=d.decision_id "
+                    " AND COALESCE(c.is_deleted,0)=0)", (sid,)).fetchone()[0]
                 ds = rows(con.execute(
-                    "SELECT decision_id, decision, rationale, priority, decision_date, "
-                    "parent_decision_id FROM shell_decisions "
-                    "WHERE shell_id=? AND COALESCE(is_deleted,0)=0 "
-                    "ORDER BY decision_date, decision_id", (sid,)))
-                return self._send(200, {"decisions": ds})
+                    "SELECT d.decision_id, d.decision, d.priority, d.decision_date, "
+                    "d.parent_decision_id " + active_sql +
+                    " ORDER BY d.decision_id DESC LIMIT ?",
+                    (sid, DECISIONS_INDEX_CAP)))
+                return self._send(200, {"decisions": ds,
+                                        "total_active": total_active,
+                                        "superseded": superseded})
+
+            if len(parts) == 4 and parts[2] == "decisions":
+                # Single decision WITH rationale — the library half of the split.
+                did = int(parts[3])
+                r = con.execute(
+                    "SELECT d.decision_id, d.decision, d.rationale, d.priority, "
+                    "d.decision_date, d.parent_decision_id, "
+                    "(SELECT c.decision_id FROM shell_decisions c "
+                    " WHERE c.parent_decision_id=d.decision_id "
+                    " AND COALESCE(c.is_deleted,0)=0 "
+                    " ORDER BY c.decision_id DESC LIMIT 1) AS superseded_by "
+                    "FROM shell_decisions d "
+                    "WHERE d.decision_id=? AND d.shell_id=? "
+                    "AND COALESCE(d.is_deleted,0)=0", (did, sid)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such decision"})
+                return self._send(200, {"decision": dict(r)})
 
             if path == "/_sc/mem/flags":
                 # Shared: flags coordinate the project, not one shell's memory —

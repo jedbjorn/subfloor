@@ -84,7 +84,7 @@ needs no work-stream.
 Before writing, see what exists — don't duplicate, and don't re-litigate:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
-sc mem get decisions      # prior Major decisions — is what you're about to plan already settled?
+sc mem get decisions      # active-decision index — already settled? (<id> = full row + rationale; --all incl. superseded)
 sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
 ```
 

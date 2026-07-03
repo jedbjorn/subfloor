@@ -1,11 +1,77 @@
----
-name: docs
-description: Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.
-category: substrate
-common: false
----
+-- 0044 — decisions recall: index/library split + boot-doc read-side line (#274)
+--
+-- Follow-up to 0043/#267: the read-trigger pulled the WHOLE decision log —
+-- every row, full rationale, no limit — every planning session, and the log
+-- grows unbounded (dos-arch: 91 rows ≈ 17k tokens/recall). The API/CLI now
+-- default to an index (active rows only, no rationale, newest-first, capped
+-- with an explicit footer); `sc mem get decisions <id>` is the library half
+-- (full row + rationale); `--all` is the full log incl. superseded.
+--
+-- This reseed carries the fork-side halves:
+--   1. docs + blueprint skill bodies — the read-trigger hint now teaches the
+--      index-default + <id>-detail form (UPSERT by name; grants preserved).
+--   2. shell system prompts — the always-loaded boot doc gains a read-side
+--      "Read before you decide" paragraph (write-side was nudged in three
+--      places; read-side had none outside the two skills), and the Decisions
+--      table row's confusing "never supersede, add a new one" is reworded.
+--      Spliced into existing shells' prompts, 0037-style; the template covers
+--      shells created from here on. Guarded idempotent.
 
-# docs — author & review documents
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'blueprint',
+  'Turn a one-line objective into a sequenced construction plan — decompose into steps, find the dependency order, mark what can run in parallel, name the verification gate. Use before multi-step builds.',
+  'craft',
+  NULL,
+  0,
+  '# blueprint — objective → sequenced plan
+
+Catalogue skill (opt-in). Use before a build that spans more than a couple of
+steps, so the work has a shape before you start cutting.
+
+## Produce
+
+1. **Restate the objective** in one sentence + the done-condition (how you''ll
+   know it''s finished).
+2. **Re-surface prior decisions** — `sc mem get decisions`: has any part of
+   this already been settled? (Index of active decisions; `sc mem get
+   decisions <id>` pulls one with its rationale.) A recorded decision
+   constrains the plan; honor it, or supersede it explicitly
+   (`sc mem decision "…" --parent <old_id>`) — never silently re-litigate.
+3. **Decompose** into concrete steps — each a unit you could verify on its own.
+4. **Order by dependency** — what must precede what. Mark steps with no
+   dependency on each other as **parallelizable**.
+5. **Per step**: the change, the files/areas it touches (use `surface_catalogue`
+   to ground this in the real repo), and its **verification** (test, run,
+   review).
+6. **Risks / unknowns** — what could break the plan; resolve the riskiest
+   unknown first (spike it) rather than last.
+7. **Gate** — the adversarial check before calling it done: does each step''s
+   verification actually prove the done-condition?
+
+## Stance
+- Plan to the **next solid checkpoint**, not the whole universe — re-plan as
+  reality lands. A plan that survives contact is short and concrete.
+- Sequence so something **works end-to-end early** (a thin slice), then deepen —
+  beats building all the pieces and integrating last.
+- In super-coder, land the plan as a **spec** on the roadmap (the `docs` skill):
+  a feature row + a `spec` document, so the plan is reviewable and freezes on
+  ship.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'docs',
+  'Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
+  'substrate',
+  NULL,
+  0,
+  '# docs — author & review documents
 
 In super-coder the **DB owns document bodies** — never loose `.md` files. A
 `documents` row is the source; `sc render` writes the read-only flat copy to
@@ -23,13 +89,13 @@ In super-coder the **DB owns document bodies** — never loose `.md` files. A
 A feature (the `roadmap` row) is the umbrella, and it exists from `brainstorm`
 onward — before any spec is written. **Specs hang off the feature, not off each
 other:** a feature can hold several unfrozen specs at once (the working pile),
-each a `documents (kind='spec')` row, ordered by `seq`. There are no
+each a `documents (kind=''spec'')` row, ordered by `seq`. There are no
 feature-to-feature links and no second roadmap row for related work — related
 work is just another spec under the same feature.
 
 A spec stays unfrozen until it ships; freeze is the ship-time record of what we
-built to, and it never gates the feature's other specs. So at any moment a
-feature's specs are in one of three states:
+built to, and it never gates the feature''s other specs. So at any moment a
+feature''s specs are in one of three states:
 
 | state | how to tell | meaning |
 |---|---|---|
@@ -37,7 +103,7 @@ feature's specs are in one of three states:
 | **active** | unfrozen **and** has rows in `spec_tasks` | the spec being built now |
 | **backlog** | unfrozen, no task plan yet | the pile, ordered by `seq` |
 
-The **doc** (`kind='doc'`) is the feature's readable face — write it when the
+The **doc** (`kind=''doc''`) is the feature''s readable face — write it when the
 first spec ships, under the same `feature_id`. It is a sibling of the specs, not
 a parent they point at.
 
@@ -45,15 +111,15 @@ a parent they point at.
 
 A feature attaches to a **work-stream** (a `projects` row) via
 `roadmap.project_id`; the GUI **Flow view groups on it**, and `NULL` shows as
-**Ungrouped**. An unassigned feature is invisible to the Flow view's grouping —
+**Ungrouped**. An unassigned feature is invisible to the Flow view''s grouping —
 so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
 create a feature or author/update a spec, assess the work-stream** as part of the
-same act (it's a planning decision, like the stage):
+same act (it''s a planning decision, like the stage):
 
 ```
 # existing work-streams (pick the one this feature belongs to):
 sc mem get projects
-# is this feature already assigned? — read its row's project_id:
+# is this feature already assigned? — read its row''s project_id:
 sc mem get roadmap
 ```
 
@@ -64,24 +130,24 @@ Then:
   `sc mem roadmap project <feature_id> <shortname>`
 - **No fitting work-stream exists yet** → create one, then assign:
   `sc mem project add <shortname> "<title>" --purpose "…"`
-- **Already correctly assigned** → **no-op**; don't churn it.
+- **Already correctly assigned** → **no-op**; don''t churn it.
 
 **Auto-assign when the stream is obvious** (only one plausible fit, or it clearly
 belongs to an existing stream). **Surface to the FnB only when ambiguous** —
-several streams could fit, or the feature implies a new stream you're unsure how
-to name. Exempt, as with stages: work that isn't a feature/spec (a quick fix)
+several streams could fit, or the feature implies a new stream you''re unsure how
+to name. Exempt, as with stages: work that isn''t a feature/spec (a quick fix)
 needs no work-stream.
 
 ## Review first
 
-Before writing, see what exists — don't duplicate, and don't re-litigate:
+Before writing, see what exists — don''t duplicate, and don''t re-litigate:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index — already settled? (<id> = full row + rationale; --all incl. superseded)
-sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
+sc map-sql "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- repo''s own docs (map db)
 ```
 
-If the spec you're about to write touches a recorded decision, honor it or
+If the spec you''re about to write touches a recorded decision, honor it or
 supersede it **explicitly** — say so in the spec, and record the new decision
 with `sc mem decision "…" --parent <old_id>`. Never silently re-decide a
 settled choice.
@@ -93,10 +159,10 @@ the markdown from a file (no shell-escaping a long body), `--seq` auto-increment
 within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
 pipeline this rides on is the `snapshot` skill):
 ```
-# a doc against a feature (kind='doc'); DB owns the body:
+# a doc against a feature (kind=''doc''); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
 
-# a feature's next spec stage (kind='spec'); seq auto-advances:
+# a feature''s next spec stage (kind=''spec''); seq auto-advances:
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
@@ -110,13 +176,13 @@ sc mem doc edit <document_id> --body-file ./draft.md
 sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 ```
 
-## Freeze + document on ship — the planner's handoff
+## Freeze + document on ship — the planner''s handoff
 
 Shipping a feature is a **two-shell** act, and the split keeps `shipped` honest:
 
 - the **dev** flips the feature to `roadmap_status = shipped` and opens a
   **docs-pending** flag (see the `spec` skill, Step 5) — so `shipped` never
-  silently claims a doc that doesn't exist yet;
+  silently claims a doc that doesn''t exist yet;
 - the **planner** picks up that flag and does the paperwork: **freeze the spec,
   write the doc, close the flag.**
 
@@ -124,7 +190,7 @@ As the planner, on a docs-pending flag (it arrived in your inbox per the `flags`
 skill):
 
 1. **Freeze the shipped spec** — records what we built to, immutable thereafter.
-   The feature's other specs stay unfrozen and unaffected; never edit a frozen one
+   The feature''s other specs stay unfrozen and unaffected; never edit a frozen one
    (open a new spec under the same feature instead). The GUI and render layer both
    refuse edits to frozen docs:
    ```
@@ -148,7 +214,7 @@ doc pending.
 
 ## View
 
-Open any doc rendered: the GUI's "open in md-converter ↗" (Roadmap card or Docs
+Open any doc rendered: the GUI''s "open in md-converter ↗" (Roadmap card or Docs
 tab) — the body rides in the URL, no upload. For long-form authoring, write the
 markdown to the `body` and let the render + md-converter handle presentation.
 
@@ -157,7 +223,7 @@ markdown to the `body` and let the render + md-converter handle presentation.
 # Authoring format (themed-markdown)
 
 The `body` you write **is** themed-markdown — the format md-converter renders.
-**Your job is structure; styling is the renderer's job.** Never write visual
+**Your job is structure; styling is the renderer''s job.** Never write visual
 instructions (colors, fonts, sizes, themes). Apply the four semantic classes;
 the theme picks the actual colors.
 
@@ -169,7 +235,7 @@ awkwardly or overflows a fixed UI slot).
 
 ## Frontmatter
 
-Author these in the body's frontmatter:
+Author these in the body''s frontmatter:
 
 ```
 ---
@@ -191,7 +257,7 @@ purpose: Brief description
 
 `date`/`project`/`purpose` → footer meta cards. **`sc render` injects
 `feature`, `roadmap_status`, `frozen`, `rendered_by`, `source` on top of these
-— don't write those yourself.** Never use comma-separated tags (`tags: a, b`);
+— don''t write those yourself.** Never use comma-separated tags (`tags: a, b`);
 always a YAML list.
 
 ## Structure
@@ -221,7 +287,7 @@ larger material.
 - Video: a bare video URL **alone on its own line** renders as a player —
   a `github.com/user-attachments/assets/<id>` URL (paste a video into a GitHub
   issue/PR to mint one) or any absolute URL ending `.mp4`/`.webm`/`.mov`/`.ogg`.
-  Don't wrap it in `![]()` or `[]()` — bare is what triggers the player.
+  Don''t wrap it in `![]()` or `[]()` — bare is what triggers the player.
 - Code: fenced with a language hint (```` ```python ````)
 
 ## Color classes
@@ -271,7 +337,7 @@ graph LR
 ```
 ````
 
-Class via `:::classN` on nodes. The app injects `classDef` — **don't** write
+Class via `:::classN` on nodes. The app injects `classDef` — **don''t** write
 `classDef`, `fill:`, or any style directive. Node label cap ≤24 (Mermaid
 auto-sizes nodes; long labels balloon them).
 
@@ -325,7 +391,36 @@ shows on GitHub but is dropped from the render (preamble rule):
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/<owner>/<repo>/blob/<branch>/<path>)
 ```
 
-Fill `<owner>/<repo>/<branch>/<path>` with the file's GitHub location (any
+Fill `<owner>/<repo>/<branch>/<path>` with the file''s GitHub location (any
 subdirectory depth). Public repos only — the badge fetches the raw file in the
-reader's browser (no server/auth). Destination unknown → keep the placeholders
-and tell the user to fill them.
+reader''s browser (no server/auth). Destination unknown → keep the placeholders
+and tell the user to fill them.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+-- 2a. Decisions table row: "never supersede, add a new one" → supersede-with-new.
+UPDATE shells
+   SET system_prompt = REPLACE(system_prompt,
+       '| Decisions | `shell_decisions` — major decisions; never supersede, add a new one |',
+       '| Decisions | `shell_decisions` — major decisions; never edit a row — supersede with a new one (`--parent`) |')
+ WHERE system_prompt LIKE '%never supersede, add a new one%';
+
+-- 2b. Read-side awareness paragraph, anchored after the writes paragraph.
+UPDATE shells
+   SET system_prompt = REPLACE(system_prompt,
+       '`memory` and `db_map` skills.',
+       '`memory` and `db_map` skills.
+
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.')
+ WHERE system_prompt LIKE '%`memory` and `db_map` skills.%'
+   AND system_prompt NOT LIKE '%Read before you decide%';
+
+COMMIT;

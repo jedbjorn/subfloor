@@ -188,9 +188,10 @@ steps, so the work has a shape before you start cutting.
 1. **Restate the objective** in one sentence + the done-condition (how you''ll
    know it''s finished).
 2. **Re-surface prior decisions** — `sc mem get decisions`: has any part of
-   this already been settled? A recorded decision constrains the plan; honor
-   it, or supersede it explicitly (`sc mem decision "…" --parent <old_id>`) —
-   never silently re-litigate.
+   this already been settled? (Index of active decisions; `sc mem get
+   decisions <id>` pulls one with its rationale.) A recorded decision
+   constrains the plan; honor it, or supersede it explicitly
+   (`sc mem decision "…" --parent <old_id>`) — never silently re-litigate.
 3. **Decompose** into concrete steps — each a unit you could verify on its own.
 4. **Order by dependency** — what must precede what. Mark steps with no
    dependency on each other as **parallelizable**.
@@ -934,7 +935,7 @@ needs no work-stream.
 Before writing, see what exists — don''t duplicate, and don''t re-litigate:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
-sc mem get decisions      # prior Major decisions — is what you''re about to plan already settled?
+sc mem get decisions      # active-decision index — already settled? (<id> = full row + rationale; --all incl. superseded)
 sc map-sql "SELECT path FROM dr_filepath WHERE role=''doc'';"  -- repo''s own docs (map db)
 ```
 
