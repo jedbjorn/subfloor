@@ -47,9 +47,11 @@ The FnB carries it upstream (that's exactly how `get documents`/`get tasks`
 landed); message a planner-flavor shell too if the fork has one. Until then, do
 what you *can* through the API and flag the rest — never the DB directly.
 
-The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
-(see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
-memory/identity/content. Don't look for `dr_*` in `shell_db.db`.
+The repo map (`dr_*`) lives in its own db, `.sc-state/map.db` (see the
+`surface_catalogue` skill). The `dr_*` tables also *exist* in `shell_db.db` but
+are **always empty** there — a `dr_*` query against `shell_db.db` silently
+returns 0 rows instead of erroring, so it looks like an empty map. Never query
+`dr_*` here; this map covers only `shell_db.db`, your memory/identity/content.
 
 ## Tables
 

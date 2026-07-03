@@ -17,7 +17,8 @@ The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
 engine memory db (`shell_db.db`) so an engine schema change never touches the
 map. Every `dr_*` query below runs against it: `sc map-sql "…"`.
 Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
-`sc snapshot` and reloaded on a fresh map db.
+snapshot (an admin/GUI step — see the curation section) and reloaded on a
+fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
@@ -186,8 +187,12 @@ VALUES ('App DB', '<db dir>/', 'Product runtime database — schema + migrations
 
 If this fork ships no database of its own, there is nothing to tag — skip it.
 
-After a curation pass, `sc snapshot` (sections are snapshotted; descriptions
-ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
+After a curation pass, your writes are already live in the shared map db —
+done. Serializing them to git (`sc snapshot`) is an **admin/GUI step**: a plain
+`sc snapshot` from a shell is refused by design. Persistence happens via the
+GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc snapshot`; don't chase it
+yourself. (Sections are snapshotted; descriptions ride the live DB + survive
+remap, refilled from the worklist if a rebuild drops them.)
 
 ## Extending the map — semantic extractors
 
@@ -216,7 +221,8 @@ never clobbers them); the table *columns* are standardized in the engine
    and rewrite the match — aim for the dominant pattern, not 100%.
 3. **Run + verify:** `sc map`, then check the table populated and the rows look
    right (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Commit** `.sc-state/map_extractors/` + `sc snapshot`.
+4. **Commit** `.sc-state/map_extractors/`. (Snapshotting the authored layer is
+   the admin/GUI step above — not yours to run.)
 
 **The contract** (full version in `templates/map_extractors/README.md`): each
 module defines `extract(con, repo_root, cfg) -> str`. `con` is the live map db
@@ -259,7 +265,8 @@ WHERE desc IS NULL AND path LIKE 'region/%' ORDER BY role, path;
 -- 3. do they form / join a section? curate dr_section if the region is a new area.
 ```
 
-Then `sc snapshot` and `--message mark-read <id>` (see the `messaging` skill).
+Then `--message mark-read <id>` (see the `messaging` skill) — your curation is
+already live; snapshotting is the admin/GUI step.
 The mechanical remap already ran via the hook; your job on the notice is purely
 the authored layer — describe the new leaves, section a new area. Scope is free:
 `desc IS NULL` already narrows to exactly the uncurated tail.

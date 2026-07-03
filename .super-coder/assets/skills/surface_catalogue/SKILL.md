@@ -71,7 +71,11 @@ SELECT name, source_file FROM dr_env ORDER BY name;
 -- semantic layer (only if an extractor is wired for this repo — see cartographer):
 SELECT method, path, handler FROM dr_endpoint ORDER BY path;            -- the API surface
 SELECT name, kind, source_file FROM dr_db_table ORDER BY name;          -- the app DB schema
-SELECT name, type, pk, not_null FROM dr_db_column WHERE table_name='users';
+-- table_name is a string ref (cache; no FK): schema + migration files each
+-- contribute their own copy of a table's columns — select source_file and
+-- read one source's rows, or expect duplicates:
+SELECT source_file, name, type, pk, not_null FROM dr_db_column
+WHERE table_name='users' ORDER BY source_file;
 SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI routes
 ```
 
