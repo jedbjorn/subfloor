@@ -98,7 +98,9 @@ So rollback restores **both**:
 
 1. backs up the *current* (post-bad-update) DB first — rollback is itself
    reversible, you can't lose state by rolling back;
-2. restores the DB from the most recent pre-update backup (`~/db_backups/`);
+2. restores the DB from the most recent pre-update backup
+   (`~/db_backups/<repo-name>/` — keyed by this fork's repo dir name; distinct
+   from any `db_backups/` dir the fork's app keeps at its repo root);
 3. re-materializes the engine at `.sc-state/engine.ref.prev` and restores
    `engine.ref` — the engine half of the restore point.
 

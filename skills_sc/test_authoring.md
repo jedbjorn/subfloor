@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # test_authoring
 
-Principles for stringent pytest tests — tests that can actually fail. Pair with test_authoring_sqlite or test_authoring_pg for stack-specific infra context.
+Principles for stringent pytest tests — tests that can actually fail. Pair with a granted stack-infra testing skill (test_authoring_sqlite / test_authoring_pg / a fork-local one) if the shell has one.
 
 **Category:** craft
 
@@ -19,8 +19,11 @@ The goal of a test is to **fail when the code is wrong**. A test that passes
 no matter what the code does is worse than no test — it reads as coverage while
 guarding nothing.
 
-Load `test_authoring_sqlite` or `test_authoring_pg` alongside this for the
-test infrastructure your stack uses (fixture setup, callers, DB access pattern).
+If your shell has a stack-infra testing skill granted (`test_authoring_sqlite`,
+`test_authoring_pg`, or a fork-local skill that supersedes this one), load it
+alongside for the test infrastructure your stack uses (fixture setup, callers,
+DB access pattern). If none is granted, this skill stands alone — don't hunt
+for one that this fork doesn't ship.
 
 ## The rules (the floor)
 

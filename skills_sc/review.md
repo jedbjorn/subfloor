@@ -65,6 +65,10 @@ whichever area the diff touches:
 | schema / migration | `database-migrations` |
 | a redline / UI change | `redline_review` |
 
+If this fork grants a skill that supersedes a lens (says so in its description —
+e.g. a fork-local testing skill superseding `test_authoring`), use the
+superseding skill: it carries the fork's actual standard.
+
 ## Step 3: Open a flag per failure — record, don't yet send
 
 Each real failure is a flag against the feature — a record of what you found:

@@ -297,7 +297,8 @@ The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
 engine memory db (`shell_db.db`) so an engine schema change never touches the
 map. Every `dr_*` query below runs against it: `sc map-sql "…"`.
 Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
-`sc snapshot` and reloaded on a fresh map db.
+snapshot (an admin/GUI step — see the curation section) and reloaded on a
+fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
@@ -466,8 +467,12 @@ VALUES (''App DB'', ''<db dir>/'', ''Product runtime database — schema + migra
 
 If this fork ships no database of its own, there is nothing to tag — skip it.
 
-After a curation pass, `sc snapshot` (sections are snapshotted; descriptions
-ride the live DB + survive remap, refilled from the worklist if a rebuild drops them).
+After a curation pass, your writes are already live in the shared map db —
+done. Serializing them to git (`sc snapshot`) is an **admin/GUI step**: a plain
+`sc snapshot` from a shell is refused by design. Persistence happens via the
+GUI Snapshot button or an admin''s `SC_ADMIN=1 ./sc snapshot`; don''t chase it
+yourself. (Sections are snapshotted; descriptions ride the live DB + survive
+remap, refilled from the worklist if a rebuild drops them.)
 
 ## Extending the map — semantic extractors
 
@@ -496,7 +501,8 @@ never clobbers them); the table *columns* are standardized in the engine
    and rewrite the match — aim for the dominant pattern, not 100%.
 3. **Run + verify:** `sc map`, then check the table populated and the rows look
    right (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Commit** `.sc-state/map_extractors/` + `sc snapshot`.
+4. **Commit** `.sc-state/map_extractors/`. (Snapshotting the authored layer is
+   the admin/GUI step above — not yours to run.)
 
 **The contract** (full version in `templates/map_extractors/README.md`): each
 module defines `extract(con, repo_root, cfg) -> str`. `con` is the live map db
@@ -539,7 +545,8 @@ WHERE desc IS NULL AND path LIKE ''region/%'' ORDER BY role, path;
 -- 3. do they form / join a section? curate dr_section if the region is a new area.
 ```
 
-Then `sc snapshot` and `--message mark-read <id>` (see the `messaging` skill).
+Then `--message mark-read <id>` (see the `messaging` skill) — your curation is
+already live; snapshotting is the admin/GUI step.
 The mechanical remap already ran via the hook; your job on the notice is purely
 the authored layer — describe the new leaves, section a new area. Scope is free:
 `desc IS NULL` already narrows to exactly the uncurated tail.
@@ -758,9 +765,11 @@ The FnB carries it upstream (that''s exactly how `get documents`/`get tasks`
 landed); message a planner-flavor shell too if the fork has one. Until then, do
 what you *can* through the API and flag the rest — never the DB directly.
 
-The repo map (`dr_*`) is **not here** — it lives in its own db, `.sc-state/map.db`
-(see the `surface_catalogue` skill). This map covers only `shell_db.db`, your
-memory/identity/content. Don''t look for `dr_*` in `shell_db.db`.
+The repo map (`dr_*`) lives in its own db, `.sc-state/map.db` (see the
+`surface_catalogue` skill). The `dr_*` tables also *exist* in `shell_db.db` but
+are **always empty** there — a `dr_*` query against `shell_db.db` silently
+returns 0 rows instead of erroring, so it looks like an empty map. Never query
+`dr_*` here; this map covers only `shell_db.db`, your memory/identity/content.
 
 ## Tables
 
@@ -1266,8 +1275,7 @@ SELECT DISTINCT r.feature_id, r.title, r.roadmap_status
 FROM roadmap r
 JOIN documents d   ON d.feature_id = r.feature_id AND d.kind=''spec''
 JOIN spec_tasks t  ON t.document_id = d.document_id AND t.title=''Verification'' AND t.status=''done''
-WHERE COALESCE(r.is_deleted,0)=0
-  AND r.roadmap_status NOT IN (''shipped'',''retired'')
+WHERE r.roadmap_status NOT IN (''shipped'',''retired'')
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
@@ -1293,8 +1301,7 @@ but not yet shipped is 3A''s job, not this one — it surfaces there first.)
 -- shipped features with no frozen doc and no open docs-pending flag:
 SELECT r.feature_id, r.title, r.roadmap_status
 FROM roadmap r
-WHERE COALESCE(r.is_deleted,0)=0
-  AND r.roadmap_status = ''shipped''
+WHERE r.roadmap_status = ''shipped''
   AND NOT EXISTS (
     SELECT 1 FROM documents d
     WHERE d.feature_id = r.feature_id AND d.kind=''spec'' AND d.frozen=1)
@@ -2535,6 +2542,10 @@ whichever area the diff touches:
 | schema / migration | `database-migrations` |
 | a redline / UI change | `redline_review` |
 
+If this fork grants a skill that supersedes a lens (says so in its description —
+e.g. a fork-local testing skill superseding `test_authoring`), use the
+superseding skill: it carries the fork''s actual standard.
+
 ## Step 3: Open a flag per failure — record, don''t yet send
 
 Each real failure is a flag against the feature — a record of what you found:
@@ -2680,7 +2691,9 @@ So rollback restores **both**:
 
 1. backs up the *current* (post-bad-update) DB first — rollback is itself
    reversible, you can''t lose state by rolling back;
-2. restores the DB from the most recent pre-update backup (`~/db_backups/`);
+2. restores the DB from the most recent pre-update backup
+   (`~/db_backups/<repo-name>/` — keyed by this fork''s repo dir name; distinct
+   from any `db_backups/` dir the fork''s app keeps at its repo root);
 3. re-materializes the engine at `.sc-state/engine.ref.prev` and restores
    `engine.ref` — the engine half of the restore point.
 
@@ -3133,7 +3146,11 @@ SELECT name, source_file FROM dr_env ORDER BY name;
 -- semantic layer (only if an extractor is wired for this repo — see cartographer):
 SELECT method, path, handler FROM dr_endpoint ORDER BY path;            -- the API surface
 SELECT name, kind, source_file FROM dr_db_table ORDER BY name;          -- the app DB schema
-SELECT name, type, pk, not_null FROM dr_db_column WHERE table_name=''users'';
+-- table_name is a string ref (cache; no FK): schema + migration files each
+-- contribute their own copy of a table''s columns — select source_file and
+-- read one source''s rows, or expect duplicates:
+SELECT source_file, name, type, pk, not_null FROM dr_db_column
+WHERE table_name=''users'' ORDER BY source_file;
 SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI routes
 ```
 
@@ -3253,7 +3270,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'test_authoring',
-  'Principles for stringent pytest tests — tests that can actually fail. Pair with test_authoring_sqlite or test_authoring_pg for stack-specific infra context.',
+  'Principles for stringent pytest tests — tests that can actually fail. Pair with a granted stack-infra testing skill (test_authoring_sqlite / test_authoring_pg / a fork-local one) if the shell has one.',
   'craft',
   NULL,
   0,
@@ -3264,8 +3281,11 @@ The goal of a test is to **fail when the code is wrong**. A test that passes
 no matter what the code does is worse than no test — it reads as coverage while
 guarding nothing.
 
-Load `test_authoring_sqlite` or `test_authoring_pg` alongside this for the
-test infrastructure your stack uses (fixture setup, callers, DB access pattern).
+If your shell has a stack-infra testing skill granted (`test_authoring_sqlite`,
+`test_authoring_pg`, or a fork-local skill that supersedes this one), load it
+alongside for the test infrastructure your stack uses (fixture setup, callers,
+DB access pattern). If none is granted, this skill stands alone — don''t hunt
+for one that this fork doesn''t ship.
 
 ## The rules (the floor)
 

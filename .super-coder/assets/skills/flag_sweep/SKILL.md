@@ -97,8 +97,7 @@ SELECT DISTINCT r.feature_id, r.title, r.roadmap_status
 FROM roadmap r
 JOIN documents d   ON d.feature_id = r.feature_id AND d.kind='spec'
 JOIN spec_tasks t  ON t.document_id = d.document_id AND t.title='Verification' AND t.status='done'
-WHERE COALESCE(r.is_deleted,0)=0
-  AND r.roadmap_status NOT IN ('shipped','retired')
+WHERE r.roadmap_status NOT IN ('shipped','retired')
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
@@ -124,8 +123,7 @@ but not yet shipped is 3A's job, not this one — it surfaces there first.)
 -- shipped features with no frozen doc and no open docs-pending flag:
 SELECT r.feature_id, r.title, r.roadmap_status
 FROM roadmap r
-WHERE COALESCE(r.is_deleted,0)=0
-  AND r.roadmap_status = 'shipped'
+WHERE r.roadmap_status = 'shipped'
   AND NOT EXISTS (
     SELECT 1 FROM documents d
     WHERE d.feature_id = r.feature_id AND d.kind='spec' AND d.frozen=1)
