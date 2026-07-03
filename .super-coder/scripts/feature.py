@@ -67,6 +67,7 @@ FEATURES: dict[str, dict] = {
         "block": "vm",
         "block_auto": False,
         "grants": {"windows_devkit": ["dev", "reviewer"],
+                   "windows_vm_gui": ["dev", "reviewer"],
                    "configure_winbox": ["admin"]},
         "link": ["link your VM: GUI → Scripts → 'Windows Test VM' wizard "
                  "(live-checks each field), or hand-fill the `vm` block in "

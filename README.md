@@ -644,7 +644,7 @@ front door to the pair:
 | Feature | Config block | Skills → flavors | What it gives the fork |
 |---|---|---|---|
 | **`pg`** | `pg` (auto-created) | `test_authoring_pg` → dev, reviewer | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — develop + test the fork's **app** against real Postgres (the engine DB stays SQLite, always) |
-| **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) |
+| **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `windows_vm_gui` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) — plus UIA-based GUI driving for exploratory QAQC |
 | **`tailnet`** | `ts` (operator-linked) | `tailscale` → devops | The tailnet broker — reach declared build/deploy hosts from the sandbox without holding a tailnet credential (section after) |
 | **`pm2`** | `pm2` (operator-linked) | `pm2` → admin, devops | The pm2 broker — observe + manage the host's pm2-supervised **app** stack (status, health, logs, scoped restarts) from the sandbox (section after) |
 | **`app-deploy`** | — (procedure-only) | `app_deploy_setup` → admin | A deploy-ritual scaffold for the fork's **app** (the engine deploys itself via `sc update`) — the admin fills the template (migration dirs, DB backup, ff-only sync, apply + move migrations, restart) and saves it as the repo's own project-local `deploy` skill, granted to every shell |
@@ -808,10 +808,10 @@ test loop (which reverts) in between.
 `libvirt_uri` is **optional** — set `qemu:///system` for a system-scope domain (the
 default `qemu:///session` can't see it); omit it otherwise.
 
-**6 · Grant the skills + start the broker.** Both skills are engine `common=0` — they
-propagate to every fork but **auto-grant to none**. `./sc feature enable windows`
-grants them in one step (`windows_devkit` → dev + reviewer, `configure_winbox` →
-admin); or toggle them per shell in the GUI. The broker comes up
+**6 · Grant the skills + start the broker.** All three skills are engine `common=0` —
+they propagate to every fork but **auto-grant to none**. `./sc feature enable windows`
+grants them in one step (`windows_devkit` + `windows_vm_gui` → dev + reviewer,
+`configure_winbox` → admin); or toggle them per shell in the GUI. The broker comes up
 automatically with `./sc launch` when a VM is linked; or drive it directly:
 
 ```bash
