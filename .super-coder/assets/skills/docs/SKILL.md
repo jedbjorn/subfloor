@@ -74,11 +74,17 @@ needs no work-stream.
 
 ## Review first
 
-Before writing, see what exists — don't duplicate:
+Before writing, see what exists — don't duplicate, and don't re-litigate:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
+sc mem get decisions      # prior Major decisions — is what you're about to plan already settled?
 sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
 ```
+
+If the spec you're about to write touches a recorded decision, honor it or
+supersede it **explicitly** — say so in the spec, and record the new decision
+with `sc mem decision "…" --parent <old_id>`. Never silently re-decide a
+settled choice.
 
 ## Author
 

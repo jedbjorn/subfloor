@@ -14,15 +14,19 @@ steps, so the work has a shape before you start cutting.
 
 1. **Restate the objective** in one sentence + the done-condition (how you'll
    know it's finished).
-2. **Decompose** into concrete steps — each a unit you could verify on its own.
-3. **Order by dependency** — what must precede what. Mark steps with no
+2. **Re-surface prior decisions** — `sc mem get decisions`: has any part of
+   this already been settled? A recorded decision constrains the plan; honor
+   it, or supersede it explicitly (`sc mem decision "…" --parent <old_id>`) —
+   never silently re-litigate.
+3. **Decompose** into concrete steps — each a unit you could verify on its own.
+4. **Order by dependency** — what must precede what. Mark steps with no
    dependency on each other as **parallelizable**.
-4. **Per step**: the change, the files/areas it touches (use `surface_catalogue`
+5. **Per step**: the change, the files/areas it touches (use `surface_catalogue`
    to ground this in the real repo), and its **verification** (test, run,
    review).
-5. **Risks / unknowns** — what could break the plan; resolve the riskiest
+6. **Risks / unknowns** — what could break the plan; resolve the riskiest
    unknown first (spike it) rather than last.
-6. **Gate** — the adversarial check before calling it done: does each step's
+7. **Gate** — the adversarial check before calling it done: does each step's
    verification actually prove the done-condition?
 
 ## Stance
