@@ -20,6 +20,10 @@ Routes (all JSON `{ok, ...}`):
     POST /push      {src,dest?} stage a host-visible artifact into transfer_dir
     POST /capture   {command?}  optional exec + a virsh screenshot (base64)
     POST /validate/{check}      one live setup check against the body's candidate cfg
+    POST /mcp/up                open the GUI seam: ssh-forward run/vm-mcp.sock
+                                to the guest's Windows-MCP port (idempotent)
+    POST /mcp/down              close it (idempotent)
+    GET  /mcp/status            {ok, running, pid, socket}
 
 Verbs act on the SAVED `vm` block; `/validate` tests the CANDIDATE block in the
 body (the wizard, before save). The socket is fs-perm gated (0600) — reachable
@@ -71,6 +75,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "service": "vm-broker"})
         if self.path == "/vm":
             return self._send(200, {"vm": vm.read()})
+        if self.path == "/mcp/status":
+            return self._send(200, vm.mcp_status())
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_PUT(self) -> None:
@@ -96,6 +102,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, vm.do_push(b.get("src", ""), b.get("dest")))
             if self.path == "/capture":
                 return self._send(200, vm.do_capture(self._body().get("command")))
+            if self.path == "/mcp/up":
+                # The GUI seam (#263): forward run/vm-mcp.sock to the guest's
+                # Windows-MCP. Target port comes from the SAVED block, never
+                # the caller — the sandbox names an action, not a destination.
+                return self._send(200, vm.do_mcp_up())
+            if self.path == "/mcp/down":
+                return self._send(200, vm.do_mcp_down())
             if self.path.startswith("/validate/"):
                 r = vm.validate(self.path.rsplit("/", 1)[1], self._body().get("vm") or {})
                 if r is None:

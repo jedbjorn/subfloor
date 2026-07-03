@@ -3678,13 +3678,35 @@ unreachable unless the server itself runs elevated.
    (`schtasks /run /tn windows-mcp-server` over SSH) — and if the task is
    missing, the snapshot was baked without the prep above.
 
-**Sandboxed seat** (the engine default): not wired yet. The sandbox has no
-`ssh`, no key, and no route to the VM — that is the broker design — and the
-vm-broker does not yet expose an MCP seam. Tracked upstream:
-[super-coder#263](https://github.com/jedbjorn/super-coder/issues/263). Until
-it lands: screenshots via `/capture`, scriptable checks via `windows_devkit`''s
-exec loop. Do **not** fake GUI driving by guessing pixel coordinates off
-`/capture` screenshots — that is the exact failure mode this skill bans.
+**Sandboxed seat** (the engine default): the sandbox has no `ssh`, no key,
+and no route to the VM — that is the broker design — so the connection is
+brokered in two halves. The vm-broker (host-side, holds the key) ssh-forwards
+a unix socket in the bind-mounted `run/` dir to the guest''s Windows-MCP; a
+tiny in-sandbox relay gives that socket the TCP URL `claude mcp add` needs:
+
+1. Start from a clean box (`windows_devkit`''s `/reset`); wait until SSH
+   answers.
+2. Open the broker tunnel:
+   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/up`
+   (idempotent; forwards `run/vm-mcp.sock` to the guest''s `mcp_port`,
+   default 8000).
+3. Start the in-sandbox relay: `./sc vm-mcp-relay up` (listens on
+   `127.0.0.1:18000`, pipes to the tunnel socket; also idempotent).
+4. Verify the endpoint answers: `curl -s http://127.0.0.1:18000/mcp`.
+5. Connect the harness:
+   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
+6. Endpoint dead → `./sc vm-mcp-relay status` first (`upstream: false` means
+   the broker tunnel is down — redo step 2; a reset drops it, so reconnect
+   after every `/reset`), then the guest task
+   (`schtasks /run /tn windows-mcp-server` via broker `/exec`) — and if the
+   task is missing, the snapshot was baked without the prep above.
+7. Done driving: `./sc vm-mcp-relay down` and
+   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/down`.
+
+No key, no ssh, no network surface enters the sandbox — both hops are unix
+sockets in the bind mount, same posture as every other broker verb. Do
+**not** fake GUI driving by guessing pixel coordinates off `/capture`
+screenshots — that is the exact failure mode this skill bans.
 
 ## Driving rules
 
