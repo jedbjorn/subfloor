@@ -69,7 +69,10 @@ def write(vm: dict | None) -> dict | None:
 
 def _run(argv: list[str], timeout: int = 30) -> tuple[bool, str]:
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        # errors="replace": Windows guests emit non-UTF-8 constantly (UTF-16
+        # files, OEM-codepage console output) — decode lossily, never raise.
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
         return p.returncode == 0, (p.stdout + p.stderr).strip()
     except FileNotFoundError as e:
         return False, f"command not found: {e.filename} — is it installed on the host?"
@@ -194,8 +197,13 @@ def do_exec(command: str, timeout: int = 120) -> dict:
     if not str(command).strip():
         return {"ok": False, "exit": -1, "stdout": "", "stderr": "exec: empty command"}
     try:
+        # errors="replace": guest output is routinely non-UTF-8 (UTF-16 files,
+        # OEM codepages). A strict decode turned the whole exec into a 500 with
+        # no exit code or partial output (#261) — lossy beats fatal here; callers
+        # needing byte-exact output base64 it guest-side.
         p = subprocess.run(_ssh_argv(cfg, command), capture_output=True,
-                           text=True, timeout=timeout)
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout)
         return {"ok": p.returncode == 0, "exit": p.returncode,
                 "stdout": p.stdout, "stderr": p.stderr}
     except FileNotFoundError as e:

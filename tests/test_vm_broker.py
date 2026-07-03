@@ -136,6 +136,29 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertTrue((Path(share) / "staged.py").is_file())
 
+    def test_exec_survives_non_utf8_guest_output(self):
+        # #261: Windows guests routinely emit non-UTF-8 (UTF-16 files, OEM
+        # codepages). A strict decode raised UnicodeDecodeError and the broker
+        # 500'd the whole exec. Real subprocess, real bytes: decode must be
+        # lossy (U+FFFD), never fatal, with exit + surrounding output intact.
+        raw = [sys.executable, "-c",
+               "import sys; sys.stdout.buffer.write(b'pre \\x83\\xff post')"]
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_ssh_argv", return_value=raw):
+            r = vm.do_exec("type addin-manifest")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["exit"], 0)
+        self.assertIn("pre ", r["stdout"])
+        self.assertIn(" post", r["stdout"])
+        self.assertIn("�", r["stdout"])  # lossy marker, not an exception
+
+    def test_run_survives_non_utf8_output(self):
+        # Same seam for reset/capture/validate — _run shares the decode policy.
+        ok, out = vm._run([sys.executable, "-c",
+                           "import sys; sys.stdout.buffer.write(b'ok \\x9d')"])
+        self.assertTrue(ok)
+        self.assertIn("ok", out)
+
     def test_capture_returns_a_base64_screenshot(self):
         def fake_run(argv, timeout=30):
             # virsh screenshot writes the file the broker then reads back
