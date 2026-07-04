@@ -162,6 +162,47 @@ class ApiMemTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_mem("get", "flags", "1")          # <id> is decisions-only
 
+    # ── decisions why-audit link: feature_id + document_id (#0047) ─────────────
+    def test_decision_feature_and_doc_link(self):
+        self.run_mem("roadmap", "add", "feat L")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat L'")[0]
+        body = self.tmp / "d.md"
+        body.write_text("# spec\n")
+        self.run_mem("doc", "add", "spec L", "--body-file", str(body), "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec L'")[0]
+
+        # --feature links the decision to the feature
+        self.run_mem("decision", "chose L", "--feature", str(fid))
+        row = self.q("SELECT feature_id, document_id FROM shell_decisions "
+                     "WHERE decision='chose L'")
+        self.assertEqual(row[0], fid)
+        self.assertIsNone(row[1])
+
+        # --doc alone derives the feature from the document
+        self.run_mem("decision", "shaped by spec L", "--doc", str(did))
+        dfid, ddid = self.q("SELECT feature_id, document_id FROM shell_decisions "
+                            "WHERE decision='shaped by spec L'")
+        self.assertEqual((dfid, ddid), (fid, did))
+
+        # the library view echoes the links + their titles
+        one = mem._api("GET", f"/_sc/mem/decisions/"
+                       f"{self.q('SELECT decision_id FROM shell_decisions WHERE decision=?', 'shaped by spec L')[0]}"
+                       )["decision"]
+        self.assertEqual(one["feature_id"], fid)
+        self.assertEqual(one["document_id"], did)
+        self.assertEqual(one["feature_title"], "feat L")
+        self.assertEqual(one["document_title"], "spec L")
+
+    def test_decision_bad_link_ids_404(self):
+        with self.assertRaises(SystemExit):
+            self.run_mem("decision", "bad feature", "--feature", "999999")
+        with self.assertRaises(SystemExit):
+            self.run_mem("decision", "bad doc", "--doc", "999999")
+        # neither wrote a row
+        self.assertEqual(
+            self.q("SELECT COUNT(*) FROM shell_decisions "
+                   "WHERE decision IN ('bad feature','bad doc')")[0], 0)
+
     # ── flags ─────────────────────────────────────────────────────────────────
     def test_flag_open_then_close(self):
         self.run_mem("flag", "open", "[x] blocked | Blocker for: y", "--name", "SC-1")

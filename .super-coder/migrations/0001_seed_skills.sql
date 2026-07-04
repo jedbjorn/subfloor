@@ -2116,6 +2116,17 @@ the narrative.
 sc mem decision "…" --rationale "…" [--parent <id>]
 ```
 
+**Link the why to the what.** Most decisions shape a feature or come out of a
+spec — attach that link so the roadmap carries not just what was built and how,
+but why it was built that way:
+```
+sc mem decision "…" --feature <feature_id>   # ties it to a roadmap feature
+sc mem decision "…" --doc <document_id>       # ties it to a spec/doc (implies the feature)
+```
+Both optional — a decision unrelated to any feature stays unlinked. `--doc` is a
+refinement of `--feature`: pass the doc alone and the feature is derived from it.
+The link surfaces on `sc mem get decisions <id>`.
+
 ## Stance
 
 Write-as-you-go beats batch-at-close: it costs nothing per write and zero at

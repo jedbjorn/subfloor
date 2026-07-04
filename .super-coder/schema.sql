@@ -145,6 +145,12 @@ CREATE TABLE shell_decisions (
     parent_decision_id INTEGER REFERENCES shell_decisions(decision_id),
     is_deleted         INTEGER NOT NULL DEFAULT 0,
     created_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    -- feature_id  INTEGER REFERENCES roadmap(feature_id)   — the feature this
+    -- document_id INTEGER REFERENCES documents(document_id) — decision shaped
+    -- (the why-audit link), both added by migration 0047. Kept out of this
+    -- baseline CREATE on purpose: ADD COLUMN can't be IF NOT EXISTS and rebuild
+    -- applies migrations after schema.sql, so inlining would double-define.
+    -- See migrations/0047_decisions_feature_link.sql.
 );
 
 -- ── Roadmap (NEW — the feature index) ───────────────────────────────────────

@@ -27,7 +27,7 @@ Run from the repo root, like every engine command:
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
     ./sc mem lns   "<body>"          [--date …] [--tag …]
     ./sc mem retire <entry_id>
-    ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID]
+    ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--feature ID] [--doc ID]
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID]
     ./sc mem flag close <flag_id>    [--notes "…"]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>]
@@ -153,6 +153,12 @@ def _render_get(surface: str, data: dict) -> int:
         if "decision" in data:                    # single decision, with rationale
             d = data["decision"]
             _line(d)
+            if d.get("feature_id"):
+                ft = f" — {d['feature_title']}" if d.get("feature_title") else ""
+                print(f"  feature: #{d['feature_id']}{ft}")
+            if d.get("document_id"):
+                dt = f" — {d['document_title']}" if d.get("document_title") else ""
+                print(f"  doc: #{d['document_id']}{dt}")
             if d.get("rationale"):
                 print("  rationale: " + d["rationale"])
             return 0
@@ -325,8 +331,12 @@ def cmd_decision(args) -> int:
              {"decision": args.decision,
               "rationale": args.rationale,
               "decision_date": args.date or str(date.today()),
-              "parent_decision_id": args.parent})
-    return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded")
+              "parent_decision_id": args.parent,
+              "feature_id": args.feature,
+              "document_id": args.doc})
+    fid = r.get("feature_id")
+    link = f" → feature #{fid}" if fid else ""
+    return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded{link}")
 
 
 def cmd_flag(args) -> int:
@@ -494,6 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--rationale")
     sp.add_argument("--date")
     sp.add_argument("--parent", type=int, help="parent_decision_id (supersession)")
+    sp.add_argument("--feature", type=int,
+                    help="feature_id this decision serves (the why-audit link)")
+    sp.add_argument("--doc", type=int,
+                    help="document_id this decision shaped (implies its feature)")
     sp.set_defaults(fn=cmd_decision)
 
     sp = sub.add_parser("flag", help="open or close a flag")
