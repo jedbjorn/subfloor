@@ -37,6 +37,7 @@ import db_driver    # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import map_repo     # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
+import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
 
 
 def snapshot_path() -> Path:
@@ -145,6 +146,18 @@ def main(argv: list[str]) -> int:
             con.close()
     else:
         print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
+
+    # The migrations above seeded every engine skill live (is_deleted=0) —
+    # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
+    # this fork has retired (a shell created before the next launch/update
+    # would otherwise be granted them).
+    con = db_driver.connect(DB_PATH)
+    try:
+        flipped = seed_skills.apply_retired(con)
+    finally:
+        con.close()
+    if flipped:
+        print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
 
     # Re-attach the keys carried over from the outgoing DB (content.sql never
     # carries api_key — it is a secret and content.sql is git-tracked, see

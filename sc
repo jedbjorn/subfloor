@@ -808,8 +808,9 @@ super-coder — forkable shell substrate
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
   sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
                              Only for procedures with no API surface (map authoring) where a skill names it
-  ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name>
-                             shells by id or shortname; rm refuses engine skills; snapshot after writes to persist
+  ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
+                             shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
+                             list (.sc-state/skills_retired.json, rides updates); snapshot after writes to persist
   ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
   ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)

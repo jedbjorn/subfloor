@@ -502,6 +502,7 @@ fits the **fork-owned extension points**, you never touch engine files, and
 |---|---|
 | **Local skills** | Fork-authored procedures (GUI → Skills) — serialized in `content.sql`, survive every update |
 | **Flavor overlays** | `.sc-state/flavors/<flavor>.json` — what a NEW shell of a flavor gets: `skills_add` / `skills_remove` against the engine template's list, plus role/mandate/focus overrides (e.g. swap the engine's `test_authoring` for a fork's own testing skill) |
+| **Skill retire list** | `.sc-state/skills_retired.json` (written by `./sc skill retire <name>`) — engine skills this fork has taken out of service, e.g. ones superseded by a fork-local skill. Retired skills leave every surface (boot doc, renders, grants) on ALL shells and stay retired across updates; `unretire` restores them, grants intact |
 | **`instance.json`** | Per-fork config: ports, harness default, the `pg` / `vm` / `ts` opt-in blocks |
 | **`.sc-state/`** | Your memory (content.sql), map tuning, engine pin — the fork's one tracked artifact |
 | **Per-shell identity** | `current_state`, connections, decisions, seed — all DB rows, all yours |

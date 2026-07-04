@@ -1,11 +1,21 @@
----
-name: local_skill_management
-description: Create, persist, assign, and remove fork-specific skills — the correct authoring path so skills survive snapshot/rebuild cycles.
-category: substrate
-common: false
----
+-- 0046 — reseed local_skill_management: point engine-skill removal at retire (#238)
+--
+-- The removal section refused engine skills with only a per-shell `revoke` as
+-- the alternative; the fork retire list (`./sc skill retire <name>`,
+-- .sc-state/skills_retired.json) is now the durable fork-wide path for an
+-- engine skill a fork has superseded. 0001 is regenerated from the assets for
+-- fresh builds; this forward reseed carries the same body to already-installed
+-- forks (UPSERT by name; skill_id + grants preserved).
 
-# local_skill_management — fork-specific skills that survive
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'local_skill_management',
+  'Create, persist, assign, and remove fork-specific skills — the correct authoring path so skills survive snapshot/rebuild cycles.',
+  'substrate',
+  NULL,
+  0,
+  '# local_skill_management — fork-specific skills that survive
 
 Fork-specific skills live in the DB and are persisted via `.sc-state/content.sql`
 (the snapshot). The asset file under `.super-coder/assets/skills/<name>/` is the
@@ -55,7 +65,7 @@ The path: **file → seed → grant → snapshot → commit**.
    ```bash
    sc snapshot && sc render
    ```
-   `snapshot.py` serializes local skills (any skill the engine seed doesn't
+   `snapshot.py` serializes local skills (any skill the engine seed doesn''t
    own) into `.sc-state/content.sql`. This is what survives `sc update` and
    `sc rebuild` — the skill row and its grants are reconstructed from
    content.sql. Without this step the skill is lost on next update.
@@ -70,7 +80,7 @@ The path: **file → seed → grant → snapshot → commit**.
 
 Edit the asset file, then repeat seed → snapshot → commit (steps 2, 4, 5). If
 the asset file is gone (removed, or authored elsewhere), recreate it from the
-DB body first: `sc sql "SELECT content FROM skills WHERE name='<name>'"`.
+DB body first: `sc sql "SELECT content FROM skills WHERE name=''<name>''"`.
 
 ## Assigning an existing skill to additional shells
 
@@ -106,12 +116,12 @@ per-shell grant toggles on every skill. The Shells tab groups its grant list
 by the same sections.
 
 - **Repo skills** — the lead section: skills authored in this fork. Membership
-  is *derived*, not declared — a skill the engine seed doesn't own is
+  is *derived*, not declared — a skill the engine seed doesn''t own is
   repo-local. This is the same rule snapshot.py uses to decide what serializes
   into `.sc-state/content.sql`, so the section shows exactly what the snapshot
   keeps durable. No frontmatter flag exists or is needed.
 - **Substrate / Craft / …** — engine skills, sectioned by their `category`
-  frontmatter. A repo skill's `category` still displays as a label on its row,
+  frontmatter. A repo skill''s `category` still displays as a label on its row,
   but never moves it out of the Repo section.
 
 Grant toggles in the GUI hit the same DB table as `sc skill grant` — they
@@ -127,4 +137,12 @@ rebuild.
   update.
 - **Never use the GUI to create skills.** Toggling grants in the GUI is fine
   (snapshot after); creating is not — the GUI writes only to the DB and cannot
-  write the asset file or seed it. Use this procedure instead.
+  write the asset file or seed it. Use this procedure instead.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
