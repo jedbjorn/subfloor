@@ -626,6 +626,7 @@ def run_snapshot_render() -> str:
 # publishes (one git index).
 BASE_BRANCH = "main"
 PUBLISH_BRANCH = "sc_gui_content"
+_STASH_MSG = "sc-publish: stray non-content work"
 _PUBLISH_LOCK = threading.Lock()
 # The git-tracked text the DB rebuilds from + the flat renders. NOT the .db
 # (gitignored). schema.sql + migrations are engine paths: TRACKED in the source
@@ -750,6 +751,18 @@ def git_publish() -> dict:
         # if a step raised or returned early, so the tree never stays stranded on
         # the publish branch.
         _land_on_base(out, state)
+        # Restore any stray non-content work stashed by _prepare_branch — only now,
+        # once we're back on base, so it lands where it was taken from. Non-content
+        # files are identical across base/publish tips, so pop can't conflict; if it
+        # somehow does, keep the stash and tell the operator loudly rather than drop.
+        if state.get("stashed"):
+            n = state["stashed"]
+            pop = _git("stash", "pop")
+            if pop.returncode == 0:
+                out.append(f"(restored {n} stashed non-content file(s))")
+            else:
+                out.append(f"⚠ {n} stashed non-content file(s) NOT restored — run "
+                           f"'git stash pop' manually:\n{pop.stderr.strip()}")
     # Record the full end-to-end trace (success OR failure) so a publish that
     # "looked done" can be inspected after the fact — the gap that made the live
     # incident unexplainable. _land_on_base above appends to `out`, so log here.
@@ -763,16 +776,28 @@ def _prepare_branch(out: list, state: dict) -> bool:
     Returns True only when the tree is sitting on a fresh PUBLISH_BRANCH ready for
     the snapshot. Recovers automatically from a tree stranded on a stale publish
     branch, but refuses (rather than clobbers) if unrelated user work is dirty."""
-    # Refuse to touch a tree carrying real, non-regenerable changes — that's user
-    # work, not publishable content, and branch moves below would disrupt it.
+    # Stash real, non-regenerable changes out of the tree for the duration of the
+    # publish — that's user work, not publishable content, and the branch moves
+    # below would otherwise carry it along (or, if pre-staged, `git commit` would
+    # sweep it into the content commit). Stashing isolates it; `git_publish`'s
+    # finally pops it back after landing on base. A stray dirty file no longer
+    # wedges publish (#283); it's restored untouched once publish is done.
     unexpected = _unexpected_dirty()
     if unexpected:
-        state["ok"] = False
-        out.append("✗ working tree has non-content changes — refusing to publish "
-                   "(commit or stash them first):\n"
-                   + "\n".join(f"  {p}" for p in unexpected[:20])
-                   + ("\n  …" if len(unexpected) > 20 else ""))
-        return False
+        st = _git("stash", "push", "-m", _STASH_MSG, "--", *unexpected)
+        if st.returncode != 0:
+            # Can't isolate the work — fall back to refusing rather than risk it.
+            state["ok"] = False
+            out.append("✗ working tree has non-content changes and they could not "
+                       "be stashed — refusing to publish (commit or stash them "
+                       "first):\n"
+                       + "\n".join(f"  {p}" for p in unexpected[:20])
+                       + ("\n  …" if len(unexpected) > 20 else "")
+                       + f"\n  (git stash failed: {st.stderr.strip()})")
+            return False
+        state["stashed"] = len(unexpected)
+        out.append(f"(stashed {len(unexpected)} non-content file(s); "
+                   "restored after publish)")
 
     # Discard regenerable dirt so the checkout below can't fail on a dirty tree.
     _restore_regenerable(out)

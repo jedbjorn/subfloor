@@ -106,9 +106,11 @@ class PrepareBranchTest(unittest.TestCase):
         self.assertTrue(server._prepare_branch(out, state), msg="\n".join(out))
         self.assertEqual(current_branch(self.repo), server.PUBLISH_BRANCH)
 
-    def test_refuses_when_unrelated_file_dirty(self) -> None:
+    def test_stashes_unrelated_file(self) -> None:
         # A non-regenerable tracked file with uncommitted edits is user work —
-        # publish must refuse rather than reset or clobber it.
+        # publish must no longer wedge on it (#283): _prepare_branch stashes it out
+        # of the way and proceeds onto a clean publish branch. git_publish's finally
+        # pops it back afterward (see PublishRestoreTest).
         write(self.repo / "notes.txt", "v1\n")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-m", "add notes")
@@ -116,12 +118,81 @@ class PrepareBranchTest(unittest.TestCase):
         out: list[str] = []
         state = {"ok": True, "pr_url": None, "pushed": False}
         ok = server._prepare_branch(out, state)
+        self.assertTrue(ok, msg="\n".join(out))
+        self.assertTrue(state["ok"])
+        self.assertEqual(state.get("stashed"), 1)
+        self.assertTrue(any("stashed" in line for line in out), msg="\n".join(out))
+        # On a fresh publish branch with a clean tree — the stray file is stashed.
+        self.assertEqual(current_branch(self.repo), server.PUBLISH_BRANCH)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        # The work is preserved on the stash stack, not lost.
+        self.assertIn(server._STASH_MSG, git(self.repo, "stash", "list"))
+
+    def test_refuses_when_stash_fails(self) -> None:
+        # If the stray work can't be isolated, publish falls back to refusing rather
+        # than risking it. Force the stash to fail by pointing _git at a path with no
+        # git repo at all.
+        write(self.repo / "notes.txt", "v1\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "add notes")
+        write(self.repo / "notes.txt", "uncommitted edit\n")
+        orig = server._git
+        try:
+            def fake_git(*args):
+                if args and args[0] == "stash":
+                    return subprocess.CompletedProcess(args, 1, "", "boom")
+                return orig(*args)
+            server._git = fake_git
+            out: list[str] = []
+            state = {"ok": True, "pr_url": None, "pushed": False}
+            ok = server._prepare_branch(out, state)
+        finally:
+            server._git = orig
         self.assertFalse(ok)
         self.assertFalse(state["ok"])
+        self.assertNotIn("stashed", state)
         self.assertTrue(any("non-content changes" in line for line in out))
         # The dirty user file is untouched, still on base.
         self.assertEqual(current_branch(self.repo), server.BASE_BRANCH)
         self.assertEqual((self.repo / "notes.txt").read_text(), "uncommitted edit\n")
+
+
+class PublishRestoreTest(unittest.TestCase):
+    """End-to-end: a stray non-content file stashed at prepare time is popped back
+    onto base after publish, byte-identical (#283)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="publish-restore-"))
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-b", server.BASE_BRANCH)
+        write(self.repo / ".sc-state" / "content.sql", "base\n")
+        write(self.repo / "notes.txt", "committed\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "init")
+        self._orig_root = server.REPO_ROOT
+        self._orig_snapshot = server.run_snapshot_render
+        self._orig_token = server._gh_token
+        server.REPO_ROOT = self.repo
+        # Stub the DB serialize/render (needs a live DB) and the token (no push).
+        server.run_snapshot_render = lambda: "(snapshot stubbed)"
+        server._gh_token = lambda: ""
+
+    def tearDown(self) -> None:
+        server.REPO_ROOT = self._orig_root
+        server.run_snapshot_render = self._orig_snapshot
+        server._gh_token = self._orig_token
+        subprocess.run(["rm", "-rf", str(self.tmp)])
+
+    def test_stray_file_restored_after_publish(self) -> None:
+        write(self.repo / "notes.txt", "uncommitted edit\n")
+        r = server.git_publish()
+        self.assertTrue(r["ok"], msg=r["output"])
+        # Back on base with the stray edit restored exactly, and no leftover stash.
+        self.assertEqual(current_branch(self.repo), server.BASE_BRANCH)
+        self.assertEqual((self.repo / "notes.txt").read_text(), "uncommitted edit\n")
+        self.assertEqual(git(self.repo, "stash", "list"), "")
+        self.assertIn("restored", r["output"])
 
 
 class HelperTest(unittest.TestCase):
