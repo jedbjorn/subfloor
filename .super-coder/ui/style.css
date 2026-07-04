@@ -323,22 +323,54 @@ a { color: var(--accent); }
 .acc-panel > .acc-group:first-child { border-top: none; }
 
 /* ── Default Models sub-tab — flavor_defaults matrix ───────────────────────
-   One .dm-row per (flavor, harness): star radio (default harness) · harness
-   label · free-text model input backed by a per-harness datalist. */
+   Fork-global config: the shell-scoped subbar is inert here. One card per
+   flavor (docs-style separation); one .dm-row per (flavor, harness): star
+   radio (default harness) · harness label · current value · search bar.
+   Search results render INLINE as chips below the row — collapsed while the
+   search is empty; family chips first (pick = track that line's latest). */
+.subbar-inert { opacity: .4; pointer-events: none; }
+.dm-card + .dm-card { margin-top: 5px; }
 .dm-meta { padding: .1rem .2rem .4rem; font-size: 11px; color: var(--dim); }
 .dm-row {
-  display: grid; grid-template-columns: 24px 110px 1fr; align-items: center;
-  gap: .7rem; padding: .4rem 1.1rem; border-top: 1px solid var(--line-soft);
+  display: grid; grid-template-columns: 24px 100px minmax(8rem, 22rem) 1fr;
+  align-items: center; gap: .7rem; padding: .4rem 1.1rem;
+  border-top: 1px solid var(--line-soft);
 }
 .dm-row input[type="radio"] { accent-color: var(--accent); margin: 0; cursor: pointer; }
 .dm-harness { font: 600 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
   letter-spacing: .06em; color: rgba(255,255,255,.85); }
-.dm-model {
+.dm-current {
+  font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
+  color: rgba(255,255,255,.90); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dm-current.dm-unset { color: var(--dim); font-style: italic; }
+.dm-search {
   background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
-  border-radius: var(--r); padding: .35rem .6rem; width: 100%; max-width: 34rem;
+  border-radius: var(--r); padding: .35rem .6rem; width: 100%;
   font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
 }
-.dm-model:focus { outline: none; border-color: var(--accent); }
+.dm-search:focus { outline: none; border-color: var(--accent); }
+.dm-results {
+  padding: .5rem 1.1rem .7rem; border-top: 1px dashed var(--line-soft);
+  display: flex; flex-wrap: wrap; gap: .35rem; align-items: center;
+}
+.dm-sect {
+  flex-basis: 100%; font-size: 10px; text-transform: uppercase;
+  letter-spacing: .12em; color: var(--dim); padding-top: .25rem;
+}
+.dm-chip {
+  display: inline-flex; align-items: baseline; gap: .45rem; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
+  border-radius: 99px; padding: .22rem .7rem; max-width: 100%;
+  font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
+}
+.dm-chip:hover { border-color: var(--accent); }
+.dm-chip b { font-weight: 600; }
+.dm-chip-sub { font-size: 10px; color: var(--dim); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 18rem; }
+.dm-chip.dm-fam { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.05); }
+.dm-chip.dm-raw { border-style: dashed; }
 .dm-note { padding: .5rem .2rem; font-size: 11px; color: var(--dim); }
 .acc { border-top: 1px solid var(--line-soft); }
 .acc > summary {

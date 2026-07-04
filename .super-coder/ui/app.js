@@ -265,6 +265,9 @@ async function renderShells(root) {
   const newBtn = el("button", { className: "act", type: "button", textContent: "＋ New shell" });
   newBtn.onclick = () => openNewShellModal(templates, root);
   sub.append(newBtn);
+  // Default Models is fork-global config — the shell-scoped header (picker,
+  // role/mandate, ＋New shell) is greyed out and inert there, not load-bearing.
+  if (shellTab === "models") sub.classList.add("subbar-inert");
   root.append(sub);
 
   // sub-tabs — Harness / Skills scoped to the selected shell; Default Models
@@ -288,17 +291,89 @@ async function renderShells(root) {
 // Default Models — the flavor_defaults launch matrix: per flavor, a model per
 // harness and ONE starred default harness (the two launch defaults run.py
 // resolves at boot). Fork-global config — the selected shell's flavor leads,
-// but the matrix is the same from any shell. Model fields are free text
-// backed by datalist suggestions from /api/models (models.dev + keyed
-// provider APIs + opencode CLI, cached server-side, static floor last) —
-// the catalog is advisory, never a constraint.
+// but the matrix is the same from any shell.
+//
+// The model picker is family-first: the primary choices are model FAMILIES
+// (opus / sonnet / fable, deepseek / glm, …) whose chip stores "this line's
+// latest" (a self-tracking alias where one exists, else the newest concrete
+// id), with every sub-version reachable through the same search. Each cell is
+// a search bar over /api/models (v2: families + models per harness) with an
+// INLINE chip list that stays collapsed while the search is empty — vital for
+// ollama-cloud's hundreds of ids — and expands fully on "all" + Enter. The
+// catalog is advisory: any typed id can be stored as-is.
+const DM_MODEL_CAP = 60;   // rendered chips per query — "all" on opencode is huge
+
+function dmModelPicker(harness, cat, row, save) {
+  const data = cat.harnesses?.[harness] || { families: [], models: [] };
+  const current = el("span", { className: "dm-current" + (row.model ? "" : " dm-unset"),
+                               textContent: row.model || "harness default" });
+  const input = el("input", { className: "dm-search",
+                              placeholder: "search models · “all” ⏎ shows everything" });
+  const results = el("div", { className: "dm-results", hidden: true });
+
+  const pick = async (value) => {
+    await save(value);
+    current.textContent = value || "harness default";
+    current.classList.toggle("dm-unset", !value);
+    input.value = "";
+    render("");
+  };
+  const chip = (label, sub, cls, value) => {
+    const c = el("button", { className: "dm-chip" + (cls ? " " + cls : ""),
+                             type: "button", title: value });
+    c.append(el("b", {}, label));
+    if (sub) c.append(el("span", { className: "dm-chip-sub" }, sub));
+    c.onclick = () => pick(value);
+    return c;
+  };
+
+  // q: lowercased query; showAll renders the full catalog ("all" + Enter).
+  const render = (q, showAll = false) => {
+    results.textContent = "";
+    if (!q && !showAll) { results.hidden = true; return; }
+    const hit = (s) => showAll || (s || "").toLowerCase().includes(q);
+    const fams = (data.families || []).filter((f) => hit(f.family) || hit(f.latest));
+    const models = (data.models || []).filter(
+      (m) => hit(m.id) || hit(m.name) || hit(m.family));
+    if (fams.length) {
+      results.append(el("div", { className: "dm-sect" }, "families — pick one to track its latest"));
+      for (const f of fams)
+        results.append(chip(f.family,
+          `→ ${f.latest}` + (f.n > 1 ? ` · ${f.n} versions` : ""), "dm-fam", f.latest));
+    }
+    if (models.length) {
+      results.append(el("div", { className: "dm-sect" },
+        `models (${models.length})` + (models.length > DM_MODEL_CAP ? ` — first ${DM_MODEL_CAP}, type to narrow` : "")));
+      for (const m of models.slice(0, DM_MODEL_CAP))
+        results.append(chip(m.id, m.release_date, "", m.id));
+    }
+    if (!fams.length && !models.length && q)
+      results.append(el("div", { className: "dm-sect" }, "no catalog match"));
+    if (q && !showAll)
+      results.append(chip(`use “${input.value.trim()}” as-is`, "", "dm-raw",
+                          input.value.trim()));
+    results.hidden = false;
+  };
+
+  input.oninput = () => render(input.value.trim().toLowerCase());
+  input.onkeydown = (e) => {
+    if (e.key === "Escape") { input.value = ""; render(""); return; }
+    if (e.key !== "Enter") return;
+    const q = input.value.trim();
+    if (!q) return;
+    if (q.toLowerCase() === "all") render("", true);   // browse everything
+    else pick(q);                                       // store as typed
+  };
+  return { current, input, results };
+}
+
 async function renderDefaultModels(root, s) {
   root.textContent = "";
   let fd;
   try { fd = await api("/flavor-defaults"); }
   catch (e) { root.append(el("div", { className: "vpanel" }, "flavor-defaults error: " + e.message)); return; }
   let cat = { harnesses: {}, sources: [], fetched_at: null, stale: true };
-  try { cat = await api("/models"); } catch { /* inputs stay free text */ }
+  try { cat = await api("/models"); } catch { /* pickers still store typed ids */ }
 
   const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
   const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh models" });
@@ -316,21 +391,14 @@ async function renderDefaultModels(root, s) {
     `catalog: ${(cat.sources || []).join(" + ") || "none"} · as of ${when}`
     + (cat.stale ? " (stale — live refresh failed)" : "")));
 
-  // one datalist per harness, shared by every flavor's input for that harness
-  for (const h of fd.harnesses) {
-    const dl = el("datalist", { id: "dm-list-" + h });
-    for (const m of cat.harnesses?.[h] || [])
-      dl.append(el("option", { value: m.id, label: m.release_date || m.name || "" }));
-    root.append(dl);
-  }
-
-  const flavors = Object.keys(fd.flavors).sort(
-    (a, b) => (a === s.flavor ? -1 : b === s.flavor ? 1 : a.localeCompare(b)));
-  const panel = el("div", { className: "vpanel" });
+  // App-wide config: flavors in a stable alphabetical order (no shell-scoped
+  // emphasis — the shell header above is inert on this tab), one card per
+  // flavor with docs-style separation between cards.
+  const flavors = Object.keys(fd.flavors).sort();
   for (const flavor of flavors) {
     const byHarness = Object.fromEntries((fd.flavors[flavor] || []).map((r) => [r.harness, r]));
-    panel.append(el("div", { className: "acc-group" },
-      flavor + (flavor === s.flavor ? " · this shell" : "")));
+    const panel = el("div", { className: "vpanel dm-card" });
+    panel.append(el("div", { className: "acc-group" }, flavor));
     for (const h of fd.harnesses) {
       const row = byHarness[h] || { model: null, is_default: false };
       const star = el("input", { type: "radio", name: "dm-star-" + flavor,
@@ -343,22 +411,21 @@ async function renderDefaultModels(root, s) {
         } catch (e) { toast("error: " + e.message); }
         renderDefaultModels(root, s);   // reflect the sibling un-star
       };
-      const input = el("input", { className: "dm-model", value: row.model || "",
-                                  placeholder: "harness default" });
-      input.setAttribute("list", "dm-list-" + h);
-      input.onchange = async () => {
+      const picker = dmModelPicker(h, cat, row, async (value) => {
         try {
-          await api("/flavor-defaults", "POST", { flavor, harness: h, model: input.value });
-          toast(`${flavor} · ${h} → ${input.value || "(harness default)"}`);
+          await api("/flavor-defaults", "POST", { flavor, harness: h, model: value });
+          toast(`${flavor} · ${h} → ${value || "(harness default)"}`);
         } catch (e) { toast("error: " + e.message); }
-      };
+      });
       panel.append(el("div", { className: "dm-row" },
-        star, el("span", { className: "dm-harness" }, h), input));
+        star, el("span", { className: "dm-harness" }, h),
+        picker.current, picker.input));
+      panel.append(picker.results);   // full-width, collapsed until typed into
     }
+    root.append(panel);
   }
-  root.append(panel);
   root.append(el("div", { className: "dm-note" },
-    "★ = default harness at launch. Suggestions are unfiltered — an open-model licence gate (e.g. MIT/Apache-only) stays operator policy."));
+    "★ = default harness at launch. Family chip = track that line's latest. Suggestions are unfiltered — an open-model licence gate (e.g. MIT/Apache-only) stays operator policy."));
 }
 
 // Harness — the shell's surfaces as grouped accordions: Operational

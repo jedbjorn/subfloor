@@ -16,10 +16,15 @@ of this is load-bearing — a source that fails just thins the suggestions:
 Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
 (ephemeral like webapp.log — NOT .sc-state/, where an auto-written file would
 dirty the tree and trip the publish guard) with a TTL; a failed refresh serves
-the stale cache and says so. Claude aliases
-(opus / sonnet / haiku) lead their list: an alias floats to the newest model
-in its family, so a stored alias never goes stale — full ids cover NEW
-families, which is the case aliases can't (a fable-shaped release).
+the stale cache and says so.
+
+Payload (v2) is family-first, matching the picker: per harness, `families`
+([{family, latest, release_date, n}], newest-first — "pick opus / sonnet /
+fable / deepseek and track its latest") plus the flat `models` list for
+sub-version search. For claude, a family with a CLI alias (opus / sonnet /
+haiku) resolves `latest` to the alias — an alias floats to the newest model
+in its family, so the stored value never goes stale; families without one
+(the fable case) resolve to the newest concrete id.
 """
 from __future__ import annotations
 
@@ -49,6 +54,11 @@ HARNESS_PROVIDER = {
 PREFIXED_HARNESSES = {"opencode"}
 
 CLAUDE_ALIASES = ["opus", "sonnet", "haiku"]
+
+# Bump when the response/cache shape changes — a cached payload from another
+# version is ignored (treated as no cache) instead of being served to a
+# client that expects the new shape.
+PAYLOAD_VERSION = 2
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -80,8 +90,10 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
         return json.loads(r.read().decode())
 
 
-def _entry(mid: str, release_date: str = "", name: str = "") -> dict:
-    return {"id": mid, "release_date": release_date, "name": name or mid}
+def _entry(mid: str, release_date: str = "", name: str = "",
+           family: str | None = None) -> dict:
+    return {"id": mid, "release_date": release_date, "name": name or mid,
+            "family": family}
 
 
 def _from_models_dev(fetch) -> dict[str, list[dict]]:
@@ -93,10 +105,34 @@ def _from_models_dev(fetch) -> dict[str, list[dict]]:
         for mid, m in models.items():
             full = f"{provider}/{mid}" if harness in PREFIXED_HARNESSES else mid
             entries.append(_entry(full, m.get("release_date") or "",
-                                  m.get("name") or mid))
+                                  m.get("name") or mid, m.get("family")))
         entries.sort(key=lambda e: e["release_date"], reverse=True)
         out[harness] = entries
     return out
+
+
+def _families(harness: str, entries: list[dict]) -> list[dict]:
+    """Group a harness's models by models.dev family, newest family first.
+    A family chip means "track this line's latest": `latest` is the newest
+    release in the family — except claude families with a CLI alias
+    (opus/sonnet/haiku), where it is the alias itself, which self-tracks
+    upstream so the stored value never goes stale. Entries from sources
+    without family data (keyed APIs, opencode CLI) simply don't group —
+    they stay reachable through model search."""
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        if e.get("family"):
+            groups.setdefault(e["family"], []).append(e)
+    fams = []
+    for fam, es in groups.items():
+        newest = max(es, key=lambda x: x["release_date"] or "")
+        label = fam.removeprefix("claude-") if harness == "claude" else fam
+        latest = label if harness == "claude" and label in CLAUDE_ALIASES \
+            else newest["id"]
+        fams.append({"family": label, "latest": latest,
+                     "release_date": newest["release_date"], "n": len(es)})
+    fams.sort(key=lambda f: f["release_date"], reverse=True)
+    return fams
 
 
 def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
@@ -161,20 +197,22 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
         sources.append("opencode-cli")
     if not sources:
         raise RuntimeError("; ".join(errors) or "no catalog sources available")
-    # claude aliases lead — self-tracking within a family, so they never stale.
-    aliases = [_entry(a, name=f"{a} (alias — tracks the family's latest)")
-               for a in CLAUDE_ALIASES]
-    harnesses["claude"] = aliases + [e for e in harnesses.get("claude", [])
-                                     if e["id"] not in CLAUDE_ALIASES]
-    return {"fetched_at": datetime.now(timezone.utc).isoformat(),
-            "sources": sources, "harnesses": harnesses}
+    return {"v": PAYLOAD_VERSION,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "sources": sources,
+            "harnesses": {h: {"families": _families(h, entries),
+                              "models": entries}
+                          for h, entries in harnesses.items()}}
 
 
 def _load_cache() -> dict | None:
     try:
-        return json.loads(CACHE.read_text())
+        cached = json.loads(CACHE.read_text())
     except Exception:  # noqa: BLE001  (missing or corrupt — both mean "no cache")
         return None
+    # A cache written by another payload version would hand the client a
+    # shape it can't render — ignore it entirely.
+    return cached if cached.get("v") == PAYLOAD_VERSION else None
 
 
 def _fresh(cached: dict) -> bool:
@@ -185,8 +223,16 @@ def _fresh(cached: dict) -> bool:
         return False
 
 
-def _floor() -> dict[str, list[dict]]:
-    return {h: [_entry(i) for i in ids] for h, ids in STATIC_FLOOR.items()}
+_FLOOR_FAMILY = {"opus": "claude-opus", "sonnet": "claude-sonnet",
+                 "haiku": "claude-haiku"}
+
+
+def _floor() -> dict[str, dict]:
+    out = {}
+    for h, ids in STATIC_FLOOR.items():
+        entries = [_entry(i, family=_FLOOR_FAMILY.get(i)) for i in ids]
+        out[h] = {"families": _families(h, entries), "models": entries}
+    return out
 
 
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
@@ -204,7 +250,8 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     except Exception as e:  # noqa: BLE001
         if cached:
             return {**cached, "stale": True, "error": str(e)}
-        return {"fetched_at": None, "sources": ["static"], "stale": True,
+        return {"v": PAYLOAD_VERSION, "fetched_at": None,
+                "sources": ["static"], "stale": True,
                 "error": str(e), "harnesses": _floor()}
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(fresh, indent=1) + "\n")
