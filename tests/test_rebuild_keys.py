@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -163,6 +164,28 @@ class RebuildKeysTest(unittest.TestCase):
         self.assertEqual(rebuild.restore_keys(keys), 0)
         after = self.keys_by_shell()
         self.assertEqual(after[1][0], "tok_already_present_wins_2222222222222222")
+
+    def test_missing_shells_table_reads_empty(self):
+        """A DB with no shells table at all is the other genuinely-keyless
+        shape — mint-all, not abort."""
+        sqlite3.connect(self.db).close()   # zero-byte DB file, no tables
+        self.assertEqual(rebuild.read_existing_keys(), {})
+
+    def test_locked_db_aborts_instead_of_rotating(self):
+        """#279: a keyed DB that can't be READ (e.g. `database is locked`
+        after the busy timeout — a >5s exclusive lock from VACUUM/checkpoint
+        racing `sc verify`) must ABORT the rebuild, not return {} and let the
+        backfill silently rotate every key. Simulated at the driver seam; the
+        real 5s-lock reproduction is documented on the issue."""
+        self.build_keyed_db()
+        with mock.patch.object(
+                rebuild.db_driver, "connect",
+                side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(SystemExit) as cm:
+                rebuild.read_existing_keys()
+        self.assertIn("aborting", str(cm.exception))
+        # the outgoing DB is untouched — nothing was deleted or rotated
+        self.assertEqual(self.keys_by_shell()[1], (KEY_1, ROTATED_AT))
 
 
 if __name__ == "__main__":
