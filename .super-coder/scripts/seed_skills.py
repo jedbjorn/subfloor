@@ -35,6 +35,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -43,6 +44,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
 DB_PATH = ENGINE / "shell_db.db"
+RETIRED_FILE = ENGINE.parent / ".sc-state" / "skills_retired.json"
 
 
 def sql_str(v) -> str:
@@ -122,6 +124,56 @@ def seeded_skill_names() -> list[str]:
         con.close()
 
 
+def retired_skill_names() -> list[str]:
+    """The fork's retire list — engine skills this fork has taken out of
+    service (`.sc-state/skills_retired.json`, tracked, fork-owned; written by
+    `./sc skill retire`). The seed/sync resurrects engine rows on every update,
+    so retirement must live OUTSIDE the DB and be re-applied after each sync —
+    same shape as the flavor overlays (#247). Loud on a malformed file: a
+    silently-ignored list means superseded skills quietly come back."""
+    if not RETIRED_FILE.exists():
+        return []
+    try:
+        names = json.loads(RETIRED_FILE.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"fork retire list {RETIRED_FILE} is not valid JSON: {e}") from e
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise ValueError(
+            f"fork retire list {RETIRED_FILE} must be a JSON array of skill names")
+    return names
+
+
+def apply_retired(con) -> list[str]:
+    """Converge the live DB's engine rows to the fork retire list: listed names
+    get is_deleted=1, unlisted engine names get is_deleted=0. is_deleted is the
+    one switch every surface already respects — the per-shell SKILL.md render,
+    the boot-doc SKILLS block, the catalogue render, common regrants, and
+    create_shell all filter on it — so one flip retires a skill everywhere.
+    Grant rows are left in place (inert while retired), so unretiring restores
+    who-had-what. Returns the names flipped; commits its own writes.
+
+    Only ENGINE names converge: local skills retire via `./sc skill rm`, and a
+    listed name that isn't engine (typo, or upstream removed the skill) is
+    warned about, never acted on."""
+    retired = set(retired_skill_names())
+    engine = set(seeded_skill_names())
+    for name in sorted(retired - engine):
+        print(f"  ⚠ retire list: '{name}' is not an engine skill — ignored "
+              "(local skills retire via `./sc skill rm`)")
+    flipped: list[str] = []
+    for name in sorted(engine):
+        want = 1 if name in retired else 0
+        cur = con.execute(
+            "UPDATE skills SET is_deleted=? WHERE name=? AND is_deleted<>?",
+            (want, name, want))
+        if cur.rowcount:
+            flipped.append(name)
+    if flipped:
+        con.commit()
+    return flipped
+
+
 def _engine_specs() -> list[dict]:
     """Asset specs that are genuinely ENGINE skills (name in the seed). A
     fork-local skill authored under assets/skills/ is excluded: it has no
@@ -176,8 +228,6 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
     if specs is None:
         specs = _engine_specs()
     stale = stale_engine_skills(con, specs)
-    if not stale:
-        return []
     by_name = {s["name"]: s for s in specs}
     for name in stale:                       # stale ⊆ spec names, so always hits
         s = by_name[name]
@@ -191,7 +241,12 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
             (s["name"], s["description"], s["category"], s["command"],
              s["common"], s["content"]),
         )
-    con.commit()
+    if stale:
+        con.commit()
+    # The heal above (and the full-seed sync on update) resurrects rows with
+    # is_deleted=0 — re-assert the fork retire list so a retired skill stays
+    # retired across heals, syncs, and rebuilds.
+    apply_retired(con)
     return stale
 
 

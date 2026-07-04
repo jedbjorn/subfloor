@@ -93,7 +93,10 @@ Then `sc snapshot && sc render` and commit.
    sc skill rm <skill_name>
    ```
    Refuses engine skills — the seed would resurrect those on the next
-   update/rebuild; `sc skill revoke` them per-shell instead.
+   update/rebuild. For an engine skill this fork has superseded, retire it
+   fork-wide instead: `sc skill retire <name>` (writes the tracked
+   `.sc-state/skills_retired.json`, which rides updates; `sc skill unretire`
+   reverses). For a per-shell removal, `sc skill revoke`.
 
 2. **Remove the asset file** (`.super-coder/assets/skills/<name>/`) — otherwise
    the next `sc seed-skills` re-inserts the skill.

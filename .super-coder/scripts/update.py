@@ -273,9 +273,15 @@ def sync_skills() -> None:
     try:
         con.executescript(seed.read_text())
         con.commit()
+        # The seed just reset every engine row to is_deleted=0 — re-assert the
+        # fork retire list (.sc-state/skills_retired.json) before regrant()
+        # hands the common catalogue back to every shell.
+        flipped = seed_skills.apply_retired(con)
     finally:
         con.close()
     print(f"  synced catalogue from {seed.name}")
+    if flipped:
+        print(f"  fork retire list re-applied: {', '.join(flipped)}")
 
 
 def regrant() -> int:
