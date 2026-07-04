@@ -52,21 +52,44 @@ def read_existing_keys() -> dict:
     SC_API_TOKEN run.py injected into each live session at boot and 401-ing
     every mem call engine-wide until the sessions re-entered (#265). Read the
     keys before the old DB is deleted; restore_keys() puts them back after the
-    content load. A missing DB or a pre-0027 one (no api_key column) yields
-    empty — every shell gets minted fresh, same as a first build."""
+    content load.
+
+    Only the shapes that GENUINELY mean "no keys to carry" yield empty: a
+    missing DB, or a pre-0027 one (no shells table / no api_key column). Any
+    other read failure ABORTS the rebuild while the outgoing DB still exists —
+    a `database is locked` here (a >5s exclusive lock: VACUUM, a checkpoint,
+    a CLI transaction racing `sc verify`) used to be swallowed into {}, which
+    silently rotated every key and 401'd all live sessions (#279). A rebuild
+    that cannot read the keys it is about to destroy must not proceed."""
     if not DB_PATH.exists():
+        print("rebuild: no outgoing DB — every shell will be minted a fresh key.")
         return {}
-    con = db_driver.connect(DB_PATH)
+    con = None
     try:
+        con = db_driver.connect(DB_PATH)
         rows = con.execute(
             "SELECT shell_id, api_key, api_key_rotated_at FROM shells "
             "WHERE api_key IS NOT NULL"
         ).fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
-    except db_driver.OperationalError:
-        return {}
+        keys = {r[0]: (r[1], r[2]) for r in rows}
+    except db_driver.OperationalError as e:
+        msg = str(e)
+        if "no such column" in msg or "no such table" in msg:
+            print(f"rebuild: outgoing DB pre-dates api keys ({msg}) — "
+                  "every shell will be minted a fresh key.")
+            return {}
+        sys.exit(
+            f"rebuild: cannot read shell api_keys from the outgoing DB ({msg}) "
+            "— aborting while it still exists. Proceeding would silently "
+            "rotate every key and 401 every live session (#279). Free the DB "
+            "(close writers, let VACUUM/checkpoints finish) and retry.")
     finally:
-        con.close()
+        if con is not None:
+            con.close()
+    # Always name the branch taken — a carry of 0 used to be indistinguishable
+    # from a working carry in the rebuild log, which is what made #279 opaque.
+    print(f"rebuild: carrying {len(keys)} shell api_key(s) across the rebuild.")
+    return keys
 
 
 def restore_keys(keys: dict) -> int:
