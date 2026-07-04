@@ -359,6 +359,7 @@ a { color: var(--accent); }
   flex-basis: 100%; font-size: 10px; text-transform: uppercase;
   letter-spacing: .12em; color: var(--dim); padding-top: .25rem;
 }
+.dm-famrow { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: .35rem; }
 .dm-chip {
   display: inline-flex; align-items: baseline; gap: .45rem; cursor: pointer;
   background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
@@ -367,10 +368,26 @@ a { color: var(--accent); }
 }
 .dm-chip:hover { border-color: var(--accent); }
 .dm-chip b { font-weight: 600; }
-.dm-chip-sub { font-size: 10px; color: var(--dim); overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; max-width: 18rem; }
+.dm-chip-sub { font-size: 10px; color: var(--dim); }
 .dm-chip.dm-fam { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.05); }
-.dm-chip.dm-raw { border-style: dashed; }
+.dm-chip.dm-active { border-color: var(--accent); background: rgba(255,255,255,.10); color: #fff; }
+/* stacked model cards — one per row, scroll past ~12 */
+.dm-cardlist {
+  flex-basis: 100%; display: flex; flex-direction: column; gap: 4px;
+  max-height: 17rem; overflow-y: auto; padding-right: .2rem;
+}
+.dm-mcard {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: .8rem; width: 100%; text-align: left; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
+  border-radius: var(--r); padding: .38rem .7rem;
+  font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
+}
+.dm-mcard:hover { border-color: var(--accent); }
+.dm-mcard b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dm-mcard-sub { font-size: 10px; color: var(--dim); white-space: nowrap; }
+.dm-mcard.dm-alias { border-color: rgba(255,255,255,.30); background: rgba(255,255,255,.05); }
+.dm-mcard.dm-raw { border-style: dashed; }
 .dm-note { padding: .5rem .2rem; font-size: 11px; color: var(--dim); }
 .acc { border-top: 1px solid var(--line-soft); }
 .acc > summary {
