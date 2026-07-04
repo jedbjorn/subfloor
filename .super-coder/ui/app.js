@@ -54,14 +54,18 @@ async function api(path, method = "GET", body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || r.statusText);
+  // publish/scripts report failure as {ok:false, output:<step trace>} with no
+  // `error` key — the trace names the refusing guard and the remedy, so it is
+  // the message, not statusText.
+  if (!r.ok) throw new Error(data.error || data.output || r.statusText);
   return data;
 }
 
 function toast(msg) {
   const t = el("div", { className: "toast" }, msg);
   document.body.append(t);
-  setTimeout(() => t.remove(), 4000);
+  // Multi-line traces (publish refusals) need longer than one-liners.
+  setTimeout(() => t.remove(), Math.min(12000, Math.max(4000, String(msg).length * 30)));
 }
 function setStatus(s) { $("#status").textContent = s; }
 
