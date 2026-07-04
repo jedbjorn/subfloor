@@ -67,6 +67,11 @@ PER_INSTANCE_TABLES = [
     # cache. Loads after `shells` (its FK target). read_at is preserved, so an
     # unread message stays unread across a rebuild.
     "shell_messages",
+    # flavor_defaults is operator-tuned launch config (the Default Models GUI:
+    # model per harness + starred default harness, per flavor). Migrations seed
+    # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
+    # the fork's edits win — without this the GUI's changes vanish on rebuild.
+    "flavor_defaults",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/map_content.sql by snapshot_map() below, not here.

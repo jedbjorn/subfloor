@@ -321,6 +321,25 @@ a { color: var(--accent); }
   background: rgba(255,255,255,.02); border-top: 1px solid var(--line-soft);
 }
 .acc-panel > .acc-group:first-child { border-top: none; }
+
+/* ── Default Models sub-tab — flavor_defaults matrix ───────────────────────
+   One .dm-row per (flavor, harness): star radio (default harness) · harness
+   label · free-text model input backed by a per-harness datalist. */
+.dm-meta { padding: .1rem .2rem .4rem; font-size: 11px; color: var(--dim); }
+.dm-row {
+  display: grid; grid-template-columns: 24px 110px 1fr; align-items: center;
+  gap: .7rem; padding: .4rem 1.1rem; border-top: 1px solid var(--line-soft);
+}
+.dm-row input[type="radio"] { accent-color: var(--accent); margin: 0; cursor: pointer; }
+.dm-harness { font: 600 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
+  letter-spacing: .06em; color: rgba(255,255,255,.85); }
+.dm-model {
+  background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
+  border-radius: var(--r); padding: .35rem .6rem; width: 100%; max-width: 34rem;
+  font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
+}
+.dm-model:focus { outline: none; border-color: var(--accent); }
+.dm-note { padding: .5rem .2rem; font-size: 11px; color: var(--dim); }
 .acc { border-top: 1px solid var(--line-soft); }
 .acc > summary {
   list-style: none; cursor: pointer; user-select: none;

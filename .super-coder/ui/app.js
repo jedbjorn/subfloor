@@ -99,7 +99,7 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 // Skills sub-tabs scoped to the selected shell. Flat panels, accordions,
 // popover pickers, and a unified edit modal.
 let selectedShell = null;
-let shellTab = "harness";     // 'harness' | 'skills'
+let shellTab = "harness";     // 'harness' | 'skills' | 'models'
 let activeSkillId = null;     // skill-viewer selection; reset on shell switch
 
 // Rough token estimator — BPE-ish, ~15% off for English; the tilde in the
@@ -267,9 +267,11 @@ async function renderShells(root) {
   sub.append(newBtn);
   root.append(sub);
 
-  // sub-tabs — Harness / Skills, both scoped to the selected shell
+  // sub-tabs — Harness / Skills scoped to the selected shell; Default Models
+  // is the fork-global launch matrix (same content from any shell)
   const tabs = el("div", { className: "vtabs" });
-  for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"]]) {
+  for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"],
+                              ["models", "Default Models"]]) {
     const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
     b.onclick = () => { shellTab = key; renderShells(root); };
     tabs.append(b);
@@ -279,7 +281,84 @@ async function renderShells(root) {
   const pane = el("div", { className: "shell-pane" });
   root.append(pane);
   if (shellTab === "harness") renderHarness(pane, s);
+  else if (shellTab === "models") renderDefaultModels(pane, s);
   else renderSkillViewer(pane, s);
+}
+
+// Default Models — the flavor_defaults launch matrix: per flavor, a model per
+// harness and ONE starred default harness (the two launch defaults run.py
+// resolves at boot). Fork-global config — the selected shell's flavor leads,
+// but the matrix is the same from any shell. Model fields are free text
+// backed by datalist suggestions from /api/models (models.dev + keyed
+// provider APIs + opencode CLI, cached server-side, static floor last) —
+// the catalog is advisory, never a constraint.
+async function renderDefaultModels(root, s) {
+  root.textContent = "";
+  let fd;
+  try { fd = await api("/flavor-defaults"); }
+  catch (e) { root.append(el("div", { className: "vpanel" }, "flavor-defaults error: " + e.message)); return; }
+  let cat = { harnesses: {}, sources: [], fetched_at: null, stale: true };
+  try { cat = await api("/models"); } catch { /* inputs stay free text */ }
+
+  const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
+  const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh models" });
+  refresh.onclick = async () => {
+    refresh.disabled = true;
+    setStatus("refreshing model catalog…");
+    try { await api("/models?refresh=1"); setStatus("model catalog refreshed"); }
+    catch (e) { toast("catalog refresh error: " + e.message); setStatus("catalog refresh failed"); }
+    renderDefaultModels(root, s);
+  };
+  head.append(refresh);
+  root.append(head);
+  const when = cat.fetched_at ? new Date(cat.fetched_at).toLocaleString() : "never";
+  root.append(el("div", { className: "dm-meta" },
+    `catalog: ${(cat.sources || []).join(" + ") || "none"} · as of ${when}`
+    + (cat.stale ? " (stale — live refresh failed)" : "")));
+
+  // one datalist per harness, shared by every flavor's input for that harness
+  for (const h of fd.harnesses) {
+    const dl = el("datalist", { id: "dm-list-" + h });
+    for (const m of cat.harnesses?.[h] || [])
+      dl.append(el("option", { value: m.id, label: m.release_date || m.name || "" }));
+    root.append(dl);
+  }
+
+  const flavors = Object.keys(fd.flavors).sort(
+    (a, b) => (a === s.flavor ? -1 : b === s.flavor ? 1 : a.localeCompare(b)));
+  const panel = el("div", { className: "vpanel" });
+  for (const flavor of flavors) {
+    const byHarness = Object.fromEntries((fd.flavors[flavor] || []).map((r) => [r.harness, r]));
+    panel.append(el("div", { className: "acc-group" },
+      flavor + (flavor === s.flavor ? " · this shell" : "")));
+    for (const h of fd.harnesses) {
+      const row = byHarness[h] || { model: null, is_default: false };
+      const star = el("input", { type: "radio", name: "dm-star-" + flavor,
+                                 title: "star = default harness at launch" });
+      star.checked = row.is_default;
+      star.onchange = async () => {
+        try {
+          await api("/flavor-defaults", "POST", { flavor, harness: h, is_default: true });
+          toast(`default harness: ${flavor} → ${h}`);
+        } catch (e) { toast("error: " + e.message); }
+        renderDefaultModels(root, s);   // reflect the sibling un-star
+      };
+      const input = el("input", { className: "dm-model", value: row.model || "",
+                                  placeholder: "harness default" });
+      input.setAttribute("list", "dm-list-" + h);
+      input.onchange = async () => {
+        try {
+          await api("/flavor-defaults", "POST", { flavor, harness: h, model: input.value });
+          toast(`${flavor} · ${h} → ${input.value || "(harness default)"}`);
+        } catch (e) { toast("error: " + e.message); }
+      };
+      panel.append(el("div", { className: "dm-row" },
+        star, el("span", { className: "dm-harness" }, h), input));
+    }
+  }
+  root.append(panel);
+  root.append(el("div", { className: "dm-note" },
+    "★ = default harness at launch. Suggestions are unfiltered — an open-model licence gate (e.g. MIT/Apache-only) stays operator policy."));
 }
 
 // Harness — the shell's surfaces as grouped accordions: Operational

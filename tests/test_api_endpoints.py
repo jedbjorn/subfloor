@@ -229,5 +229,72 @@ class FeatureBlockerTest(unittest.TestCase):
         self.assertIn("cycle", err)
 
 
+class FlavorDefaultsTest(unittest.TestCase):
+    """The Default Models matrix: get_flavor_defaults / set_flavor_default.
+
+    flavor_defaults is migration-seeded launch config the GUI now edits — the
+    contract is upsert-on-write (template flavors / harnesses may lack seeded
+    rows), a transactional star (exactly one is_default per flavor after), and
+    loud validation for unknown names."""
+
+    def setUp(self) -> None:
+        self.con = build_db()
+
+    def _row(self, flavor, harness):
+        return self.con.execute(
+            "SELECT model, is_default FROM flavor_defaults "
+            "WHERE flavor=? AND harness=?", (flavor, harness)).fetchone()
+
+    def test_matrix_includes_template_flavors_and_harnesses(self) -> None:
+        got = server.get_flavor_defaults(self.con)
+        self.assertIn("planner", got["flavors"])
+        self.assertIn("admin", got["flavors"], "template flavors appear even unseeded")
+        for h in ("claude", "codex", "opencode", "vibe"):
+            self.assertIn(h, got["harnesses"])
+
+    def test_set_model(self) -> None:
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
+        self.assertTrue(ok, err)
+        self.assertEqual(self._row("planner", "claude")["model"], "opus")
+
+    def test_star_is_transactional_across_the_flavor(self) -> None:
+        self.assertTrue(server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "codex",
+                       "is_default": True})[0])
+        rows = self.con.execute(
+            "SELECT harness, is_default FROM flavor_defaults "
+            "WHERE flavor='planner'").fetchall()
+        stars = {r["harness"]: r["is_default"] for r in rows}
+        self.assertEqual(sum(stars.values()), 1)
+        self.assertEqual(stars["codex"], 1)
+
+    def test_upsert_missing_cell(self) -> None:
+        # 'vibe' has no seeded row for planner — a write must create it
+        self.assertIsNone(self._row("planner", "vibe"))
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "vibe",
+                       "model": "devstral-latest", "is_default": True})
+        self.assertTrue(ok, err)
+        row = self._row("planner", "vibe")
+        self.assertEqual(row["model"], "devstral-latest")
+        self.assertEqual(row["is_default"], 1)
+
+    def test_empty_model_clears_to_null(self) -> None:
+        server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
+        server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude", "model": ""})
+        self.assertIsNone(self._row("planner", "claude")["model"])
+
+    def test_unknown_names_and_empty_writes_are_loud(self) -> None:
+        self.assertFalse(server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "emacs", "model": "x"})[0])
+        self.assertFalse(server.set_flavor_default(
+            self.con, {"flavor": "nope", "harness": "claude", "model": "x"})[0])
+        self.assertFalse(server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude"})[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
