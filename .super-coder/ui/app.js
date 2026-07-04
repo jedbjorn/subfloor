@@ -293,77 +293,121 @@ async function renderShells(root) {
 // resolves at boot). Fork-global config — the selected shell's flavor leads,
 // but the matrix is the same from any shell.
 //
-// The model picker is family-first: the primary choices are model FAMILIES
-// (opus / sonnet / fable, deepseek / glm, …) whose chip stores "this line's
-// latest" (a self-tracking alias where one exists, else the newest concrete
-// id), with every sub-version reachable through the same search. Each cell is
-// a search bar over /api/models (v2: families + models per harness) with an
-// INLINE chip list that stays collapsed while the search is empty — vital for
-// ollama-cloud's hundreds of ids — and expands fully on "all" + Enter. The
-// catalog is advisory: any typed id can be stored as-is.
-const DM_MODEL_CAP = 60;   // rendered chips per query — "all" on opencode is huge
+// The model picker is family-first: family chips are FILTERS — click one to
+// narrow the list to that line (opus / sonnet / fable, deepseek / glm, …),
+// then select a model from its stacked cards. Where a family has a
+// self-tracking CLI alias (opus/sonnet/haiku) an "alias — tracks latest" card
+// is pinned on top of that family's list; elsewhere the newest release
+// already leads. The panel opens on focus (family chips first), the card
+// list appears once a family is active or a query is typed, "all" + Enter
+// browses everything, Enter stores any typed id as-is, Escape / outside
+// click / a pick collapses. Catalog: /api/models v2 — advisory, never a
+// constraint.
+const DM_MODEL_CAP = 60;   // rendered cards per view — "all" on opencode is huge
 
 function dmModelPicker(harness, cat, row, save) {
   const data = cat.harnesses?.[harness] || { families: [], models: [] };
   const current = el("span", { className: "dm-current" + (row.model ? "" : " dm-unset"),
                                textContent: row.model || "harness default" });
   const input = el("input", { className: "dm-search",
-                              placeholder: "search models · “all” ⏎ shows everything" });
+                              placeholder: "search · click a family to filter · “all” ⏎" });
   const results = el("div", { className: "dm-results", hidden: true });
+  let open = false, activeFam = null, allMode = false;
 
+  // model family labels are raw ("claude-opus"); family chips are stripped
+  const famOf = (m) => harness === "claude"
+    ? (m.family || "").replace(/^claude-/, "") : (m.family || "");
+
+  const close = () => { open = false; activeFam = null; allMode = false; input.value = ""; paint(); };
   const pick = async (value) => {
     await save(value);
     current.textContent = value || "harness default";
     current.classList.toggle("dm-unset", !value);
-    input.value = "";
-    render("");
+    close();
   };
-  const chip = (label, sub, cls, value) => {
-    const c = el("button", { className: "dm-chip" + (cls ? " " + cls : ""),
-                             type: "button", title: value });
-    c.append(el("b", {}, label));
-    if (sub) c.append(el("span", { className: "dm-chip-sub" }, sub));
-    c.onclick = () => pick(value);
+
+  const famChip = (f) => {
+    const c = el("button", { className: "dm-chip dm-fam" + (activeFam === f.family ? " dm-active" : ""),
+                             type: "button",
+                             title: `filter to the ${f.family} line (${f.n} model${f.n > 1 ? "s" : ""})` });
+    c.append(el("b", {}, f.family), el("span", { className: "dm-chip-sub" }, String(f.n)));
+    c.onclick = () => { activeFam = activeFam === f.family ? null : f.family; allMode = false; paint(); };
+    return c;
+  };
+  const mcard = (id, sub, cls) => {
+    const c = el("button", { className: "dm-mcard" + (cls ? " " + cls : ""), type: "button", title: id });
+    c.append(el("b", {}, id), el("span", { className: "dm-mcard-sub" }, sub || ""));
+    c.onclick = () => pick(id);
     return c;
   };
 
-  // q: lowercased query; showAll renders the full catalog ("all" + Enter).
-  const render = (q, showAll = false) => {
+  const paint = () => {
     results.textContent = "";
-    if (!q && !showAll) { results.hidden = true; return; }
-    const hit = (s) => showAll || (s || "").toLowerCase().includes(q);
-    const fams = (data.families || []).filter((f) => hit(f.family) || hit(f.latest));
-    const models = (data.models || []).filter(
-      (m) => hit(m.id) || hit(m.name) || hit(m.family));
+    if (!open) { results.hidden = true; return; }
+    const q = input.value.trim().toLowerCase();
+    const hit = (s) => !q || (s || "").toLowerCase().includes(q);
+
+    // family filter row — always visible while open; the query narrows it too
+    const fams = (data.families || []).filter((f) => hit(f.family) || f.family === activeFam);
     if (fams.length) {
-      results.append(el("div", { className: "dm-sect" }, "families — pick one to track its latest"));
-      for (const f of fams)
-        results.append(chip(f.family,
-          `→ ${f.latest}` + (f.n > 1 ? ` · ${f.n} versions` : ""), "dm-fam", f.latest));
+      results.append(el("div", { className: "dm-sect" }, "families — click to filter"));
+      const frow = el("div", { className: "dm-famrow" });
+      for (const f of fams) frow.append(famChip(f));
+      results.append(frow);
     }
-    if (models.length) {
+
+    // stacked model cards — once a family is active, a query is typed, or all-mode
+    let models = null;
+    if (activeFam) {
+      models = (data.models || []).filter(
+        (m) => famOf(m) === activeFam && (hit(m.id) || hit(m.name)));
+    } else if (allMode) {
+      models = data.models || [];
+    } else if (q) {
+      models = (data.models || []).filter(
+        (m) => hit(m.id) || hit(m.name) || hit(m.family));
+    }
+    if (models) {
+      const label = activeFam ? `${activeFam} models` : "models";
       results.append(el("div", { className: "dm-sect" },
-        `models (${models.length})` + (models.length > DM_MODEL_CAP ? ` — first ${DM_MODEL_CAP}, type to narrow` : "")));
+        `${label} (${models.length})`
+        + (models.length > DM_MODEL_CAP ? ` — first ${DM_MODEL_CAP}, type to narrow` : "")));
+      const list = el("div", { className: "dm-cardlist" });
+      // aliased family → pin the self-tracking card on top of its list
+      const famMeta = activeFam && (data.families || []).find((f) => f.family === activeFam);
+      if (famMeta && !models.some((m) => m.id === famMeta.latest) && hit(famMeta.latest))
+        list.append(mcard(famMeta.latest, "alias — tracks this family's latest", "dm-alias"));
       for (const m of models.slice(0, DM_MODEL_CAP))
-        results.append(chip(m.id, m.release_date, "", m.id));
+        list.append(mcard(m.id, m.release_date));
+      if (q && !allMode)
+        list.append(mcard(input.value.trim(), "use as typed", "dm-raw"));
+      results.append(list);
+      if (!models.length && !q)
+        results.append(el("div", { className: "dm-sect" }, "no models in this family"));
+    } else {
+      results.append(el("div", { className: "dm-sect" },
+        "click a family to filter · type to search · “all” ⏎ for everything"));
     }
-    if (!fams.length && !models.length && q)
-      results.append(el("div", { className: "dm-sect" }, "no catalog match"));
-    if (q && !showAll)
-      results.append(chip(`use “${input.value.trim()}” as-is`, "", "dm-raw",
-                          input.value.trim()));
     results.hidden = false;
   };
 
-  input.oninput = () => render(input.value.trim().toLowerCase());
+  input.onfocus = () => { if (!open) { open = true; paint(); } };
+  input.oninput = () => { allMode = false; paint(); };
   input.onkeydown = (e) => {
-    if (e.key === "Escape") { input.value = ""; render(""); return; }
+    if (e.key === "Escape") { close(); input.blur(); return; }
     if (e.key !== "Enter") return;
     const q = input.value.trim();
     if (!q) return;
-    if (q.toLowerCase() === "all") render("", true);   // browse everything
-    else pick(q);                                       // store as typed
+    if (q.toLowerCase() === "all") { allMode = true; activeFam = null; input.value = ""; paint(); }
+    else pick(q);
   };
+  // outside click collapses; chips/cards live inside `results`, so picks land
+  // first. Self-unregisters once this render generation is detached.
+  const outside = (e) => {
+    if (!results.isConnected) { document.removeEventListener("mousedown", outside); return; }
+    if (open && e.target !== input && !results.contains(e.target)) close();
+  };
+  document.addEventListener("mousedown", outside);
   return { current, input, results };
 }
 
