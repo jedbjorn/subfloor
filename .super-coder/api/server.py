@@ -60,6 +60,7 @@ import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
+import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
@@ -222,6 +223,65 @@ def get_skills(con) -> dict:
     for s in skills:
         s["granted_shells"] = grants.get(s["skill_id"], [])
     return {"skills": skills, "shells": get_shells(con)}
+
+
+def known_harnesses() -> list[str]:
+    """The harness set = the shipped adapters (claude/codex/opencode/vibe)."""
+    d = ENGINE / "adapters"
+    if d.exists():
+        return sorted(p.name for p in d.iterdir() if p.is_dir())
+    return ["claude", "codex", "opencode", "vibe"]
+
+
+def get_flavor_defaults(con) -> dict:
+    """The launch-defaults matrix for the Default Models sub-tab: per flavor,
+    a model per harness + one starred default harness (flavor_defaults rows —
+    the exact table run.py's picker resolves at launch). Template flavors with
+    no rows yet are included empty so the GUI matrix is complete; missing
+    cells are created on first write (see set_flavor_default)."""
+    flavors: dict[str, list] = {}
+    for r in rows(con.execute(
+            "SELECT flavor, harness, model, is_default FROM flavor_defaults "
+            "ORDER BY flavor, harness")):
+        flavors.setdefault(r["flavor"], []).append(
+            {"harness": r["harness"], "model": r["model"],
+             "is_default": bool(r["is_default"])})
+    for t in shell_factory.flavors():
+        flavors.setdefault(t.get("flavor"), [])
+    return {"flavors": flavors, "harnesses": known_harnesses()}
+
+
+def set_flavor_default(con, body) -> tuple[bool, str | None]:
+    """One write to the launch-defaults matrix: set a (flavor, harness) cell's
+    model, and/or star the harness as the flavor's default. Starring is
+    transactional across the flavor's rows — exactly one is_default=1 after.
+    Upserts the row so template flavors / harnesses without a seeded row are
+    settable; an empty model clears the cell back to NULL (harness default)."""
+    flavor = (body.get("flavor") or "").strip()
+    harness = (body.get("harness") or "").strip()
+    if not flavor or not harness:
+        return False, "flavor and harness required"
+    if harness not in known_harnesses():
+        return False, f"unknown harness '{harness}'"
+    known_flavors = {t.get("flavor") for t in shell_factory.flavors()} | {
+        r[0] for r in con.execute("SELECT DISTINCT flavor FROM flavor_defaults")}
+    if flavor not in known_flavors:
+        return False, f"unknown flavor '{flavor}'"
+    if "model" not in body and not body.get("is_default"):
+        return False, "nothing to set — pass model and/or is_default"
+    con.execute(
+        "INSERT INTO flavor_defaults (flavor, harness, model, is_default) "
+        "VALUES (?, ?, NULL, 0) ON CONFLICT(flavor, harness) DO NOTHING",
+        (flavor, harness))
+    if "model" in body:
+        model = (body.get("model") or "").strip() or None
+        con.execute("UPDATE flavor_defaults SET model=? "
+                    "WHERE flavor=? AND harness=?", (model, flavor, harness))
+    if body.get("is_default"):
+        con.execute("UPDATE flavor_defaults SET is_default = (harness = ?) "
+                    "WHERE flavor = ?", (harness, flavor))
+    con.commit()
+    return True, None
 
 
 # Board order: delivered work first, then the committed funnel read backward
@@ -1509,7 +1569,6 @@ class Handler(BaseHTTPRequestHandler):
         # fetch for accurate behind-counts + fresh PR state; the default skips it
         # so the initial tab load is snappy.
         if urlparse(self.path).path == "/api/git-state":
-            from urllib.parse import parse_qs
             q = parse_qs(urlparse(self.path).query)
             fetch = q.get("fetch", ["0"])[0] in ("1", "true", "yes")
             try:
@@ -1532,6 +1591,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"shells": get_shells(con)})
             if path == "/api/shell-templates":
                 return self._send(200, {"templates": shell_factory.flavors()})
+            if path == "/api/flavor-defaults":
+                return self._send(200, get_flavor_defaults(con))
+            if path == "/api/models":
+                q = parse_qs(urlparse(self.path).query)
+                return self._send(200, model_catalog.catalog(
+                    refresh=q.get("refresh", ["0"])[0] in ("1", "true")))
             if path.startswith("/api/shells/"):
                 sid = int(path.rsplit("/", 1)[1])
                 shell = get_shell(con, sid)
@@ -1632,6 +1697,10 @@ class Handler(BaseHTTPRequestHandler):
                 sn = con.execute(
                     "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
                 return self._send(201, {"shell_id": sid, "shortname": sn})
+            if path == "/api/flavor-defaults":
+                ok, err = set_flavor_default(con, self._body())
+                return self._send(200 if ok else 400,
+                                  {"ok": ok} if ok else {"error": err})
             if path == "/api/snapshot":
                 try:
                     out = run_snapshot_render()
