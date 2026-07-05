@@ -265,6 +265,16 @@ async function renderShells(root) {
   const newBtn = el("button", { className: "act", type: "button", textContent: "＋ New shell" });
   newBtn.onclick = () => openNewShellModal(templates, root);
   sub.append(newBtn);
+
+  // delete shell — soft-delete the selected shell, then re-render
+  const delBtn = el("button", { className: "act", type: "button", textContent: "✕ Delete shell" });
+  delBtn.onclick = async () => {
+    if (!confirm("Delete shell “" + s.display_name + "”?")) return;
+    await api("/shells/" + selectedShell, "DELETE");
+    selectedShell = null;
+    renderShells(root);
+  };
+  sub.append(delBtn);
   // Default Models is fork-global config — the shell-scoped header (picker,
   // role/mandate, ＋New shell) is greyed out and inert there, not load-bearing.
   if (shellTab === "models") sub.classList.add("subbar-inert");
