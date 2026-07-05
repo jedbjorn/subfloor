@@ -1128,6 +1128,11 @@ class Handler(BaseHTTPRequestHandler):
                 r = con.execute(
                     "SELECT d.decision_id, d.decision, d.rationale, d.priority, "
                     "d.decision_date, d.parent_decision_id, "
+                    "d.feature_id, d.document_id, "
+                    "(SELECT title FROM roadmap WHERE feature_id=d.feature_id) "
+                    " AS feature_title, "
+                    "(SELECT title FROM documents WHERE document_id=d.document_id) "
+                    " AS document_title, "
                     "(SELECT c.decision_id FROM shell_decisions c "
                     " WHERE c.parent_decision_id=d.decision_id "
                     " AND COALESCE(c.is_deleted,0)=0 "
@@ -1278,17 +1283,40 @@ class Handler(BaseHTTPRequestHandler):
                 d = (body.get("decision") or "").strip()
                 if not d:
                     return self._send(400, {"error": "decision required"})
+                # Optional why-audit links (#0047). document_id is a refinement of
+                # feature_id — a doc rolls up to a feature — so when only the doc
+                # is given, derive feature_id from it (the audit-by-feature query
+                # then works even for a doc-only link). Both validated: a typo'd
+                # id would silently break the audit, so 404 instead of bad data.
+                feature_id = body.get("feature_id") or None
+                document_id = body.get("document_id") or None
+                if document_id is not None:
+                    doc = con.execute(
+                        "SELECT feature_id FROM documents WHERE document_id=?",
+                        (document_id,)).fetchone()
+                    if doc is None:
+                        return self._send(404, {"error": f"no document {document_id}"})
+                    if feature_id is None:
+                        feature_id = doc["feature_id"]
+                if feature_id is not None and con.execute(
+                        "SELECT 1 FROM roadmap WHERE feature_id=?",
+                        (feature_id,)).fetchone() is None:
+                    return self._send(404, {"error": f"no feature {feature_id}"})
                 cur = con.execute(
                     "INSERT INTO shell_decisions "
-                    "(shell_id, decision, rationale, priority, decision_date, parent_decision_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(shell_id, decision, rationale, priority, decision_date, "
+                    " parent_decision_id, feature_id, document_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (sid, d,
                      body.get("rationale") or None,
                      body.get("priority") or "M",
                      body.get("decision_date") or None,
-                     body.get("parent_decision_id") or None))
+                     body.get("parent_decision_id") or None,
+                     feature_id, document_id))
                 con.commit()
-                return self._send(201, {"decision_id": cur.lastrowid})
+                return self._send(201, {"decision_id": cur.lastrowid,
+                                        "feature_id": feature_id,
+                                        "document_id": document_id})
 
             if path == "/_sc/mem/flags":
                 desc = (body.get("description") or "").strip()
