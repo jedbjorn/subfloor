@@ -1921,6 +1921,29 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def do_DELETE(self):
+        # DELETE /api/shells/{id} — soft-delete a shell (flip is_deleted=1).
+        # Matches the house pattern (skill.py): every read path filters on
+        # COALESCE(is_deleted,0)=0, so this hides the shell everywhere without
+        # touching its child rows, and frees the cartographer singleton slot.
+        path = urlparse(self.path).path
+        con = db()
+        try:
+            if path.startswith("/api/shells/") and path.count("/") == 3:
+                sid = int(path.rsplit("/", 1)[1])
+                cur = con.execute(
+                    "UPDATE shells SET is_deleted=1 "
+                    "WHERE shell_id=? AND COALESCE(is_deleted,0)=0", (sid,))
+                con.commit()
+                if cur.rowcount == 0:
+                    return self._send(404, {"error": "no such shell"})
+                return self._send(200, {"ok": True, "shell_id": sid})
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
 
 def main(argv):
     port = None
