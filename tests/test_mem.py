@@ -180,6 +180,14 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("roadmap", "status", str(a["feature_id"]), "shipped")
         self.assertEqual(self.q("SELECT roadmap_status FROM roadmap WHERE feature_id=?",
                                 a["feature_id"])[0], "shipped")
+        # edit: revise title + summary on an existing feature (issue #287)
+        self.run_mem("roadmap", "edit", str(a["feature_id"]),
+                     "--title", "feat A2", "--summary", "revised summary")
+        self.assertEqual(list(self.q("SELECT title, summary FROM roadmap WHERE feature_id=?",
+                                     a["feature_id"])), ["feat A2", "revised summary"])
+        # edit with no fields → client dies before hitting the API
+        with self.assertRaises(SystemExit):
+            self.run_mem("roadmap", "edit", str(a["feature_id"]))
         # A depends on B
         self.run_mem("roadmap", "depends", str(a["feature_id"]), "--on", str(b))
         self.assertIsNotNone(self.q("SELECT 1 FROM feature_blockers WHERE feature_id=? "
