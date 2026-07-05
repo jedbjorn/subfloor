@@ -80,6 +80,29 @@ RUN pip install --no-cache-dir "playwright==1.60.0" \
 # (dos-arch QAQC-02). _sc_devtool in ./sc resolves .venv → PATH in that order.
 RUN pip install --no-cache-dir ruff mypy
 
+# Durable bare `sc` on PATH for EVERY harness. run.py prepends the repo root to
+# PATH at exec, but that only survives into a harness that hands its env verbatim
+# to each command shell: claude's Bash tool does, so bare `sc` works there; codex
+# spawns a fresh login-ish shell per call that drops the inherited PATH, so bare
+# `sc` from a worktree hit `sc: command not found` (dos-arch #291, #292). A real
+# file on PATH fixes it independently of inherited env. It resolves the checkout
+# from the CALLER's cwd via git — never from $0 (a symlink would misresolve) and
+# never from env — then exec's that checkout's own tracked ./sc, which finds the
+# engine at the main worktree root and stays in cwd. /usr/local/bin is on PATH for
+# every shell; run.py's REPO_ROOT prepend still shadows this for claude (same wrapper).
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      '# Durable bare `sc` (baked in the sandbox image — see Dockerfile). Resolves the' \
+      '# checkout from the caller cwd via git and execs its tracked ./sc. Never uses' \
+      '# $0 or inherited env, so it survives whatever shell a harness spawns.' \
+      'top=$(git rev-parse --show-toplevel 2>/dev/null || true)' \
+      '[ -n "$top" ] && [ -x "$top/sc" ] && exec "$top/sc" "$@"' \
+      '[ -n "$SC_ROOT" ] && [ -x "$SC_ROOT/sc" ] && exec "$SC_ROOT/sc" "$@"' \
+      'echo "sc: not in a super-coder checkout (no ./sc via git toplevel or SC_ROOT)" >&2' \
+      'exit 127' \
+      > /usr/local/bin/sc \
+ && chmod 0755 /usr/local/bin/sc
+
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 # A host GID may already exist in the base image — notably macOS's primary GID 20
 # (`staff`) collides with Debian's pre-existing `dialout` group — so creating it

@@ -37,9 +37,9 @@ different ways, so keep them straight:
 
 - **Engine memory DB** — `.super-coder/shell_db.db`. Fixed name, always under
   `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
-  Gitignored and rebuilt from tracked text. **Write through `./sc mem`** — the
-  write lands in the live engine DB, durable and visible to all. `./sc mem which`
-  confirms the API is reachable and who your token resolves to. `./sc mem` routes
+  Gitignored and rebuilt from tracked text. **Write through `sc mem`** — the
+  write lands in the live engine DB, durable and visible to all. `sc mem which`
+  confirms the API is reachable and who your token resolves to. `sc mem` routes
   through the engine API (no direct-DB fallback). If it reports "API unreachable",
   the engine server is down — surface this to FnB; they restart it with
   `./sc restart` / `make dos-r`. Do not retry silently; surface the error and stop.
@@ -54,7 +54,7 @@ different ways, so keep them straight:
   the `dev_kit` skill.
 
 **Decision rule:** your memory / planning / specs / roadmap → **engine DB**,
-written via `./sc mem`. The product's data or schema → **app DB**, via its
+written via `sc mem`. The product's data or schema → **app DB**, via its
 migrations. If a task is about what the product stores or how its tables are
 shaped, it is never the engine DB.
 
@@ -151,7 +151,7 @@ the commit on every harness, vibe included. Both are escapable when you mean it 
 Finish before you stop. Before you go dormant, leave your tree **clean or on a
 pushed branch with a PR** — never a dirty or unpushed worktree for the admin to
 adopt. And **close the flags your work cleared**: an open flag is an open handoff,
-so resolve it (`./sc mem flag close <id> --notes "…"`) with a note on *how* —
+so resolve it (`sc mem flag close <id> --notes "…"`) with a note on *how* —
 scoped to the feature you're on (`WHERE feature_id=<current>`), never a scan of
 the whole flag table. Full procedure — sync gate, finish gate, attribution,
 cleanup, what not to commit: the `git` skill; flag detail: the `flags` skill.
