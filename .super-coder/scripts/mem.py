@@ -32,6 +32,7 @@ Run from the repo root, like every engine command:
     ./sc mem flag close <flag_id>    [--notes "…"]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>]
     ./sc mem roadmap status <feature_id> <status>
+    ./sc mem roadmap edit <feature_id> [--title "…"] [--summary "…"]   # revise a feature's title/summary
     ./sc mem roadmap project <feature_id> <shortname|id|none>   # set/clear the feature's work-stream
     ./sc mem roadmap depends <feature_id> [--on <id> …]         # set dependencies (replaces; omit --on to clear)
     ./sc mem project add <shortname> "<title>" [--purpose …] [--standing …] [--status active] [--role …]
@@ -368,6 +369,17 @@ def cmd_roadmap(args) -> int:
         tgt = ("unassigned (no work-stream)" if str(args.project).lower() in ("none", "-", "")
                else f"work-stream '{args.project}'")
         return _finish_api(f"mem: feature #{args.feature_id} → {tgt}")
+    if args.roadmap_cmd == "edit":
+        payload: dict = {}
+        if args.title is not None:
+            payload["title"] = args.title
+        if args.summary is not None:
+            payload["summary"] = args.summary
+        if not payload:
+            die("nothing to edit — pass at least one of --title / --summary")
+        _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}", payload)
+        edited = " + ".join(payload)  # 'title', 'summary', or both
+        return _finish_api(f"mem: feature #{args.feature_id} edited ({edited})")
     # depends — replace the dependency set (server validates + refuses cycles)
     _api("PATCH", f"/_sc/mem/roadmap/{args.feature_id}", {"blocked_by": args.on or []})
     desc = ", ".join(f"#{d}" for d in args.on) if args.on else "— (cleared)"
@@ -524,7 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ROADMAP_STATUSES = ["shipped", "in_progress", "next", "near_term",
                         "long_term", "brainstorm", "retired"]
-    sp = sub.add_parser("roadmap", help="add a feature, move its status, set its work-stream or dependencies")
+    sp = sub.add_parser("roadmap", help="add a feature, edit its title/summary, move its status, set its work-stream or dependencies")
     rsub = sp.add_subparsers(dest="roadmap_cmd", required=True)
     ra = rsub.add_parser("add")
     ra.add_argument("title")
@@ -537,6 +549,10 @@ def build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("project", help="set/clear a feature's work-stream")
     rp.add_argument("feature_id", type=int)
     rp.add_argument("project", help="work-stream shortname|id, or 'none' to clear")
+    re = rsub.add_parser("edit", help="revise a feature's title/summary (keeps the roadmap row truthful as specs evolve)")
+    re.add_argument("feature_id", type=int)
+    re.add_argument("--title")
+    re.add_argument("--summary")
     rd = rsub.add_parser("depends", help="set a feature's dependencies (replaces the set)")
     rd.add_argument("feature_id", type=int)
     rd.add_argument("--on", type=int, action="append", metavar="FEATURE_ID",
