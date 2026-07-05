@@ -1586,18 +1586,22 @@ Getting that text into the repo is the GUI **Publish** button (or the admin shel
 on `main`) — see ''After DB work'' below. (In the super-coder SOURCE repo only,
 `schema.sql` + `migrations/` are tracked too — there the engine *is* the project.)
 
-## After DB work — snapshot persists it; Publish puts it in the repo
+## After DB work — your `sc mem` write is already saved; Publish puts it in the repo
 
-Your DB edits live only in the live `.db` until serialized, so run `sc
-snapshot` (+ `sc render` if docs/roadmap/skills changed) — that''s the "save my
-work" step, so a `sc rebuild` can''t lose it. But the serialization lands at the
-**main checkout root**, NOT your worktree (the shared engine + DB live there), so
-don''t try to commit `content.sql` or the `_sc` renders onto your branch — from a
-worktree they aren''t there. Committing that text to the repo is the GUI
-**Publish** button (snapshot → render → commit → push → PR on `sc_gui_content`),
-or the admin shell working in the repo root on `main`. Your feature-branch PRs
-carry your project files; the serialized DB content is published separately. See
-the `snapshot` skill.
+Your `sc mem` write is durable the moment it lands: it goes straight into the
+shared engine DB (visible to every shell at once), and a `sc rebuild` restores it
+from the serialized snapshot. There is **no per-shell "save" step** — do **not**
+run `sc snapshot` yourself. Snapshot serializes the shared main tree and refuses
+outside admin/GUI *by design* (`snapshot: refused — serializing to the shared main
+tree is an admin/GUI step`): run from a worktree it would only churn and collide
+with the tree other shells share. Getting that DB text *into the repo* is the
+admin/GUI **Publish** flow (snapshot → render → commit → push → PR on
+`sc_gui_content`) — the GUI **Publish** button, or the admin shell on `main`
+running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills
+changed). It also lands at the **main checkout root**, NOT your worktree, so don''t
+try to commit `content.sql` or the `_sc` renders onto your branch — from a
+worktree they aren''t there. Your feature-branch PRs carry your project files; the
+serialized DB content is published separately. See the `snapshot` skill.
 
 ## Notes
 
