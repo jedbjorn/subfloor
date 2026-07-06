@@ -13,7 +13,7 @@ Usage:
 """
 from __future__ import annotations
 
-import shutil
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -124,13 +124,28 @@ def prune_backups(prefix: str) -> None:
         old.unlink(missing_ok=True)
 
 
+def backup_db(dst: Path, src: Path = DB_PATH) -> None:
+    """WAL-safe snapshot via sqlite3's online-backup API. A plain file copy of
+    a live WAL database misses every un-checkpointed page (they live in the
+    -wal sidecar), so a copy2 restore point could silently drop the most
+    recent writes — the exact rows it exists to protect."""
+    src_con = sqlite3.connect(src)
+    dst_con = sqlite3.connect(dst)
+    try:
+        with dst_con:
+            src_con.backup(dst_con)
+    finally:
+        dst_con.close()
+        src_con.close()
+
+
 def backup_existing() -> None:
     if not DB_PATH.exists():
         return
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dst = BACKUP_DIR / f"shell_db.prerebuild.{ts}.db"
-    shutil.copy2(DB_PATH, dst)
+    backup_db(dst)
     prune_backups("shell_db.prerebuild")
     print(f"rebuild: backed up existing DB -> {dst}")
 

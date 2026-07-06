@@ -17,7 +17,7 @@
 #   HOT (short + long):
 #   make dos-e   / dos-enter     attach a session (pick shell + harness); dos-e s=ap01 boots one
 #   make dos-l   / dos-launch    build + start the docker sandbox (+ review GUI)
-#   make dos-r   / dos-restart   down + launch — recreate the sandbox fresh
+#   make dos-r   / dos-restart   confirm (YES) + DB backup, then down + launch
 #   make dos-d   / dos-down      stop the sandbox
 #   make dos-u   / dos-update    fetch + materialize the engine, reconcile in place
 #   make dos-t   / dos-test      backend (pytest/unittest) + UI (vitest) suites
@@ -81,7 +81,7 @@ dos-h:
 	@echo "  ├───────┼─────────────┼──────────────────────────────────────────┤"
 	@echo "  │ dos-e │ dos-enter   │ attach a session (pick shell + harness)  │"
 	@echo "  │ dos-l │ dos-launch  │ build + start the docker sandbox + GUI   │"
-	@echo "  │ dos-r │ dos-restart │ recreate the sandbox fresh (down+launch) │"
+	@echo "  │ dos-r │ dos-restart │ confirm + DB backup, then recreate fresh │"
 	@echo "  │ dos-d │ dos-down    │ stop the sandbox                         │"
 	@echo "  │ dos-u │ dos-update  │ update the engine in place               │"
 	@echo "  │ dos-t │ dos-test    │ run backend + UI test suites             │"
@@ -96,7 +96,7 @@ dos-help:
 	@echo "  ├──────────────────────┼──────────────────────────────────────────────────────────┤"
 	@echo "  │ dos-e  dos-enter     │ attach a session — pick shell + harness (dos-e s=ap01)   │"
 	@echo "  │ dos-l  dos-launch    │ build + start the docker sandbox (server + review GUI)   │"
-	@echo "  │ dos-r  dos-restart   │ down + launch — recreate the sandbox fresh               │"
+	@echo "  │ dos-r  dos-restart   │ confirm (YES) + DB backup -> down + launch (fresh)       │"
 	@echo "  │ dos-d  dos-down      │ stop + remove the sandbox container                      │"
 	@echo "  │ dos-u  dos-update    │ fetch + materialize the engine, reconcile in place       │"
 	@echo "  │ dos-t  dos-test      │ backend (pytest/unittest) + UI (vitest) suites           │"
