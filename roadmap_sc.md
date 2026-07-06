@@ -20,6 +20,12 @@ Give each dev shell its own git worktree so multiple dev shells can run in paral
 
 _No open flags._
 
+### Agents skill — delegated waves · owner: `cc`
+New engine skill 'agents' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.
+
+**Blockers:**
+- `SC-001` [Docs] agents skill shipped, doc pending | Blocker for: agents feature doc
+
 ### B2 — Content & render · owner: `cc`
 Flat _sc render, per-shell SKILL.md, skill seed pipeline. PR #1.
 
@@ -51,11 +57,6 @@ _No open flags._
 
 ### B1 — First-launch installer · owner: `cc`
 Full installer on top of init_fork: requirements check, harness auto-detect, slot-filled shell_system_prompt template.
-
-_No open flags._
-
-### Agents skill — delegated waves · owner: `cc`
-New engine skill 'agents' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.
 
 _No open flags._
 

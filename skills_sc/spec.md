@@ -145,6 +145,10 @@ sc mem state "[<feature_title>] — last: —. next: Preparation."
 
 ## Step 4: Track session by session
 
+**Agents overlay:** if this shell is granted `agents` and the FnB invoked
+`--agents`, that skill's overlay replaces this step's one-task-at-a-time loop
+with adjudicated waves — load it and apply it on top of this step.
+
 At the start of each work session, load the current plan state:
 
 ```

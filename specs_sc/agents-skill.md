@@ -3,7 +3,7 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Agents skill — delegated waves
-roadmap_status: next
+roadmap_status: shipped
 frozen: false
 title: agents — delegated waves
 tags: [skill, orchestration, dev, reviewer]

@@ -39,6 +39,11 @@ sc mem get shells
 
 ## Step 2: Review along the three axes
 
+**Agents overlay:** if this shell is granted `agents` and the FnB invoked
+`--agents`, that skill's overlay fans this step out to an adversarial
+finding-panel — load it and apply it on top of this step. Steps 1, 3, and 4
+stay yours, unchanged.
+
 Apply every axis, every review — combined with the granted *lenses* that sharpen
 whichever area the diff touches:
 

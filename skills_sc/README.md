@@ -8,6 +8,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 > The substrate's skill catalogue, rendered from the DB. Per-shell grants live in `.claude/skills/` (rebuilt at boot).
 
+- [`agents`](skills_sc/agents.md) — --agents [model] — delegate work to spawned subagents under the system's discipline. Dev — execute a spec's task plan as implementer waves; reviewer — fan the three review axes out to an adversarial finding-panel. Overlay on spec/review; parent-only memory writes; AGENTS spawn ledger with a hard 6h validity window; parent-set timeouts. Load ONLY when the FnB invokes --agents.
 - [`api-design`](skills_sc/api-design.md) — REST/HTTP API design patterns — resource naming, status codes, pagination, filtering, errors, versioning, idempotency. Use when designing or reviewing API endpoints.
 - [`app_deploy_setup`](skills_sc/app_deploy_setup.md) — Admin-run, one-time scaffold — turn the shipped deploy template into this repo's own project-local `deploy` skill (migration dirs, DB backup, ff-only sync, apply + move migrations, restart), then grant it to every shell.
 - [`blueprint`](skills_sc/blueprint.md) — Turn a one-line objective into a sequenced construction plan — decompose into steps, find the dependency order, mark what can run in parallel, name the verification gate. Use before multi-step builds.
