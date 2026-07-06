@@ -54,6 +54,11 @@ Full installer on top of init_fork: requirements check, harness auto-detect, slo
 
 _No open flags._
 
+### Agents skill — delegated waves · owner: `cc`
+New engine skill 'agents' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.
+
+_No open flags._
+
 ### B6 — Commit→PR automation · owner: `cc`
 edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapshot button is the manual precursor.
 
