@@ -27,6 +27,17 @@ judgment work warrants a heavier worker, and you may bump a single agent''s
 tier when a task is judged hard. You — the parent — never change tier; you
 stay the judge.
 
+**The core loop is `implement → you verify → adversarially refute → you
+fix` — the refute step is where the quality comes from.** Parallel
+implementers are an optional scale-up for genuinely large, file-disjoint
+work, not the headline. The spend buys verification depth and an audit
+trail, not wall-clock: your loop (compose → wait → adjudicate → re-verify)
+is serial, and field runs measured hundreds of k of subagent tokens even
+on small waves. Fit test before spawning: multi-surface, file-disjoint,
+spec''d work with high correctness stakes → waves. A single-file or small
+fix → run the base procedure solo; at most, spawn one adversarial skeptic
+against your own diff — that is the cheap, high-ROI slice of this skill.
+
 - **Harness:** subagent tooling exists in the claude harness only. No
   subagent tooling in your harness → this skill is inert; run the base
   procedure.
@@ -47,13 +58,41 @@ stay the judge.
 2. **Prompt ingredients, not canned prompts.** You compose every agent
    prompt fresh, and it must carry: the spec excerpt / done-condition it
    serves, the exact file paths in play, the fork conventions that apply,
-   the deadline block (see the ledger check), and a required return shape.
-3. **Isolation by role.** More than one implementer in flight → each works
-   in its own isolated worktree (writers never share a tree). Reviewer and
-   checker agents are read-only; no isolation needed.
+   the expected base commit (the agent verifies it via `git log -1` before
+   editing and REPORTS a mismatch instead of silently proceeding), the
+   deadline block (see the ledger check), and a required return shape.
+3. **Isolation by conflict risk.** Concurrent writers on the same files —
+   or any writer that must touch git state — each work in their own
+   isolated worktree (writers never share a tree''s index). A file-disjoint
+   wave may share your tree, edits only: agents run no `git
+   add`/`stash`/`checkout`/`commit`. Read *Worktree reality* below before
+   reaching for isolation — it has real costs. Reviewer and checker agents
+   are read-only; no isolation needed.
 4. **Agent claims are inputs, not results.** Re-run the real check yourself
    — `./sc test`, lint, the spec''s done-condition — before marking anything
-   done. "Agent says tests pass" is not verification.
+   done. "Agent says tests pass" is not verification. Same for diffs: pull
+   them yourself (`git -C <worktree> diff`); never adjudicate pasted diffs
+   or pasted test output — pastes are lossy and unverifiable.
+
+---
+
+## Worktree reality — what isolation actually gives an agent
+
+Harness worktrees are fresh trees, and two properties bite (both observed
+on first fork runs — super-coder #303, #304):
+
+- **They seed from the default branch (origin/main), not your branch
+  HEAD.** In a stacked feature, a later-wave implementer authors — and
+  "verifies" — against a base missing the earlier waves'' commits. Hence
+  the base-commit ingredient in contract rule 2, and hence: writers
+  return diffs, you apply each one to YOUR tree with `git apply --3way`
+  (note: it STAGES — inspect via `git diff HEAD`), and every check runs
+  on the merged state.
+- **They lack untracked toolchains.** No `node_modules`; sandboxed
+  interpreters are typically mounted only into the primary worktree. An
+  isolated agent often cannot run the app''s suite at all. Say so in the
+  prompt so it doesn''t burn a turn rediscovering it, and treat its tree
+  as an authoring surface: verification is yours, in your tree.
 
 ---
 
@@ -101,7 +140,9 @@ Every agent prompt ends with this deadline block, filled in:
 ```
 Your deadline is <spawned + timeout> UTC. Past it, stop and return
 partial results. If the current time is after <spawned + 6h>, do no
-work — return immediately.
+work — return immediately. Run all verification synchronously; never
+end your turn waiting on a background task — your final message is
+your only channel back.
 ```
 
 The 6-hour window is a hard constant. You choose timeouts freely under it;
@@ -118,12 +159,14 @@ never evidence.
 After the task plan exists (base skill, Steps 1–3, unchanged):
 
 1. Classify pending tasks into **dependency waves** — independent tasks may
-   run in parallel; dependent tasks sequence. Use `blueprint` for the
-   dependency read; don''t reimplement it.
+   run in parallel; dependent tasks sequence. When the ordering is
+   non-obvious, use `blueprint` for the dependency read; a task plan that
+   already encodes the order stands on its own.
 2. Per wave: run the ledger check → mark each wave task `in_progress`
-   (`sc mem task start`) → spawn one implementer per task (worktrees if
-   more than one) → on each returned diff, spawn checker agent(s) prompted
-   to **refute** it → adjudicate, apply, run the real tests → `sc mem task
+   (`sc mem task start`) → spawn one implementer per task (isolation per
+   contract rule 3) → pull each returned diff yourself and apply it to
+   your tree → spawn checker agent(s) prompted to **refute** it →
+   adjudicate, run the real tests on the merged state → `sc mem task
    done` → update current_state → next wave.
 3. One wave live at a time.
 
