@@ -37,7 +37,7 @@ ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import engine_manifest  # noqa: E402
-import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, prune_backups, KEEP_BACKUPS)
+import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, backup_db, prune_backups, KEEP_BACKUPS)
 import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
 
 # One source of truth with rebuild.py — the PER-FORK dir. A restore point must
@@ -59,7 +59,7 @@ def backup_current_db() -> None:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dst = BACKUP_DIR / f"shell_db.prerollback.{ts}.db"
-    shutil.copy2(DB_PATH, dst)
+    rebuild_mod.backup_db(dst)
     rebuild_mod.prune_backups("shell_db.prerollback")
     print(f"→ backed up current DB -> {dst}")
 

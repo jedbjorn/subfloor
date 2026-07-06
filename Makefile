@@ -11,7 +11,7 @@
 #   make dos-l / dos-launch  build + start the docker sandbox
 #   make dos-e / dos-enter   attach an interactive session (pick shell + harness)
 #   make dos-e s=cc          attach + boot the 'cc' shell directly
-#   make dos-r / dos-restart down + launch — recreate the sandbox fresh
+#   make dos-r / dos-restart confirm (YES) + DB backup, then down + launch
 #   make dos-d / dos-down    stop the sandbox
 #   make dos-h / dos-help    list / describe all commands
 include .super-coder/aliases.mk
