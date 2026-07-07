@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import urllib.error
 import urllib.request
@@ -631,6 +632,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str]) -> int:
+    # Restore the default SIGPIPE disposition so piping a render into `head`
+    # (or any reader that closes early) terminates quietly like a normal Unix
+    # filter, instead of raising BrokenPipeError mid-render loop (#299). Python
+    # installs SIG_IGN by default, which turns the closed pipe into an
+    # exception; SIG_DFL makes the write kill the process cleanly. Guarded for
+    # platforms without SIGPIPE (Windows), though this only ever runs on Linux.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     args = build_parser().parse_args(argv)
     _require_api()  # every command goes through the API — fail loud if unwired
     return args.fn(args)
