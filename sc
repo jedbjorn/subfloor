@@ -45,6 +45,11 @@ SC_NET="${SC_NET:-sc-net}"
 # against real Postgres inside the sandbox, isolated from any host PG.
 PGNAME="sc-pg-$(basename "$here")"
 PGVOL="sc-pg-$(basename "$here")-data"
+# /dev/shm for the sidecar. Docker's 64MB default is too small for postgres's
+# posix DSM (parallel-query segments) — concurrent suites exhaust it and trip a
+# postmaster crash-reinit that kills every connection (#298). tmpfs, allocated
+# on use, so a generous cap is cheap. Override with SC_PG_SHM.
+SC_PG_SHM="${SC_PG_SHM:-1g}"
 
 # Fail fast with the fix if the docker daemon isn't reachable, instead of a
 # cryptic build/run error. Host setup is one-time and lives in `./sc doctor` /
@@ -547,6 +552,7 @@ sc_pg_up() {
   docker volume create "$PGVOL" >/dev/null
   docker run -d --name "$PGNAME" --restart unless-stopped \
     --network "$SC_NET" \
+    --shm-size "$SC_PG_SHM" \
     -e POSTGRES_USER=sc \
     -e POSTGRES_PASSWORD=sc \
     -e POSTGRES_DB=sc \
@@ -928,6 +934,7 @@ super-coder — forkable shell substrate
   ./sc pg-init             add the "pg" key to instance.json (enables the sidecar)
   ./sc pg-up               start the postgres:17 container; self-skips if unconfigured/already up
   ./sc pg-down             stop + remove the container (data volume retained)
+                             (recreate via pg-down→pg-up to change --shm-size / SC_PG_SHM)
 
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health
