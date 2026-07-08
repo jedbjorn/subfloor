@@ -132,7 +132,8 @@ def read_log() -> list[dict]:
 
 # Shell fields the review layer may write. seed/L&S/system_prompt/mandate are
 # deliberately ABSENT — the law says the shell curates them, so there is no door.
-SHELL_EDITABLE = {"current_state"}  # workspace + connections both retired (B5) → current_state is the one writable surface; "where things live" is the derived dr_* map
+# display_name is operator-set at creation, so the operator may also correct it.
+SHELL_EDITABLE = {"current_state", "display_name"}  # workspace + connections both retired (B5); "where things live" is the derived dr_* map
 FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "priority"}
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
@@ -471,6 +472,31 @@ def set_blockers(con, feature_id, blocked_by):
         [(feature_id, b) for b in ids])
     con.commit()
     return True, None
+
+
+def patch_shell(con, shell_id, body):
+    """PATCH /api/shells/{id}. A display_name change (fixing a name that got
+    wonked at creation) also re-stamps the system_prompt H1 — but ONLY when the
+    H1 still exactly carries the creation-time render (`# <old name> — …`).
+    That prefix is shell_factory machinery output, not shell curation; anything
+    the shell has since made its own no longer matches and is never touched."""
+    if "display_name" in body:
+        dn = body["display_name"]
+        if not isinstance(dn, str) or not dn.strip():
+            return False, "display_name must be a non-empty string"
+        body["display_name"] = dn = dn.strip()
+        r = con.execute(
+            "SELECT display_name, system_prompt FROM shells WHERE shell_id=?",
+            (shell_id,)).fetchone()
+        if r is None:
+            return False, "not found"
+        old_h1 = f"# {r['display_name']} — "
+        if r["system_prompt"].startswith(old_h1):
+            con.execute(
+                "UPDATE shells SET system_prompt=? WHERE shell_id=?",
+                (f"# {dn} — " + r["system_prompt"][len(old_h1):], shell_id))
+    return patch_columns(con, "shells", "shell_id", shell_id, body,
+                         SHELL_EDITABLE)
 
 
 def patch_document(con, doc_id, body):
@@ -1855,8 +1881,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.startswith("/api/shells/") and path.count("/") == 3:
                 sid = int(path.rsplit("/", 1)[1])
-                ok, err = patch_columns(con, "shells", "shell_id", sid, body,
-                                        SHELL_EDITABLE)
+                ok, err = patch_shell(con, sid, body)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
             if path.startswith("/api/flags/"):
                 fid = int(path.rsplit("/", 1)[1])

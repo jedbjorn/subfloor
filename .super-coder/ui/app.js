@@ -266,6 +266,18 @@ async function renderShells(root) {
   newBtn.onclick = () => openNewShellModal(templates, root);
   sub.append(newBtn);
 
+  // rename shell — fix a display_name that got wonked at creation
+  const renBtn = el("button", { className: "act", type: "button", textContent: "✎ Rename" });
+  renBtn.onclick = async () => {
+    const name = (prompt("New display name", s.display_name) || "").trim();
+    if (!name || name === s.display_name) return;
+    try {
+      await api("/shells/" + selectedShell, "PATCH", { display_name: name });
+      setStatus("shell renamed — " + name); renderShells(root);
+    } catch (e) { toast("error: " + e.message); }
+  };
+  sub.append(renBtn);
+
   // delete shell — soft-delete the selected shell, then re-render
   const delBtn = el("button", { className: "act", type: "button", textContent: "✕ Delete shell" });
   delBtn.onclick = async () => {
