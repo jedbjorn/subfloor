@@ -296,5 +296,77 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.con, {"flavor": "planner", "harness": "claude"})[0])
 
 
+class PatchShellTest(unittest.TestCase):
+    """server.patch_shell — display_name rename + the strictly-guarded
+    system_prompt H1 re-stamp (creation-time render only, never curation)."""
+
+    def setUp(self) -> None:
+        self.con = build_db()
+
+    def tearDown(self) -> None:
+        self.con.close()
+
+    def _mk(self, name, prompt) -> int:
+        sid = self.con.execute(
+            "INSERT INTO shells (display_name, system_prompt) VALUES (?, ?)",
+            (name, prompt)).lastrowid
+        self.con.commit()
+        return sid
+
+    def _shell(self, sid):
+        return self.con.execute(
+            "SELECT display_name, system_prompt, current_state FROM shells "
+            "WHERE shell_id=?", (sid,)).fetchone()
+
+    def test_rename_restamps_pristine_h1(self) -> None:
+        sid = self._mk("DEV1", "# DEV1 — dev shell, working repo\n\nfocus")
+        ok, err = server.patch_shell(self.con, sid, {"display_name": "Forge"})
+        self.assertTrue(ok, err)
+        row = self._shell(sid)
+        self.assertEqual(row["display_name"], "Forge")
+        self.assertEqual(row["system_prompt"],
+                         "# Forge — dev shell, working repo\n\nfocus")
+
+    def test_rename_never_touches_curated_prompt(self) -> None:
+        # H1 no longer carries the creation-time name → shell curation, no door
+        sid = self._mk("DEV1", "# The Floorwright\n\nmy own words")
+        ok, _ = server.patch_shell(self.con, sid, {"display_name": "Forge"})
+        self.assertTrue(ok)
+        row = self._shell(sid)
+        self.assertEqual(row["display_name"], "Forge")
+        self.assertEqual(row["system_prompt"], "# The Floorwright\n\nmy own words")
+
+    def test_rename_trims_whitespace(self) -> None:
+        sid = self._mk("DEV1", "x")
+        ok, _ = server.patch_shell(self.con, sid, {"display_name": "  Forge  "})
+        self.assertTrue(ok)
+        self.assertEqual(self._shell(sid)["display_name"], "Forge")
+
+    def test_empty_and_nonstring_names_rejected(self) -> None:
+        sid = self._mk("DEV1", "x")
+        for bad in ("", "   ", None, 7):
+            ok, err = server.patch_shell(self.con, sid, {"display_name": bad})
+            self.assertFalse(ok)
+            self.assertIn("non-empty", err)
+        self.assertEqual(self._shell(sid)["display_name"], "DEV1")
+
+    def test_missing_shell_is_not_found(self) -> None:
+        ok, err = server.patch_shell(self.con, 999999, {"display_name": "X"})
+        self.assertFalse(ok)
+        self.assertEqual(err, "not found")
+
+    def test_current_state_path_unchanged(self) -> None:
+        sid = self._mk("DEV1", "x")
+        ok, _ = server.patch_shell(self.con, sid, {"current_state": "building"})
+        self.assertTrue(ok)
+        self.assertEqual(self._shell(sid)["current_state"], "building")
+
+    def test_system_prompt_stays_doorless(self) -> None:
+        sid = self._mk("DEV1", "x")
+        ok, err = server.patch_shell(self.con, sid, {"system_prompt": "hijack"})
+        self.assertFalse(ok)
+        self.assertEqual(self._shell(sid)["system_prompt"], "x")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
