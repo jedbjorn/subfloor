@@ -94,6 +94,13 @@ FnB and any rebooted shell reads to re-orient mid-sprint. On a tracker wake,
 that's the whole job: read the event, update the board, nudge whoever it
 unblocks if their own tracker hasn't already.
 
+**Messages are your steering wheel.** The `sprint` skill has every dev check
+its inbox at the start of each step and on every tracker wake — so a message
+from you is guaranteed to be read before that dev's next move. Steer with it:
+holds, re-sequencing, nudges, rulings on reported reds. The board records
+state; messages change behavior. When they'd conflict, your latest message
+wins — then update the board to match.
+
 ## Step 4: Unblock
 
 Stalls you'll meet, and the moves:
@@ -101,6 +108,12 @@ Stalls you'll meet, and the moves:
 - **A dev wedged on red CI** (it reports after three failed fix attempts, per
   the `sprint` skill): decide — pair another shell onto it, re-scope the
   unit, or pull the failing part into a follow-up unit so the chain moves.
+- **An anomalous red** — the dev reports a failure that isn't its bug (flaky
+  test, runner death, `main` red underneath): the dev's job was to rerun and
+  report, not to patch healthy code. Yours is to fix the cause as its own
+  unit (or hold the chain while infra recovers) and rule by message when the
+  dev may proceed. Don't count phantom reds against a dev's fix attempts —
+  and don't let anyone merge over one either; green means green.
 - **A unit growing past its scope**: split it; the piece downstream actually
   needs ships first, the rest becomes a new unit at the chain's tail.
 - **A merge broke `main`**: message all devs to hold merges, insert a fix

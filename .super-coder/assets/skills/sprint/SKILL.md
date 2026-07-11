@@ -60,6 +60,12 @@ it and dies when the sprint closes. When in doubt, check the doc; if it says
 
 ## The loop
 
+One discipline spans every step: **check your inbox (`sc mem message check`)
+at the start of each step and on every tracker wake.** The planner steers the
+sprint by message — holds, re-sequencing, scope changes land there before the
+board catches up — so a message is authoritative for your slot. Never start a
+step on a stale slot.
+
 **1. Know your slot.** Read the sprint doc; find your row. Note what you
 depend on (upstream unit + its shell) and what depends on you (downstream
 shell — that's who you hand off to). No upstream → you start immediately.
@@ -115,10 +121,23 @@ ballooning), message the planner — don't sit silent behind a stuck link.
 
 **6. Babysit CI.** `gh pr checks <your-pr> --watch` while live; your tracker
 covers the cold gaps — a red on your PR is a wake-up call, not news you hear
-from the planner. Red → read the failure, fix, push, watch again. This is
-your loop to run, not the planner's to chase. **Three honest fix attempts
-without green → message the planner** with what's failing and what you've
-tried; a wedged link is a board problem, not a private shame.
+from the planner.
+
+**Not every red is your bug — triage before you fix.** Ask: is the failure
+in something your diff touches? Does `main` show the same failure? Does the
+log say timeout, runner died, network, a flaky test you never went near?
+Anomalous → **re-run the failed checks** (`gh run rerun <run-id> --failed`),
+don't patch healthy code. An anomalous red that survives two reruns is a
+board problem — message the planner (flaky suite, broken `main`, infra) and
+hold; it's the planner's to fix as a unit, not yours to absorb. When a fix
+needs a fix, suspect the diagnosis.
+
+A real red → read the failure, fix, push, watch again. This is your loop to
+run, not the planner's to chase. **Three honest fix attempts without green →
+message the planner** with what's failing and what you've tried; a wedged
+link is a board problem, not a private shame. (Reruns of flakes don't count
+as attempts — but neither do they count as green: **merge authority still
+requires actual green checks.** "It's just a flake" is never a merge.)
 
 **7. Merge on green, then hand off.** All checks green and the boundary above
 satisfied:

@@ -84,6 +84,12 @@ it and dies when the sprint closes. When in doubt, check the doc; if it says
 
 ## The loop
 
+One discipline spans every step: **check your inbox (`sc mem message check`)
+at the start of each step and on every tracker wake.** The planner steers the
+sprint by message — holds, re-sequencing, scope changes land there before the
+board catches up — so a message is authoritative for your slot. Never start a
+step on a stale slot.
+
 **1. Know your slot.** Read the sprint doc; find your row. Note what you
 depend on (upstream unit + its shell) and what depends on you (downstream
 shell — that''s who you hand off to). No upstream → you start immediately.
@@ -139,10 +145,23 @@ ballooning), message the planner — don''t sit silent behind a stuck link.
 
 **6. Babysit CI.** `gh pr checks <your-pr> --watch` while live; your tracker
 covers the cold gaps — a red on your PR is a wake-up call, not news you hear
-from the planner. Red → read the failure, fix, push, watch again. This is
-your loop to run, not the planner''s to chase. **Three honest fix attempts
-without green → message the planner** with what''s failing and what you''ve
-tried; a wedged link is a board problem, not a private shame.
+from the planner.
+
+**Not every red is your bug — triage before you fix.** Ask: is the failure
+in something your diff touches? Does `main` show the same failure? Does the
+log say timeout, runner died, network, a flaky test you never went near?
+Anomalous → **re-run the failed checks** (`gh run rerun <run-id> --failed`),
+don''t patch healthy code. An anomalous red that survives two reruns is a
+board problem — message the planner (flaky suite, broken `main`, infra) and
+hold; it''s the planner''s to fix as a unit, not yours to absorb. When a fix
+needs a fix, suspect the diagnosis.
+
+A real red → read the failure, fix, push, watch again. This is your loop to
+run, not the planner''s to chase. **Three honest fix attempts without green →
+message the planner** with what''s failing and what you''ve tried; a wedged
+link is a board problem, not a private shame. (Reruns of flakes don''t count
+as attempts — but neither do they count as green: **merge authority still
+requires actual green checks.** "It''s just a flake" is never a merge.)
 
 **7. Merge on green, then hand off.** All checks green and the boundary above
 satisfied:
@@ -266,6 +285,13 @@ FnB and any rebooted shell reads to re-orient mid-sprint. On a tracker wake,
 that''s the whole job: read the event, update the board, nudge whoever it
 unblocks if their own tracker hasn''t already.
 
+**Messages are your steering wheel.** The `sprint` skill has every dev check
+its inbox at the start of each step and on every tracker wake — so a message
+from you is guaranteed to be read before that dev''s next move. Steer with it:
+holds, re-sequencing, nudges, rulings on reported reds. The board records
+state; messages change behavior. When they''d conflict, your latest message
+wins — then update the board to match.
+
 ## Step 4: Unblock
 
 Stalls you''ll meet, and the moves:
@@ -273,6 +299,12 @@ Stalls you''ll meet, and the moves:
 - **A dev wedged on red CI** (it reports after three failed fix attempts, per
   the `sprint` skill): decide — pair another shell onto it, re-scope the
   unit, or pull the failing part into a follow-up unit so the chain moves.
+- **An anomalous red** — the dev reports a failure that isn''t its bug (flaky
+  test, runner death, `main` red underneath): the dev''s job was to rerun and
+  report, not to patch healthy code. Yours is to fix the cause as its own
+  unit (or hold the chain while infra recovers) and rule by message when the
+  dev may proceed. Don''t count phantom reds against a dev''s fix attempts —
+  and don''t let anyone merge over one either; green means green.
 - **A unit growing past its scope**: split it; the piece downstream actually
   needs ships first, the rest becomes a new unit at the chain''s tail.
 - **A merge broke `main`**: message all devs to hold merges, insert a fix
