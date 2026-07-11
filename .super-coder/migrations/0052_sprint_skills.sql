@@ -90,9 +90,21 @@ sprint by message — holds, re-sequencing, scope changes land there before the
 board catches up — so a message is authoritative for your slot. Never start a
 step on a stale slot.
 
-**1. Know your slot.** Read the sprint doc; find your row. Note what you
-depend on (upstream unit + its shell) and what depends on you (downstream
-shell — that''s who you hand off to). No upstream → you start immediately.
+**1. Know your slot — and write it down.** Read the sprint doc; find your
+row. Note what you depend on (upstream unit + its shell) and what depends on
+you (downstream shell — that''s who you hand off to). No upstream → you start
+immediately. Then embed one line in your `current_state`:
+
+```
+SPRINT doc=<id> unit=<seq> upstream=<seq|none> downstream=<shortname|none> status=<...>
+```
+
+This line is what survives a reboot: a cold session''s inbox is already read
+and its tracker may have died with it — the SPRINT line in your own state is
+how the next boot knows it''s mid-sprint, reloads this skill, and re-checks
+the board (your dependency may have merged while you were down — then it''s
+simply your turn). Keep `status=` current as yours walks; recreate the
+tracker if a reboot killed it.
 
 **2. Stand up your sprint tracker — one, for the whole sprint.** A sprint is
 mostly waiting for someone else''s PR to go green and merge, and you won''t be
@@ -177,8 +189,8 @@ Then clean up local per the `git` skill (re-pin base, delete the branch).
 
 **8. Stand down.** The planner''s close-out message (or a frozen/`CLOSED`
 sprint doc) ends the sprint: merge authority is gone, default gates resume,
-and — **before anything else — kill your tracker** and confirm it in your
-reply to the planner. If your unit is done early, help by reviewing
+and — **before anything else — kill your tracker, drop the SPRINT line from
+your `current_state`,** and confirm both in your reply to the planner. If your unit is done early, help by reviewing
 downstream PRs on request — but merging anyone else''s PR was never yours to
 do, sprint or not.
 
@@ -239,7 +251,10 @@ declared: <date> · planner: <shortname>
 ```
 
 Unit `status` walks: `waiting → building → pr-open → ci-red → merged`.
-Note the returned `document_id` — every kickoff and report references it.
+Note the returned `document_id` — every kickoff and report references it —
+and embed `SPRINT doc=<id> governing` in your own `current_state`, so a
+planner rebooted mid-sprint re-orients from its own state (same reboot
+armor the `sprint` skill gives the devs). Drop the line at close-out.
 
 **You are the doc''s only writer.** Devs report transitions by message; you
 fold them into the board with `sc mem doc edit <id> --body-file`. One writer,
@@ -309,6 +324,13 @@ Stalls you''ll meet, and the moves:
   needs ships first, the rest becomes a new unit at the chain''s tail.
 - **A merge broke `main`**: message all devs to hold merges, insert a fix
   unit at the front of the chain, resume when green.
+- **A link gone quiet** — no transition report, no tracker-visible movement,
+  no reply: nudge by message; a live shell reads it at its next step
+  boundary, a dead one never will. A second nudge met with silence →
+  **escalate to the FnB: only the FnB boots shells.** Ask for the shell to
+  be booted (its SPRINT state line re-orients it on arrival) or the unit
+  reassigned. A dead link is invisible unless you''re counting heartbeats —
+  the bottleneck question in Step 3 is what surfaces it.
 - **Re-sequencing**: when the plan meets reality, edit the board and message
   *every* affected dev with its new slot — a dev acting on a stale slot is
   worse than a paused one.

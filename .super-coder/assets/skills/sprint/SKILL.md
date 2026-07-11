@@ -66,9 +66,21 @@ sprint by message — holds, re-sequencing, scope changes land there before the
 board catches up — so a message is authoritative for your slot. Never start a
 step on a stale slot.
 
-**1. Know your slot.** Read the sprint doc; find your row. Note what you
-depend on (upstream unit + its shell) and what depends on you (downstream
-shell — that's who you hand off to). No upstream → you start immediately.
+**1. Know your slot — and write it down.** Read the sprint doc; find your
+row. Note what you depend on (upstream unit + its shell) and what depends on
+you (downstream shell — that's who you hand off to). No upstream → you start
+immediately. Then embed one line in your `current_state`:
+
+```
+SPRINT doc=<id> unit=<seq> upstream=<seq|none> downstream=<shortname|none> status=<...>
+```
+
+This line is what survives a reboot: a cold session's inbox is already read
+and its tracker may have died with it — the SPRINT line in your own state is
+how the next boot knows it's mid-sprint, reloads this skill, and re-checks
+the board (your dependency may have merged while you were down — then it's
+simply your turn). Keep `status=` current as yours walks; recreate the
+tracker if a reboot killed it.
 
 **2. Stand up your sprint tracker — one, for the whole sprint.** A sprint is
 mostly waiting for someone else's PR to go green and merge, and you won't be
@@ -153,8 +165,8 @@ Then clean up local per the `git` skill (re-pin base, delete the branch).
 
 **8. Stand down.** The planner's close-out message (or a frozen/`CLOSED`
 sprint doc) ends the sprint: merge authority is gone, default gates resume,
-and — **before anything else — kill your tracker** and confirm it in your
-reply to the planner. If your unit is done early, help by reviewing
+and — **before anything else — kill your tracker, drop the SPRINT line from
+your `current_state`,** and confirm both in your reply to the planner. If your unit is done early, help by reviewing
 downstream PRs on request — but merging anyone else's PR was never yours to
 do, sprint or not.
 
