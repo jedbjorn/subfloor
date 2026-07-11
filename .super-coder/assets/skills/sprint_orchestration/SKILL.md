@@ -1,20 +1,23 @@
 ---
 name: sprint_orchestration
-description: Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, declare the sprint doc, kick off the devs (every shell stands up one sprint tracker), monitor the board, unblock stalls, close out — freezing the doc revokes the devs' scoped merge authority and every tracker is torn down. Load when the FnB directs a coordinated multi-dev push. Companion to the dev-side `sprint` skill.
+description: Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, declare the sprint doc, kick everyone off (every shell stands up one sprint tracker), monitor the board, unblock stalls, close out — freeze the doc (revoking all scoped authority), tear down every tracker, and write the sprint report. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.
 category: craft
 common: false
 ---
 
 # sprint_orchestration — governing a coordinated multi-shell push
 
-The FnB declares *that* a sprint happens; you make it run. You decompose the
-push into units, sequence who builds on whom, kick off every participant,
-watch the whole board, unblock stalls, and close it out. The dev-side loop
-(watch dependency → PR → babysit CI → merge on green → hand off) is the
-`sprint` skill — each participant runs it; you run this.
+The FnB declares *that* a sprint happens; you make it run. The loop is
+planner → devs → reviewers → devs → planner: you decompose the push into
+units, sequence who builds on whom, assign a reviewer to every unit, kick
+off every participant, watch the whole board, unblock stalls, and close it
+out with a report. The participant loop (build → PR → CI → sprint review →
+merge on green+clean → hand off, plus the reviewer slot) is the `sprint`
+skill — devs and reviewers run it; you run this.
 
-The two skills meet at one artifact: the **sprint doc**. Your declaration
-turns the devs' scoped merge authority on; your close-out turns it off.
+The skills meet at one artifact: the **sprint doc**. Your declaration turns
+the participants' scoped authority on (dev merge-on-green+clean, reviewer
+direct handoffs); your close-out turns it off.
 
 ## Step 1: Declare the sprint
 
@@ -24,7 +27,9 @@ dependency, not a preference.** Units that don't touch each other run in
 parallel; a chain is only as fast as its slowest link, so keep chains short
 and the graph wide where the code allows.
 
-Assign each unit to a shell, then write the board as a `documents` row:
+Assign each unit a dev shell **and a reviewer shell** (one reviewer can gate
+several units — just don't let one reviewer become the whole sprint's
+bottleneck), then write the board as a `documents` row:
 
 ```
 sc mem doc add "SPRINT: <title>" --kind doc --body-file <draft.md>
@@ -37,14 +42,14 @@ Body contract (the `sprint` skill quotes the same one — keep it exact):
 status: ACTIVE                      # ACTIVE | CLOSED
 declared: <date> · planner: <shortname>
 
-| seq | unit | shell | depends on | branch | pr | status |
+| seq | unit | shell | reviewer | depends on | branch | pr | status |
 ```
 
-Unit `status` walks: `waiting → building → pr-open → ci-red → merged`.
-Note the returned `document_id` — every kickoff and report references it —
-and embed `SPRINT doc=<id> governing` in your own `current_state`, so a
-planner rebooted mid-sprint re-orients from its own state (same reboot
-armor the `sprint` skill gives the devs). Drop the line at close-out.
+Unit `status` walks: `waiting → building → pr-open → in-review → fixing →
+merged` (`fixing` loops back to `in-review` until clean; `ci-red` can
+interleave anywhere from `pr-open` on). Note the returned `document_id` —
+every kickoff and report references it — and embed `SPRINT doc=<id>
+governing` in your own `current_state`; drop it at close-out.
 
 **You are the doc's only writer.** Devs report transitions by message; you
 fold them into the board with `sc mem doc edit <id> --body-file`. One writer,
@@ -52,16 +57,20 @@ one board, no drift.
 
 ## Step 2: Kick off
 
-Message every participant its slot — unit, what it depends on, who depends
-on it, the doc id, and the instruction to load the `sprint` skill:
+Message every participant its slot — the doc id, the instruction to load the
+`sprint` skill, and what its slot is:
 
 ```
-sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. Depends on unit <k> (<shell>); <shell'> depends on you. Load the sprint skill and take your slot. First move: <start now | build locally, wait for unit <k>>."
+# devs — unit, dependencies, reviewer:
+sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. Depends on unit <k> (<shell>); <shell'> depends on you; <reviewer> reviews you. Load the sprint skill and take your slot. First move: <start now | build locally, wait for unit <k>>."
+
+# reviewers — assigned units, the severity bar:
+sc mem message send <reviewer> "SPRINT <doc-id>: you review units <seq,seq> — Major/Medium block, Low goes to the report. Load the sprint skill (reviewer slot). Review requests come to you directly as units go green."
 ```
 
 First-in-chain starts immediately; everyone else starts watching. From this
-message on, each dev holds the `sprint` skill's scoped merge authority for
-its own unit.
+message on, each dev holds the scoped merge authority and each reviewer the
+direct-handoff authority for its assigned units.
 
 Then **stand up your own sprint tracker** — the same pattern the `sprint`
 skill gives the devs, and the answer to "how does a cold shell know it's
@@ -114,13 +123,19 @@ Stalls you'll meet, and the moves:
   needs ships first, the rest becomes a new unit at the chain's tail.
 - **A merge broke `main`**: message all devs to hold merges, insert a fix
   unit at the front of the chain, resume when green.
+- **A review stall** — a unit sitting `in-review` while its reviewer works
+  something else: nudge the reviewer; still stuck → reassign the unit to
+  another reviewer. A severity dispute (dev says Low, reviewer says Medium)
+  → **you rule, by message, immediately** — a chain waiting on a
+  classification argument is pure loss. When the dispute is genuinely about
+  what the unit *should do*, that's a judgment call: FnB.
 - **A link gone quiet** — no transition report, no tracker-visible movement,
   no reply: nudge by message; a live shell reads it at its next step
   boundary, a dead one never will. A second nudge met with silence →
   **escalate to the FnB: only the FnB boots shells.** Ask for the shell to
-  be booted (its SPRINT state line re-orients it on arrival) or the unit
-  reassigned. A dead link is invisible unless you're counting heartbeats —
-  the bottleneck question in Step 3 is what surfaces it.
+  be booted or the unit reassigned. A dead link is invisible unless you're
+  counting heartbeats — the bottleneck question in Step 3 is what surfaces
+  it.
 - **Re-sequencing**: when the plan meets reality, edit the board and message
   *every* affected dev with its new slot — a dev acting on a stale slot is
   worse than a paused one.
@@ -142,8 +157,19 @@ When every unit is `merged` and `main` is green:
    confirmations. The sprint is not closed while any tracker lives — a
    watcher leaking into later sessions fires on unrelated PRs and erodes
    trust in the next sprint's signals. Chase silence like you'd chase red CI.
-4. Report the outcome to the FnB: units shipped (PRs), anything cut or
-   re-scoped, what it surfaced.
+4. **Write the sprint report** — one `documents` row, the sprint's durable
+   record:
+
+   ```
+   sc mem doc add "SPRINT REPORT: <title>" --kind doc --body-file <report.md>
+   ```
+
+   Cover: units shipped (PRs, planned vs. actual order), review outcomes
+   (Major/Medium found and fixed per unit; the Low notes reviewers filed —
+   this is where they land, as the post-sprint cleanup list), stalls hit and
+   how each was unblocked, anything cut or re-scoped and why, and what the
+   sprint surfaced about the process itself. Message the FnB: sprint closed,
+   report at doc `<id>`.
 5. Settle the bookkeeping — close the sprint's flags, advance roadmap /
    feature status, note docs-pending.
 
