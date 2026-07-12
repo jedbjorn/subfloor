@@ -7,91 +7,79 @@ common: false
 
 # docs — author & review documents
 
-In super-coder the **DB owns document bodies** — never loose `.md` files. A
-`documents` row is the source; `sc render` writes the read-only flat copy to
-`specs_sc/` / `docs_sc/`, and the GUI opens it rendered in md-converter.
+The DB owns document bodies: a `documents` row is the source — NEVER author a
+loose `.md` file as the canonical body. `sc render` writes the read-only flat
+copy to `specs_sc/` / `docs_sc/`; the GUI opens it rendered in md-converter.
 
 | kind | lives on | meaning |
 |---|---|---|
-| `spec` | the **Roadmap** (the dev cycle) | a working spec for a feature; a feature can hold several at once; **freezes on ship** |
+| `spec` | the **Roadmap** (the dev cycle) | working spec for a feature; a feature can hold several at once; **freezes on ship** |
 | `doc` | the **Docs** tab | documentation; not part of the spec lifecycle |
 
 `<self>` = your shell_id.
 
 ## One feature, many specs
 
-A feature (the `roadmap` row) is the umbrella, and it exists from `brainstorm`
-onward — before any spec is written. **Specs hang off the feature, not off each
-other:** a feature can hold several unfrozen specs at once (the working pile),
-each a `documents (kind='spec')` row, ordered by `seq`. There are no
-feature-to-feature links and no second roadmap row for related work — related
-work is just another spec under the same feature.
+Feature = the `roadmap` row; exists from `brainstorm` onward, before any spec.
+Specs hang off the feature, not off each other: several unfrozen specs per
+feature, each a `documents (kind='spec')` row, ordered by `seq`. No
+feature-to-feature links; no second roadmap row for related work — related
+work = another spec under the same feature. Freeze = the ship-time record of
+what was built to; it never gates the feature's other specs.
 
-A spec stays unfrozen until it ships; freeze is the ship-time record of what we
-built to, and it never gates the feature's other specs. So at any moment a
-feature's specs are in one of three states:
-
-| state | how to tell | meaning |
+| state | test | meaning |
 |---|---|---|
 | **shipped** | `frozen = 1` | delivered; immutable record |
-| **active** | unfrozen **and** has rows in `spec_tasks` | the spec being built now |
-| **backlog** | unfrozen, no task plan yet | the pile, ordered by `seq` |
+| **active** | unfrozen + has rows in `spec_tasks` | the spec being built now |
+| **backlog** | unfrozen, no task plan | the pile, ordered by `seq` |
 
-The **doc** (`kind='doc'`) is the feature's readable face — write it when the
-first spec ships, under the same `feature_id`. It is a sibling of the specs, not
-a parent they point at.
+The **doc** (`kind='doc'`) = the feature's readable face — write it when the
+first spec ships, under the same `feature_id`. Sibling of the specs, not a
+parent.
 
-## Every feature belongs to a work-stream — assess it
+## Assess the work-stream on every feature
 
-A feature attaches to a **work-stream** (a `projects` row) via
-`roadmap.project_id`; the GUI **Flow view groups on it**, and `NULL` shows as
-**Ungrouped**. An unassigned feature is invisible to the Flow view's grouping —
-so a roadmap of Ungrouped features is a roadmap with no flows. **Whenever you
-create a feature or author/update a spec, assess the work-stream** as part of the
-same act (it's a planning decision, like the stage):
+A feature attaches to a work-stream (`projects` row) via `roadmap.project_id`.
+The GUI Flow view groups on it; `NULL` shows as Ungrouped = invisible to the
+grouping. On every feature create / spec author / spec update, assess the
+work-stream in the same act:
 
 ```
-# existing work-streams (pick the one this feature belongs to):
-sc mem get projects
-# is this feature already assigned? — read its row's project_id:
-sc mem get roadmap
+sc mem get projects   # existing work-streams — pick the fit
+sc mem get roadmap    # this feature's current project_id
 ```
 
-Then:
-- **New feature** → create it already assigned:
-  `sc mem roadmap add "<title>" --project <shortname>`
-- **Existing + Ungrouped** → assign it:
-  `sc mem roadmap project <feature_id> <shortname>`
-- **No fitting work-stream exists yet** → create one, then assign:
-  `sc mem project add <shortname> "<title>" --purpose "…"`
-- **Already correctly assigned** → **no-op**; don't churn it.
+| case | action |
+|---|---|
+| new feature | create pre-assigned: `sc mem roadmap add "<title>" --project <shortname>` |
+| existing + Ungrouped | `sc mem roadmap project <feature_id> <shortname>` |
+| no fitting stream | `sc mem project add <shortname> "<title>" --purpose "…"` -> then assign |
+| already correctly assigned | no-op — don't churn |
 
-**Auto-assign when the stream is obvious** (only one plausible fit, or it clearly
-belongs to an existing stream). **Surface to the FnB only when ambiguous** —
-several streams could fit, or the feature implies a new stream you're unsure how
-to name. Exempt, as with stages: work that isn't a feature/spec (a quick fix)
-needs no work-stream.
+Auto-assign when only one plausible fit / it clearly belongs to an existing
+stream. Surface to the FnB only when ambiguous — several streams fit, or a
+new stream you're unsure how to name. Exempt (as with stages): work that
+isn't a feature/spec (a quick fix) needs no work-stream.
 
 ## Review first
 
-Before writing, see what exists — don't duplicate, and don't re-litigate:
+Before writing — don't duplicate, don't re-litigate:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
-sc mem get decisions      # active-decision index — already settled? (<id> = full row + rationale; --all incl. superseded)
-sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"  -- repo's own docs (map db)
+sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
+sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"   # repo's own docs (map db)
 ```
 
-If the spec you're about to write touches a recorded decision, honor it or
-supersede it **explicitly** — say so in the spec, and record the new decision
-with `sc mem decision "…" --parent <old_id>`. Never silently re-decide a
-settled choice.
+Spec touches a recorded decision -> honor it, or supersede explicitly: say so
+in the spec + record `sc mem decision "…" --parent <old_id>`. NEVER silently
+re-decide a settled choice.
 
 ## Author
 
-Write through `sc mem doc add` — it routes through the engine API, `--body-file` reads
-the markdown from a file (no shell-escaping a long body), `--seq` auto-increments
-within `(feature, kind)`, and it renders + snapshots for you (the render/snapshot
-pipeline this rides on is the `snapshot` skill):
+Write through `sc mem doc add` (routes through the engine API): `--body-file`
+reads the markdown from a file (no shell-escaping a long body); `--seq`
+auto-increments within `(feature, kind)`; it renders + snapshots for you
+(pipeline = the `snapshot` skill):
 ```
 # a doc against a feature (kind='doc'); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
@@ -102,9 +90,9 @@ sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-
 
 ## Revise before freeze
 
-While a doc is still unfrozen, revise it in place — no new row, no seq bump.
-Pass any of `--title` / `--body-file` / `--render-path`; it renders + snapshots
-like `add`. Refused once frozen (open a new spec instead — see below):
+Unfrozen -> edit in place: no new row, no seq bump. Pass any of `--title` /
+`--body-file` / `--render-path`; renders + snapshots like `add`. Frozen ->
+refused; open a new spec under the same feature instead:
 ```
 sc mem doc edit <document_id> --body-file ./draft.md
 sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
@@ -112,64 +100,58 @@ sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 
 ## Freeze + document on ship — the planner's handoff
 
-Shipping a feature is a **two-shell** act, and the split keeps `shipped` honest:
+Shipping is a two-shell act (keeps `shipped` honest):
 
-- the **dev** flips the feature to `roadmap_status = shipped` and opens a
-  **docs-pending** flag (see the `spec` skill, Step 5) — so `shipped` never
-  silently claims a doc that doesn't exist yet;
-- the **planner** picks up that flag and does the paperwork: **freeze the spec,
-  write the doc, close the flag.**
+- **dev**: flips `roadmap_status = shipped` + opens a **docs-pending** flag
+  (`spec` skill, Step 5) — `shipped` never silently claims a doc that doesn't
+  exist yet.
+- **planner**: on that flag (arrives in your inbox per the `flags` skill), do
+  the paperwork:
 
-As the planner, on a docs-pending flag (it arrived in your inbox per the `flags`
-skill):
-
-1. **Freeze the shipped spec** — records what we built to, immutable thereafter.
-   The feature's other specs stay unfrozen and unaffected; never edit a frozen one
-   (open a new spec under the same feature instead). The GUI and render layer both
-   refuse edits to frozen docs:
+1. **Freeze the shipped spec** — immutable thereafter; the feature's other
+   specs stay unfrozen and unaffected. NEVER edit a frozen spec (open a new
+   spec under the same feature); the GUI and render layer both refuse edits
+   to frozen docs:
    ```
    sc mem doc freeze <document_id>
    ```
-2. **Read the shipped code, then write the doc.** The doc is written from
-   interpretation of the code as it actually shipped — not from the spec body.
-   Drift happens during production: decisions get made, scope adjusts, edge cases
-   land differently than planned. The spec captures the intent; the code is the
-   truth. Read the implementation first, then write what it does:
+2. **Read the shipped code, then write the doc** — from the code as it
+   actually shipped, NOT from the spec body. The spec is intent; the code is
+   truth (drift lands during production). Read the implementation first,
+   write what it does:
    ```
    sc mem doc add "<feature> — how it works" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/<slug>.md
    ```
-3. **Close the docs-pending flag** with a note pointing at the doc:
+3. **Close the docs-pending flag** pointing at the doc:
    ```
    sc mem flag close <flag_id> --notes "Spec frozen; doc <document_id> written → docs_sc/<slug>.md"
    ```
 
-Until step 3, `shipped` + the open flag is the truthful interim state: delivered,
+Until step 3, `shipped` + open flag = the truthful interim state: delivered,
 doc pending.
 
 ## View
 
-Open any doc rendered: the GUI's "open in md-converter ↗" (Roadmap card or Docs
-tab) — the body rides in the URL, no upload. For long-form authoring, write the
-markdown to the `body` and let the render + md-converter handle presentation.
+GUI "open in md-converter ↗" (Roadmap card / Docs tab) opens any doc rendered
+— the body rides in the URL, no upload. Long-form authoring: write the
+markdown to `body`; render + md-converter own presentation.
 
 ---
 
 # Authoring format (themed-markdown)
 
-The `body` you write **is** themed-markdown — the format md-converter renders.
-**Your job is structure; styling is the renderer's job.** Never write visual
-instructions (colors, fonts, sizes, themes). Apply the four semantic classes;
-the theme picks the actual colors.
+The `body` you write IS themed-markdown — the format md-converter renders.
+Your job = structure; styling = the renderer's job. NEVER write visual
+instructions (colors, fonts, sizes, themes) — apply the four semantic
+classes; the theme picks colors.
 
-Use **only** the constructs below. Anything else either drops silently or breaks
-the render.
+Use ONLY the constructs below — anything else drops silently or breaks the
+render.
 
-`req` = required · `opt` = optional · `≤N` = soft character cap (over-cap wraps
-awkwardly or overflows a fixed UI slot).
+`req` = required · `opt` = optional · `≤N` = soft character cap (over-cap
+wraps awkwardly / overflows a fixed UI slot).
 
 ## Frontmatter
-
-Author these in the body's frontmatter:
 
 ```
 ---
@@ -189,10 +171,10 @@ purpose: Brief description
 | `project` | opt | ≤40 |
 | `purpose` | opt | ≤40 |
 
-`date`/`project`/`purpose` → footer meta cards. **`sc render` injects
-`feature`, `roadmap_status`, `frozen`, `rendered_by`, `source` on top of these
-— don't write those yourself.** Never use comma-separated tags (`tags: a, b`);
-always a YAML list.
+`date`/`project`/`purpose` -> footer meta cards. `sc render` injects
+`feature`, `roadmap_status`, `frozen`, `rendered_by`, `source` on top —
+NEVER write those yourself. Tags = YAML list only; comma-separated
+(`tags: a, b`) breaks.
 
 ## Structure
 
@@ -200,17 +182,17 @@ always a YAML list.
 |---|---|---|
 | `# Title` | doc title (opt; falls back to `frontmatter.title`) | — |
 | `## Section` | sidebar tab | ≤28 |
-| `### Heading` | subsection → `<h3>` | ≤80 |
+| `### Heading` | subsection -> `<h3>` | ≤80 |
 
 H4–H6 ⛔.
 
-**Tab rule:** every H2 = one tab. Content between two H2s belongs to the first.
-Content between H1 and the first H2 is **silently dropped** — put intro under an
-H2 (e.g. "Overview"). Single-section docs may omit H2s (whole doc = one tab).
+**Tab rule:** every H2 = one tab; content between two H2s belongs to the
+first. Content between H1 and the first H2 is silently dropped — put intro
+under an H2 (e.g. "Overview"). Single-section docs may omit H2s (whole doc =
+one tab).
 
-**Doc scale:** the app renders every section up-front and re-renders every
-Mermaid on each tab switch. Aim for ≤25 sections and ≤15 Mermaid diagrams; split
-larger material.
+**Doc scale:** ≤25 sections + ≤15 Mermaid diagrams (every section renders
+up-front; every Mermaid re-renders per tab switch) — split larger material.
 
 ## Inline · lists · tables · images · code
 
@@ -218,19 +200,19 @@ larger material.
 - Lists: `-` unordered · `1.` ordered · `- [ ]` / `- [x]` tasks
 - Tables: standard GFM pipe tables
 - Images: `![alt](https://url/img.png)` — absolute URLs only, descriptive alt
-- Video: a bare video URL **alone on its own line** renders as a player —
-  a `github.com/user-attachments/assets/<id>` URL (paste a video into a GitHub
+- Video: a bare video URL alone on its own line renders as a player — a
+  `github.com/user-attachments/assets/<id>` URL (paste a video into a GitHub
   issue/PR to mint one) or any absolute URL ending `.mp4`/`.webm`/`.mov`/`.ogg`.
-  Don't wrap it in `![]()` or `[]()` — bare is what triggers the player.
+  NEVER wrap it in `![]()` / `[]()` — bare triggers the player.
 - Code: fenced with a language hint (```` ```python ````)
 
 ## Color classes
 
-`class1`–`class4`, available on callouts, stat cards, mermaid nodes, and linear
-steps. **You choose which class fits each piece by meaning** — the theme decides
-the color. Keep one class per semantic role across the doc (e.g. `class1` =
-primary, `class2` = supporting, `class3` = positive/done, `class4` =
-caution/warning). Consistency > specific choice.
+`class1`–`class4` — on callouts, stat cards, mermaid nodes, linear steps.
+Choose the class by meaning; the theme decides the color. Keep one class per
+semantic role across the doc (e.g. `class1` = primary, `class2` = supporting,
+`class3` = positive/done, `class4` = caution/warning). Consistency >
+specific choice.
 
 ## Callouts
 
@@ -256,9 +238,9 @@ label: Active users
 
 | Field | Status | Cap | Notes |
 |---|---|---|---|
-| `value` | req | ≤12 | Short token: `87%`, `1.2M`. Not sentences. |
-| `label` | req | ≤28 | One short noun phrase. |
-| `description` | opt | one short line | Omit if no signal. |
+| `value` | req | ≤12 | short token (`87%`, `1.2M`) — not sentences |
+| `label` | req | ≤28 | one short noun phrase |
+| `description` | opt | one short line | omit if no signal |
 
 Layout: 2 per row; trailing odd card spans the row.
 
@@ -271,16 +253,16 @@ graph LR
 ```
 ````
 
-Class via `:::classN` on nodes. The app injects `classDef` — **don't** write
-`classDef`, `fill:`, or any style directive. Node label cap ≤24 (Mermaid
-auto-sizes nodes; long labels balloon them).
+Class via `:::classN` on nodes. The app injects `classDef` — NEVER write
+`classDef`, `fill:`, or any style directive. Node label cap ≤24 (long labels
+balloon auto-sized nodes).
 
-**Quote labels with special characters.** Unquoted node text is parsed as
-Mermaid grammar, not literal text. Any label containing `/`, `(`, `)`, `*`, `[`,
-`]`, `{`, `}`, `<`, `>`, `#`, `:`, `;`, or a quote **must** be wrapped in double
-quotes inside the brackets — otherwise the diagram throws *"Syntax error in
-text"* and renders nothing. Notably `A[/text/]` is the parallelogram shape, so a
-literal path like `/lease/mail/*` breaks unless quoted.
+**Quote labels with special characters** — unquoted node text is parsed as
+Mermaid grammar. Any label containing `/`, `(`, `)`, `*`, `[`, `]`, `{`, `}`,
+`<`, `>`, `#`, `:`, `;`, or a quote MUST be double-quoted inside the brackets
+-> else *"Syntax error in text"* and nothing renders. Notably `A[/text/]` =
+the parallelogram shape, so a literal path like `/lease/mail/*` breaks unless
+quoted.
 
 ```
 GOOD:  AD["/admin/user-credentials/"]:::class3
@@ -290,7 +272,7 @@ BAD:   AD[/admin/user-credentials/]      (parsed as a parallelogram shape → er
 ```
 
 Cylinder/stadium shapes are fine as-is — `DB[(secrets.db)]`, `X([ready])` —
-quote only the inner *text*, not the shape brackets.
+quote only the inner text, not the shape brackets.
 
 ## Linear
 
@@ -299,8 +281,8 @@ quote only the inner *text*, not the shape brackets.
 Step 1 :::class1 -> Step 2 :::class2 -> Step 3 :::class3
 ```
 ````
-Steps separated by `->`, optional class via `:::classN`. Steps render
-**vertically** — one per row, top→bottom (never horizontal). Step text cap ≤48.
+Steps separated by `->`, optional `:::classN`. Renders vertically — one step
+per row, top→bottom (never horizontal). Step text cap ≤48.
 
 ## Never
 
@@ -314,18 +296,18 @@ Steps separated by `->`, optional class via `:::classN`. Steps render
 ## Open in md-converter
 
 A doc whose `body` lives in the DB already opens in the app from the GUI
-("open in md-converter ↗" on the Roadmap/Docs card) — nothing to author there.
+("open in md-converter ↗" on the Roadmap/Docs card) — author nothing there.
 
-When you instead **commit a standalone themed-markdown file** to the repo (a
-README, or a rendered `docs_sc/` page meant to be read on GitHub), drop a
-one-click badge in its preamble — between `# Title` and the first `##`, so it
-shows on GitHub but is dropped from the render (preamble rule):
+When committing a **standalone** themed-markdown file to the repo (a README,
+or a rendered `docs_sc/` page meant to be read on GitHub), drop a one-click
+badge in its preamble — between `# Title` and the first `##` (shows on
+GitHub, dropped from the render by the preamble rule):
 
 ```markdown
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/<owner>/<repo>/blob/<branch>/<path>)
 ```
 
 Fill `<owner>/<repo>/<branch>/<path>` with the file's GitHub location (any
-subdirectory depth). Public repos only — the badge fetches the raw file in the
-reader's browser (no server/auth). Destination unknown → keep the placeholders
-and tell the user to fill them.
+subdirectory depth). Public repos only — the badge fetches the raw file in
+the reader's browser (no server/auth). Destination unknown -> keep the
+placeholders and tell the user to fill them.

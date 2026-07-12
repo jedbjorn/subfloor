@@ -14,8 +14,8 @@ SQLite test infrastructure for super-coder-style forks — throwaway DB, Alice/B
 
 # test_authoring_sqlite — SQLite test infra
 
-Read `test_authoring` for the foundational rules. This skill covers the
-test infrastructure for SQLite-backed forks (super-coder, dos-arch).
+Rules live in `test_authoring` — read it alongside. This skill = the test
+infrastructure for SQLite-backed forks (super-coder, dos-arch).
 
 ## Foundation
 
@@ -36,16 +36,16 @@ shell, and drives the real app through `TestClient` with real auth.
 | `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
 
 **Throwaway DB setup:**
-- `tempfile.NamedTemporaryFile(suffix=".db")` → path injected via
-  `os.environ["SHELL_DB_PATH"]` **before** importing the app (the auth
-  middleware calls `db()` directly; a `Depends` override alone misses it).
+- `tempfile.NamedTemporaryFile(suffix=".db")` -> path injected via
+  `os.environ["SHELL_DB_PATH"]` BEFORE importing the app — the auth
+  middleware calls `db()` directly; a `Depends` override alone misses it.
 - `apply_schema_and_migrations(con)` builds the schema on the throwaway DB —
-  single source shared by all test harnesses; do not copy-paste it.
+  single source shared by all test harnesses; NEVER copy-paste it.
 - A second throwaway (`DISPATCH_DB_PATH`) isolates egress/spend rows.
-- `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` — plain `dsess` cookie,
+- `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` -> plain `dsess` cookie,
   no `__Host-` prefix in tests.
 
-**Callers:**
+**Callers** — all pytest fixtures:
 ```python
 alice   # session-cookie caller, USER_A identity
 bob     # session-cookie caller, USER_B identity
@@ -54,13 +54,13 @@ anon    # no auth
 shell_a # bearer-key caller, KEY_A
 shell_b # bearer-key caller, KEY_B
 ```
-All are pytest fixtures. `shell_a` / `shell_b` use `Authorization: Bearer`.
+`shell_a` / `shell_b` send `Authorization: Bearer`.
 
 **TestClient:**
-- Created without a `with` block — skips startup hooks (catalogue / model
+- Create WITHOUT a `with` block -> skips startup hooks (catalogue / model
   sync) that would hit the network.
-- Session-scoped (`scope="session"`) so the DB is shared across all tests in a
-  run; tests must not depend on a clean DB unless they seed their own via
+- `scope="session"` -> one DB shared across the whole run. Never depend on a
+  clean DB; a test needing isolation seeds its own via
   `build_substrate_db()` (in-memory, returns a `sqlite3.Connection`).
 
 **Direct DB assertions:**
@@ -73,6 +73,6 @@ rows = con.execute("SELECT * FROM table WHERE ...").fetchall()
 Assert against real rows, not the response payload. The throwaway path is
 stable for the lifetime of the test session.
 
-**Mocking boundary:**
-Mock only true external egress — outbound IMAP, HTTP, broker calls. Never
-mock the router, the DB layer, or the function under test.
+**Mocking boundary:** mock only true external egress — outbound IMAP, HTTP,
+broker calls. NEVER mock the router, the DB layer, or the function under
+test.

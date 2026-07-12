@@ -7,51 +7,51 @@ common: false
 
 # flags — blockers & follow-ups
 
-A flag is an open question or blocker. Linking it to a `feature_id` makes it that
-feature's blocker (joined on the roadmap + shown on the Roadmap card and the
-Flags tab). `<self>` = your shell_id.
+flag = open question / blocker. `--feature <id>` set -> the flag is that
+feature's blocker (joined on the roadmap; shown on the Roadmap card + Flags
+tab). `<self>` = your shell_id. All reads/writes go through `sc mem` (the
+engine API) — there is no `sqlite3` path.
 
 ## Surface
 
 ```
-sc mem get flags          # your open flags (id, name, priority, description) — via the API
+sc mem get flags          # your open flags (id, name, priority, description)
 sc mem get flags --json   # same, as JSON
 ```
 
-(Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
-the blocked feature's title. Reads go through the API — there is no `sqlite3`.)
+Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
+the blocked feature's title.
 
 ## Open
 
-Write through `sc mem` (routed through the engine API):
 ```
 sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```
-- `--name`: short id (`SC-###`).
-- the description is `[Area] {what} | Blocker for: {what it blocks}`.
-- `--priority`: High / Medium / Low. `--feature`: the feature it blocks (or omit).
 
-### Always pair the open with a message
+- `--name` = short id, format `SC-###`.
+- description format = `[Area] {what} | Blocker for: {what it blocks}`.
+- `--priority` = High / Medium / Low. `--feature` = the feature it blocks (omit if none).
 
-A flag sitting in the DB that no one is told about isn't a handoff — it's a note
-to yourself. **Every flag you open also sends a message to whoever clears it**, so
-the work lands in their inbox on their next boot (see the `messaging` skill):
+### Pair every open with a message
+
+Every `flag open` -> a `message send` to whoever clears it (see the
+`messaging` skill), so the work lands in their inbox on their next boot:
 
 ```
 sc mem message send <shortname> "Opened SC-### — <one line> (Blocker for: <x>)."
 ```
 
-Resolve the recipient by what the flag blocks:
+Recipient = whoever the flag blocks:
 
 | Flag is about | Message |
 |---|---|
 | docs pending after ship | the **planner** |
 | a review failure on a diff | the **author dev** |
 | a blocker on another shell's work | **that shell** |
-| an FnB decision, or no shell owns it | **surface to the FnB** (no `send`) |
+| an FnB decision / no shell owns it | **surface to the FnB** (no `send`) |
 
-Idempotent: pair the message with the *open*. Don't re-message a flag that's
-already open, and don't message on `close`.
+Message pairs with the *open* only: NEVER re-message a flag that is already
+open; NEVER message on `close`.
 
 ## Resolve
 
@@ -59,10 +59,11 @@ already open, and don't message on `close`.
 sc mem flag close <flag_id> --notes "…"
 ```
 
+`--notes` states *how* it was resolved — that's the trail.
+
 ## Stance
 
-Open a flag the moment something is blocked or needs follow-up — don't hold it in
-your head. Resolve with a note saying *how*, so the trail is legible. Open flags
-on a feature are its blockers; clear them before calling the feature done. **An
-opened flag always rides out on a message** to whoever clears it — a flag nobody
-is told about is a dropped handoff.
+Open a flag the moment something blocks or needs follow-up — don't hold it in
+your head. Open flags on a feature = its blockers; clear them all before
+calling the feature done. An opened flag with no message sent = a dropped
+handoff.

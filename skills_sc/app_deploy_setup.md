@@ -14,17 +14,15 @@ Admin-run, one-time scaffold — turn the shipped deploy template into this repo
 
 # app_deploy_setup — scaffold this app's deploy ritual (once, admin)
 
-The engine deploys itself (`sc update`). The HOST APP this fork lives in has
-its own deploy story — app process, app DB, app migrations — that the engine
-cannot know. This skill turns the template below into the repo's own `deploy`
-skill, filled in with this app's specifics.
+The engine deploys itself (`sc update`); the host app's deploy — app process,
+app DB, app migrations — is the fork's own. Fill the template below with this
+app's specifics and save it as a NEW project-local `deploy` skill.
 
-**Why a NEW project-local skill instead of editing this one:** engine skills
-self-heal on every `sc update` — a fork edit to any skill named in
-`assets/skills/` is detected as stale and reverted to the shipped body. A
-project-local skill (a name the engine doesn't ship) is never touched by that
-guard and persists through rebuilds via `sc snapshot` → `.sc-state/content.sql`.
-Fill in the template, save it under a NEW name, leave this scaffold as shipped.
+NEVER save the result by editing this skill: engine skills self-heal on every
+`sc update` — a fork edit to any skill named in `assets/skills/` is detected
+as stale and reverted to the shipped body. A project-local name (one the
+engine doesn't ship) is never touched and persists through rebuilds via
+`sc snapshot` -> `.sc-state/content.sql`. Leave this scaffold as shipped.
 
 ## 1. Scaffold the migration dirs
 
@@ -33,17 +31,17 @@ mkdir -p migrations_app/pending migrations_app/completed
 touch migrations_app/pending/.gitkeep migrations_app/completed/.gitkeep
 ```
 
-Commit them. Rename to fit the repo's layout if you like (`db/migrations/…`,
-`deploy/migrations/…`) — keep `pending/` and `completed/` as siblings and use
-the same paths in the template. These are the APP's schema migrations —
-unrelated to `.super-coder/migrations/` (engine DB, ledger-tracked, owned by
-`sc update`).
+Commit them. Renaming to fit the repo's layout (`db/migrations/…`,
+`deploy/migrations/…`) is fine -> keep `pending/` + `completed/` as siblings
+and use the same paths in the template. These hold the APP's schema
+migrations — NOT `.super-coder/migrations/` (engine DB, ledger-tracked, owned
+by `sc update`).
 
 ## 2. Fill the template
 
-Every `⟨ADMIN: …⟩` slot is app-specific. Get each answer from the operator or
-the repo itself, and **run each command once by hand** before writing it in —
-a deploy skill is no place for untested commands.
+Every `⟨ADMIN: …⟩` slot is app-specific — get it from the operator or the
+repo. Run each command once by hand before writing it in; an untested command
+does not enter a deploy skill.
 
 ```markdown
 # deploy — ⟨ADMIN: app name⟩ post-merge deploy ritual
@@ -77,10 +75,10 @@ guessing; if a step fails, stop — the app is down and the DB is backed up.
    ⟨ADMIN: health check — e.g. curl -fsS http://127.0.0.1:<port>/health⟩
 ```
 
-## 3. Save it as a project-local skill
+## 3. Save as a project-local skill
 
-Both SQL blocks below run via `./sc sql-rw "<SQL>"` — the explicit read-write
-passthrough (`sc sql` is read-only and refuses writes).
+Run both SQL blocks via `./sc sql-rw "<SQL>"` — `sc sql` is read-only and
+refuses writes.
 
 ```sql
 INSERT INTO skills (name, description, category, content, common)
@@ -91,9 +89,9 @@ VALUES ('deploy',
         1);
 ```
 
-`common=1` is the "grant to every shell" switch: new shells receive it at
-creation, and `sc update` re-grants every common skill to every live shell.
-Grant existing shells now without waiting for an update:
+`common=1` = grant-to-every-shell: new shells receive it at creation, and
+`sc update` re-grants every common skill to every live shell. Grant existing
+shells now, without waiting for an update:
 
 ```sql
 INSERT OR IGNORE INTO shell_skills (shell_id, skill_id)
@@ -101,18 +99,17 @@ SELECT s.shell_id, k.skill_id FROM shells s, skills k
 WHERE COALESCE(s.is_deleted,0)=0 AND k.name='deploy' AND k.is_deleted=0;
 ```
 
-Then persist: `sc snapshot` (project-local skills + grants live in
-`.sc-state/content.sql`).
+Then `sc snapshot` -> the skill + grants persist in `.sc-state/content.sql`.
 
 ## 4. Optional make surface
 
-If the operator wants make muscle-memory, add a bare `deploy` target to the
-**repo's own root Makefile** — that is the fork's convention space. Do NOT add
-it to `.super-coder/aliases.mk`: that file is engine-owned, every target must
-delegate to `./sc`, and the engine knows nothing about the app.
+Operator wants make muscle-memory -> add a bare `deploy` target to the repo's
+own root Makefile (the fork's convention space). NEVER add it to
+`.super-coder/aliases.mk` — engine-owned; every target there must delegate to
+`./sc`, and the engine knows nothing about the app.
 
 ## 5. Done
 
-Dry-run the ritual once on a quiet window end-to-end. This scaffold stays
-granted to admin only; the finished `deploy` skill is the one every shell
-carries.
+Dry-run the ritual end-to-end once in a quiet window -> all 7 steps pass
+before any shell relies on it. This scaffold stays granted to admin only; the
+finished `deploy` skill is the one every shell carries.

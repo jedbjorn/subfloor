@@ -15,66 +15,62 @@ Data model behind the engine memory surfaces + the `sc mem` command for each. Ch
 # db_map — super-coder's DB at a glance
 
 All identity, memory, and content live in the engine DB
-(`.super-coder/shell_db.db`) — but you never touch that file. You read and write
-it **only through the engine API**, via `sc mem`:
+(`.super-coder/shell_db.db`). NEVER touch that file — read and write it only
+through the engine API, via `sc mem`:
 
-- **Read** — `sc mem get <surface>`: your own `state`, `seed`, `lns`,
-  `decisions`, `flags`, `narrative`, `messages`; and the shared planning state
-  `roadmap`, `projects`, `documents`, `tasks`, `shells` (add `--json` for raw).
-  `documents`/`tasks` take `--feature <id>` or `--doc <id>` (and `--doc` on
-  `documents` returns the one doc *with* its body).
-- **Write** — `sc mem <cmd> …` (see `## Common writes` below).
+- **Read** = `sc mem get <surface>`: your own `state`, `seed`, `lns`,
+  `decisions`, `flags`, `narrative`, `messages`; shared planning state
+  `roadmap`, `projects`, `documents`, `tasks`, `shells` (`--json` for raw).
+  `documents`/`tasks` take `--feature <id>` / `--doc <id>`; `--doc` on
+  `documents` returns the one doc *with* its body.
+- **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
-There is **no `sqlite3` path** — not as a fallback, not for "ad-hoc" reads.
-`sc mem` goes through the API and only the API; if the API isn't wired it
-fails loud rather than writing the DB behind its back. Your identity rides in
-your bearer token — the server resolves token → shell, so you never name a
-shell. The table below is the **data model** behind those surfaces (and what
-each `sc mem` write touches), not a query cheatsheet. Lazy-load: `get` the one
-surface you need, don't bulk-read.
+There is NO `sqlite3` path — not as a fallback, not for "ad-hoc" reads. If the
+API isn't wired, `sc mem` fails loud instead of writing the DB behind its
+back. Your identity rides in your bearer token — the server resolves token ->
+shell; never name a shell in a write. The table below = the data model behind
+those surfaces (what each `sc mem` write touches), not a query cheatsheet.
+Lazy-load: `get` the one surface you need, don't bulk-read.
 
-**Need a read or write `sc mem` doesn't expose?** That's a gap to *report*, not
-a reason to reach for the DB — the direct path is closed by design, and a fork
-can't patch the engine anyway (`sc update` would overwrite it). A missing
-surface is an engine gap that goes **up to the FnB**: open a flag naming the data
-and the use, and surface it. Don't improvise around the API.
+**Need a read/write `sc mem` doesn't expose?** Report the gap, don't reach for
+the DB — the direct path is closed by design, and a fork can't patch the
+engine (`sc update` would overwrite it). Open a flag naming the data + the
+use, surface it to the FnB (who carries it upstream); message a
+planner-flavor shell too if the fork has one. Until it lands: do what you can
+through the API, flag the rest — NEVER query the DB directly.
 
 ```
 sc mem flag open "[Engine] need to <read|write> <what> — no sc mem surface for it | Blocker for: <your work>"
 ```
 
-The FnB carries it upstream (that's exactly how `get documents`/`get tasks`
-landed); message a planner-flavor shell too if the fork has one. Until then, do
-what you *can* through the API and flag the rest — never the DB directly.
-
 The repo map (`dr_*`) lives in its own db, `.sc-state/map.db` (see the
-`surface_catalogue` skill). The `dr_*` tables also *exist* in `shell_db.db` but
-are **always empty** there — a `dr_*` query against `shell_db.db` silently
-returns 0 rows instead of erroring, so it looks like an empty map. Never query
-`dr_*` here; this map covers only `shell_db.db`, your memory/identity/content.
+`surface_catalogue` skill). The `dr_*` tables also exist in `shell_db.db` but
+are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
+0 rows instead of erroring. Never query `dr_*` here; this map covers only
+`shell_db.db` (memory/identity/content).
 
 ## Tables
 
 | Table | Holds | Write rule |
 |---|---|---|
 | `shells` | identity core: `mandate`, `system_prompt`, `current_state` (rolling, ~500 chars), `lineage_seed`, `active_archive_id`. (`connections`/`workspace` retired — boot `## CONNECTIONS` is derived from the `dr_*` map, not authored here) | UPDATE in place |
-| `shell_identity_entries` | seed (cap 10) + L&S (`kind='lns'`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — never edit a seed body (Law 3) |
+| `shell_identity_entries` | seed (cap 10) + L&S (`kind='lns'`, cap 20); triggers enforce caps | INSERT to add; UPDATE `retired_at` to curate out — NEVER edit a seed body (Law 3) |
 | `shell_decisions` | major decisions | INSERT only; supersede via `parent_decision_id` |
 | `shell_memory_archives` | one row per session; `full_narrative` appended progressively | INSERT at session open; UPDATE narrative |
-| `roadmap` | one row per planned feature; `roadmap_status` is a planning horizon (`brainstorm`→`in_progress`→`next`→`near_term`→`long_term`→`shipped`→`retired`), `sort_order` within a bucket. `shipped` = delivered; `retired` = taken off the board (decided-against / split / absorbed / replaced) without shipping — keep the row. `project_id` (nullable) = the work-stream the feature belongs to; the GUI Flow view groups on it (NULL = Ungrouped) | INSERT/UPDATE |
-| `feature_blockers` | the roadmap's dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite must land first). Directed, kept acyclic (the GUI Flow view wires them; the card's "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `sc mem roadmap depends` |
-| `documents` | the content store — specs/docs bodies live here; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; never edit a frozen body |
+| `roadmap` | one row per planned feature; `roadmap_status` = planning horizon (`brainstorm`→`in_progress`→`next`→`near_term`→`long_term`→`shipped`→`retired`), `sort_order` within a bucket. `shipped` = delivered; `retired` = off the board without shipping (decided-against / split / absorbed / replaced) — keep the row. `project_id` (nullable) = the work-stream the feature belongs to; the GUI Flow view groups on it (NULL = Ungrouped) | INSERT/UPDATE |
+| `feature_blockers` | roadmap dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite lands first). Directed, kept acyclic (GUI Flow view wires them; the card's "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `sc mem roadmap depends` |
+| `documents` | content store — spec/doc bodies; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; NEVER edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
 | `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | managed by engine; grants via `./sc skill grant/revoke` |
-| `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a **work-stream** that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
+| `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a work-stream that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
 `<self>` = your `shell_id` (in the boot doc's ACTIVE SESSION block).
 
 ## Common writes
 
-Each routes through the engine API and writes to the live shared DB. `sc mem which`
+Each routes through the engine API to the live shared DB. `sc mem which`
 orients; `sc mem <cmd> -h` shows flags. Writes always target your own shell —
-the server resolves it from your token; you never name a shell.
+the server resolves it from your token.
 
 ```
 # current_state (rolling status, not a log — replaces in place):
@@ -118,6 +114,5 @@ sc mem oriented                          # mark first-run done (bootstrapped=1)
 
 ## After writing
 
-Nothing more to run — the write is live in the shared engine DB the moment it
-commits, visible to every shell. Persisting it to git is an admin/GUI step, not
-yours.
+Nothing more to run — the write is live in the shared engine DB on commit,
+visible to every shell. Persisting to git is an admin/GUI step, not yours.

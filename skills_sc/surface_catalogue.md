@@ -14,16 +14,14 @@ Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE g
 
 # surface_catalogue — read the repo from the map, not by grepping
 
-super-coder lives inside a host repo. The **dr_\*** tables are a scan of that
-repo — query them first to orient, instead of walking the tree blind. They live
-in the **map db**, `.sc-state/map.db` — a *separate* file from your memory db
-(`.super-coder/shell_db.db`). Query that file: `sc map-sql "…"`.
+super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
+— query them first to orient, not the tree. They live in the **map db**,
+`.sc-state/map.db` — a separate file from your memory db
+(`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
 
-You do **not** map the repo. The map is kept fresh for you automatically (git
-hooks re-map on pull / branch-switch / rebase) and is owned by the
-**cartographer** shell, which configures and heals it. Your job is to *read* it.
-If it ever looks empty, stale, or wrong, that's a cartographer task — flag it,
-don't map it yourself.
+NEVER map the repo yourself. The map stays fresh automatically (git hooks
+re-map on pull / branch-switch / rebase) and is owned by the **cartographer**
+shell. Empty / stale / wrong map -> flag the cartographer, don't re-map.
 
 | Table | Holds |
 |---|---|
@@ -36,18 +34,18 @@ don't map it yourself.
 | `dr_db_table` / `dr_db_column` | the app DB schema: tables/views + their columns (`type`, `pk`, `not_null`) |
 | `dr_route` / `dr_component` | UI routes (`path`, `kind`) + components (`name`, `path`) |
 
-The first five are mapped on **every** repo. The last three are the **semantic
-layer** — populated only when the cartographer has wired an extractor for this
-repo's stack (see the `cartographer` skill). An empty `dr_endpoint` means *no
-extractor wired*, not "no endpoints" — check before relying on it, and flag the
-cartographer if a dimension you need is missing.
+First five = mapped on EVERY repo. Last three = the semantic layer, populated
+only when the cartographer wired an extractor for this repo's stack (see the
+`cartographer` skill). Empty `dr_endpoint` = no extractor wired, NOT "no
+endpoints" — check before relying on it; flag the cartographer if a dimension
+you need is missing.
 
 ## Orient fast
 
-The boot `## CONNECTIONS` block already shows the **section index** (where to
-start). The flow is: pick a section there → query *that section's leaves* (file
-names + descriptions) → read the one or two files you need. Section-first, one
-cheap query deep — never a full preload.
+Boot `## CONNECTIONS` already shows the section index. Flow: pick a section
+there -> query that section's leaves (file names + descriptions) -> read the
+one or two files you need. Section-first, one cheap query deep — never a full
+preload.
 
 ```sql
 -- all of these run against the map db:  sc map-sql "<query>"
@@ -88,16 +86,15 @@ SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI ro
 
 ## Stance
 
-- **Map first, grep second.** Query `dr_filepath` to find the handful of files
-  that matter, then read those — don't `grep -r` the whole tree.
-- **Lazy-load.** The catalogue is the index; pull a file's contents only once
-  the map points you at it. Carry the map, not the territory.
-- **Map looks wrong?** Empty, stale (repo changed since `mapped_at`), or
-  mis-classified — that's the cartographer's to fix. Raise it; don't re-map.
-  A file under "other / unsectioned", or a `desc IS NULL` where you needed one,
-  is also a cartographer worklist item — flag it, don't author the map yourself.
-- Always maps files / deps / env + the navigation layer (sections + per-file
-  descriptions). The semantic layer (endpoints / DB schema / UI routes) is there
-  when the cartographer wired an extractor for this stack — query it to jump
-  straight to the API surface or schema; fall back to section + descriptions when
-  a dimension is empty. Symbol-level semantics (functions/classes) are a later pass.
+- **Map first, grep second.** Query `dr_filepath` for the handful of files
+  that matter, then read those — NEVER `grep -r` the whole tree.
+- **Lazy-load.** Pull a file's contents only once the map points at it. Carry
+  the map, not the territory.
+- **Map looks wrong?** Empty, stale (repo changed since `mapped_at`),
+  mis-classified, a file under "other / unsectioned", or a `desc IS NULL`
+  where you needed one -> cartographer worklist item. Flag it; don't author
+  the map yourself.
+- **Semantic layer when wired.** Endpoints / DB schema / UI routes let you
+  jump straight to the API surface or schema; a dimension is empty -> fall
+  back to section + descriptions. Symbol-level semantics (functions/classes)
+  are a later pass.

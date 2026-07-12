@@ -14,80 +14,76 @@ Author and apply fork-specific DB schema migrations — naming, format, how to a
 
 # migration_management — fork-specific schema changes
 
-Migrations live in `.super-coder/migrations/` and apply in numeric order,
-tracked by the `schema_migrations` ledger table. Engine updates apply pending
-migrations automatically; you can apply them locally without a fetch using
+Migrations live in `.super-coder/migrations/`, apply in numeric order, tracked
+by the `schema_migrations` ledger table. Engine updates apply pending
+migrations automatically; apply locally without a fetch via
 `sc update --no-fetch`.
 
-**Scope:** fork-specific schema changes — tables, columns, constraints, or
-system-content seeds (skills, flavor defaults) that this fork needs and that
-will not ship upstream. Upstream engine migrations arrive via `sc update`
-and require no action from you.
+**Scope:** fork-specific changes — tables, columns, constraints, or
+system-content seeds (skills, flavor defaults) this fork needs that will not
+ship upstream. Upstream engine migrations arrive via `sc update`; no action
+from you.
 
 ## Authoring a migration
 
-1. **Find the next migration number.**
+1. **Find the next number:**
    ```bash
    ls .super-coder/migrations/ | sort | tail -5
    ```
-   Name the file `NNNN_<slug>.sql` where NNNN is the next integer, zero-padded
-   to 4 digits (e.g. `0012`).
+   Name the file `NNNN_<slug>.sql`, NNNN = next integer zero-padded to 4
+   digits (e.g. `0012`).
 
-2. **Write the file.**
-   Path: `.super-coder/migrations/NNNN_<slug>.sql`
-
-   Requirements:
+2. **Write the file** at `.super-coder/migrations/NNNN_<slug>.sql`:
    - Wrap in `BEGIN; ... COMMIT;`
    - Idempotent: `CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`,
      `CREATE INDEX IF NOT EXISTS`, `DROP TABLE IF EXISTS` before recreate
-   - Comment header: migration number, intent, and doctrine notes if relevant
-   - Structure and system content only — per-instance data (shell memory,
+   - Comment header: migration number + intent (+ doctrine notes if relevant)
+   - Structure + system content only — per-instance data (shell memory,
      grants, roadmap, flags) lives in `.sc-state/content.sql` via snapshot,
-     not in migrations
+     never in migrations
 
-3. **Apply locally.**
+3. **Apply locally:**
    ```bash
    sc update --no-fetch
    ```
    Skips the upstream fetch; applies all pending local migrations in order.
-   Confirm the migration landed:
+   Confirm it landed:
    ```sql
    SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5;
    ```
 
-4. **Verify.**
+4. **Verify:**
    ```bash
    sc verify
    ```
-   Headless boot proof — confirms shells, memory, and schema are intact.
+   Headless boot proof — shells, memory, and schema intact.
 
-5. **Snapshot and commit.**
+5. **Snapshot + commit:**
    ```bash
    sc snapshot
    ```
    Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
-   - **Content-seed migration?** If the migration seeds *system content* that
-     renders (skills, flavor defaults), it also changes the flat `_sc` mirrors —
-     but only once the new rows are in the DB. After `sc update --no-fetch`,
-     run `sc render && sc render-check` and commit the re-rendered `_sc`
-     files alongside the migration. A render against a DB that predates the seed
-     passes locally while CI's hermetic rebuild goes red. See the `snapshot`
-     skill (stale-mirror trap).
+   - **Content-seed migration** (seeds system content that renders — skills,
+     flavor defaults) also changes the flat `_sc` mirrors, but only once the
+     new rows are in the DB: after `sc update --no-fetch`, run
+     `sc render && sc render-check` and commit the re-rendered `_sc` files
+     alongside the migration. A render against a DB predating the seed passes
+     locally while CI's hermetic rebuild goes red — the stale-mirror trap; see
+     the `snapshot` skill.
 
 ## What makes a good migration
 
-- **Additive by default.** Add columns, tables, indexes. Avoid DROP or RENAME
-  unless correcting a prior mistake; prefer a new column over renaming one that
-  code may already reference.
-- **No per-instance content.** Shell memory, skill grants, roadmap items, and
-  flags go in the snapshot, not here. Migrations carry structure and system
-  content that propagates to all forks.
-- **Comment the why.** Future-you reading a migration needs the intent, not
-  just the SQL.
+- **Additive by default.** Add columns/tables/indexes. No DROP or RENAME
+  unless correcting a prior mistake; prefer a new column over renaming one
+  code may reference.
+- **No per-instance content.** Shell memory, skill grants, roadmap items,
+  flags -> snapshot. Migrations carry structure + system content that
+  propagates to all forks.
+- **Comment the why** — future readers need the intent, not just the SQL.
 
 ## Rollback
 
-There is no per-migration rollback. `sc rollback` restores the full DB +
-engine to the prior update point (`engine.ref.prev`). Use it only when a
-migration is so broken the DB is corrupt or the app won't start. For logical
-errors, write a corrective migration instead.
+No per-migration rollback. `sc rollback` restores the full DB + engine to the
+prior update point (`engine.ref.prev`). Use only when a migration is so broken
+the DB is corrupt or the app won't start; for logical errors, write a
+corrective migration instead.

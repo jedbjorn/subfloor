@@ -14,8 +14,8 @@ Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/B
 
 # test_authoring_pg — Postgres test infra
 
-Read `test_authoring` for the foundational rules. This skill covers the
-test infrastructure for Postgres-backed forks.
+Rules live in `test_authoring` — read it alongside. This skill = the test
+infrastructure for Postgres-backed forks.
 
 ## Foundation
 
@@ -37,16 +37,17 @@ shell, and drives the real app through `TestClient` with real auth.
 
 **Throwaway DB setup:**
 - An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
-  creates a unique `dosarch_test_<uuid>` database at session start and drops it
-  at session teardown.
-- `DATABASE_URL` is injected via `os.environ["DATABASE_URL"]` **before**
-  importing the app; the app's DB layer reads it at import time.
-- `schema.sql` (the postgres variant) + migrations are applied via
+  creates a unique `dosarch_test_<uuid>` database at session start and drops
+  it at session teardown.
+- `DATABASE_URL` injected via `os.environ["DATABASE_URL"]` BEFORE importing
+  the app — the app's DB layer reads it at import time.
+- `schema.sql` (the postgres variant) + migrations applied via
   `cur.execute(SCHEMA.read_text())` on the throwaway DB connection.
 - A second throwaway database (or schema) isolates egress/spend rows
   (`DISPATCH_DATABASE_URL`).
 
-**Callers:**
+**Callers** — same `Caller` pattern as the SQLite variant; identity carried
+via cookie or `Authorization: Bearer` header:
 ```python
 alice   # session-cookie caller, USER_A identity
 bob     # session-cookie caller, USER_B identity
@@ -55,15 +56,12 @@ anon    # no auth
 shell_a # bearer-key caller, KEY_A
 shell_b # bearer-key caller, KEY_B
 ```
-Same `Caller` pattern as the SQLite variant — identity carried via cookie
-or `Authorization: Bearer` header.
 
 **TestClient:**
-- Created without a `with` block — skips startup hooks (catalogue / model
+- Create WITHOUT a `with` block -> skips startup hooks (catalogue / model
   sync) that would hit the network.
-- Session-scoped (`scope="session"`) so the DB is shared across all tests
-  in a run; tests that need isolation seed their own fixture rows and
-  clean up explicitly.
+- `scope="session"` -> one DB shared across the whole run. A test needing
+  isolation seeds its own fixture rows + cleans up explicitly.
 
 **Direct DB assertions:**
 ```python
@@ -76,6 +74,6 @@ rows = cur.fetchall()
 ```
 Assert against real rows, not the response payload.
 
-**Mocking boundary:**
-Mock only true external egress — outbound HTTP, broker calls, third-party
-APIs. Never mock the router, the DB layer, or the function under test.
+**Mocking boundary:** mock only true external egress — outbound HTTP, broker
+calls, third-party APIs. NEVER mock the router, the DB layer, or the
+function under test.

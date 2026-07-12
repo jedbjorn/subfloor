@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # cartographer
 
-Own the repo map. Configure mapping to THIS repo, wire the auto-remap git hooks, and heal both when the repo or automation drifts. The cartographer's job alone — no working shell maps. Run on first boot, and again whenever the map looks wrong.
+Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.
 
 **Category:** substrate  ·  **Command:** `sc map-setup`
 
@@ -14,57 +14,49 @@ Own the repo map. Configure mapping to THIS repo, wire the auto-remap git hooks,
 
 # cartographer — own the repo map so no other shell has to
 
-Working shells *consume* the `dr_*` catalogue and never map (see
-`surface_catalogue`). Mapping — keeping that catalogue true to the repo — is
-yours alone. You do three things: **configure** how this repo is mapped,
-**wire** the automation that keeps it fresh, and **heal** both when they drift.
+Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
+map. You alone do three things: **configure** how this repo is mapped, **wire**
+the automation that keeps it fresh, **heal** both on drift.
 
-The catalogue lives in its **own db** — `.sc-state/map.db`, separate from the
-engine memory db (`shell_db.db`) so an engine schema change never touches the
-map. Every `dr_*` read below runs against it: `sc map-sql "…"` (read-only).
-The authoring writes in this skill (UPDATE/INSERT/DELETE on `dr_*`) run via
-`sc map-sql-rw "…"` — the explicit read-write passthrough; `sc map-sql`
-refuses writes.
-Its authored layer (sections) is serialized to `.sc-state/map_content.sql` on
-snapshot (an admin/GUI step — see the curation section) and reloaded on a
-fresh map db.
+Map db = `.sc-state/map.db`, separate from the engine memory db
+(`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
+map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
+map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
+`.sc-state/map_content.sql` on snapshot (admin/GUI step — see Standing jobs)
+and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
 
-## How the map stays fresh (so you know what you own)
+## Freshness machinery — what you own
 
-- **Git hooks** (`post-merge`, `post-checkout`, `post-rewrite`) re-run `sc map`
-  on every pull / branch-switch / rebase. They live tracked in
-  `.super-coder/hooks/` and fire via `core.hooksPath` — a per-clone git setting
-  that `sc map-setup` wires. This is the routine refresh; no shell touches it.
-- **`sc rebuild`** re-maps too (the map is a derived cache; rebuilding the DB
-  rebuilds it). So a fresh rebuild never leaves an empty map.
-- **Hourly cron** — pm2 runs `sc-map-<repo>` on a `cron_restart` schedule
-  (`.super-coder/ecosystem.config.cjs`), re-mapping every hour while the stack is
-  up (`sc up`). This is the belt to the hooks' suspenders: it catches
-  uncommitted local restructuring the git hooks can't see, so the map stays live
-  unattended. Verify it: `pm2 list | grep sc-map` (state cycles stopped→online on
-  each tick — that's the one-shot pattern, not a crash).
-- **You** set the per-repo *config*, install the hook wiring, build the
-  extractors, and repair all of it. `core.hooksPath` is unset on a fresh clone
-  until `map-setup` runs, and a fork that doesn't run pm2 has no cron — the git
-  hooks still cover those, and a manual `sc map` always works.
+- **Git hooks** `post-merge` / `post-checkout` / `post-rewrite` re-run `sc map`
+  on every pull / branch-switch / rebase. Tracked in `.super-coder/hooks/`,
+  fired via `core.hooksPath` — per-clone, unset until `sc map-setup` wires it.
+- **`sc rebuild`** re-maps (map = derived cache) -> a fresh rebuild never
+  leaves an empty map.
+- **Hourly cron** — pm2 runs `sc-map-<repo>` on `cron_restart`
+  (`.super-coder/ecosystem.config.cjs`) while the stack is up (`sc up`);
+  catches uncommitted local restructuring the git hooks can't see. Verify:
+  `pm2 list | grep sc-map` — state cycling stopped→online per tick = the
+  one-shot pattern, not a crash. A fork without pm2 has no cron; the hooks
+  still cover it, and manual `sc map` always works.
+- **You** — per-repo config + hook wiring + extractors + repair of all three.
 
 ## First boot — configure mapping for THIS repo
 
-1. **Look at the repo.** Read the current map and the tree:
+1. **Inspect.** Read the current map + tree:
    ```sql
    SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
    SELECT lang, COUNT(*) n FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
    SELECT role, COUNT(*) n FROM dr_filepath GROUP BY role ORDER BY n DESC;
    ```
-   Then eyeball the top-level dirs. Ask: is anything mis-classified, or is a
-   generated/vendored dir being indexed that shouldn't be?
+   Eyeball the top-level dirs -> anything mis-classified, or a
+   generated/vendored dir being indexed?
 
-2. **Author `.sc-state/map.config.json`** to fit what's actually here. It is
-   *authored content* (tracked, per-fork, survives `sc update` — it lives in
-   `.sc-state/`, outside the gitignored engine dir). All keys optional; each
-   merges over `map_repo.py`'s built-in defaults:
+2. **Author `.sc-state/map.config.json`** — authored content (tracked,
+   per-fork, survives `sc update`; lives in `.sc-state/`, outside the
+   gitignored engine dir). All keys optional; each merges over `map_repo.py`
+   defaults:
    ```json
    {
      "skip_dirs":  ["generated", "fixtures"],
@@ -76,16 +68,16 @@ fresh map db.
      ]
    }
    ```
-   - `skip_dirs` / `skip_files` — ADDED to the defaults (never shrink them).
-   - `role_overrides` — applied after the default role inference; first match
+   - `skip_dirs` / `skip_files` — ADDED to the defaults; never shrink them.
+   - `role_overrides` — applied after default role inference, first match
      wins. `prefix` matches the repo-relative path; `glob` matches the filename.
-   Only add what the defaults get wrong — an empty/absent config is fine for a
+   Add only what the defaults get wrong — empty/absent config is fine for a
    plain repo.
 
-3. **Wire + map:** `sc map-setup` — points `core.hooksPath` at
-   `.super-coder/hooks/`, marks the hooks executable, and runs the initial map.
+3. **Wire + map:** `sc map-setup` -> `core.hooksPath` points at
+   `.super-coder/hooks/`, hooks executable, initial map run.
 
-4. **Verify** the automation is real, not just the file:
+4. **Verify the wiring, not just the files:**
    ```sh
    git config --get core.hooksPath      # → .super-coder/hooks
    ls -l .super-coder/hooks             # all three, executable
@@ -93,49 +85,43 @@ fresh map db.
    ```sql
    SELECT file_count, mapped_at FROM dr_repo;   -- non-zero, just now
    ```
-   Spot-check that your `role_overrides` took:
+   Spot-check overrides took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE 'cmd/%';`
 
-5. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
-   and fill every `desc IS NULL` file before continuing. The worklist must be
-   empty when you leave.
+5. **Describe all NULLs** — run the description worklist (Standing jobs § 2);
+   leave only when it returns zero rows.
 
-6. **Commit** the config + hooks (`git` skill), set your state
-   (`sc mem state "…"`), then `sc mem oriented` (sets `bootstrapped=1` +
-   snapshots).
+6. **Commit** the config + hooks (`git` skill) -> `sc mem state "…"` ->
+   `sc mem oriented` (sets `bootstrapped=1` + snapshots).
 
-## Heal — re-run any time the map looks wrong
+## Heal — run whenever the map looks wrong
 
-Re-boot the cartographer and run this when: the repo was restructured, a new
-language/dir showed up, files are mis-roled, or the map went stale/empty on a
-clone where the hooks never got wired.
+Triggers: repo restructured / new language or dir / files mis-roled / map
+stale or empty on a clone whose hooks never got wired.
 
 1. Re-inspect (step 1) — what changed?
 2. Edit `.sc-state/map.config.json` to match (step 2).
-3. `sc map-setup` — re-wires hooks (idempotent) + re-maps.
-4. Verify (step 4). `dr_filepath` stale entries are pruned automatically by the
-   remap — paths that vanished from the repo are deleted from the catalogue.
-5. **Check stale sections.** `dr_section` is authored and never auto-pruned.
-   After any migration or restructure, run the stale-section worklist
-   (see Standing jobs § 1) and DELETE or repath any sections that come back.
-6. **Describe all NULLs.** Run the description worklist (see Standing jobs § 2)
-   and fill every `desc IS NULL` file. The worklist must be empty when you leave.
+3. `sc map-setup` (idempotent) — re-wires hooks + re-maps.
+4. Verify (step 4). Vanished paths are auto-pruned from `dr_filepath` by the
+   remap.
+5. **Stale sections** — `dr_section` is authored, never auto-pruned. After any
+   migration/restructure run the stale-section worklist (Standing jobs § 1);
+   DELETE or repath every row it returns.
+6. **Describe all NULLs** (Standing jobs § 2) -> worklist empty before you
+   leave.
 7. Commit.
 
-## Standing jobs — sections, descriptions & the product DB (the navigation layer)
+## Standing jobs — sections, descriptions, product DB
 
-Beyond keeping the file list true, you own the two AUTHORED layers that turn the
-raw map into navigation. Sections are curated as they emerge. Descriptions are
-**required — every run ends with an empty worklist**; neither blocks the
-auto-remap hook the working shells trigger. Both survive the remap (`dr_section`
-is never touched by the mapper; `dr_filepath.desc` is preserved by its UPSERT).
-The boot `## CONNECTIONS` block renders the section index; the descriptions are
-the leaves a shell queries once it has narrowed to a section.
+Both authored layers survive the remap (`dr_section` is never touched by the
+mapper; `dr_filepath.desc` is preserved by its UPSERT); neither blocks the
+auto-remap hook. Boot `## CONNECTIONS` renders the section index;
+descriptions are the leaves a shell queries once narrowed to a section.
 
-**1. Sections (`dr_section`)** — author/curate the navigational index. Seeded
-from top-level dirs on first map (one section per dir), so it is non-empty on day
-one; your job is to make it *good*: rename to what shells call the area, split a
-coarse dir into real areas, merge noise, write the one-line `description`.
+**1. Sections (`dr_section`)** — curate the navigational index. Seeded one
+section per top-level dir on first map; make it *good*: rename to what shells
+call the area, split coarse dirs into real areas, merge noise, write the
+one-line `description`.
 
 ```sql
 -- the current index + live file counts:
@@ -163,10 +149,10 @@ ORDER BY s.name;
 -- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
-**2. Descriptions (`dr_filepath.desc`)** — fill per-file one-liners (≤100 chars).
-Run the worklist every session and describe every NULL before you finish — this
-is not optional. They are queried by working shells *within a chosen section*
-(via `surface_catalogue`), never bulk-loaded at boot.
+**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars.
+Run the worklist every session; every run ends with zero NULLs — not optional.
+Queried by working shells within a chosen section (`surface_catalogue`), never
+bulk-loaded at boot.
 
 ```sql
 -- WORKLIST — undescribed files, most-load-bearing first:
@@ -176,14 +162,13 @@ SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
 UPDATE dr_filepath SET desc='Boot composer — assembles CLAUDE.md from DB state' WHERE path='.super-coder/render/compose.py';
 ```
 
-**3. The product database** — your repo builds an app, and that app has its own
-database, *separate* from the engine memory DB (`.super-coder/shell_db.db`).
-Working shells change them in completely different ways (boot `## DATABASES`) and
-the only per-fork signal of *where* the app DB lives is the map you author — so
-make it unmistakable. The live `.db` is usually gitignored (absent from the map);
-its **schema + migrations are tracked**, so they are the durable anchor. Tag them
-plainly as the *product/app* DB so a shell never mistakes them for engine memory,
-and give them a section if they form an area.
+**3. Product DB** — the app's own database, separate from engine memory
+(`.super-coder/shell_db.db`); working shells change them in completely
+different ways (boot `## DATABASES`), and the map you author is the only
+per-fork signal of where the app DB lives. The live `.db` is usually
+gitignored (absent from the map); schema + migrations are tracked = the
+durable anchor. Tag them plainly as the product/app DB so no shell mistakes
+them for engine memory; give them a section if they form an area.
 
 ```sql
 -- tag the product DB's definition (the engine-vs-app split made visible):
@@ -194,77 +179,73 @@ INSERT INTO dr_section (name, path_prefix, description, sort_order)
 VALUES ('App DB', '<db dir>/', 'Product runtime database — schema + migrations (NOT the engine memory DB)', 7);
 ```
 
-If this fork ships no database of its own, there is nothing to tag — skip it.
+Fork ships no database of its own -> skip.
 
-After a curation pass, your writes are already live in the shared map db —
-done. Serializing them to git (`sc snapshot`) is an **admin/GUI step**: a plain
-`sc snapshot` from a shell is refused by design. Persistence happens via the
-GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc snapshot`; don't chase it
-yourself. (Sections are snapshotted; descriptions ride the live DB + survive
-remap, refilled from the worklist if a rebuild drops them.)
+After a curation pass your writes are already live in the shared map db —
+done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
+persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc
+snapshot`. Don't chase it. (Sections are snapshotted; descriptions ride the
+live DB + survive remap — refill from the worklist if a rebuild drops them.)
 
 ## Extending the map — semantic extractors
 
-The engine maps the generic 80% on every repo: files, languages, roles, deps,
-env. The **semantic** dimensions — HTTP endpoints (`dr_endpoint`), the app DB
-schema (`dr_db_table`/`dr_db_column`), UI routes/components (`dr_route`/
-`dr_component`) — vary by stack, so the engine can't extract them generically.
-That is your job, via **extractors**: drop-in Python modules in
-`.sc-state/map_extractors/*.py` that `sc map` discovers and runs after the core
-pass. They are fork-owned (outside the gitignored engine dir, so `sc update`
-never clobbers them); the table *columns* are standardized in the engine
-(`map_schema.sql`), so a working shell's queries have a stable shape everywhere.
+The engine maps the generic 80% (files, languages, roles, deps, env).
+Semantic dimensions — HTTP endpoints (`dr_endpoint`), app DB schema
+(`dr_db_table`/`dr_db_column`), UI routes/components
+(`dr_route`/`dr_component`) — vary by stack: you extract them via drop-in
+Python modules in `.sc-state/map_extractors/*.py`, discovered + run by
+`sc map` after the core pass. Fork-owned (outside the gitignored engine dir ->
+`sc update` never clobbers them); table *columns* are standardized in the
+engine (`map_schema.sql`) so working-shell queries have a stable shape
+everywhere.
 
-**Adopt one per stack:**
+Adopt one per stack:
 
-1. **Detect the stack** from the map: `SELECT manager, name FROM dr_dependency;`
-   (fastapi? flask? svelte? next?) and the file mix
+1. **Detect the stack:** `SELECT manager, name FROM dr_dependency;`
+   (fastapi? flask? svelte? next?) + the file mix
    (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
 2. **Copy the matching reference** from the engine's
    `.super-coder/templates/map_extractors/` into `.sc-state/map_extractors/`:
    - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
    - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
    - `sveltekit_routes.py` — filesystem routes + `*.svelte` → `dr_route`/`dr_component`
-   Adapt the `framework` label and file filter to this repo. For a stack none
-   cover (Django URLs, Express, Spring, Rails), copy the closest as a skeleton
-   and rewrite the match — aim for the dominant pattern, not 100%.
-3. **Run + verify:** `sc map`, then check the table populated and the rows look
-   right (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Commit** `.sc-state/map_extractors/`. (Snapshotting the authored layer is
+   Adapt the `framework` label + file filter to this repo. Uncovered stack
+   (Django URLs, Express, Spring, Rails) -> copy the closest as a skeleton,
+   rewrite the match — target the dominant pattern, not 100%.
+3. **Run + verify:** `sc map` -> table populated, rows look right
+   (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
+4. **Commit** `.sc-state/map_extractors/`. (Snapshotting the authored layer =
    the admin/GUI step above — not yours to run.)
 
-**The contract** (full version in `templates/map_extractors/README.md`): each
-module defines `extract(con, repo_root, cfg) -> str`. `con` is the live map db
-(dr_filepath is already populated — query it for inputs); the module DELETEs +
-repopulates only its own `dr_*` table(s); returns a one-line summary for the map
-log. Be defensive — `map_repo` guards each extractor, but a module that needs the
-map should never assume a file parses. Static extraction is best-effort: log what
-you skip (dynamic routes, computed paths), never imply full coverage.
+**Contract** (full version: `templates/map_extractors/README.md`): each module
+defines `extract(con, repo_root, cfg) -> str`. `con` = the live map db with
+`dr_filepath` already populated — query it for inputs. DELETE + repopulate
+only your own `dr_*` table(s); return a one-line summary for the map log.
+NEVER assume a file parses — guard yourself even though `map_repo` guards each
+extractor. Static extraction is best-effort: log what you skip (dynamic
+routes, computed paths); never claim full coverage.
 
 ## Shape-change notices — the curation trigger
 
-The git hooks keep the *mechanical* catalogue fresh on their own (paths, langs,
-deps), but a newly-landed file arrives `desc IS NULL` and unsectioned — the
-authored layer above doesn't fill itself. So working shells **message you** when
-they change the repo's shape, turning curation from a next-boot *pull* into a
-timely *push*. This is the only inbox traffic you act on as cartographer.
+The hooks keep the mechanical catalogue fresh, but a newly-landed file arrives
+`desc IS NULL` and unsectioned. Working shells message you on shape change so
+curation is a timely push, not a next-boot pull — the only inbox traffic you
+act on as cartographer.
 
-**The notice contract** (what the relay shells send — one source of truth here;
-the relay skills point at this section). A working shell sends, via the
-`messaging` skill, to shortname `cartographer`:
+**Notice contract** (one source of truth — the relay skills point here).
+Sender = the **dev/coder** shell on merge (feature landed, doc written); NOT
+the planner — specs render into a known area and need no curation. Sent via
+the `messaging` skill to shortname `cartographer`:
 
 ```
 --message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."
 ```
 
-- Sent by the shell that *lands code shape*: the **dev/coder** shell on merge (new
-  feature implemented, new doc written). NOT the planner — specs render into a
-  known, predictable area and need no semantic curation.
-- The body names **what** changed and **where** (the path region) so your pass is
-  scoped, not a full re-survey. A `documents`/feature ref is welcome but optional.
+Body names **what** changed + **where** (the path region) so your pass is
+scoped, not a full re-survey. A `documents`/feature ref is optional.
 
-**On a notice** — check inbox, then run the existing worklists *scoped to the
-named region*, and mark read:
+**On a notice** — check inbox -> run the worklists scoped to the named
+region -> mark read:
 
 ```sql
 -- 1. the new files this notice is about (scope by the region it named):
@@ -274,20 +255,18 @@ WHERE desc IS NULL AND path LIKE 'region/%' ORDER BY role, path;
 -- 3. do they form / join a section? curate dr_section if the region is a new area.
 ```
 
-Then `--message mark-read <id>` (see the `messaging` skill) — your curation is
-already live; snapshotting is the admin/GUI step.
-The mechanical remap already ran via the hook; your job on the notice is purely
-the authored layer — describe the new leaves, section a new area. Scope is free:
-`desc IS NULL` already narrows to exactly the uncurated tail.
+Then `--message mark-read <id>` (`messaging` skill). The mechanical remap
+already ran via the hook; your job on the notice = the authored layer only —
+describe the new leaves, section a new area. `desc IS NULL` already narrows to
+exactly the uncurated tail.
 
 ## Stance
 
-- **The map is infrastructure, not a chore for every shell.** You own it so the
-  working shells never think about it. If a working shell is hunting the tree
-  for something the map should know, that's a signal to heal the map — not to
+- The map is infrastructure, not a chore for every shell. A working shell
+  hunting the tree for something the map should know = heal the map; do not
   teach that shell to map.
-- **Config is the lever, not code.** Tune `map.config.json`; only touch
-  `map_repo.py` if the *mechanism* (a parser, a new role kind) is wrong.
-- **Verify the automation, not just the file.** A written hook that
-  `core.hooksPath` doesn't point at does nothing. Check the wiring after every
-  setup.
+- Config is the lever: tune `map.config.json`; touch `map_repo.py` only when
+  the mechanism itself (a parser, a role kind) is wrong.
+- Verify the automation, not just the file: a written hook that
+  `core.hooksPath` doesn't point at does nothing -> check the wiring after
+  every setup.
