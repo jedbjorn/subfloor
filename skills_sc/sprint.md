@@ -67,6 +67,24 @@ check, an unreviewed diff, a closed or frozen sprint — is the default FnB
 gate, unchanged. The authority dies when the sprint closes; in doubt ->
 read the doc; `CLOSED` or frozen -> no merge authority.
 
+## Ambiguity calls
+
+A spec ambiguity mid-unit — more than one defensible reading and the
+spec doesn't pick — is yours to call inside a sprint: pick the reading
+that keeps your unit shippable and keep building; don't stall the chain
+waiting for a ruling. Scoped like the merge authority: it covers *how*
+your unit meets its spec, never *what* the unit is — an interface
+another shell reads, scope growth, or cutting a deliverable stays a
+planner escalation.
+
+Every call is reported, never silent: with your next transition message
+to the planner, one line per call —
+`ambiguity: <what the spec left open> → chose <reading> — <why>`. No
+planner overrule -> your call stands; an overrule arrives by message and
+is worked like a review finding. Repeat your open calls in the review
+request (step 7) so the reviewer gates against your reading, not its
+own guess.
+
 ## The loop (dev slot)
 
 At the start of every step and on every tracker wake: `sc mem message
