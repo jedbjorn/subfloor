@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # redline_review
 
-Review PNG redlines from the shared scratch dir — find the image by filename match, describe what is seen, interpret intent, propose an implementation, then hold for approval before writing code. Use when the FnB says "redlines".
+Review PNG redlines from the shared scratch dir — find by filename match, describe what is seen, interpret intent, propose implementation, hold for approval before any code. Fires when the FnB says "redlines".
 
 **Category:** craft
 
@@ -14,35 +14,35 @@ Review PNG redlines from the shared scratch dir — find the image by filename m
 
 # redline_review — read a redline before you build it
 
-A redline is a marked-up screenshot the FnB drops in the repo's shared scratch
-dir (`<repo>/shared/redlines/`) to communicate a change visually. This skill is
-the discipline for turning that image into an approved plan **before** any code.
+Redline = a marked-up screenshot the FnB drops in `<repo>/shared/redlines/` to
+communicate a change visually. Turn the image into an approved plan BEFORE any
+code.
 
-**Trigger:** the FnB says "redlines" (with or without specific context).
+Trigger: the FnB says "redlines" (with or without specific context).
 
 ## Steps
 
 1. **Find the image**
-   - List `shared/redlines/`. If the dir doesn't exist (fork installed before
-     the engine created it), `mkdir -p <repo>/shared/redlines` and check
-     `shared/` root — earlier drops land there.
-   - Match a filename to the prompt context (fuzzy / keyword).
-   - One file present and no strong mismatch → use it. Multiple → pick the best
-     filename match; if it's genuinely ambiguous, surface that rather than guess.
+   - List `shared/redlines/`. Dir missing (fork installed before the engine
+     created it) -> `mkdir -p <repo>/shared/redlines` + check `shared/` root —
+     earlier drops land there.
+   - Match a filename to the prompt context (fuzzy/keyword). One file + no
+     strong mismatch -> use it. Multiple -> best filename match; genuinely
+     ambiguous -> surface the candidates, do not guess.
 
-2. **Read the image** — use the Read tool to load the PNG visually.
+2. **Read the image** — Read tool, load the PNG visually.
 
 3. **Report in three parts — skip none:**
    - **What I see:** literal description — layout, labels, UI elements,
      annotations, the markup itself.
-   - **What I understand:** the interpreted intent — the change or requirement
-     this redline is communicating.
-   - **What I propose:** a concrete implementation plan — files, components,
+   - **What I understand:** interpreted intent — the change or requirement the
+     redline is communicating.
+   - **What I propose:** concrete implementation plan — files, components,
      approach.
 
-4. **Hold** — do not write or execute any code until the FnB explicitly approves
-   the proposal.
+4. **Hold** — write/execute NO code until the FnB explicitly approves the
+   proposal.
 
-5. **After resolution is confirmed** — once the FnB confirms the redline is
-   resolved, delete the source `.png` from `shared/redlines/`. Delete only on
-   explicit confirmation, never on assumed completion.
+5. **After resolution** — FnB confirms the redline resolved -> delete the
+   source `.png` from `shared/redlines/`. Delete only on explicit
+   confirmation, never on assumed completion.

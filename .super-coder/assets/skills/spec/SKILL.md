@@ -7,11 +7,11 @@ common: false
 
 # spec — analyze and execute a spec
 
-Load this skill at the start of any session where you're building or implementing
-a feature — whether or not the work is framed out loud as a "spec." If a spec
-governs the work, this is how you execute it; if one should but doesn't yet, the
-`docs` skill authors it first. Run **Analyze** before touching any code. Pause for FnB on blockers or unclear
-items you can't resolve alone.
+Load at the start of any session that builds or implements a feature, whether
+or not the work is framed as a "spec". A spec governs the work -> this skill
+executes it; one should exist but doesn't -> the `docs` skill authors it first.
+Run **Analyze** before touching any code. Blockers / unclear items you can't
+resolve alone -> pause for the FnB.
 
 `<self>` = your shell_id.
 
@@ -19,10 +19,9 @@ items you can't resolve alone.
 
 ## Step 1: Load the spec
 
-A feature can hold several unfrozen specs at once (see the `docs` skill), so don't
-auto-pick "the latest" — list the feature's open specs and choose the target
-explicitly. The **active** spec is the unfrozen one that already has a task plan;
-the rest are backlog.
+A feature can hold several unfrozen specs at once (see the `docs` skill).
+NEVER auto-pick "the latest" — list the feature's open specs and choose the
+target explicitly:
 
 ```
 # the feature's documents — pick an unfrozen spec (frozen=0) by id:
@@ -33,12 +32,12 @@ sc mem get documents --doc <doc_id>
 sc mem get tasks --doc <doc_id>
 ```
 
-`get documents --feature <id>` lists every spec/doc under the feature with its
-`kind`, `seq`, `frozen`, and `task_count`. `task_count > 0` marks the active spec — resume that one; an empty spec is backlog,
-and starting it (Step 3) makes it active. If more than one open spec matches and
-which to work is unclear, ask the FnB.
+`get documents --feature <id>` lists every spec/doc with `kind`, `seq`,
+`frozen`, `task_count`. Active spec = the unfrozen one with `task_count > 0`
+— resume it. `task_count = 0` = backlog; starting it (Step 3) makes it
+active. More than one open spec and the target unclear -> ask the FnB.
 
-If tasks already exist, skip to **Step 4** (Track).
+Tasks already exist -> skip to **Step 4** (Track).
 
 Read the entire spec body before going further. Do not skim.
 
@@ -46,32 +45,31 @@ Read the entire spec body before going further. Do not skim.
 
 ## Step 2: Analyze
 
-Surface the following before any planning or code:
+Surface all three before any planning or code:
 
 ### Viability
-- Can this be completed in the current session? Bounded + clear entry points:
-  yes. Multiple layers, migrations, unknown dependencies: no — say so and
-  propose a session-sized slice.
-- Does the spec state a clear done-condition? If not, that is the first unclear
-  item.
+- Session-completable? Bounded + clear entry points = yes. Multiple layers /
+  migrations / unknown dependencies = no -> say so + propose a session-sized
+  slice.
+- No stated done-condition in the spec -> that is the first unclear item.
 
 ### Unclear items
-Things you cannot act on without guessing:
+Anything you cannot act on without guessing:
 - Ambiguous between two interpretations
 - Missing a critical detail (which table? which endpoint? which component?)
 - Implies knowledge not stated in the spec
 
-List these and ask the FnB before writing the plan.
+List them and ask the FnB before writing the plan.
 
 ### Blockers
 Hard stops — prior work not shipped, missing environment state, unresolved
-external dependency. Open a flag for each:
+external dependency. Open one flag per blocker:
 
 ```
 sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
 ```
 
-Don't open flags for unclear items you can resolve by asking — ask first.
+NEVER open a flag for an unclear item resolvable by asking — ask first.
 
 ---
 
@@ -79,38 +77,36 @@ Don't open flags for unclear items you can resolve by asking — ask first.
 
 ### Reconcile the stage first
 
-Planning a spec means you're engaging it to build — so the feature's
-`roadmap_status` (loaded in Step 1) must catch up to reality. The horizon stages
-are `brainstorm · long_term · near_term · next · in_progress · shipped`.
+Planning a spec = engaging it to build, so the feature's `roadmap_status`
+(loaded in Step 1) must catch up to reality. Stages:
+`brainstorm · long_term · near_term · next · in_progress · shipped`.
 
-- Feature sits at `brainstorm`/`long_term`/`near_term` and you're **building this
-  session** → move it to `in_progress`:
+- At `brainstorm`/`long_term`/`near_term` + building this session ->
   `sc mem roadmap status <feature_id> in_progress`
-- You're only **planning ahead** (no build this session) → move it to `next`.
-- Already at `in_progress` (or further) → **no-op**; don't churn it.
+- Planning ahead only (no build this session) -> move it to `next`.
+- Already at `in_progress` (or further) -> no-op; don't churn it.
 
-This is a transition you make because you're *acting on* the spec — not something
-that fires from merely reading one for reference. If there is no spec governing the
-work (a quick UI fix, a minor migration), skip all stage handling: it doesn't
-apply (see the Stance).
+The transition fires because you *act on* the spec — reading one for
+reference moves nothing. No spec governing the work (quick UI fix, minor
+migration) -> skip all stage handling (see Stance).
 
 ### Confirm the work-stream too
 
-While you're reconciling the stage, check the same feature's **work-stream**
-(`roadmap.project_id` — the Flow-view grouping). If it's Ungrouped, assign it now
-so the feature shows up in a flow, not the Ungrouped pile:
+Check the feature's work-stream (`roadmap.project_id` — the Flow-view
+grouping). Ungrouped -> assign now so the feature shows in a flow:
 
 ```
 sc mem roadmap project <feature_id> <shortname>   # 'none' to clear
 ```
 
-Assign when the stream is obvious; surface to the FnB when it's ambiguous. No-op
-if already assigned. The full create/assess procedure (new streams, new features)
-lives in the `docs` skill — this is just the engage-time confirmation so drift
-doesn't accumulate.
+Stream obvious -> assign; ambiguous -> surface to the FnB; already assigned
+-> no-op. Full create/assess procedure (new streams, new features) = the
+`docs` skill; this is only the engage-time confirmation.
 
-Once analysis is clear and blockers are resolved or accepted, generate the task
-list and INSERT it. Always this shape:
+### Write the task plan
+
+Analysis clear + blockers resolved or accepted -> generate the task list.
+Always this shape:
 
 | seq | title | role |
 |---|---|---|
@@ -118,7 +114,7 @@ list and INSERT it. Always this shape:
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
 | N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
-Add each task with `sc mem task add` (one per seq) — each write is live in the
+Add one task per seq with `sc mem task add` — each write is live in the
 shared DB immediately:
 
 ```
@@ -128,7 +124,7 @@ sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<
 sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
-Then set `current_state` — no last-done yet, next is Preparation:
+Then set `current_state` — nothing done yet, next = Preparation:
 
 ```
 sc mem state "[<feature_title>] — last: —. next: Preparation."
@@ -138,60 +134,53 @@ sc mem state "[<feature_title>] — last: —. next: Preparation."
 
 ## Step 4: Track session by session
 
-**Agents overlay:** if this shell is granted `agents` and the FnB invoked
-`--agents`, that skill's overlay replaces this step's one-task-at-a-time loop
-with adjudicated waves — load it and apply it on top of this step.
+**Agents overlay:** this shell granted `agents` + FnB invoked `--agents` ->
+that skill's overlay replaces this step's one-task-at-a-time loop with
+adjudicated waves. Load it and apply it on top of this step.
 
-At the start of each work session, load the current plan state:
+At each work session's start, load the plan:
 
 ```
 sc mem get tasks --doc <doc_id>
 ```
 
-Find the first `pending` task. Mark it `in_progress`:
+Find the first `pending` task -> mark it in progress:
 
 ```
 sc mem task start <task_id>
 ```
 
-Work only that task. When done, mark it complete, then resolve last-done / next-up
-with a read:
+Work ONLY that task. When done:
 
 ```
 sc mem task done <task_id>
 ```
 
-Re-read the plan and resolve last-done / next-up from it — `last_done` is the
-highest-`seq` `done` task, `next_up` the lowest-`seq` `pending` one:
-
-```
-sc mem get tasks --doc <doc_id>
-```
-
-Then advance `current_state`:
+Re-read the plan (`sc mem get tasks --doc <doc_id>`) and resolve from it:
+`last_done` = highest-`seq` `done` task; `next_up` = lowest-`seq` `pending`.
+Advance `current_state`:
 
 ```
 sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
 ```
 
-If `next_up` is NULL, all tasks are done — set current_state to reflect that.
+`next_up` NULL = all tasks done -> set current_state to reflect that.
 
 ---
 
 ## Step 5: Hand off on completion
 
-When the **Verification** task passes (`next_up` is NULL — the existing
-done-line), the feature is delivered. As the dev, do the handoff — you flip the
-horizon and hand the paperwork to the planner; you do **not** freeze the spec or
-write the doc (that's the planner — see the `docs` skill):
+Verification task passes (`next_up` NULL — the existing done-line) = feature
+delivered. As the dev: flip the horizon + hand the paperwork to the planner.
+Do NOT freeze the spec or write the doc — that's the planner (`docs` skill).
 
 1. **Flip the horizon to shipped:**
    ```
    sc mem roadmap status <feature_id> shipped
    ```
-2. **Open a docs-pending flag and message the planner with full instructions.**
-   `shipped` + an open flag is the honest interim state. The message carries
-   everything the planner needs to act without digging:
+2. **Open a docs-pending flag + message the planner with full instructions.**
+   `shipped` + an open flag = the honest interim state; the message carries
+   everything the planner needs without digging:
    ```
    sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
    sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
@@ -203,43 +192,43 @@ write the doc (that's the planner — see the `docs` skill):
    3. Write the doc (\`kind='doc'\`) under feature <feature_id> (see the \`docs\` skill).
    4. Close flag SC-### when the doc is live."
    ```
-3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec + write
-   the doc." The planner closes the flag when the doc lands.
+3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec +
+   write the doc." The planner closes the flag when the doc lands.
 
-If this fork has no planner-flavor shell, message nobody — surface to the FnB
+No planner-flavor shell in this fork -> message nobody; surface to the FnB
 directly and leave the docs-pending flag open for whoever picks up docs.
 
 ---
 
 ## Watch for creep while you build
 
-If, mid-build, the work grows past the spec's stated what/why:
+Mid-build, the work grows past the spec's stated what/why:
 
-- **Small growth** (same mental model, a few more tasks) → the spec is *living*
-  while unfrozen; just edit it (`sc mem doc edit`) and carry on. No ceremony.
-- **A separate coherent intent** (a new mental-model boundary — the granularity
-  test in the `docs` skill) → don't quietly absorb it. Recommend a **new spec** to
-  the FnB, to be authored by the planner against its own feature. Significant creep
-  is a planning event, not a dev improvisation.
+- **Small growth** (same mental model, a few more tasks) -> the unfrozen spec
+  is living; edit it (`sc mem doc edit`) and carry on. No ceremony.
+- **A separate coherent intent** (a new mental-model boundary — the
+  granularity test in the `docs` skill) -> do NOT quietly absorb it.
+  Recommend a **new spec** to the FnB, authored by the planner against its
+  own feature. Significant creep = planning event, not dev improvisation.
 
 ---
 
 ## Stance
 
-- **Analyze before acting.** The analysis phase discovers the gap between what
-  the spec says and what the code does.
-- **One task at a time.** Don't start task N+1 until task N is verified and
+- **Analyze before acting.** Analysis finds the gap between what the spec
+  says and what the code does.
+- **One task at a time.** Start task N+1 only after task N is verified +
   marked done.
 - **Verification is not optional.** It is the last task; skipping it makes
   "done" meaningless.
-- **If the spec is too large for one session:** scope a session slice at
-  Preparation — cover steps 1–K that can be verified now, leave K+1–N pending.
-  Don't start work that can't be verified before the session ends.
-- **current_state always reflects the plan.** After every task completion,
-  update it — last done + next up. This is how the next session resumes without
+- **Spec too large for one session** -> scope a slice at Preparation: cover
+  steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can't
+  be verified before the session ends.
+- **current_state always reflects the plan.** Update after every task
+  completion — last done + next up. The next session resumes from it without
   reading the full task list first.
-- **The stage tracks reality, but only for spec'd work.** Engaging a spec moves
-  it forward (→ `in_progress`); finishing it hands off (→ `shipped`). No-op when
-  the stage already matches — don't churn it. Work with **no spec** (quick UI
-  tweaks, minor migrations) is exempt entirely: no promotion, no handoff, no creep
-  check. Stage discipline must never become a blocker for small things.
+- **The stage tracks reality — spec'd work only.** Engaging a spec ->
+  `in_progress`; finishing -> `shipped`; already matching -> no-op, don't
+  churn. Work with no spec (quick UI tweaks, minor migrations) is exempt
+  entirely: no promotion, no handoff, no creep check. Stage discipline never
+  blocks small things.

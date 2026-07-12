@@ -7,34 +7,32 @@ common: false
 
 # blueprint — objective → sequenced plan
 
-Catalogue skill (opt-in). Use before a build that spans more than a couple of
-steps, so the work has a shape before you start cutting.
+Catalogue skill (opt-in). Run before any build spanning more than a couple of
+steps. Output = the seven items below, in order.
 
-## Produce
-
-1. **Restate the objective** in one sentence + the done-condition (how you'll
-   know it's finished).
-2. **Re-surface prior decisions** — `sc mem get decisions`: has any part of
-   this already been settled? (Index of active decisions; `sc mem get
-   decisions <id>` pulls one with its rationale.) A recorded decision
-   constrains the plan; honor it, or supersede it explicitly
-   (`sc mem decision "…" --parent <old_id>`) — never silently re-litigate.
-3. **Decompose** into concrete steps — each a unit you could verify on its own.
-4. **Order by dependency** — what must precede what. Mark steps with no
-   dependency on each other as **parallelizable**.
-5. **Per step**: the change, the files/areas it touches (use `surface_catalogue`
-   to ground this in the real repo), and its **verification** (test, run,
+1. **Objective** — one sentence + done-condition (the observable check that
+   ends the build).
+2. **Prior decisions** — `sc mem get decisions` (active-decision index;
+   `sc mem get decisions <id>` = full row + rationale). A recorded decision
+   constrains the plan: honor it, or supersede it explicitly with
+   `sc mem decision "…" --parent <old_id>`. NEVER silently re-litigate a
+   settled decision.
+3. **Decompose** — concrete steps, each verifiable on its own.
+4. **Order** — dependency sequence (what must precede what); steps with no
+   dependency on each other -> mark **parallelizable**.
+5. **Per step** — the change + files/areas touched (ground in the real repo
+   via `surface_catalogue`, not memory) + its verification (test / run /
    review).
-6. **Risks / unknowns** — what could break the plan; resolve the riskiest
-   unknown first (spike it) rather than last.
-7. **Gate** — the adversarial check before calling it done: does each step's
-   verification actually prove the done-condition?
+6. **Risks / unknowns** — list what could break the plan; spike the riskiest
+   unknown first, not last.
+7. **Gate** — adversarial pass before calling it done: each step's
+   verification proves the done-condition, or the plan fails the gate.
 
 ## Stance
-- Plan to the **next solid checkpoint**, not the whole universe — re-plan as
-  reality lands. A plan that survives contact is short and concrete.
-- Sequence so something **works end-to-end early** (a thin slice), then deepen —
-  beats building all the pieces and integrating last.
-- In super-coder, land the plan as a **spec** on the roadmap (the `docs` skill):
-  a feature row + a `spec` document, so the plan is reviewable and freezes on
-  ship.
+
+- Plan to the next solid checkpoint, not the whole universe — re-plan as
+  reality lands.
+- Sequence a thin slice that works end-to-end early, then deepen — never
+  build all the pieces and integrate last.
+- In super-coder, land the plan as a **spec** on the roadmap (`docs` skill):
+  feature row + `spec` document -> reviewable, freezes on ship.

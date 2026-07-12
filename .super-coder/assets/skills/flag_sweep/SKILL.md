@@ -1,17 +1,17 @@
 ---
 name: flag_sweep
-description: Admin's every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (and message the planner), and surface the judgment calls to the FnB. Step 1 of the admin standing pass; run it before git_cleanup.
+description: Admin's every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.
 category: substrate
 common: false
 ---
 
 # flag_sweep — reconcile flags against state
 
-Admin-only. The first leg of your standing every-session pass (then `git_cleanup`,
-then optional `local_skill_management`). Working shells close the flags *their own*
-work clears (boot doc, "Finish before you stop"); this sweep is the backstop — it
-catches the stragglers they dropped and the docs nobody opened a flag for. It runs
-in **two directions**: close what's provably resolved, open what's provably missing.
+Admin-only. Leg 1 of the standing every-session pass -> then `git_cleanup` ->
+then optional `local_skill_management`. Working shells close the flags their
+own work clears (boot doc, "Finish before you stop"); this sweep is the
+backstop for the stragglers they dropped + the docs nobody opened a flag for.
+Two directions: close what's provably resolved, open what's provably missing.
 
 `<self>` = your shell_id. Resolve the planner once up front:
 
@@ -35,61 +35,57 @@ WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
 ORDER BY f.priority, f.flag_id;
 ```
 
-Sort each open flag into exactly one bucket below. **Auto-close only on unambiguous
-evidence** — when in doubt, surface, don't close.
+Sort every open flag into exactly one bucket (Step 2 / Step 4). Auto-close
+only on unambiguous evidence — any doubt -> Step 4, not a close.
 
 ---
 
 ## Step 2: Auto-close the deterministic ones
 
-Close with `sc mem flag close <flag_id> --notes "…"`. The note must cite the
-evidence — that is the whole point of doing it here instead of guessing.
+Close with `sc mem flag close <flag_id> --notes "…"`. The note MUST cite the
+evidence.
 
-**A. Docs-pending flag, doc now exists.** A `[Docs] … docs pending` flag on a
-feature whose `frozen_docs > 0`:
+**A. Docs-pending flag, doc now exists** = `[Docs] … docs pending` flag on a
+feature with `frozen_docs > 0`:
 ```
 sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for feature #<id> (flag_sweep)."
 ```
 
-**B. Ship-blocker, feature now shipped.** A flag of the form `… | Blocker for: <X>`
-whose linked feature's `roadmap_status` is `shipped` (or later) **and** whose text
-is about that feature shipping / becoming available (not a separate concern that
-merely happens to hang off the same feature):
+**B. Ship-blocker, feature now shipped** = flag of the form
+`… | Blocker for: <X>` + linked feature's `roadmap_status` is `shipped` (or
+later) + the flag text is about that feature shipping / becoming available. A
+separate concern that merely hangs off the same feature does NOT qualify:
 ```
 sc mem flag close <flag_id> --notes "Auto: blocking feature #<id> (<title>) now shipped (flag_sweep)."
 ```
 
-**C. Ship-drift flag, now shipped *and* documented.** A `[Ship] … not marked
-shipped` flag (Step 3A) covers both halves — mark shipped *and* reconcile the doc —
-so only close it once **both** are true: `roadmap_status` is `shipped` (or later)
-**and** `frozen_docs > 0`. Shipped-but-still-undocumented leaves it open (the doc
-half isn't done):
+**C. Ship-drift flag, now shipped AND documented** = `[Ship] … not marked
+shipped` flag (opened by Step 3A) covers two halves — mark shipped + reconcile
+the doc — so close only when BOTH hold: `roadmap_status` is `shipped` (or
+later) + `frozen_docs > 0`. Shipped-but-undocumented -> leave open:
 ```
 sc mem flag close <flag_id> --notes "Auto: feature #<id> (<title>) now shipped with a frozen doc (flag_sweep)."
 ```
 
-Do **not** message on close (per the `flags` skill — messages pair with `open`, not
-`close`). Do **not** reopen anything. Do **not** close a flag whose evidence you had
-to infer — that goes to Step 4.
+NEVER message on close (per the `flags` skill — messages pair with `open`).
+NEVER reopen a flag. A close whose evidence you had to infer -> Step 4.
 
 ---
 
 ## Step 3: Open the flags nobody opened
 
-Two upstream gaps drop silently — work that finished but was never marked shipped,
-and shipped work with no doc. They're sequential: a feature climbs out of 3A (gets
-marked shipped) before 3B can apply. Pick `SC-###` for any open below as the next
-free id (`SELECT display_name FROM flags ORDER BY flag_id DESC LIMIT 5;`).
+Two gaps drop silently, in sequence: 3A (done but never marked shipped)
+precedes 3B (shipped but undocumented) — a feature exits 3A before 3B can
+apply. Pick `SC-###` for any open below = next free id
+(`SELECT display_name FROM flags ORDER BY flag_id DESC LIMIT 5;`).
 
 ### 3A — Implemented but not marked shipped (ship-drift)
 
-The dev is supposed to flip the horizon to `shipped` when Verification passes (the
-`spec` skill, hand-off step) — but the spec sometimes gets built and the flip gets
-missed, so the feature lingers `in_progress` with its work actually done. The
-deterministic signal is a spec whose **Verification task is `done`** while the
-feature is **not** `shipped`. Open a durable `[Ship]` flag — it governs both halves
-of the dropped hand-off (mark shipped **and** reconcile the doc to the spec) and
-lingers until a planner does them.
+The dev flips the horizon to `shipped` when Verification passes (`spec` skill,
+hand-off step) — the flip sometimes gets missed. Deterministic signal = spec's
+**Verification task `done`** + feature **not** `shipped`. Open a durable
+`[Ship]` flag — it governs both halves of the dropped hand-off (mark shipped +
+reconcile the doc to the spec) and stays open until a planner does both.
 
 ```sql
 -- specs finished (Verification done) on features still short of shipped, with no open ship/docs flag:
@@ -104,8 +100,8 @@ WHERE r.roadmap_status NOT IN ('shipped','retired')
       AND (f.description LIKE '%not marked shipped%' OR f.description LIKE '%docs pending%'));
 ```
 
-For each row, open the flag and message the planner (or surface to the FnB if there
-is no planner) — same contract as the `flags` skill:
+Per row: open + message the planner (no planner -> surface to the FnB) — same
+contract as the `flags` skill:
 
 ```
 sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
@@ -114,10 +110,9 @@ sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) —
 
 ### 3B — Shipped but undocumented (docs-pending)
 
-Devs are supposed to open a docs-pending flag when they ship — but they sometimes
-skip it. Find `shipped` features with no frozen doc **and** no open docs-pending
-flag, and open one so they don't ship silently undocumented. (Work that's finished
-but not yet shipped is 3A's job, not this one — it surfaces there first.)
+Devs open a docs-pending flag when they ship — sometimes skipped. Find
+`shipped` features with no frozen doc + no open docs-pending flag; open one
+per row. (Finished-but-not-shipped is 3A's job, not this one.)
 
 ```sql
 -- shipped features with no frozen doc and no open docs-pending flag:
@@ -133,8 +128,8 @@ WHERE r.roadmap_status = 'shipped'
       AND f.description LIKE '%docs pending%');
 ```
 
-For each row, open the flag and message the planner (or surface to the FnB if there
-is no planner) — same contract as the `flags` skill:
+Per row: open + message the planner (no planner -> surface to the FnB) — same
+contract as the `flags` skill:
 
 ```
 sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
@@ -145,29 +140,27 @@ sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) is 
 
 ## Step 4: Surface the rest — don't guess
 
-Everything that isn't a clean Step-2 close or Step-3 open goes to the FnB as a
-short list (no `send` unless a specific shell owns it): review-failure flags (the
-author dev closes those when the fix lands), FnB-decision flags, blockers whose
+Everything that isn't a clean Step-2 close / Step-3 open -> short list to the
+FnB (no `send` unless a specific shell owns it): review-failure flags (author
+dev closes those when the fix lands), FnB-decision flags, blockers whose
 resolution you can't verify from state, anything ambiguous. One line each:
 
 > `SC-042` [High] — <description> · feature #N at <status> · *why I didn't auto-act*
 
-The FnB or the owning shell closes these with a real note. You only ever auto-act
-on unambiguous evidence.
+The FnB or the owning shell closes these with a real note. Auto-act ONLY on
+unambiguous evidence.
 
 ---
 
 ## Stance
 
-- **Deterministic-only auto-close.** Evidence in the DB, cited in the note, or it
-  surfaces. A wrongly-closed live blocker is worse than a straggler.
-- **You are the backstop, not the owner.** The shell that did the work should close
-  its own flag with the richer "how" note; you sweep what they dropped. Don't race
-  to close a flag whose owner is still active on that feature.
-- **Both directions, every session.** Close what's resolved; open what's missing.
-  An implemented-but-unshipped spec and an undocumented shipped feature are each as
-  much a dropped handoff as an unclosed flag — and the signal is already in the DB
-  (a `done` Verification task, a missing frozen doc), so surfacing them is
-  deterministic, not a guess.
-- **Then move on to `git_cleanup`.** flag_sweep is leg 1 of the pass, not the whole
-  pass.
+- **Deterministic-only auto-close.** Evidence in the DB + cited in the note,
+  or it surfaces. A wrongly-closed live blocker is worse than a straggler.
+- **Backstop, not owner.** The shell that did the work closes its own flag
+  with the richer "how" note; don't race to close a flag whose owner is still
+  active on that feature.
+- **Both directions, every session.** An implemented-but-unshipped spec and an
+  undocumented shipped feature are dropped handoffs; the signal is already in
+  the DB (a `done` Verification task, a missing frozen doc) — surfacing them
+  is deterministic.
+- **Then `git_cleanup`.** flag_sweep is leg 1 of the pass, not the whole pass.

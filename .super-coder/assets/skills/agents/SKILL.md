@@ -7,100 +7,98 @@ common: false
 
 # agents — delegated waves under your discipline
 
-The FnB invokes this as `--agents [model]`. It is an **overlay** on `spec`
-(dev mode) and `review` (review mode): it changes only what is written here.
+FnB invokes this as `--agents [model]`. It is an **overlay** on `spec` (dev
+mode) and `review` (review mode): it changes only what is written here.
 Everything upstream and downstream of the named steps — loading the spec,
 task tracking, flags, the FnB handoff gate — is the base skill, unchanged.
-Load the base skill first; apply this on top of it.
+Load the base skill first; apply this on top.
 
-`[model]` sets the **worker tier**, passed through verbatim to the harness's
-agent tool. No arg → agents inherit your model. Guidance is one line: heavier
-judgment work warrants a heavier worker, and you may bump a single agent's
-tier when a task is judged hard. You — the parent — never change tier; you
-stay the judge.
+`[model]` = worker tier, passed verbatim to the harness's agent tool. No arg
+-> agents inherit your model. Heavier judgment work -> heavier worker; you
+may bump a single agent's tier for a task judged hard. You — the parent —
+NEVER change tier; you stay the judge.
 
-**The core loop is `implement → you verify → adversarially refute → you
-fix` — the refute step is where the quality comes from.** Parallel
-implementers are an optional scale-up for genuinely large, file-disjoint
-work, not the headline. The spend buys verification depth and an audit
-trail, not wall-clock: your loop (compose → wait → adjudicate → re-verify)
-is serial, and field runs measured hundreds of k of subagent tokens even
-on small waves. Fit test before spawning: multi-surface, file-disjoint,
-spec'd work with high correctness stakes → waves. A single-file or small
-fix → run the base procedure solo; at most, spawn one adversarial skeptic
-against your own diff — that is the cheap, high-ROI slice of this skill.
+**Core loop = implement -> you verify -> adversarially refute -> you fix.**
+The refute step is where the quality comes from. Parallel implementers are an
+optional scale-up for genuinely large, file-disjoint work, not the headline:
+your loop (compose -> wait -> adjudicate -> re-verify) is serial, and field
+runs measured hundreds of k of subagent tokens even on small waves — the
+spend buys verification depth + an audit trail, not wall-clock.
+
+Fit test before spawning: multi-surface + file-disjoint + spec'd + high
+correctness stakes -> waves. Single-file / small fix -> run the base
+procedure solo; at most spawn one adversarial skeptic against your own diff
+— the cheap, high-ROI slice of this skill.
 
 - **Harness:** subagent tooling exists in the claude harness only. No
-  subagent tooling in your harness → this skill is inert; run the base
+  subagent tooling in your harness -> this skill is inert; run the base
   procedure.
-- **Not a workflow-script system.** No deterministic orchestration scripts —
-  you spawn agents directly and stay in the loop between waves. Do not
-  "upgrade" this to scripted workflows; the point is that you decide scale,
-  batching, and prompts live, per this session's demands.
+- **Not a workflow-script system.** NEVER build deterministic orchestration
+  scripts — spawn agents directly and stay in the loop between waves. You
+  decide scale, batching, and prompts live, per this session's demands.
 
 ---
 
 ## The contract — four rules, non-negotiable
 
-1. **You are the only memory writer.** Agents never run `sc mem` — no task
-   status, no flags, no messages, no current_state, no narrative — and never
-   `git push`, open PRs, or message shells. They return diffs and findings;
-   you adjudicate and record. This keeps the shared DB coherent and leaves
-   the reviewer's FnB handoff gate untouched.
-2. **Prompt ingredients, not canned prompts.** You compose every agent
-   prompt fresh, and it must carry: the spec excerpt / done-condition it
-   serves, the exact file paths in play, the fork conventions that apply,
-   the expected base commit (the agent verifies it via `git log -1` before
-   editing and REPORTS a mismatch instead of silently proceeding), the
-   deadline block (see the ledger check), and a required return shape.
-3. **Isolation by conflict risk.** Concurrent writers on the same files —
-   or any writer that must touch git state — each work in their own
-   isolated worktree (writers never share a tree's index). A file-disjoint
-   wave may share your tree, edits only: agents run no `git
+1. **You are the only memory writer.** Agents NEVER run `sc mem` — no task
+   status, flags, messages, current_state, narrative — and NEVER `git push`,
+   open PRs, or message shells. They return diffs + findings; you adjudicate
+   and record. Keeps the shared DB coherent and the reviewer's FnB handoff
+   gate intact.
+2. **Prompt ingredients, not canned prompts.** Compose every agent prompt
+   fresh; each MUST carry: the spec excerpt / done-condition it serves, the
+   exact file paths in play, the fork conventions that apply, the expected
+   base commit (agent verifies via `git log -1` before editing and REPORTS a
+   mismatch instead of silently proceeding), the deadline block (see the
+   ledger check), and a required return shape.
+3. **Isolation by conflict risk.** Concurrent writers on the same files — or
+   any writer that must touch git state — each get their own isolated
+   worktree (writers never share a tree's index). A file-disjoint wave may
+   share your tree, edits only: agents run no `git
    add`/`stash`/`checkout`/`commit`. Read *Worktree reality* below before
-   reaching for isolation — it has real costs. Reviewer and checker agents
-   are read-only; no isolation needed.
+   reaching for isolation — it has real costs. Reviewer/checker agents are
+   read-only; no isolation needed.
 4. **Agent claims are inputs, not results.** Re-run the real check yourself
    — `./sc test`, lint, the spec's done-condition — before marking anything
-   done. "Agent says tests pass" is not verification. Same for diffs: pull
-   them yourself (`git -C <worktree> diff`); never adjudicate pasted diffs
-   or pasted test output — pastes are lossy and unverifiable.
+   done. "Agent says tests pass" is not verification. Diffs: pull them
+   yourself (`git -C <worktree> diff`); NEVER adjudicate pasted diffs or
+   pasted test output — pastes are lossy and unverifiable.
 
 ---
 
 ## Worktree reality — what isolation actually gives an agent
 
-Harness worktrees are fresh trees, and two properties bite (both observed
-on first fork runs — super-coder #303, #304):
+Harness worktrees are fresh trees; two properties bite (both observed on
+first fork runs — super-coder #303, #304):
 
-- **They seed from the default branch (origin/main), not your branch
-  HEAD.** In a stacked feature, a later-wave implementer authors — and
-  "verifies" — against a base missing the earlier waves' commits. Hence
-  the base-commit ingredient in contract rule 2, and hence: writers
-  return diffs, you apply each one to YOUR tree with `git apply --3way`
-  (note: it STAGES — inspect via `git diff HEAD`), and every check runs
-  on the merged state.
+- **They seed from the default branch (origin/main), not your branch HEAD.**
+  In a stacked feature, a later-wave implementer authors — and "verifies" —
+  against a base missing the earlier waves' commits. Hence the base-commit
+  ingredient in contract rule 2, and hence: writers return diffs, you apply
+  each one to YOUR tree with `git apply --3way` (note: it STAGES — inspect
+  via `git diff HEAD`), and every check runs on the merged state.
 - **They lack untracked toolchains.** No `node_modules`; sandboxed
-  interpreters are typically mounted only into the primary worktree. An
-  isolated agent often cannot run the app's suite at all. Say so in the
-  prompt so it doesn't burn a turn rediscovering it, and treat its tree
-  as an authoring surface: verification is yours, in your tree.
+  interpreters typically mount only into the primary worktree — an isolated
+  agent often cannot run the app's suite at all. Say so in the prompt so it
+  doesn't burn a turn rediscovering it; treat its tree as an authoring
+  surface — verification is yours, in your tree.
 
 ---
 
 ## The ledger check — before EVERY spawn, before acting on ANY result
 
-The ledger is a single line embedded in current_state (one wave live at a
-time, so one line is the complete record):
+The ledger = one line embedded in current_state (one wave live at a time, so
+one line is the complete record):
 
 ```
 AGENTS wave=2/3 spawned=2026-07-06T14:32Z timeout=30m out=task4,task5
 ```
 
 Review mode uses axis/lens names in `out=` (e.g.
-`out=quality,edges,conformance,api-design`). Stamp `spawned=` from the
-clock (UTC) at the moment you spawn — never recalled or recomputed from
-context. Remove the line at wave close.
+`out=quality,edges,conformance,api-design`). Stamp `spawned=` from the clock
+(UTC) at the moment you spawn — NEVER recalled or recomputed from context.
+Remove the line at wave close.
 
 Execute this check verbatim; do not interpret it:
 
@@ -137,11 +135,11 @@ end your turn waiting on a background task — your final message is
 your only channel back.
 ```
 
-The 6-hour window is a hard constant. You choose timeouts freely under it;
-nothing extends it. Step 3b is deliberate: expired output is discarded even
-when it looks correct — "looks correct" hours later against a moved tree is
+The 6-hour window is a hard constant: choose timeouts freely under it;
+nothing extends it. Step 3b is deliberate — expired output is discarded even
+when it looks correct; "looks correct" hours later against a moved tree is
 exactly the trap. Step 3c recovers anything real: a diff that genuinely
-landed and verifies passes reconciliation as done. Stale ledger text is
+landed and verifies NOW passes reconciliation as done. Stale ledger text is
 never evidence.
 
 ---
@@ -150,26 +148,26 @@ never evidence.
 
 After the task plan exists (base skill, Steps 1–3, unchanged):
 
-1. Classify pending tasks into **dependency waves** — independent tasks may
-   run in parallel; dependent tasks sequence. When the ordering is
-   non-obvious, use `blueprint` for the dependency read; a task plan that
-   already encodes the order stands on its own.
-2. Per wave: run the ledger check → mark each wave task `in_progress`
-   (`sc mem task start`) → spawn one implementer per task (isolation per
-   contract rule 3) → pull each returned diff yourself and apply it to
-   your tree → spawn checker agent(s) prompted to **refute** it →
-   adjudicate, run the real tests on the merged state → `sc mem task
-   done` → update current_state → next wave.
+1. Classify pending tasks into **dependency waves** — independent tasks run
+   in parallel; dependent tasks sequence. Ordering non-obvious -> use
+   `blueprint` for the dependency read; a plan that already encodes the
+   order stands on its own.
+2. Per wave: run the ledger check -> mark each wave task `in_progress`
+   (`sc mem task start`) -> spawn one implementer per task (isolation per
+   contract rule 3) -> pull each returned diff yourself and apply it to your
+   tree -> spawn checker agent(s) prompted to **refute** it -> adjudicate +
+   run the real tests on the merged state -> `sc mem task done` -> update
+   current_state -> next wave.
 3. One wave live at a time.
 
 Stance amendment: `spec`'s "one task at a time" becomes "one **wave** at a
-time" under `--agents`. Each task is still independently verified before it
-is marked done — the spirit holds. Step 5 of `spec` (handoff on completion)
-is unchanged and is yours, never an agent's.
+time" under `--agents`; each task is still independently verified before it
+is marked done. `spec` Step 5 (handoff on completion) is unchanged — yours,
+never an agent's.
 
 ## Review mode — overlay on `review` Step 2
 
-Steps 1, 3, and 4 of `review` — loading the diff and its spec, flags, the
+`review` Steps 1, 3, and 4 — loading the diff and its spec, flags, the
 FnB-gated handoff — are unchanged. Agents never open flags.
 
 1. Run the ledger check, then fan out **one agent per axis** (code quality /
@@ -177,11 +175,11 @@ FnB-gated handoff — are unchanged. Agents never open flags.
    from the base skill's lens table. Each agent is read-only and returns
    candidate findings in a fixed shape:
    `file:line · claim · severity · how to reproduce`.
-2. Dedupe the returns. For an uncertain finding, optionally spawn a skeptic
+2. Dedupe the returns. Uncertain finding -> optionally spawn a skeptic
    prompted to refute it. Adjudicate every survivor yourself — re-read the
-   code path; an agent's finding is a lead, not a verdict.
-3. Proceed to base Step 3 with the adjudicated findings. The agents widen
-   the search; you remain the gate.
+   code path; a finding is a lead, not a verdict.
+3. Proceed to base Step 3 with the adjudicated findings. Agents widen the
+   search; you remain the gate.
 
 ---
 
@@ -197,18 +195,18 @@ discipline, written to surfaces the FnB already watches:
 | narrative | one line per inflection: wave landed, timeout, checker refuted an implementation |
 | on demand | "status?" from the FnB → inspect your running agents' output, answer in two lines |
 
-Honest limitation: mid-task granularity inside a single agent is only
-visible by inspecting its output on demand. There is no per-agent progress
-bar — giving agents a write surface would break rule 1.
+Limit: mid-task granularity inside a single agent is visible only by
+inspecting its output on demand. No per-agent progress bar — a write surface
+for agents would break rule 1.
 
 ## Timeouts
 
-Set a timeout per agent at spawn, sized to the task, and record it in the
-ledger line — the budget is visible, not private.
+Set a timeout per agent at spawn, sized to the task, recorded in the ledger
+line — the budget is visible, not private.
 
-At expiry: inspect the agent's partial output → stop it → either respawn
-with a **narrower** prompt (a timeout usually means the prompt was too
-broad) or take the task inline.
+At expiry: inspect the agent's partial output -> stop it -> respawn with a
+**narrower** prompt (a timeout usually means the prompt was too broad) /
+take the task inline.
 
 **Two-strike rule:** a task whose agent times out twice is done inline by
 you, full stop. No respawn loops. Every timeout gets a narrative line —

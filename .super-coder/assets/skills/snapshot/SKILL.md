@@ -1,6 +1,6 @@
 ---
 name: snapshot
-description: Persist DB work to git-tracked text — the admin/GUI step that runs sc snapshot / sc render. The .db is the live shared source of truth; serializing it to git writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.
+description: Serialize DB work to git-tracked text via sc snapshot / sc render. The .db is the live shared source of truth; serializing writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.
 category: substrate
 command: sc snapshot
 common: false
@@ -8,19 +8,18 @@ common: false
 
 # snapshot — serialize the DB back to text
 
-The live `shell_db.db` is the **single source of truth shared by every shell** —
-a `sc mem` write is durable and visible to all shells the instant it commits.
-The `.db` is also **gitignored**, so it reconstructs from git-tracked text on
-`sc rebuild`; an edit not yet serialized is discarded by a rebuild (like an
-uncommitted working tree on a hard reset).
+Live `shell_db.db` = the single source of truth shared by every shell; a
+`sc mem` write is durable + visible to all shells the instant it commits. The
+`.db` is gitignored and reconstructs from git-tracked text on `sc rebuild` —
+an edit not yet serialized is discarded by a rebuild.
 
-**Serializing is an admin/GUI operation, not a per-write shell step.** It writes
-`.sc-state/` + the flat `_sc` mirror into the **shared MAIN worktree** — running
-it from a shell's linked worktree churns and collides with other shells. So
-`sc snapshot` and `sc render flat` **refuse unless `SC_ADMIN=1`** (the GUI/API,
-`install`, `update`, and `render-check` set it for you). A shell does not run them;
-its writes are captured when admin snapshots (GUI **Publish**/Snapshot button, or
-`SC_ADMIN=1 sc snapshot`) before a rebuild. The rest of this skill is for that
+Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
+`.sc-state/` + the flat `_sc` mirror into the shared MAIN worktree, and from a
+shell's linked worktree it churns and collides with other shells. `sc snapshot`
+and `sc render flat` refuse unless `SC_ADMIN=1` (GUI/API, `install`, `update`,
+and `render-check` set it for you). A shell does not run them; its writes are
+captured when admin snapshots (GUI **Publish**/Snapshot button, or
+`SC_ADMIN=1 sc snapshot`) before a rebuild. The rest of this skill = the
 admin/GUI path.
 
 ## The three text serializations
@@ -31,72 +30,67 @@ admin/GUI path.
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `sc seed-skills` |
 | `.sc-state/content.sql` | **this repo's** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants. Tracked, fork-owned, kept OUTSIDE the gitignored engine dir | no (stays local) | `sc snapshot` |
 
-The split that matters: **system content propagates via migrations; per-instance
-content stays in the snapshot.** Skill *bodies* are system (migration); which
-shell is *granted* a skill is per-instance (snapshot).
+The split: system content propagates via migrations; per-instance content stays
+in the snapshot. Skill *bodies* = system (migration); which shell is *granted*
+a skill = per-instance (snapshot).
 
 ## When admin serializes (the GUI Publish button does all of this)
 
-All commands below require `SC_ADMIN=1` and are run from the **main checkout**.
+All commands require `SC_ADMIN=1`, run from the main checkout.
 
-1. **`SC_ADMIN=1 sc snapshot`** — dumps the per-instance tables to
-   `.sc-state/content.sql` (deterministic DELETE-then-INSERT in PK order, so
-   re-running is byte-identical → clean diffs). Captures every shell's accumulated
-   changes to identity, memory, roadmap, documents, flags, projects, or grants.
+1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to
+   `.sc-state/content.sql`. Deterministic DELETE-then-INSERT in PK order ->
+   re-running is byte-identical -> clean diffs.
 
-2. **`SC_ADMIN=1 sc render`** — regenerates the tracked flat `_sc` visibility files
-   (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run it
-   when you changed a document body, the roadmap, or skills. Render is
-   incremental — unchanged files aren't rewritten. (`.claude/skills/` is
-   rebuilt at boot, not here — it's gitignored.)
+2. `SC_ADMIN=1 sc render` -> regenerates the tracked flat `_sc` files
+   (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run
+   after changing a document body, the roadmap, or skills. Incremental —
+   unchanged files not rewritten. (`.claude/skills/` rebuilds at boot and is
+   gitignored — not rendered here.)
 
-3. **Verify the rebuild reproduces:** `sc rebuild && sc verify`. The DB
-   should rebuild from text alone, byte-for-byte.
+3. Verify reproducibility: `sc rebuild && sc verify` -> DB rebuilds from text
+   alone, byte-for-byte.
+   Before committing any `_sc` render: `sc render-check` — rebuilds the DB
+   hermetically from text and fails if the committed mirror drifts from that
+   render (the CI guard, run locally). A plain `sc render` reads the *live* DB,
+   which can lag the source just edited (skill-catalogue trap below);
+   `render-check`'s rebuild-first catches the stale mirror the live-DB render
+   silently passed.
 
-   **Before committing any `_sc` render, run `sc render-check`.** It rebuilds
-   the DB hermetically (from text) and fails if the committed flat mirror drifts
-   from that render — the CI guard, reproduced locally. A plain `sc render`
-   renders from your *live* DB, which can lag the source you just edited (see the
-   skill-catalogue trap below); `render-check`'s rebuild-first is what catches
-   the stale mirror your live-DB render silently passed.
-
-4. **Publish** the text — don't hand-commit it. `sc snapshot`/`render` write
+4. Publish — do NOT hand-commit from a shell branch. snapshot/render write
    `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
-   **main checkout root** (where the shared engine + DB live), not your worktree,
-   so they aren't yours to stage from a shell branch. The GUI **Publish** button
-   commits them and opens one PR (snapshot → render → commit → push → PR on
-   `sc_gui_content`); the admin shell on `main` can also commit them directly.
-   Never commit the `.db` or anything under the gitignored `.super-coder/` engine
-   dir. (In the super-coder SOURCE repo only, `schema.sql` + `migrations/` are
-   tracked and committed here too.)
+   main checkout root (where the shared engine + DB live), not your worktree —
+   they are not yours to stage. GUI **Publish** = snapshot -> render -> commit
+   -> push -> PR on `sc_gui_content`; the admin shell on `main` may commit them
+   directly. NEVER commit the `.db` or anything under the gitignored
+   `.super-coder/` engine dir. (super-coder SOURCE repo only: `schema.sql` +
+   `migrations/` are tracked and committed here too.)
 
 ## Authoring vs. snapshotting
 
-- **Per-instance content** (your memory, this repo's roadmap/docs): edit the DB,
-  then `sc snapshot`. The snapshot is the canonical reproducer.
-- **Skill catalogue** (system, propagates): edit `assets/skills/<name>/SKILL.md`,
-  then `sc seed-skills` — it upserts the live DB *and* (source repo only)
-  regenerates the seed migration. Not the snapshot. See `seed_skills.py`.
-  - Sequence is **`sc seed-skills && sc render`, then `sc render-check`**
-    before committing. Commit the regenerated `migrations/0001_seed_skills.sql`
-    *and* the re-rendered `skills_sc/` mirror together — the migration without
-    the mirror is the drift.
+- **Per-instance content** (your memory, this repo's roadmap/docs): edit the
+  DB -> `sc snapshot`. The snapshot is the canonical reproducer.
+- **Skill catalogue** (system, propagates): edit
+  `assets/skills/<name>/SKILL.md` -> `sc seed-skills` — upserts the live DB
+  *and* (source repo only) regenerates the seed migration. Not the snapshot.
+  See `seed_skills.py`.
+  - Sequence: `sc seed-skills && sc render`, then `sc render-check` before
+    committing. Commit the regenerated `migrations/0001_seed_skills.sql` +
+    the re-rendered `skills_sc/` mirror together — migration without mirror =
+    the drift.
 
-> Steps 1–3 are durability — serialize so a `sc rebuild` can't lose your work.
-> Step 4 is the GUI **Publish** button: it runs snapshot → render → commit →
-> push → PR on the `sc_gui_content` branch, so you rarely commit this text by
-> hand. The serialization lives at the main checkout root, not a worktree.
+Steps 1–3 = durability (a `sc rebuild` cannot lose serialized work). Step 4 =
+the GUI Publish button; you rarely commit this text by hand.
 
 ## Related skills
 
-This skill owns the render/snapshot pipeline and the `render-check` guard; the
-skills that *feed* it link back here:
+This skill owns the render/snapshot pipeline + the `render-check` guard:
 
-- `self_update` — `sc update` re-renders these same `_sc` files; its verify
-  step runs `render-check` (this skill) before committing the engine bump.
+- `self_update` — `sc update` re-renders the same `_sc` files; its verify step
+  runs `render-check` before committing the engine bump.
 - `local_skill_management` — fork-local skills persist via `sc snapshot`; run
   `render-check` before committing the `skills_sc/` mirror.
 - `migration_management` — a **content-seed** migration (skills, flavor
   defaults) changes what renders; rebuild + render + `render-check` after.
-- `docs` / `spec` — document bodies live in the DB and render to `docs_sc/` /
+- `docs` / `spec` — document bodies live in the DB, render to `docs_sc/` /
   `specs_sc/`; authored via `sc mem doc`, serialized here.

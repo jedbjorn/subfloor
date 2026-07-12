@@ -1,173 +1,87 @@
 ---
 name: git
-description: Git conventions for a super-coder shell — one repo, one cwd. Branch before committing, open PRs (never merge without the FnB's OK), attribute commits per-shell. Use before any git work.
+description: Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB's OK), attribute commits per-shell. Use before any git work.
 category: substrate
 common: false
 ---
 
 # git — version control, the super-coder way
 
-A super-coder shell works **one repo at its root** — no cross-repo confusion, so
-plain `git` (cwd = repo root) is safe. The discipline:
+One repo at its root -> plain `git` (cwd = repo root) is safe.
 
-**Operate on the project, never the engine.** Your project is this repo —
-everything except `.super-coder/`. The engine is a gitignored, materialized
-dependency (refreshed by `sc update`); don't commit it or edit it as if it
-were your code. Engine changes are authored upstream in super-coder.
+Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
 
-## Sync before you start — a hard pre-code gate
+## Sync before you start — hard pre-code gate
 
-**Before you touch code, reconcile your own tree.** Every session, and again
-before each new unit of work — not "when convenient." This is *your* job, not the
-admin's; a shell that self-syncs is a shell the admin never has to clean up after.
+Run the gate every session + before each new unit of work. `shell/<shortname>` = a moving base pinned to `origin/main`, not a content branch — cut feature branches from it. A stale base -> you read code that no longer exists + your PRs conflict on arrival.
 
-Your `shell/<shortname>` branch is a **moving base pinned to `origin/main`**,
-not a content branch — work happens on feature branches cut from it. A worktree
-is born at first-boot HEAD and drifts as other shells' PRs merge; a stale base
-means you read code that no longer exists and your PRs conflict on arrival.
+The launcher auto-syncs at boot when provably nothing can be lost (on base branch + clean tree + no local-only commits). Read the `sync:` line in ACTIVE SESSION: auto-synced + nothing done since -> current, carry on. Says **NOT auto-synced** / you're mid-session about to start new work -> run:
 
-The launcher checks drift at every boot and **auto-syncs when provably nothing
-can be lost** (on the base branch, clean tree, no local-only commits). Read the
-`sync:` line in ACTIVE SESSION above. If it auto-synced and you've done nothing
-since, you're current — carry on. Otherwise — it says **NOT auto-synced**, or
-you're mid-session about to start new work — run the gate yourself:
+1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> 0 = carry on.
+2. Behind -> take stock BEFORE touching anything: `git status` (uncommitted) + `git rev-list origin/main..HEAD` (unmerged commits) + `git branch --no-merged origin/main` (unlanded branches).
+3. Anything local -> surface to the FnB first: list the commits/files, ask land / stash / discard. No sync without their call (soft gate).
+4. Clean (or FnB said go) -> `git checkout shell/<shortname> && git reset --hard origin/main`. NEVER `git pull`/merge on the base — merge bubbles accumulate + your squash-merged work replays as conflicts.
+5. Reset only the base, never a feature branch. Stale feature branch -> `git rebase origin/main`.
 
-1. `git fetch origin main && git rev-list --count HEAD..origin/main` — behind
-   count. Zero → carry on.
-2. Behind → take stock of local state BEFORE touching anything:
-   `git status` (uncommitted), `git rev-list origin/main..HEAD` (unmerged
-   commits), `git branch --no-merged origin/main` (unlanded branches).
-3. Anything local → **surface it to the FnB first**: list the commits/files and
-   ask — land it, stash it, or discard? No sync without their call (soft gate).
-4. Clean (or FnB said go) → `git checkout shell/<shortname> && git reset --hard
-   origin/main`. **Never `git pull`/merge on the base branch** — merge bubbles
-   accumulate forever, and your own squash-merged work replays as conflicts.
-5. Never reset a *feature* branch to `origin/main` — only the base. A stale
-   feature branch gets `git rebase origin/main` if it must catch up.
+## Branch -> commit -> push -> PR -> stop
 
-## Branch → commit → push → PR → stop
-
-1. **Never commit straight to the default branch.** Branch first:
-   `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs).
-   *Admin-flavor exception:* the admin shell boots in the repo root on `main`
-   and maintains it directly (engine updates, migrations, applying approved
-   patches) — the branch-guard exempts it. If that's you, commit to main is
-   your mandate; start each session with `git pull --ff-only` so you maintain
-   the real main. Every other shell branches first, always.
-2. Commit in logical units. End the message with your shell's attribution so
-   parallel shells' work stays legible:
+1. NEVER commit to the default branch. Branch first: `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). *Admin-shell exception:* it boots at the repo root on `main`, exempt from the branch-guard; committing to main is its mandate (engine updates, migrations, approved patches) and it starts each session with `git pull --ff-only`. Every other shell branches, always.
+2. Commit in logical units. End every message with your shell's trailer:
    ```
    Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
    ```
-3. Push, open a **PR**, then **stop**. **Do not merge** without an explicit
-   directive from the FnB — opening is the default, merging is a separate gate.
+3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
 
-## Merging a stack (when the FnB has you land one)
+## Merging a stack (only when the FnB hands you one)
 
-Merging stays the FnB's call (above). When they *do* hand you a stack to land,
-merge **bottom-up, retargeting before each merge — never rely on GitHub's
-auto-retarget**:
+Merge bottom-up, retargeting before each merge — never rely on GitHub's auto-retarget:
 
-1. Check the stack is clean: `gh pr view <n> --json mergeable,mergeStateStatus`.
-2. Merge the lowest PR: `gh pr merge <low> --squash --delete-branch`.
-3. **Before** the next merge, re-root it onto `main`: `gh pr edit <next> --base
-   main`. Deleting the merged base otherwise orphans the PR above it (GitHub
-   closes it `CONFLICTING`, base ref gone).
-4. Re-check that PR is `MERGEABLE`, then merge. Repeat up the stack.
+1. `gh pr view <n> --json mergeable,mergeStateStatus` -> clean.
+2. `gh pr merge <low> --squash --delete-branch`.
+3. BEFORE the next merge: `gh pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
+4. Re-check `MERGEABLE` -> merge. Repeat up the stack.
 
-If a PR was already orphaned (its base was deleted under it), nothing is lost —
-the head branch still holds the commits. Recreate the base ref so the *same* PR
-can reopen, rather than rebuilding it:
+PR already orphaned (base deleted under it) -> the head branch still holds the commits; reopen the SAME PR, don't rebuild:
 
-1. `git push origin <merged-sha>:refs/heads/<deleted-branch>`
-   (`<merged-sha>` = `gh pr view <merged-pr> --json headRefOid`).
-2. `gh pr reopen <closed-pr>` → `gh pr edit <closed-pr> --base main`.
-3. Verify `MERGEABLE`, then delete the recreated branch again.
+1. `git push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh pr view <merged-pr> --json headRefOid`.
+2. `gh pr reopen <closed-pr>` -> `gh pr edit <closed-pr> --base main`.
+3. Verify `MERGEABLE` -> delete the recreated branch again.
 
 ## Finish before you stop
 
-The bookend to "sync before you start." **Before you go dormant, land or surface
-your own work — don't leave a dirty or unpushed tree for the admin to adopt.** A
-worktree left with uncommitted or unpushed work is exactly what forces the admin's
-`git_cleanup` to map attribution, check your liveness, and commit on your behalf.
-Self-finish and that whole tier disappears.
+Bookend to the sync gate. At end of session: `git status` (uncommitted) + `git rev-list origin/<base>..HEAD` (unpushed) -> resolve every hit:
 
-At end of session, take stock — `git status` (uncommitted), `git rev-list
-origin/<base>..HEAD` (unpushed) — and resolve it:
+1. Real work -> commit (attributed, trailer above) + push + open the PR. Don't skip because the session is ending.
+2. Throwaway / experiment -> discard deliberately: `git restore` / `git stash`.
+3. Genuinely unsure -> surface to the FnB + leave it committed-and-pushed on a branch — never sitting uncommitted.
 
-1. **Real work** → commit it (attributed, see above), push, open the PR. That's
-   the normal flow; just don't skip it because the session is ending.
-2. **Throwaway / experiment** → discard it deliberately (`git restore` /
-   `git stash`), so the tree is clean.
-3. **Genuinely unsure** → surface to the FnB and leave it committed-and-pushed on
-   a branch (never just sitting uncommitted) — captured work is recoverable; an
-   abandoned dirty worktree is the admin's problem.
-
-Leave your tree either **clean** or **on a pushed branch with a PR**. Nothing
-half-done waiting for someone else to finish.
+Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces the admin's `git_cleanup` to map attribution, check liveness, and commit on your behalf.
 
 ## After a merge — clean up local
 
-Once the FnB merges your PR, tidy local so stale branches don't accumulate:
+Only after the PR is merged:
 
-1. Re-pin your base onto the merged commit. In a worktree you **cannot**
-   `git checkout main` — main is checked out at the repo root, and git refuses
-   a branch already checked out in another worktree. Instead:
-   `git checkout shell/<shortname> && git fetch origin && git reset --hard
-   origin/main`. (Admin shell, repo root: `git pull --ff-only` on main.)
-2. Delete the merged branch: `git branch -d <branch>`. If it was
-   **squash-merged**, git won't recognize it as merged and `-d` refuses — confirm
-   the PR shows *merged* on the remote, then `git branch -D <branch>`.
-3. `git fetch --prune` — drop remote-tracking refs for branches deleted upstream.
+1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
+2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren't ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
+3. `git fetch --prune`.
 
-Only after the PR is merged. Never delete a branch carrying unmerged, un-PR'd
-work — a deleted branch with no PR is lost work.
+NEVER delete a branch carrying unmerged, un-PR'd work — no PR = lost work.
 
-## Don't commit the engine or rebuilt/derived files
+## Never commit the engine or derived files
 
-The whole engine dir is gitignored (`/.super-coder/`) — never force-add anything
-under it. Also gitignored + regenerated: `CLAUDE.md`, `AGENTS.md`,
-`opencode.json`, `.claude/skills/`, and `.sc-state/engine.ref.prev` (the
-ephemeral rollback pointer). From a shell **worktree you commit your project's
-own files** — the code/config you edited there. You do **not** hand-commit the
-serialized DB state: `.sc-state/content.sql` (the memory the `.db` rebuilds
-from), `.sc-state/engine.ref` (the engine pin), and the tracked `_sc` renders are
-written by `sc` to the **main checkout root** (where the shared engine + DB
-live), not your worktree — so they aren't even present to stage from your branch.
-Getting that text into the repo is the GUI **Publish** button (or the admin shell
-on `main`) — see 'After DB work' below. (In the super-coder SOURCE repo only,
-`schema.sql` + `migrations/` are tracked too — there the engine *is* the project.)
+- `/.super-coder/` is gitignored — never force-add anything under it.
+- Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
+- From a worktree, commit only your project's own files. Do NOT hand-commit `.sc-state/content.sql` (serialized DB memory), `.sc-state/engine.ref` (engine pin), or the tracked `_sc` renders — `sc` writes them to the main checkout root, so they aren't in your worktree to stage. They enter the repo via Publish (below).
+- Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
 
-## After DB work — your `sc mem` write is already saved; Publish puts it in the repo
+## After DB work — `sc mem` is already saved; Publish is separate
 
-Your `sc mem` write is durable the moment it lands: it goes straight into the
-shared engine DB (visible to every shell at once), and a `sc rebuild` restores it
-from the serialized snapshot. There is **no per-shell "save" step** — do **not**
-run `sc snapshot` yourself. Snapshot serializes the shared main tree and refuses
-outside admin/GUI *by design* (`snapshot: refused — serializing to the shared main
-tree is an admin/GUI step`): run from a worktree it would only churn and collide
-with the tree other shells share. Getting that DB text *into the repo* is the
-admin/GUI **Publish** flow (snapshot → render → commit → push → PR on
-`sc_gui_content`) — the GUI **Publish** button, or the admin shell on `main`
-running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills
-changed). It also lands at the **main checkout root**, NOT your worktree, so don't
-try to commit `content.sql` or the `_sc` renders onto your branch — from a
-worktree they aren't there. Your feature-branch PRs carry your project files; the
-serialized DB content is published separately. See the `snapshot` skill.
+An `sc mem` write lands in the shared engine DB immediately (visible to every shell) and `sc rebuild` restores it from the serialized snapshot — there is no per-shell save step. NEVER run `sc snapshot` from a worktree — it refuses by design (`snapshot: refused — serializing to the shared main tree is an admin/GUI step`).
+
+Getting DB text into the repo = the Publish flow (snapshot -> render -> commit -> push -> PR on `sc_gui_content`): the GUI **Publish** button, or the admin shell on `main` running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills changed). Output lands at the main checkout root, NOT your worktree — don't try to commit `content.sql` or `_sc` renders onto your branch. Feature-branch PRs carry project files; DB content publishes separately. See the `snapshot` skill.
 
 ## Notes
 
-- Confirm you're in the intended repo before destructive ops (`git -C` if ever in
-  doubt).
-- Multi-shell: shells each boot into their own git worktree at
-  `.sc-worktrees/<shortname>/` on branch `shell/<shortname>` — a moving base
-  the launcher keeps pinned to `origin/main` (see 'Sync before you start').
-  Parallel shells never share a cwd — worktree isolation is automatic. The
-  admin shell is the one exception: it boots in the repo root on `main`.
-- Preview UI work: because you edit in your worktree, your changes do NOT show on
-  the fork's main dev server. `sc preview` runs a router that serves every
-  shell's worktree UI live (HMR) on the fork's `dev_port`, one subdomain each:
-  `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your
-  URL after each commit — surface that line to the FnB so they can eyeball the
-  change. If preview isn't running, start it once from the main checkout:
-  `sc preview`.
+- Before destructive ops, confirm the repo — `git -C <abs-path>` if ever in doubt.
+- Multi-shell: each shell boots into its own worktree at `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`; the launcher keeps the base pinned to `origin/main` (see the sync gate). Worktree isolation is automatic — no shared cwd. Admin shell = the one exception: repo root on `main`.
+- UI preview: worktree edits do NOT show on the fork's main dev server. `sc preview` (start once from the main checkout if not running) serves every shell's worktree UI live (HMR) on the fork's `dev_port`, one subdomain each: `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your URL after each commit — surface that line to the FnB.
