@@ -1,10 +1,10 @@
--- 0053 — authoring_syntax: the house authoring standard joins the catalogue
+-- 0054 — authoring_syntax: the house authoring standard joins the catalogue
 --
 -- New craft skill `authoring_syntax`: house syntax for AI-consumed text
 -- (skill bodies, shell focus/mandate text, agent prompts) — directives with
 -- success conditions, specific prohibitions, light operators, need-to-know,
 -- plus the Self-test for "syntax check X" requests. Ported from the superCC
--- original that governed the 0052 catalogue rewrite.
+-- original that governed the 0053 catalogue rewrite.
 --
 -- Self-contained on purpose (0049 pattern): at update time `migrate` runs
 -- BEFORE the catalogue sync, so the grant below cannot rely on the sync
