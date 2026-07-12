@@ -1,11 +1,22 @@
----
-name: sprint
-description: Participant loop for a declared multi-shell sprint — dev or reviewer slot. Read your slot from the sprint doc, stand up your one sprint tracker (wakes you on every green/red/merge), take your turn when your dependency lands (rebase → PR), babysit CI, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, hand off, kill the tracker at close-out. Load when a sprint kickoff message names you a participant.
-category: craft
-common: false
----
+-- 0056 — reseed: sprint — fix the single-doc read command
+--
+-- The dev-slot instructions quoted `sc mem get doc --id <N>` for reading the
+-- sprint doc's full body; `--id` does not exist on `mem get` (the positional
+-- id is decisions-only) so a participant following the skill verbatim hits an
+-- argparse error at its very first step. The working flag is `--doc <N>`.
+-- Source asset updated in the same commit; this trailing forward reseed
+-- (UPSERT by name; skill_id + grants preserved) carries it to installed forks
+-- and fresh builds alike.
 
-# sprint — your slot in a coordinated multi-shell push
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint',
+  'Participant loop for a declared multi-shell sprint — dev or reviewer slot. Read your slot from the sprint doc, stand up your one sprint tracker (wakes you on every green/red/merge), take your turn when your dependency lands (rebase → PR), babysit CI, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, hand off, kill the tracker at close-out. Load when a sprint kickoff message names you a participant.',
+  'craft',
+  NULL,
+  0,
+  '# sprint — your slot in a coordinated multi-shell push
 
 A sprint = a declared, planner-governed push where shells build dependent
 units (B on A, C on B); loop = planner → devs → reviewers → devs → planner,
@@ -40,18 +51,18 @@ Unit `status` walks `waiting → building → pr-open → in-review → fixing �
 merged`; `fixing` loops back to `in-review` until clean; `ci-red` can
 interleave anywhere from `pr-open` on.
 
-The planner is the doc's only writer. NEVER `sc mem doc edit` the sprint
+The planner is the doc''s only writer. NEVER `sc mem doc edit` the sprint
 doc — report state changes to the planner by message; the planner updates
 the board.
 
 ## Scoped merge authority
 
-The `git` skill's rule stands: merging is the FnB's gate. A sprint grants
+The `git` skill''s rule stands: merging is the FnB''s gate. A sprint grants
 one narrow exception — merge only when ALL four hold:
 
 - the PR is for **your assigned unit** in this sprint,
 - **all checks are green**,
-- your unit's reviewer declared **review-clean** (every Major/Medium
+- your unit''s reviewer declared **review-clean** (every Major/Medium
   finding fixed),
 - the sprint doc says `status: ACTIVE` and is not frozen.
 
@@ -78,16 +89,16 @@ SPRINT doc=<id> unit=<seq> upstream=<seq|none> downstream=<shortname|none> statu
 
 **2. Stand up your sprint tracker — exactly one, spanning the sprint.** A
 recurring watcher in your harness scheduler (cron / scheduled wakeup) that
-polls the sprint's PRs and notifies you on every transition — any sprint
+polls the sprint''s PRs and notifies you on every transition — any sprint
 PR going green, going red, or merging. It is what wakes a cold shell.
 Rules:
 
 - Derive the watch list live each poll — `gh pr list` filtered to the
   branches in the sprint doc — so mid-sprint PRs join automatically.
   Tempted to add a second trigger or edit the first mid-sprint -> the
-  query was wrong; fix it, don't multiply it.
+  query was wrong; fix it, don''t multiply it.
 - Waking is not knowing. On wake, before acting: read the sprint doc, find
-  your row, check your inbox. The doc says whether it's your turn; the
+  your row, check your inbox. The doc says whether it''s your turn; the
   tracker only says "look".
 - The tracker dies at step 9. A sprint tracker firing in a later session =
   a defect you created.
@@ -95,9 +106,9 @@ Rules:
   (`gh pr view <upstream-pr> --json state,mergedAt` · `git fetch origin
   main`) and say so to the planner at kickoff.
 
-**3. Prepare.** Run the `git` skill's sync gate; cut your feature branch
-from your base. Your unit needs upstream code that hasn't merged -> branch
-stacked on the upstream shell's branch + accept the retarget duty in
+**3. Prepare.** Run the `git` skill''s sync gate; cut your feature branch
+from your base. Your unit needs upstream code that hasn''t merged -> branch
+stacked on the upstream shell''s branch + accept the retarget duty in
 step 5. Buildable against current `main` -> branch from `main`; stack only
 for real code dependencies.
 
@@ -111,13 +122,13 @@ for real code dependencies.
 
 While waiting: build and commit locally, but do NOT open your PR out of
 turn. Upstream visibly stalls (red CI for hours, scope ballooning) ->
-message the planner; don't sit silent behind a stuck link.
+message the planner; don''t sit silent behind a stuck link.
 
 **5. Take your turn** the moment your dependency merges:
 
 - stacked on the upstream branch -> retarget first: `gh pr edit <your-pr>
   --base main` if the PR exists, otherwise note your base is gone — same
-  discipline as the `git` skill's stacked-merge procedure;
+  discipline as the `git` skill''s stacked-merge procedure;
 - `git fetch origin && git rebase origin/main` on your feature branch;
 - push, open your PR, message the planner `pr-open`.
 
@@ -128,23 +139,23 @@ the planner.
 Triage before fixing: is the failure in something your diff touches? Does
 `main` show the same failure? Does the log say timeout / runner died /
 network / flaky test you never touched? Anomalous -> `gh run rerun
-<run-id> --failed`, don't patch healthy code. Anomalous red survives two
+<run-id> --failed`, don''t patch healthy code. Anomalous red survives two
 reruns -> message the planner (flaky suite, broken `main`, infra) and
-hold — planner's to fix as a unit, not yours to absorb. When a fix needs a
+hold — planner''s to fix as a unit, not yours to absorb. When a fix needs a
 fix, suspect the diagnosis.
 
 Real red -> read the failure, fix, push, watch again — your loop to run,
-not the planner's to chase. Three honest fix attempts without green ->
-message the planner with what's failing and what you've tried. Reruns of
+not the planner''s to chase. Three honest fix attempts without green ->
+message the planner with what''s failing and what you''ve tried. Reruns of
 flakes count neither as attempts nor as green: merge authority requires
-actual green checks — "it's just a flake" is never a merge.
+actual green checks — "it''s just a flake" is never a merge.
 
-**7. Pass sprint review.** CI green -> message your unit's reviewer
+**7. Pass sprint review.** CI green -> message your unit''s reviewer
 `sprint <doc-id>: unit <seq> ready for review — PR #<n>, checks green` +
 tell the planner `in-review`. Major/Medium findings block: fix, push,
 re-request; keep CI green across fix pushes. Low findings = notes for the
 sprint report, not gates. Disagree with a severity call -> planner rules;
-don't litigate in the thread while the chain waits.
+don''t litigate in the thread while the chain waits.
 
 **8. Merge on green + clean, then hand off.** All checks green + reviewer
 declared review-clean + boundary above satisfied:
@@ -165,20 +176,20 @@ anything else: kill your tracker + drop the SPRINT line from
 
 ## Reviewer slot
 
-Gate the units the doc's `reviewer` column assigns you. Method = the base
-`review` skill (adversarial, verify-don't-trust, review against the unit's
+Gate the units the doc''s `reviewer` column assigns you. Method = the base
+`review` skill (adversarial, verify-don''t-trust, review against the unit''s
 scope); this overlay changes only pace and severity:
 
 1. **Same tracker, same ledger.** Stand up your one sprint tracker at
    kickoff + a `SPRINT doc=<id> reviewing=<seq,seq,…>` line in
    `current_state`. Wake signal = a `ready for review` message or an
-   assigned unit's PR going green. A review request is next-in-queue work;
+   assigned unit''s PR going green. A review request is next-in-queue work;
    a waiting review stalls the chain exactly like red CI.
 2. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
    security / spec-violation (Major) or will-bite-soon (Medium) -> the dev
    fixes now; re-review on the fix push. Style / naming / nice-to-have
    refactors (Low) -> one summary note to the planner for the sprint
-   report; Low never blocks merge and you don't re-litigate it.
+   report; Low never blocks merge and you don''t re-litigate it.
 3. **Handoffs go direct** — scoped relaxation, same shape as the merge
    authority. The base `review` skill gates handoffs behind the FnB;
    inside an ACTIVE sprint, for your assigned units only: message the
@@ -187,7 +198,7 @@ scope); this overlay changes only pace and severity:
    review-clean`). The FnB gate is unchanged everywhere else and returns
    the moment the doc freezes.
 4. **Clean is a declaration.** Say `review-clean` explicitly to dev +
-   planner — it is what unlocks the dev's merge; never leave it implied.
+   planner — it is what unlocks the dev''s merge; never leave it implied.
 5. **Stand down** on close-out: kill your tracker, drop your SPRINT line,
    confirm to the planner.
 
@@ -198,4 +209,12 @@ scope); this overlay changes only pace and severity:
 - Report state transitions (`building → pr-open → in-review → fixing →
   merged`), one line each — not progress prose.
 - Merge-on-green+clean and direct review handoffs are scoped authority
-  inside a declared sprint, never precedent outside one.
+  inside a declared sprint, never precedent outside one.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

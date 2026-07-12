@@ -30,7 +30,7 @@ Declaration = a `documents` row (kind `doc`, title `SPRINT: …`). Read:
 
 ```
 sc mem get docs                     # find it in the index
-sc mem get doc --id <N>             # full body
+sc mem get doc --doc <N>            # full body
 ```
 
 Body contract:
