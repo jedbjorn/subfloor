@@ -439,6 +439,17 @@ shells**: the loop is planner → devs → reviewers → devs → planner, self-
 what the operator used to orchestrate by hand. You declare *that* a sprint
 happens; the planner makes it run.
 
+> [!class4]
+> **Prerequisite: a planned, spec'd feature.** A sprint doesn't start from an
+> idea — it starts from a thorough, multi-step feature already worked out with
+> the planner: recommendation, feature design, and the specs (usually more than
+> one) the units are cut from. Then start a **fresh session** and declare the
+> sprint — planning and sprinting don't share a chat.
+
+```linear
+Recommendation :::class3 -> Design feature + specs :::class3 -> New session :::class4 -> Sprint :::class1
+```
+
 ```linear
 Declare :::class1 -> Kick off :::class1 -> Build :::class2 -> Review :::class3 -> Merge :::class2 -> Hand off :::class2 -> Close out :::class1
 ```
