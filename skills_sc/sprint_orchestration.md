@@ -34,7 +34,15 @@ chains short and the graph wide where the code allows.
 
 Assign each unit a dev shell + a reviewer shell (one reviewer may gate
 several units — don't let one reviewer become the whole sprint's
-bottleneck). Write the board as a `documents` row:
+bottleneck).
+
+**How many shells to deploy = your call, not a formula.** Weigh the
+magnitude of the push against the capacity actually available — the shells
+that exist, reviewer bandwidth, how wide the dependency graph genuinely
+runs — and make the call. More units than shells is fine (units queue
+behind the chain); more shells than parallel work is waste.
+
+Write the board as a `documents` row:
 
 ```
 sc mem doc add "SPRINT: <title>" --kind doc --body-file <draft.md>
