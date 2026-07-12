@@ -104,6 +104,13 @@ re-sequencing, nudges, rulings on reported reds. The board records state;
 messages change behavior; on conflict your latest message wins -> then
 update the board to match.
 
+Dev ambiguity reports (`ambiguity: … → chose …`) get a ruling on
+receipt: overrule by message while the unit is still un-merged, or stay
+silent and the call stands. Either way log the call + outcome the
+moment it arrives — the sprint report lists every one, and calls
+reconstructed at close-out from old messages are calls lost.
+
+
 ## Step 4: Unblock
 
 Stalls and the moves:
@@ -160,10 +167,16 @@ When every unit is `merged` and `main` is green:
 
    Cover: units shipped (PRs, planned vs. actual order); review outcomes
    (Major/Medium found and fixed per unit; reviewers' Low notes — they
-   land here, as the post-sprint cleanup list); stalls hit and how each
+   land here, as the post-sprint cleanup list); every ambiguity call —
+   what the spec left open, what the dev chose, ratified or overruled
+   (this list is where spec debt surfaces); stalls hit and how each
    was unblocked; anything cut or re-scoped and why; what the sprint
-   surfaced about the process itself. Message the FnB: sprint closed,
-   report at doc `<id>`.
+   surfaced about the process itself.
+
+   Then drop a copy at the repo root: write the same body to
+   `shared/SPRINT_REPORT_<slug>.md` (`mkdir -p shared` — the dir may
+   not exist yet). Message the FnB: sprint closed, report at doc
+   `<id>` + the `shared/` file.
 5. Settle the bookkeeping — close the sprint's flags, advance roadmap /
    feature status, note docs-pending.
 

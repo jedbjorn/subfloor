@@ -495,6 +495,11 @@ graph TD
   is not knowing: on wake a shell re-reads the board and its inbox — the
   tracker only says "look". All trackers die at close-out; a sprint tracker
   firing in a later session is a defect.
+- **Ambiguities are called, then reported.** A dev that hits a spec ambiguity
+  mid-unit makes the judgment call and keeps building — the chain doesn't wait
+  for a ruling — and reports the call to the planner in one line (what was
+  open, what it chose, why). The planner may overrule while the unit is
+  un-merged; silence ratifies. Every call lands in the sprint report.
 - **Review runs at sprint pace.** Same adversarial method as the everyday
   loop, different gate: **Major/Medium findings block** the merge and loop the
   dev through `fixing`; **Low findings inform** — one summary note to the
@@ -505,8 +510,10 @@ graph TD
   planner sets `CLOSED`, freezes the doc (freezing **is** the revocation — it's
   exactly what the `sprint` skill checks before any merge), collects every
   tracker-kill confirmation, and writes a **sprint report**: units shipped,
-  review outcomes, stalls and how each was unblocked, what the sprint surfaced
-  about the process itself.
+  review outcomes, every ambiguity called and the decision it landed on,
+  stalls and how each was unblocked, what the sprint surfaced about the
+  process itself — filed as a doc row and dropped as a copy in the fork's
+  `shared/` dir.
 
 Enforcement is advisory in v1 — merge order and authority live in the skill
 text and the board, not in a pre-commit check. The planner absorbs mechanics
