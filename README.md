@@ -199,9 +199,10 @@ it owns:
 9. **Patch + test** — dev addresses the flags, re-runs `./sc test`, and
    re-pushes; the thread closes when it's clean.
    *(dev · `dev_kit`, `test_authoring`, `flags`, `git` · UI: Flags)*
-10. **Operator merges** — merging is the FnB's gate, never a shell's. On dev's
-    next boot the launcher auto-syncs the base onto `origin/main` and prunes the
-    merged branch. *(operator gate; no shell skill · UI: Worktrees)*
+10. **Operator merges** — merging is the FnB's gate, never a shell's (the one
+    scoped exception is a declared sprint — see *Sprints*). On dev's next boot
+    the launcher auto-syncs the base onto `origin/main` and prunes the merged
+    branch. *(operator gate; no shell skill · UI: Worktrees)*
 11. **Freeze spec + write docs** — on ship, the spec freezes (`frozen=1`,
     immutable; the next stage opens a fresh `seq`) and the feature doc is authored
     — both via `docs`. `snapshot` + `./sc render` write read-only `specs_sc/` +
@@ -424,6 +425,82 @@ needed. They all work the same repo without clobbering each other:
   server. `./sc preview` serves every shell worktree's UI live (HMR) on the
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
   — and the post-commit hook prints the shell's URL after each commit.
+
+## Sprints
+
+> [!class2]
+> **UI** Docs · **Shells** planner governs (`sprint_orchestration`) · devs build + reviewers gate (`sprint`)
+
+The everyday loop ships one feature through one dev, with the operator merging.
+A **sprint** is the multi-shell mode: a declared, planner-governed push where
+several shells build **dependent units** — B builds on A, C on B — and run the
+handoffs themselves. Every unit is built, reviewed, fixed, and **merged by the
+shells**: the loop is planner → devs → reviewers → devs → planner, self-running
+what the operator used to orchestrate by hand. You declare *that* a sprint
+happens; the planner makes it run.
+
+```linear
+Declare :::class1 -> Kick off :::class1 -> Build :::class2 -> Review :::class3 -> Merge :::class2 -> Hand off :::class2 -> Close out :::class1
+```
+
+```mermaid
+graph TD
+  F[FnB directs a push]:::class4 --> D[Planner declares the sprint doc]:::class1
+  D --> K[Kickoff — scoped authority ON, one tracker per shell]:::class1
+  K --> B[Dev builds its unit]:::class2
+  B --> P[PR open → CI green]:::class2
+  P --> R[Sprint review]:::class3
+  R -->|Major / Medium findings| B
+  R -->|review-clean| M[Dev merges its own PR]:::class2
+  M -->|"your turn" → downstream dev| B
+  M --> C[all units merged]:::class1
+  C --> X[Close out — freeze the doc, authority OFF · trackers die · sprint report]:::class1
+```
+
+| Slot | Skill | Owns |
+|---|---|---|
+| **planner** | `sprint_orchestration` | decompose into units · sequence the chain · declare the board · kick off · monitor · unblock stalls · close out + report |
+| **dev** | `sprint` | build its unit · PR · babysit CI · fix review findings · merge on green+clean · hand off downstream |
+| **reviewer** | `sprint` | gate assigned units — Major/Medium block, Low goes to the report · declare `review-clean` |
+
+- **The sprint doc is the board — one writer.** The declaration is a
+  `documents` row (`SPRINT: <title>`, visible in the Docs tab): status line
+  (`ACTIVE | CLOSED`) plus one table row per unit — `seq · unit · shell ·
+  reviewer · depends on · branch · pr · status`. Unit status walks
+  `waiting → building → pr-open → in-review → fixing → merged`. The planner is
+  the doc's **only writer**; participants report transitions by message and the
+  planner folds them in. One writer, one board, no drift — the board is what
+  the operator and any rebooted shell reads to re-orient mid-sprint.
+- **Scoped merge authority.** Merging stays the operator's gate everywhere —
+  a sprint grants the one narrow exception. A dev may merge **only** its
+  assigned unit's PR, **only** on all-green checks, **only** after its reviewer
+  declared review-clean (every Major/Medium fixed), **only** while the doc says
+  `ACTIVE` and isn't frozen. Anything outside those four conditions is the
+  default gate, unchanged — and the authority dies when the sprint closes.
+- **Trackers wake cold shells.** A sprint is mostly waiting for someone else's
+  PR, and nobody's sitting in a live session when it merges. Every participant
+  stands up **exactly one** recurring watcher in its harness scheduler that
+  polls the sprint's PRs and notifies on every green, red, and merge. Waking
+  is not knowing: on wake a shell re-reads the board and its inbox — the
+  tracker only says "look". All trackers die at close-out; a sprint tracker
+  firing in a later session is a defect.
+- **Review runs at sprint pace.** Same adversarial method as the everyday
+  loop, different gate: **Major/Medium findings block** the merge and loop the
+  dev through `fixing`; **Low findings inform** — one summary note to the
+  planner, landing in the sprint report as the post-sprint cleanup list.
+  Reviewers hand findings to the dev directly (scoped, like the merge
+  authority) instead of routing through the operator.
+- **Close-out revokes everything.** All units merged and `main` green → the
+  planner sets `CLOSED`, freezes the doc (freezing **is** the revocation — it's
+  exactly what the `sprint` skill checks before any merge), collects every
+  tracker-kill confirmation, and writes a **sprint report**: units shipped,
+  review outcomes, stalls and how each was unblocked, what the sprint surfaced
+  about the process itself.
+
+Enforcement is advisory in v1 — merge order and authority live in the skill
+text and the board, not in a pre-commit check. The planner absorbs mechanics
+(re-sequencing, stalls, severity disputes) and escalates judgment: scope cuts,
+interface changes, and booting a dead shell stay the operator's calls.
 
 ## Update a fork
 
