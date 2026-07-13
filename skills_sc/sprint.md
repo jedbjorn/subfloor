@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # sprint
 
-Participant loop for a declared multi-shell sprint — dev or reviewer slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, report every transition as a result row. No scheduled polling — the planner and the watcher daemon wake you. Load when a sprint task message names you a participant.
+Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Load when a sprint task message names you a participant.
 
 **Category:** craft
 
@@ -17,8 +17,10 @@ Participant loop for a declared multi-shell sprint — dev or reviewer slot. Rea
 A sprint = a declared, planner-governed push where shells build dependent
 units (B on A, C on B); loop = planner → devs → reviewers → devs → planner,
 the shells running the handoffs themselves. This skill is the participant
-side: a **dev slot** ("The loop") or a **reviewer slot** ("Reviewer slot").
-Planner side (declare / monitor / close / report) = `sprint_orchestration`.
+side: a **dev slot** ("The loop"), a **reviewer slot** ("Reviewer slot"),
+or a **conformance slot** ("Conformance slot" — the close-out spec-vs-main
+pass). Planner side (declare / monitor / close / report) =
+`sprint_orchestration`.
 `git`, `review`, `messaging` remain the base disciplines underneath.
 
 You are in a sprint ONLY when a planner `task` message names you a
@@ -172,19 +174,41 @@ CI green across fix pushes. Low findings = notes for the sprint report,
 not gates. Disagree with a severity call -> planner rules; don't litigate
 in the thread while the chain waits.
 
-**7. Merge on green + clean, then hand off.** All checks green + reviewer
-declared review-clean + boundary above satisfied:
+**7. Merge on green + clean, file your unit report, hand off.** All
+checks green + reviewer declared review-clean + boundary above satisfied:
 
 ```
 gh pr merge <your-pr> --squash --delete-branch
 sc mem message send <downstream-shortname> "sprint <doc-id>: unit <seq> merged — your dependency is on main. Your turn."
-sc mem message send <planner-shortname> "sprint <doc-id>: unit <seq> merged (PR #<n>)." --kind result
 ```
 
+Then close your unit with the **unit report** — your merged-notification
+to the planner, grown from one line into ONE structured `result` row,
+fixed template:
+
+```
+sc mem message send <planner-shortname> "$(cat <<'EOF'
+unit-report <doc-id> unit=<seq> pr=#<n>
+shipped: <what the unit does now, 1-2 lines — the claim, not the diff>
+judgements: <ambiguity calls incl. final state (ratified/overruled); 'none'>
+issues: <CI reds (real vs anomalous), fix loops, stalls, review friction; 'none'>
+deviations: <known departures from the spec's reading + why; 'none'>
+follow-ups: <Lows deferred, TODOs left, cleanup owed; 'none'>
+EOF
+)" --kind result
+```
+
+One report per unit, at merge, mandatory — written NOW, while the unit's
+history is still in your context, never reconstructed later. Every field
+answered; `none` is an answer. `deviations` is the honesty field: a
+deviation declared here is a judgement for the planner to ratify; the
+same deviation found only by the conformance pass is a finding. This is
+the one sanctioned multi-line `result` row — transitions stay one-line.
+
 (The daemon also emits the merge to the planner and retires your watch —
-the `pr_event` is the wake-up, your `result` row is the report; send it
+the `pr_event` is the wake-up, your unit report is the record; send it
 anyway: worker self-reports and daemon ground truth cross-check each
-other.) No downstream (last link) -> the planner message is the handoff.
+other.) No downstream (last link) -> the planner report is the handoff.
 Then clean up local per the `git` skill (re-pin base, delete the branch).
 
 **8. Stand down.** Planner close-out message / frozen or `CLOSED` sprint
@@ -220,6 +244,44 @@ scope); this overlay changes only pace and severity:
 5. **Stand down** on close-out: drop your SPRINT line, confirm to the
    planner in a final `result` row.
 
+## Conformance slot
+
+The sprint's final gate: after every unit is merged and `main` is green,
+*before* the freeze, the planner boots you to answer the one question no
+unit reviewer is positioned to answer — **does what shipped on `main`
+actually match the spec?** Unit reviewers gated diffs against unit
+scopes; you read the integrated whole. Cross-unit seams — one unit's
+interface drifting from what another assumed, a requirement that fell
+between two units — are yours to catch.
+
+1. **Wake = the planner's kickoff.** Its `task` row carries exactly: the
+   spec doc id, the sprint doc id, the merge SHA of `main`, your section
+   scope (if the pass is sharded), and the planner's list of **ratified
+   judgement calls**. That list is your only narrative input — it is what
+   lets you tell an intentional deviation from a silent one. Everything
+   else is artifact: judge the spec against the code on `main` at that
+   SHA — never the diffs, never the message trail, never the devs'
+   reasoning.
+2. **Verdicts.** Every spec requirement in scope gets exactly one:
+   - `as-specced` — code matches the spec's reading;
+   - `deviated-intentionally` — matches a ratified judgement call;
+   - `deviated-silently` — departs from spec, nobody declared it;
+   - `unimplemented` — spec requires it, nothing on `main` does it.
+   The last two are findings: attach spec section, code location, and
+   Major/Medium/Low — the sprint's severity bar, same meanings.
+3. **Output.** Write a `documents` row — `CONFORMANCE: <sprint title>`,
+   kind `doc` (`sc mem doc add`) — holding the verdict table + findings,
+   then send the planner ONE line pointing at it:
+   `sprint <doc-id>: conformance done — doc <id>, N findings (x Major, y
+   Medium, z Low)` (--kind result). Detail in the doc, wake-up in the
+   message.
+4. **No authority.** You file verdicts; you rule on nothing. Fix units,
+   deferrals, and severity disputes are the planner's; anything that
+   changes what the sprint *means* is the FnB's. Same escalation ladder
+   as every other slot.
+5. **Stand down** when the planner confirms receipt (a re-run on fix
+   units arrives as a fresh scoped `task` row).
+
 ## Stance
 
 - No scheduled polling, ever: `task` rows and headless boots wake you;
@@ -228,6 +290,9 @@ scope); this overlay changes only pace and severity:
 - Register the watch in the same step that opens the PR — an unwatched PR
   is a silent link, and silent links revert the sprint to polling.
 - Report state transitions (`building → pr-open → in-review → fixing →
-  merged`) as `result` rows, one line each — not progress prose.
+  merged`) as `result` rows, one line each — not progress prose. The
+  unit report at merge is the one sanctioned multi-line row.
 - Merge-on-green+clean and direct review handoffs are scoped authority
   inside a declared sprint, never precedent outside one.
+- "All units merged" and "the spec shipped" are different claims — the
+  conformance slot exists because only the first is otherwise checked.
