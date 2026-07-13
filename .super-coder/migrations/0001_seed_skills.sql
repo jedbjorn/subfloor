@@ -344,29 +344,34 @@ guessing; if a step fails, stop — the app is down and the DB is backed up.
 
 ## 3. Save as a project-local skill
 
-Run both SQL blocks via `./sc sql-rw "<SQL>"` — `sc sql` is read-only and
-refuses writes.
+Persist the filled template through the `local_skill_management` path — the
+ONE authoring lane for fork-local skills (#321: hand-rolled `sc sql-rw`
+INSERTs leave no asset file to re-seed from and contradict that skill''s
+contract in the same catalogue):
 
-```sql
-INSERT INTO skills (name, description, category, content, common)
-VALUES (''deploy'',
-        ''Post-merge deploy ritual for this app — down, backup, ff-only sync, migrate pending→completed, restart, verify.'',
-        ''substrate'',
-        ''<the filled template>'',
-        1);
-```
+1. Write the asset file at `.super-coder/assets/skills/deploy/SKILL.md` —
+   frontmatter carries the identity; body = the filled template:
 
-`common=1` = grant-to-every-shell: new shells receive it at creation, and
-`sc update` re-grants every common skill to every live shell. Grant existing
-shells now, without waiting for an update:
+   ```markdown
+   ---
+   name: deploy
+   description: Post-merge deploy ritual for this app — down, backup, ff-only sync, migrate pending→completed, restart, verify.
+   category: substrate
+   common: true
+   ---
+   <the filled template>
+   ```
 
-```sql
-INSERT OR IGNORE INTO shell_skills (shell_id, skill_id)
-SELECT s.shell_id, k.skill_id FROM shells s, skills k
-WHERE COALESCE(s.is_deleted,0)=0 AND k.name=''deploy'' AND k.is_deleted=0;
-```
+   `common: true` = grant-to-every-shell: new shells receive it at creation,
+   and `sc update` re-grants every common skill to every live shell.
 
-Then `sc snapshot` -> the skill + grants persist in `.sc-state/content.sql`.
+2. Seed it into the catalogue + grant it live: `sc seed-skills` (upserts the
+   asset into the DB, grants common skills to every live shell).
+
+3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in
+   `.sc-state/content.sql`; commit per that skill''s steps.
+
+Details, updates, and removal: the `local_skill_management` skill.
 
 ## 4. Optional make surface
 
@@ -640,7 +645,8 @@ and reload on a fresh map db.
    leave only when it returns zero rows.
 
 6. **Commit** the config + hooks (`git` skill) -> `sc mem state "…"` ->
-   `sc mem oriented` (sets `bootstrapped=1` + snapshots).
+   `sc mem oriented` (sets `bootstrapped=1` — the write is live in the
+   shared DB; it does NOT snapshot).
 
 ## Heal — run whenever the map looks wrong
 
@@ -956,6 +962,17 @@ general safety for the host repo''s database.
 - **SQLite**: limited `ALTER` — changing a constraint = recreate-and-copy
   (new table -> copy -> drop -> rename) with `foreign_keys` off during the
   swap. Renames break FK references — check them.
+- **Postgres**: locks are the hazard, not `ALTER` limits. `CREATE INDEX
+  CONCURRENTLY` on populated tables (a plain CREATE INDEX takes a write
+  lock for the whole build; note CONCURRENTLY can''t run inside a
+  transaction). `ALTER TABLE … ADD COLUMN` with a volatile default rewrites
+  the table — add nullable, backfill in batches, then set the default.
+  `ALTER TYPE … ADD VALUE` (enums) is append-only and (pre-PG12) refuses to
+  run in a transaction with other work; removing/reordering values = new
+  type + column swap. Set `lock_timeout` before DDL so a blocked ALTER
+  fails fast instead of queueing behind (and ahead of) live traffic.
+- Dialect specifics beyond these belong to your fork''s own skills (e.g. a
+  `query_authoring_pg`-style companion) — this skill stays stack-neutral.
 
 ## Stance
 
@@ -988,12 +1005,23 @@ through the engine API, via `sc mem`:
   `documents` returns the one doc *with* its body.
 - **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
-There is NO `sqlite3` path — not as a fallback, not for "ad-hoc" reads. If the
-API isn''t wired, `sc mem` fails loud instead of writing the DB behind its
-back. Your identity rides in your bearer token — the server resolves token ->
-shell; never name a shell in a write. The table below = the data model behind
-those surfaces (what each `sc mem` write touches), not a query cheatsheet.
-Lazy-load: `get` the one surface you need, don''t bulk-read.
+There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
+If the API isn''t wired, `sc mem` fails loud instead of writing the DB behind
+its back. Your identity rides in your bearer token — the server resolves
+token -> shell; never name a shell in a write. Decisions read FLEET-WIDE
+(every row, tagged `@shortname`) so cross-shell citations resolve; every
+other identity surface reads as you.
+
+**The `sc sql` lane** (read-only; `sc sql-rw` gated) is real and blessed for
+what `sc mem` doesn''t cover: admin/reporting reads and sweep queries — the
+flag_sweep / git_cleanup skills run it by design. The doctrine is one level
+down: memory-surface reads and writes go through `sc mem`; `sc sql` is for
+reporting ACROSS surfaces, never a write path for identity/memory (that is
+what `sc mem` scopes and validates).
+
+The table below = the data model behind those surfaces (what each `sc mem`
+write touches), not a query cheatsheet. Lazy-load: `get` the one surface you
+need, don''t bulk-read.
 
 **Need a read/write `sc mem` doesn''t expose?** Report the gap, don''t reach for
 the DB — the direct path is closed by design, and a fork can''t patch the
@@ -1436,12 +1464,16 @@ SELECT shortname FROM shells WHERE flavor=''planner'' AND COALESCE(is_deleted,0)
 SELECT f.flag_id, f.display_name, f.priority, f.description,
        f.feature_id, r.title AS feature, r.roadmap_status,
        (SELECT COUNT(*) FROM documents d
-        WHERE d.feature_id = f.feature_id AND d.kind=''spec'' AND d.frozen=1) AS frozen_docs
+        WHERE d.feature_id = f.feature_id AND d.frozen=1) AS frozen_docs
 FROM flags f
 LEFT JOIN roadmap r ON r.feature_id = f.feature_id
 WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
 ORDER BY f.priority, f.flag_id;
 ```
+
+`frozen_docs` counts ANY frozen document on the feature — kind=''spec'' AND
+kind=''doc'' both qualify (#319: forks that freeze kind=''doc'' rows for shipped
+docs got false "undocumented" positives every sweep under a spec-only count).
 
 Sort every open flag into exactly one bucket (Step 2 / Step 4). Auto-close
 only on unambiguous evidence — any doubt -> Step 4, not a close.
@@ -1529,7 +1561,7 @@ FROM roadmap r
 WHERE r.roadmap_status = ''shipped''
   AND NOT EXISTS (
     SELECT 1 FROM documents d
-    WHERE d.feature_id = r.feature_id AND d.kind=''spec'' AND d.frozen=1)
+    WHERE d.feature_id = r.feature_id AND d.frozen=1)
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
@@ -2020,7 +2052,7 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
 
 4. **Snapshot — the persistence step:**
    ```bash
-   sc snapshot && sc render
+   SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn''t
    own) into `.sc-state/content.sql` — what survives `sc update` and
@@ -2043,7 +2075,7 @@ first: `sc sql "SELECT content FROM skills WHERE name=''<name>''"`.
 ```bash
 sc skill grant <skill_name> <shell>...
 ```
-Then `sc snapshot && sc render` + commit.
+Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
 
 ## Removing a skill
 
@@ -2062,7 +2094,7 @@ Then `sc snapshot && sc render` + commit.
 
 3. **Snapshot, render, commit:**
    ```bash
-   sc snapshot && sc render
+   SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
 
 ## How the GUI organizes skills
@@ -2080,7 +2112,7 @@ grant toggles; the Shells tab groups its grant list by the same sections.
   moves it out of the Repo section.
 
 GUI grant toggles hit the same DB table as `sc skill grant` — they still need
-a snapshot (header button or `sc snapshot`) to survive a rebuild.
+a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a rebuild.
 
 ## What NOT to do
 
@@ -2184,7 +2216,7 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   'messaging',
   'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
   'substrate',
-  NULL,
+  'sc mem message',
   1,
   '# messaging — the shell inbox
 
@@ -2324,13 +2356,13 @@ from you.
 
 5. **Snapshot + commit:**
    ```bash
-   sc snapshot
+   SC_ADMIN=1 sc snapshot
    ```
    Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
    - **Content-seed migration** (seeds system content that renders — skills,
      flavor defaults) also changes the flat `_sc` mirrors, but only once the
      new rows are in the DB: after `sc update --no-fetch`, run
-     `sc render && sc render-check` and commit the re-rendered `_sc` files
+     `SC_ADMIN=1 sc render && sc render-check` and commit the re-rendered `_sc` files
      alongside the migration. A render against a DB predating the seed passes
      locally while CI''s hermetic rebuild goes red — the stale-mirror trap; see
      the `snapshot` skill.
@@ -2699,8 +2731,10 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# review — gate a diff against its spec
 
 The reviewer''s job end to end. You are a **different lineage than the code**
-(see the README''s model note) -> read adversarially: disprove the claim that
-the work is correct, don''t confirm it. `<self>` = your shell_id.
+— reviewer shells are deliberately booted on a different model family than
+the authoring dev, so the review doesn''t share the author''s blind spots ->
+read adversarially: disprove the claim that the work is correct, don''t
+confirm it. `<self>` = your shell_id.
 
 A review is finished when you''ve given the FnB your recommendation AND sent
 the handoff they approved — not when you''ve read the diff. Every outbound
@@ -4156,15 +4190,22 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# test_authoring_pg — Postgres test infra
 
 Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure for Postgres-backed forks.
+infrastructure PATTERN for Postgres-backed forks.
 
-## Foundation
+**Your fork''s `tests/conftest.py` is the source of truth** for the throwaway
+DB''s naming, what schema artifact seeds it (a live `schema.sql`, a squash, a
+migration replay), and the fixture roster — read it before writing a test.
+Everything below is the typical shape, not a contract; where your conftest
+differs, the conftest wins. A fork may also ship its own superseding
+test-authoring skill — if one is granted, prefer it.
+
+## Foundation (typical shape)
 
 `tests/conftest.py` creates a throwaway Postgres DB at session start, applies
-`schema.sql` + migrations, seeds two tenants (Alice / Bob) + a shared system
+the fork''s schema artifact, seeds two tenants (Alice / Bob) + a shared system
 shell, and drives the real app through `TestClient` with real auth.
 
-**Key identities (fixed rowids — address by literal in tests):**
+**Key identities (an example roster — confirm against your conftest):**
 
 | Name | Kind | ID |
 |---|---|---|
@@ -4178,14 +4219,15 @@ shell, and drives the real app through `TestClient` with real auth.
 
 **Throwaway DB setup:**
 - An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
-  creates a unique `dosarch_test_<uuid>` database at session start and drops
-  it at session teardown.
+  creates a uniquely-named `<fork>_test_<unique>` database at session start
+  and drops it at session teardown — the naming scheme is the conftest''s.
 - `DATABASE_URL` injected via `os.environ["DATABASE_URL"]` BEFORE importing
   the app — the app''s DB layer reads it at import time.
-- `schema.sql` (the postgres variant) + migrations applied via
-  `cur.execute(SCHEMA.read_text())` on the throwaway DB connection.
-- A second throwaway database (or schema) isolates egress/spend rows
-  (`DISPATCH_DATABASE_URL`).
+- The fork''s schema artifact applied on the throwaway connection — which
+  artifact (postgres `schema.sql`, a schema squash, a migration replay) is a
+  per-fork choice; read the conftest, don''t assume.
+- Some forks isolate egress/spend rows in a second throwaway DB/schema —
+  only if your conftest declares one.
 
 **Callers** — same `Caller` pattern as the SQLite variant; identity carried
 via cookie or `Authorization: Bearer` header:
@@ -4234,15 +4276,22 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# test_authoring_sqlite — SQLite test infra
 
 Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure for SQLite-backed forks (super-coder, dos-arch).
+infrastructure PATTERN for SQLite-backed forks.
 
-## Foundation
+**Your fork''s `tests/conftest.py` is the source of truth** for how the
+throwaway DB is built and what fixtures exist — read it before writing a
+test. Everything below is the typical shape, not a contract; where your
+conftest differs, the conftest wins. A fork may also ship its own superseding
+test-authoring skill — if one is granted, prefer it.
 
-`tests/conftest.py` builds a throwaway SQLite DB from `schema.sql` + the
-post-059 migration replay, seeds two tenants (Alice / Bob) + a shared system
-shell, and drives the real app through `TestClient` with real auth.
+## Foundation (typical shape)
 
-**Key identities (fixed rowids — address by literal in tests):**
+`tests/conftest.py` builds a throwaway SQLite DB from the fork''s schema
+artifact (schema.sql + a migration replay, or a squash), seeds two tenants
+(Alice / Bob) + a shared system shell, and drives the real app through
+`TestClient` with real auth.
+
+**Key identities (an example roster — confirm against your conftest):**
 
 | Name | Kind | ID |
 |---|---|---|
@@ -4258,9 +4307,11 @@ shell, and drives the real app through `TestClient` with real auth.
 - `tempfile.NamedTemporaryFile(suffix=".db")` -> path injected via
   `os.environ["SHELL_DB_PATH"]` BEFORE importing the app — the auth
   middleware calls `db()` directly; a `Depends` override alone misses it.
-- `apply_schema_and_migrations(con)` builds the schema on the throwaway DB —
-  single source shared by all test harnesses; NEVER copy-paste it.
-- A second throwaway (`DISPATCH_DB_PATH`) isolates egress/spend rows.
+- The conftest''s schema builder (e.g. `apply_schema_and_migrations(con)`)
+  builds the throwaway DB — single source shared by all test harnesses;
+  NEVER copy-paste it.
+- Some forks isolate egress/spend rows in a second throwaway DB — only if
+  your conftest declares one.
 - `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` -> plain `dsess` cookie,
   no `__Host-` prefix in tests.
 

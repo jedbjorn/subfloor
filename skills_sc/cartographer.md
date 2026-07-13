@@ -92,7 +92,8 @@ and reload on a fresh map db.
    leave only when it returns zero rows.
 
 6. **Commit** the config + hooks (`git` skill) -> `sc mem state "…"` ->
-   `sc mem oriented` (sets `bootstrapped=1` + snapshots).
+   `sc mem oriented` (sets `bootstrapped=1` — the write is live in the
+   shared DB; it does NOT snapshot).
 
 ## Heal — run whenever the map looks wrong
 

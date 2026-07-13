@@ -77,29 +77,34 @@ guessing; if a step fails, stop — the app is down and the DB is backed up.
 
 ## 3. Save as a project-local skill
 
-Run both SQL blocks via `./sc sql-rw "<SQL>"` — `sc sql` is read-only and
-refuses writes.
+Persist the filled template through the `local_skill_management` path — the
+ONE authoring lane for fork-local skills (#321: hand-rolled `sc sql-rw`
+INSERTs leave no asset file to re-seed from and contradict that skill's
+contract in the same catalogue):
 
-```sql
-INSERT INTO skills (name, description, category, content, common)
-VALUES ('deploy',
-        'Post-merge deploy ritual for this app — down, backup, ff-only sync, migrate pending→completed, restart, verify.',
-        'substrate',
-        '<the filled template>',
-        1);
-```
+1. Write the asset file at `.super-coder/assets/skills/deploy/SKILL.md` —
+   frontmatter carries the identity; body = the filled template:
 
-`common=1` = grant-to-every-shell: new shells receive it at creation, and
-`sc update` re-grants every common skill to every live shell. Grant existing
-shells now, without waiting for an update:
+   ```markdown
+   ---
+   name: deploy
+   description: Post-merge deploy ritual for this app — down, backup, ff-only sync, migrate pending→completed, restart, verify.
+   category: substrate
+   common: true
+   ---
+   <the filled template>
+   ```
 
-```sql
-INSERT OR IGNORE INTO shell_skills (shell_id, skill_id)
-SELECT s.shell_id, k.skill_id FROM shells s, skills k
-WHERE COALESCE(s.is_deleted,0)=0 AND k.name='deploy' AND k.is_deleted=0;
-```
+   `common: true` = grant-to-every-shell: new shells receive it at creation,
+   and `sc update` re-grants every common skill to every live shell.
 
-Then `sc snapshot` -> the skill + grants persist in `.sc-state/content.sql`.
+2. Seed it into the catalogue + grant it live: `sc seed-skills` (upserts the
+   asset into the DB, grants common skills to every live shell).
+
+3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in
+   `.sc-state/content.sql`; commit per that skill's steps.
+
+Details, updates, and removal: the `local_skill_management` skill.
 
 ## 4. Optional make surface
 

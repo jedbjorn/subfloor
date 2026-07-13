@@ -8,15 +8,22 @@ common: false
 # test_authoring_pg — Postgres test infra
 
 Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure for Postgres-backed forks.
+infrastructure PATTERN for Postgres-backed forks.
 
-## Foundation
+**Your fork's `tests/conftest.py` is the source of truth** for the throwaway
+DB's naming, what schema artifact seeds it (a live `schema.sql`, a squash, a
+migration replay), and the fixture roster — read it before writing a test.
+Everything below is the typical shape, not a contract; where your conftest
+differs, the conftest wins. A fork may also ship its own superseding
+test-authoring skill — if one is granted, prefer it.
+
+## Foundation (typical shape)
 
 `tests/conftest.py` creates a throwaway Postgres DB at session start, applies
-`schema.sql` + migrations, seeds two tenants (Alice / Bob) + a shared system
+the fork's schema artifact, seeds two tenants (Alice / Bob) + a shared system
 shell, and drives the real app through `TestClient` with real auth.
 
-**Key identities (fixed rowids — address by literal in tests):**
+**Key identities (an example roster — confirm against your conftest):**
 
 | Name | Kind | ID |
 |---|---|---|
@@ -30,14 +37,15 @@ shell, and drives the real app through `TestClient` with real auth.
 
 **Throwaway DB setup:**
 - An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
-  creates a unique `dosarch_test_<uuid>` database at session start and drops
-  it at session teardown.
+  creates a uniquely-named `<fork>_test_<unique>` database at session start
+  and drops it at session teardown — the naming scheme is the conftest's.
 - `DATABASE_URL` injected via `os.environ["DATABASE_URL"]` BEFORE importing
   the app — the app's DB layer reads it at import time.
-- `schema.sql` (the postgres variant) + migrations applied via
-  `cur.execute(SCHEMA.read_text())` on the throwaway DB connection.
-- A second throwaway database (or schema) isolates egress/spend rows
-  (`DISPATCH_DATABASE_URL`).
+- The fork's schema artifact applied on the throwaway connection — which
+  artifact (postgres `schema.sql`, a schema squash, a migration replay) is a
+  per-fork choice; read the conftest, don't assume.
+- Some forks isolate egress/spend rows in a second throwaway DB/schema —
+  only if your conftest declares one.
 
 **Callers** — same `Caller` pattern as the SQLite variant; identity carried
 via cookie or `Authorization: Bearer` header:

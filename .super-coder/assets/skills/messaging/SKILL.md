@@ -2,6 +2,7 @@
 name: messaging
 description: Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.
 category: substrate
+command: sc mem message
 common: true
 ---
 

@@ -52,7 +52,7 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
 
 4. **Snapshot — the persistence step:**
    ```bash
-   sc snapshot && sc render
+   SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn't
    own) into `.sc-state/content.sql` — what survives `sc update` and
@@ -75,7 +75,7 @@ first: `sc sql "SELECT content FROM skills WHERE name='<name>'"`.
 ```bash
 sc skill grant <skill_name> <shell>...
 ```
-Then `sc snapshot && sc render` + commit.
+Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
 
 ## Removing a skill
 
@@ -94,7 +94,7 @@ Then `sc snapshot && sc render` + commit.
 
 3. **Snapshot, render, commit:**
    ```bash
-   sc snapshot && sc render
+   SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
 
 ## How the GUI organizes skills
@@ -112,7 +112,7 @@ grant toggles; the Shells tab groups its grant list by the same sections.
   moves it out of the Repo section.
 
 GUI grant toggles hit the same DB table as `sc skill grant` — they still need
-a snapshot (header button or `sc snapshot`) to survive a rebuild.
+a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a rebuild.
 
 ## What NOT to do
 

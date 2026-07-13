@@ -43,6 +43,17 @@ general safety for the host repo's database.
 - **SQLite**: limited `ALTER` — changing a constraint = recreate-and-copy
   (new table -> copy -> drop -> rename) with `foreign_keys` off during the
   swap. Renames break FK references — check them.
+- **Postgres**: locks are the hazard, not `ALTER` limits. `CREATE INDEX
+  CONCURRENTLY` on populated tables (a plain CREATE INDEX takes a write
+  lock for the whole build; note CONCURRENTLY can't run inside a
+  transaction). `ALTER TABLE … ADD COLUMN` with a volatile default rewrites
+  the table — add nullable, backfill in batches, then set the default.
+  `ALTER TYPE … ADD VALUE` (enums) is append-only and (pre-PG12) refuses to
+  run in a transaction with other work; removing/reordering values = new
+  type + column swap. Set `lock_timeout` before DDL so a blocked ALTER
+  fails fast instead of queueing behind (and ahead of) live traffic.
+- Dialect specifics beyond these belong to your fork's own skills (e.g. a
+  `query_authoring_pg`-style companion) — this skill stays stack-neutral.
 
 ## Stance
 

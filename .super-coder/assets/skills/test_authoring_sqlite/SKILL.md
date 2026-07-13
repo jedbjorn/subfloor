@@ -8,15 +8,22 @@ common: false
 # test_authoring_sqlite — SQLite test infra
 
 Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure for SQLite-backed forks (super-coder, dos-arch).
+infrastructure PATTERN for SQLite-backed forks.
 
-## Foundation
+**Your fork's `tests/conftest.py` is the source of truth** for how the
+throwaway DB is built and what fixtures exist — read it before writing a
+test. Everything below is the typical shape, not a contract; where your
+conftest differs, the conftest wins. A fork may also ship its own superseding
+test-authoring skill — if one is granted, prefer it.
 
-`tests/conftest.py` builds a throwaway SQLite DB from `schema.sql` + the
-post-059 migration replay, seeds two tenants (Alice / Bob) + a shared system
-shell, and drives the real app through `TestClient` with real auth.
+## Foundation (typical shape)
 
-**Key identities (fixed rowids — address by literal in tests):**
+`tests/conftest.py` builds a throwaway SQLite DB from the fork's schema
+artifact (schema.sql + a migration replay, or a squash), seeds two tenants
+(Alice / Bob) + a shared system shell, and drives the real app through
+`TestClient` with real auth.
+
+**Key identities (an example roster — confirm against your conftest):**
 
 | Name | Kind | ID |
 |---|---|---|
@@ -32,9 +39,11 @@ shell, and drives the real app through `TestClient` with real auth.
 - `tempfile.NamedTemporaryFile(suffix=".db")` -> path injected via
   `os.environ["SHELL_DB_PATH"]` BEFORE importing the app — the auth
   middleware calls `db()` directly; a `Depends` override alone misses it.
-- `apply_schema_and_migrations(con)` builds the schema on the throwaway DB —
-  single source shared by all test harnesses; NEVER copy-paste it.
-- A second throwaway (`DISPATCH_DB_PATH`) isolates egress/spend rows.
+- The conftest's schema builder (e.g. `apply_schema_and_migrations(con)`)
+  builds the throwaway DB — single source shared by all test harnesses;
+  NEVER copy-paste it.
+- Some forks isolate egress/spend rows in a second throwaway DB — only if
+  your conftest declares one.
 - `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` -> plain `dsess` cookie,
   no `__Host-` prefix in tests.
 

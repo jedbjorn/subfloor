@@ -28,12 +28,16 @@ SELECT shortname FROM shells WHERE flavor='planner' AND COALESCE(is_deleted,0)=0
 SELECT f.flag_id, f.display_name, f.priority, f.description,
        f.feature_id, r.title AS feature, r.roadmap_status,
        (SELECT COUNT(*) FROM documents d
-        WHERE d.feature_id = f.feature_id AND d.kind='spec' AND d.frozen=1) AS frozen_docs
+        WHERE d.feature_id = f.feature_id AND d.frozen=1) AS frozen_docs
 FROM flags f
 LEFT JOIN roadmap r ON r.feature_id = f.feature_id
 WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
 ORDER BY f.priority, f.flag_id;
 ```
+
+`frozen_docs` counts ANY frozen document on the feature — kind='spec' AND
+kind='doc' both qualify (#319: forks that freeze kind='doc' rows for shipped
+docs got false "undocumented" positives every sweep under a spec-only count).
 
 Sort every open flag into exactly one bucket (Step 2 / Step 4). Auto-close
 only on unambiguous evidence — any doubt -> Step 4, not a close.
@@ -121,7 +125,7 @@ FROM roadmap r
 WHERE r.roadmap_status = 'shipped'
   AND NOT EXISTS (
     SELECT 1 FROM documents d
-    WHERE d.feature_id = r.feature_id AND d.kind='spec' AND d.frozen=1)
+    WHERE d.feature_id = r.feature_id AND d.frozen=1)
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
