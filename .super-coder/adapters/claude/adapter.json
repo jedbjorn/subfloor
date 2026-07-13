@@ -6,6 +6,7 @@
   "env": {},
   "model": { "flag": "--model" },
   "name": { "flag": "--name" },
+  "headless": { "launch": ["claude", "-p"], "model_flag": "--model" },
   "merge_json": {
     ".claude/settings.local.json": {
       "hooks": {
@@ -28,6 +29,7 @@
       ".claude/settings.json": {
         "permissions": { "defaultMode": "acceptEdits" }
       }
-    }
+    },
+    "headless_flags": ["--dangerously-skip-permissions"]
   }
 }

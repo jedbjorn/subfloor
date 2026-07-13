@@ -5,5 +5,6 @@
   "emit": [".codex/hooks.json"],
   "env": {},
   "model": { "flag": "--model" },
+  "headless": { "launch": ["codex", "exec"], "model_flag": "-m" },
   "sandbox": { "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"] }
 }

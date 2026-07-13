@@ -391,7 +391,33 @@ The logic, three rules:
   defaults premium on Codex.
 
 > [!class2]
-> **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch seam — it selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a fourth column here.
+> **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch seam — it selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a fourth column here — and for the same reason it takes no headless boot (`./sc run` covers claude · codex · opencode).
+
+### The sprint interview — models per role, per sprint
+
+`flavor_defaults` + the picker cover interactive boots. Sprints boot workers
+**headlessly** (`./sc run` — no picker), so the model seam moves to the sprint
+declaration: the planner asks the operator exactly **two questions** — which
+harness and model for **devs** (one answer, every dev runs it), and which for
+**reviewers** (one answer, every reviewer runs it). The answers land in the
+sprint doc's header —
+
+```
+models: devs=<harness>/<model> · reviewers=<harness>/<model>
+```
+
+— and parameterize every `./sc run` the planner issues for that sprint. No
+answer → `flavor_defaults`, unchanged. One answer per flavor is deliberate:
+shells of a flavor are interchangeable workers, and reviewers stay a
+*different lineage* from the code they gate — the doctrine above, chosen per
+sprint instead of per boot.
+
+The planner itself is not interviewed — it is already booted. **Strong
+recommendation, not a gate: run the planner on Claude.** The planner is the
+low-volume, high-leverage reasoning seat, the one long-lived context in the
+loop, and the only role the inbox watcher (`./sc watch inbox`, claude-only)
+fully serves. Any harness *works* in the planner seat — wake latency and
+ergonomics degrade, correctness doesn't.
 
 ## How shells share one repo
 
@@ -457,15 +483,15 @@ Declare :::class1 -> Kick off :::class1 -> Build :::class2 -> Review :::class3 -
 ```mermaid
 graph TD
   F[FnB directs a push]:::class4 --> D[Planner declares the sprint doc]:::class1
-  D --> K[Kickoff — scoped authority ON, one tracker per shell]:::class1
+  D --> K[Kickoff — scoped authority ON · task rows + headless worker boots]:::class1
   K --> B[Dev builds its unit]:::class2
-  B --> P[PR open → CI green]:::class2
+  B --> P[PR open + watch registered → CI green]:::class2
   P --> R[Sprint review]:::class3
   R -->|Major / Medium findings| B
   R -->|review-clean| M[Dev merges its own PR]:::class2
-  M -->|"your turn" → downstream dev| B
+  M -->|pr_event wakes planner → boots downstream dev| B
   M --> C[all units merged]:::class1
-  C --> X[Close out — freeze the doc, authority OFF · trackers die · sprint report]:::class1
+  C --> X[Close out — freeze the doc, authority OFF · watches self-retired · sprint report]:::class1
 ```
 
 | Slot | Skill | Owns |
@@ -488,13 +514,27 @@ graph TD
   declared review-clean (every Major/Medium fixed), **only** while the doc says
   `ACTIVE` and isn't frozen. Anything outside those four conditions is the
   default gate, unchanged — and the authority dies when the sprint closes.
-- **Trackers wake cold shells.** A sprint is mostly waiting for someone else's
-  PR, and nobody's sitting in a live session when it merges. Every participant
-  stands up **exactly one** recurring watcher in its harness scheduler that
-  polls the sprint's PRs and notifies on every green, red, and merge. Waking
-  is not knowing: on wake a shell re-reads the board and its inbox — the
-  tracker only says "look". All trackers die at close-out; a sprint tracker
-  firing in a later session is a defect.
+- **Events wake shells — nobody polls on a schedule.** A sprint is mostly
+  waiting for someone else's PR, and idle waiting used to cost a full-context
+  harness turn per poll, per shell. Now every instruction and result is a
+  typed `shell_messages` row: the planner sends `task` rows and boots workers
+  headless (`./sc run <shell>` — same render as an interactive boot, drains
+  the inbox, acts, exits); a dev opens its PR **and registers a watch for the
+  planner** (`./sc watch pr <owner/repo> <n> --shell <planner>`); the fork's
+  ONE GitHub watcher daemon (up with `./sc launch`) turns CI conclusions,
+  reviews, and merges into `pr_event` rows; the planner's zero-token inbox
+  watcher (`./sc watch inbox`, claude-harness) wakes it the moment any row
+  lands. Waking is not knowing: on wake a shell re-reads the board and its
+  inbox — the event only says "look". Watches retire themselves on
+  merge/close, and the whole coordination history replays from
+  `shell_messages` alone.
+- **Models are declared per sprint.** Headless boots never pass the launch
+  picker, so the model seam moves to the declaration: the planner asks the
+  operator exactly two questions — which harness/model for **devs**, which
+  for **reviewers** — and the answers ride the sprint doc's `models:` line
+  into every `./sc run` of the sprint (see *Harnesses & models · The sprint
+  interview*). No answer → `flavor_defaults`, unchanged. Cross-provider is
+  first-class: devs on one harness, reviewers on another.
 - **Ambiguities are called, then reported.** A dev that hits a spec ambiguity
   mid-unit makes the judgment call and keeps building — the chain doesn't wait
   for a ruling — and reports the call to the planner in one line (what was
@@ -508,8 +548,8 @@ graph TD
   authority) instead of routing through the operator.
 - **Close-out revokes everything.** All units merged and `main` green → the
   planner sets `CLOSED`, freezes the doc (freezing **is** the revocation — it's
-  exactly what the `sprint` skill checks before any merge), collects every
-  tracker-kill confirmation, and writes a **sprint report**: units shipped,
+  exactly what the `sprint` skill checks before any merge), verifies every PR
+  watch retired itself (`./sc watch list`), and writes a **sprint report**: units shipped,
   review outcomes, every ambiguity called and the decision it landed on,
   stalls and how each was unblocked, what the sprint surfaced about the
   process itself — filed as a doc row and dropped as a copy in the fork's
@@ -517,8 +557,11 @@ graph TD
 
 Enforcement is advisory in v1 — merge order and authority live in the skill
 text and the board, not in a pre-commit check. The planner absorbs mechanics
-(re-sequencing, stalls, severity disputes) and escalates judgment: scope cuts,
-interface changes, and booting a dead shell stay the operator's calls.
+(re-sequencing, stalls, severity disputes, booting workers — `./sc run` is
+the nudge that replaces "is it alive?"), and escalates judgment: scope cuts
+and interface changes stay the operator's calls. The daemon never boots
+anything — it only writes rows; only the planner (or the operator) starts a
+session.
 
 ## Update a fork
 

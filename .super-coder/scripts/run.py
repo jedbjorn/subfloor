@@ -15,6 +15,16 @@ Flow:
 Usage:
     python3 .super-coder/scripts/run.py [shortname] [--first]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
+
+Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]`):
+the same render-then-exec path minus the picker and the TTY. The harness runs
+non-interactively via its adapter's `headless` block (claude -p · codex exec ·
+opencode run), streams a final message, and exits — the ephemeral-worker
+primitive of sprint eventing (specs_sc/sprint-eventing.md). Default prompt
+drains the inbox; a liveness guard refuses a shell whose worktree already
+hosts a live session (one shell, one session). Harness + model resolve:
+explicit flags → the shell's flavor_defaults (a sprint's `models:` line rides
+in AS flags — the planner passes it on every `sc run` it issues).
 """
 from __future__ import annotations
 
@@ -40,8 +50,37 @@ import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
+import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
 
 ADAPTERS = ENGINE / "adapters"
+
+DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
+
+
+def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
+                           harness: str) -> "str | None":
+    """Headless model resolution: an explicit -m wins; else the shell's
+    (flavor, harness) default; else None — the harness picks its own."""
+    if flag_model:
+        return flag_model
+    return fdef["models"].get(harness) if fdef else None
+
+
+def headless_command(adapter: dict, prompt: str, model: "str | None" = None,
+                     sandbox_flags: "list[str] | None" = None) -> "list[str] | None":
+    """The non-interactive exec argv from the adapter's `headless` block —
+    launch prefix + model flag + sandbox flags + the prompt as the final
+    positional. None when the harness declares no headless block (e.g. vibe,
+    which takes no model from the launch seam — see the spec's non-goals)."""
+    hcfg = adapter.get("headless")
+    if not hcfg or not hcfg.get("launch"):
+        return None
+    cmd = list(hcfg["launch"])
+    if model and hcfg.get("model_flag"):
+        cmd += [hcfg["model_flag"], model]
+    cmd += list(sandbox_flags or [])
+    cmd.append(prompt)
+    return cmd
 
 
 def load_adapter(harness: str) -> dict:
@@ -402,12 +441,14 @@ def open_db():
 
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
-def authenticate(con):
+def authenticate(con, interactive: bool = True):
     # SC_USER env wins; else prompt on a TTY; else (headless: `./sc verify`, CI)
     # default to the first active user so launch doesn't EOFError without a TTY.
+    # `interactive=False` (an `./sc run` headless boot) never prompts even on a
+    # TTY — the caller is usually another shell's session, not an operator.
     username = os.environ.get("SC_USER")
     if not username:
-        if sys.stdin.isatty():
+        if interactive and sys.stdin.isatty():
             username = input("Username: ").strip()
         else:
             row = con.execute(
@@ -559,9 +600,13 @@ def atomic_write(path: Path, content: str) -> None:
 def main() -> None:
     args = sys.argv[1:]
     first = "--first" in args
+    headless = "--headless" in args
     # --harness <name> / --harness=<name> forces the harness and skips the
     # picker; its value must not be mistaken for the shell shortname positional.
+    # Headless adds -p/--prompt and -m/--model (value-taking, same rule).
     flag_harness = None
+    flag_model = None
+    prompt = None
     positional = []
     i = 0
     while i < len(args):
@@ -570,12 +615,26 @@ def main() -> None:
             flag_harness = args[i + 1] if i + 1 < len(args) else None
             i += 2
             continue
+        if a in ("-m", "--model"):
+            flag_model = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if a in ("-p", "--prompt"):
+            prompt = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
         if a.startswith("--harness="):
             flag_harness = a.split("=", 1)[1]
+        elif a.startswith("--model="):
+            flag_model = a.split("=", 1)[1]
+        elif a.startswith("--prompt="):
+            prompt = a.split("=", 1)[1]
         elif not a.startswith("-"):
             positional.append(a)
         i += 1
     requested = positional[0] if positional else None
+    if headless and not requested:
+        sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]')
 
     con = open_db()
     # Self-heal stale engine skills before anything this boot reads them
@@ -597,9 +656,23 @@ def main() -> None:
                 pass
             heal_note = None
 
-    user = authenticate(con)
+    user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
     chosen = pick_shell(list_shells(con, user["user_id"]), requested, first, fdefaults)
+
+    # Liveness guard (headless only): one shell, one session. A headless boot
+    # into a worktree that already hosts a live harness would run two sessions
+    # of the same shell against one tree + one memory row set. Interactive
+    # boots keep the operator's judgment; `sc run` is scripted, so it refuses.
+    # Admin boots at the repo root (no worktree signal), so it isn't guarded.
+    if headless and chosen["shortname"] and chosen["flavor"] != "admin":
+        snap = shell_liveness.compute()
+        if snap.get("supported") and shell_liveness.is_active(chosen["shortname"], snap):
+            sys.exit(f"sc run: shell '{chosen['shortname']}' already has a live "
+                     f"session — one shell, one session (see shell_liveness)")
+        if snap.get("supported") and snap.get("indeterminate"):
+            print(f"→ liveness: {snap['indeterminate']} unreadable harness process(es) — "
+                  f"proceeding, but liveness was indeterminate")
 
     # This shell's flavor default (advisory): the harness it boots with. The
     # model is resolved AFTER the harness pick — a flavor names a model PER
@@ -617,7 +690,7 @@ def main() -> None:
     ensure_harness_path()
     default_harness = flavor_harness or _configured_harness() or "claude"
     harness = (flag_harness or os.environ.get("HARNESS")
-               or pick_harness(detect_harnesses(), default_harness, first)
+               or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
 
     # Now that the harness is known, resolve THIS flavor's model for it (the
@@ -713,10 +786,14 @@ def main() -> None:
     # The adapter declares HOW it takes a model — a launch flag (claude/codex:
     # `--model <id>`) or a config-file key (opencode: opencode.json "model"). A
     # NULL flavor model, or a harness declaring neither, skips this. Still
-    # overridable in-session / via the harness's own `-m`.
+    # overridable in-session / via the harness's own `-m`. Headless resolves
+    # its model separately (flags → flavor default) through the headless
+    # block's model_flag, so this interactive routing is skipped there.
     model_args: list[str] = []
     mcfg = adapter.get("model") or {}
-    if flavor_model and mcfg.get("flag"):
+    if headless:
+        pass
+    elif flavor_model and mcfg.get("flag"):
         model_args = [mcfg["flag"], flavor_model]
         print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
     elif flavor_model and mcfg.get("file"):
@@ -738,12 +815,33 @@ def main() -> None:
 
     # Sandbox-only launch flags — e.g. codex's approval/sandbox bypass, safe
     # because the container is the safety boundary. The no-docker host path keeps
-    # the harness's normal prompts (SC_SANDBOX unset).
+    # the harness's normal prompts (SC_SANDBOX unset). Headless adds the
+    # adapter's `headless_flags`: a non-interactive run can't answer a
+    # permission prompt (it auto-denies and the worker silently stalls), so
+    # e.g. claude gets its bypass flag — in the sandbox ONLY, same doctrine.
     sandbox_flags: list[str] = []
     if os.environ.get("SC_SANDBOX"):
-        sandbox_flags = (adapter.get("sandbox") or {}).get("launch_flags") or []
+        scfg = adapter.get("sandbox") or {}
+        sandbox_flags = list(scfg.get("launch_flags") or [])
+        if headless:
+            sandbox_flags += scfg.get("headless_flags") or []
         if sandbox_flags:
             print(f"→ sandbox: launch flags → {' '.join(sandbox_flags)}")
+
+    # Headless: resolve the non-interactive argv now (before RENDER_ONLY) so a
+    # render-only run still validates the adapter + prints what would exec.
+    headless_cmd = None
+    if headless:
+        hmodel = resolve_headless_model(flag_model, fdef, harness)
+        headless_cmd = headless_command(
+            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags)
+        if headless_cmd is None:
+            sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
+                     f"use claude, codex, or opencode")
+        if hmodel:
+            src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
+            print(f"→ model: {hmodel} ({src})")
+        print(f"→ headless prompt: {(prompt or DEFAULT_HEADLESS_PROMPT)[:120]}")
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")
@@ -755,10 +853,11 @@ def main() -> None:
     # Adapter-declared, so only harnesses that support it (claude) get the flag.
     name_args: list[str] = []
     ncfg = adapter.get("name") or {}
-    if ncfg.get("flag") and full["display_name"]:
+    if not headless and ncfg.get("flag") and full["display_name"]:
         name_args = [ncfg["flag"], full["display_name"]]
 
-    cmd = (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags
+    cmd = (headless_cmd if headless else
+           (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags)
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
     # The booted shell's flavor, inherited by everything the harness spawns.
     # branch-guard.sh reads it to exempt the admin shell (which works on main
@@ -798,7 +897,8 @@ def main() -> None:
     # run.py passes it through automatically (via {**os.environ} above), so no
     # explicit assignment is needed. This comment documents it as a first-class
     # supported env var alongside SC_PROTECTED_BRANCHES and SC_SHELL_WORKTREE.
-    set_terminal_tab_title(full["display_name"])
+    if not headless:
+        set_terminal_tab_title(full["display_name"])
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
     os.execvpe(cmd[0], cmd, env)

@@ -263,7 +263,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (11, 'Dev shell git worktrees', 'shipped', 0, 1, 'Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).', '2026-06-11 00:15:53', '2026-06-11 00:29:51', NULL);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (12, 'Dev shell live UI preview', 'shipped', 73, 1, 'One router on the fork''s dev_port fans out to each dev shell''s worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.', '2026-06-11 05:14:10', '2026-06-11 05:14:10', NULL);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (13, 'Agents skill — delegated waves', 'shipped', 0, 1, 'New engine skill ''agents'' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.', '2026-07-06 15:08:37', '2026-07-06 15:08:37', 1);
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'brainstorm', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-12 16:58:16', 1);
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'in_progress', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:08:29', 1);
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -2153,6 +2153,8 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='surface_catalogue';
 
 DELETE FROM shell_messages;
+
+DELETE FROM watched_prs;
 
 DELETE FROM flavor_defaults;
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('dev', 'codex', 'gpt-5.5', 1);
