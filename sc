@@ -690,6 +690,40 @@ print('-> pg: added to $f')
 }
 
 
+# ── GitHub watcher daemon (HOST-side; the fork's ONE PR poller) ───────────────
+# Sprint eventing (specs_sc/sprint-eventing.md): one poller for the whole fork
+# watches every registered PR (watched_prs) and turns transitions into
+# `pr_event` message rows. Runs HOST-side like the brokers — the host owns the
+# gh login — with the same supervision: `launch` brings it up, `down` stops it.
+# No socket, so aliveness is the pidfile, not a health curl. Self-skips when gh
+# is absent (the fork degrades to task-boundary inbox checks, never breaks).
+WATCH_DAEMON_PID="$ENGINE/run/watch-daemon.pid"
+
+sc_watch_daemon_alive() {
+  [ -f "$WATCH_DAEMON_PID" ] && kill -0 "$(cat "$WATCH_DAEMON_PID" 2>/dev/null)" 2>/dev/null
+}
+sc_watch_daemon_up() {
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "→ watch-daemon: gh CLI not found on the host — PR eventing disabled (install gh + login to enable)"; return 0
+  fi
+  if sc_watch_daemon_alive; then
+    echo "→ watch-daemon already running (pid $(cat "$WATCH_DAEMON_PID"))"; return 0
+  fi
+  mkdir -p "$ENGINE/run"
+  nohup "$PY" "$S/watch.py" daemon >"$ENGINE/run/watch-daemon.log" 2>&1 &
+  echo $! > "$WATCH_DAEMON_PID"
+  echo "→ watch-daemon up (pid $!) · log $ENGINE/run/watch-daemon.log"
+}
+sc_watch_daemon_down() {
+  if sc_watch_daemon_alive; then
+    kill "$(cat "$WATCH_DAEMON_PID")" && echo "→ watch-daemon stopped"
+  else
+    echo "→ watch-daemon not running"
+  fi
+  rm -f "$WATCH_DAEMON_PID"
+}
+
+
 # WAL-safe DB backup via sqlite3's online-backup API — a plain file copy of a
 # live WAL database misses un-checkpointed pages (they live in the -wal
 # sidecar). Same dir + naming + keep-5 pruning as rebuild.py/rollback.py.
@@ -732,6 +766,11 @@ case "$cmd" in
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
+  # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
+  # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
+  watch)             exec "$PY" "$S/watch.py" "$@" ;;
+  watch-daemon-up)   sc_watch_daemon_up ;;
+  watch-daemon-down) sc_watch_daemon_down ;;
   # Raw read passthrough to the engine + map DBs, resolved by absolute path so no
   # skill example ever needs a cwd-relative `sqlite3 .super-coder/…` (which pulls a
   # shell into `cd`-ing to the root — the cwd trap). Read-only is ENFORCED
@@ -805,6 +844,10 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
+  # Headless boot (sprint eventing): same render-then-exec path as boot, minus
+  # the picker and the TTY. In-container primitive like boot — the planner
+  # calls it to stand up an ephemeral worker; also the no-docker host path.
+  run)          exec "$PY" "$S/run.py" --headless "$@" ;;
   deps)         sc_deps "$@" ;;
   test)         sc_test "$@" ;;
   lint)         sc_lint "$@" ;;
@@ -910,6 +953,9 @@ case "$cmd" in
     sc_ts_broker_up || true
     # Same for the pm2 broker — self-skips when no `pm2` block is linked.
     sc_pm2_broker_up || true
+    # GitHub watcher daemon — the fork's one PR poller (sprint eventing).
+    # Self-skips when gh is absent; idles cheaply when no watches are live.
+    sc_watch_daemon_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
@@ -918,6 +964,7 @@ case "$cmd" in
                 sc_vm_broker_down
                 sc_ts_broker_down
                 sc_pm2_broker_down
+                sc_watch_daemon_down
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
   # live session inside the sandbox along with whatever those sessions had not
@@ -966,6 +1013,11 @@ super-coder — forkable shell substrate
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
+  ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner);
+                             the watcher daemon turns its transitions into pr_event inbox rows
+  ./sc watch list          live PR watches (--all includes retired)
+  ./sc watch inbox         block until this shell has unread messages, then exit — the zero-token
+                             inbox watcher; arm as a background task and its exit is your wake-up
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
   sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
@@ -987,6 +1039,10 @@ super-coder — forkable shell substrate
   ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
+  ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
+                             opencode) to drain the shell's inbox and act; -p "<prompt>" overrides the
+                             default prompt · --harness <h> · -m <model> (else flavor_defaults);
+                             refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm (YES) + DB backup, then down + launch — recreate fresh (--yes skips the prompt)
   ./sc build               (re)build the sandbox image
@@ -1049,6 +1105,14 @@ super-coder — forkable shell substrate
   ./sc db-broker-sock      print the broker's socket path
   ./sc db-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc db-broker-uninstall remove the systemd unit
+
+  GitHub watcher daemon (HOST-side — the fork's ONE PR poller, sprint eventing:
+  diffs every registered watch on one batched GraphQL query and writes pr_event
+  message rows; watches retire themselves on merge/close). `launch` brings it
+  up when gh is present; `down` stops it:
+  ./sc watch daemon        run the daemon in the foreground (--once = single cycle)
+  ./sc watch-daemon-up     start it in the background (nohup + pidfile); self-skips if gh missing/already up
+  ./sc watch-daemon-down   stop the backgrounded daemon
 
   Postgres sidecar (app-only; docker container on SC_NET, data in a named volume).
   For developing/testing the fork's APP against real Postgres in the sandbox — the

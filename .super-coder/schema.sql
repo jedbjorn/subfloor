@@ -268,6 +268,32 @@ CREATE TABLE shell_messages (
     body          TEXT    NOT NULL CHECK (length(body) > 0),
     created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
     read_at       TEXT                          -- NULL = unread
+    -- kind TEXT NOT NULL DEFAULT 'shell' CHECK (kind IN
+    -- ('shell','task','result','pr_event')) — typed sprint-eventing traffic,
+    -- added by migration 0059. Kept out of this baseline CREATE on purpose:
+    -- ADD COLUMN can't be IF NOT EXISTS and rebuild applies migrations after
+    -- schema.sql, so inlining would double-define (the 0047 precedent). See
+    -- migrations/0059_sprint_eventing.sql.
+);
+
+-- ── Watched PRs (sprint eventing — subscription registry + daemon state) ────
+-- One row per (repo, PR, subscriber shell). `./sc watch pr` registers; the
+-- GitHub watcher daemon (`./sc watch daemon`, supervised by launch/down) polls
+-- every live watch on one batched query, diffs against last_seen, and writes a
+-- `pr_event` message row to the owning shell on each transition. On merge or
+-- close it emits the final event and sets closed_at — the watch retires
+-- itself. See migrations/0059_sprint_eventing.sql (convergent — carries an
+-- existing fork).
+
+CREATE TABLE watched_prs (
+    watch_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo           TEXT    NOT NULL,          -- owner/name
+    pr_number      INTEGER NOT NULL,
+    shell_id       INTEGER NOT NULL REFERENCES shells(shell_id),
+    last_seen      TEXT,                      -- JSON: checks/review/state fingerprint
+    created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    closed_at      TEXT,                      -- set on merge/close; NULL = live
+    UNIQUE (repo, pr_number, shell_id)
 );
 
 -- ── Skills (system content — seeded from assets/, propagates) ────────────────
@@ -385,6 +411,7 @@ CREATE INDEX idx_sie_shell_kind_active
     ON shell_identity_entries(shell_id, kind)
     WHERE is_deleted = 0 AND retired_at IS NULL;
 CREATE INDEX idx_shell_messages_to_unread ON shell_messages(to_shell_id, read_at);
+CREATE INDEX idx_watched_prs_live ON watched_prs(closed_at) WHERE closed_at IS NULL;
 CREATE INDEX idx_dr_filepath_role ON dr_filepath(role);
 CREATE INDEX idx_dr_filepath_lang ON dr_filepath(lang);
 CREATE INDEX idx_dr_dependency_mgr ON dr_dependency(manager);

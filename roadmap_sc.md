@@ -53,6 +53,10 @@ The substrate itself: data layer we build, harness we rent. v1 targets Claude Co
 
 _No open flags._
 
+### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
+
+_No open flags._
+
 ## Next
 
 ### B1 — First-launch installer · owner: `cc`
@@ -81,9 +85,5 @@ _No open flags._
 
 ### Fork to sibling repos · owner: `cc`
 Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.
-
-_No open flags._
-
-### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
 
 _No open flags._

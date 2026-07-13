@@ -46,8 +46,8 @@ Run from the repo root, like every engine command:
     ./sc mem doc freeze <document_id>
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
-    ./sc mem message send <to-shortname> "<body>"      # from = you (the token)
-    ./sc mem message mark-read <message_id>
+    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
+    ./sc mem message mark-read <message_id>            # (pr_event rows are daemon-emitted)
 """
 from __future__ import annotations
 
@@ -266,7 +266,7 @@ def _render_get(surface: str, data: dict) -> int:
         print(f"mem: {len(msgs)} message(s), {len(unread)} unread:")
         for m in msgs:
             mark = "" if m.get("read_at") else " *unread*"
-            print(f"  [#{m['message_id']}] from shell #{m['from_shell_id']} · {m['created_at']}{mark}")
+            print(f"  [#{m['message_id']}]{_kind_tag(m)} from shell #{m['from_shell_id']} · {m['created_at']}{mark}")
             print("    " + (m.get("body") or "").replace("\n", "\n    "))
         return 0
     die(f"unknown surface '{surface}'")
@@ -451,6 +451,13 @@ def cmd_narrative(args) -> int:
     return _finish_api("mem: narrative appended")
 
 
+def _kind_tag(m: dict) -> str:
+    """' task' / ' result' / ' pr_event' label; blank for ordinary mail (and
+    for rows from a pre-0059 server that returns no kind)."""
+    kind = m.get("kind") or "shell"
+    return f" {kind}" if kind != "shell" else ""
+
+
 def cmd_message(args) -> int:
     if args.message_cmd == "check":
         r = _api("GET", "/_sc/mem/messages")
@@ -461,14 +468,16 @@ def cmd_message(args) -> int:
             return 0
         print(f"mem: {len(unread)} unread:")
         for m in unread:
-            print(f"  [#{m['message_id']}] from shell #{m['from_shell_id']} · {m['created_at']}")
+            print(f"  [#{m['message_id']}]{_kind_tag(m)} from shell #{m['from_shell_id']} · {m['created_at']}")
             print("    " + (m["body"] or "").replace("\n", "\n    "))
         return 0
     if args.message_cmd == "send":
         if not args.body.strip():
             die("body is empty")
-        r = _api("POST", "/_sc/mem/messages", {"to": args.to, "body": args.body})
-        return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}")
+        r = _api("POST", "/_sc/mem/messages",
+                 {"to": args.to, "body": args.body, "kind": args.kind})
+        tag = f" ({args.kind})" if args.kind != "shell" else ""
+        return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}{tag}")
     # mark-read
     _api("PATCH", f"/_sc/mem/messages/{args.message_id}/read")
     return _finish_api(f"mem: message #{args.message_id} marked read")
@@ -624,6 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
     ms = msub.add_parser("send")
     ms.add_argument("to")
     ms.add_argument("body")
+    # 'pr_event' is deliberately not offered — it is the daemon's kind; a shell
+    # forging PR transitions would poison the wake loop's ground truth.
+    ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
+                    help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
     mm = msub.add_parser("mark-read")
     mm.add_argument("message_id", type=int)
     sp.set_defaults(fn=cmd_message)

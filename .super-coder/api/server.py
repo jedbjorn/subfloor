@@ -137,6 +137,12 @@ SHELL_EDITABLE = {"current_state", "display_name"}  # workspace + connections bo
 FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "priority"}
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
+# Typed traffic on the shell_messages bus (migration 0059). Shells send the
+# first three via `sc mem message send --kind`; 'pr_event' is emitted by the
+# GitHub watcher daemon (scripts/watch.py), which writes the DB directly —
+# accepted here too so a replayed/manual event isn't rejected on kind alone.
+MESSAGE_KINDS = {"shell", "task", "result", "pr_event"}
+
 
 def db():
     return db_driver.connect(DB_PATH)
@@ -1199,7 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/_sc/mem/messages":
                 msgs = rows(con.execute(
-                    "SELECT message_id, from_shell_id, body, created_at, read_at "
+                    "SELECT message_id, from_shell_id, kind, body, created_at, read_at "
                     "FROM shell_messages WHERE to_shell_id=? "
                     "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
                     (sid,)))
@@ -1439,6 +1445,9 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/_sc/mem/messages":
                 msg = (body.get("body") or "").strip()
+                kind = (body.get("kind") or "shell").strip()
+                if kind not in MESSAGE_KINDS:
+                    return self._send(400, {"error": f"kind must be one of {', '.join(sorted(MESSAGE_KINDS))}"})
                 to_sid = body.get("to_shell_id")
                 if to_sid is None and body.get("to"):
                     r = con.execute(
@@ -1450,8 +1459,9 @@ class Handler(BaseHTTPRequestHandler):
                 if to_sid is None or not msg:
                     return self._send(400, {"error": "to (shortname) or to_shell_id, and body, required"})
                 cur = con.execute(
-                    "INSERT INTO shell_messages (from_shell_id, to_shell_id, body) VALUES (?, ?, ?)",
-                    (sid, int(to_sid), msg))
+                    "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind) "
+                    "VALUES (?, ?, ?, ?)",
+                    (sid, int(to_sid), msg, kind))
                 con.commit()
                 return self._send(201, {"message_id": cur.lastrowid})
 
@@ -1631,6 +1641,83 @@ class Handler(BaseHTTPRequestHandler):
             con.close()
 
     # -- static + GET --
+    # -- /_sc/watches — the PR watch registry (sprint eventing) --
+    # Token-scoped like /_sc/mem/*: registration defaults to the calling shell;
+    # `shell` names another subscriber (the sprint skill registers the planner
+    # at PR open — the recipient-naming precedent of `message send`). The list
+    # is a shared read like /roadmap: single-operator fork, the planner needs
+    # the whole board. The daemon never calls these — it owns the DB side
+    # (last_seen, closed_at) directly.
+
+    def _watches_get(self):
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            include_closed = q.get("all", ["0"])[0] in ("1", "true", "yes")
+            sql = ("SELECT w.watch_id, w.repo, w.pr_number, w.shell_id, "
+                   "s.shortname, w.created_at, w.closed_at FROM watched_prs w "
+                   "JOIN shells s ON s.shell_id = w.shell_id")
+            if not include_closed:
+                sql += " WHERE w.closed_at IS NULL"
+            sql += " ORDER BY w.repo, w.pr_number, w.watch_id"
+            return self._send(200, {"watches": rows(con.execute(sql))})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
+    def _watches_post(self, body: dict):
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            repo = (body.get("repo") or "").strip().strip("/")
+            try:
+                pr = int(body.get("pr_number"))
+            except (TypeError, ValueError):
+                pr = None
+            if not repo or repo.count("/") != 1 or pr is None:
+                return self._send(400, {"error": "repo (owner/name) and pr_number (int) required"})
+            target = sid
+            if body.get("shell"):
+                r = con.execute(
+                    "SELECT shell_id FROM shells WHERE LOWER(shortname)=LOWER(?) "
+                    "AND COALESCE(is_deleted,0)=0", (body["shell"],)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": f"shell '{body['shell']}' unknown"})
+                target = r[0]
+            # Idempotent by (repo, pr, shell): a live duplicate returns the
+            # existing watch; a retired one re-arms (fresh baseline — last_seen
+            # cleared so the first poll re-fingerprints, not diffs stale state).
+            existing = con.execute(
+                "SELECT watch_id, closed_at FROM watched_prs "
+                "WHERE repo=? AND pr_number=? AND shell_id=?",
+                (repo, pr, target)).fetchone()
+            if existing is not None:
+                if existing["closed_at"] is None:
+                    return self._send(200, {"watch_id": existing["watch_id"],
+                                            "existing": True})
+                con.execute(
+                    "UPDATE watched_prs SET closed_at=NULL, last_seen=NULL, "
+                    "created_at=datetime('now') WHERE watch_id=?",
+                    (existing["watch_id"],))
+                con.commit()
+                return self._send(201, {"watch_id": existing["watch_id"],
+                                        "reopened": True})
+            cur = con.execute(
+                "INSERT INTO watched_prs (repo, pr_number, shell_id) VALUES (?, ?, ?)",
+                (repo, pr, target))
+            con.commit()
+            return self._send(201, {"watch_id": cur.lastrowid})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path in _STATIC:
@@ -1641,6 +1728,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f.read_text(), ctype)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
+        if path == "/_sc/watches":
+            return self._watches_get()
         if not path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         # git-hygiene is a live filesystem/git read — no DB, computed on demand
@@ -1755,6 +1844,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
+        if path == "/_sc/watches":
+            return self._watches_post(self._body())
         con = db()
         try:
             if path == "/api/flags":
