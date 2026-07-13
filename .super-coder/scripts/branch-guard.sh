@@ -164,6 +164,17 @@ if [ -n "$target" ]; then
   [ -d "${tdir:-}" ] || tdir="."
   tgt_top="$(toplevel_of "$tdir")"
   if [ -n "$tgt_top" ]; then
+    # ── Gitignored exemption (#317) ─────────────────────────────────────────
+    # A target git itself refuses to track can never land on ANY branch, so the
+    # protected-branch rule has nothing to protect. Concretely: the boot-granted
+    # shared/ handoff dir is gitignored in the main-root checkout, and blocking
+    # it forced shells to side-step the hook (write to /tmp, cp via Bash) to
+    # complete a documented workflow. check-ignore answers for not-yet-existing
+    # paths too; tracked files are never "ignored", so no real repo file gains
+    # a bypass.
+    if git -C "$tdir" check-ignore -q -- "$target" 2>/dev/null; then
+      exit 0
+    fi
     tgt_branch="$(branch_of "$tdir")"
     if is_protected "$tgt_branch"; then
       echo "Blocked: this edit targets '$target', which is in repo '$tgt_top' on protected branch '$tgt_branch'." >&2

@@ -138,6 +138,31 @@ class VerbDispatchTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("not in processes", r["output"])
 
+    def test_tail_is_bounded_not_a_whole_file_read(self):
+        # #308: pm2 never rotates by default — a multi-GB log slurped via
+        # readlines() hung the verb into an empty reply. _tail must return the
+        # last N lines while reading only a bounded window from the end.
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            for i in range(10_000):
+                f.write(f"line-{i}\n")
+            path = f.name
+        try:
+            out = pm2._tail(path, 3)
+            self.assertEqual(out.splitlines(), ["line-9997", "line-9998", "line-9999"])
+            # reads stay bounded even when the file has no newlines at all
+            with open(path, "w") as f:
+                f.write("x" * (9 * 1024 * 1024))
+            capped = pm2._tail(path, 5)
+            self.assertLessEqual(len(capped), 9 * 1024 * 1024)
+            self.assertTrue(capped)  # still returns the tail window, no hang
+        finally:
+            Path(path).unlink()
+
+    def test_tail_missing_file_reports_unreadable(self):
+        self.assertIn("unreadable", pm2._tail("/nonexistent/x.log", 5))
+        self.assertEqual(pm2._tail(None, 5), "")
+
     def test_health_curls_the_saved_url_host_side(self):
         with mock.patch.object(pm2, "read", return_value=SAVED), \
              mock.patch.object(pm2, "_fetch",
