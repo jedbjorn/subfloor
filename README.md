@@ -491,14 +491,17 @@ graph TD
   R -->|review-clean| M[Dev merges its own PR]:::class2
   M -->|pr_event wakes planner → boots downstream dev| B
   M --> C[all units merged]:::class1
-  C --> X[Close out — freeze the doc, authority OFF · watches self-retired · sprint report]:::class1
+  C --> Q[Conformance pass — spec vs main]:::class3
+  Q -->|Major finding → fix unit| B
+  Q --> X[Close out — freeze the doc, authority OFF · watches self-retired · sprint report]:::class1
 ```
 
 | Slot | Skill | Owns |
 |---|---|---|
-| **planner** | `sprint_orchestration` | decompose into units · sequence the chain · declare the board · kick off · monitor · unblock stalls · close out + report |
-| **dev** | `sprint` | build its unit · PR · babysit CI · fix review findings · merge on green+clean · hand off downstream |
+| **planner** | `sprint_orchestration` | decompose into units · sequence the chain · declare the board · kick off · monitor · unblock stalls · conformance pass + rulings · close out + synthesized report |
+| **dev** | `sprint` | build its unit · PR · babysit CI · fix review findings · merge on green+clean · file its unit report · hand off downstream |
 | **reviewer** | `sprint` | gate assigned units — Major/Medium block, Low goes to the report · declare `review-clean` |
+| **conformance** | `sprint` | judge the spec against `main` pre-freeze — four-way verdicts filed as a `CONFORMANCE:` doc · verdicts, never rulings |
 
 - **The sprint doc is the board — one writer.** The declaration is a
   `documents` row (`SPRINT: <title>`, visible in the Docs tab): status line
@@ -548,14 +551,30 @@ graph TD
   planner, landing in the sprint report as the post-sprint cleanup list.
   Reviewers hand findings to the dev directly (scoped, like the merge
   authority) instead of routing through the operator.
-- **Close-out revokes everything.** All units merged and `main` green → the
-  planner sets `CLOSED`, freezes the doc (freezing **is** the revocation — it's
-  exactly what the `sprint` skill checks before any merge), verifies every PR
-  watch retired itself (`./sc watch list`), and writes a **sprint report**: units shipped,
-  review outcomes, every ambiguity called and the decision it landed on,
-  stalls and how each was unblocked, what the sprint surfaced about the
-  process itself — filed as a doc row and dropped as a copy in the fork's
-  `shared/` dir.
+- **Every merge closes with a unit report.** A dev's merged-notification is
+  a structured result row — `shipped / judgements / issues / deviations /
+  follow-ups` — filed at merge, while the unit's history is still in the
+  worker's context. `deviations` is the honesty field: declared here it's a
+  judgement to ratify; found later by the conformance pass it's a finding.
+- **A conformance pass gates the close.** "All units merged" and "the spec
+  shipped" are different claims — unit reviewers gate diffs, nobody else
+  reads the integrated whole. So after the last merge, **before** the freeze,
+  the planner boots review shell(s) to judge the spec against `main`: every
+  requirement gets one of four verdicts — `as-specced`,
+  `deviated-intentionally` (matches a ratified call), `deviated-silently`,
+  `unimplemented`. Major findings become fix units under still-active sprint
+  authority; Medium is a planner ruling; Low never holds the close. The
+  design is [`specs_sc/sprint-reporting.md`](specs_sc/sprint-reporting.md).
+- **Close-out revokes everything, then reports.** Conformance rulings settled
+  → the planner sets `CLOSED`, freezes the doc (freezing **is** the
+  revocation — it's exactly what the `sprint` skill checks before any merge),
+  verifies every PR watch retired itself (`./sc watch list`), and
+  **synthesizes the sprint report** from the unit reports and the conformance
+  doc reconciled against each other — fixed skeleton: Verdict · Units
+  Shipped · Judgements Made · Spec Accuracy · Issues Encountered · Deferred &
+  Follow-ups · Spec Debt · Metrics — filed as a doc row and dropped as a copy
+  in the fork's `shared/` dir, with the `CONFORMANCE:` doc alongside as the
+  evidence trail.
 
 Enforcement is advisory in v1 — merge order and authority live in the skill
 text and the board, not in a pre-commit check. The planner absorbs mechanics
