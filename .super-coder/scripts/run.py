@@ -820,6 +820,7 @@ def main() -> None:
     # permission prompt (it auto-denies and the worker silently stalls), so
     # e.g. claude gets its bypass flag — in the sandbox ONLY, same doctrine.
     sandbox_flags: list[str] = []
+    sandbox_env: dict[str, str] = {}
     if os.environ.get("SC_SANDBOX"):
         scfg = adapter.get("sandbox") or {}
         sandbox_flags = list(scfg.get("launch_flags") or [])
@@ -827,6 +828,12 @@ def main() -> None:
             sandbox_flags += scfg.get("headless_flags") or []
         if sandbox_flags:
             print(f"→ sandbox: launch flags → {' '.join(sandbox_flags)}")
+        # Sandbox-only launch env — e.g. claude's IS_SANDBOX=1, required because
+        # the rootless container runs the harness as uid 0 and claude refuses
+        # bypass-permissions mode as root unless the env marks it as sandboxed.
+        sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
+        if sandbox_env:
+            print(f"→ sandbox: launch env → {' '.join(sandbox_env)}")
 
     # Headless: resolve the non-interactive argv now (before RENDER_ONLY) so a
     # render-only run still validates the adapter + prints what would exec.
@@ -858,7 +865,7 @@ def main() -> None:
 
     cmd = (headless_cmd if headless else
            (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags)
-    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}}
+    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}, **sandbox_env}
     # The booted shell's flavor, inherited by everything the harness spawns.
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.

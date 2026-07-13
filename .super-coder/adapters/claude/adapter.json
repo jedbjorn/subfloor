@@ -25,9 +25,11 @@
     }
   },
   "sandbox": {
+    "env": { "IS_SANDBOX": "1" },
     "merge_json": {
-      ".claude/settings.json": {
-        "permissions": { "defaultMode": "acceptEdits" }
+      ".claude/settings.local.json": {
+        "permissions": { "defaultMode": "bypassPermissions" },
+        "skipDangerousModePermissionPrompt": true
       }
     },
     "headless_flags": ["--dangerously-skip-permissions"]
