@@ -331,6 +331,88 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("task", "done", str(tid))
         self.assertEqual(self.q("SELECT status FROM spec_tasks WHERE task_id=?", tid)[0], "done")
 
+    # ── task cancel: honest terminal state after a feature split (#342) ───────
+    def test_task_cancel_with_notes(self):
+        self.run_mem("roadmap", "add", "feat split")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat split'")[0]
+        body = self.tmp / "sp.md"
+        body.write_text("# spec\n")
+        self.run_mem("doc", "add", "spec split", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec split'")[0]
+        self.run_mem("task", "add", "moved away", "--feature", str(fid),
+                     "--doc", str(did), "--seq", "1")
+        tid = self.q("SELECT task_id FROM spec_tasks WHERE title='moved away'")[0]
+        self.run_mem("task", "cancel", str(tid), "--notes", "moved to F999 as task #7")
+        row = self.q("SELECT status, resolution_notes, completed_date "
+                     "FROM spec_tasks WHERE task_id=?", tid)
+        self.assertEqual(row["status"], "cancelled")
+        self.assertEqual(row["resolution_notes"], "moved to F999 as task #7")
+        self.assertIsNone(row["completed_date"])  # cancelled ≠ done
+        # the read surface shows the trail
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.run_mem("get", "tasks", "--doc", str(did))
+        self.assertIn("cancelled", buf.getvalue())
+        self.assertIn("moved to F999", buf.getvalue())
+
+    def test_task_bogus_status_is_400_not_500(self):
+        self.run_mem("roadmap", "add", "feat vs")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat vs'")[0]
+        body = self.tmp / "vs.md"
+        body.write_text("# spec\n")
+        self.run_mem("doc", "add", "spec vs", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec vs'")[0]
+        self.run_mem("task", "add", "victim", "--feature", str(fid),
+                     "--doc", str(did), "--seq", "1")
+        tid = self.q("SELECT task_id FROM spec_tasks WHERE title='victim'")[0]
+        try:
+            mem._api("PATCH", f"/_sc/mem/tasks/{tid}", {"status": "wontfix"})
+            self.fail("bogus status accepted")
+        except SystemExit as e:
+            self.assertIn("400", str(e.code))   # validated, not a CHECK 500
+        self.assertEqual(self.q("SELECT status FROM spec_tasks WHERE task_id=?",
+                                tid)["status"], "pending")
+
+    # ── flag edit: tracker flags update via CLI, not raw PATCH probes (#316) ──
+    def test_flag_edit(self):
+        self.run_mem("flag", "open", "[x] tracker | Blocker for: arc", "--name", "SC-9")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-9'")[0]
+        self.run_mem("flag", "edit", str(fid),
+                     "--description", "[x] tracker — gate 1 cleared | Blocker for: arc",
+                     "--priority", "High")
+        row = self.q("SELECT description, priority, resolved FROM flags "
+                     "WHERE flag_id=?", fid)
+        self.assertIn("gate 1 cleared", row["description"])
+        self.assertEqual(row["priority"], "High")
+        self.assertEqual(row["resolved"], 0)  # edit never resolves
+        with self.assertRaises(SystemExit):   # no fields → dies client-side
+            self.run_mem("flag", "edit", str(fid))
+
+    # ── doc edit --render-path is honored, not silently dropped (#312) ────────
+    def test_doc_edit_render_path(self):
+        body = self.tmp / "rp.md"
+        body.write_text("# publishable\n")
+        self.run_mem("doc", "add", "pathless doc", "--kind", "doc",
+                     "--body-file", str(body))
+        did = self.q("SELECT document_id FROM documents WHERE title='pathless doc'")[0]
+        self.assertIsNone(self.q("SELECT render_path FROM documents "
+                                 "WHERE document_id=?", did)[0])
+        self.run_mem("doc", "edit", str(did), "--render-path", "docs_sc/pathless.md")
+        self.assertEqual(self.q("SELECT render_path FROM documents "
+                                "WHERE document_id=?", did)[0], "docs_sc/pathless.md")
+
+    # ── decision guard: a bare sibling verb is a guess, not a decision (#311) ─
+    def test_decision_bare_verb_guarded(self):
+        before = self.q("SELECT COUNT(*) FROM shell_decisions")[0]
+        with self.assertRaises(SystemExit):
+            self.run_mem("decision", "add")
+        self.assertEqual(self.q("SELECT COUNT(*) FROM shell_decisions")[0], before)
+        # --force records it; a real multi-word decision never trips the guard
+        self.run_mem("decision", "add", "--force")
+        self.assertIsNotNone(self.q("SELECT 1 FROM shell_decisions WHERE decision='add'"))
+
     def test_doc_add_standalone_no_feature(self):
         # feature_id is optional — standalone docs are contract (the docs +
         # onboard skills and `sc mem doc add [--feature ID]` all say so; the

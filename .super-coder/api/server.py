@@ -142,6 +142,10 @@ ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project
 # GitHub watcher daemon (scripts/watch.py), which writes the DB directly —
 # accepted here too so a replayed/manual event isn't rejected on kind alone.
 MESSAGE_KINDS = {"shell", "task", "result", "pr_event"}
+# spec_tasks lifecycle — 'cancelled' (#342) closes a task whose work moved in
+# a feature split/re-scope without lying that it was built. Validated here so
+# a typo'd status is a 400, not a raw CHECK-constraint 500.
+TASK_STATUSES = {"pending", "in_progress", "done", "cancelled"}
 
 
 def db():
@@ -512,8 +516,11 @@ def patch_document(con, doc_id, body):
         return False, "no such document"
     if r["frozen"]:
         return False, "document is frozen — open the next spec, don't edit this one"
+    # render_path is editable (#312): a doc authored without one could never
+    # be made publishable — `doc edit --render-path` advertised the option
+    # and silently dropped it, and `doc add` always INSERTs a new row.
     return patch_columns(con, "documents", "document_id", doc_id, body,
-                          {"body", "title"})
+                          {"body", "title", "render_path"})
 
 
 def create_flag(con, body):
@@ -1300,7 +1307,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "tasks needs ?doc=<id> or ?feature=<id>"})
                 ts = rows(con.execute(
                     "SELECT task_id, feature_id, document_id, seq, title, description, "
-                    "status, completed_date FROM spec_tasks WHERE " + where +
+                    "status, completed_date, resolution_notes FROM spec_tasks WHERE " + where +
                     " ORDER BY seq", params))
                 return self._send(200, {"tasks": ts})
 
@@ -1626,17 +1633,23 @@ class Handler(BaseHTTPRequestHandler):
             # PATCH /_sc/mem/tasks/{id}
             # Shared: a spec's task plan is collaborative (the builder starts/
             # completes tasks the planner laid in). shell_id records who added
-            # the task and is left untouched.
+            # the task and is left untouched. 'cancelled' (#342) is the honest
+            # terminal state for a task overtaken by a feature split/re-scope;
+            # resolution_notes says why (mirrors flag close --notes).
             if len(parts) == 4 and parts[2] == "tasks":
                 tid = int(parts[3])
                 if not con.execute(
                         "SELECT 1 FROM spec_tasks WHERE task_id=?",
                         (tid,)).fetchone():
                     return self._send(404, {"error": "no such task"})
+                if "status" in body and body["status"] not in TASK_STATUSES:
+                    return self._send(400, {"error": f"status must be one of "
+                                            f"{', '.join(sorted(TASK_STATUSES))}"})
                 if body.get("status") == "done":
                     body.setdefault("completed_date", date.today().isoformat())
                 ok, err = patch_columns(con, "spec_tasks", "task_id", tid,
-                                        body, {"status", "title", "description", "completed_date"})
+                                        body, {"status", "title", "description",
+                                               "completed_date", "resolution_notes"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
 
             # PATCH /_sc/mem/docs/{id}/freeze — must precede the bare /docs/{id} check
