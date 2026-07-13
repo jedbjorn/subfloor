@@ -255,9 +255,63 @@ class ApiMemTest(unittest.TestCase):
     # ── messaging: send by shortname (recipient ≠ identity) ───────────────────
     def test_message_send_by_shortname(self):
         self.run_mem("message", "send", "tc", "ping")
-        row = self.q("SELECT from_shell_id, to_shell_id, body FROM shell_messages "
-                     "WHERE body='ping'")
+        row = self.q("SELECT from_shell_id, to_shell_id, body, dedupe_key "
+                     "FROM shell_messages WHERE body='ping'")
         self.assertEqual((row["from_shell_id"], row["to_shell_id"]), (1, 1))
+        self.assertTrue(row["dedupe_key"])  # every CLI send is stamped (#333)
+
+    # ── messaging: idempotent send — a repeat key never writes a twin (#333) ──
+    def test_message_send_dedupe_key(self):
+        payload = {"to": "tc", "body": "dedupe me", "kind": "shell",
+                   "dedupe_key": "test-dk-1"}
+        first = mem._api("POST", "/_sc/mem/messages", payload)
+        again = mem._api("POST", "/_sc/mem/messages", payload)
+        self.assertEqual(again["message_id"], first["message_id"])
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(self.q("SELECT COUNT(*) FROM shell_messages "
+                                "WHERE body='dedupe me'")[0], 1)
+
+    # ── messaging: the sent view — check-before-resend is satisfiable (#333) ──
+    def test_message_sent_view(self):
+        self.run_mem("message", "send", "tc", "outbound proof")
+        sent = mem._api("GET", "/_sc/mem/messages?direction=sent")
+        self.assertEqual(sent["direction"], "sent")
+        mine = [m for m in sent["messages"] if m["body"] == "outbound proof"]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0]["to_shortname"], "tc")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(self.run_mem("message", "sent"), 0)
+        self.assertIn("outbound proof", buf.getvalue())
+
+    # ── engine DB busy → 503 + Retry-After, and the client retries (#331) ─────
+    def test_busy_write_maps_to_503_and_client_retries(self):
+        real_db, tripped = server.db, {"armed": True}
+
+        class FlakyCon:
+            """First non-auth statement raises 'database is locked'; the token
+            lookup must stay live or the request dies at auth, not in the
+            handler try-block where contention actually surfaces."""
+            def __init__(self):
+                self._con = real_db()
+
+            def execute(self, sql, *a):
+                if tripped["armed"] and "api_key" not in sql:
+                    tripped["armed"] = False
+                    raise sqlite3.OperationalError("database is locked")
+                return self._con.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+
+        server.db = lambda: FlakyCon()
+        try:
+            self.run_mem("state", "written through contention")
+        finally:
+            server.db = real_db
+        self.assertFalse(tripped["armed"])  # the busy path actually fired
+        self.assertEqual(self.q("SELECT current_state FROM shells WHERE shell_id=1")[0],
+                         "written through contention")
 
     # ── docs + tasks ──────────────────────────────────────────────────────────
     def test_doc_and_task(self):

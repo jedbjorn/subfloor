@@ -47,7 +47,13 @@ Run from the repo root, like every engine command:
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
+    ./sc mem message sent                              # outbound view — verify delivery
     ./sc mem message mark-read <message_id>            # (pr_event rows are daemon-emitted)
+
+Writes retry on engine-DB contention (#331): the server answers 503 when the
+shared DB is busy (nothing committed) and every method retries it; ambiguous
+timeouts are retried only where safe — GET/PATCH, plus sends (idempotent via a
+per-invocation dedupe_key, so a retry can never write a duplicate, #333).
 """
 from __future__ import annotations
 
@@ -56,8 +62,10 @@ import json
 import os
 import signal
 import sys
+import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -83,25 +91,58 @@ def _require_api() -> None:
         f"`./sc mem` does not fall back to direct DB.")
 
 
-def _api(method: str, path: str, payload: "dict | None" = None) -> dict:
-    """POST/PATCH/GET to the engine API; die loud on any error."""
+_RETRIES = 3          # extra attempts beyond the first
+_RETRY_PAUSE = 2.0    # seconds between attempts (503 may override via Retry-After)
+
+
+def _api(method: str, path: str, payload: "dict | None" = None,
+         idempotent: "bool | None" = None) -> dict:
+    """POST/PATCH/GET to the engine API; die loud on any error.
+
+    Retries (#331 — multi-shell write contention on the engine DB):
+      • HTTP 503 (server says the DB is busy; nothing was committed) — safe to
+        retry for EVERY method, after Retry-After seconds.
+      • Timeouts — ambiguous: the write may have landed server-side. Retried
+        only when the request is idempotent: GET and PATCH always are (every
+        PATCH sets absolute values / stamps), POST only when the caller says
+        so (message send carries a dedupe_key; state/oriented are absolute).
+        A non-idempotent POST timeout still dies loud, saying the write may
+        have landed.
+    """
+    if idempotent is None:
+        idempotent = method in ("GET", "PATCH")
     url = SC_API_BASE.rstrip("/") + path
     data = json.dumps(payload).encode() if payload is not None else None
     headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
+    for attempt in range(1 + _RETRIES):
+        last = attempt == _RETRIES
         try:
-            msg = json.loads(e.read()).get("error", e.reason)
-        except Exception:
-            msg = e.reason
-        die(f"API {method} {path} → HTTP {e.code}: {msg}")
-    except Exception as exc:
-        die(f"API unreachable ({SC_API_BASE}): {exc}")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 503 and not last:
+                try:
+                    pause = float(e.headers.get("Retry-After") or _RETRY_PAUSE)
+                except ValueError:
+                    pause = _RETRY_PAUSE
+                time.sleep(pause)
+                continue
+            try:
+                msg = json.loads(e.read()).get("error", e.reason)
+            except Exception:
+                msg = e.reason
+            die(f"API {method} {path} → HTTP {e.code}: {msg}")
+        except Exception as exc:
+            timed_out = isinstance(exc, TimeoutError) or "timed out" in str(exc)
+            if timed_out and idempotent and not last:
+                time.sleep(_RETRY_PAUSE)
+                continue
+            hint = (" — the write MAY have landed server-side; check before "
+                    "resending" if timed_out and not idempotent else "")
+            die(f"API unreachable ({SC_API_BASE}): {exc}{hint}")
 
 
 def _finish_api(summary: str) -> int:
@@ -302,7 +343,8 @@ def cmd_get(args) -> int:
 
 
 def cmd_state(args) -> int:
-    _api("POST", "/_sc/mem/state", {"body": args.text})
+    # Absolute overwrite — safe to retry on an ambiguous timeout.
+    _api("POST", "/_sc/mem/state", {"body": args.text}, idempotent=True)
     return _finish_api(f"mem: current_state updated ({len(args.text)} chars)")
 
 
@@ -413,7 +455,7 @@ def cmd_task(args) -> int:
 
 
 def cmd_oriented(args) -> int:
-    _api("POST", "/_sc/mem/oriented")
+    _api("POST", "/_sc/mem/oriented", idempotent=True)
     return _finish_api("mem: shell marked oriented (bootstrapped=1)")
 
 
@@ -471,13 +513,34 @@ def cmd_message(args) -> int:
             print(f"  [#{m['message_id']}]{_kind_tag(m)} from shell #{m['from_shell_id']} · {m['created_at']}")
             print("    " + (m["body"] or "").replace("\n", "\n    "))
         return 0
+    if args.message_cmd == "sent":
+        # Outbound view (#333) — after an ambiguous send timeout, verify
+        # delivery here instead of blind-resending.
+        r = _api("GET", "/_sc/mem/messages?direction=sent")
+        msgs = r.get("messages", [])
+        if not msgs:
+            print("mem: nothing sent")
+            return 0
+        print(f"mem: {len(msgs)} sent (newest first):")
+        for m in msgs:
+            rcpt = f" · read {m['read_at']}" if m.get("read_at") else " · unread"
+            print(f"  [#{m['message_id']}]{_kind_tag(m)} to {m.get('to_shortname') or m['to_shell_id']}"
+                  f" · {m['created_at']}{rcpt}")
+            print("    " + (m.get("body") or "").replace("\n", "\n    "))
+        return 0
     if args.message_cmd == "send":
         if not args.body.strip():
             die("body is empty")
+        # dedupe_key makes the send idempotent (#333): the server returns the
+        # original row for a repeat key, so _api may safely retry an ambiguous
+        # timeout — the failure mode that used to duplicate messages fleet-wide.
         r = _api("POST", "/_sc/mem/messages",
-                 {"to": args.to, "body": args.body, "kind": args.kind})
+                 {"to": args.to, "body": args.body, "kind": args.kind,
+                  "dedupe_key": uuid.uuid4().hex},
+                 idempotent=True)
         tag = f" ({args.kind})" if args.kind != "shell" else ""
-        return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}{tag}")
+        dup = " (already delivered — deduped, no twin written)" if r.get("duplicate") else ""
+        return _finish_api(f"mem: message #{r.get('message_id', '')} sent to {args.to}{tag}{dup}")
     # mark-read
     _api("PATCH", f"/_sc/mem/messages/{args.message_id}/read")
     return _finish_api(f"mem: message #{args.message_id} marked read")
@@ -625,11 +688,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("line")
     sp.set_defaults(fn=cmd_narrative)
 
-    sp = sub.add_parser("message", help="shell-to-shell inbox: check / send / mark-read")
+    sp = sub.add_parser("message", help="shell-to-shell inbox: check / send / sent / mark-read")
     msub = sp.add_subparsers(dest="message_cmd", required=True)
     mc = msub.add_parser("check")
     mc.add_argument("limit", type=int, nargs="?", default=50,
                     help="(accepted; the API returns your latest 50)")
+    msub.add_parser("sent", help="your outbound view — verify delivery after a send timeout")
     ms = msub.add_parser("send")
     ms.add_argument("to")
     ms.add_argument("body")
