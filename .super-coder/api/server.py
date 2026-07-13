@@ -1139,49 +1139,62 @@ class Handler(BaseHTTPRequestHandler):
                 # rationale, newest-first, capped — with counts so the client
                 # can say what was hidden. ?all=1 = full log incl. superseded
                 # (still no rationale); /decisions/<id> = the full row.
+                #
+                # Shared on READ (#318/#340, the flags precedent): decisions
+                # coordinate the project — a planner's design lock cited in a
+                # kickoff message must resolve from every seat, or shells
+                # accuse each other of phantom citations. Rows are tagged with
+                # the author's shortname; writes stay token-scoped.
                 q = parse_qs(urlparse(self.path).query)
                 if q.get("all", ["0"])[0] in ("1", "true"):
                     ds = rows(con.execute(
                         "SELECT d.decision_id, d.decision, d.priority, d.decision_date, "
                         "d.parent_decision_id, "
+                        "(SELECT s.shortname FROM shells s WHERE s.shell_id=d.shell_id) "
+                        " AS shortname, "
                         "(SELECT c.decision_id FROM shell_decisions c "
                         " WHERE c.parent_decision_id=d.decision_id "
                         " AND COALESCE(c.is_deleted,0)=0 "
                         " ORDER BY c.decision_id DESC LIMIT 1) AS superseded_by "
                         "FROM shell_decisions d "
-                        "WHERE d.shell_id=? AND COALESCE(d.is_deleted,0)=0 "
-                        "ORDER BY d.decision_date, d.decision_id", (sid,)))
+                        "WHERE COALESCE(d.is_deleted,0)=0 "
+                        "ORDER BY d.decision_date, d.decision_id"))
                     return self._send(200, {"decisions": ds, "all": True})
                 active_sql = (
                     "FROM shell_decisions d "
-                    "WHERE d.shell_id=? AND COALESCE(d.is_deleted,0)=0 "
+                    "WHERE COALESCE(d.is_deleted,0)=0 "
                     "AND NOT EXISTS (SELECT 1 FROM shell_decisions c "
                     " WHERE c.parent_decision_id=d.decision_id "
                     " AND COALESCE(c.is_deleted,0)=0)")
                 total_active = con.execute(
-                    "SELECT COUNT(*) " + active_sql, (sid,)).fetchone()[0]
+                    "SELECT COUNT(*) " + active_sql).fetchone()[0]
                 superseded = con.execute(
                     "SELECT COUNT(*) FROM shell_decisions d "
-                    "WHERE d.shell_id=? AND COALESCE(d.is_deleted,0)=0 "
+                    "WHERE COALESCE(d.is_deleted,0)=0 "
                     "AND EXISTS (SELECT 1 FROM shell_decisions c "
                     " WHERE c.parent_decision_id=d.decision_id "
-                    " AND COALESCE(c.is_deleted,0)=0)", (sid,)).fetchone()[0]
+                    " AND COALESCE(c.is_deleted,0)=0)").fetchone()[0]
                 ds = rows(con.execute(
                     "SELECT d.decision_id, d.decision, d.priority, d.decision_date, "
-                    "d.parent_decision_id " + active_sql +
+                    "d.parent_decision_id, "
+                    "(SELECT s.shortname FROM shells s WHERE s.shell_id=d.shell_id) "
+                    " AS shortname " + active_sql +
                     " ORDER BY d.decision_id DESC LIMIT ?",
-                    (sid, DECISIONS_INDEX_CAP)))
+                    (DECISIONS_INDEX_CAP,)))
                 return self._send(200, {"decisions": ds,
                                         "total_active": total_active,
                                         "superseded": superseded})
 
             if len(parts) == 4 and parts[2] == "decisions":
                 # Single decision WITH rationale — the library half of the split.
+                # Fleet-wide by id (#318/#340): cross-shell citations resolve.
                 did = int(parts[3])
                 r = con.execute(
                     "SELECT d.decision_id, d.decision, d.rationale, d.priority, "
                     "d.decision_date, d.parent_decision_id, "
                     "d.feature_id, d.document_id, "
+                    "(SELECT s.shortname FROM shells s WHERE s.shell_id=d.shell_id) "
+                    " AS shortname, "
                     "(SELECT title FROM roadmap WHERE feature_id=d.feature_id) "
                     " AS feature_title, "
                     "(SELECT title FROM documents WHERE document_id=d.document_id) "
@@ -1191,8 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
                     " AND COALESCE(c.is_deleted,0)=0 "
                     " ORDER BY c.decision_id DESC LIMIT 1) AS superseded_by "
                     "FROM shell_decisions d "
-                    "WHERE d.decision_id=? AND d.shell_id=? "
-                    "AND COALESCE(d.is_deleted,0)=0", (did, sid)).fetchone()
+                    "WHERE d.decision_id=? "
+                    "AND COALESCE(d.is_deleted,0)=0", (did,)).fetchone()
                 if r is None:
                     return self._send(404, {"error": "no such decision"})
                 return self._send(200, {"decision": dict(r)})
