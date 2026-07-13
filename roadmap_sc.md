@@ -65,6 +65,11 @@ Full installer on top of init_fork: requirements check, harness auto-detect, slo
 
 _No open flags._
 
+### Sprint reporting — unit reports, conformance pass, planner synthesis · owner: `cc`
+Dev unit-report result rows at merge; pre-freeze conformance pass (review shells judge spec vs main, four-way verdicts); sprint report becomes a fixed skeleton the planner synthesizes from unit reports + conformance doc. Skill-text only — no schema, no CLI. See specs_sc/sprint-reporting.md.
+
+_No open flags._
+
 ### B6 — Commit→PR automation · owner: `cc`
 edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapshot button is the manual precursor.
 
