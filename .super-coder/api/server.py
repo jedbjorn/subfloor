@@ -993,13 +993,15 @@ def _land_on_base(out: list, state: dict) -> None:
 class Handler(BaseHTTPRequestHandler):
     server_version = "super-coder/1.0"
 
-    def _send(self, code, payload, ctype="application/json"):
+    def _send(self, code, payload, ctype="application/json", headers=None):
         body = (json.dumps(payload, default=_json_default)
                 if ctype.startswith("application/json")
                 else payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1027,6 +1029,18 @@ class Handler(BaseHTTPRequestHandler):
         trace (a SELECT omitting a column read by key surfaced only as
         `{"error": "'feature_id'"}`, no stack, status 400). Log the full
         traceback to stderr and return 500 so it reads as a server fault."""
+        # Write contention on the shared engine DB is not a fault of either
+        # side — it's a retryable condition (#331: multi-shell sprint load
+        # exhausts busy_timeout and SQLite raises 'database is locked').
+        # Nothing was committed (the con rolls back on close), so tell the
+        # client to retry instead of leaking the raw sqlite error as a 500.
+        if isinstance(exc, db_driver.OperationalError) and (
+                "locked" in str(exc) or "busy" in str(exc)):
+            log_event("busy", ok=False, path=getattr(self, "path", "?"),
+                      detail=[str(exc)])
+            return self._send(503, {"error": "engine DB busy — retry",
+                                    "retry_after": 2},
+                              headers={"Retry-After": "2"})
         traceback.print_exc()
         # Also land it in the rolling log so a failed request is visible after the
         # fact, not only in stderr that may have scrolled away / not been captured.
@@ -1204,6 +1218,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"narrative": (r[0] if r else None)})
 
             if path == "/_sc/mem/messages":
+                # ?direction=sent — the caller's OUTBOUND view (#333): after an
+                # ambiguous send timeout, "check-before-resend" needs a way to
+                # see whether the write landed. Default stays the inbox.
+                q = parse_qs(urlparse(self.path).query)
+                if q.get("direction", ["inbox"])[0] == "sent":
+                    msgs = rows(con.execute(
+                        "SELECT m.message_id, m.to_shell_id, "
+                        "s.shortname AS to_shortname, m.kind, m.body, "
+                        "m.created_at, m.read_at FROM shell_messages m "
+                        "JOIN shells s ON s.shell_id = m.to_shell_id "
+                        "WHERE m.from_shell_id=? "
+                        "ORDER BY m.created_at DESC LIMIT 50", (sid,)))
+                    return self._send(200, {"messages": msgs, "direction": "sent"})
                 msgs = rows(con.execute(
                     "SELECT message_id, from_shell_id, kind, body, created_at, read_at "
                     "FROM shell_messages WHERE to_shell_id=? "
@@ -1458,11 +1485,33 @@ class Handler(BaseHTTPRequestHandler):
                     to_sid = r[0]
                 if to_sid is None or not msg:
                     return self._send(400, {"error": "to (shortname) or to_shell_id, and body, required"})
-                cur = con.execute(
-                    "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind) "
-                    "VALUES (?, ?, ?, ?)",
-                    (sid, int(to_sid), msg, kind))
-                con.commit()
+                # Idempotent send (#333): a client timeout after the server-side
+                # write left the sender unable to tell delivered from lost, and
+                # blind resends duplicated fleet-wide. The client stamps each
+                # send invocation with a dedupe_key; a resend of the same key
+                # returns the original row instead of inserting a twin. The
+                # unique index (from_shell_id, dedupe_key) backstops the
+                # check-then-insert race.
+                dk = (body.get("dedupe_key") or "").strip() or None
+                if dk is not None:
+                    r = con.execute(
+                        "SELECT message_id FROM shell_messages "
+                        "WHERE from_shell_id=? AND dedupe_key=?", (sid, dk)).fetchone()
+                    if r is not None:
+                        return self._send(200, {"message_id": r[0], "duplicate": True})
+                try:
+                    cur = con.execute(
+                        "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind, dedupe_key) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (sid, int(to_sid), msg, kind, dk))
+                    con.commit()
+                except db_driver.IntegrityError:
+                    r = con.execute(
+                        "SELECT message_id FROM shell_messages "
+                        "WHERE from_shell_id=? AND dedupe_key=?", (sid, dk)).fetchone()
+                    if r is None:
+                        raise
+                    return self._send(200, {"message_id": r[0], "duplicate": True})
                 return self._send(201, {"message_id": cur.lastrowid})
 
             if path == "/_sc/mem/projects":

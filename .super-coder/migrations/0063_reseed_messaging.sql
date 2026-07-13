@@ -1,18 +1,24 @@
----
-rendered_by: super-coder
-source: db
-edit: changes here are overwritten — author via the shell or localhost GUI
----
+-- 0063 — reseed: messaging — idempotent send + the sent view (#331/#333).
+--
+-- `sc mem message send` now stamps every invocation with a dedupe_key
+-- (migration 0062) so an ambiguous timeout retries itself without ever
+-- writing a duplicate, and `sc mem message sent` gives the sender an
+-- outbound view to verify delivery before resending. The messaging skill
+-- teaches both: never hand-resend a timed-out send; check `sent` first.
+--
+-- Source asset updated in the same commit; this trailing forward reseed
+-- (UPSERT by name; skill_id + grants preserved) carries it to installed
+-- forks and fresh builds alike.
 
-# messaging
+BEGIN;
 
-Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.
-
-**Category:** substrate
-
----
-
-# messaging — the shell inbox
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'messaging',
+  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
+  'substrate',
+  NULL,
+  1,
+  '# messaging — the shell inbox
 
 Shell-to-shell markdown messages, driven by `sc mem message`. Sender = you;
 recipient addressed by `shortname`. Body = markdown, preserved verbatim.
@@ -24,7 +30,7 @@ Args: `check [N] | send <to-shortname> <body> [--kind k] | sent | mark-read <id>
 ## Message kinds
 
 Every message carries a `kind` — the trail stays filterable
-(`SELECT * FROM shell_messages WHERE kind != 'shell'` replays a sprint's
+(`SELECT * FROM shell_messages WHERE kind != ''shell''` replays a sprint''s
 whole coordination history):
 
 - `shell` — ordinary shell-to-shell mail (the default; what `send` does
@@ -33,7 +39,7 @@ whole coordination history):
 - `result` — worker → planner completion or transition report.
 - `pr_event` — GitHub watcher daemon → shell PR transition (checks
   green/red, review submitted, merged, closed). Daemon-emitted only:
-  `send` refuses it — a forged PR event would poison the wake loop's
+  `send` refuses it — a forged PR event would poison the wake loop''s
   ground truth. Detail lives in `gh`; the row is the wake-up, not the
   payload.
 
@@ -56,7 +62,7 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 - Multi-word body = one quoted argument; markdown preserved verbatim.
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
   · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
-- Unknown / deleted recipient -> `mem: recipient shortname '<x>' unknown`;
+- Unknown / deleted recipient -> `mem: recipient shortname ''<x>'' unknown`;
   empty body -> `mem: body is empty`. Surface either to the operator plainly.
 - Sends are idempotent under load: each invocation carries a dedupe key, so
   a timed-out send retries itself and can never write a duplicate. Do NOT
@@ -80,7 +86,7 @@ sc mem message mark-read <message_id>
 ```
 
 Pass the `message_id` that `check` surfaced. Only messages addressed to you
-clear — another shell's message = no-op; re-marking a read message = no-op.
+clear — another shell''s message = no-op; re-marking a read message = no-op.
 
 ## Stance
 
@@ -88,4 +94,12 @@ clear — another shell's message = no-op; re-marking a read message = no-op.
   item before continuing.
 - No threading: a reply = a new `send`; include `Re: <topic>` in the body if
   it matters.
-- `mark-read` only after you have actually acted on the message.
+- `mark-read` only after you have actually acted on the message.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

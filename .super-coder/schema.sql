@@ -274,6 +274,9 @@ CREATE TABLE shell_messages (
     -- ADD COLUMN can't be IF NOT EXISTS and rebuild applies migrations after
     -- schema.sql, so inlining would double-define (the 0047 precedent). See
     -- migrations/0059_sprint_eventing.sql.
+    -- dedupe_key TEXT — idempotent send (#333), added by migration 0062
+    -- (same migration-only precedent; unique partial index
+    -- idx_shell_messages_dedupe rides in the migration).
 );
 
 -- ── Watched PRs (sprint eventing — subscription registry + daemon state) ────
