@@ -26,6 +26,11 @@ New engine skill 'agents' (--agents [model]) for dev + reviewer flavors: delegat
 **Blockers:**
 - `SC-001` [Docs] agents skill shipped, doc pending | Blocker for: agents feature doc
 
+### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
+
+**Blockers:**
+- `SC-002` [Docs] sprint eventing shipped (PR #338), feature doc pending — and the loop is unproven until a real sprint runs on it | Blocker for: eventing feature doc + first eventing sprint
+
 ### B2 — Content & render · owner: `cc`
 Flat _sc render, per-shell SKILL.md, skill seed pipeline. PR #1.
 
@@ -50,10 +55,6 @@ _No open flags._
 
 ### super-coder · owner: `cc`
 The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.
-
-_No open flags._
-
-### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
 
 _No open flags._
 

@@ -263,7 +263,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (11, 'Dev shell git worktrees', 'shipped', 0, 1, 'Give each dev shell its own git worktree so multiple dev shells can run in parallel without sharing a tree. Reviewer/planner stay on the main tree (read-only on git).', '2026-06-11 00:15:53', '2026-06-11 00:29:51', NULL);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (12, 'Dev shell live UI preview', 'shipped', 73, 1, 'One router on the fork''s dev_port fans out to each dev shell''s worktree vite, routed by subdomain (http://<shortname>.localhost:<dev_port>/) — live HMR per worktree, no base-path config, no concurrent-edit conflict. post-commit hook prints the URL. See specs_sc/dev-preview.md.', '2026-06-11 05:14:10', '2026-06-11 05:14:10', NULL);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (13, 'Agents skill — delegated waves', 'shipped', 0, 1, 'New engine skill ''agents'' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.', '2026-07-06 15:08:37', '2026-07-06 15:08:37', 1);
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'in_progress', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:08:29', 1);
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'shipped', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:30:04', 1);
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -1713,7 +1713,7 @@ No schema change, no new tables, no API change, no GUI change.
 - `skills_sc/agents.md` renders; migration applies cleanly on a fork via the
   standard update path.
 ', 'specs_sc/agents-skill.md', '2026-07-06 15:08:47', '2026-07-06 15:08:47');
-INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (7, 14, 'spec', 1, 'Sprint eventing — daemon + headless boot', 0, NULL, '---
+INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (7, 14, 'spec', 1, 'Sprint eventing — daemon + headless boot', 1, '2026-07-13', '---
 title: Sprint eventing — daemon + headless boot
 tags: [sprints, messaging, daemon, orchestration, cross-provider]
 date: 2026-07-12
@@ -2002,6 +2002,7 @@ exactly as the declaration interview chose, every `sc run` honoring it.
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (2, 'SC-001', 'Medium', '[Docs] agents skill shipped, doc pending | Blocker for: agents feature doc', '2026-07-06', NULL, 0, 1, 13, NULL, NULL, 0);
+INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (3, 'SC-002', 'Medium', '[Docs] sprint eventing shipped (PR #338), feature doc pending — and the loop is unproven until a real sprint runs on it | Blocker for: eventing feature doc + first eventing sprint', '2026-07-13', NULL, 0, NULL, 14, NULL, NULL, 0);
 
 DELETE FROM spec_tasks;
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, shell_id, created_date) VALUES (1, 13, 6, 0, 'Preparation', 'Trace seed_skills/sync/regrant pipeline, asset format, migration numbering', 'done', '2026-07-06', 1, '2026-07-06');
