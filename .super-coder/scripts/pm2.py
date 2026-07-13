@@ -145,12 +145,27 @@ def _proc_row(p: dict) -> dict:
 
 def _tail(path: str | None, lines: int) -> str:
     """Last `lines` lines of a pm2 log file — read host-side, never streamed
-    (`pm2 logs` streams forever; a broker verb must return)."""
+    (`pm2 logs` streams forever; a broker verb must return).
+
+    Reverse-seek, bounded (#308): pm2 never rotates logs by default, so a
+    long-lived app's out log is arbitrarily large — `readlines()` slurped the
+    whole file and a multi-GB log turned the verb into a minutes-long hang
+    ending in an empty reply. Read backward in chunks until enough newlines,
+    with a hard byte cap against pathological line lengths."""
     if not path:
         return ""
+    chunk, cap = 64 * 1024, 8 * 1024 * 1024
     try:
         with open(path, "rb") as f:
-            return b"".join(f.readlines()[-lines:]).decode("utf-8", "replace")
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            buf = b""
+            while pos > 0 and buf.count(b"\n") <= lines and len(buf) < cap:
+                step = min(chunk, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+            return b"\n".join(buf.splitlines()[-lines:]).decode("utf-8", "replace")
     except OSError as e:
         return f"(unreadable: {e})"
 
