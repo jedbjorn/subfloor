@@ -178,6 +178,48 @@ sc_deps() {
   base_reqs="$(printf '%s\n' "$reqs" | grep -v 'requirements-dev\.txt' || true)"
   if [ -n "$skip_py" ]; then
     echo "→ deps: python deps are host-managed (pinned interpreter mounted by launch) — skipping venv/pip in the sandbox"
+    # Never green-lie the skip (#314/#324/#339): the pinned tree carries what
+    # the host installed at launch time, which silently lags the fork's
+    # declared pins (a branch adds requirements → deps says done → 12 mystery
+    # ModuleNotFoundError test failures). Verify every declared pin resolves
+    # in the mounted tree; a missing one is a hard failure with the fix named,
+    # not a ✓. (Installing from in here stays off-limits by design — the tree
+    # is host-managed and shared.)
+    if [ -n "$base_reqs" ]; then
+      missing="$(printf '%s\n' "$base_reqs" | "$venv/bin/python" -c '
+import importlib.metadata as md, re, sys
+missing = []
+for path in (l.strip() for l in sys.stdin):
+    if not path:
+        continue
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        continue
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        # skip options (-r/-e/--hash), URL/path requirements — only plain pins verify
+        if not line or line.startswith("-") or "://" in line or line.startswith((".", "/")):
+            continue
+        name = re.split(r"[<>=!~\[; ]", line, 1)[0].strip()
+        if not name:
+            continue
+        try:
+            md.version(name)
+        except md.PackageNotFoundError:
+            missing.append(line)
+print("\n".join(missing))
+')"
+      if [ -n "$missing" ]; then
+        echo "✗ deps: host-managed venv is missing declared python deps:" >&2
+        printf '%s\n' "$missing" | sed 's/^/    /' >&2
+        echo "  Fix: install the pins above into the pinned venv — on the host (e.g. uv pip install …)," >&2
+        echo "  or \`$venv/bin/pip install <pins>\` (the mounted tree accepts installs; ownership lands root)." >&2
+        rc=1
+      else
+        echo "→ deps: host-managed tree verified — every declared python pin present"
+      fi
+    fi
   else
   # The engine dev kit lives in this .venv, so create it unconditionally — a fork
   # that declares no requirements*.txt still needs pytest on hand for `./sc test`
@@ -255,7 +297,18 @@ sc_test() {
   rc=0
   if [ -x "$venv/bin/pytest" ]; then
     echo "→ test: $venv/bin/pytest"
-    ( cd "$here" && "$venv/bin/pytest" "$@" ) || rc=1
+    ( cd "$here" && "$venv/bin/pytest" "$@" )
+    prc=$?
+    if [ "$prc" -eq 5 ] && [ $# -eq 0 ]; then
+      # pytest exit 5 = collected nothing. On a bare `./sc test` in a fork with
+      # no python tests (JS-only forks: vitest is the real suite) that is not a
+      # failure — counting it as one left every JS-only fork permanently red
+      # (#310). With explicit args a collection miss stays red: a typo'd path
+      # must not pass green.
+      echo "→ test: pytest collected no python tests — not counted as a failure (JS-only fork)"
+    elif [ "$prc" -ne 0 ]; then
+      rc=1
+    fi
   elif ls "$here"/tests/test_*.py >/dev/null 2>&1; then
     # pytest still unavailable after provisioning (venv create failed, or a
     # host-managed sandbox interpreter that skips pip). A fork that *declares*

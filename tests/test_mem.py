@@ -34,6 +34,7 @@ import mem  # noqa: E402
 import server  # noqa: E402
 
 TOKEN = "test-token-deadbeef"
+PEER_TOKEN = "peer-token-cafebabe"   # second shell — cross-shell read coverage
 
 
 def build_engine_db(path: Path) -> None:
@@ -48,6 +49,10 @@ def build_engine_db(path: Path) -> None:
         "INSERT INTO shells (shell_id, display_name, shortname, mandate, system_prompt, "
         "user_id, is_shared, has_identity, bootstrapped, api_key) "
         "VALUES (1, 'TC', 'tc', 'test', 'sp', 1, 0, 1, 0, ?)", (TOKEN,))
+    con.execute(
+        "INSERT INTO shells (shell_id, display_name, shortname, mandate, system_prompt, "
+        "user_id, is_shared, has_identity, bootstrapped, api_key) "
+        "VALUES (2, 'Peer', 'peer', 'test', 'sp', 1, 0, 1, 0, ?)", (PEER_TOKEN,))
     con.execute(
         "INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date) "
         "VALUES (1, 1, '0001', '2026-01-01')")
@@ -202,6 +207,28 @@ class ApiMemTest(unittest.TestCase):
         self.assertEqual(
             self.q("SELECT COUNT(*) FROM shell_decisions "
                    "WHERE decision IN ('bad feature','bad doc')")[0], 0)
+
+    # ── decisions read fleet-wide; writes stay token-scoped (#318/#340) ───────
+    def test_decisions_read_fleet_wide(self):
+        saved = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = PEER_TOKEN
+        try:
+            self.run_mem("decision", "peer design lock", "--rationale", "peer why")
+        finally:
+            mem.SC_API_TOKEN = saved
+        did = self.q("SELECT decision_id FROM shell_decisions "
+                     "WHERE decision='peer design lock'")[0]
+        # by-id resolves from another seat — a cross-shell citation is live
+        one = mem._api("GET", f"/_sc/mem/decisions/{did}")["decision"]
+        self.assertEqual(one["rationale"], "peer why")
+        self.assertEqual(one["shortname"], "peer")
+        # the full log carries it too, attributed to its author
+        alld = mem._api("GET", "/_sc/mem/decisions?all=1")["decisions"]
+        row = next(d for d in alld if d["decision_id"] == did)
+        self.assertEqual(row["shortname"], "peer")
+        # the write itself stayed scoped to the author's token
+        self.assertEqual(self.q("SELECT shell_id FROM shell_decisions "
+                                "WHERE decision_id=?", did)[0], 2)
 
     # ── flags ─────────────────────────────────────────────────────────────────
     def test_flag_open_then_close(self):

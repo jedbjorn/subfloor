@@ -23,6 +23,7 @@ Run from the repo root, like every engine command:
     ./sc mem which                                 # confirm API reachability + who your token resolves to
     ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
     ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
+                                                   # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
     ./sc mem state "<text>"
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
     ./sc mem lns   "<body>"          [--date …] [--tag …]
@@ -192,8 +193,9 @@ def _render_get(surface: str, data: dict) -> int:
         def _line(d) -> None:
             par = f" (supersedes #{d['parent_decision_id']})" if d.get("parent_decision_id") else ""
             sup = f" (superseded by #{d['superseded_by']})" if d.get("superseded_by") else ""
+            who = f" @{d['shortname']}" if d.get("shortname") else ""
             print(f"#{d['decision_id']} [{d.get('priority') or 'M'}] "
-                  f"{d.get('decision_date') or ''}{par}{sup}")
+                  f"{d.get('decision_date') or ''}{who}{par}{sup}")
             print("  " + (d.get("decision") or ""))
         if "decision" in data:                    # single decision, with rationale
             d = data["decision"]

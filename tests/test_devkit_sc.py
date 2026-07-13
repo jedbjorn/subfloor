@@ -85,5 +85,51 @@ class ImageFallbackTest(unittest.TestCase):
                          "fallback for host-managed-.venv forks")
 
 
+class DepsHostManagedVerifyTest(unittest.TestCase):
+    """#314/#324/#339 — the sandbox pip-skip must never green-lie: declared
+    pins missing from the host-managed tree are a hard failure, not a ✓."""
+
+    def test_skip_branch_verifies_and_fails_loud(self):
+        body = re.search(r"sc_deps\(\) \{.*?\n\}", SC, re.S).group(0)
+        self.assertIn("host-managed venv is missing declared python deps", body)
+        self.assertIn("importlib.metadata", body)
+        # the failure sets rc, so `✓ deps: done` can't follow a missing pin
+        miss_at = body.index("missing declared python deps")
+        self.assertIn("rc=1", body[miss_at:miss_at + 600])
+
+    def test_verify_snippet_flags_missing_pins_live(self):
+        import sys
+        m = re.search(r'-c \'\n(import importlib.*?)\n\'\)"', SC, re.S)
+        self.assertIsNotNone(m, "deps verify python snippet missing from sc")
+        snippet = m.group(1)
+        import importlib.metadata as md
+        present = next(iter(md.distributions())).metadata["Name"]
+        with tempfile.TemporaryDirectory() as tmp:
+            req = Path(tmp) / "requirements.txt"
+            req.write_text(f"{present}\n"
+                           "definitely-not-a-real-dist-xyz==9.9\n"
+                           "# a comment\n"
+                           "-e ./local\n"
+                           "https://example.com/wheel.whl\n")
+            out = subprocess.run([sys.executable, "-c", snippet],
+                                 input=f"{req}\n", capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            flagged = [l for l in out.stdout.splitlines() if l]
+            self.assertEqual(flagged, ["definitely-not-a-real-dist-xyz==9.9"],
+                             "exactly the missing plain pin — present dists, "
+                             "comments, editables, URLs all pass through")
+
+
+class TestVerbExitFiveTest(unittest.TestCase):
+    """#310 — pytest exit 5 (nothing collected) on a bare `./sc test` is a
+    JS-only fork, not a failed suite; with explicit args it stays a failure."""
+
+    def test_exit_five_handled_only_for_bare_invocation(self):
+        body = re.search(r"sc_test\(\) \{.*?\n\}", SC, re.S).group(0)
+        self.assertIn('"$prc" -eq 5', body)
+        self.assertIn('[ $# -eq 0 ]', body)
+        self.assertIn("not counted as a failure", body)
+
+
 if __name__ == "__main__":
     unittest.main()
