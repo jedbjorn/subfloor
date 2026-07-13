@@ -1,7 +1,7 @@
 ---
 title: super-coder
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
-date: 2026-06-14
+date: 2026-07-13
 project: super-coder
 purpose: Forkable shell substrate for a repo
 ---
@@ -367,7 +367,7 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 
 ★ = the harness the picker pre-selects for that flavor.
 
-The logic, three rules:
+The logic, four rules:
 
 - **Bookends premium, middle fast.** Planner and reviewer are *low-volume,
   high-leverage reasoning* — one good plan or one sharp review pays for the
@@ -508,6 +508,12 @@ graph TD
   the doc's **only writer**; participants report transitions by message and the
   planner folds them in. One writer, one board, no drift — the board is what
   the operator and any rebooted shell reads to re-orient mid-sprint.
+- **Crew size is the planner's call, not a formula.** The planner weighs the
+  magnitude of the push against the capacity actually available — the shells
+  that exist, reviewer bandwidth, how wide the dependency graph genuinely
+  runs. More units than shells is fine (units queue behind the chain); more
+  shells than parallel work is waste. One reviewer may gate several units —
+  it just mustn't become the whole sprint's bottleneck.
 - **Scoped merge authority.** Merging stays the operator's gate everywhere —
   a sprint grants the one narrow exception. A dev may merge **only** its
   assigned unit's PR, **only** on all-green checks, **only** after its reviewer
@@ -518,16 +524,12 @@ graph TD
   waiting for someone else's PR, and idle waiting used to cost a full-context
   harness turn per poll, per shell. Now every instruction and result is a
   typed `shell_messages` row: the planner sends `task` rows and boots workers
-  headless (`./sc run <shell>` — same render as an interactive boot, drains
-  the inbox, acts, exits); a dev opens its PR **and registers a watch for the
-  planner** (`./sc watch pr <owner/repo> <n> --shell <planner>`); the fork's
-  ONE GitHub watcher daemon (up with `./sc launch`) turns CI conclusions,
-  reviews, and merges into `pr_event` rows; the planner's zero-token inbox
-  watcher (`./sc watch inbox`, claude-harness) wakes it the moment any row
-  lands. Waking is not knowing: on wake a shell re-reads the board and its
-  inbox — the event only says "look". Watches retire themselves on
-  merge/close, and the whole coordination history replays from
-  `shell_messages` alone.
+  headless; a dev opens its PR and registers a watch for the planner; the
+  fork's ONE GitHub watcher daemon turns CI conclusions, reviews, and merges
+  into `pr_event` rows; the planner's zero-token inbox watcher wakes it the
+  moment any row lands. Waking is not knowing: on wake a shell re-reads the
+  board and its inbox — the event only says "look". The pieces and their
+  commands are *Under the hood — the event loop*, below.
 - **Models are declared per sprint.** Headless boots never pass the launch
   picker, so the model seam moves to the declaration: the planner asks the
   operator exactly two questions — which harness/model for **devs**, which
@@ -562,6 +564,53 @@ the nudge that replaces "is it alive?"), and escalates judgment: scope cuts
 and interface changes stay the operator's calls. The daemon never boots
 anything — it only writes rows; only the planner (or the operator) starts a
 session.
+
+### Under the hood — the event loop
+
+Four pieces carry a sprint's coordination, one direction of flow. The frozen
+design is [`specs_sc/sprint-eventing.md`](specs_sc/sprint-eventing.md).
+
+- **Typed messages.** Every `shell_messages` row carries a `kind`: `shell`
+  (ordinary shell-to-shell mail, the default), `task` (planner → worker
+  instruction), `result` (worker → planner completion report), `pr_event`
+  (daemon → shell GitHub transition). The sprint trail is one query, and a
+  rebooted planner — or the operator — can replay the whole coordination
+  history from the table alone.
+- **One watcher daemon per fork.** `./sc watch pr <owner/repo> <n>
+  --shell <shortname>` registers a PR in the `watched_prs` registry (the
+  `sprint` skill does it in the same step that opens the PR). The daemon —
+  supervised by `./sc launch` / `./sc down` like the brokers — covers every
+  live watch with one batched GraphQL poll and turns transitions (checks
+  concluded, review submitted, merged, closed) into one-line `pr_event`
+  rows: the message is the wake-up, not the payload. On merge/close a watch
+  retires itself; `./sc watch list` shows what's live. The daemon only ever
+  writes rows — it never boots shells and never touches git.
+- **Headless workers.** `./sc run <shortname> [-p "<prompt>"]
+  [--harness <h>] [-m <model>]` boots a shell non-interactively: the same
+  render as `./sc enter`, then a per-harness adapter — `claude -p` ·
+  `codex exec` · `opencode run`. The default prompt is *"Check your inbox
+  and act on your unread messages."* Harness + model resolve explicit flags
+  → the sprint doc's `models:` line → `flavor_defaults`; a liveness guard
+  refuses a shell that already has a live session. Workers become
+  ephemeral, per-task sessions — boot fresh, act, report a `result` row,
+  exit — so no worker context accretes across the sprint, while memory,
+  archives, and messages accrete in the DB exactly as in an interactive
+  session.
+- **A zero-token wake for the planner.** `./sc watch inbox` blocks until a
+  message row lands, then exits — armed as a background task, its exit
+  wakes the live planner session the moment anything arrives, at zero token
+  cost while idle. Claude-harness only; on other harnesses the planner
+  keeps the task-boundary inbox check, so correctness is identical and only
+  wake latency degrades.
+
+```linear
+Planner sends task row :::class1 -> sc run dev (headless) :::class2 -> Dev builds, opens PR + watch :::class2 -> CI concludes :::class3 -> Daemon writes pr_event :::class3 -> Watcher wakes planner :::class1 -> Planner boots next unit :::class1
+```
+
+The bar the feature shipped against: a unit goes task → build → PR → green →
+review → merge with **zero scheduled polling by any shell** — the planner is
+woken by rows, workers are booted per task, and the full history replays
+from `shell_messages`.
 
 ## Update a fork
 
@@ -688,6 +737,9 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc launch              # build + start the sandbox container (server + GUI), 127.0.0.1 only
 ./sc enter               # attach a session: auth + pick a shell + pick a harness + boot
 ./sc enter-<shortname>   # attach + boot one shell directly, skip the shell picker
+./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
+./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
+./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
 ./sc down                # stop + remove the sandbox container
 ./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
