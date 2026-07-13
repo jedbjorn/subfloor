@@ -53,13 +53,13 @@ from you.
 
 5. **Snapshot + commit:**
    ```bash
-   sc snapshot
+   SC_ADMIN=1 sc snapshot
    ```
    Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
    - **Content-seed migration** (seeds system content that renders — skills,
      flavor defaults) also changes the flat `_sc` mirrors, but only once the
      new rows are in the DB: after `sc update --no-fetch`, run
-     `sc render && sc render-check` and commit the re-rendered `_sc` files
+     `SC_ADMIN=1 sc render && sc render-check` and commit the re-rendered `_sc` files
      alongside the migration. A render against a DB predating the seed passes
      locally while CI's hermetic rebuild goes red — the stale-mirror trap; see
      the `snapshot` skill.

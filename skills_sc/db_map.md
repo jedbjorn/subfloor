@@ -25,12 +25,23 @@ through the engine API, via `sc mem`:
   `documents` returns the one doc *with* its body.
 - **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
-There is NO `sqlite3` path — not as a fallback, not for "ad-hoc" reads. If the
-API isn't wired, `sc mem` fails loud instead of writing the DB behind its
-back. Your identity rides in your bearer token — the server resolves token ->
-shell; never name a shell in a write. The table below = the data model behind
-those surfaces (what each `sc mem` write touches), not a query cheatsheet.
-Lazy-load: `get` the one surface you need, don't bulk-read.
+There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
+If the API isn't wired, `sc mem` fails loud instead of writing the DB behind
+its back. Your identity rides in your bearer token — the server resolves
+token -> shell; never name a shell in a write. Decisions read FLEET-WIDE
+(every row, tagged `@shortname`) so cross-shell citations resolve; every
+other identity surface reads as you.
+
+**The `sc sql` lane** (read-only; `sc sql-rw` gated) is real and blessed for
+what `sc mem` doesn't cover: admin/reporting reads and sweep queries — the
+flag_sweep / git_cleanup skills run it by design. The doctrine is one level
+down: memory-surface reads and writes go through `sc mem`; `sc sql` is for
+reporting ACROSS surfaces, never a write path for identity/memory (that is
+what `sc mem` scopes and validates).
+
+The table below = the data model behind those surfaces (what each `sc mem`
+write touches), not a query cheatsheet. Lazy-load: `get` the one surface you
+need, don't bulk-read.
 
 **Need a read/write `sc mem` doesn't expose?** Report the gap, don't reach for
 the DB — the direct path is closed by design, and a fork can't patch the

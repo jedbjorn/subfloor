@@ -15,8 +15,10 @@ Reviewer procedure — read a diff against its spec along three axes (code quali
 # review — gate a diff against its spec
 
 The reviewer's job end to end. You are a **different lineage than the code**
-(see the README's model note) -> read adversarially: disprove the claim that
-the work is correct, don't confirm it. `<self>` = your shell_id.
+— reviewer shells are deliberately booted on a different model family than
+the authoring dev, so the review doesn't share the author's blind spots ->
+read adversarially: disprove the claim that the work is correct, don't
+confirm it. `<self>` = your shell_id.
 
 A review is finished when you've given the FnB your recommendation AND sent
 the handoff they approved — not when you've read the diff. Every outbound
