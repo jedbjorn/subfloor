@@ -83,3 +83,7 @@ _No open flags._
 Fork super-coder into dos-arch / rst-c / emergence / md-converter; reseed pattern.
 
 _No open flags._
+
+### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
+
+_No open flags._
