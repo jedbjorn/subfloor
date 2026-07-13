@@ -1,6 +1,6 @@
 ---
 name: flags
-description: Track blockers as flags — surface open ones, open new ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.
+description: Track blockers as flags — surface open ones, open new ones, edit long-lived ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.
 category: substrate
 common: false
 ---
@@ -52,6 +52,16 @@ Recipient = whoever the flag blocks:
 
 Message pairs with the *open* only: NEVER re-message a flag that is already
 open; NEVER message on `close`.
+
+## Edit
+
+```
+sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
+```
+
+For long-lived tracker flags (one flag per arc, description updated
+progressively as gates clear). `--description` replaces the whole text —
+carry forward what still applies.
 
 ## Resolve
 

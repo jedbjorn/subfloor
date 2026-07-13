@@ -1058,12 +1058,14 @@ sc mem roadmap depends <feature_id> --on <id> [--on <id>]   # set dependencies (
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 sc mem doc freeze <document_id>
 
-# spec_tasks (the plan): add a task / advance it:
+# spec_tasks (the plan): add a task / advance it / close it honestly:
 sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
 sc mem task start <task_id>     # sc mem task done <task_id>
+sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
 
-# open / close a flag:
+# open / edit / close a flag:
 sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
+sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"
 
 # projects (standing + linkage):
@@ -1579,7 +1581,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'flags',
-  'Track blockers as flags — surface open ones, open new ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.',
+  'Track blockers as flags — surface open ones, open new ones, edit long-lived ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.',
   'substrate',
   NULL,
   0,
@@ -1630,6 +1632,16 @@ Recipient = whoever the flag blocks:
 
 Message pairs with the *open* only: NEVER re-message a flag that is already
 open; NEVER message on `close`.
+
+## Edit
+
+```
+sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
+```
+
+For long-lived tracker flags (one flag per arc, description updated
+progressively as gates clear). `--description` replaces the whole text —
+carry forward what still applies.
 
 ## Resolve
 
@@ -3156,6 +3168,17 @@ Work ONLY that task. When done:
 ```
 sc mem task done <task_id>
 ```
+
+A planned task overtaken by a feature split or re-scope (its work moved to
+another feature/spec, never built here) is cancelled, not done:
+
+```
+sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
+```
+
+NEVER mark unbuilt work `done` and NEVER leave it `pending` under a shipped
+feature — the task ledger is how a planner answers "is this feature actually
+finished."
 
 Re-read the plan (`sc mem get tasks --doc <doc_id>`) and resolve from it:
 `last_done` = highest-`seq` `done` task; `next_up` = lowest-`seq` `pending`.

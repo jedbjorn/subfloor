@@ -30,6 +30,7 @@ Run from the repo root, like every engine command:
     ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--feature ID] [--doc ID]
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID]
     ./sc mem flag close <flag_id>    [--notes "…"]
+    ./sc mem flag edit  <flag_id>    [--description "…"] [--priority P] [--feature ID]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>]
     ./sc mem roadmap status <feature_id> <status>
     ./sc mem roadmap edit <feature_id> [--title "…"] [--summary "…"]   # revise a feature's title/summary
@@ -40,6 +41,7 @@ Run from the repo root, like every engine command:
     ./sc mem project status <shortname|id> active|inactive|paused
     ./sc mem task add "<title>" --feature <id> --doc <id> --seq <n> [--desc "…"]
     ./sc mem task start <task_id>    ./sc mem task done <task_id>
+    ./sc mem task cancel <task_id>   [--notes "…"]   # work moved/rescoped — never built
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
@@ -297,6 +299,8 @@ def _render_get(surface: str, data: dict) -> int:
                   f"{t.get('title') or ''}")
             if t.get("description"):
                 print("  " + t["description"])
+            if t.get("resolution_notes"):
+                print("  ⤷ " + t["resolution_notes"])
         return 0
     if surface == "messages":
         msgs = data.get("messages", [])
@@ -370,7 +374,24 @@ def cmd_retire(args) -> int:
     return _finish_api(f"mem: identity entry #{args.entry_id} retired (slot freed)")
 
 
+# Sibling verb vocabulary across `sc mem` subcommands. `decision` takes its
+# text as a positional, so a lone `add` (a subcommand guess by analogy with
+# `task add` / `flag open`) used to land verbatim in the append-only decision
+# log — permanent junk (#311). A single-token body colliding with this set is
+# almost never a real decision; require --force for the rare one that is.
+_VERB_VOCAB = {"add", "edit", "open", "close", "list", "get", "set",
+               "start", "done", "cancel", "status", "standing", "depends",
+               "project", "freeze", "retire", "send", "check", "sent",
+               "mark-read", "delete", "remove", "update", "new", "help"}
+
+
 def cmd_decision(args) -> int:
+    text = args.decision.strip()
+    if not args.force and " " not in text and text.lower() in _VERB_VOCAB:
+        die(f"'{text}' looks like a subcommand guess, not a decision — "
+            f"`sc mem decision` records its positional argument verbatim in "
+            f"the append-only log (no delete exists). Pass the decision text "
+            f"in quotes, or --force if '{text}' really is the decision.")
     r = _api("POST", "/_sc/mem/decisions",
              {"decision": args.decision,
               "rationale": args.rationale,
@@ -392,6 +413,20 @@ def cmd_flag(args) -> int:
                   "feature_id": args.feature})
         return _finish_api(f"mem: flag #{r.get('flag_id', '')} opened"
                            f"{f' ({args.name})' if args.name else ''}")
+    if args.flag_cmd == "edit":
+        # Long-lived tracker flags update their description progressively
+        # (#316) — the API always supported the PATCH; this exposes it.
+        payload: dict = {}
+        if args.description is not None:
+            payload["description"] = args.description
+        if args.priority is not None:
+            payload["priority"] = args.priority
+        if args.feature is not None:
+            payload["feature_id"] = args.feature
+        if not payload:
+            die("nothing to edit — pass at least one of --description / --priority / --feature")
+        _api("PATCH", f"/_sc/mem/flags/{args.flag_id}", payload)
+        return _finish_api(f"mem: flag #{args.flag_id} edited ({' + '.join(payload)})")
     _api("PATCH", f"/_sc/mem/flags/{args.flag_id}",
          {"resolved": True, "resolution_notes": args.notes})
     return _finish_api(f"mem: flag #{args.flag_id} closed")
@@ -449,6 +484,15 @@ def cmd_task(args) -> int:
                  {"title": args.title, "feature_id": args.feature,
                   "document_id": args.doc, "seq": args.seq, "description": args.desc})
         return _finish_api(f"mem: task #{r.get('task_id', '')} added (seq {args.seq}, '{args.title}')")
+    if args.task_cmd == "cancel":
+        # The honest terminal state for a task overtaken by a feature split /
+        # re-scope (#342): the work was never built — 'done' would be a lie,
+        # 'pending' under a shipped feature is drift. Notes say why/where.
+        payload: dict = {"status": "cancelled"}
+        if args.notes is not None:
+            payload["resolution_notes"] = args.notes
+        _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", payload)
+        return _finish_api(f"mem: task #{args.task_id} → cancelled")
     status = "in_progress" if args.task_cmd == "start" else "done"
     _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", {"status": status})
     return _finish_api(f"mem: task #{args.task_id} → {status}")
@@ -586,6 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("decision", help="record a Major decision")
     sp.add_argument("decision")
+    sp.add_argument("--force", action="store_true",
+                    help="record even a bare verb-like single word (see #311 guard)")
     sp.add_argument("--rationale")
     sp.add_argument("--date")
     sp.add_argument("--parent", type=int, help="parent_decision_id (supersession)")
@@ -595,13 +641,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="document_id this decision shaped (implies its feature)")
     sp.set_defaults(fn=cmd_decision)
 
-    sp = sub.add_parser("flag", help="open or close a flag")
+    sp = sub.add_parser("flag", help="open, edit, or close a flag")
     fsub = sp.add_subparsers(dest="flag_cmd", required=True)
     fo = fsub.add_parser("open")
     fo.add_argument("description")
     fo.add_argument("--name")
     fo.add_argument("--priority", default="Medium", choices=["High", "Medium", "Low"])
     fo.add_argument("--feature", type=int)
+    fe = fsub.add_parser("edit", help="update an open flag's description/priority/feature")
+    fe.add_argument("flag_id", type=int)
+    fe.add_argument("--description")
+    fe.add_argument("--priority", choices=["High", "Medium", "Low"])
+    fe.add_argument("--feature", type=int)
     fc = fsub.add_parser("close")
     fc.add_argument("flag_id", type=int)
     fc.add_argument("--notes")
@@ -649,7 +700,7 @@ def build_parser() -> argparse.ArgumentParser:
     pss.add_argument("status", choices=["active", "inactive", "paused"])
     sp.set_defaults(fn=cmd_project)
 
-    sp = sub.add_parser("task", help="spec_tasks: add / start / done")
+    sp = sub.add_parser("task", help="spec_tasks: add / start / done / cancel")
     tsub = sp.add_subparsers(dest="task_cmd", required=True)
     ta = tsub.add_parser("add")
     ta.add_argument("title")
@@ -661,6 +712,10 @@ def build_parser() -> argparse.ArgumentParser:
     tst.add_argument("task_id", type=int)
     tdn = tsub.add_parser("done")
     tdn.add_argument("task_id", type=int)
+    tcl = tsub.add_parser("cancel",
+                          help="terminal close without building — split/re-scope moved the work")
+    tcl.add_argument("task_id", type=int)
+    tcl.add_argument("--notes", help="why + where the work went (e.g. 'moved to F117 as task #431')")
     sp.set_defaults(fn=cmd_task)
 
     sub.add_parser("oriented", help="mark this shell oriented (bootstrapped=1)") \

@@ -156,6 +156,17 @@ Work ONLY that task. When done:
 sc mem task done <task_id>
 ```
 
+A planned task overtaken by a feature split or re-scope (its work moved to
+another feature/spec, never built here) is cancelled, not done:
+
+```
+sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
+```
+
+NEVER mark unbuilt work `done` and NEVER leave it `pending` under a shipped
+feature — the task ledger is how a planner answers "is this feature actually
+finished."
+
 Re-read the plan (`sc mem get tasks --doc <doc_id>`) and resolve from it:
 `last_done` = highest-`seq` `done` task; `next_up` = lowest-`seq` `pending`.
 Advance `current_state`:

@@ -95,12 +95,14 @@ sc mem roadmap depends <feature_id> --on <id> [--on <id>]   # set dependencies (
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 sc mem doc freeze <document_id>
 
-# spec_tasks (the plan): add a task / advance it:
+# spec_tasks (the plan): add a task / advance it / close it honestly:
 sc mem task add "…" --feature <id> --doc <doc_id> --seq <n> [--desc "…"]
 sc mem task start <task_id>     # sc mem task done <task_id>
+sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
 
-# open / close a flag:
+# open / edit / close a flag:
 sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
+sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"
 
 # projects (standing + linkage):
