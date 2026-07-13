@@ -237,6 +237,9 @@ CREATE TABLE flags (
 -- ── Spec tasks (per-instance — implementation plan for a spec) ──────────────
 -- One row per task. Seq 0 = Preparation, last seq = Verification, middle = impl
 -- steps. Status drives current_state updates (last done + next pending).
+-- 'cancelled' + resolution_notes (migration 0064 rebuild, #342): the honest
+-- terminal state for a task overtaken by a feature split/re-scope — the work
+-- was never built; the notes say why and where it went.
 
 CREATE TABLE spec_tasks (
     task_id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,8 +249,9 @@ CREATE TABLE spec_tasks (
     title          TEXT    NOT NULL,
     description    TEXT,
     status         TEXT    NOT NULL DEFAULT 'pending'
-                   CHECK(status IN ('pending','in_progress','done')),
+                   CHECK(status IN ('pending','in_progress','done','cancelled')),
     completed_date DATE,
+    resolution_notes TEXT,
     shell_id       INTEGER REFERENCES shells(shell_id),
     created_date   DATE    NOT NULL DEFAULT (date('now')),
     UNIQUE(document_id, seq)
