@@ -3299,7 +3299,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'sprint',
-  'Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Load when a sprint task message names you a participant.',
+  'Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.',
   'craft',
   NULL,
   0,
@@ -3386,6 +3386,34 @@ planner overrule -> your call stands; an overrule arrives as a `task`
 row and is worked like a review finding. Repeat your open calls in the
 review request (step 6) so the reviewer gates against your reading, not
 its own guess.
+
+## Local long work — suites, benches, builds
+
+A harness background task is session-scoped: in a headless boot it dies
+with the session, silently — "the harness will wake me" is false there.
+Never park a suite, bench, build, or watcher on one. Long local work
+goes through `./sc job`, two patterns:
+
+- **Fire-and-wake (default):** `./sc job start [--label <x>]
+  [--timeout <s>] -- <cmd>` — the job survives your session; completion
+  lands in YOUR inbox as a `result` row, and the normal event loop (your
+  next boot''s inbox drain) acts on it. If the sprint waits on the
+  outcome, report the job id to the planner, then end the turn.
+- **Wait-slice (the result decides THIS turn''s next step):**
+  `./sc job wait <id>` blocks ≤550s in the foreground — exit 0 =
+  finished · 2 = still running. Between slices drain your inbox
+  (`sc mem message check`) and act on what landed — a planner hold read
+  only after your suite finished was a stale-slot build — then slice
+  again.
+
+Set `--timeout` on anything that can wedge: a deadlocked suite becomes
+a bounded failure with a completion row, not a four-hour hole in the
+sprint.
+
+**Measurements:** a local bench is exploratory only. A perf number that
+gates a merge or decides a design is CI-vs-CI on the same runner, in
+one run — local numbers die with sessions and double-launches; they
+have contaminated a sprint decision before.
 
 ## The loop (dev slot)
 
@@ -3578,6 +3606,9 @@ between two units — are yours to catch.
 - No scheduled polling, ever: `task` rows and headless boots wake you;
   `pr_event` rows wake the planner; the sprint doc tells you what a wake
   means.
+- Nothing that must outlive the turn rides a harness background task —
+  local long work goes through `./sc job`; measurement claims are
+  CI-vs-CI on one runner.
 - Register the watch in the same step that opens the PR — an unwatched PR
   is a silent link, and silent links revert the sprint to polling.
 - Report state transitions (`building → pr-open → in-review → fixing →
@@ -3694,6 +3725,13 @@ exit is your wake-up):
 ./sc watch inbox        # background it via your harness''s background-task tool
 ```
 
+**Interactive sessions only.** A harness background task is
+session-scoped: in a headless (`-p`) boot it dies with the session,
+silently — six sprint stalls traced to exactly this. A headless planner
+turn arms nothing: drain the inbox, act, end the turn — the next event
+row boots you again. The watcher belongs to the long-lived interactive
+planner seat, nowhere else.
+
 Re-arm it every time you finish draining your inbox. On other harnesses
 the watcher isn''t available — check your inbox at every task boundary
 instead; correctness is identical, latency degrades gracefully. (Strong
@@ -3807,6 +3845,18 @@ Stalls and the moves:
 - **Re-sequencing**: edit the board + `task` row to *every* affected dev
   with its new slot — a dev acting on a stale slot is worse than a paused
   one.
+- **Every worker boot failing at once**: check provider auth and spend
+  limits BEFORE debugging the engine — a monthly cap presents as a
+  fleet-wide boot failure and costs an hour of misdiagnosis. Pause at a
+  clean gate (units green, nothing mid-merge), surface to the FnB (auth
+  switch is theirs), resume where the board says you stopped.
+- **CI queue clogged at the tail**: a queued verify whose commit a later
+  stack head already supersedes is pure queue time — cancel it (`gh run
+  cancel`) and let the head''s run stand for the stack. Cancelling
+  anything to protect a measurement run is allowed but logged: rationale
+  in the board or a `result` row, and re-run the cancelled check after.
+  Green means green — cancellation never substitutes for a verdict on
+  what still needs one.
 - **Judgment calls** (scope vs. deadline, cutting a unit, changing an
   interface another team reads): escalate to the FnB immediately — the one
   stall you can''t unblock yourself.
@@ -3894,6 +3944,10 @@ When every unit is `merged` and `main` is green:
 - Zero scheduled polling by any shell: rows wake you, you boot workers,
   watches retire themselves. A scheduled tracker anywhere in the sprint
   is a defect.
+- Local long work rides `./sc job` (see the `sprint` skill) — a job''s
+  completion is a `result` row like any other wake-up. A hand-rolled
+  nohup/poll waiter anywhere in the sprint is a defect: one sprint''s
+  hand-rolled waiter carried a self-match bug that masked a dead bench.
 - You manage; you never load code. Your context grows at coordination
   density — the workers'' grows at code density and is discarded per task.
 - Monitor > interrogate: `pr_event` rows and `gh` reads cost no dev a
@@ -4147,6 +4201,17 @@ stands alone; do NOT hunt for one the fork doesn''t ship.
 8. **Reject silent-empty.** Bad filter / typo''d enum value -> assert 422
    explicitly, never a 200 reading as "nothing found."
 
+9. **Cleanup lives in the fixture, never after the asserts.** A resource
+   opened in a test body (connection, file handle, subprocess) and closed
+   on the line after the assertions leaks exactly when the test FAILS —
+   the worst possible correlation: the suite hangs or exhausts a pool
+   only when it is catching bugs (a close-after-assert probe connection
+   deadlocked three concurrent pytest runs of one file for four hours in
+   a dos-arch sprint). Open in a fixture (`yield` + teardown /
+   `addfinalizer`) or a `with` block; teardown must run on the red path.
+   Audit pattern: AST-scan the suite for opens whose close sits after an
+   `assert` in the same body.
+
 ## Review lens (tests/ diff)
 
 - Read the assertions, not the test name.
@@ -4169,6 +4234,8 @@ this skill.
 
 ## Never
 
+- Close a resource on the line after an assert — a failing assert skips
+  it; fixtures own teardown (rule 9).
 - Mock the function under test, then assert the mock returned what you set.
 - Assert a key exists without asserting its value.
 - Let a count or status code stand in for "the right thing happened."

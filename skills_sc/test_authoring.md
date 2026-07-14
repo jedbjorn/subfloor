@@ -62,6 +62,17 @@ stands alone; do NOT hunt for one the fork doesn't ship.
 8. **Reject silent-empty.** Bad filter / typo'd enum value -> assert 422
    explicitly, never a 200 reading as "nothing found."
 
+9. **Cleanup lives in the fixture, never after the asserts.** A resource
+   opened in a test body (connection, file handle, subprocess) and closed
+   on the line after the assertions leaks exactly when the test FAILS —
+   the worst possible correlation: the suite hangs or exhausts a pool
+   only when it is catching bugs (a close-after-assert probe connection
+   deadlocked three concurrent pytest runs of one file for four hours in
+   a dos-arch sprint). Open in a fixture (`yield` + teardown /
+   `addfinalizer`) or a `with` block; teardown must run on the red path.
+   Audit pattern: AST-scan the suite for opens whose close sits after an
+   `assert` in the same body.
+
 ## Review lens (tests/ diff)
 
 - Read the assertions, not the test name.
@@ -84,6 +95,8 @@ this skill.
 
 ## Never
 
+- Close a resource on the line after an assert — a failing assert skips
+  it; fixtures own teardown (rule 9).
 - Mock the function under test, then assert the mock returned what you set.
 - Assert a key exists without asserting its value.
 - Let a count or status code stand in for "the right thing happened."

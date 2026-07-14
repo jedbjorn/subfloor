@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # sprint
 
-Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Load when a sprint task message names you a participant.
+Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.
 
 **Category:** craft
 
@@ -95,6 +95,34 @@ planner overrule -> your call stands; an overrule arrives as a `task`
 row and is worked like a review finding. Repeat your open calls in the
 review request (step 6) so the reviewer gates against your reading, not
 its own guess.
+
+## Local long work — suites, benches, builds
+
+A harness background task is session-scoped: in a headless boot it dies
+with the session, silently — "the harness will wake me" is false there.
+Never park a suite, bench, build, or watcher on one. Long local work
+goes through `./sc job`, two patterns:
+
+- **Fire-and-wake (default):** `./sc job start [--label <x>]
+  [--timeout <s>] -- <cmd>` — the job survives your session; completion
+  lands in YOUR inbox as a `result` row, and the normal event loop (your
+  next boot's inbox drain) acts on it. If the sprint waits on the
+  outcome, report the job id to the planner, then end the turn.
+- **Wait-slice (the result decides THIS turn's next step):**
+  `./sc job wait <id>` blocks ≤550s in the foreground — exit 0 =
+  finished · 2 = still running. Between slices drain your inbox
+  (`sc mem message check`) and act on what landed — a planner hold read
+  only after your suite finished was a stale-slot build — then slice
+  again.
+
+Set `--timeout` on anything that can wedge: a deadlocked suite becomes
+a bounded failure with a completion row, not a four-hour hole in the
+sprint.
+
+**Measurements:** a local bench is exploratory only. A perf number that
+gates a merge or decides a design is CI-vs-CI on the same runner, in
+one run — local numbers die with sessions and double-launches; they
+have contaminated a sprint decision before.
 
 ## The loop (dev slot)
 
@@ -287,6 +315,9 @@ between two units — are yours to catch.
 - No scheduled polling, ever: `task` rows and headless boots wake you;
   `pr_event` rows wake the planner; the sprint doc tells you what a wake
   means.
+- Nothing that must outlive the turn rides a harness background task —
+  local long work goes through `./sc job`; measurement claims are
+  CI-vs-CI on one runner.
 - Register the watch in the same step that opens the PR — an unwatched PR
   is a silent link, and silent links revert the sprint to polling.
 - Report state transitions (`building → pr-open → in-review → fixing →
