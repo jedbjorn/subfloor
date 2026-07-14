@@ -265,6 +265,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (13, 'Agents skill — delegated waves', 'shipped', 0, 1, 'New engine skill ''agents'' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.', '2026-07-06 15:08:37', '2026-07-06 15:08:37', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'shipped', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:30:04', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (15, 'Sprint reporting — unit reports, conformance pass, planner synthesis', 'next', 0, 1, 'Dev unit-report result rows at merge; pre-freeze conformance pass (review shells judge spec vs main, four-way verdicts); sprint report becomes a fixed skeleton the planner synthesizes from unit reports + conformance doc. Skill-text only — no schema, no CLI. See specs_sc/sprint-reporting.md.', '2026-07-13 20:04:22', '2026-07-13 20:04:22', 1);
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (16, 'Session-surviving job runner (sc job)', 'in_progress', 0, 1, NULL, '2026-07-14 07:14:59', '2026-07-14 07:14:59', NULL);
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -2222,6 +2223,143 @@ to its named sources. Silent deviations are either zero or itemized
 findings with rulings — "all units merged" and "the spec shipped" are
 finally separately-checked claims, and the report states both.
 ', 'specs_sc/sprint-reporting.md', '2026-07-13 20:04:30', '2026-07-13 20:04:30');
+INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (9, 16, 'spec', 1, 'sc job — session-surviving job runner', 0, NULL, '---
+title: sc job — session-surviving job runner
+tags: [jobs, sprints, headless, eventing, supervision]
+date: 2026-07-14
+project: super-coder
+purpose: Local long-running work that survives the session that started it
+---
+
+# sc job — session-surviving local job runner
+
+## Overview
+
+`./sc job` runs a long local command — a test suite, a bench, a build —
+as a **detached, supervised process** that survives the harness session
+that started it, and reports its completion as a `result` row in the
+starting shell''s own inbox. The existing eventing loop (inbox watcher,
+headless boots on message rows) then covers local long jobs exactly the
+way it already covers PR transitions: the process outlives the session;
+the completion row wakes the shell.
+
+```
+./sc job start [--label <slug>] [--timeout <sec>] -- <cmd ...>
+./sc job list [--all]
+./sc job status <id>
+./sc job tail <id> [-n N]
+./sc job wait <id> [--for <sec>]
+./sc job kill <id>
+```
+
+## Problem
+
+The dos-arch sprint-221 report''s recurring failure (~6 occurrences):
+sessions ended turns with suite runs, benches, and watches parked on
+harness background tasks. In a headless (`-p`) session those tasks die
+with the session — "the harness will wake me" is false. Consequences
+observed in one sprint: a bench that died silently and contaminated a
+measurement decision; a 4-hour wedge on a deadlocked local suite; an
+evolving stack of hand-rolled mitigations (detached runs with manual
+kill-0 poll slices, drain-inbox-between-slices discipline), each shell
+reinventing its own waiter — one with a self-match bug that masked the
+dead bench.
+
+> [!class1]
+> A harness background task is session-scoped. Anything that must
+> outlive the turn — a suite, a bench, a build — must not be parked on
+> one. `sc job` is the engine-owned answer; hand-rolled `nohup` + poll
+> loops are the thing it replaces.
+
+## Job lifecycle
+
+`start` spawns a small **supervisor** (`job.py _supervise <dir>`) in a
+new session (`setsid`), which spawns the command as its own process
+group, then:
+
+1. records the child pid in `meta.json`,
+2. streams combined stdout+stderr to `log`,
+3. waits for exit (or kills the group at `--timeout` seconds),
+4. writes `exit_code` + `finished_at` to `meta.json`,
+5. posts ONE completion message to the starting shell''s own inbox via
+   the engine API — kind `result`, body one line:
+   `job <id> (<label>) exited <code> after <duration> — log: <path>`,
+   stamped with a `dedupe_key` so an API retry never double-sends.
+
+The message is the wake-up, not the payload — detail lives in
+`sc job status` / `tail`. If the API is unreachable at completion the
+supervisor retries briefly, then gives up: `meta.json` still holds the
+result, `status`/`wait` still see it. The completion row is the fast
+path, never the only path.
+
+State lives under `<engine>/run/jobs/<id>/` — `meta.json` (cmd, label,
+cwd, owner shortname, timestamps, pid, exit) + `log`. No DB schema
+changes: the only DB surface is the existing `shell_messages` bus, and
+the supervisor is the one writer, through the API like any shell-side
+actor (token from the environment it inherited at `start`).
+
+## The two wait patterns
+
+- **Event-driven (preferred, planner-visible):** `job start`, report
+  the job id in your `result`/board row, end the turn. The completion
+  row wakes the shell through the normal inbox path. Nothing polls.
+- **Wait-slice (when the result decides THIS turn''s next step):**
+  `job wait <id> --for <sec>` blocks in the foreground up to `--for`
+  seconds (default 300, cap 550 — under harness foreground-timeout
+  limits). Exit 0 = finished (status line printed); exit 2 = still
+  running. Between slices: drain your inbox, then slice again. The
+  canonical waiter every shell was hand-rolling, once, correctly.
+
+> [!class4]
+> `job wait` exit codes: 0 done · 2 still running · 1 no such job.
+> A wait-slice loop that never drains the inbox between slices
+> reproduces the stale-state failure the sprint hit — the slice is
+> bounded exactly so the inbox gets read.
+
+## Timeouts and the wedge case
+
+`--timeout <sec>` arms the supervisor to SIGTERM (then SIGKILL after a
+grace period) the whole process group and report
+`exited timeout(-15) …`. The sprint''s 4-hour deadlocked pytest wedge is
+the motivating case: a wedged suite becomes a bounded failure with a
+completion row, not a silent hole in the sprint.
+
+`job kill <id>` is the manual form: SIGTERM to the group, recorded as
+killed, completion row still posted (by the supervisor, which survives).
+
+## Surfaces to change
+
+| Surface | Change |
+|---|---|
+| `scripts/job.py` | new — verbs + the supervisor |
+| `sc` dispatcher | `job)` arm + help stanza |
+| `run/jobs/` | new state dir (gitignored with the rest of `run/`) |
+| `shell_messages` | none — existing kind `result` + `dedupe_key` |
+| skills (`sprint`, `sprint_orchestration`) | teach: long local work goes through `sc job`; wait-slice + drain-inbox discipline (separate reseed) |
+| `tests/test_job.py` | new — lifecycle, wait codes, timeout, completion row |
+
+## Non-goals
+
+- **Fleet-wide job registry.** Jobs are per-shell, state is
+  engine-local to the worktree that started them; the completion row on
+  the message bus is the fleet-visible surface. A cross-shell `job list`
+  is a later feature if wanted.
+- **Supervision beyond one shot.** No restarts, no cron, no queues —
+  a job runs once and reports once. The brokers own long-lived services.
+- **Replacing CI.** CI-vs-CI on the same runner stays the decision
+  number for measurements (sprint-221 ruling); `sc job` exists so local
+  runs that do happen can''t die silently.
+
+## Done condition
+
+A headless sprint worker starts a 30-minute suite with
+`./sc job start --timeout 3600 -- …`, ends its turn immediately, and
+the suite keeps running. On exit the worker''s inbox gets one `result`
+row; the planner''s next boot of that shell acts on the outcome.
+`job wait` covers the in-turn case in ≤550s slices with inbox drains
+between. A wedged run dies at its timeout with a completion row instead
+of wedging the sprint. Zero scheduled polling anywhere.
+', 'specs_sc/job-runner.md', '2026-07-14 07:15:07', '2026-07-14 07:15:07');
 
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
@@ -2229,11 +2367,11 @@ INSERT INTO flags (flag_id, display_name, priority, description, created_date, r
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (3, 'SC-002', 'Medium', '[Docs] sprint eventing shipped (PR #338), feature doc pending — and the loop is unproven until a real sprint runs on it | Blocker for: eventing feature doc + first eventing sprint', '2026-07-13', NULL, 0, NULL, 14, NULL, NULL, 0);
 
 DELETE FROM spec_tasks;
-INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, shell_id, created_date) VALUES (1, 13, 6, 0, 'Preparation', 'Trace seed_skills/sync/regrant pipeline, asset format, migration numbering', 'done', '2026-07-06', 1, '2026-07-06');
-INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, shell_id, created_date) VALUES (2, 13, 6, 1, 'Author agents SKILL.md asset', 'Full skill body per spec: contract, dev/review overlays, monitoring, timeouts, verbatim ledger check', 'done', '2026-07-06', 1, '2026-07-06');
-INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, shell_id, created_date) VALUES (3, 13, 6, 2, 'Seed regen + forward migration', './sc seed-skills; 0049 self-contained UPSERT agents + spec/review reseed + dev/reviewer grants', 'done', '2026-07-06', 1, '2026-07-06');
-INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, shell_id, created_date) VALUES (4, 13, 6, 3, 'Templates + overlay pointers', 'dev.json/reviewer.json skills arrays; pointer lines in spec + review assets', 'done', '2026-07-06', 1, '2026-07-06');
-INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, shell_id, created_date) VALUES (5, 13, 6, 4, 'Verification', 'render-check hermetic pass, tests, local apply, snapshot+render, grants verified', 'done', '2026-07-06', 1, '2026-07-06');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (1, 13, 6, 0, 'Preparation', 'Trace seed_skills/sync/regrant pipeline, asset format, migration numbering', 'done', '2026-07-06', NULL, 1, '2026-07-06');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (2, 13, 6, 1, 'Author agents SKILL.md asset', 'Full skill body per spec: contract, dev/review overlays, monitoring, timeouts, verbatim ledger check', 'done', '2026-07-06', NULL, 1, '2026-07-06');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (3, 13, 6, 2, 'Seed regen + forward migration', './sc seed-skills; 0049 self-contained UPSERT agents + spec/review reseed + dev/reviewer grants', 'done', '2026-07-06', NULL, 1, '2026-07-06');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (4, 13, 6, 3, 'Templates + overlay pointers', 'dev.json/reviewer.json skills arrays; pointer lines in spec + review assets', 'done', '2026-07-06', NULL, 1, '2026-07-06');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (5, 13, 6, 4, 'Verification', 'render-check hermetic pass, tests, local apply, snapshot+render, grants verified', 'done', '2026-07-06', NULL, 1, '2026-07-06');
 
 DELETE FROM feature_blockers;
 
