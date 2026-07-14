@@ -274,6 +274,65 @@ class PollOnceTest(unittest.TestCase):
         self.assertIn("pullRequest(number: 22)", q)
 
 
+# ── daemon heartbeat (#359): beat upsert + liveness rendering ────────────────
+
+class HeartbeatTest(unittest.TestCase):
+    def setUp(self):
+        self.con = build_db()
+
+    def tearDown(self):
+        self.con.close()
+
+    def beat_rows(self):
+        return self.con.execute(
+            "SELECT name, beat_at, interval_s FROM daemon_heartbeats").fetchall()
+
+    def test_beat_inserts_then_updates_one_row(self):
+        watch.beat(self.con, 75)
+        rows = self.beat_rows()
+        self.assertEqual([(r["name"], r["interval_s"]) for r in rows], [("watch", 75)])
+        watch.beat(self.con, 30)   # re-beat upserts — never a second row
+        rows = self.beat_rows()
+        self.assertEqual([(r["name"], r["interval_s"]) for r in rows], [("watch", 30)])
+
+    def test_daemon_once_beats_even_with_no_watches(self):
+        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
+        build_db(tmp).close()
+        old = watch.DB_PATH
+        watch.DB_PATH = tmp
+        try:
+            self.assertEqual(watch.main(["daemon", "--once"]), 0)
+        finally:
+            watch.DB_PATH = old
+        con = sqlite3.connect(tmp)
+        try:
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM daemon_heartbeats WHERE name='watch'"
+            ).fetchone()[0], 1)
+        finally:
+            con.close()
+
+
+class DaemonLineTest(unittest.TestCase):
+    def test_never_run(self):
+        self.assertIn("never run", watch.daemon_line(None))
+        self.assertIn("NOT being polled", watch.daemon_line(None))
+
+    def test_live(self):
+        line = watch.daemon_line(
+            {"beat_at": "2026-07-15 09:00:00", "interval_s": 75, "age_s": 14, "stale": False})
+        self.assertIn("live", line)
+        self.assertIn("14s ago", line)
+        self.assertNotIn("NOT being polled", line)
+
+    def test_stale(self):
+        line = watch.daemon_line(
+            {"beat_at": "2026-07-14 20:22:19", "interval_s": 75, "age_s": 14520, "stale": True})
+        self.assertIn("STALE", line)
+        self.assertIn("4h ago", line)
+        self.assertIn("NOT being polled", line)
+
+
 # ── API: /_sc/watches + message kinds, over the real server ─────────────────
 
 class ApiTest(unittest.TestCase):
@@ -428,6 +487,73 @@ class HeadlessTest(unittest.TestCase):
         cmd = run.headless_command(self.adapter("claude"), "trailing prompt", "opus",
                                    ["--dangerously-skip-permissions"])
         self.assertEqual(cmd[-1], "trailing prompt")
+
+
+# ── API: daemon liveness on /_sc/watches (#359) ──────────────────────────────
+# Own DB + server so heartbeat state can't leak into ApiTest. Method names are
+# alphabetically ordered on purpose — the class DB is shared and the sequence
+# never → live → stale → dropped-table walks one heartbeat row through its
+# states.
+
+class DaemonLivenessApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.db = cls.tmp / "shell_db.db"
+        con = build_db(cls.db)
+        seed_shells(con)
+        con.close()
+        server.DB_PATH = cls.db
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        watch.SC_API_BASE = f"http://127.0.0.1:{cls.port}"
+        watch.SC_API_TOKEN = TOKEN
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def x(self, sql, *params):
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+
+    def test_a_no_heartbeat_reports_never_run(self):
+        r = watch._api("GET", "/_sc/watches")
+        self.assertIsNone(r["daemon"])
+
+    def test_b_fresh_beat_reports_live(self):
+        self.x("INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
+               "VALUES ('watch', datetime('now'), 75)")
+        d = watch._api("GET", "/_sc/watches")["daemon"]
+        self.assertFalse(d["stale"])
+        self.assertEqual(d["interval_s"], 75)
+        self.assertLessEqual(d["age_s"], 5)
+
+    def test_c_old_beat_reports_stale(self):
+        self.x("UPDATE daemon_heartbeats SET beat_at=datetime('now', '-1 hour') "
+               "WHERE name='watch'")
+        d = watch._api("GET", "/_sc/watches")["daemon"]
+        self.assertTrue(d["stale"])
+        self.assertGreaterEqual(d["age_s"], 3600)
+
+    def test_d_registration_response_carries_daemon(self):
+        r = watch._api("POST", "/_sc/watches", {"repo": "own/repo", "pr_number": 44})
+        self.assertTrue(r["daemon"]["stale"])   # still the -1h beat from test_c
+        r = watch._api("POST", "/_sc/watches", {"repo": "own/repo", "pr_number": 44})
+        self.assertTrue(r.get("existing"))      # idempotent path carries it too
+        self.assertTrue(r["daemon"]["stale"])
+
+    def test_e_pre_migration_db_degrades_to_never_run(self):
+        self.x("DROP TABLE daemon_heartbeats")
+        r = watch._api("GET", "/_sc/watches")
+        self.assertIsNone(r["daemon"])
 
 
 if __name__ == "__main__":

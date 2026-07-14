@@ -25,7 +25,10 @@ addressed to the watch's shell. Events: checks concluded (green or red),
 review submitted, merged, closed. On merge/close the final event is emitted
 and `closed_at` set — the watch retires itself. The daemon only ever writes
 message rows + its own registry state: it never boots shells, never marks
-anything read, never touches git.
+anything read, never touches git. Each cycle it also beats a heartbeat row
+(daemon_heartbeats) so `list`/`pr` can say whether anybody is actually
+polling (#359) — a dead daemon otherwise leaves watches reporting "live"
+with no eventing behind them.
 
 A `pr_event` body is one line — repo, PR, what changed, head SHA. Detail
 lives in `gh`; the message is the wake-up, not the payload.
@@ -100,6 +103,27 @@ def _api(method: str, path: str, payload: "dict | None" = None) -> dict:
         die(f"API unreachable ({SC_API_BASE}): {exc}")
 
 
+def _age_str(seconds: int) -> str:
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
+def daemon_line(d: "dict | None") -> str:
+    """Render the /_sc/watches `daemon` block as the liveness line (#359):
+    a watch is only as live as its poller, and `list` saying "live" while the
+    daemon is dead was the lying half of the dos-arch incident."""
+    dead = "watches are NOT being polled (host: ./sc watch-daemon-up)"
+    if not d or not d.get("beat_at"):
+        return f"  daemon: never run — {dead}"
+    age = _age_str(int(d.get("age_s") or 0))
+    if d.get("stale"):
+        return f"  daemon: STALE — last poll {age} ago ({d['beat_at']}Z); {dead}"
+    return f"  daemon: live — last poll {age} ago (interval {d.get('interval_s')}s)"
+
+
 def cmd_pr(args) -> int:
     _require_api()
     repo = args.repo.strip().strip("/")
@@ -116,12 +140,16 @@ def cmd_pr(args) -> int:
         state = "re-armed" if r.get("reopened") else "registered"
         print(f"watch: {repo}#{args.number} {state} for {who} (watch #{r['watch_id']})")
         print("  (pr_event rows land in the shell's inbox as the daemon sees transitions)")
+    d = r.get("daemon")
+    if not d or not d.get("beat_at") or d.get("stale"):
+        print(daemon_line(d))
     return 0
 
 
 def cmd_list(args) -> int:
     _require_api()
     r = _api("GET", "/_sc/watches" + ("?all=1" if args.all else ""))
+    print(daemon_line(r.get("daemon")))
     ws = r.get("watches", [])
     if not ws:
         print("watch: no watches" if args.all else "watch: no live watches")
@@ -323,6 +351,17 @@ def poll_once(con, fetch=_gh_graphql) -> int:
     return emitted
 
 
+def beat(con, interval: int) -> None:
+    """Heartbeat (#359): one UPSERT per poll cycle — idle cycles included —
+    so the watch surface can tell "no transition yet" from "nobody watching"."""
+    con.execute(
+        "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
+        "VALUES ('watch', datetime('now'), ?) "
+        "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at, "
+        "interval_s=excluded.interval_s", (interval,))
+    con.commit()
+
+
 def cmd_daemon(args) -> int:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         die(f"no usable DB at {DB_PATH} — rebuild with ./sc rebuild")
@@ -331,6 +370,7 @@ def cmd_daemon(args) -> int:
     while True:
         con = db_driver.connect(DB_PATH)
         try:
+            beat(con, interval)
             n = poll_once(con)
             if n:
                 print(f"watch daemon: {n} pr_event(s) emitted", flush=True)

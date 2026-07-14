@@ -753,7 +753,14 @@ print('-> pg: added to $f')
 WATCH_DAEMON_PID="$ENGINE/run/watch-daemon.pid"
 
 sc_watch_daemon_alive() {
-  [ -f "$WATCH_DAEMON_PID" ] && kill -0 "$(cat "$WATCH_DAEMON_PID" 2>/dev/null)" 2>/dev/null
+  # pid exists AND is actually the daemon — a stale pidfile surviving a host
+  # reboot can point at a reused pid, and a bare kill -0 would false-skip the
+  # relaunch (#359: reboot killed the daemon; the sandbox auto-restarted, so
+  # nothing else looked wrong).
+  [ -f "$WATCH_DAEMON_PID" ] || return 1
+  pid="$(cat "$WATCH_DAEMON_PID" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  ps -p "$pid" -o args= 2>/dev/null | grep -q "watch\.py daemon"
 }
 sc_watch_daemon_up() {
   if ! command -v gh >/dev/null 2>&1; then

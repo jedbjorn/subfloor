@@ -303,6 +303,18 @@ CREATE TABLE watched_prs (
     UNIQUE (repo, pr_number, shell_id)
 );
 
+-- Daemon liveness (#359): the watcher daemon UPSERTs its row once per poll
+-- cycle; the /_sc/watches API turns beat age into a live/stale/never verdict
+-- so `./sc watch list` can't report watches "live" with nobody polling.
+-- See migrations/0068_watch_daemon_heartbeat.sql (convergent — carries an
+-- existing fork).
+
+CREATE TABLE daemon_heartbeats (
+    name        TEXT PRIMARY KEY,              -- 'watch' — one row per daemon
+    beat_at     TEXT    NOT NULL,              -- datetime('now') at last poll cycle
+    interval_s  INTEGER NOT NULL               -- the daemon's configured poll interval
+);
+
 -- ── Skills (system content — seeded from assets/, propagates) ────────────────
 
 CREATE TABLE skills (
