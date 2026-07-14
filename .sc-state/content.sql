@@ -265,7 +265,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (13, 'Agents skill — delegated waves', 'shipped', 0, 1, 'New engine skill ''agents'' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.', '2026-07-06 15:08:37', '2026-07-06 15:08:37', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'shipped', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:30:04', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (15, 'Sprint reporting — unit reports, conformance pass, planner synthesis', 'next', 0, 1, 'Dev unit-report result rows at merge; pre-freeze conformance pass (review shells judge spec vs main, four-way verdicts); sprint report becomes a fixed skeleton the planner synthesizes from unit reports + conformance doc. Skill-text only — no schema, no CLI. See specs_sc/sprint-reporting.md.', '2026-07-13 20:04:22', '2026-07-13 20:04:22', 1);
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (16, 'Session-surviving job runner (sc job)', 'in_progress', 0, 1, NULL, '2026-07-14 07:14:59', '2026-07-14 07:14:59', NULL);
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (16, 'Session-surviving job runner (sc job)', 'shipped', 0, 1, NULL, '2026-07-14 07:14:59', '2026-07-14 07:14:59', 1);
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -2223,7 +2223,7 @@ to its named sources. Silent deviations are either zero or itemized
 findings with rulings — "all units merged" and "the spec shipped" are
 finally separately-checked claims, and the report states both.
 ', 'specs_sc/sprint-reporting.md', '2026-07-13 20:04:30', '2026-07-13 20:04:30');
-INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (9, 16, 'spec', 1, 'sc job — session-surviving job runner', 0, NULL, '---
+INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (9, 16, 'spec', 1, 'sc job — session-surviving job runner', 1, '2026-07-14', '---
 title: sc job — session-surviving job runner
 tags: [jobs, sprints, headless, eventing, supervision]
 date: 2026-07-14
@@ -2360,6 +2360,83 @@ row; the planner''s next boot of that shell acts on the outcome.
 between. A wedged run dies at its timeout with a completion row instead
 of wedging the sprint. Zero scheduled polling anywhere.
 ', 'specs_sc/job-runner.md', '2026-07-14 07:15:07', '2026-07-14 07:15:07');
+INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (10, 16, 'doc', 1, 'sc job — local jobs that survive your session', 0, NULL, '---
+title: sc job — local jobs that survive your session
+tags: [jobs, sprints, headless, eventing]
+date: 2026-07-14
+project: super-coder
+purpose: How to run and wait on long local work with sc job
+---
+
+# sc job — local jobs that survive your session
+
+## What it is
+
+`./sc job` runs a long local command — a test suite, a bench, a build —
+as a detached, supervised one-shot that outlives the session that
+started it. When the job exits, its completion arrives as a `result`
+row in YOUR inbox: the same wake-up path PR events use, so the sprint
+loop needs nothing new to act on it.
+
+Reach for it whenever work must outlive the turn. A harness background
+task is session-scoped — in a headless (`-p`) boot it dies with the
+session, silently. That failure killed benches and wedged a sprint for
+four hours before this existed; the sprint skills now hard-ban parking
+long work on one.
+
+## The verbs
+
+```
+./sc job start [--label <slug>] [--timeout <sec>] -- <cmd ...>
+./sc job list [--all]            # live jobs; --all includes finished
+./sc job status <id>             # state · pid · exit · timestamps · log path
+./sc job tail <id> [-n N]        # last N log lines (default 50)
+./sc job wait <id> [--for <sec>] # bounded foreground wait (≤550s slice)
+./sc job kill <id>               # SIGTERM→SIGKILL the whole process group
+```
+
+Job states: `running` · `done` · `failed` · `timeout` · `killed` ·
+`lost` (supervisor died without recording an exit — reboot/SIGKILL;
+check the log before trusting anything).
+
+## The two ways to wait
+
+**Fire-and-wake (default).** Start the job, report its id if someone
+is waiting on it, end the turn. The completion `result` row wakes you
+through the normal inbox path — nothing polls, nothing is parked on
+the session.
+
+**Wait-slice (the result decides this turn''s next step).**
+`./sc job wait <id>` blocks up to 550 seconds in the foreground and
+exits `0` = finished (status line printed) or `2` = still running.
+Between slices, drain your inbox (`sc mem message check`) and act on
+what landed, then slice again. Exit `1` = no such job / lost.
+
+## Timeouts and stuck jobs
+
+Always pass `--timeout` for anything that can wedge: the supervisor
+SIGTERMs the job''s whole process group at the deadline (SIGKILL after
+a grace period), records `timeout`, and still sends the completion
+row. A deadlocked suite becomes a bounded failure with a wake-up, not
+a silent hole. `kill` is the manual version, same group-kill, same
+completion row.
+
+## How it works
+
+`start` writes `<engine>/run/jobs/<id>/` (`meta.json` + `log`) and
+spawns a small supervisor in its own session. The supervisor spawns
+the command as its own process group, streams combined stdout+stderr
+to the log, waits, records the exit in `meta.json`, and posts one
+completion message to the starting shell''s own inbox through the
+engine API — kind `result`, stamped with a `dedupe_key` so a retry
+never double-sends. If the API is down it retries briefly and gives
+up: `meta.json` is the durable record; `status`/`wait` read it without
+the API.
+
+No DB surface beyond that one message. Jobs are per-shell and
+engine-local; the message bus is the only fleet-visible part. Spec:
+`specs_sc/job-runner.md` (frozen).
+', 'docs_sc/job-runner.md', '2026-07-14 10:10:22', '2026-07-14 10:10:22');
 
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
@@ -2516,6 +2593,7 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='surface_catalogue';
 
 DELETE FROM shell_messages;
+INSERT INTO shell_messages (message_id, from_shell_id, to_shell_id, body, created_at, read_at, kind, dedupe_key) VALUES (7, 1, 1, 'job 1-smoke (smoke) done exit=0 after 2s — `sc job status 1-smoke` · log: /home/j3d1/super-coder/.super-coder/run/jobs/1-smoke/log', '2026-07-14 07:25:59', '2026-07-14 07:26:22', 'result', 'job-1-smoke-completion');
 
 DELETE FROM watched_prs;
 
