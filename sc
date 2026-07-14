@@ -750,8 +750,15 @@ print('-> pg: added to $f')
 # gh login — with the same supervision: `launch` brings it up, `down` stops it.
 # No socket, so aliveness is the pidfile, not a health curl. Self-skips when gh
 # is absent (the fork degrades to task-boundary inbox checks, never breaks).
+# `watch-daemon-install` writes a systemd --user unit for reboot-survival
+# (#359: a host reboot killed the nohup'd daemon while the sandbox
+# auto-restarted); `up`/`down` defer to systemd when the unit is active.
 WATCH_DAEMON_PID="$ENGINE/run/watch-daemon.pid"
+WATCH_DAEMON_UNIT="sc-watch-daemon-$(basename "$here").service"
 
+sc_watch_daemon_unit_active() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$WATCH_DAEMON_UNIT" 2>/dev/null
+}
 sc_watch_daemon_alive() {
   # pid exists AND is actually the daemon — a stale pidfile surviving a host
   # reboot can point at a reused pid, and a bare kill -0 would false-skip the
@@ -766,6 +773,9 @@ sc_watch_daemon_up() {
   if ! command -v gh >/dev/null 2>&1; then
     echo "→ watch-daemon: gh CLI not found on the host — PR eventing disabled (install gh + login to enable)"; return 0
   fi
+  if sc_watch_daemon_unit_active; then
+    echo "→ watch-daemon systemd-managed ($WATCH_DAEMON_UNIT) — already running"; return 0
+  fi
   if sc_watch_daemon_alive; then
     echo "→ watch-daemon already running (pid $(cat "$WATCH_DAEMON_PID"))"; return 0
   fi
@@ -777,10 +787,68 @@ sc_watch_daemon_up() {
 sc_watch_daemon_down() {
   if sc_watch_daemon_alive; then
     kill "$(cat "$WATCH_DAEMON_PID")" && echo "→ watch-daemon stopped"
+  elif sc_watch_daemon_unit_active; then
+    echo "→ watch-daemon is systemd-managed ($WATCH_DAEMON_UNIT) — leaving it; use watch-daemon-uninstall"
   else
     echo "→ watch-daemon not running"
   fi
   rm -f "$WATCH_DAEMON_PID"
+}
+sc_watch_daemon_install() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ watch-daemon-install: systemd (systemctl) not found on this host" >&2; return 1; }
+  command -v gh >/dev/null 2>&1 || { echo "✗ watch-daemon-install: gh CLI not found — nothing to poll GitHub with (install gh + login first)" >&2; return 1; }
+  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/$WATCH_DAEMON_UNIT" <<UNIT
+[Unit]
+Description=super-coder watch-daemon ($(basename "$here")) — GitHub PR watcher (sprint eventing)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=$PY $S/watch.py daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+  # A pidfile-managed daemon would double-poll and double-emit pr_events;
+  # stop it so systemd owns the one poller.
+  sc_watch_daemon_down >/dev/null 2>&1 || true
+  systemctl --user enable --now "$WATCH_DAEMON_UNIT"
+  echo "→ watch-daemon installed as systemd --user unit: $WATCH_DAEMON_UNIT (enabled, started, linger on)"
+  echo "  status: systemctl --user status $WATCH_DAEMON_UNIT   ·   logs: journalctl --user -u $WATCH_DAEMON_UNIT"
+}
+sc_watch_daemon_uninstall() {
+  command -v systemctl >/dev/null 2>&1 || { echo "✗ watch-daemon-uninstall: systemd not found" >&2; return 1; }
+  systemctl --user disable --now "$WATCH_DAEMON_UNIT" 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$WATCH_DAEMON_UNIT"
+  systemctl --user daemon-reload
+  echo "→ watch-daemon systemd unit removed ($WATCH_DAEMON_UNIT)"
+}
+
+# ── persist: reboot-proof every applicable host-side daemon in one verb ───────
+# The #359 incident shape: a host reboot kills the nohup'd daemons while the
+# docker sandbox resurrects itself — the fork looks healthy with nobody
+# polling. One idempotent verb installs the systemd --user unit for each
+# daemon that applies to this fork (skips the rest with a reason); linger is
+# enabled by the installs, so units start at boot with no login.
+sc_persist() {
+  command -v systemctl >/dev/null 2>&1 || {
+    echo "✗ persist: systemd (systemctl) not found — nohup + \`./sc launch\` is the only supervision on this host" >&2; return 1; }
+  if command -v gh >/dev/null 2>&1; then
+    sc_watch_daemon_install
+  else
+    echo "→ persist: gh CLI not found — watch-daemon skipped (PR eventing disabled)"
+  fi
+  if "$PY" "$S/vm.py" configured;  then sc_vm_broker_install;  else echo "→ persist: no VM linked — vm-broker skipped"; fi
+  if "$PY" "$S/ts.py" configured;  then sc_ts_broker_install;  else echo "→ persist: no tailnet linked — ts-broker skipped"; fi
+  if "$PY" "$S/pm2.py" configured; then sc_pm2_broker_install; else echo "→ persist: no pm2 stack linked — pm2-broker skipped"; fi
+  if "$PY" "$S/dbq.py" configured; then sc_db_broker_install;  else echo "→ persist: no live DB linked — db-broker skipped"; fi
+  echo "→ persist: done — units survive reboot + logout; remove per daemon with ./sc <name>-uninstall"
 }
 
 
@@ -831,6 +899,10 @@ case "$cmd" in
   watch)             exec "$PY" "$S/watch.py" "$@" ;;
   watch-daemon-up)   sc_watch_daemon_up ;;
   watch-daemon-down) sc_watch_daemon_down ;;
+  watch-daemon-install)   sc_watch_daemon_install ;;
+  watch-daemon-uninstall) sc_watch_daemon_uninstall ;;
+  # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
+  persist)           sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
   # completion posts a result row to the starting shell's inbox ──
   job)               exec "$PY" "$S/job.py" "$@" ;;
@@ -1181,6 +1253,14 @@ super-coder — forkable shell substrate
   ./sc watch daemon        run the daemon in the foreground (--once = single cycle)
   ./sc watch-daemon-up     start it in the background (nohup + pidfile); self-skips if gh missing/already up
   ./sc watch-daemon-down   stop the backgrounded daemon
+  ./sc watch-daemon-install   supervise via a systemd --user unit (survives logout/reboot)
+  ./sc watch-daemon-uninstall remove the systemd unit
+
+  Persist (HOST-side — reboot-proof the fork in one verb; #359): installs the
+  systemd --user unit for every daemon that applies here (watch-daemon when gh
+  is present; vm/ts/pm2/db brokers when linked), enables linger, skips the
+  rest with a reason. Idempotent — re-run any time:
+  ./sc persist             install + enable --now every applicable unit
 
   Postgres sidecar (app-only; docker container on SC_NET, data in a named volume).
   For developing/testing the fork's APP against real Postgres in the sandbox — the
