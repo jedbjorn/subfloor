@@ -31,6 +31,17 @@ Permissions: /proc/<pid>/cwd is readable only for same-user processes. A harness
 owned by another OS user is counted but unreadable → `indeterminate`. When
 `indeterminate > 0` the admin must NOT assume all-clear — surface instead.
 
+Orphans: closing a terminal window does not reliably kill the harness on every
+host — the session survives, holds its shell's one-session slot, and blocks
+every headless boot of that shell until someone kills it by hand. Each process
+is therefore classified (`orphaned`): 'tty-gone' (had a controlling terminal;
+the pty vanished — the window closed under it), 'detached' (no controlling
+TTY and reparented to init — its spawning session is gone), or None (normal).
+Classification is reporting only — an orphan may still be mid-work (a merge,
+a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
+operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
+processes doing work, then `kill <pid>`.
+
 Non-Linux: /proc is absent; compute() returns supported=False. Fall back to
 `lsof -a +D <worktree>` / `ps`. The substrate host is Linux.
 
@@ -82,18 +93,73 @@ def _read(p: Path) -> str:
         return ""
 
 
-def _ppid(pid: int) -> int | None:
-    """Parent pid from /proc/<pid>/stat. comm (field 2) may contain spaces and
-    parens, so split after the final ')': state, ppid, ... follow."""
+def _stat_fields(pid: int) -> "list[str]":
+    """Fields of /proc/<pid>/stat after comm. comm (field 2) may contain spaces
+    and parens, so split after the final ')': state, ppid, ... follow."""
     data = _read(PROC / str(pid) / "stat")
     rp = data.rfind(")")
     if rp == -1:
-        return None
-    rest = data[rp + 2:].split()
+        return []
+    return data[rp + 2:].split()
+
+
+def _ppid(pid: int) -> int | None:
+    rest = _stat_fields(pid)
     try:
         return int(rest[1])              # rest[0]=state, rest[1]=ppid
     except (IndexError, ValueError):
         return None
+
+
+def _tty_nr(pid: int) -> int | None:
+    rest = _stat_fields(pid)
+    try:
+        return int(rest[4])              # rest[4]=tty_nr; 0 = no controlling TTY
+    except (IndexError, ValueError):
+        return None
+
+
+def _tty_fd(pid: int) -> str | None:
+    """The terminal device behind the process's stdio, from /proc/<pid>/fd/0..2 —
+    the first fd whose link target is a tty device. A vanished pty keeps the
+    link but readlink may append ' (deleted)'. None when no stdio fd is a tty
+    (fully redirected) or the fds are unreadable (foreign user)."""
+    for n in ("0", "1", "2"):
+        try:
+            target = os.readlink(PROC / str(pid) / "fd" / n)
+        except OSError:
+            continue
+        base = target.removesuffix(" (deleted)")
+        if base.startswith("/dev/pts/") or base.startswith("/dev/tty"):
+            return target
+    return None
+
+
+def classify_orphan(tty_nr: "int | None", ppid: "int | None",
+                    tty_fd: "str | None",
+                    tty_exists: "bool | None" = None) -> "str | None":
+    """Orphan verdict for one harness process — pure, injectable for tests.
+
+    'tty-gone'  — has (had) a controlling TTY but the pty device is gone: the
+                  terminal window closed under the session.
+    'detached'  — no controlling TTY and reparented to init: whatever spawned
+                  it (a headless boot's parent, a dead terminal's shell) is
+                  gone. A NORMAL headless session still has a live parent, so
+                  ppid==1 is the discriminator.
+    None        — attached and normal, or not enough signal to say otherwise
+                  (conservative: never call an orphan on missing data).
+    """
+    if tty_nr is None:
+        return None
+    if tty_nr == 0:
+        return "detached" if ppid == 1 else None
+    if tty_fd is None:
+        return None
+    if tty_fd.endswith(" (deleted)"):
+        return "tty-gone"
+    if tty_exists is None:
+        tty_exists = os.path.exists(tty_fd)
+    return None if tty_exists else "tty-gone"
 
 
 def _self_harness_pid(harness_pids: set[int]) -> int | None:
@@ -188,10 +254,13 @@ def compute() -> dict:
             "shortname": shortname,
             "display_name": (labels.get(shortname or "", {}).get("display_name")),
             "is_self": pid == self_pid,
+            "orphaned": (None if pid == self_pid
+                         else classify_orphan(_tty_nr(pid), _ppid(pid), _tty_fd(pid))),
         })
 
     active_other = sorted(worktree_sessions)
     indeterminate = len(indeterminate_pids)
+    orphaned_pids = [p["pid"] for p in processes if p["orphaned"]]
     return {
         "supported": True,
         "repo": {"name": REPO_ROOT.name, "root": str(REPO_ROOT)},
@@ -203,6 +272,7 @@ def compute() -> dict:
         "admin_root_pids": admin_root_pids,
         "indeterminate": indeterminate,
         "indeterminate_pids": indeterminate_pids,
+        "orphaned_pids": orphaned_pids,
         # The gate: only the admin is live AND nothing is unreadable.
         "safe_to_clean_all": not active_other and indeterminate == 0,
     }
@@ -212,6 +282,16 @@ def is_active(shortname: str, snap: dict | None = None) -> bool:
     """Convenience for the admin gate: is THIS shell's worktree live right now?"""
     snap = snap or compute()
     return shortname.lower() in {s.lower() for s in snap.get("active_other_shells", [])}
+
+
+def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
+    """(all pids, orphaned pids) for one shell's worktree sessions — the shape
+    the `sc run` guard needs: every-session-orphaned means the slot is held by
+    survivors of closed terminals / dead parents, not by a working session."""
+    procs = [p for p in snap.get("processes", [])
+             if (p.get("shortname") or "").lower() == shortname.lower()]
+    return ([p["pid"] for p in procs],
+            [p["pid"] for p in procs if p.get("orphaned")])
 
 
 def _print_text(d: dict) -> None:
@@ -229,6 +309,8 @@ def _print_text(d: dict) -> None:
         tags = []
         if p["is_self"]:
             tags.append("SELF")
+        if p["orphaned"]:
+            tags.append(f"ORPHAN:{p['orphaned']}")
         tag = f"  [{', '.join(tags)}]" if tags else ""
         print(f"  pid {p['pid']:<7} {p['comm']:<9} {p['region']:<9} {who}{tag}")
         print(f"            {p['cwd']}")
@@ -236,6 +318,13 @@ def _print_text(d: dict) -> None:
         print(f"\n⚠ {d['indeterminate']} harness process(es) with unreadable cwd "
               f"(other OS user?): pids {d['indeterminate_pids']} — liveness "
               f"INDETERMINATE; do not assume all-clear.")
+    if d.get("orphaned_pids"):
+        print(f"\n⚠ {len(d['orphaned_pids'])} orphaned session(s): pids "
+              f"{d['orphaned_pids']} — terminal closed / parent gone. Each "
+              f"holds its shell's one-session slot. Verify idle "
+              f"(`ps -o etime=,stat= -p <pid>`; no busy children), then "
+              f"`kill <pid>`. An orphan can still be mid-work — never kill "
+              f"unverified.")
     print("\nVERDICT")
     if d["active_other_shells"]:
         print(f"  Live OTHER shells: {', '.join(d['active_other_shells'])}"

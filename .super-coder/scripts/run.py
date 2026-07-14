@@ -668,6 +668,17 @@ def main() -> None:
     if headless and chosen["shortname"] and chosen["flavor"] != "admin":
         snap = shell_liveness.compute()
         if snap.get("supported") and shell_liveness.is_active(chosen["shortname"], snap):
+            pids, orphans = shell_liveness.orphan_split(chosen["shortname"], snap)
+            if pids and len(orphans) == len(pids):
+                # The slot-holder outlived its terminal/parent — still refuse
+                # (it may be mid-work), but name the fix instead of a dead end.
+                sys.exit(
+                    f"sc run: shell '{chosen['shortname']}' slot is held by an "
+                    f"ORPHANED session (pid {', '.join(map(str, orphans))} — "
+                    f"terminal closed / parent gone). Verify it is idle "
+                    f"(`ps -o etime=,stat= -p <pid>`; no busy children), "
+                    f"`kill <pid>`, then re-run. An orphan can still be "
+                    f"mid-work — never kill unverified.")
             sys.exit(f"sc run: shell '{chosen['shortname']}' already has a live "
                      f"session — one shell, one session (see shell_liveness)")
         if snap.get("supported") and snap.get("indeterminate"):
