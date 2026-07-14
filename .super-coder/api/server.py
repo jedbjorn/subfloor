@@ -1724,6 +1724,24 @@ class Handler(BaseHTTPRequestHandler):
     # the whole board. The daemon never calls these — it owns the DB side
     # (last_seen, closed_at) directly.
 
+    def _daemon_state(self, con) -> "dict | None":
+        """Watcher-daemon liveness (#359): the heartbeat row → age + verdict.
+        Stale = beat older than 3× the daemon's own poll interval (one slow gh
+        call + the sleep fit comfortably inside). None = never run (or a
+        pre-0068 DB with no heartbeat table yet) — the client renders both
+        None and stale as "watches are NOT being polled"."""
+        try:
+            r = con.execute(
+                "SELECT beat_at, interval_s, CAST((julianday('now') - "
+                "julianday(beat_at)) * 86400 AS INTEGER) AS age_s "
+                "FROM daemon_heartbeats WHERE name='watch'").fetchone()
+        except Exception:
+            return None
+        if r is None:
+            return None
+        return {"beat_at": r["beat_at"], "interval_s": r["interval_s"],
+                "age_s": r["age_s"], "stale": r["age_s"] > 3 * r["interval_s"]}
+
     def _watches_get(self):
         sid = self._require_shell_auth()
         if sid is None:
@@ -1738,7 +1756,8 @@ class Handler(BaseHTTPRequestHandler):
             if not include_closed:
                 sql += " WHERE w.closed_at IS NULL"
             sql += " ORDER BY w.repo, w.pr_number, w.watch_id"
-            return self._send(200, {"watches": rows(con.execute(sql))})
+            return self._send(200, {"watches": rows(con.execute(sql)),
+                                    "daemon": self._daemon_state(con)})
         except Exception as e:
             return self._fail(e)
         finally:
@@ -1772,22 +1791,25 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT watch_id, closed_at FROM watched_prs "
                 "WHERE repo=? AND pr_number=? AND shell_id=?",
                 (repo, pr, target)).fetchone()
+            # daemon liveness rides every registration response (#359): a
+            # watch registered while nobody is polling must say so up front.
+            daemon = self._daemon_state(con)
             if existing is not None:
                 if existing["closed_at"] is None:
                     return self._send(200, {"watch_id": existing["watch_id"],
-                                            "existing": True})
+                                            "existing": True, "daemon": daemon})
                 con.execute(
                     "UPDATE watched_prs SET closed_at=NULL, last_seen=NULL, "
                     "created_at=datetime('now') WHERE watch_id=?",
                     (existing["watch_id"],))
                 con.commit()
                 return self._send(201, {"watch_id": existing["watch_id"],
-                                        "reopened": True})
+                                        "reopened": True, "daemon": daemon})
             cur = con.execute(
                 "INSERT INTO watched_prs (repo, pr_number, shell_id) VALUES (?, ?, ?)",
                 (repo, pr, target))
             con.commit()
-            return self._send(201, {"watch_id": cur.lastrowid})
+            return self._send(201, {"watch_id": cur.lastrowid, "daemon": daemon})
         except Exception as e:
             return self._fail(e)
         finally:
