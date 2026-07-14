@@ -58,6 +58,10 @@ The substrate itself: data layer we build, harness we rent. v1 targets Claude Co
 
 _No open flags._
 
+### Session-surviving job runner (sc job) · owner: `cc`
+
+_No open flags._
+
 ## Next
 
 ### B1 — First-launch installer · owner: `cc`
