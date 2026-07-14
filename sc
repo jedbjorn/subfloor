@@ -824,6 +824,9 @@ case "$cmd" in
   watch)             exec "$PY" "$S/watch.py" "$@" ;;
   watch-daemon-up)   sc_watch_daemon_up ;;
   watch-daemon-down) sc_watch_daemon_down ;;
+  # ── session-surviving local jobs: detached supervised one-shots whose
+  # completion posts a result row to the starting shell's inbox ──
+  job)               exec "$PY" "$S/job.py" "$@" ;;
   # Raw read passthrough to the engine + map DBs, resolved by absolute path so no
   # skill example ever needs a cwd-relative `sqlite3 .super-coder/…` (which pulls a
   # shell into `cd`-ing to the root — the cwd trap). Read-only is ENFORCED
@@ -1071,6 +1074,11 @@ super-coder — forkable shell substrate
   ./sc watch list          live PR watches (--all includes retired)
   ./sc watch inbox         block until this shell has unread messages, then exit — the zero-token
                              inbox watcher; arm as a background task and its exit is your wake-up
+  ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
+                             survives your session; completion lands in YOUR inbox as a result row
+                             (--label <slug> names it, --timeout <s> kills the wedged process group)
+  ./sc job wait <id>       bounded foreground wait, ≤550s slice — exit 0 done · 2 still running
+                             (drain your inbox between slices); list/status/tail/kill complete the set
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
   sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
