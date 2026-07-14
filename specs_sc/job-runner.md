@@ -3,8 +3,8 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Session-surviving job runner (sc job)
-roadmap_status: in_progress
-frozen: false
+roadmap_status: shipped
+frozen: true
 title: sc job — session-surviving job runner
 tags: [jobs, sprints, headless, eventing, supervision]
 date: 2026-07-14
