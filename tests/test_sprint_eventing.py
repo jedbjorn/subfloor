@@ -312,6 +312,27 @@ class HeartbeatTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_beat_failure_never_blocks_the_poll(self):
+        # Pre-0068 DB (code newer than schema): the beat raises, the poll must
+        # still run — heartbeat error, not poll error, and never a crash.
+        import contextlib
+        import io
+        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
+        con = build_db(tmp)
+        con.execute("DROP TABLE daemon_heartbeats")
+        con.commit()
+        con.close()
+        old = watch.DB_PATH
+        watch.DB_PATH = tmp
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(watch.main(["daemon", "--once"]), 0)
+        finally:
+            watch.DB_PATH = old
+        self.assertIn("heartbeat error", out.getvalue())
+        self.assertNotIn("poll error", out.getvalue())
+
 
 class DaemonLineTest(unittest.TestCase):
     def test_never_run(self):

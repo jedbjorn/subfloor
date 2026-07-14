@@ -370,7 +370,15 @@ def cmd_daemon(args) -> int:
     while True:
         con = db_driver.connect(DB_PATH)
         try:
-            beat(con, interval)
+            # The beat must never block the poll: on a pre-0068 DB (code newer
+            # than schema — a dev tree between migrate runs) the table is
+            # missing, and a beat raising into the poll's except would turn a
+            # working daemon into a dead-with-noise one. Liveness degrades to
+            # "never run"; eventing keeps flowing.
+            try:
+                beat(con, interval)
+            except Exception as e:
+                print(f"watch daemon: heartbeat error ({e})", flush=True)
             n = poll_once(con)
             if n:
                 print(f"watch daemon: {n} pr_event(s) emitted", flush=True)
