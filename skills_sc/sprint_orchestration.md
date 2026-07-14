@@ -106,6 +106,13 @@ exit is your wake-up):
 ./sc watch inbox        # background it via your harness's background-task tool
 ```
 
+**Interactive sessions only.** A harness background task is
+session-scoped: in a headless (`-p`) boot it dies with the session,
+silently — six sprint stalls traced to exactly this. A headless planner
+turn arms nothing: drain the inbox, act, end the turn — the next event
+row boots you again. The watcher belongs to the long-lived interactive
+planner seat, nowhere else.
+
 Re-arm it every time you finish draining your inbox. On other harnesses
 the watcher isn't available — check your inbox at every task boundary
 instead; correctness is identical, latency degrades gracefully. (Strong
@@ -219,6 +226,18 @@ Stalls and the moves:
 - **Re-sequencing**: edit the board + `task` row to *every* affected dev
   with its new slot — a dev acting on a stale slot is worse than a paused
   one.
+- **Every worker boot failing at once**: check provider auth and spend
+  limits BEFORE debugging the engine — a monthly cap presents as a
+  fleet-wide boot failure and costs an hour of misdiagnosis. Pause at a
+  clean gate (units green, nothing mid-merge), surface to the FnB (auth
+  switch is theirs), resume where the board says you stopped.
+- **CI queue clogged at the tail**: a queued verify whose commit a later
+  stack head already supersedes is pure queue time — cancel it (`gh run
+  cancel`) and let the head's run stand for the stack. Cancelling
+  anything to protect a measurement run is allowed but logged: rationale
+  in the board or a `result` row, and re-run the cancelled check after.
+  Green means green — cancellation never substitutes for a verdict on
+  what still needs one.
 - **Judgment calls** (scope vs. deadline, cutting a unit, changing an
   interface another team reads): escalate to the FnB immediately — the one
   stall you can't unblock yourself.
@@ -306,6 +325,10 @@ When every unit is `merged` and `main` is green:
 - Zero scheduled polling by any shell: rows wake you, you boot workers,
   watches retire themselves. A scheduled tracker anywhere in the sprint
   is a defect.
+- Local long work rides `./sc job` (see the `sprint` skill) — a job's
+  completion is a `result` row like any other wake-up. A hand-rolled
+  nohup/poll waiter anywhere in the sprint is a defect: one sprint's
+  hand-rolled waiter carried a self-match bug that masked a dead bench.
 - You manage; you never load code. Your context grows at coordination
   density — the workers' grows at code density and is discarded per task.
 - Monitor > interrogate: `pr_event` rows and `gh` reads cost no dev a
