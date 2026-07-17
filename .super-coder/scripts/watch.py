@@ -22,10 +22,14 @@ row is folded into ONE batched GraphQL query per poll (~1% of an authenticated
 rate limit at 60–90s), each PR is diffed against its stored `last_seen`
 fingerprint, and every transition becomes a `pr_event` row in shell_messages
 addressed to the watch's shell. Events: checks concluded (green or red),
-review submitted, merged, closed. On merge/close the final event is emitted
-and `closed_at` set — the watch retires itself. The daemon only ever writes
-message rows + its own registry state: it never boots shells, never marks
-anything read, never touches git. Each cycle it also beats a heartbeat row
+review submitted, merged, closed. On close — and on merge with no checks
+still running — the final event is emitted and `closed_at` set: the watch
+retires itself. A merge with checks still PENDING retains the watch (#375):
+the merge event is emitted immediately, the watch stays live until the
+rollup concludes, then the green/red event retires it — an early merge must
+not swallow the terminal CI verdict the planner is waiting on. The daemon
+only ever writes message rows + its own registry state: it never boots
+shells, never marks anything read, never touches git. Each cycle it also beats a heartbeat row
 (daemon_heartbeats) so `list`/`pr` can say whether anybody is actually
 polling (#359) — a dead daemon otherwise leaves watches reporting "live"
 with no eventing behind them.
@@ -260,24 +264,40 @@ def diff_events(prev: "dict | None", cur: dict, repo: str, number: int) -> "tupl
 
     A head-SHA change resets the checks comparison implicitly: the fingerprint
     compares (sha, checks) together, so a new push going green is a fresh
-    transition even if the old head was green too."""
+    transition even if the old head was green too.
+
+    Merge is terminal ONLY once no checks are still running (#375): a PR
+    merged while its rollup is PENDING keeps its watch — the merge event
+    fires now, the checks conclusion fires (and retires the watch) when the
+    already-running workflows finish. Retiring at merge dropped that verdict
+    on the floor and silently stalled the planner's sprint gate. Close
+    without merge retires immediately regardless — its pending checks get
+    cancelled, no conclusion is coming."""
     events: list[str] = []
     sha7 = (cur.get("sha") or "")[:7]
     tag = f"{repo}#{number}"
 
+    merged = cur.get("state") == "MERGED"
     checks = cur.get("checks")
+    checks_pending = checks is not None and checks not in CONCLUDED  # PENDING/EXPECTED
+    terminal = cur.get("state") == "CLOSED" or (merged and not checks_pending)
+
     checks_changed = prev is None or (prev.get("checks"), prev.get("sha")) != (checks, cur.get("sha"))
     if checks in CONCLUDED and checks_changed:
         word = "green" if checks == "SUCCESS" else "red"
-        events.append(f"pr_event {tag}: checks {word} ({checks}) @ {sha7}")
+        # On a retained post-merge watch this conclusion is the retiring event.
+        tail = " — watch retired" if merged and prev is not None and prev.get("state") == "MERGED" else ""
+        events.append(f"pr_event {tag}: checks {word} ({checks}) @ {sha7}{tail}")
 
     if prev is not None and (cur.get("reviews") or 0) > (prev.get("reviews") or 0):
         state = cur.get("review_state") or "REVIEW"
         events.append(f"pr_event {tag}: review submitted ({state}) @ {sha7}")
 
-    terminal = cur.get("state") in ("MERGED", "CLOSED")
-    if cur.get("state") == "MERGED" and (prev is None or prev.get("state") != "MERGED"):
-        events.append(f"pr_event {tag}: merged @ {sha7} — watch retired")
+    if merged and (prev is None or prev.get("state") != "MERGED"):
+        if checks_pending:
+            events.append(f"pr_event {tag}: merged @ {sha7} — checks still pending, watch retained")
+        else:
+            events.append(f"pr_event {tag}: merged @ {sha7} — watch retired")
     elif cur.get("state") == "CLOSED" and (prev is None or prev.get("state") != "CLOSED"):
         events.append(f"pr_event {tag}: closed without merge — watch retired")
     return events, terminal
