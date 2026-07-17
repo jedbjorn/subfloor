@@ -173,6 +173,54 @@ class DiffEventsTest(unittest.TestCase):
         self.assertTrue(terminal)
         self.assertTrue(any("merged" in e for e in events))
 
+    # ── merge with checks still running (#375) ──────────────────────────────
+
+    def test_merged_with_pending_checks_retains_the_watch(self):
+        events, terminal = self.diff(snap(checks="PENDING"),
+                                     snap(state="MERGED", checks="PENDING"))
+        self.assertFalse(terminal)
+        self.assertEqual(len(events), 1)
+        self.assertIn("merged", events[0])
+        self.assertIn("watch retained", events[0])
+        self.assertNotIn("watch retired", events[0])
+
+    def test_baseline_merged_with_pending_checks_wakes_and_retains(self):
+        events, terminal = self.diff(None, snap(state="MERGED", checks="PENDING"))
+        self.assertFalse(terminal)
+        self.assertTrue(any("watch retained" in e for e in events))
+
+    def test_retained_watch_is_silent_until_checks_conclude(self):
+        events, terminal = self.diff(snap(state="MERGED", checks="PENDING"),
+                                     snap(state="MERGED", checks="PENDING"))
+        self.assertEqual(events, [])
+        self.assertFalse(terminal)
+
+    def test_post_merge_green_emits_and_retires(self):
+        events, terminal = self.diff(snap(state="MERGED", checks="PENDING"),
+                                     snap(state="MERGED", checks="SUCCESS"))
+        self.assertTrue(terminal)
+        self.assertEqual(len(events), 1)          # no duplicate merged event
+        self.assertIn("checks green", events[0])
+        self.assertIn("watch retired", events[0])
+
+    def test_post_merge_red_emits_and_retires(self):
+        events, terminal = self.diff(snap(state="MERGED", checks="PENDING"),
+                                     snap(state="MERGED", checks="FAILURE"))
+        self.assertTrue(terminal)
+        self.assertIn("checks red", events[0])
+        self.assertIn("watch retired", events[0])
+
+    def test_merged_with_no_checks_retires_immediately(self):
+        events, terminal = self.diff(snap(), snap(state="MERGED", checks=None))
+        self.assertTrue(terminal)
+        self.assertTrue(any("watch retired" in e for e in events))
+
+    def test_closed_with_pending_checks_retires_immediately(self):
+        events, terminal = self.diff(snap(checks="PENDING"),
+                                     snap(state="CLOSED", checks="PENDING"))
+        self.assertTrue(terminal)
+        self.assertIn("closed without merge", events[0])
+
     def test_event_bodies_are_one_line_with_repo_pr_sha(self):
         events, _ = self.diff(snap(checks="PENDING"), snap(checks="SUCCESS"))
         self.assertNotIn("\n", events[0])
@@ -247,6 +295,32 @@ class PollOnceTest(unittest.TestCase):
         n = watch.poll_once(self.con, lambda q: (self.assertNotIn("number: 2", q)
                                                  or {"r0": {"pullRequest": self.gh_node(checks="PENDING")}}))
         self.assertEqual(n, 0)
+
+    def test_early_merge_keeps_watch_until_checks_conclude(self):
+        # The #375 incident, end to end: merge lands while checks are PENDING
+        # → merge event now, watch stays live, conclusion event + retirement
+        # when the already-running workflows finish.
+        watch.poll_once(self.con, self.fetch_returning(
+            self.gh_node(checks="PENDING"), self.gh_node(checks="PENDING")))
+        n = watch.poll_once(self.con, self.fetch_returning(
+            self.gh_node(checks="PENDING"),
+            self.gh_node(state="MERGED", checks="PENDING")))
+        self.assertEqual(n, 1)                    # merge event only, PR 2's single subscriber
+        live = self.con.execute(
+            "SELECT pr_number FROM watched_prs WHERE closed_at IS NULL").fetchall()
+        self.assertEqual({r["pr_number"] for r in live}, {1, 2})  # PR 2 retained
+        n = watch.poll_once(self.con, self.fetch_returning(
+            self.gh_node(checks="PENDING"),
+            self.gh_node(state="MERGED", checks="SUCCESS")))
+        self.assertEqual(n, 1)                    # the deferred conclusion
+        bodies = [m["body"] for m in self.messages() if "#2" in m["body"]]
+        self.assertEqual(len(bodies), 2)          # merge + conclusion, nothing else
+        self.assertIn("checks still pending, watch retained", bodies[0])
+        self.assertIn("checks green", bodies[1])
+        self.assertIn("watch retired", bodies[1])
+        live = self.con.execute(
+            "SELECT pr_number FROM watched_prs WHERE closed_at IS NULL").fetchall()
+        self.assertEqual({r["pr_number"] for r in live}, {1})     # now retired
 
     def test_failed_fetch_changes_nothing(self):
         n = watch.poll_once(self.con, lambda q: None)
