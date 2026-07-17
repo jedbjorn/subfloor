@@ -287,6 +287,37 @@ class ApiMemTest(unittest.TestCase):
         self.assertEqual((row["from_shell_id"], row["to_shell_id"]), (1, 1))
         self.assertTrue(row["dedupe_key"])  # every CLI send is stamped (#333)
 
+    # ── messaging: `cartographer` role alias (#369–#372) ─────────────────────
+    # Boot docs address the map-keeper by role; forks mint shortnames like
+    # CART1. Ordered a/b/c: the shared class DB walks no-cartographer →
+    # flavor-resolved → exact-shortname-precedence.
+    def test_message_cart_alias_a_missing_cartographer_is_a_clear_404(self):
+        with self.assertRaises(SystemExit):   # _api dies on HTTP 404
+            mem._api("POST", "/_sc/mem/messages",
+                     {"to": "cartographer", "body": "map gap: x. heal."})
+
+    def test_message_cart_alias_b_resolves_by_flavor(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO shells (shell_id, display_name, shortname, flavor, "
+            "system_prompt, user_id) VALUES (7, 'Cart', 'CART9', 'cartographer', 'sp', 1)")
+        con.commit()
+        con.close()
+        self.run_mem("message", "send", "cartographer", "map gap: y. heal.")
+        row = self.q("SELECT to_shell_id FROM shell_messages WHERE body='map gap: y. heal.'")
+        self.assertEqual(row["to_shell_id"], 7)
+
+    def test_message_cart_alias_c_exact_shortname_wins(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO shells (shell_id, display_name, shortname, "
+            "system_prompt, user_id) VALUES (8, 'Literal', 'cartographer', 'sp', 1)")
+        con.commit()
+        con.close()
+        self.run_mem("message", "send", "cartographer", "map gap: z. heal.")
+        row = self.q("SELECT to_shell_id FROM shell_messages WHERE body='map gap: z. heal.'")
+        self.assertEqual(row["to_shell_id"], 8)
+
     # ── messaging: idempotent send — a repeat key never writes a twin (#333) ──
     def test_message_send_dedupe_key(self):
         payload = {"to": "tc", "body": "dedupe me", "kind": "shell",

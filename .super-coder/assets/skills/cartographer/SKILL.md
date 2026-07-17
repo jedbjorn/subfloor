@@ -230,7 +230,8 @@ act on as cartographer.
 **Notice contract** (one source of truth — the relay skills point here).
 Sender = the **dev/coder** shell on merge (feature landed, doc written); NOT
 the planner — specs render into a known area and need no curation. Sent via
-the `messaging` skill to shortname `cartographer`:
+the `messaging` skill to `cartographer` — a role alias the API resolves to
+this fork's cartographer shell whatever its actual shortname:
 
 ```
 --message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."

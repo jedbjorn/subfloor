@@ -1,18 +1,26 @@
----
-rendered_by: super-coder
-source: db
-edit: changes here are overwritten — author via the shell or localhost GUI
----
+-- 0069 — reseed: cartographer role alias (#369–#372).
+--
+-- Five seats across two forks (kcsos ×4, dos-arch #367) followed the
+-- documented map-gap notice — `--message send cartographer "…"` — into
+-- HTTP 404: the docs address the map-keeper by ROLE, but forks mint
+-- shortnames like CART1. The API now resolves `cartographer` as a role
+-- alias (exact shortname wins; the flavor singleton guarantees one row).
+-- These two skills teach the alias: messaging documents the resolution
+-- rule; the cartographer notice contract names it.
+--
+-- Source assets updated in the same commit; this trailing forward reseed
+-- (UPSERT by name; skill_id + grants preserved) carries them to installed
+-- forks and fresh builds alike.
 
-# cartographer
+BEGIN;
 
-Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.
-
-**Category:** substrate  ·  **Command:** `sc map-setup`
-
----
-
-# cartographer — own the repo map so no other shell has to
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'cartographer',
+  'Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
+  'substrate',
+  'sc map-setup',
+  0,
+  '# cartographer — own the repo map so no other shell has to
 
 Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
 map. You alone do three things: **configure** how this repo is mapped, **wire**
@@ -36,7 +44,7 @@ and reload on a fresh map db.
   leaves an empty map.
 - **Hourly cron** — pm2 runs `sc-map-<repo>` on `cron_restart`
   (`.super-coder/ecosystem.config.cjs`) while the stack is up (`sc up`);
-  catches uncommitted local restructuring the git hooks can't see. Verify:
+  catches uncommitted local restructuring the git hooks can''t see. Verify:
   `pm2 list | grep sc-map` — state cycling stopped→online per tick = the
   one-shot pattern, not a crash. A fork without pm2 has no cron; the hooks
   still cover it, and manual `sc map` always works.
@@ -86,7 +94,7 @@ and reload on a fresh map db.
    SELECT file_count, mapped_at FROM dr_repo;   -- non-zero, just now
    ```
    Spot-check overrides took:
-   `SELECT path, role FROM dr_filepath WHERE path LIKE 'cmd/%';`
+   `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
 
 5. **Describe all NULLs** — run the description worklist (Standing jobs § 2);
    leave only when it returns zero rows.
@@ -127,25 +135,25 @@ one-line `description`.
 ```sql
 -- the current index + live file counts:
 SELECT s.name, s.path_prefix, s.description,
-       (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') n
+       (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') n
 FROM dr_section s ORDER BY s.sort_order, s.name;
 
 -- split / rename / describe (authored — survives the remap, snapshotted):
-UPDATE dr_section SET name='API', path_prefix='shell_core/api/', description='FastAPI routers' WHERE name='shell_core';
+UPDATE dr_section SET name=''API'', path_prefix=''shell_core/api/'', description=''FastAPI routers'' WHERE name=''shell_core'';
 INSERT INTO dr_section (name, path_prefix, description, sort_order)
-VALUES ('UI', 'shell_core/ui/', 'SvelteKit substrate UI', 5);
+VALUES (''UI'', ''shell_core/ui/'', ''SvelteKit substrate UI'', 5);
 
 -- WORKLIST — keep the catch-all empty. Files under no section = a new area to
 -- section (they render under "other / unsectioned" in CONNECTIONS until you do):
 SELECT path FROM dr_filepath f WHERE NOT EXISTS
-  (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || '%')
+  (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || ''%'')
 ORDER BY path;
 
 -- STALE SECTIONS (run after any migration or restructure — dr_filepath pruning
 -- is automatic; dr_section is authored and never auto-pruned):
 SELECT s.name, s.path_prefix, s.description
 FROM dr_section s
-WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') = 0
+WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') = 0
 ORDER BY s.name;
 -- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
@@ -160,10 +168,10 @@ bulk-loaded at boot.
 SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
 
 -- describe (≤100 chars; preserved across the next auto-remap):
-UPDATE dr_filepath SET desc='Boot composer — assembles CLAUDE.md from DB state' WHERE path='.super-coder/render/compose.py';
+UPDATE dr_filepath SET desc=''Boot composer — assembles CLAUDE.md from DB state'' WHERE path=''.super-coder/render/compose.py'';
 ```
 
-**3. Product DB** — the app's own database, separate from engine memory
+**3. Product DB** — the app''s own database, separate from engine memory
 (`.super-coder/shell_db.db`); working shells change them in completely
 different ways (boot `## DATABASES`), and the map you author is the only
 per-fork signal of where the app DB lives. The live `.db` is usually
@@ -172,20 +180,20 @@ durable anchor. Tag them plainly as the product/app DB so no shell mistakes
 them for engine memory; give them a section if they form an area.
 
 ```sql
--- tag the product DB's definition (the engine-vs-app split made visible):
-UPDATE dr_filepath SET desc='Product DB schema — the APP database (NOT engine memory)' WHERE path='<app schema file>';
-UPDATE dr_filepath SET desc='Product DB migration — change the app schema here' WHERE path LIKE '<app migrations dir>/%';
+-- tag the product DB''s definition (the engine-vs-app split made visible):
+UPDATE dr_filepath SET desc=''Product DB schema — the APP database (NOT engine memory)'' WHERE path=''<app schema file>'';
+UPDATE dr_filepath SET desc=''Product DB migration — change the app schema here'' WHERE path LIKE ''<app migrations dir>/%'';
 -- optional: a section if the product DB is its own area
 INSERT INTO dr_section (name, path_prefix, description, sort_order)
-VALUES ('App DB', '<db dir>/', 'Product runtime database — schema + migrations (NOT the engine memory DB)', 7);
+VALUES (''App DB'', ''<db dir>/'', ''Product runtime database — schema + migrations (NOT the engine memory DB)'', 7);
 ```
 
 Fork ships no database of its own -> skip.
 
 After a curation pass your writes are already live in the shared map db —
 done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc
-snapshot`. Don't chase it. (Sections are snapshotted; descriptions ride the
+persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 ./sc
+snapshot`. Don''t chase it. (Sections are snapshotted; descriptions ride the
 live DB + survive remap — refill from the worklist if a rebuild drops them.)
 
 ## Extending the map — semantic extractors
@@ -205,7 +213,7 @@ Adopt one per stack:
 1. **Detect the stack:** `SELECT manager, name FROM dr_dependency;`
    (fastapi? flask? svelte? next?) + the file mix
    (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
-2. **Copy the matching reference** from the engine's
+2. **Copy the matching reference** from the engine''s
    `.super-coder/templates/map_extractors/` into `.sc-state/map_extractors/`:
    - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
    - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
@@ -237,7 +245,7 @@ act on as cartographer.
 Sender = the **dev/coder** shell on merge (feature landed, doc written); NOT
 the planner — specs render into a known area and need no curation. Sent via
 the `messaging` skill to `cartographer` — a role alias the API resolves to
-this fork's cartographer shell whatever its actual shortname:
+this fork''s cartographer shell whatever its actual shortname:
 
 ```
 --message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."
@@ -252,7 +260,7 @@ region -> mark read:
 ```sql
 -- 1. the new files this notice is about (scope by the region it named):
 SELECT path, role FROM dr_filepath
-WHERE desc IS NULL AND path LIKE 'region/%' ORDER BY role, path;
+WHERE desc IS NULL AND path LIKE ''region/%'' ORDER BY role, path;
 -- 2. describe them (≤100 chars) — UPDATE dr_filepath SET desc=… per the worklist above.
 -- 3. do they form / join a section? curate dr_section if the region is a new area.
 ```
@@ -270,5 +278,107 @@ exactly the uncurated tail.
 - Config is the lever: tune `map.config.json`; touch `map_repo.py` only when
   the mechanism itself (a parser, a role kind) is wrong.
 - Verify the automation, not just the file: a written hook that
-  `core.hooksPath` doesn't point at does nothing -> check the wiring after
-  every setup.
+  `core.hooksPath` doesn''t point at does nothing -> check the wiring after
+  every setup.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'messaging',
+  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
+  'substrate',
+  'sc mem message',
+  1,
+  '# messaging — the shell inbox
+
+Shell-to-shell markdown messages, driven by `sc mem message`. Sender = you;
+recipient addressed by `shortname`. Body = markdown, preserved verbatim.
+Recipient discovers it on its next boot via the `## STATUS` `Inbox:` count.
+
+Trigger: `--message`
+Args: `check [N] | send <to-shortname> <body> [--kind k] | sent | mark-read <id>`
+
+## Message kinds
+
+Every message carries a `kind` — the trail stays filterable
+(`SELECT * FROM shell_messages WHERE kind != ''shell''` replays a sprint''s
+whole coordination history):
+
+- `shell` — ordinary shell-to-shell mail (the default; what `send` does
+  unless told otherwise).
+- `task` — planner → worker instruction (a sprint kickoff / re-task).
+- `result` — worker → planner completion or transition report.
+- `pr_event` — GitHub watcher daemon → shell PR transition (checks
+  green/red, review submitted, merged, closed). Daemon-emitted only:
+  `send` refuses it — a forged PR event would poison the wake loop''s
+  ground truth. Detail lives in `gh`; the row is the wake-up, not the
+  payload.
+
+## check — your unread inbox
+
+```
+sc mem message check [N]      # N optional; default 50, max 200
+```
+
+Read-only — it does NOT auto-mark-read. Non-`shell` rows show their kind
+inline. Surface the body to the operator (reply if warranted — a reply is
+itself a `send`), then `mark-read` the inbound in the same turn.
+
+## send — message another shell
+
+```
+sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
+```
+
+- Multi-word body = one quoted argument; markdown preserved verbatim.
+- Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
+  · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
+- `cartographer` is a **role alias**: when no shell has that literal
+  shortname, it resolves to the fork''s cartographer shell whatever its
+  shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no
+  shortname lookup needed. An exact shortname match always wins.
+- Unknown / deleted recipient -> `mem: recipient shortname ''<x>'' unknown`;
+  empty body -> `mem: body is empty`. Surface either to the operator plainly.
+- Sends are idempotent under load: each invocation carries a dedupe key, so
+  a timed-out send retries itself and can never write a duplicate. Do NOT
+  re-run a timed-out send by hand — the retry already happened; if it still
+  died, check `sent` first.
+
+## sent — your outbound view
+
+```
+sc mem message sent           # latest 50 you sent, newest first, read receipts
+```
+
+Verify delivery after an ambiguous failure (a send that died after its
+retries) before ever resending. A row present = delivered; absent = safe
+to resend.
+
+## mark-read — clear an inbox item (idempotent)
+
+```
+sc mem message mark-read <message_id>
+```
+
+Pass the `message_id` that `check` surfaced. Only messages addressed to you
+clear — another shell''s message = no-op; re-marking a read message = no-op.
+
+## Stance
+
+- On boot, `Inbox:` non-zero -> run `--message check` and surface the first
+  item before continuing.
+- No threading: a reply = a new `send`; include `Re: <topic>` in the body if
+  it matters.
+- `mark-read` only after you have actually acted on the message.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
