@@ -1500,6 +1500,20 @@ class Handler(BaseHTTPRequestHandler):
                     r = con.execute(
                         "SELECT shell_id FROM shells WHERE LOWER(shortname)=LOWER(?) "
                         "AND COALESCE(is_deleted,0)=0", (body["to"],)).fetchone()
+                    if r is None and body["to"].strip().lower() == "cartographer":
+                        # Role alias (#369–#372): boot docs and skills address the
+                        # map-keeper by role, but forks mint shortnames like CART1
+                        # — five seats across two forks followed the docs into a
+                        # 404. An exact shortname always wins (checked above); the
+                        # flavor's singleton trigger guarantees at most one row.
+                        r = con.execute(
+                            "SELECT shell_id FROM shells WHERE flavor='cartographer' "
+                            "AND COALESCE(is_deleted,0)=0").fetchone()
+                        if r is None:
+                            return self._send(404, {"error": (
+                                "no cartographer shell in this fork — create one "
+                                "(flavor 'cartographer'), or address a shortname "
+                                "from `sc mem get shells`")})
                     if r is None:
                         return self._send(404, {"error": f"recipient shortname '{body['to']}' unknown"})
                     to_sid = r[0]

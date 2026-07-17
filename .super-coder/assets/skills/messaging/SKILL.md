@@ -50,6 +50,10 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 - Multi-word body = one quoted argument; markdown preserved verbatim.
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
   · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
+- `cartographer` is a **role alias**: when no shell has that literal
+  shortname, it resolves to the fork's cartographer shell whatever its
+  shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no
+  shortname lookup needed. An exact shortname match always wins.
 - Unknown / deleted recipient -> `mem: recipient shortname '<x>' unknown`;
   empty body -> `mem: body is empty`. Surface either to the operator plainly.
 - Sends are idempotent under load: each invocation carries a dedupe key, so

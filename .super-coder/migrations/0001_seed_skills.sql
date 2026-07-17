@@ -789,7 +789,8 @@ act on as cartographer.
 **Notice contract** (one source of truth — the relay skills point here).
 Sender = the **dev/coder** shell on merge (feature landed, doc written); NOT
 the planner — specs render into a known area and need no curation. Sent via
-the `messaging` skill to shortname `cartographer`:
+the `messaging` skill to `cartographer` — a role alias the API resolves to
+this fork''s cartographer shell whatever its actual shortname:
 
 ```
 --message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."
@@ -2262,6 +2263,10 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 - Multi-word body = one quoted argument; markdown preserved verbatim.
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
   · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
+- `cartographer` is a **role alias**: when no shell has that literal
+  shortname, it resolves to the fork''s cartographer shell whatever its
+  shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no
+  shortname lookup needed. An exact shortname match always wins.
 - Unknown / deleted recipient -> `mem: recipient shortname ''<x>'' unknown`;
   empty body -> `mem: body is empty`. Surface either to the operator plainly.
 - Sends are idempotent under load: each invocation carries a dedupe key, so
