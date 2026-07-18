@@ -27,12 +27,7 @@ Free to use, open source, MIT License.
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
-and render a boot artifact the harness reads natively. Around that core the
-layer has grown into a full **harness overlay**: an orchestration plane (typed
-messages, a PR watch daemon, headless boots, session-surviving jobs) and an
-execution plane (sandbox, per-shell worktrees, host-side brokers) wrap
-whichever harness you rent — the loop stays the harness's; everything around
-it is ours.
+and render a boot artifact the harness reads natively.
 
 ```mermaid
 graph TD
@@ -42,6 +37,29 @@ graph TD
   H --> REPO[your repo]:::class4
   DB -.serialize.-> SQL[.sc-state/content.sql]:::class2
 ```
+
+### A harness overlay
+
+A coding harness ships the **loop** — model, tools, context window — and
+forgets everything else between sessions. super-coder is a **harness
+overlay**: it supplies the properties a harness doesn't keep, and injects
+every one of them through an extension point the harness itself already
+ships — nothing patched, nothing forked:
+
+| Property | Ours | Enters the harness via |
+|---|---|---|
+| **Boot context** | identity · memory · laws · current state | the boot doc it reads natively (`CLAUDE.md` / `AGENTS.md`) |
+| **Native tooling** | the `./sc` CLI — `mem` · jobs · watches · brokers | the shell it already executes commands in |
+| **Skills** | DB-canonical catalogue, per-shell grants | the skill dirs it already discovers |
+| **Guardrails** | branch-guard · sandbox · worktrees | its own hook / plugin seams + the environment it boots into |
+| **Orchestration** | eventing · headless boots · sprints | its headless mode (`claude -p` · `codex exec` · `opencode run`) |
+
+The overlay makes the harness you rent behave like it has all of this built
+in — without touching its loop. Think **distro over kernel**: the kernel (the
+harness) runs the process; the distro (super-coder) gives it users, packages,
+init, and permissions. Four harnesses, one overlay, zero forks of anyone's
+loop — that is what harness-agnostic means in practice, and it's why a fork
+is cheap: same overlay, whichever kernel you rent underneath.
 
 This repo is also **dogfood**: super-coder maintains super-coder. Its own
 `.super-coder/` engine manages the maintainer shell that builds it.
