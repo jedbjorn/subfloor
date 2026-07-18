@@ -799,7 +799,7 @@ sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` 
 ./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
-./sc feature             # opt-in features: list / enable / disable (pg · windows · tailnet · app-deploy)
+./sc feature             # opt-in features: list / enable / disable (pg · windows · tailnet · pm2 · app-deploy)
 ./sc eject               # ONE-WAY: own the engine — stop tracking upstream (confirm-gated)
 ./sc verify              # rebuild + flat render + headless boot (no exec) — the proof
 ./sc help                # all commands

@@ -28,7 +28,7 @@ grants.
 Usage:
     ./sc feature                      # = list
     ./sc feature list
-    ./sc feature enable  <name>       # pg · windows · tailnet · app-deploy
+    ./sc feature enable  <name>       # pg · windows · tailnet · pm2 · app-deploy
     ./sc feature disable <name>
 """
 from __future__ import annotations
