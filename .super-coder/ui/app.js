@@ -773,7 +773,7 @@ async function renderRoadmap(root) {
     const shown = q
       ? byStatus
           .map((b) => ({ ...b, features: b.features.filter((f) =>
-            `${f.title || ""} ${f.project_title || ""}`.toLowerCase().includes(q)) }))
+            `${f.title || ""} #${f.feature_id} ${f.project_title || ""}`.toLowerCase().includes(q)) }))
           .filter((b) => b.features.length)
       : byStatus;
     results.replaceChildren();
@@ -879,7 +879,8 @@ function buildFlowGraph(features, stageOf, candidates = [], projects = []) {
       // tooltip) — these cards are a compact list, not the wired sequence.
       const full = f.title || "(untitled)";
       const shown = s === "shipped" && full.length > 32 ? full.slice(0, 31).trimEnd() + "…" : full;
-      card.append(el("div", { className: "flow-card-title", title: full }, shown));
+      card.append(el("div", { className: "flow-card-title", title: `#${f.feature_id} ${full}` }, shown,
+        el("span", { className: "idnum" }, " #" + f.feature_id)));
       // Shipped cards are a title-only "done" list — no owner pill, flag count,
       // or doc links. The other stages carry the full meta + doc rows.
       if (s !== "shipped") {
@@ -895,6 +896,7 @@ function buildFlowGraph(features, stageOf, candidates = [], projects = []) {
           for (const d of docs) dl.append(el("a", {
             className: "flow-doc-link", href: "/api/documents/" + d.document_id + "/open",
             target: "_blank", rel: "noopener",
+            title: `#${d.document_id}${d.title ? " " + d.title : ""}`,
             textContent: (d.kind === "doc" ? "doc" : `${d.kind} v${d.seq}`) + " ↗" }));
           card.append(dl);
         }
@@ -1036,7 +1038,7 @@ function featureForm(f, candidates = [], projects = []) {
       const cur = new Set(f.blockers || []);
       for (const c of others) blockerSelect.append(el("option", {
         value: String(c.feature_id), selected: cur.has(c.feature_id),
-        textContent: c.title || ("#" + c.feature_id) }));
+        textContent: `#${c.feature_id} ${c.title || "(untitled)"}` }));
     }
   }
 
@@ -1113,7 +1115,8 @@ function openFeatureModal(f, candidates = [], projects = []) {
   const saveBtn = el("button", { className: "act primary", type: "button", textContent: "Save" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
   const close = openModal({
-    title: f.title || "(untitled)", bodyNode: node, footNodes: [saveBtn, cancel],
+    title: (f.title || "(untitled)") + "  #" + f.feature_id,
+    bodyNode: node, footNodes: [saveBtn, cancel],
     width: 680, height: 720,
   });
   saveBtn.onclick = async () => {
@@ -1137,7 +1140,8 @@ function featureCard(f, candidates = [], projects = []) {
   if (f.roadmap_status === "shipped") c.classList.add("shipped-bar");
   else if (tasks.length) c.classList.add("has-tasks", doneCount === tasks.length ? "tasks-done" : "tasks-open");
   const sum = el("summary", { className: "feature-head" });
-  sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)"));
+  sum.append(el("span", { className: "feature-title" }, f.title || "(untitled)",
+    el("span", { className: "idnum" }, " #" + f.feature_id)));
   const meta = el("span", { className: "feature-meta" });
   meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: SLABEL[f.roadmap_status] || f.roadmap_status }));
   if (f.owner) meta.append(el("span", { className: "pill " + f.roadmap_status, textContent: f.owner }));
@@ -1174,7 +1178,9 @@ function docBlock(d, { readOnly = false } = {}) {
     className: "act primary", href: "/api/documents/" + d.document_id + "/open",
     target: "_blank", rel: "noopener", textContent: "open in md-converter ↗",
   });
-  const head = el("div", { className: "docrow-head" }, el("span", { className: "docrow-label" }, label), open);
+  const head = el("div", { className: "docrow-head" },
+    el("span", { className: "docrow-label" }, label,
+      el("span", { className: "idnum" }, " #" + d.document_id)), open);
   wrap.append(head);
 
   if (readOnly) return wrap;   // open-link only — no edit toggle, no lock-note
@@ -1222,12 +1228,15 @@ async function renderDocs(root) {
   const draw = () => {
     const q = docsQuery.trim().toLowerCase();
     const matched = q
-      ? docs.filter((d) => `${d.title || ""} ${d.feature_title || ""}`.toLowerCase().includes(q))
+      ? docs.filter((d) =>
+          `${d.title || ""} #${d.document_id} ${d.feature_title || ""} #${d.feature_id ?? ""}`
+            .toLowerCase().includes(q))
       : docs;
     results.replaceChildren();
     if (!matched.length) { results.append(el("div", { className: "muted" }, "No docs match.")); return; }
     const byFeat = {};
-    for (const d of matched) (byFeat[d.feature_title || UNLINKED] ||= []).push(d);
+    for (const d of matched)
+      (byFeat[d.feature_title ? `${d.feature_title} #${d.feature_id}` : UNLINKED] ||= []).push(d);
     for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
       const c = el("div", { className: "card" });
       c.append(el("h2", {}, title));
@@ -1249,7 +1258,7 @@ function openNewFlagModal(features) {
   const desc = el("textarea", { rows: 4, placeholder: "[Area] description | Blocker for: …" });
   const feat = el("select", {});
   feat.append(el("option", { value: "", textContent: "— no feature —" }));
-  for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: f.title }));
+  for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: `#${f.feature_id} ${f.title}` }));
   const prio = el("select", {});
   for (const p of ["High", "Medium", "Low"]) prio.append(el("option", { value: p, selected: p === "Medium", textContent: p }));
   const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
@@ -1304,7 +1313,7 @@ async function renderFlags(root) {
       flagFilter === "all" ? true : flagFilter === "resolved" ? f.resolved : !f.resolved);
     const shown = q
       ? byToggle.filter((f) =>
-          `${f.display_name || ""} #${f.flag_id} ${f.description || ""} ${f.feature_title || ""}`
+          `${f.display_name || ""} #${f.flag_id} ${f.description || ""} ${f.feature_title || ""} #${f.feature_id ?? ""}`
             .toLowerCase().includes(q))
       : byToggle;
     results.replaceChildren();
@@ -1313,7 +1322,8 @@ async function renderFlags(root) {
       return;
     }
     const byFeat = {};
-    for (const f of shown) (byFeat[f.feature_title || UNLINKED] ||= []).push(f);
+    for (const f of shown)
+      (byFeat[f.feature_title ? `${f.feature_title} #${f.feature_id}` : UNLINKED] ||= []).push(f);
     for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
       const c = el("div", { className: "card" });
       c.append(el("h2", {}, title));

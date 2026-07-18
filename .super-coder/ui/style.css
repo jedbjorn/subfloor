@@ -209,6 +209,8 @@ details.feature.shipped-bar { border-left-color: var(--lock); }
 .flag > summary:hover { background: var(--accent2); }
 .flag .desc { flex: 1; }
 .flag .flag-num { color: var(--dim); font-weight: 400; }
+/* DB row number riding a title — features, specs/docs; the id shells cite. */
+.idnum { color: var(--dim); font-weight: 400; font-size: .9em; }
 .pill.prio-high { color: var(--warn); border-color: var(--warn); }
 .pill.prio-medium { color: var(--accent); }
 .pill.prio-low { color: var(--dim); }
