@@ -24,6 +24,32 @@ Free to use, open source, MIT License.
 
 ![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cover.png)
 
+### The headliners
+
+- **Cross-provider orchestration.** A sprint runs planner → devs → reviewers
+  **across providers** — devs on Codex, reviewers on Claude, the planner woken
+  by events, workers booted headless per task. Zero scheduled polling: typed
+  message rows, one PR-watch daemon, and session-surviving jobs carry the
+  whole coordination. ([*Sprints*](#sprints))
+- **A standing team, not a session.** Shells are DB rows — identity, memory,
+  decisions, skills — that survive every session and boot on any of four
+  harnesses; the same shell can run Claude Code today and OpenCode tomorrow.
+  ([*The loop*](#the-loop) · [*Harnesses & models*](#harnesses--models))
+- **Sidecars + brokers: capability without credentials.** A sandboxed shell
+  tests against real Postgres, drives a real Windows VM, reaches tailnet
+  hosts, bounces the host's pm2 stack, and reads the live app DB — while the
+  DSN, the SSH key, the tailnet identity, and every route stay on the host,
+  behind unix-socket brokers with fail-closed allowlists.
+  ([*Opt-in features*](#opt-in-features) → the broker sections)
+- **Worktrees + guardrails.** Every shell boots into its own git worktree on
+  a base pinned to `origin/main`; a branch-guard blocks work on `main` in
+  every harness; merging stays the operator's gate. Parallel shells, no
+  clobbering, no surprise commits.
+  ([*How shells share one repo*](#how-shells-share-one-repo))
+- **Self-updating, in place.** `./sc update` pulls the new engine and
+  migrates the DB under the fork's feet — memory intact, sound
+  `./sc rollback`, and `./sc eject` the day you'd rather own it outright.
+  ([*Update a fork*](#update-a-fork))
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
