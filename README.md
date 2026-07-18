@@ -17,9 +17,10 @@ a project repo; it brings the shell system — DB-backed identity, memory, seed/
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
 whatever coding harness you point at it — **Claude Code, OpenCode, Codex, and
 Mistral Vibe**, all sandbox-integrated (or run on the no-docker host path).
-Free to use, open source, MIT License. 
+Free to use, open source, MIT License.
 
-Repo: https://github.com/jedbjorn/super-coder
+> [!class2]
+> **Repo:** [github.com/jedbjorn/super-coder](https://github.com/jedbjorn/super-coder) — source, issues, and releases.
 
 ![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cover.png)
 
