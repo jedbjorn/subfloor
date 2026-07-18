@@ -1,7 +1,7 @@
 ---
 title: super-coder
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
-date: 2026-07-13
+date: 2026-07-18
 project: super-coder
 purpose: Forkable shell substrate for a repo
 ---
@@ -27,7 +27,12 @@ Free to use, open source, MIT License.
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
-and render a boot artifact the harness reads natively.
+and render a boot artifact the harness reads natively. Around that core the
+layer has grown into a full **harness overlay**: an orchestration plane (typed
+messages, a PR watch daemon, headless boots, session-surviving jobs) and an
+execution plane (sandbox, per-shell worktrees, host-side brokers) wrap
+whichever harness you rent — the loop stays the harness's; everything around
+it is ours.
 
 ```mermaid
 graph TD
@@ -589,7 +594,7 @@ session.
 
 ### Under the hood — the event loop
 
-Four pieces carry a sprint's coordination, one direction of flow. The frozen
+Five pieces carry a sprint's coordination, one direction of flow. The frozen
 design is [`specs_sc/sprint-eventing.md`](specs_sc/sprint-eventing.md).
 
 - **Typed messages.** Every `shell_messages` row carries a `kind`: `shell`
@@ -605,15 +610,21 @@ design is [`specs_sc/sprint-eventing.md`](specs_sc/sprint-eventing.md).
   live watch with one batched GraphQL poll and turns transitions (checks
   concluded, review submitted, merged, closed) into one-line `pr_event`
   rows: the message is the wake-up, not the payload. On merge/close a watch
-  retires itself; `./sc watch list` shows what's live. The daemon only ever
-  writes rows — it never boots shells and never touches git.
+  retires itself (a merge whose checks are still pending keeps its watch until
+  they conclude); `./sc watch list` shows what's live. Each cycle the daemon
+  also beats a heartbeat row, so `list` / `pr` can say whether anybody is
+  actually polling — a watch can no longer report live with the daemon down.
+  The daemon only ever writes rows — it never boots shells and never touches
+  git.
 - **Headless workers.** `./sc run <shortname> [-p "<prompt>"]
   [--harness <h>] [-m <model>]` boots a shell non-interactively: the same
   render as `./sc enter`, then a per-harness adapter — `claude -p` ·
   `codex exec` · `opencode run`. The default prompt is *"Check your inbox
   and act on your unread messages."* Harness + model resolve explicit flags
   → the sprint doc's `models:` line → `flavor_defaults`; a liveness guard
-  refuses a shell that already has a live session. Workers become
+  refuses a shell that already has a live session — and classifies sessions
+  that outlived their terminal as *orphaned*, so a dead boot is a labeled
+  fact, not a silent block. Workers become
   ephemeral, per-task sessions — boot fresh, act, report a `result` row,
   exit — so no worker context accretes across the sprint, while memory,
   archives, and messages accrete in the DB exactly as in an interactive
@@ -624,6 +635,16 @@ design is [`specs_sc/sprint-eventing.md`](specs_sc/sprint-eventing.md).
   cost while idle. Claude-harness only; on other harnesses the planner
   keeps the task-boundary inbox check, so correctness is identical and only
   wake latency degrades.
+- **Session-surviving jobs.** `./sc job start [--label <slug>] [--timeout <s>]
+  -- <cmd>` runs long local work — a suite, a bench, a build — as a detached,
+  supervised one-shot that **outlives the session that started it** (a harness
+  background task is session-scoped and dies with a headless boot, silently).
+  Completion lands as a `result` row in the starting shell's own inbox — the
+  same wake path PR events ride — and `--timeout` group-kills a wedged run
+  into a bounded failure *with* a wake-up, never a silent hole. `list` /
+  `status` / `tail` / `kill` complete the set; `./sc job wait <id>` is the
+  bounded foreground slice (≤ 550 s; exit 2 = still running — drain your inbox
+  between slices). Full doc: [`docs_sc/job-runner.md`](docs_sc/job-runner.md).
 
 ```linear
 Planner sends task row :::class1 -> sc run dev (headless) :::class2 -> Dev builds, opens PR + watch :::class2 -> CI concludes :::class3 -> Daemon writes pr_event :::class3 -> Watcher wakes planner :::class1 -> Planner boots next unit :::class1
@@ -762,7 +783,14 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
 ./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
 ./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
+./sc job start -- <cmd>  # run a long local command detached + supervised — survives the session,
+                         #   completion lands in your inbox (wait/list/status/tail/kill complete the set)
+./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·
+                         #   flag · roadmap · doc · narrative) — identity is the shell's token
+sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` for the repo-map dr_*
 ./sc down                # stop + remove the sandbox container
+./sc restart             # confirm-gated (YES) + DB backup, then down + launch — recreate fresh
+./sc persist             # reboot-proof the host daemons: install every applicable systemd --user unit
 ./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
 ./sc render              # regenerate the tracked flat _sc files from the DB
@@ -1072,6 +1100,11 @@ graph LR
 - `windows_devkit` simply `curl --unix-socket`s the four verbs. The key never enters
   the fork and `virsh` runs only on the host — a compromised sandbox can *ask* for a
   reset, but cannot script libvirt or read the credential.
+- **GUI driving rides the same seam.** `./sc vm-mcp-relay up` opens an
+  in-sandbox TCP relay (`127.0.0.1:18000`) tunneled through the broker's
+  socket to the guest's Windows-MCP, so `claude mcp add --transport http`
+  reaches it from a sandboxed seat — the `windows_vm_gui` skill's UIA-based
+  exploratory QAQC runs over this.
 
 Full design: [`.super-coder/docs/windows-test-vm.md`](.super-coder/docs/windows-test-vm.md) ·
 [`.super-coder/docs/windows-vm-broker.md`](.super-coder/docs/windows-vm-broker.md).
@@ -1144,6 +1177,46 @@ curl -s --unix-socket "$SOCK" http://pm2/restart -d '{"proc":"myapp-api"}'
 
 Full design: [`.super-coder/docs/pm2-broker.md`](.super-coder/docs/pm2-broker.md).
 
+## db broker (opt-in)
+
+> [!class2]
+> **Shells** dev · reviewer · planner (diagnostic reads) · **UI** `./sc db-init` scaffolds the `db` block (no wizard)
+
+Fourth sibling, same shape, different backend: a **host-side broker over a unix
+socket** for **read-only diagnostic reads of the fork's live app Postgres** —
+without handing the sandbox a DSN or a network route. The sandbox's own pg
+sidecar is deliberately empty (it's the dev/test target), so the live DB —
+where the runtime telemetry that *confirms* a diagnosis lives — is unreachable
+from inside; the cruder fixes (mount the DSN, open a route) both widen the
+blast radius. Instead the DSN and the route stay host-side and the sandbox
+gets one narrow verb.
+
+Read-only is **enforced twice**: the DSN must be a read-only Postgres role
+(the DB-enforced backstop; the broker also connects
+`default_transaction_read_only=on`), and the broker rejects anything that
+isn't a single `SELECT`/`WITH` before `psql` ever runs. Table scoping is
+fail-closed on the `db` block's `allow_tables` (default: ops/telemetry only —
+content/tenant tables are added only by explicit operator scope), every query
+gets a row cap + statement timeout, and every call lands in an audit log. The
+block carries **no secret** — it names an env var (`dsn_env`), which the
+broker resolves host-side at query time; `instance.json` stays
+sandbox-readable and safe.
+
+```bash
+./sc db-init                 # scaffold the "db" block + print the one-time host steps (RO role, GRANTs, export the DSN)
+./sc db-broker-up            # start backgrounded (also auto-started by ./sc launch when a db is linked)
+./sc db-broker-install       # optional: a systemd --user unit (its EnvironmentFile carries the DSN var)
+SOCK="$(./sc db-broker-sock)"
+curl -s --unix-socket "$SOCK" http://db/query -d '{"sql":"SELECT count(*) FROM skill_runs"}'
+```
+
+Unlike the other three, this one isn't a `./sc feature` entry — `./sc db-init`
+plus the host steps it prints are the whole setup. Full design:
+[`.super-coder/docs/db-broker.md`](.super-coder/docs/db-broker.md).
+
+> [!class2]
+> **Reboot-proof it all in one verb.** Every host-side daemon — the GitHub watch daemon and the four brokers — has a `-install` verb (a systemd `--user` unit). `./sc persist` runs them all in one pass: installs + enables every unit that applies to this fork (the watch daemon when `gh` is present; each broker when its block is linked), enables linger so they survive logout and reboot, and skips the rest with a reason. Idempotent — re-run any time.
+
 ## Review GUI
 
 > [!class2]
@@ -1214,7 +1287,8 @@ the one bind-mounted repo + creds. The port publishes to `127.0.0.1` only.
 > **Ports are derived per repo**, never fixed — a fork runs *inside* a host repo that may have its own dev server, and several forks can run at once. Each fork hashes its path to a stable port in the `88xx` band (clear of superCC 8000 / dos-arch 8001 and common host ports), persisted to a gitignored `.super-coder/instance.json` you can hand-edit. Two forks won't collide.
 
 What you can do in the GUI: read everything; **create shells** (pick a flavor —
-the factory grants its skill set and opens its first session); edit a shell's
+the factory grants its skill set and opens its first session); rename a
+shell's `display_name` (✎ next to the name); edit a shell's
 operational fields (`current_state`, `connections`, `workspace`) and skill
 grants; edit the roadmap (linear status buckets, with toggle-filters) and
 **non-frozen** documents; create and resolve flags. **seed and L&S are
