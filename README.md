@@ -15,8 +15,9 @@ purpose: Forkable shell substrate for a repo
 A **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
-whatever coding harness you point at it — **Claude Code, OpenCode, Codex, and
-Mistral Vibe**, all sandbox-integrated (or run on the no-docker host path).
+whatever coding harness you point at it — **Claude Code, OpenCode, Codex,
+Mistral Vibe, and Kimi Code**, all sandbox-integrated (or run on the no-docker
+host path).
 Free to use, open source, MIT License.
 
 > [!class2]
@@ -92,9 +93,9 @@ This repo is also **dogfood**: super-coder maintains super-coder. Its own
 
 ```stats
 :::class1
-value: 4
+value: 5
 label: Coding harnesses
-description: Claude · Codex · OpenCode · Vibe
+description: Claude · Codex · OpenCode · Vibe · Kimi
 :::class3
 value: 5
 label: Shell flavors
@@ -143,8 +144,8 @@ coding harness.
 |---|---|---|
 | **Container engine** | `sudo pacman -S docker`, then start a daemon — rootless default: `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker` | `brew install colima docker && colima start` (or Docker Desktop) |
 | **Base tools** | `sudo pacman -S git curl python sqlite` (usually already present) | `xcode-select --install` (git/curl); python3 + sqlite3 ship with macOS |
-| **Harness CLI** | installed for you by `./sc install` (`claude` · `opencode` · `codex` · `vibe`, native installers). Repair by hand: `curl -fsSL https://claude.ai/install.sh \| bash` | same — **and put `~/.local/bin` on your PATH** (a fresh macOS shell omits it) |
-| **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe; sign in once on the host (step 3) | same |
+| **Harness CLI** | installed for you by `./sc install` (`claude` · `opencode` · `codex` · `vibe` · `kimi`, native installers). Repair by hand: `curl -fsSL https://claude.ai/install.sh \| bash` | same — **and put `~/.local/bin` on your PATH** (a fresh macOS shell omits it) |
+| **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe · Kimi Code; sign in once on the host (step 3) | same |
 
 > [!class4]
 > **The bar: a reachable docker daemon + a harness CLI on PATH.** `./sc doctor` reports the docker mode it finds (rootless / rootful) and the exact next command; `python3` + `sqlite3` are the only *hard* requirements (the engine runtime). **macOS PATH gotcha:** if `claude` reports *"missing or broken — run claude install to repair"*, the CLI installed fine but `~/.local/bin` isn't on your PATH. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc`), open a new shell, then `claude install`. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the host.
@@ -166,7 +167,7 @@ git checkout super-coder/main -- .super-coder sc
 ./sc install
 
 # 3. Sign in to your harness once, on the HOST (not inside the sandbox):
-claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup
+claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
 
 # 4. Launch the sandbox (server + GUI) and attach a session:
 ./sc launch
@@ -315,7 +316,7 @@ via git (no history merge; super-coder never touches your repo's own
 `Makefile`), `./sc install`, sign in, launch, commit.
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
-(`claude` + `opencode` + `codex` + `vibe`, via their official native installers — no
+(`claude` + `opencode` + `codex` + `vibe` + `kimi`, via their official native installers — no
 npm — if any are missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
 **makes the engine a gitignored dependency** (`git rm -r --cached .super-coder` —
 files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
@@ -357,18 +358,23 @@ claude                      # Claude Code — prompts to sign in on first run
 opencode auth login         # OpenCode
 codex login                 # Codex (OpenAI / ChatGPT account)
 vibe --setup                # Mistral Vibe — stores the API key (or export MISTRAL_API_KEY)
+kimi login                  # Kimi Code — device-code OAuth against your Kimi membership
 ```
 
 `./sc launch` bind-mounts each harness's credential dir into the sandbox
 (`~/.claude` + `~/.claude.json`, `~/.config/opencode` + `~/.local/share/opencode`,
-`~/.codex`, `~/.vibe`), so host auth flows straight into the container — **you
-never sign in inside the sandbox.** Authenticate on the host, then `./sc enter`.
+`~/.codex`, `~/.vibe`, `~/.kimi-code`), so host auth flows straight into the
+container — **you never sign in inside the sandbox.** Authenticate on the host,
+then `./sc enter`.
 
 > [!class4]
 > **Sign in on the host, not inside the sandbox.** OAuth logins spin up a localhost callback server (Codex uses `:1455`). Run the login on the **host** so your browser's callback reaches it — from *inside* the sandbox that port isn't published, so the browser gets `ERR_CONNECTION_REFUSED`.
 
 > [!class2]
 > **Vibe creds.** `vibe --setup` stores your key under `~/.vibe`, which the sandbox now mounts — so Vibe works inside the container like the others. Prefer the env-var path? `export MISTRAL_API_KEY` on the host before `./sc launch` and it's forwarded in (only when set). Re-run `./sc launch` after first authenticating, so the mount picks up `~/.vibe`.
+
+> [!class2]
+> **Kimi creds.** `kimi login` (device-code OAuth) stores its state under `~/.kimi-code`, which the sandbox mounts — host auth flows in. Note kimi does **not** read keys from shell env vars (`export KIMI_API_KEY=…` does nothing); provider keys live in `~/.kimi-code/config.toml`. Re-run `./sc launch` after first authenticating, so the mount picks it up.
 
 > [!class2]
 > **OpenCode is the exception.** Its `opencode auth login` for **API-key** providers is a paste-the-key prompt, not an OAuth callback, so it works at **either level** — host or inside the container (`./sc enter`). Because `~/.config/opencode` + `~/.local/share/opencode` are bind-mounted read-write, a key entered on either side lands in the same `auth.json`. (OAuth-based OpenCode providers still follow the host rule above.)
@@ -395,6 +401,7 @@ against its plan rather than its pay-as-you-go API:
 | **Claude Code** | Anthropic | [Claude Pro / Max](https://claude.com/pricing) |
 | **Codex** | OpenAI | [ChatGPT Plus / Pro](https://openai.com/chatgpt/pricing/) |
 | **Vibe** | Mistral | [Mistral plans](https://mistral.ai/pricing) |
+| **Kimi Code** | Moonshot AI | [Kimi memberships (Moderato / Allegretto / …)](https://www.kimi.com/help/membership/membership-pricing) |
 | **OpenCode** → open-weights | Ollama | [Ollama Cloud (or run local, free)](https://ollama.com/) |
 
 Codex exists for exactly this reason — a ChatGPT account bills **flat, with no
@@ -443,7 +450,7 @@ The logic, four rules:
   defaults premium on Codex.
 
 > [!class2]
-> **Vibe sits outside this matrix.** Mistral Vibe takes no model from the launch seam — it selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`. It's a fourth harness option, not a fourth column here — and for the same reason it takes no headless boot (`./sc run` covers claude · codex · opencode).
+> **Vibe and Kimi Code sit outside this matrix.** Neither takes a model from the launch seam. Vibe selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`, and takes no headless boot. Kimi Code selects via `default_model` in `~/.kimi-code/config.toml` (its `-m` wants a user-local alias, not a portable model id) — it *does* boot headless (`kimi -p`), on that configured default (`./sc run` covers claude · codex · opencode · kimi).
 
 ### The sprint interview — models per role, per sprint
 

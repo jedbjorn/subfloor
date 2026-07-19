@@ -86,6 +86,11 @@ is harness-blind. Each holds an `adapter.json`:
   `--dangerously-bypass-approvals-and-sandbox`); model is selected via `--model`.
 - **`vibe/`** — reads `AGENTS.md` natively; nothing to emit. Launches `vibe
   --trust` (sandbox adds `--agent auto-approve`).
+- **`kimi/`** — reads `AGENTS.md` natively; nothing to emit. Launches `kimi`
+  (sandbox adds `--yolo` — interactive only: `kimi -p` rejects permission-mode
+  flags and always runs auto-approve). Headless via `kimi -p`; takes no model
+  from the launch seam (kimi's `-m` wants a user-local alias from
+  `~/.kimi-code/config.toml`, not a portable model id).
 
 The boot render dual-writes `CLAUDE.md` + `AGENTS.md` and the skills, so both
 harnesses consume the same substrate unchanged — that's the harness-agnostic bet.

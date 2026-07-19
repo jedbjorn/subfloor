@@ -1,0 +1,9 @@
+{
+  "harness": "kimi",
+  "launch": ["kimi"],
+  "boot_artifact": "AGENTS.md",
+  "emit": [],
+  "env": {},
+  "headless": { "launch": ["kimi", "-p"] },
+  "sandbox": { "launch_flags": ["--yolo"] }
+}

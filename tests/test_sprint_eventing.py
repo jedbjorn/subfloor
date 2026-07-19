@@ -578,6 +578,17 @@ class HeadlessTest(unittest.TestCase):
     def test_vibe_has_no_headless_seam(self):
         self.assertIsNone(run.headless_command(self.adapter("vibe"), "p"))
 
+    def test_kimi_headless_argv(self):
+        cmd = run.headless_command(self.adapter("kimi"), "do it")
+        self.assertEqual(cmd, ["kimi", "-p", "do it"])
+
+    def test_kimi_takes_no_model_from_the_seam(self):
+        # kimi declares no model_flag (its -m wants a config.toml alias, not a
+        # portable id) — a resolved model must NOT leak into the argv, where it
+        # would land between -p and its prompt value.
+        cmd = run.headless_command(self.adapter("kimi"), "p", "k3")
+        self.assertEqual(cmd, ["kimi", "-p", "p"])
+
     def test_prompt_is_the_final_positional(self):
         cmd = run.headless_command(self.adapter("claude"), "trailing prompt", "opus",
                                    ["--dangerously-skip-permissions"])

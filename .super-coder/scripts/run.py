@@ -357,7 +357,15 @@ def ensure_harness_path() -> None:
     detect_harnesses() silently never offers opencode even though ensure-harness
     reported it installed: install.py trusts HARNESS_BIN, the launcher trusted
     PATH only, and they disagreed. Reuse install.HARNESS_BIN so there is one
-    source for where a harness lives."""
+    source for where a harness lives.
+
+    In the sandbox this is a no-op: the image's ENV PATH already carries every
+    baked binary dir, and folding host dirs in is actively wrong for kimi —
+    host `~/.kimi-code` (its bin/ + config in one dir) is bind-mounted for
+    creds, and prepending its bin/ would shadow the image's own kimi binary
+    with the host's (a darwin binary on a macOS host)."""
+    if os.environ.get("SC_SANDBOX"):
+        return
     try:
         bin_dirs = [p.parent for p in install.HARNESS_BIN.values()]
     except Exception:
@@ -826,17 +834,20 @@ def main() -> None:
 
     # Sandbox-only launch flags — e.g. codex's approval/sandbox bypass, safe
     # because the container is the safety boundary. The no-docker host path keeps
-    # the harness's normal prompts (SC_SANDBOX unset). Headless adds the
-    # adapter's `headless_flags`: a non-interactive run can't answer a
-    # permission prompt (it auto-denies and the worker silently stalls), so
-    # e.g. claude gets its bypass flag — in the sandbox ONLY, same doctrine.
+    # the harness's normal prompts (SC_SANDBOX unset). The two flag sets are
+    # disjoint by launch mode: `launch_flags` for interactive, `headless_flags`
+    # for headless — a non-interactive run can't answer a permission prompt (it
+    # auto-denies and the worker silently stalls), so e.g. claude gets its bypass
+    # flag there; codex declares the same flag in both. They are NOT folded
+    # together because a harness's interactive flag can be invalid headless —
+    # `kimi -p` hard-errors on `--yolo`/`--auto` (prompt mode is always
+    # auto-permission, no flag needed).
     sandbox_flags: list[str] = []
     sandbox_env: dict[str, str] = {}
     if os.environ.get("SC_SANDBOX"):
         scfg = adapter.get("sandbox") or {}
-        sandbox_flags = list(scfg.get("launch_flags") or [])
-        if headless:
-            sandbox_flags += scfg.get("headless_flags") or []
+        key = "headless_flags" if headless else "launch_flags"
+        sandbox_flags = list(scfg.get(key) or [])
         if sandbox_flags:
             print(f"→ sandbox: launch flags → {' '.join(sandbox_flags)}")
         # Sandbox-only launch env — e.g. claude's IS_SANDBOX=1, required because
@@ -855,7 +866,7 @@ def main() -> None:
             adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags)
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
-                     f"use claude, codex, or opencode")
+                     f"use claude, codex, opencode, or kimi")
         if hmodel:
             src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
             print(f"→ model: {hmodel} ({src})")

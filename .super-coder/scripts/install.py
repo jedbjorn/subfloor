@@ -9,7 +9,7 @@ from "engine present" to "a team you can launch":
                  is already installed (both would destroy content). --force skips.
     2. Require — python3 + sqlite3 (+ a heads-up if git/curl missing, and a
                  docker preflight for the sandbox run path — advisory, not fatal).
-    3. Harness — ensure claude + opencode + codex + vibe are installed (official native
+    3. Harness — ensure claude + opencode + codex + vibe + kimi are installed (official native
                  installers, no npm); pick the launch default → instance.json.
     4. Strip   — super-coder's own per-instance content; a fork inherits the
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
@@ -135,22 +135,24 @@ def already_installed() -> bool:
 
 
 def detect_harness() -> str | None:
-    for h in ("claude", "opencode", "codex", "vibe"):
+    for h in ("claude", "opencode", "codex", "vibe", "kimi"):
         if _harness_installed(h):
             return h
     return None
 
 
 # Official NATIVE installers — no npm. Claude Code dropped npm as the primary
-# path (https://code.claude.com/docs/en/setup); opencode + codex + vibe ship their own
-# scripts too. Pipe-to-shell, latest version. vibe installs via uv (its script
-# checks for / uses `uv tool install mistral-vibe`); a missing uv makes its
-# install fail best-effort, same as any other harness.
+# path (https://code.claude.com/docs/en/setup); opencode + codex + vibe + kimi ship
+# their own scripts too. Pipe-to-shell, latest version. vibe installs via uv (its
+# script checks for / uses `uv tool install mistral-vibe`); a missing uv makes its
+# install fail best-effort, same as any other harness. kimi (Kimi Code) is a
+# single binary dropped into its own config home, ~/.kimi-code/bin.
 HARNESS_INSTALL = {
     "claude":   "curl -fsSL https://claude.ai/install.sh | bash",
     "opencode": "curl -fsSL https://opencode.ai/install | bash",
     "codex":    "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
     "vibe":     "curl -LsSf https://mistral.ai/vibe/install.sh | bash",
+    "kimi":     "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
 }
 # Where each installer drops its binary. Checked post-install because the new
 # bin dir is NOT on this process's PATH — the installer edits shell rc files,
@@ -162,6 +164,7 @@ HARNESS_BIN = {
     "opencode": Path.home() / ".opencode" / "bin" / "opencode",
     "codex":    Path.home() / ".local" / "bin" / "codex",
     "vibe":     Path.home() / ".local" / "bin" / "vibe",
+    "kimi":     Path.home() / ".kimi-code" / "bin" / "kimi",
 }
 
 
@@ -254,7 +257,7 @@ def update_harnesses() -> dict[str, str]:
 
 def ensure_harnesses() -> dict[str, str]:
     """Install any missing harness CLI via its official native installer (no
-    npm) — claude + opencode + codex + vibe, so a fork can launch and run any. Best
+    npm) — claude + opencode + codex + vibe + kimi, so a fork can launch and run any. Best
     effort: a failed install warns and continues (the harness is only needed at
     launch and can be installed by hand later). Returns {name: status}."""
     status: dict[str, str] = {}
@@ -508,14 +511,14 @@ def main(argv: list[str]) -> int:
 
     # Standalone: force-update all harness CLIs to latest and exit.
     if "--update-harnesses" in argv:
-        step("Updating harness CLIs to latest (claude + opencode + codex + vibe)")
+        step("Updating harness CLIs to latest (claude + opencode + codex + vibe + kimi)")
         update_harnesses()
         return 0
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
     # fork). Runs before the guards so it works anywhere.
     if "--ensure-harness" in argv:
-        step("Ensuring harness CLIs (claude + opencode + codex + vibe)")
+        step("Ensuring harness CLIs (claude + opencode + codex + vibe + kimi)")
         ensure_harnesses()
         return 0
 
@@ -556,12 +559,12 @@ def main(argv: list[str]) -> int:
     report_docker()
 
     # 3. Ensure harness CLIs --------------------------------------------------
-    # Install claude + opencode + codex + vibe if missing, via their official NATIVE
+    # Install claude + opencode + codex + vibe + kimi if missing, via their official NATIVE
     # installers (no npm). The harness picker lets a fork launch + run any, so we
     # want all present. --skip-harness-install detects only (CI / air-gapped).
     # instance.json's harness is the launch default; the picker overrides it
     # per-launch.
-    step("Ensuring harness CLIs (claude + opencode + codex + vibe)")
+    step("Ensuring harness CLIs (claude + opencode + codex + vibe + kimi)")
     if skip_harness:
         print("  --skip-harness-install set — detecting only, not installing")
         for n in HARNESS_INSTALL:

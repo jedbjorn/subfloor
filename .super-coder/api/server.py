@@ -237,11 +237,11 @@ def get_skills(con) -> dict:
 
 
 def known_harnesses() -> list[str]:
-    """The harness set = the shipped adapters (claude/codex/opencode/vibe)."""
+    """The harness set = the shipped adapters (claude/codex/kimi/opencode/vibe)."""
     d = ENGINE / "adapters"
     if d.exists():
         return sorted(p.name for p in d.iterdir() if p.is_dir())
-    return ["claude", "codex", "opencode", "vibe"]
+    return ["claude", "codex", "kimi", "opencode", "vibe"]
 
 
 def get_flavor_defaults(con) -> dict:

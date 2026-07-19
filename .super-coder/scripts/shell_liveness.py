@@ -63,7 +63,7 @@ ADAPTERS = ENGINE / "adapters"
 DB_PATH = ENGINE / "shell_db.db"
 PROC = Path("/proc")
 
-_FALLBACK_BINS = {"claude", "codex", "opencode", "vibe"}
+_FALLBACK_BINS = {"claude", "codex", "opencode", "vibe", "kimi"}
 
 
 def harness_binaries() -> set[str]:
