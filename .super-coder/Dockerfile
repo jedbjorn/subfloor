@@ -2,7 +2,7 @@
 #
 # The repo is bind-mounted at runtime (see `./sc launch`); this image carries
 # what the harness needs to run: python3 + sqlite3, git/curl/ripgrep, gh, and the
-# harness CLIs (claude / opencode / codex / vibe) baked in via their official
+# harness CLIs (claude / opencode / codex / vibe / kimi) baked in via their official
 # native installers (the same ones install.py uses — keep the URLs in sync with
 # scripts/install.py HARNESS_INSTALL).
 # It also carries the dev-kit TOOLCHAIN super-coder develops against — node LTS for
@@ -14,8 +14,9 @@
 # ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode + codex
 # are fat self-contained binaries. Baking them sidesteps the symlink dance.
 # Auth/config (~/.claude, ~/.claude.json, ~/.config/opencode,
-# ~/.local/share/opencode, ~/.codex) is mounted rw from the host so the container
-# reuses the login you already did — no in-container `auth login`.
+# ~/.local/share/opencode, ~/.codex, ~/.vibe, ~/.kimi-code) is mounted rw from
+# the host so the container reuses the login you already did — no in-container
+# `auth login`.
 #
 # The container runs as your uid (compose `user:`) with HOME=/home/<user> equal
 # to the host, so paths match host==container and Path.home() finds everything.
@@ -103,6 +104,15 @@ RUN printf '%s\n' \
       > /usr/local/bin/sc \
  && chmod 0755 /usr/local/bin/sc
 
+# Kimi Code — baked HERE (root stage) with its binary DELIBERATELY redirected to
+# /usr/local/bin (root-writable, on every PATH), unlike the $HOME installs below.
+# Its default home, ~/.kimi-code, holds bin/ AND config in one dir, and
+# `./sc launch` bind-mounts the host's ~/.kimi-code for creds — installing there
+# would let the mount shadow the baked binary (fatal on a macOS host: darwin
+# binary, linux container). KIMI_NO_MODIFY_PATH skips its shell-rc edit.
+RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
+      | env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
+
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
 # A host GID may already exist in the base image — notably macOS's primary GID 20
 # (`staff`) collides with Debian's pre-existing `dialout` group — so creating it
@@ -121,6 +131,7 @@ ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 # Harness CLIs — official native installers, no npm (mirrors install.py).
 # codex drops into ~/.local/bin (already on PATH above), same as claude. vibe's
 # installer self-bootstraps uv (astral.sh) then `uv tool install`s into ~/.local/bin.
+# (kimi is baked earlier, in the root stage — see the comment there.)
 RUN curl -fsSL https://claude.ai/install.sh | bash \
  && curl -fsSL https://opencode.ai/install | bash \
  && curl -fsSL https://chatgpt.com/codex/install.sh | sh \

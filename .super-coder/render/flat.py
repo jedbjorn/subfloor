@@ -14,7 +14,8 @@ reverse):
     granted skills. A NON-load-bearing convenience cache for harnesses that
     auto-discover this path natively (Claude Code / OpenCode / Crush). It is NOT
     the source of truth and NOT the cross-harness load path: codex reads its own
-    `$CODEX_HOME/skills` and vibe (Mistral) has no skill dir at all. The
+    `$CODEX_HOME/skills`, kimi its `.kimi-code/skills` / `.agents/skills`, and
+    vibe (Mistral) has no skill dir at all. The
     canonical, harness-agnostic load path is the DB — the boot doc's `## SKILLS`
     block renders each grant's exact `SELECT content FROM skills …` query
     (see compose.render_skills). Like the boot artifact (CLAUDE.md/AGENTS.md)
