@@ -1677,6 +1677,408 @@ async function renderWorktrees(root, opts = {}) {
   root.append(sc);
 }
 
+// ── Analytics ──────────────────────────────────────────────────────────────
+// Token & session analytics (doc #11). Timestamps arrive as UTC ISO; ALL
+// day-grouping and displayed times are LOCAL — translated here at render,
+// never on the server. The tab load runs an incremental sweep first so the
+// view reflects harness data as of now.
+let anFilters = { harness: "", model: "" };  // provider intentionally absent — harness + model identify the slice
+let anSessions = [];      // accumulated cards across "More" pages
+let anNextBefore = null;  // cursor for the next page (null = no older rows)
+let anDaysLoaded = 0;     // window size loaded so far (7 per page)
+let anClass = null;  // selected stat card; null = combined (all classes summed)
+
+const AN_CLASSES = [
+  ["input_tokens", "Input"], ["output_tokens", "Output"],
+  ["cache_read_tokens", "Cache read"], ["cache_write_tokens", "Cache write"],
+  ["reasoning_tokens", "Reasoning"],
+];
+
+const fmtTok = (n) => n == null ? "—"
+  : n >= 1e9 ? (n / 1e9).toFixed(1) + "B"
+  : n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+  : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+const cardTotal = (c) => ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]
+  .reduce((t, k) => t + (c[k] || 0), 0);
+const localDay = (iso) => iso ? new Date(iso).toLocaleDateString(undefined,
+  { weekday: "short", year: "numeric", month: "short", day: "numeric" }) : "undated";
+const localTime = (iso) => iso ? new Date(iso).toLocaleTimeString(undefined,
+  { hour: "2-digit", minute: "2-digit" }) : "—";
+
+function anQuery(extra = {}) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries({ ...anFilters, ...extra })) if (v) p.set(k, v);
+  const s = p.toString();
+  return s ? "?" + s : "";
+}
+
+const AN_RANGES = [["1W", 7], ["1M", 30], ["3M", 90], ["6M", 180]];
+let anRange = 7;          // the active time chip, in days
+
+async function anLoadPage(days) {
+  const d = await api("/analytics/sessions" + anQuery({
+    ...(anNextBefore ? { before: anNextBefore } : {}), days }));
+  anSessions.push(...d.sessions);
+  anNextBefore = d.next_before;
+  anDaysLoaded += days;
+}
+
+// ── chart: local-day buckets + a monotone-cubic spline ──
+// Buckets come from the loaded session cards (not a second endpoint), so the
+// stat cards, the graph, and the list below always agree — same window, same
+// filters, same local-day boundaries. Empty days are measured zero, not gaps.
+function anBuckets(cls) {  // cls null = combined (the four classes summed)
+  const days = anDaysLoaded || anRange;
+  const keyOf = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  const buckets = [];
+  const byKey = {};
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 864e5);
+    const b = { key: keyOf(d), date: d, value: 0 };
+    buckets.push(b);
+    byKey[b.key] = b;
+  }
+  for (const c of anSessions) {
+    if (!c.started_at) continue;
+    const b = byKey[keyOf(new Date(c.started_at))];
+    if (b) b.value += cls ? (c[cls] || 0) : cardTotal(c);
+  }
+  return buckets;
+}
+
+// Monotone cubic interpolation (Fritsch–Carlson, d3 curveMonotoneX shape):
+// smooth through every point with no overshoot — a spend series never dips
+// below what was measured just to look curvy.
+function monotonePath(pts) {
+  if (pts.length < 2) return "";
+  const n = pts.length;
+  const dx = [], dy = [], m = [];
+  for (let i = 0; i < n - 1; i++) {
+    dx.push(pts[i + 1][0] - pts[i][0]);
+    dy.push(pts[i + 1][1] - pts[i][1]);
+    m.push(dy[i] / (dx[i] || 1));
+  }
+  const t = [m[0]];
+  for (let i = 1; i < n - 1; i++)
+    t.push(m[i - 1] * m[i] <= 0 ? 0
+      : 3 * (dx[i - 1] + dx[i]) / ((2 * dx[i] + dx[i - 1]) / m[i - 1] + (dx[i] + 2 * dx[i - 1]) / m[i]));
+  t.push(m[n - 2]);
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = dx[i] / 3;
+    d += `C${pts[i][0] + h},${pts[i][1] + h * t[i]} ` +
+         `${pts[i + 1][0] - h},${pts[i + 1][1] - h * t[i + 1]} ` +
+         `${pts[i + 1][0]},${pts[i + 1][1]}`;
+  }
+  return d;
+}
+
+const niceMax = (v) => {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const s of [1, 2, 5, 10]) if (v <= s * p) return s * p;
+  return 10 * p;
+};
+
+function anChartLabel() {
+  const cls = anClass ? AN_CLASSES.find(([k]) => k === anClass)[1] : "Total";
+  const scope = [anFilters.harness || "all harnesses", anFilters.model].filter(Boolean).join(" · ");
+  return `${cls} tokens — last ${anDaysLoaded || anRange} days — ${scope}`;
+}
+
+const SVG = "http://www.w3.org/2000/svg";
+const svgEl = (t, attrs = {}) => {
+  const n = document.createElementNS(SVG, t);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  return n;
+};
+
+function anChart(cls) {
+  const buckets = anBuckets(cls);
+  const W = 860, H = 180, L = 48, R = 14, T = 10, B = 22;
+  const iw = W - L - R, ih = H - T - B;
+  const ymax = niceMax(Math.max(...buckets.map((b) => b.value)));
+  const x = (i) => L + (buckets.length === 1 ? iw / 2 : (i / (buckets.length - 1)) * iw);
+  const y = (v) => T + ih - (v / ymax) * ih;
+  const pts = buckets.map((b, i) => [x(i), y(b.value)]);
+
+  const wrap = el("div", { className: "an-chart-wrap", tabIndex: 0 });
+  wrap.append(el("div", { className: "an-chart-title" }, anChartLabel()));
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "an-chart" });
+
+  // recessive hairline grid + clean y ticks (0 / mid / max)
+  for (const v of [0, ymax / 2, ymax]) {
+    svg.append(svgEl("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: "an-grid" }));
+    const tick = svgEl("text", { x: L - 6, y: y(v) + 3, class: "an-tick", "text-anchor": "end" });
+    tick.textContent = fmtTok(v);
+    svg.append(tick);
+  }
+  // x labels: first, middle, last day (local)
+  const xLabel = (i, anchor) => {
+    const t2 = svgEl("text", { x: x(i), y: H - 6, class: "an-tick", "text-anchor": anchor });
+    t2.textContent = buckets[i].date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return t2;
+  };
+  svg.append(xLabel(0, "start"), xLabel(Math.floor(buckets.length / 2), "middle"),
+             xLabel(buckets.length - 1, "end"));
+
+  const line = monotonePath(pts);
+  svg.append(svgEl("path", { d: `${line}L${x(buckets.length - 1)},${y(0)}L${x(0)},${y(0)}Z`, class: "an-area" }));
+  svg.append(svgEl("path", { d: line, class: "an-line" }));
+
+  // crosshair + tooltip: aim at a day, never at the 2px line; arrows work too
+  const cross = svgEl("line", { y1: T, y2: T + ih, class: "an-cross", visibility: "hidden" });
+  const dot = svgEl("circle", { r: 4, class: "an-dot", visibility: "hidden" });
+  svg.append(cross, dot);
+  const tip = el("div", { className: "an-tip", hidden: true });
+  wrap.append(svg, tip);
+
+  let cur = -1;
+  const show = (i) => {
+    cur = i;
+    const [px, py] = pts[i];
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px);
+    cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", px); dot.setAttribute("cy", py);
+    dot.setAttribute("visibility", "visible");
+    tip.replaceChildren(
+      el("b", {}, (buckets[i].value || 0).toLocaleString()),
+      " ", el("span", { className: "muted" },
+        buckets[i].date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })));
+    tip.hidden = false;
+    const frac = (px - L) / iw;
+    tip.style.left = `calc(${(px / W) * 100}% - ${Math.round(frac * tip.offsetWidth)}px)`;
+    tip.style.top = `${Math.max(0, (py / H) * 100 - 18)}%`;
+  };
+  const hide = () => { cur = -1; cross.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden"); tip.hidden = true; };
+  svg.addEventListener("pointermove", (e) => {
+    const r = svg.getBoundingClientRect();
+    const px = ((e.clientX - r.left) / r.width) * W;
+    let best = 0;
+    for (let i = 1; i < pts.length; i++) if (Math.abs(pts[i][0] - px) < Math.abs(pts[best][0] - px)) best = i;
+    show(best);
+  });
+  svg.addEventListener("pointerleave", hide);
+  wrap.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowRight") { show(Math.min(cur + 1, pts.length - 1)); e.preventDefault(); }
+    else if (e.key === "ArrowLeft") { show(Math.max(cur - 1, 0)); e.preventDefault(); }
+    else if (e.key === "Escape") hide();
+  });
+  wrap.addEventListener("blur", hide);
+  return wrap;
+}
+
+function anSelect(label, key, values, onChange) {
+  const wrap = el("label", { className: "an-filter" }, microlabel(label));
+  const sel = el("select", { className: "an-select" });
+  sel.append(el("option", { value: "" }, "All"));
+  for (const v of values) sel.append(el("option", { value: v, selected: anFilters[key] === v }, v));
+  sel.onchange = () => onChange(sel.value);
+  wrap.append(sel);
+  return wrap;
+}
+
+function anSessionCard(c, sprintTitles) {
+  const row = el("details", { className: "sess" });
+  const head = el("summary", { className: "sess-head" });
+  head.append(el("span", { className: "sess-time" },
+    localTime(c.started_at) + "–" + localTime(c.ended_at)));
+  head.append(el("span", { className: "pill" + (c.unattributed ? " warn" : "") },
+    c.unattributed ? "unattributed" : c.shell || "?"));
+  head.append(el("span", { className: "pill" }, c.harness));
+  if (c.models) head.append(el("span", { className: "sess-model" }, c.models));
+  const title = c.title || "";
+  head.append(el("span", { className: "sess-title" },
+    title.length > 100 ? title.slice(0, 100) + "…" : title));
+  head.append(el("span", { className: "sess-tok" }, fmtTok(cardTotal(c) || null)));
+  row.append(head);
+
+  const body = el("div", { className: "sess-body" });
+  if (title.length > 100) body.append(el("div", { className: "sess-full-title" }, title));
+  body.append(statRow([
+    ["input", fmtTok(c.input_tokens)], ["output", fmtTok(c.output_tokens)],
+    ["cache read", fmtTok(c.cache_read_tokens)], ["cache write", fmtTok(c.cache_write_tokens)],
+    ...(c.reasoning_tokens != null ? [["reasoning", fmtTok(c.reasoning_tokens)]] : []),
+  ]));
+  const meta = [];
+  if (c.providers) meta.push(["provider", c.providers]);
+  if (c.shell_session) meta.push(["session", c.shell_session]);
+  if (c.sprint_ref) meta.push(["sprint", sprintTitles[c.sprint_ref] || "#" + c.sprint_ref]);
+  if (c.status !== "ok") meta.push(["status", c.status]);
+  if (meta.length) body.append(statRow(meta));
+  body.append(el("code", { className: "sess-ref" }, c.harness_session_ref));
+  row.append(body);
+  return row;
+}
+
+async function renderAnalytics(root) {
+  root.replaceChildren(el("div", { className: "muted" }, "sweeping harness data…"));
+  try { await api("/analytics/sweep", "POST"); } catch { /* sweep is best-effort; show what's stored */ }
+  const winDays = anDaysLoaded || anRange;
+  const winFrom = new Date(Date.now() - winDays * 864e5).toISOString().slice(0, 10);
+  let filters, usage;
+  try {
+    [filters, usage] = await Promise.all([
+      api("/analytics/filters"), api("/analytics/usage?from=" + winFrom)]);
+    if (!anSessions.length && !anDaysLoaded) await anLoadPage(anRange);
+  } catch (e) {
+    root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
+    return;
+  }
+  root.replaceChildren();
+
+  // filter row — harness + model scope everything below (provider is
+  // deliberately absent: harness + model already identify the slice); the
+  // segmented time chips sit right and set the whole window
+  const reset = (k) => (v) => {
+    anFilters[k] = v;
+    anSessions = []; anNextBefore = null; anDaysLoaded = 0;
+    renderAnalytics(root);
+  };
+  const rangeSeg = el("div", { className: "filters seg an-range" });
+  for (const [label, days] of AN_RANGES) {
+    const chip = el("button", { className: "chip" + (anRange === days && anDaysLoaded <= days ? " on" : ""),
+      type: "button", textContent: label });
+    chip.onclick = () => {
+      anRange = days;
+      anSessions = []; anNextBefore = null; anDaysLoaded = 0;
+      renderAnalytics(root);
+    };
+    rangeSeg.append(chip);
+  }
+  root.append(el("div", { className: "an-filters" },
+    anSelect("Harness", "harness", filters.harnesses, reset("harness")),
+    anSelect("Model", "model", filters.models, reset("model")),
+    rangeSeg));
+
+  // stat cards, then the graph in ITS OWN card: no card selected = the
+  // combined total is graphed; clicking a card graphs that class, clicking it
+  // again deselects back to combined. Totals and buckets both come from the
+  // loaded session cards, so cards, graph, and the list below always agree.
+  const totals = {};
+  for (const [k] of AN_CLASSES)
+    totals[k] = anSessions.reduce((t, c) => c[k] == null ? t : (t ?? 0) + c[k], null);
+  if (anClass && totals[anClass] == null) anClass = null;  // slice stopped exposing it
+  const graphCard = el("div", { className: "card an-graph" });
+  const cardRow = el("div", { className: "an-cards" });
+  const drawCards = () => {
+    cardRow.replaceChildren();
+    for (const [k, label] of AN_CLASSES) {
+      if (k === "reasoning_tokens" && totals[k] == null) continue;  // not exposed in this slice
+      const c = el("button", { className: "an-card" + (anClass === k ? " on" : ""), type: "button" });
+      c.append(el("span", { className: "an-card-label" }, label),
+               el("span", { className: "an-card-value" }, fmtTok(totals[k] ?? 0)));
+      c.onclick = () => {
+        anClass = anClass === k ? null : k;
+        drawCards();
+        graphCard.replaceChildren(anChart(anClass));
+      };
+      cardRow.append(c);
+    }
+  };
+  drawCards();
+  graphCard.append(anChart(anClass));
+  root.append(cardRow, graphCard);
+
+  // usage panels — favorite model by flavor · peak day · features shipped ·
+  // specs shipped · docs outstanding. Peak day is client-computed from the
+  // combined buckets (all classes, all models in the slice); the shipped
+  // counts are window-scoped server-side; outstanding is current-state.
+  const sprintTitles = usage.sprint_titles || {};
+  const panels = el("div", { className: "an-panels" });
+  // items: strings, or {id, label} — an id renders as #id with a copy button
+  // so the number can ride straight into a Roadmap/Docs/Flags search.
+  const panel = (label, valueText, items) => {
+    const p = el("div", { className: "card an-panel" });
+    p.append(microlabel(label), el("div", { className: "an-panel-value" }, valueText));
+    for (const it of (items || []).slice(0, 5)) {
+      const row = el("div", { className: "an-usage-row" });
+      if (it && typeof it === "object") {
+        const num = "#" + it.id;
+        const btn = el("button", { className: "an-copy", type: "button", title: `copy ${num}` }, "⧉");
+        btn.onclick = () => navigator.clipboard.writeText(num)
+          .then(() => toast(`copied ${num}`), () => toast("copy failed"));
+        row.append(el("span", { className: "an-id" }, num), btn,
+                   el("span", { className: "an-row-label" }, it.label || ""));
+        row.title = `${num} ${it.label || ""}`;
+      } else {
+        row.append(it);
+      }
+      p.append(row);
+    }
+    return p;
+  };
+  if ((usage.favorite_models || []).length) {
+    const p = el("div", { className: "card an-panel" }, microlabel("Favorite model by flavor"));
+    for (const f of usage.favorite_models)
+      p.append(el("div", { className: "an-usage-row" },
+        el("span", { className: "pill" }, f.flavor), " ", f.model,
+        el("span", { className: "muted" }, ` — ${f.sessions} session(s)`)));
+    panels.append(p);
+  }
+  const peak = anBuckets(null).reduce((a, b) => (b.value > a.value ? b : a));
+  panels.append(panel("Peak day", peak.value ? fmtTok(peak.value) : "—",
+    peak.value ? [peak.date.toLocaleDateString(undefined,
+      { weekday: "short", month: "short", day: "numeric" }) + " — all models"] : []));
+  panels.append(panel("Features shipped", String((usage.features_shipped || []).length),
+    (usage.features_shipped || []).map((f) => ({ id: f.feature_id, label: f.title }))));
+  panels.append(panel("Specs shipped", String((usage.specs_shipped || []).length),
+    (usage.specs_shipped || []).map((s) => ({ id: s.document_id, label: s.title || s.feature_title }))));
+  panels.append(panel("Docs outstanding", String((usage.docs_outstanding || []).length),
+    (usage.docs_outstanding || []).map((f) => ({ id: f.feature_id, label: f.title }))));
+  root.append(panels);
+
+  // session history — grouped by LOCAL day, newest first; within a day,
+  // sessions sharing a sprint_ref cluster under a sprint header with rolled-up
+  // totals; solo sessions list flat.
+  const list = el("div", {});
+  root.append(list);
+  if (!anSessions.length) {
+    list.append(el("div", { className: "muted" }, "No sessions in the loaded window."));
+  }
+  const byDay = new Map();  // insertion order follows the DESC-sorted rows
+  for (const c of anSessions) {
+    const day = localDay(c.started_at);
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push(c);
+  }
+  for (const [day, cards] of byDay) {
+    const dayCard = el("div", { className: "card an-day" });
+    dayCard.append(el("h2", {}, day));
+    const bySprint = new Map();
+    for (const c of cards) {
+      const k = c.sprint_ref || null;
+      if (!bySprint.has(k)) bySprint.set(k, []);
+      bySprint.get(k).push(c);
+    }
+    for (const [ref, group] of bySprint) {
+      if (ref && group.length > 1) {
+        const cl = el("div", { className: "an-sprint" });
+        cl.append(el("div", { className: "an-sprint-head" },
+          el("span", { className: "pill next" }, "sprint"),
+          " " + (sprintTitles[ref] || "#" + ref),
+          el("span", { className: "sess-tok" },
+            fmtTok(group.reduce((t, c) => t + cardTotal(c), 0)))));
+        for (const c of group) cl.append(anSessionCard(c, sprintTitles));
+        dayCard.append(cl);
+      } else {
+        for (const c of group) dayCard.append(anSessionCard(c, sprintTitles));
+      }
+    }
+    list.append(dayCard);
+  }
+  if (anNextBefore) {
+    const more = el("button", { className: "act", type: "button", textContent: "More ↓ (7 more days)" });
+    more.onclick = async () => {
+      more.disabled = true;
+      try { await anLoadPage(7); renderAnalytics(root); }
+      catch (e) { toast("error: " + e.message); more.disabled = false; }
+    };
+    list.append(el("div", { className: "an-more" }, more));
+  }
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
@@ -1686,6 +2088,7 @@ const VIEWS = {
   flags: ["#view-flags", renderFlags],
   worktrees: ["#view-worktrees", renderWorktrees],
   map: ["#view-map", renderMap],
+  analytics: ["#view-analytics", renderAnalytics],
   scripts: ["#view-scripts", renderScripts],
 };
 async function load(tab) {

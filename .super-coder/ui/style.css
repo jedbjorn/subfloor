@@ -629,3 +629,67 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .flow-wrap.flow-hover .flow-wire.lit { stroke: var(--accent); stroke-width: 2px; }
 
 .flow-hint { font-size: .82rem; text-align: center; margin-top: .4rem; }
+
+/* ── Analytics tab (doc #11) ── */
+.an-filters { display: flex; gap: .8rem; align-items: end; margin-bottom: .6rem; flex-wrap: wrap; }
+.an-filter { display: flex; flex-direction: column; gap: .2rem; }
+.an-select { background: var(--accent2); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: .3rem .5rem; font-size: .85rem; }
+.an-summary { margin-bottom: .6rem; }
+.an-panels { display: flex; gap: 6px; margin-bottom: .6rem; }  /* one line, always */
+.an-panel { flex: 1 1 0; min-width: 0; }
+.an-usage-row { font-size: .8rem; padding: .15rem 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; display: flex;
+  align-items: center; gap: .35rem; }
+.an-id { color: var(--accent); font-variant-numeric: tabular-nums; flex: none; }
+.an-row-label { overflow: hidden; text-overflow: ellipsis; }
+.an-copy { flex: none; background: none; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--dim); font-size: .7rem; line-height: 1; padding: .1rem .25rem; cursor: pointer; }
+.an-copy:hover { color: var(--ink); border-color: var(--accent); }
+.an-day + .an-day { margin-top: 6px; }
+.sess { border-top: 1px solid var(--line); }
+.sess:first-of-type { border-top: none; }
+.sess-head { display: flex; gap: .5rem; align-items: center; padding: .35rem 0;
+  cursor: pointer; list-style: none; font-size: .85rem; }
+.sess-head::-webkit-details-marker { display: none; }
+.sess-time { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sess-model { color: var(--dim); font-size: .78rem; white-space: nowrap; }
+.sess-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sess-tok { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--accent); white-space: nowrap; }
+.sess-body { padding: .2rem 0 .6rem 1rem; }
+.sess-full-title { font-size: .85rem; margin-bottom: .3rem; }
+.sess-ref { display: block; color: var(--dim); font-size: .72rem; margin-top: .3rem;
+  overflow-wrap: anywhere; }
+.an-sprint { border-left: 2px solid var(--accent); padding-left: .6rem; margin: .4rem 0; }
+.an-sprint-head { display: flex; gap: .5rem; align-items: center; font-size: .85rem; padding: .2rem 0; }
+.an-more { text-align: center; margin: .8rem 0; }
+
+/* ── Analytics: stat cards + spline graph + range chips ── */
+.an-range { margin-left: auto; align-self: center; }
+.an-range .chip { border-radius: 0; }
+.an-range .chip:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
+.an-range .chip:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
+.an-cards { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: .5rem; }
+.an-card { flex: 1 1 120px; background: var(--accent2); border: 1px solid var(--line);
+  border-radius: 8px; padding: .5rem .7rem; display: flex; flex-direction: column;
+  gap: .15rem; cursor: pointer; text-align: left; color: var(--dim); transition: border-color .12s; }
+.an-card:hover { border-color: var(--accent); }
+.an-card.on { border-color: var(--accent); color: var(--ink);
+  box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
+.an-card-label { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
+.an-card-value { font-size: 1.25rem; font-weight: 600; color: var(--ink); }
+.an-chart-wrap { position: relative; outline: none; }
+.an-chart-title { font-size: 1.05rem; font-weight: 600; color: var(--ink); margin: .1rem 0 .5rem; }
+.an-graph { margin-bottom: .6rem; }
+.an-panel-value { font-size: 1.5rem; font-weight: 600; color: var(--ink); margin: .15rem 0 .25rem; }
+.an-chart { width: 100%; height: auto; display: block; }
+.an-grid { stroke: var(--line-soft); stroke-width: 1; }
+.an-tick { fill: var(--dim); font-size: 10px; }
+.an-line { fill: none; stroke: var(--accent); stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round; }
+.an-area { fill: var(--accent); opacity: .1; }
+.an-cross { stroke: var(--dim); stroke-width: 1; }
+.an-dot { fill: var(--accent); stroke: var(--bg); stroke-width: 2; }
+.an-tip { position: absolute; background: var(--menu-bg); border: 1px solid var(--menu-border);
+  border-radius: 6px; padding: .25rem .5rem; font-size: .78rem;
+  pointer-events: none; white-space: nowrap; box-shadow: var(--menu-shadow); }

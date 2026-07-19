@@ -62,6 +62,11 @@ The substrate itself: data layer we build, harness we rent. v1 targets Claude Co
 
 _No open flags._
 
+### Token & session analytics · owner: `cc`
+Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness's on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history with session titles, harness/provider/model filters, sprint clusters, usage analytics). Tokens only, no pricing, v1.
+
+_No open flags._
+
 ## Next
 
 ### B1 — First-launch installer · owner: `cc`
@@ -71,11 +76,6 @@ _No open flags._
 
 ### Sprint reporting — unit reports, conformance pass, planner synthesis · owner: `cc`
 Dev unit-report result rows at merge; pre-freeze conformance pass (review shells judge spec vs main, four-way verdicts); sprint report becomes a fixed skeleton the planner synthesizes from unit reports + conformance doc. Skill-text only — no schema, no CLI. See specs_sc/sprint-reporting.md.
-
-_No open flags._
-
-### Token & session analytics · owner: `cc`
-Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness's on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history with session titles, harness/provider/model filters, sprint clusters, usage analytics). Tokens only, no pricing, v1.
 
 _No open flags._
 

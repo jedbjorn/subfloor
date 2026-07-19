@@ -20,6 +20,16 @@
               }
             ]
           }
+        ],
+        "SessionEnd": [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash -c 'eng=\"${SC_ENGINE_DIR:-$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd)/.super-coder}\"; exec bash \"$eng/scripts/telemetry-hook.sh\"'"
+              }
+            ]
+          }
         ]
       }
     }
