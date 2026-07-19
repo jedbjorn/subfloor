@@ -73,15 +73,16 @@ def _load_parsers(only: "str | None", log) -> list:
     return mods
 
 
-def _since_fn(con):
-    """ref → last captured_at epoch, for the parsers' incremental skip.
-    Keyed on (harness, ref) folded to ref alone — refs are absolute paths /
-    ids, unique across harnesses in practice; the worst collision cost is a
-    redundant re-parse, never lost data."""
+def _since_fn(con, harness: str, parser_version: str):
+    """ref → last captured_at epoch, for one harness's incremental skip.
+    Scoped to rows written by the CURRENT parser version: a version bump
+    makes every ref look never-captured, forcing the full re-parse that
+    lets count-affecting parser fixes reach already-swept sessions."""
     seen: dict[str, float] = {}
     for r in con.execute(
             "SELECT harness_session_ref, MAX(captured_at) c FROM session_token_usage "
-            "GROUP BY harness_session_ref"):
+            "WHERE harness=? AND parser_version=? GROUP BY harness_session_ref",
+            (harness, parser_version)):
         e = _iso_epoch(r["c"])
         if e is not None:
             seen[r["harness_session_ref"]] = e
@@ -190,11 +191,11 @@ def sweep(only: "str | None" = None, quiet: bool = False) -> dict:
 
     con = db_driver.connect(DB_PATH)
     try:
-        since = _since_fn(con)
         captured_at = _now_iso()
         counts = {"insert": 0, "update": 0}
         batch: list[dict] = []
         for mod in _load_parsers(only, log):
+            since = _since_fn(con, mod.HARNESS, mod.PARSER_VERSION)
             try:
                 rows = mod.sweep(REPO_ROOT, since, log)
             except Exception as e:  # plugin stance: loud, never fatal to the sweep

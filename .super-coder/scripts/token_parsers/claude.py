@@ -14,6 +14,14 @@ token classes + the model. TWO verified hazards shape this parser:
      dirs are skipped wholesale. File-level mtime skips would silently
      re-count ids living in the skipped files.
 
+Subagent transcripts live in SUBDIRECTORIES of the project dir
+(<session-uuid>/subagents/agent-*.jsonl) — a non-recursive glob misses them
+entirely (measured: ~29% of fresh input on a multi-agent-heavy corpus). The
+walk is recursive, and a subdirectory file folds into the top-level session
+named by its first path component: subagent spend is the parent session's
+spend, one row per (session x model). Titles come from top-level files only
+(a subagent's first user message is its task prompt, not a display title).
+
 Repo filter: the `cwd` field on the lines, NOT the project-dir name — the
 dir-name dash-encoding is lossy (`/` and `-` encode identically). The encoded
 dir name is only a cheap prefilter (an encoded path under repo_root always
@@ -31,7 +39,7 @@ from pathlib import Path
 from . import in_repo, iso_utc, norm_iso, row
 
 HARNESS = "claude"
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"  # 2: recursive walk — subagent transcripts fold into parent
 DATA_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
 TITLE_CAP = 500  # storage cap; the UI truncates at 100 for collapsed cards
 
@@ -107,6 +115,16 @@ def _parse_file(path: Path, seen: set, log) -> "dict | None":
             "partial": bad_lines > 0}
 
 
+def _session_ref(proj: Path, path: Path) -> str:
+    """The session a transcript belongs to. Top-level files ARE sessions;
+    files in subdirectories (<uuid>/subagents/agent-*.jsonl) belong to the
+    top-level session named by their first path component."""
+    rel = path.relative_to(proj)
+    if len(rel.parts) == 1:
+        return str(path)
+    return str(proj / (rel.parts[0] + ".jsonl"))
+
+
 def sweep(repo_root, since_epoch, log) -> list[dict]:
     if not DATA_DIR.is_dir():
         return []
@@ -115,31 +133,46 @@ def sweep(repo_root, since_epoch, log) -> list[dict]:
     for proj in sorted(DATA_DIR.iterdir()):
         if not (proj.is_dir() and proj.name.startswith(prefix)):
             continue
-        files = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        files = sorted(proj.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         if not files:
             continue
         # dir-scoped incrementality (see module docstring)
-        changed = any((since_epoch(str(p)) or 0) < p.stat().st_mtime for p in files)
+        changed = any((since_epoch(_session_ref(proj, p)) or 0) < p.stat().st_mtime
+                      for p in files)
         if not changed:
             continue
         seen: set = set()
+        sessions: dict[str, dict] = {}  # ref → merged aggregate (insertion order)
         for path in files:  # mtime order: copies count where they first appeared
             parsed = _parse_file(path, seen, log)
             if parsed is None or not in_repo(parsed["cwd"], repo_root):
                 continue
-            common = dict(harness=HARNESS, parser_version=PARSER_VERSION,
-                          provider="anthropic", title=parsed["title"],
-                          started_at=parsed["started_at"],
-                          ended_at=parsed["ended_at"], cwd=parsed["cwd"])
-            if not parsed["per_model"]:
-                rows.append(row(ref=str(path), model=None, status="no_usage", **common))
-                continue
-            status = "partial" if parsed["partial"] else "ok"
+            agg = sessions.setdefault(_session_ref(proj, path), {
+                "per_model": {}, "title": None, "cwd": parsed["cwd"],
+                "started_at": None, "ended_at": None, "partial": False})
             for model, by_id in parsed["per_model"].items():
+                agg["per_model"].setdefault(model, {}).update(by_id)
+            if path.parent == proj and agg["title"] is None:
+                agg["title"] = parsed["title"]
+            agg["started_at"] = min((t for t in (agg["started_at"], parsed["started_at"]) if t),
+                                    default=None)
+            agg["ended_at"] = max((t for t in (agg["ended_at"], parsed["ended_at"]) if t),
+                                  default=None)
+            agg["partial"] = agg["partial"] or parsed["partial"]
+        for ref, agg in sessions.items():
+            common = dict(harness=HARNESS, parser_version=PARSER_VERSION,
+                          provider="anthropic", title=agg["title"],
+                          started_at=agg["started_at"],
+                          ended_at=agg["ended_at"], cwd=agg["cwd"])
+            if not agg["per_model"]:
+                rows.append(row(ref=ref, model=None, status="no_usage", **common))
+                continue
+            status = "partial" if agg["partial"] else "ok"
+            for model, by_id in agg["per_model"].items():
                 def total(key):
                     return sum(u.get(key) or 0 for u in by_id.values())
                 rows.append(row(
-                    ref=str(path), model=model, status=status,
+                    ref=ref, model=model, status=status,
                     input_tokens=total("input_tokens"),
                     output_tokens=total("output_tokens"),
                     cache_read_tokens=total("cache_read_input_tokens"),

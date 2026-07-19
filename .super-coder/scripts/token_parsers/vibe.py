@@ -22,8 +22,11 @@ DATA_DIR = Path.home() / ".vibe/logs/session"
 
 
 def _provider(cfg: dict, model: "str | None") -> str:
+    # active_model holds the ALIAS when one is set; models[] carries both
+    # `name` and `alias` — match either, or the lookup never fires.
     for m in (cfg.get("models") or []):
-        if isinstance(m, dict) and m.get("name") == model and m.get("provider"):
+        if isinstance(m, dict) and m.get("provider") \
+                and model in (m.get("name"), m.get("alias")):
             return m["provider"]
     return "mistral"
 

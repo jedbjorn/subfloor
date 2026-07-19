@@ -11,6 +11,12 @@ Caveat (spec doc #11): the token columns are NOT NULL DEFAULT 0, so "not
 exposed" and "measured zero" are indistinguishable at that layer — trust
 opencode's numbers as-is (status stays 'ok').
 
+Normalization: opencode reports reasoning DISJOINT from output (message
+tokens: total = input + output + reasoning + cache.read — verified against
+message-level data), while the row contract is codex-shaped (reasoning is
+an informational subset of output_tokens). So output_tokens here is
+tokens_output + tokens_reasoning; reasoning_tokens keeps the split.
+
 Sub-sessions (parent_id set — spawned subagents) are real spend in the same
 directory and get their own rows; the ref is the session id either way.
 """
@@ -24,7 +30,7 @@ from pathlib import Path
 from . import in_repo, iso_utc, row
 
 HARNESS = "opencode"
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"  # 2: reasoning folded into output_tokens (codex-shaped contract)
 DB = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode/opencode.db"
 
 
@@ -72,7 +78,8 @@ def sweep(repo_root, since_epoch, log) -> list[dict]:
                 provider=provider, model=model, title=s["title"],
                 started_at=iso_utc((s["time_created"] or 0) / 1000 or None),
                 ended_at=iso_utc(updated or None),
-                input_tokens=s["tokens_input"], output_tokens=s["tokens_output"],
+                input_tokens=s["tokens_input"],
+                output_tokens=(s["tokens_output"] or 0) + (s["tokens_reasoning"] or 0),
                 cache_read_tokens=s["tokens_cache_read"],
                 cache_write_tokens=s["tokens_cache_write"],
                 reasoning_tokens=s["tokens_reasoning"],

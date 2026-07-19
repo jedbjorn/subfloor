@@ -25,6 +25,17 @@ ended_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 reasoning_tokens, status ('ok'|'partial'|'no_usage'), parser_version, cwd
 (transient). Token-class rule: NULL means "not exposed by this harness",
 0 means "measured zero" — never write zeros as if measured.
+
+reasoning_tokens is informational and ALWAYS a subset of output_tokens
+(codex reports it that way natively; a parser whose source reports
+reasoning separately folds it into output_tokens — see opencode). Total
+spend is therefore input + output + cache_read + cache_write, never
++ reasoning.
+
+PARSER_VERSION doubles as the incrementality pin: the collector skips a
+ref only when its stored rows carry the CURRENT version, so bumping it
+forces a full re-parse and count-affecting fixes reach already-swept
+sessions.
 """
 from __future__ import annotations
 

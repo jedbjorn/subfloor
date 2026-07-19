@@ -36,6 +36,7 @@ import analytics  # noqa: E402
 from token_parsers import claude as p_claude  # noqa: E402
 from token_parsers import codex as p_codex  # noqa: E402
 from token_parsers import kimi as p_kimi  # noqa: E402
+from token_parsers import opencode as p_opencode  # noqa: E402
 
 
 def build_engine_db(path: Path) -> None:
@@ -125,6 +126,28 @@ class ClaudeParserTest(unittest.TestCase):
         far_future = 4102444800.0  # 2100-01-01 — newer than any file mtime
         self.assertEqual(self.sweep(since=lambda ref: far_future), [])
 
+    def test_subagent_fold_into_parent(self):
+        # subagent transcripts live at <uuid>/subagents/agent-*.jsonl — their
+        # spend folds into the top-level session row; title from parent only
+        cwd = str(self.repo)
+        parent = self.proj / "f497716c.jsonl"
+        parent.write_text(user_line("build the feature", cwd) + "\n"
+                          + usage_line("m1", cwd=cwd))
+        sub = self.proj / "f497716c/subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-a1.jsonl").write_text("\n".join([
+            user_line("You are an implementer agent…", cwd),
+            usage_line("m2", cwd=cwd),
+            usage_line("m1", cwd=cwd),  # copy of the parent's id — dedupes
+        ]))
+        os.utime(parent, (1, 1))  # parent older: it owns m1
+        rows = self.sweep()
+        self.assertEqual(len(rows), 1)               # ONE row, not two
+        r = rows[0]
+        self.assertEqual(r["harness_session_ref"], str(parent))
+        self.assertEqual(r["input_tokens"], 200)     # m1 + m2, m1 counted once
+        self.assertEqual(r["title"], "build the feature")  # never the subagent prompt
+
 
 class CodexParserTest(unittest.TestCase):
     def test_subset_normalization(self):
@@ -196,6 +219,42 @@ class KimiParserTest(unittest.TestCase):
         self.assertEqual(r["title"], "swarm run")
 
 
+class OpencodeParserTest(unittest.TestCase):
+    def test_reasoning_folds_into_output(self):
+        # opencode reports reasoning DISJOINT from output; the row contract is
+        # codex-shaped (reasoning ⊆ output), so the parser folds it in
+        tmp = Path(tempfile.mkdtemp())
+        repo = tmp / "r"
+        repo.mkdir()
+        db = tmp / "opencode.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE session (id TEXT, directory TEXT, title TEXT, "
+                    "model TEXT, time_created INTEGER, time_updated INTEGER, "
+                    "tokens_input INTEGER NOT NULL DEFAULT 0, "
+                    "tokens_output INTEGER NOT NULL DEFAULT 0, "
+                    "tokens_reasoning INTEGER NOT NULL DEFAULT 0, "
+                    "tokens_cache_read INTEGER NOT NULL DEFAULT 0, "
+                    "tokens_cache_write INTEGER NOT NULL DEFAULT 0)")
+        con.execute("INSERT INTO session VALUES ('ses_1', ?, 't', "
+                    "'{\"id\": \"gpt-5.5\", \"providerID\": \"openai\"}', "
+                    "1781566825695, 1781566825695, 100, 80, 20, 500, 0)",
+                    (str(repo),))
+        con.commit()
+        con.close()
+        orig = p_opencode.DB
+        p_opencode.DB = db
+        try:
+            rows = p_opencode.sweep(repo, lambda ref: None, lambda m: None)
+        finally:
+            p_opencode.DB = orig
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["output_tokens"], 100)      # 80 output + 20 reasoning
+        self.assertEqual(r["reasoning_tokens"], 20)    # split kept informationally
+        self.assertEqual(r["input_tokens"], 100)
+        self.assertEqual(r["provider"], "openai")
+
+
 class CollectorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -226,6 +285,21 @@ class CollectorTest(unittest.TestCase):
         n, cap = con.execute("SELECT COUNT(*), MAX(captured_at) FROM session_token_usage").fetchone()
         self.assertEqual(n, 1)
         self.assertEqual(cap, "2026-07-19T11:00:00Z")
+
+    def test_since_fn_version_pinned(self):
+        # rows written by an OLDER parser version don't gate the skip — a
+        # version bump must force the full re-parse
+        con = self.con()
+        r = {"harness": "claude", "harness_session_ref": "/x.jsonl", "model": "m",
+             "provider": None, "title": None, "started_at": None, "ended_at": None,
+             "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": None,
+             "cache_write_tokens": None, "reasoning_tokens": None,
+             "status": "ok", "parser_version": "1"}
+        analytics._upsert(con, r, "2026-07-19T10:00:00Z")
+        con.commit()
+        self.assertIsNotNone(analytics._since_fn(con, "claude", "1")("/x.jsonl"))
+        self.assertIsNone(analytics._since_fn(con, "claude", "2")("/x.jsonl"))
+        self.assertIsNone(analytics._since_fn(con, "kimi", "1")("/x.jsonl"))
 
     def test_attribution_windows(self):
         con = self.con()
