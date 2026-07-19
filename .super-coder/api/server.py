@@ -1548,9 +1548,13 @@ class Handler(BaseHTTPRequestHandler):
                         mod = __import__(f"token_parsers.{harness}", fromlist=[harness])
                     except ImportError:
                         return self._send(400, {"error": f"no parser for '{harness}'"})
+                    # Sanity gate only — the ref is NEVER opened (the sweep
+                    # rescans the harness's own data dir); pure string
+                    # normalization keeps the user value out of every
+                    # filesystem call (CodeQL py/path-injection).
                     base = getattr(mod, "DATA_DIR", None)
-                    rp = Path(os.path.expanduser(ref)).resolve()
-                    if base is None or not str(rp).startswith(str(Path(base).resolve()) + os.sep):
+                    rp = os.path.normpath(os.path.expanduser(ref))
+                    if base is None or not rp.startswith(str(base) + os.sep):
                         return self._send(400, {"error": "ref outside the harness data dir"})
                 return self._send(200, analytics.sweep(only=harness, quiet=True))
 
