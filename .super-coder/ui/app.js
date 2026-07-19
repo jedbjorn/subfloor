@@ -1686,7 +1686,7 @@ let anFilters = { harness: "", model: "" };  // provider intentionally absent �
 let anSessions = [];      // accumulated cards across "More" pages
 let anNextBefore = null;  // cursor for the next page (null = no older rows)
 let anDaysLoaded = 0;     // window size loaded so far (7 per page)
-let anClass = "input_tokens";  // the stat card selected for the graph
+let anClass = null;  // selected stat card; null = combined (all classes summed)
 
 const AN_CLASSES = [
   ["input_tokens", "Input"], ["output_tokens", "Output"],
@@ -1727,8 +1727,8 @@ async function anLoadPage(days) {
 // Buckets come from the loaded session cards (not a second endpoint), so the
 // stat cards, the graph, and the list below always agree — same window, same
 // filters, same local-day boundaries. Empty days are measured zero, not gaps.
-function anBuckets(cls) {
-  const days = Math.max(anDaysLoaded, 7);
+function anBuckets(cls) {  // cls null = combined (the four classes summed)
+  const days = anDaysLoaded || anRange;
   const keyOf = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
   const buckets = [];
   const byKey = {};
@@ -1741,7 +1741,7 @@ function anBuckets(cls) {
   for (const c of anSessions) {
     if (!c.started_at) continue;
     const b = byKey[keyOf(new Date(c.started_at))];
-    if (b) b.value += c[cls] || 0;
+    if (b) b.value += cls ? (c[cls] || 0) : cardTotal(c);
   }
   return buckets;
 }
@@ -1781,9 +1781,9 @@ const niceMax = (v) => {
 };
 
 function anChartLabel() {
-  const cls = AN_CLASSES.find(([k]) => k === anClass)[1];
+  const cls = anClass ? AN_CLASSES.find(([k]) => k === anClass)[1] : "Total";
   const scope = [anFilters.harness || "all harnesses", anFilters.model].filter(Boolean).join(" · ");
-  return `${cls} tokens — last ${Math.max(anDaysLoaded, 7)} days — ${scope}`;
+  return `${cls} tokens — last ${anDaysLoaded || anRange} days — ${scope}`;
 }
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -1915,10 +1915,12 @@ function anSessionCard(c, sprintTitles) {
 async function renderAnalytics(root) {
   root.replaceChildren(el("div", { className: "muted" }, "sweeping harness data…"));
   try { await api("/analytics/sweep", "POST"); } catch { /* sweep is best-effort; show what's stored */ }
+  const winDays = anDaysLoaded || anRange;
+  const winFrom = new Date(Date.now() - winDays * 864e5).toISOString().slice(0, 10);
   let filters, usage;
   try {
     [filters, usage] = await Promise.all([
-      api("/analytics/filters"), api("/analytics/usage")]);
+      api("/analytics/filters"), api("/analytics/usage?from=" + winFrom)]);
     if (!anSessions.length && !anDaysLoaded) await anLoadPage(anRange);
   } catch (e) {
     root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
@@ -1950,13 +1952,15 @@ async function renderAnalytics(root) {
     anSelect("Model", "model", filters.models, reset("model")),
     rangeSeg));
 
-  // stat cards + the graph under them: click a card to graph that class over
-  // the selected window. Totals and buckets both come from the loaded session
-  // cards, so cards, graph, and the list below always agree.
+  // stat cards, then the graph in ITS OWN card: no card selected = the
+  // combined total is graphed; clicking a card graphs that class, clicking it
+  // again deselects back to combined. Totals and buckets both come from the
+  // loaded session cards, so cards, graph, and the list below always agree.
   const totals = {};
   for (const [k] of AN_CLASSES)
     totals[k] = anSessions.reduce((t, c) => c[k] == null ? t : (t ?? 0) + c[k], null);
-  const graphBox = el("div", {});
+  if (anClass && totals[anClass] == null) anClass = null;  // slice stopped exposing it
+  const graphCard = el("div", { className: "card an-graph" });
   const cardRow = el("div", { className: "an-cards" });
   const drawCards = () => {
     cardRow.replaceChildren();
@@ -1965,43 +1969,50 @@ async function renderAnalytics(root) {
       const c = el("button", { className: "an-card" + (anClass === k ? " on" : ""), type: "button" });
       c.append(el("span", { className: "an-card-label" }, label),
                el("span", { className: "an-card-value" }, fmtTok(totals[k] ?? 0)));
-      c.onclick = () => { anClass = k; drawCards(); graphBox.replaceChildren(anChart(anClass)); };
+      c.onclick = () => {
+        anClass = anClass === k ? null : k;
+        drawCards();
+        graphCard.replaceChildren(anChart(anClass));
+      };
       cardRow.append(c);
     }
   };
-  if (anClass === "reasoning_tokens" && totals.reasoning_tokens == null) anClass = "input_tokens";
   drawCards();
-  graphBox.append(anChart(anClass));
-  root.append(el("div", { className: "card an-summary" }, cardRow, graphBox));
+  graphCard.append(anChart(anClass));
+  root.append(cardRow, graphCard);
 
-  // usage panels — favorite model per flavor, recent sprints, recent features
-  const sprintTitles = {};
-  for (const s of usage.recent_sprints || []) sprintTitles[s.sprint_ref] = s.title;
+  // usage panels — favorite model by flavor · peak day · features shipped ·
+  // specs shipped · docs outstanding. Peak day is client-computed from the
+  // combined buckets (all classes, all models in the slice); the shipped
+  // counts are window-scoped server-side; outstanding is current-state.
+  const sprintTitles = usage.sprint_titles || {};
   const panels = el("div", { className: "an-panels" });
+  const panel = (label, valueText, items) => {
+    const p = el("div", { className: "card an-panel" });
+    p.append(microlabel(label), el("div", { className: "an-panel-value" }, valueText));
+    for (const it of (items || []).slice(0, 5))
+      p.append(el("div", { className: "an-usage-row" }, it));
+    return p;
+  };
   if ((usage.favorite_models || []).length) {
-    const p = el("div", { className: "card" }, microlabel("Favorite model by flavor"));
+    const p = el("div", { className: "card an-panel" }, microlabel("Favorite model by flavor"));
     for (const f of usage.favorite_models)
       p.append(el("div", { className: "an-usage-row" },
         el("span", { className: "pill" }, f.flavor), " ", f.model,
         el("span", { className: "muted" }, ` — ${f.sessions} session(s)`)));
     panels.append(p);
   }
-  if ((usage.recent_sprints || []).length) {
-    const p = el("div", { className: "card" }, microlabel("Recent sprints"));
-    for (const s of usage.recent_sprints)
-      p.append(el("div", { className: "an-usage-row" },
-        s.title || "sprint #" + s.sprint_ref,
-        el("span", { className: "muted" }, ` — ${s.sessions} session(s)`)));
-    panels.append(p);
-  }
-  if ((usage.recent_features || []).length) {
-    const p = el("div", { className: "card" }, microlabel("Recent features"));
-    for (const f of usage.recent_features)
-      p.append(el("div", { className: "an-usage-row" },
-        f.title, el("span", { className: "pill " + (f.roadmap_status || "") }, f.roadmap_status || "")));
-    panels.append(p);
-  }
-  if (panels.children.length) root.append(panels);
+  const peak = anBuckets(null).reduce((a, b) => (b.value > a.value ? b : a));
+  panels.append(panel("Peak day", peak.value ? fmtTok(peak.value) : "—",
+    peak.value ? [peak.date.toLocaleDateString(undefined,
+      { weekday: "short", month: "short", day: "numeric" }) + " — all models"] : []));
+  panels.append(panel("Features shipped", String((usage.features_shipped || []).length),
+    (usage.features_shipped || []).map((f) => f.title)));
+  panels.append(panel("Specs shipped", String((usage.specs_shipped || []).length),
+    (usage.specs_shipped || []).map((s) => s.title || s.feature_title || "#" + s.document_id)));
+  panels.append(panel("Docs outstanding", String((usage.docs_outstanding || []).length),
+    (usage.docs_outstanding || []).map((f) => f.title)));
+  root.append(panels);
 
   // session history — grouped by LOCAL day, newest first; within a day,
   // sessions sharing a sprint_ref cluster under a sprint header with rolled-up

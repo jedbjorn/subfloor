@@ -672,7 +672,9 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-card-label { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
 .an-card-value { font-size: 1.25rem; font-weight: 600; color: var(--ink); }
 .an-chart-wrap { position: relative; outline: none; }
-.an-chart-title { font-size: .8rem; color: var(--dim); margin: .35rem 0 .25rem; }
+.an-chart-title { font-size: 1.05rem; font-weight: 600; color: var(--ink); margin: .1rem 0 .5rem; }
+.an-graph { margin-bottom: .6rem; }
+.an-panel-value { font-size: 1.5rem; font-weight: 600; color: var(--ink); margin: .15rem 0 .25rem; }
 .an-chart { width: 100%; height: auto; display: block; }
 .an-grid { stroke: var(--line-soft); stroke-width: 1; }
 .an-tick { fill: var(--dim); font-size: 10px; }

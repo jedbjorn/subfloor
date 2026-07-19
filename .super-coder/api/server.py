@@ -531,7 +531,22 @@ def get_analytics_tokens(con, q) -> dict:
     return {"totals": totals, "series": series}
 
 
-def get_analytics_usage(con) -> dict:
+def get_analytics_usage(con, q) -> dict:
+    """Behavioral reads for the Analytics tab's usage panels. `from`/`to`
+    scope the shipped counts to the UI's selected window; comparisons are at
+    DAY granularity (substr to the date part) because the source columns mix
+    `datetime('now')` (space-separated) and ISO-T formats — full-string
+    comparison across the two lies about same-day ordering."""
+    frm = (q.get("from", [""])[0] or "")[:10]
+    to = (q.get("to", [""])[0] or "")[:10]
+    window, wparams = "", []
+    if frm:
+        window += " AND substr({col}, 1, 10) >= ?"
+        wparams.append(frm)
+    if to:
+        window += " AND substr({col}, 1, 10) <= ?"
+        wparams.append(to)
+
     # favorite model per shell flavor — most sessions wins, read-time only
     fav: dict[str, dict] = {}
     for r in con.execute(
@@ -543,26 +558,33 @@ def get_analytics_usage(con) -> dict:
         if r["flavor"] not in fav or r["sessions"] > fav[r["flavor"]]["sessions"]:
             fav[r["flavor"]] = {"flavor": r["flavor"], "model": r["model"],
                                 "sessions": r["sessions"]}
-    # recent sprints: sprint_ref = the tracker document_id set at spawn
-    sprints = rows(con.execute(
-        "SELECT a.sprint_ref, MAX(a.started_at) AS last_seen, "
-        "COUNT(*) AS sessions, d.title, d.feature_id "
-        "FROM shell_memory_archives a "
+
+    # shipped in the window — updated_at is the read-time proxy for the flip
+    # date (the status write is normally the row's last touch)
+    features_shipped = rows(con.execute(
+        "SELECT feature_id, title, updated_at FROM roadmap "
+        "WHERE roadmap_status='shipped'" + window.format(col="updated_at") +
+        " ORDER BY updated_at DESC", wparams))
+    specs_shipped = rows(con.execute(
+        "SELECT d.document_id, d.title, d.frozen_date, r.title AS feature_title "
+        "FROM documents d LEFT JOIN roadmap r ON r.feature_id=d.feature_id "
+        "WHERE d.kind='spec' AND d.frozen=1" + window.format(col="d.frozen_date") +
+        " ORDER BY d.frozen_date DESC", wparams))
+    # outstanding is a CURRENT-state number, never window-scoped: a shipped
+    # feature with no doc-kind document yet (the docs-pending debt)
+    docs_outstanding = rows(con.execute(
+        "SELECT r.feature_id, r.title FROM roadmap r "
+        "WHERE r.roadmap_status='shipped' AND NOT EXISTS "
+        "(SELECT 1 FROM documents d WHERE d.feature_id=r.feature_id AND d.kind='doc') "
+        "ORDER BY r.updated_at DESC"))
+    # sprint_ref → tracker-doc title, for the session list's sprint clusters
+    sprint_titles = {r["sprint_ref"]: r["title"] for r in con.execute(
+        "SELECT DISTINCT a.sprint_ref, d.title FROM shell_memory_archives a "
         "LEFT JOIN documents d ON CAST(d.document_id AS TEXT) = a.sprint_ref "
-        "WHERE a.sprint_ref IS NOT NULL GROUP BY a.sprint_ref "
-        "ORDER BY last_seen DESC LIMIT 5"))
-    # recent features: through the sprint docs' feature_id, order preserved
-    feats, seen = [], set()
-    for sp in sprints:
-        fid = sp.get("feature_id")
-        if fid and fid not in seen:
-            seen.add(fid)
-            r = con.execute("SELECT feature_id, title, roadmap_status FROM roadmap "
-                            "WHERE feature_id=?", (fid,)).fetchone()
-            if r:
-                feats.append(dict(r))
+        "WHERE a.sprint_ref IS NOT NULL")}
     return {"favorite_models": sorted(fav.values(), key=lambda f: f["flavor"]),
-            "recent_sprints": sprints, "recent_features": feats}
+            "features_shipped": features_shipped, "specs_shipped": specs_shipped,
+            "docs_outstanding": docs_outstanding, "sprint_titles": sprint_titles}
 
 
 def get_analytics_filters(con) -> dict:
@@ -2108,7 +2130,8 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(urlparse(self.path).query)
                 return self._send(200, get_analytics_tokens(con, q))
             if path == "/api/analytics/usage":
-                return self._send(200, get_analytics_usage(con))
+                q = parse_qs(urlparse(self.path).query)
+                return self._send(200, get_analytics_usage(con, q))
             if path == "/api/analytics/filters":
                 return self._send(200, get_analytics_filters(con))
             if path == "/api/scripts":
