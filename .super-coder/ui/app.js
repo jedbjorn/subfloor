@@ -1986,6 +1986,7 @@ async function renderAnalytics(root) {
   // combined buckets (all classes, all models in the slice); the shipped
   // counts are window-scoped server-side; outstanding is current-state.
   const sprintTitles = usage.sprint_titles || {};
+  const panelsTop = el("div", { className: "an-panels" });
   const panels = el("div", { className: "an-panels" });
   // items: strings, or {id, label} — an id renders as #id with a copy button
   // so the number can ride straight into a Roadmap/Docs/Flags search.
@@ -2009,25 +2010,28 @@ async function renderAnalytics(root) {
     }
     return p;
   };
-  if ((usage.favorite_models || []).length) {
-    const p = el("div", { className: "card an-panel" }, microlabel("Favorite model by flavor"));
-    for (const f of usage.favorite_models)
-      p.append(el("div", { className: "an-usage-row" },
-        el("span", { className: "pill" }, f.flavor), " ", f.model,
-        el("span", { className: "muted" }, ` — ${f.sessions} session(s)`)));
-    panels.append(p);
-  }
+  // row 1: favorite model by flavor + peak day. The favorite card is always
+  // rendered — "—" until shell attribution has data to roll up.
+  const favP = el("div", { className: "card an-panel" }, microlabel("Favorite model by flavor"));
+  const favs = usage.favorite_models || [];
+  if (!favs.length) favP.append(el("div", { className: "an-panel-value" }, "—"));
+  for (const f of favs)
+    favP.append(el("div", { className: "an-usage-row" },
+      el("span", { className: "pill" }, f.flavor), " ", f.model,
+      el("span", { className: "muted" }, ` — ${f.sessions} session(s)`)));
+  panelsTop.append(favP);
   const peak = anBuckets(null).reduce((a, b) => (b.value > a.value ? b : a));
-  panels.append(panel("Peak day", peak.value ? fmtTok(peak.value) : "—",
+  panelsTop.append(panel("Peak day", peak.value ? fmtTok(peak.value) : "—",
     peak.value ? [peak.date.toLocaleDateString(undefined,
       { weekday: "short", month: "short", day: "numeric" }) + " — all models"] : []));
+  // row 2: the shipped/owed trio
   panels.append(panel("Features shipped", String((usage.features_shipped || []).length),
     (usage.features_shipped || []).map((f) => ({ id: f.feature_id, label: f.title }))));
   panels.append(panel("Specs shipped", String((usage.specs_shipped || []).length),
     (usage.specs_shipped || []).map((s) => ({ id: s.document_id, label: s.title || s.feature_title }))));
   panels.append(panel("Docs outstanding", String((usage.docs_outstanding || []).length),
     (usage.docs_outstanding || []).map((f) => ({ id: f.feature_id, label: f.title }))));
-  root.append(panels);
+  root.append(panelsTop, panels);
 
   // session history — grouped by LOCAL day, newest first; within a day,
   // sessions sharing a sprint_ref cluster under a sprint header with rolled-up

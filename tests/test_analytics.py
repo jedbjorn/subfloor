@@ -328,15 +328,17 @@ class CollectorTest(unittest.TestCase):
         for r in rows:
             analytics._upsert(con, r, "2026-07-19T13:00:00Z")
         con.commit()
-        n = analytics._attribute(con, rows, lambda m: None)
+        n, shell_only = analytics._attribute(con, rows, lambda m: None)
         con.commit()
         self.assertEqual(n, 2)
-        got = {r["harness_session_ref"]: r["archive_id"] for r in
-               con.execute("SELECT harness_session_ref, archive_id FROM session_token_usage")}
-        self.assertEqual(got["s1"], 10)
-        self.assertEqual(got["s2"], 11)
-        self.assertIsNone(got["s3"])
-        self.assertIsNone(got["s4"])
+        self.assertEqual(shell_only, 1)  # s3: no kimi window, but cwd → dev1
+        got = {r["harness_session_ref"]: (r["archive_id"], r["shell_id"]) for r in
+               con.execute("SELECT harness_session_ref, archive_id, shell_id "
+                           "FROM session_token_usage")}
+        self.assertEqual(got["s1"], (10, 2))
+        self.assertEqual(got["s2"], (11, 2))
+        self.assertEqual(got["s3"], (None, 2))   # shell-only: flavor rollups see it
+        self.assertEqual(got["s4"], (None, None))  # off-repo → nothing, not admin
         # ended_at backfill: archive 10's end = its attributed rows' max ended_at
         con.execute("UPDATE session_token_usage SET ended_at='2026-07-19T10:30:00Z' "
                     "WHERE harness_session_ref='s1'")
@@ -345,6 +347,64 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(con.execute("SELECT ended_at FROM shell_memory_archives "
                                      "WHERE archive_id=10").fetchone()[0],
                          "2026-07-19T10:30:00Z")
+
+    def test_shell_only_attribution(self):
+        """Rows predating lifecycle archives still get shell_id from cwd alone;
+        a later window match upgrades them to full attribution; ambiguous
+        root-cwd (two admin shells) stays NULL."""
+        con = self.con()
+        wt = str(analytics.REPO_ROOT / ".sc-worktrees/dev1")
+        root = str(analytics.REPO_ROOT)
+        base = {"model": "m", "provider": None, "title": None, "ended_at": None,
+                "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": None,
+                "cache_write_tokens": None, "reasoning_tokens": None,
+                "status": "ok", "parser_version": "1"}
+        rows = [
+            {**base, "harness": "claude", "harness_session_ref": "h1",
+             "started_at": "2026-06-01T09:00:00Z", "cwd": wt},    # worktree → dev1
+            {**base, "harness": "claude", "harness_session_ref": "h2",
+             "started_at": "2026-06-01T09:00:00Z", "cwd": root},  # root → sole admin
+            {**base, "harness": "claude", "harness_session_ref": "h3",
+             "started_at": None, "cwd": wt},                      # no timestamp: still ok
+        ]
+        for r in rows:
+            analytics._upsert(con, r, "2026-07-19T13:00:00Z")
+        con.commit()
+        n, shell_only = analytics._attribute(con, rows, lambda m: None)
+        con.commit()
+        self.assertEqual((n, shell_only), (0, 3))
+        got = {r["harness_session_ref"]: (r["archive_id"], r["shell_id"]) for r in
+               con.execute("SELECT harness_session_ref, archive_id, shell_id "
+                           "FROM session_token_usage")}
+        self.assertEqual(got["h1"], (None, 2))
+        self.assertEqual(got["h2"], (None, 1))
+        self.assertEqual(got["h3"], (None, 2))
+        # a lifecycle archive appearing later upgrades the shell-only row
+        con.execute("INSERT INTO shell_memory_archives (archive_id, shell_id, "
+                    "session_id, date, started_at, harness) VALUES (20, 2, '0001', "
+                    "'2026-06-01', '2026-06-01T08:00:00Z', 'claude')")
+        con.commit()
+        n, shell_only = analytics._attribute(con, [rows[0]], lambda m: None)
+        con.commit()
+        self.assertEqual((n, shell_only), (1, 0))
+        got = con.execute("SELECT archive_id, shell_id FROM session_token_usage "
+                          "WHERE harness_session_ref='h1'").fetchone()
+        self.assertEqual((got[0], got[1]), (20, 2))
+        # two admin shells → root cwd is ambiguous, second sweep leaves h2 as-is
+        con.execute("INSERT INTO shells (shell_id, display_name, shortname, mandate, "
+                    "system_prompt, user_id, is_shared, has_identity, bootstrapped, "
+                    "flavor, api_key) VALUES (3, 'Admin2', 'adm2', 't', 'sp', 1, 0, "
+                    "1, 0, 'admin', 'tok-b')")
+        con.commit()
+        rows[1]["harness_session_ref"] = "h4"
+        analytics._upsert(con, rows[1], "2026-07-19T13:00:00Z")
+        con.commit()
+        n, shell_only = analytics._attribute(con, [rows[1]], lambda m: None)
+        con.commit()
+        self.assertEqual((n, shell_only), (0, 0))
+        self.assertIsNone(con.execute(
+            "SELECT shell_id FROM session_token_usage "
+            "WHERE harness_session_ref='h4'").fetchone()[0])
 
 
 if __name__ == "__main__":
