@@ -1272,11 +1272,11 @@ plus the host steps it prints are the whole setup. Full design:
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
 A zero-dependency localhost GUI to review the substrate — shells, roadmap,
 flags. One stdlib Python server serves both the JSON API and a static UI; no
-venv, no npm, no build step. Its eight tabs are the windows the workflow above
+venv, no npm, no build step. Its nine tabs are the windows the workflow above
 refers to:
 
 | Tab | What it shows |
@@ -1288,6 +1288,7 @@ refers to:
 | **Flags** | The blocker / follow-up tracker, grouped by feature, filterable Open/Resolved/All. |
 | **Worktrees** | Live git-hygiene report — dirty worktrees, prunable merged branches, clean trees. |
 | **Map** | The repo catalogue — language mix, file roles, dependencies, env vars — with a re-map button. |
+| **Analytics** | Token & session analytics — per-class spend cards, a local-day graph, and the session history swept from each harness's on-disk usage data (see [Token & session analytics](#token--session-analytics)). |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
 The header's **snapshot ⤓** / **publish ⤴** buttons serialize the DB and open a
@@ -1361,6 +1362,42 @@ git-tracked text. See `.super-coder/README.md` for the full model.
 
 > [!class2]
 > **Spec:** the founding design lives in the roadmap (`super-coder` feature row) and renders to `specs_sc/`.
+
+## Token & session analytics
+
+> [!class2]
+> **Every token, every harness** — swept from what the CLIs already write to disk; no wrapper, no proxy, nothing in the model path
+
+super-coder never calls a model itself — it launches harness CLIs — so token
+telemetry is **pull-based**: each harness already writes usage data to disk
+(claude transcripts — subagents included, codex rollouts, kimi wire logs, the
+opencode DB, vibe session metas), and a per-harness parser normalizes what it
+finds into one table, `session_token_usage` — one row per harness session ×
+model, in four token classes (fresh input / output / cache read / cache write)
+plus an informational reasoning split. `NULL` means *this harness doesn't
+expose the class*; `0` means *measured zero* — parsers never invent zeros.
+
+The sweep is incremental and idempotent — re-sweeping never double-counts —
+and runs from four triggers:
+
+- **every boot** — `./sc enter` sweeps before opening the session, so the view
+  is current and the previous session's end time gets backfilled;
+- **claude SessionEnd hook** — real-time capture the moment a session ends;
+- **Analytics tab load** — the GUI sweeps on open;
+- **manual** — `./sc analytics sweep [--harness <name>]`.
+
+Sessions attribute to shells by cwd (a worktree maps to the shell whose
+shortname names it) and archive time-window; anything ambiguous stays visibly
+**unattributed** rather than guessed. The Analytics tab reads it all back:
+per-class stat cards with harness/model filters, a local-day spend graph,
+usage panels (favorite model by flavor, peak day, features and specs shipped,
+docs outstanding), and a session history grouped by local day with sprint
+clusters and per-session token rollups.
+
+![Review GUI, Analytics tab — token-class stat cards with harness and model filters, the total-tokens spend graph, usage panels (favorite model by flavor, peak day, features and specs shipped, docs outstanding), and the day-grouped session history](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/analytics.png)
+
+The same reads are served as JSON at `/api/analytics/*` (session window +
+cursor, token totals and series, filters) for anything outside the GUI.
 
 ## License
 
