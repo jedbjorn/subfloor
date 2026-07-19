@@ -636,9 +636,10 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-select { background: var(--accent2); color: var(--ink); border: 1px solid var(--line);
   border-radius: 6px; padding: .3rem .5rem; font-size: .85rem; }
 .an-summary { margin-bottom: .6rem; }
-.an-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 6px; margin-bottom: .6rem; }
-.an-usage-row { font-size: .85rem; padding: .2rem 0; }
+.an-panels { display: flex; gap: 6px; margin-bottom: .6rem; }  /* one line, always */
+.an-panel { flex: 1 1 0; min-width: 0; }
+.an-usage-row { font-size: .8rem; padding: .15rem 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
 .an-day + .an-day { margin-top: 6px; }
 .sess { border-top: 1px solid var(--line); }
 .sess:first-of-type { border-top: none; }
