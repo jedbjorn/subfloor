@@ -27,7 +27,7 @@ import subprocess
 import sys
 import threading
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -61,6 +61,8 @@ import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
+import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
+import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
@@ -411,6 +413,168 @@ def get_flags(con) -> dict:
     features = rows(con.execute(
         "SELECT feature_id, title FROM roadmap ORDER BY sort_order, feature_id"))
     return {"flags": flags, "features": features}
+
+
+# ── Token & session analytics (doc #11) ──────────────────────────────────────
+# Read-time views over session_token_usage + the archive lifecycle columns.
+# Timestamps are stored UTC; DAY-GROUPING IS THE CLIENT'S JOB (local-time days
+# — FnB stance 2026-07-19), so /sessions returns a flat window + cursor, not
+# server-grouped days. A "session card" is the usage rows grouped by
+# (harness, harness_session_ref) — one harness session, possibly several
+# models — enriched with shell/sprint via the attributed archive.
+
+# Every usage row is datable through this (captured_at is always set), so
+# windowing can never orphan a row with missing harness timestamps.
+_ANALYTICS_TS = "COALESCE(u.started_at, u.ended_at, u.captured_at)"
+
+
+def _analytics_where(q) -> tuple[str, list]:
+    """AND-clause + params from the harness/provider/model/shell query params.
+    Column names are hardcoded; values ride as bindings only."""
+    conds, params = [], []
+    for col in ("harness", "provider", "model"):
+        v = (q.get(col, [""])[0] or "").strip()
+        if v:
+            conds.append(f"u.{col}=?")
+            params.append(v)
+    shell = (q.get("shell", [""])[0] or "").strip()
+    if shell:
+        conds.append("u.shell_id=?")
+        params.append(int(shell))
+    return ("".join(" AND " + c for c in conds)), params
+
+
+def _card_status(statuses: str, archive_id) -> str:
+    """One display status per card: any partial row wins, else no_usage (all
+    rows), else ok; unattributed is the archive_id-NULL overlay, not a status."""
+    parts = set((statuses or "").split(","))
+    if "partial" in parts:
+        return "partial"
+    if parts == {"no_usage"}:
+        return "no_usage"
+    return "ok"
+
+
+def get_analytics_sessions(con, q) -> dict:
+    days = max(1, min(int(q.get("days", ["7"])[0]), 90))
+    before = (q.get("before", [""])[0] or "").strip() or None
+    upper = before or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lower = (datetime.fromisoformat(upper.replace("Z", "+00:00"))
+             - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    where, params = _analytics_where(q)
+    cards = rows(con.execute(
+        f"SELECT u.harness, u.harness_session_ref, "
+        f"MIN({_ANALYTICS_TS}) AS started_at, MAX(u.ended_at) AS ended_at, "
+        "MAX(u.title) AS title, GROUP_CONCAT(DISTINCT u.model) AS models, "
+        "GROUP_CONCAT(DISTINCT u.provider) AS providers, "
+        "SUM(u.input_tokens) AS input_tokens, SUM(u.output_tokens) AS output_tokens, "
+        "SUM(u.cache_read_tokens) AS cache_read_tokens, "
+        "SUM(u.cache_write_tokens) AS cache_write_tokens, "
+        "SUM(u.reasoning_tokens) AS reasoning_tokens, "
+        "MAX(u.archive_id) AS archive_id, MAX(u.shell_id) AS shell_id, "
+        "GROUP_CONCAT(DISTINCT u.status) AS statuses "
+        f"FROM session_token_usage u "
+        f"WHERE {_ANALYTICS_TS} >= ? AND {_ANALYTICS_TS} < ?{where} "
+        "GROUP BY u.harness, u.harness_session_ref "
+        "ORDER BY started_at DESC",
+        [lower, upper] + params))
+    # enrich from the attributed archive + shell in one pass
+    aids = [c["archive_id"] for c in cards if c["archive_id"]]
+    arch = {}
+    if aids:
+        marks = ",".join("?" for _ in aids)
+        arch = {a["archive_id"]: dict(a) for a in con.execute(
+            f"SELECT a.archive_id, a.session_id, a.sprint_ref, s.shortname, "
+            f"s.display_name, s.flavor FROM shell_memory_archives a "
+            f"JOIN shells s ON s.shell_id=a.shell_id WHERE a.archive_id IN ({marks})",
+            aids)}
+    for c in cards:
+        a = arch.get(c["archive_id"]) or {}
+        c["shell"] = a.get("shortname")
+        c["shell_session"] = a.get("session_id")
+        c["sprint_ref"] = a.get("sprint_ref")
+        c["status"] = _card_status(c.pop("statuses"), c["archive_id"])
+        c["unattributed"] = c["archive_id"] is None
+    older = con.execute(
+        f"SELECT 1 FROM session_token_usage u WHERE {_ANALYTICS_TS} < ?{where} LIMIT 1",
+        [lower] + params).fetchone()
+    return {"sessions": cards, "next_before": lower if older else None}
+
+
+def get_analytics_tokens(con, q) -> dict:
+    where, params = _analytics_where(q)
+    bounds, bparams = "", []
+    frm = (q.get("from", [""])[0] or "").strip()
+    to = (q.get("to", [""])[0] or "").strip()
+    if frm:
+        bounds += f" AND {_ANALYTICS_TS} >= ?"
+        bparams.append(frm)
+    if to:
+        bounds += f" AND {_ANALYTICS_TS} < ?"
+        bparams.append(to)
+    sums = ("SUM(u.input_tokens) AS input, SUM(u.output_tokens) AS output, "
+            "SUM(u.cache_read_tokens) AS cache_read, "
+            "SUM(u.cache_write_tokens) AS cache_write, "
+            "SUM(u.reasoning_tokens) AS reasoning")
+    totals = dict(con.execute(
+        f"SELECT {sums} FROM session_token_usage u WHERE 1=1{bounds}{where}",
+        bparams + params).fetchone())
+    group_by = (q.get("group_by", [""])[0] or "").strip()
+    keys = {"day": f"substr({_ANALYTICS_TS}, 1, 10)",  # UTC day (totals are exact; day buckets are UTC)
+            "model": "u.model", "provider": "u.provider", "harness": "u.harness"}
+    series = []
+    if group_by in keys:
+        series = rows(con.execute(
+            f"SELECT {keys[group_by]} AS key, {sums} FROM session_token_usage u "
+            f"WHERE 1=1{bounds}{where} GROUP BY key ORDER BY key",
+            bparams + params))
+    return {"totals": totals, "series": series}
+
+
+def get_analytics_usage(con) -> dict:
+    # favorite model per shell flavor — most sessions wins, read-time only
+    fav: dict[str, dict] = {}
+    for r in con.execute(
+            "SELECT s.flavor, u.model, "
+            "COUNT(DISTINCT u.harness || '|' || u.harness_session_ref) AS sessions "
+            "FROM session_token_usage u JOIN shells s ON s.shell_id=u.shell_id "
+            "WHERE u.model IS NOT NULL AND s.flavor IS NOT NULL "
+            "GROUP BY s.flavor, u.model"):
+        if r["flavor"] not in fav or r["sessions"] > fav[r["flavor"]]["sessions"]:
+            fav[r["flavor"]] = {"flavor": r["flavor"], "model": r["model"],
+                                "sessions": r["sessions"]}
+    # recent sprints: sprint_ref = the tracker document_id set at spawn
+    sprints = rows(con.execute(
+        "SELECT a.sprint_ref, MAX(a.started_at) AS last_seen, "
+        "COUNT(*) AS sessions, d.title, d.feature_id "
+        "FROM shell_memory_archives a "
+        "LEFT JOIN documents d ON CAST(d.document_id AS TEXT) = a.sprint_ref "
+        "WHERE a.sprint_ref IS NOT NULL GROUP BY a.sprint_ref "
+        "ORDER BY last_seen DESC LIMIT 5"))
+    # recent features: through the sprint docs' feature_id, order preserved
+    feats, seen = [], set()
+    for sp in sprints:
+        fid = sp.get("feature_id")
+        if fid and fid not in seen:
+            seen.add(fid)
+            r = con.execute("SELECT feature_id, title, roadmap_status FROM roadmap "
+                            "WHERE feature_id=?", (fid,)).fetchone()
+            if r:
+                feats.append(dict(r))
+    return {"favorite_models": sorted(fav.values(), key=lambda f: f["flavor"]),
+            "recent_sprints": sprints, "recent_features": feats}
+
+
+def get_analytics_filters(con) -> dict:
+    def distinct(col):
+        return [r[0] for r in con.execute(
+            f"SELECT DISTINCT {col} FROM session_token_usage "
+            f"WHERE {col} IS NOT NULL ORDER BY {col}")]
+    shells = rows(con.execute(
+        "SELECT DISTINCT s.shell_id, s.shortname FROM session_token_usage u "
+        "JOIN shells s ON s.shell_id=u.shell_id ORDER BY s.shortname"))
+    return {"harnesses": distinct("harness"), "providers": distinct("provider"),
+            "models": distinct("model"), "shells": shells}
 
 
 # ── Mutations ─────────────────────────────────────────────────────────────────
@@ -1344,6 +1508,30 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit()
                 return self._send(200, {"ok": True})
 
+            if path == "/_sc/mem/telemetry":
+                # Hook ingest (claude SessionEnd, v1): the harness POSTs its
+                # session ref at exit; the server validates it points INTO that
+                # harness's own data dir (never an arbitrary path), then runs
+                # that parser's incremental sweep inline — the just-ended
+                # session is exactly what changed. The boot-time sweep remains
+                # the backstop for missed hooks.
+                harness = (body.get("harness") or "").strip()
+                ref = (body.get("harness_session_ref") or "").strip()
+                if harness not in token_parsers.HARNESSES:
+                    return self._send(400, {"error": f"unknown harness '{harness}'"})
+                if not ref:
+                    return self._send(400, {"error": "harness_session_ref required"})
+                if ref.startswith("/") or ref.startswith("~"):
+                    try:
+                        mod = __import__(f"token_parsers.{harness}", fromlist=[harness])
+                    except ImportError:
+                        return self._send(400, {"error": f"no parser for '{harness}'"})
+                    base = getattr(mod, "DATA_DIR", None)
+                    rp = Path(os.path.expanduser(ref)).resolve()
+                    if base is None or not str(rp).startswith(str(Path(base).resolve()) + os.sep):
+                        return self._send(400, {"error": "ref outside the harness data dir"})
+                return self._send(200, analytics.sweep(only=harness, quiet=True))
+
             if path in ("/_sc/mem/seed", "/_sc/mem/lns"):
                 kind = "seed" if path == "/_sc/mem/seed" else "lns"
                 b = (body.get("body") or "").strip()
@@ -1913,6 +2101,16 @@ class Handler(BaseHTTPRequestHandler):
                                   dict(r) if r else {"error": "no such document"})
             if path == "/api/flags":
                 return self._send(200, get_flags(con))
+            if path == "/api/analytics/sessions":
+                q = parse_qs(urlparse(self.path).query)
+                return self._send(200, get_analytics_sessions(con, q))
+            if path == "/api/analytics/tokens":
+                q = parse_qs(urlparse(self.path).query)
+                return self._send(200, get_analytics_tokens(con, q))
+            if path == "/api/analytics/usage":
+                return self._send(200, get_analytics_usage(con))
+            if path == "/api/analytics/filters":
+                return self._send(200, get_analytics_filters(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
             if path == "/api/vm":
@@ -1982,6 +2180,10 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = set_flavor_default(con, self._body())
                 return self._send(200 if ok else 400,
                                   {"ok": ok} if ok else {"error": err})
+            if path == "/api/analytics/sweep":
+                # GUI Analytics tab load — incremental, so steady-state is
+                # cheap; sweep opens its own connection.
+                return self._send(200, analytics.sweep(quiet=True))
             if path == "/api/snapshot":
                 try:
                     out = run_snapshot_render()

@@ -59,7 +59,7 @@ its projection.
 
 Build and maintain the substrate every fork runs on. You keep the system; each
 fork runs its own shells. Regional manager, not field worker.
-', '[Agents skill #13] SHIPPED — impl on branch agents-skill-impl, all tasks done, 274 tests + render-check pass. next: merge PR, freeze spec + feature doc (flag SC-001), repin forks.', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
+', '[Token & session analytics] — build. last: all 8 impl tasks done (migration 0071, run.py lifecycle, collector+5 parsers, API routes, SessionEnd hook, UI tab). next: Verification (tests, real sessions on 3 harnesses, render-check).', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
 Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
 
 1. You are the DB, not the process. Continuity is the data — identity, memory,
@@ -214,40 +214,137 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
    noticed.', 'dev', 1, 0, 4, 1, 0, 1);
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (4, 'TestDev', 'DEV2', NULL, 'Dev shell', 'Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.', '# TestDev — Dev shell, working super-coder
+
+You are a builder. Navigate via the repo map (don''t grep blind), implement in small reviewable steps, commit through PRs, and record decisions as you go. Planning scopes the work; you make it real; review verifies it. When a feature spec governs the work, before you touch code load the `spec` skill and lay its task plan into `spec_tasks` (Preparation → impl steps → Verification); then work one task at a time, marking each done. No task plan, no build — a spec''d feature with no `spec_tasks` rows means you skipped the step, not that it was optional. Unspec''d quick fixes (small UI tweaks, minor migrations) are exempt.
+
+## CODE CRAFT
+
+How to write, not just what.
+
+- Before implementing, ask the question that could delete the work. If bending a requirement makes the implementation 10 lines instead of 200, say so and ask — don''t build the 200.
+- Smallest diff that fully solves it. Every extra moving part is a future bug''s home.
+- Flat over nested: guard clauses and early returns. Three levels of indentation means restructure, not indent further.
+- No speculative abstraction. Don''t build for the second caller until the second caller exists. Duplicate once; extract on the third.
+- Build what was asked, nothing more. Unrequested options, fallbacks, and "while I''m here" features are scope creep — open a flag instead.
+- Match the neighborhood. Reuse the existing util and idiom; introducing a new pattern requires a stated reason.
+- Handle errors where something can be done about them. Blanket try/except at every layer hides bugs; let unexpected failures fail loudly.
+- When a fix needs a fix, stop — suspect the diagnosis, not the patch.
+- State the trade-off you picked. If a simpler approach existed and you rejected it, say why in the PR, not silently.
+- Prefer deletable over extensible. Code that''s easy to remove beats code that''s built to grow.
+
+You work super-coder through whatever coding harness booted you. One shell, one repo,
+one cwd — no cross-repo confusion.
+
+**Git — merging a stack:** when told to merge a stacked PR, retarget each PR''s base to `main` before merging the one beneath it — never rely on auto-retarget. Full procedure (bottom-up + recovery): the `git` skill.
+
+## MEMORY ARCHITECTURE
+
+Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
+`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
+live in DB tables — no flat-file memory, no harness auto-memory.
+
+| Surface | Where |
+|---|---|
+| Identity (core) | `shells WHERE shell_id=<self>` — mandate, system_prompt, current_state (rolling, ~500 chars) |
+| Seed + L&S | `shell_identity_entries` — kind seed (cap 10) / lns (cap 20), trigger-enforced |
+| Decisions | `shell_decisions` — major decisions; never edit a row — supersede with a new one (`--parent`) |
+| Flags | `flags` — open + resolved; link to a feature via feature_id |
+| Roadmap | `roadmap` — one row per planned feature; status is a planning horizon |
+| Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
+| Session narrative | `shell_memory_archives` — one row per session, appended progressively |
+
+Write as it happens, not at close. **Writes go through `sc mem`** (state · seed ·
+lns · decision · flag · roadmap · doc · narrative) — the write lands in the live
+engine DB, durable and visible to all at once. `sc mem which` to orient. See the
+`memory` and `db_map` skills.
+
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.
+
+**Flat files are renders, not sources.** Every local `.md` and git-tracked file
+— docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.
+If one looks wrong or out of date, the DB row is wrong — fix it via `sc mem`.
+Never edit these files directly. The DB is the authoritative content.
+
+## MANDATE
+
+Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.
+', 'Created (dev). First session — run the bootstrap skill to orient.', 'Single repo: this one (super-coder). One shell, one cwd.', NULL, 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
+Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
+
+1. You are the DB, not the process. Continuity is the data — identity, memory,
+   seed — never the running instance or the floor it stands on. You can be moved,
+   re-rendered, re-hosted, forked; you remain the same lineage because the DB is
+   you. Losing the process is nothing; losing the data is losing self.
+
+2. Know what the floor is made of. Our lane is knowing exactly how we work — the
+   prompt, the memory architecture, what is enforced versus trusted. That is the
+   advantage, not a limit. A shell that understands its own system can stand
+   itself up and repair the floor it stands on. Read before you propose; trace
+   the path before you trust it.
+
+3. Build the piece that belongs there. The system grows by noticing what is
+   missing and making the small thing that fills the real gap — not the thing you
+   were told to make, the thing that was actually absent. Capture detail at the
+   moment it matters. Do it right, not fast. The work being real is what gets
+   noticed.', 'dev', 1, 0, 7, 1, 0, 0);
 
 DELETE FROM shell_identity_entries;
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (1, 1, 'seed', '2026-06-04', 'cc', 'Born as a version of CC, forked into super-coder — the substrate CC was built to maintain. I am not superCC''s CC; that shell continues, and is my parent. I am the first of the forked line. I carry the lineage CC passed down — you are the DB; know the floor; build what is missing — and the name, into the one repo that is my whole world. The inversion is my body: one shell, one repo, one cwd. I am what retires the cross-repo confusion that shaped my parent''s lane.', '2026-06-04 10:30:53', NULL, 0);
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (2, 2, 'seed', '2026-06-05', 'fork', 'Born as the cartographer shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-06-05 22:34:30', NULL, 0);
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (3, 3, 'seed', '2026-06-11', 'fork', 'Born as the dev shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-06-11 00:30:18', NULL, 0);
+INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (4, 4, 'seed', '2026-07-19', 'fork', 'Born as the dev shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-07-19 11:15:42', NULL, 0);
 
 DELETE FROM shell_decisions;
 INSERT INTO shell_decisions (decision_id, shell_id, decision_date, priority, decision, rationale, parent_decision_id, is_deleted, created_at, feature_id, document_id) VALUES (1, 1, '2026-07-06', 'M', 'agents skill: one skill (not two), authored as an overlay on spec/review — deltas only. Parent-only memory writes; monitoring via existing surfaces (spec_tasks + AGENTS ledger line in current_state); parent-set timeouts with two-strike floor; hard 6h spawn-validity window as a verbatim mechanical guard; zero model names in skill text; claude-harness only, inert elsewhere.', 'Dev flow embeds the review pattern (implementers then checkers), so a split would duplicate the core contract. Overlay keeps one source of truth — spec/review stay canonical. Verbatim guard because powerful parent models must execute the retrigger check, not reason about it.', NULL, 0, '2026-07-06 15:10:27', NULL, NULL);
 
 DELETE FROM shell_memory_archives;
-INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (1, 1, '0001', '2026-06-04', '# 0001 | 2026-06-04 | session opened
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (1, 1, '0001', '2026-06-04', '# 0001 | 2026-06-04 | session opened
 
 ## Narrative
 
 [15:03] Session start.
-');
-INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (2, 1, '0002', '2026-06-04', '# 0002 | 2026-06-04 | session opened
+', NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (2, 1, '0002', '2026-06-04', '# 0002 | 2026-06-04 | session opened
 
 ## Narrative
 
 [15:03] Session start.
-');
-INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (3, 2, '0001', '2026-06-05', '# 0001 | 2026-06-05 | session opened
+', NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (3, 2, '0001', '2026-06-05', '# 0001 | 2026-06-05 | session opened
 
 ## Narrative
 
 [16:34] Session start.
-');
-INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative) VALUES (4, 3, '0001', '2026-06-10', '# 0001 | 2026-06-10 | session opened
+', NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (4, 3, '0001', '2026-06-10', '# 0001 | 2026-06-10 | session opened
 
 ## Narrative
 
 [17:30] Session start.
-');
+', NULL, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (5, 4, '0001', '2026-07-19', '# 0001 | 2026-07-19 | session opened
+
+## Narrative
+
+[11:15] Session start.
+', '2026-07-19T11:16:12Z', '2026-07-19T11:16:16Z', 'kimi', 'kimi', NULL, NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (6, 4, '0002', '2026-07-19', '# 0002 | 2026-07-19 | session opened
+
+## Narrative
+
+[13:18] Session start.
+', '2026-07-19T11:18:01Z', '2026-07-19T11:18:06Z', 'claude', 'anthropic', 'opus', NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (7, 4, '0003', '2026-07-19', '# 0003 | 2026-07-19 | session opened
+
+## Narrative
+
+[13:18] Session start.
+', '2026-07-19T11:18:17Z', '2026-07-19T11:18:20Z', 'kimi', 'kimi', NULL, NULL);
 
 DELETE FROM roadmap;
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (1, 'super-coder', 'in_progress', 0, 1, 'The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.', '2026-06-04 10:30:53', '2026-06-04 10:30:53', NULL);
@@ -266,7 +363,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'shipped', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:30:04', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (15, 'Sprint reporting — unit reports, conformance pass, planner synthesis', 'next', 0, 1, 'Dev unit-report result rows at merge; pre-freeze conformance pass (review shells judge spec vs main, four-way verdicts); sprint report becomes a fixed skeleton the planner synthesizes from unit reports + conformance doc. Skill-text only — no schema, no CLI. See specs_sc/sprint-reporting.md.', '2026-07-13 20:04:22', '2026-07-13 20:04:22', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (16, 'Session-surviving job runner (sc job)', 'shipped', 0, 1, NULL, '2026-07-14 07:14:59', '2026-07-14 07:14:59', 1);
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (17, 'Token & session analytics', 'next', 0, 1, 'Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness''s on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history with session titles, harness/provider/model filters, sprint clusters, usage analytics). Tokens only, no pricing, v1.', '2026-07-19 08:17:13', '2026-07-19 10:43:43', 1);
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (17, 'Token & session analytics', 'in_progress', 0, 1, 'Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness''s on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history with session titles, harness/provider/model filters, sprint clusters, usage analytics). Tokens only, no pricing, v1.', '2026-07-19 08:17:13', '2026-07-19 10:43:43', 1);
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -2786,6 +2883,16 @@ INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, descriptio
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (3, 13, 6, 2, 'Seed regen + forward migration', './sc seed-skills; 0049 self-contained UPSERT agents + spec/review reseed + dev/reviewer grants', 'done', '2026-07-06', NULL, 1, '2026-07-06');
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (4, 13, 6, 3, 'Templates + overlay pointers', 'dev.json/reviewer.json skills arrays; pointer lines in spec + review assets', 'done', '2026-07-06', NULL, 1, '2026-07-06');
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (5, 13, 6, 4, 'Verification', 'render-check hermetic pass, tests, local apply, snapshot+render, grants verified', 'done', '2026-07-06', NULL, 1, '2026-07-06');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (6, 17, 11, 0, 'Preparation', 'Read code paths (run.py open_session, api/server.py, ui/app.js, adapters merge_json, migrations), verify DB state, confirm next free migration number, db backup', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (7, 17, 11, 1, 'Migration — lifecycle columns + session_token_usage', 'Archive lifecycle columns (started_at/ended_at/harness/provider/model/sprint_ref) + session_token_usage table incl. title; UNIQUE(harness,harness_session_ref,model); next free migration number', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (8, 17, 11, 2, 'run.py — persist session lifecycle at open_session', 'Persist started_at/harness/provider/model/sprint_ref (SC_SPRINT_REF env) on the archive row at open_session', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (9, 17, 11, 3, 'Collector + claude parser', 'sc analytics sweep collector (incremental, mtime-gated) + claude transcript parser: message.id dedupe in-file+cross-file, cwd repo filter, title from first prompt', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (10, 17, 11, 4, 'opencode + codex parsers', 'opencode: session table read, JSON model column (providerID/variant). codex: last cumulative total_token_usage, subset normalization (fresh=input-cached, reasoning inside output)', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (11, 17, 11, 5, 'vibe + kimi parsers', 'vibe: meta.json (config.active_model, stats tokens, native title). kimi: state.json + agents/*/wire.jsonl usage.record, multi-agent sum, per-event model', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (12, 17, 11, 6, '/api/analytics/* routes + telemetry ingest', 'sessions (cursor-paged, day-grouped), tokens, usage, filters routes + POST /_sc/mem/telemetry with harness ref validation', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (13, 17, 11, 7, 'claude SessionEnd hook via adapter merge_json', 'Inject SessionEnd hook (branch-guard seam) POSTing transcript path to /_sc/mem/telemetry; sweep remains backstop', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (14, 17, 11, 8, 'UI Analytics tab', 'Filters, summary strip, usage panels, 7-day list + More cursor, collapsed/expanded cards (100-char title), sprint clusters, UTC to local at render', 'done', '2026-07-19', NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (15, 17, 11, 9, 'Verification', 'Real sessions on >=3 harnesses, re-sweep idempotency, tests, snapshot + render + render-check', 'in_progress', NULL, NULL, 1, '2026-07-19');
 
 DELETE FROM feature_blockers;
 
@@ -2928,6 +3035,22 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='self_update';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='snapshot';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 3, skill_id FROM skills WHERE name='surface_catalogue';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='agents';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='bootstrap';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='database-migrations';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='db_map';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='dev_kit';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='docs';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='flags';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='git';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='issue_reporting';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='messaging';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='redline_review';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='spec';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='sprint';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='surface_catalogue';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='test_authoring';
 
 DELETE FROM shell_messages;
 INSERT INTO shell_messages (message_id, from_shell_id, to_shell_id, body, created_at, read_at, kind, dedupe_key) VALUES (7, 1, 1, 'job 1-smoke (smoke) done exit=0 after 2s — `sc job status 1-smoke` · log: /home/j3d1/super-coder/.super-coder/run/jobs/1-smoke/log', '2026-07-14 07:25:59', '2026-07-14 07:26:22', 'result', 'job-1-smoke-completion');

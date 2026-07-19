@@ -33,7 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -51,6 +51,9 @@ import git_prune  # noqa: E402  — boot-time prune of provably-merged local bra
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
+
+sys.path.insert(0, str(ENGINE / "api"))
+import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
 
 ADAPTERS = ENGINE / "adapters"
 
@@ -562,10 +565,33 @@ def _is_unused(narrative: str) -> bool:
     return (narrative or "").count("\n[") <= 1
 
 
-def open_session(con, shell_id: int) -> tuple[str, int]:
+def session_provider(harness: str, model: "str | None") -> "str | None":
+    """Boot-time provider for the archive row. opencode model ids are
+    provider-prefixed ("ollama-cloud/<model>") — the prefix wins; otherwise the
+    harness's home provider (claude→anthropic, codex→openai, vibe→mistral).
+    kimi is absent from model_catalog's map (models.dev has no kimi key) but its
+    wire.jsonl reports provider="kimi" natively — pin the same value here so
+    boot-row and sweep-row providers agree."""
+    if harness in model_catalog.PREFIXED_HARNESSES and model and "/" in model:
+        return model.split("/", 1)[0]
+    if harness == "kimi":
+        return "kimi"
+    return model_catalog.HARNESS_PROVIDER.get(harness)
+
+
+def open_session(con, shell_id: int,
+                 lifecycle: "dict | None" = None) -> tuple[str, int]:
+    """`lifecycle` carries the launch telemetry persisted onto the archive row
+    (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
+    NOT written here: run.py execs the harness, so no code runs at exit; the
+    analytics sweep backfills it from harness session data."""
+    life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **(lifecycle or {})}
+    life_cols = ["started_at", "harness", "provider", "model", "sprint_ref"]
     # Reuse the active session if it was opened but never used (e.g. install
     # opened session 0001, or a prior launch did no work) — avoids phantom empty
-    # sessions and the incidental first-snapshot diff.
+    # sessions and the incidental first-snapshot diff. The reused stub becomes
+    # THIS launch's session, so its lifecycle is overwritten with this launch's.
     active = con.execute(
         "SELECT active_archive_id FROM shells WHERE shell_id=?", (shell_id,)
     ).fetchone()[0]
@@ -574,7 +600,19 @@ def open_session(con, shell_id: int) -> tuple[str, int]:
             "SELECT archive_id, session_id, full_narrative FROM shell_memory_archives "
             "WHERE archive_id=?", (active,)
         ).fetchone()
-        if row and _is_unused(row["full_narrative"]):
+        # …but a stub that actually LAUNCHED a harness session is not unused:
+        # attributed usage rows prove real spend under this archive's lifecycle,
+        # and reusing it would overwrite that lifecycle with this boot's (three
+        # headless one-shots once collapsed into one kimi-flavored archive).
+        # The pre-session sweep runs before this, so attribution is current.
+        if row and _is_unused(row["full_narrative"]) and not con.execute(
+                "SELECT 1 FROM session_token_usage WHERE archive_id=? LIMIT 1",
+                (row["archive_id"],)).fetchone():
+            con.execute(
+                f"UPDATE shell_memory_archives SET {', '.join(c + '=?' for c in life_cols)} "
+                "WHERE archive_id=?",
+                [life.get(c) for c in life_cols] + [row["archive_id"]])
+            con.commit()
             return row["session_id"], row["archive_id"]
 
     last = con.execute(
@@ -586,9 +624,10 @@ def open_session(con, shell_id: int) -> tuple[str, int]:
     narrative = (f"# {session_id} | {today} | session opened\n\n"
                  f"## Narrative\n\n[{now_hm}] Session start.\n")
     cur = con.execute(
-        "INSERT INTO shell_memory_archives (shell_id, session_id, date, full_narrative) "
-        "VALUES (?, ?, ?, ?)",
-        (shell_id, session_id, today, narrative),
+        "INSERT INTO shell_memory_archives "
+        f"(shell_id, session_id, date, full_narrative, {', '.join(life_cols)}) "
+        f"VALUES (?, ?, ?, ?, {', '.join('?' for _ in life_cols)})",
+        [shell_id, session_id, today, narrative] + [life.get(c) for c in life_cols],
     )
     archive_id = cur.lastrowid
     con.execute("UPDATE shells SET active_archive_id=? WHERE shell_id=?",
@@ -717,7 +756,36 @@ def main() -> None:
     # harness (e.g. opencode as a manual fallback) — then the harness picks its own.
     flavor_model = fdef["models"].get(harness) if fdef else None
 
-    session_id, archive_id = open_session(con, chosen["shell_id"])
+    # Pre-session analytics sweep (doc #11): pull harness-side usage data into
+    # session_token_usage + backfill the PREVIOUS session's ended_at. MUST run
+    # before open_session — the stub-reuse check there relies on the previous
+    # boot's session being attributed to its archive already. Incremental
+    # (mtime-gated), so steady-state cost is near zero; the first-ever sweep of
+    # harness history is the one large pass. Best-effort like the prune — a
+    # broken parser must never block a boot. Skipped under RENDER_ONLY
+    # (headless verify must not mutate).
+    sweep_note = None
+    if not os.environ.get("RENDER_ONLY"):
+        try:
+            import analytics
+            s = analytics.sweep(quiet=True)
+            if s["inserted"] or s["updated"]:
+                sweep_note = (f"{s['inserted']} new, {s['updated']} refreshed "
+                              f"session-usage row(s)")
+        except Exception:
+            sweep_note = None
+
+    # The model this launch will actually route (headless resolves via flags →
+    # flavor default; interactive routes the flavor default). None = the harness
+    # picks its own — recorded as NULL, honest about what we know at boot.
+    session_model = (resolve_headless_model(flag_model, fdef, harness)
+                     if headless else flavor_model)
+    session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
+        "harness": harness,
+        "provider": session_provider(harness, session_model),
+        "model": session_model,
+        "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+    })
 
     full = con.execute(
         "SELECT shell_id, display_name, shortname, partner, role, mandate, "
@@ -785,6 +853,8 @@ def main() -> None:
         print(f"→ heal: {heal_note}")
     if prune_note:
         print(f"→ prune: {prune_note}")
+    if sweep_note:
+        print(f"→ analytics: {sweep_note}")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
     if api_port and full["api_key"]:
@@ -861,7 +931,7 @@ def main() -> None:
     # render-only run still validates the adapter + prints what would exec.
     headless_cmd = None
     if headless:
-        hmodel = resolve_headless_model(flag_model, fdef, harness)
+        hmodel = session_model  # resolved up front (persisted on the archive row)
         headless_cmd = headless_command(
             adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags)
         if headless_cmd is None:

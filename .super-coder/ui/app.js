@@ -1677,6 +1677,203 @@ async function renderWorktrees(root, opts = {}) {
   root.append(sc);
 }
 
+// ── Analytics ──────────────────────────────────────────────────────────────
+// Token & session analytics (doc #11). Timestamps arrive as UTC ISO; ALL
+// day-grouping and displayed times are LOCAL — translated here at render,
+// never on the server. The tab load runs an incremental sweep first so the
+// view reflects harness data as of now.
+let anFilters = { harness: "", provider: "", model: "" };
+let anSessions = [];      // accumulated cards across "More" pages
+let anNextBefore = null;  // cursor for the next page (null = no older rows)
+let anDaysLoaded = 0;     // window size loaded so far (7 per page)
+
+const fmtTok = (n) => n == null ? "—"
+  : n >= 1e9 ? (n / 1e9).toFixed(1) + "B"
+  : n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+  : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+const cardTotal = (c) => ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]
+  .reduce((t, k) => t + (c[k] || 0), 0);
+const localDay = (iso) => iso ? new Date(iso).toLocaleDateString(undefined,
+  { weekday: "short", year: "numeric", month: "short", day: "numeric" }) : "undated";
+const localTime = (iso) => iso ? new Date(iso).toLocaleTimeString(undefined,
+  { hour: "2-digit", minute: "2-digit" }) : "—";
+
+function anQuery(extra = {}) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries({ ...anFilters, ...extra })) if (v) p.set(k, v);
+  const s = p.toString();
+  return s ? "?" + s : "";
+}
+
+async function anLoadPage() {
+  const d = await api("/analytics/sessions" + anQuery(anNextBefore ? { before: anNextBefore, days: 7 } : { days: 7 }));
+  anSessions.push(...d.sessions);
+  anNextBefore = d.next_before;
+  anDaysLoaded += 7;
+}
+
+function anSelect(label, key, values, onChange) {
+  const wrap = el("label", { className: "an-filter" }, microlabel(label));
+  const sel = el("select", { className: "an-select" });
+  sel.append(el("option", { value: "" }, "All"));
+  for (const v of values) sel.append(el("option", { value: v, selected: anFilters[key] === v }, v));
+  sel.onchange = () => onChange(sel.value);
+  wrap.append(sel);
+  return wrap;
+}
+
+function anSessionCard(c, sprintTitles) {
+  const row = el("details", { className: "sess" });
+  const head = el("summary", { className: "sess-head" });
+  head.append(el("span", { className: "sess-time" },
+    localTime(c.started_at) + "–" + localTime(c.ended_at)));
+  head.append(el("span", { className: "pill" + (c.unattributed ? " warn" : "") },
+    c.unattributed ? "unattributed" : c.shell || "?"));
+  head.append(el("span", { className: "pill" }, c.harness));
+  if (c.models) head.append(el("span", { className: "sess-model" }, c.models));
+  const title = c.title || "";
+  head.append(el("span", { className: "sess-title" },
+    title.length > 100 ? title.slice(0, 100) + "…" : title));
+  head.append(el("span", { className: "sess-tok" }, fmtTok(cardTotal(c) || null)));
+  row.append(head);
+
+  const body = el("div", { className: "sess-body" });
+  if (title.length > 100) body.append(el("div", { className: "sess-full-title" }, title));
+  body.append(statRow([
+    ["input", fmtTok(c.input_tokens)], ["output", fmtTok(c.output_tokens)],
+    ["cache read", fmtTok(c.cache_read_tokens)], ["cache write", fmtTok(c.cache_write_tokens)],
+    ...(c.reasoning_tokens != null ? [["reasoning", fmtTok(c.reasoning_tokens)]] : []),
+  ]));
+  const meta = [];
+  if (c.providers) meta.push(["provider", c.providers]);
+  if (c.shell_session) meta.push(["session", c.shell_session]);
+  if (c.sprint_ref) meta.push(["sprint", sprintTitles[c.sprint_ref] || "#" + c.sprint_ref]);
+  if (c.status !== "ok") meta.push(["status", c.status]);
+  if (meta.length) body.append(statRow(meta));
+  body.append(el("code", { className: "sess-ref" }, c.harness_session_ref));
+  row.append(body);
+  return row;
+}
+
+async function renderAnalytics(root) {
+  root.replaceChildren(el("div", { className: "muted" }, "sweeping harness data…"));
+  try { await api("/analytics/sweep", "POST"); } catch { /* sweep is best-effort; show what's stored */ }
+  const winFrom = new Date(Date.now() - Math.max(anDaysLoaded, 7) * 864e5).toISOString().slice(0, 19) + "Z";
+  let filters, tokens, usage;
+  try {
+    [filters, tokens, usage] = await Promise.all([
+      api("/analytics/filters"),
+      api("/analytics/tokens" + anQuery({ from: winFrom })),
+      api("/analytics/usage")]);
+    if (!anSessions.length && anNextBefore === null && !anDaysLoaded) await anLoadPage();
+  } catch (e) {
+    root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
+    return;
+  }
+  root.replaceChildren();
+
+  // filter row — applies to the summary, usage panels, and the list
+  const reset = (k) => (v) => {
+    anFilters[k] = v;
+    anSessions = []; anNextBefore = null; anDaysLoaded = 0;
+    renderAnalytics(root);
+  };
+  root.append(el("div", { className: "an-filters" },
+    anSelect("Harness", "harness", filters.harnesses, reset("harness")),
+    anSelect("Provider", "provider", filters.providers, reset("provider")),
+    anSelect("Model", "model", filters.models, reset("model"))));
+
+  // summary strip — totals for the loaded window
+  const t = tokens.totals || {};
+  const strip = el("div", { className: "card an-summary" });
+  strip.append(microlabel(`Tokens — last ${Math.max(anDaysLoaded, 7)} days` +
+    (anFilters.harness || anFilters.provider || anFilters.model ? " (filtered)" : "")));
+  strip.append(statRow([
+    ["input", fmtTok(t.input)], ["output", fmtTok(t.output)],
+    ["cache read", fmtTok(t.cache_read)], ["cache write", fmtTok(t.cache_write)],
+    ...(t.reasoning != null ? [["reasoning", fmtTok(t.reasoning)]] : []),
+  ]));
+  root.append(strip);
+
+  // usage panels — favorite model per flavor, recent sprints, recent features
+  const sprintTitles = {};
+  for (const s of usage.recent_sprints || []) sprintTitles[s.sprint_ref] = s.title;
+  const panels = el("div", { className: "an-panels" });
+  if ((usage.favorite_models || []).length) {
+    const p = el("div", { className: "card" }, microlabel("Favorite model by flavor"));
+    for (const f of usage.favorite_models)
+      p.append(el("div", { className: "an-usage-row" },
+        el("span", { className: "pill" }, f.flavor), " ", f.model,
+        el("span", { className: "muted" }, ` — ${f.sessions} session(s)`)));
+    panels.append(p);
+  }
+  if ((usage.recent_sprints || []).length) {
+    const p = el("div", { className: "card" }, microlabel("Recent sprints"));
+    for (const s of usage.recent_sprints)
+      p.append(el("div", { className: "an-usage-row" },
+        s.title || "sprint #" + s.sprint_ref,
+        el("span", { className: "muted" }, ` — ${s.sessions} session(s)`)));
+    panels.append(p);
+  }
+  if ((usage.recent_features || []).length) {
+    const p = el("div", { className: "card" }, microlabel("Recent features"));
+    for (const f of usage.recent_features)
+      p.append(el("div", { className: "an-usage-row" },
+        f.title, el("span", { className: "pill " + (f.roadmap_status || "") }, f.roadmap_status || "")));
+    panels.append(p);
+  }
+  if (panels.children.length) root.append(panels);
+
+  // session history — grouped by LOCAL day, newest first; within a day,
+  // sessions sharing a sprint_ref cluster under a sprint header with rolled-up
+  // totals; solo sessions list flat.
+  const list = el("div", {});
+  root.append(list);
+  if (!anSessions.length) {
+    list.append(el("div", { className: "muted" }, "No sessions in the loaded window."));
+  }
+  const byDay = new Map();  // insertion order follows the DESC-sorted rows
+  for (const c of anSessions) {
+    const day = localDay(c.started_at);
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push(c);
+  }
+  for (const [day, cards] of byDay) {
+    const dayCard = el("div", { className: "card an-day" });
+    dayCard.append(el("h2", {}, day));
+    const bySprint = new Map();
+    for (const c of cards) {
+      const k = c.sprint_ref || null;
+      if (!bySprint.has(k)) bySprint.set(k, []);
+      bySprint.get(k).push(c);
+    }
+    for (const [ref, group] of bySprint) {
+      if (ref && group.length > 1) {
+        const cl = el("div", { className: "an-sprint" });
+        cl.append(el("div", { className: "an-sprint-head" },
+          el("span", { className: "pill next" }, "sprint"),
+          " " + (sprintTitles[ref] || "#" + ref),
+          el("span", { className: "sess-tok" },
+            fmtTok(group.reduce((t, c) => t + cardTotal(c), 0)))));
+        for (const c of group) cl.append(anSessionCard(c, sprintTitles));
+        dayCard.append(cl);
+      } else {
+        for (const c of group) dayCard.append(anSessionCard(c, sprintTitles));
+      }
+    }
+    list.append(dayCard);
+  }
+  if (anNextBefore) {
+    const more = el("button", { className: "act", type: "button", textContent: "More ↓ (7 more days)" });
+    more.onclick = async () => {
+      more.disabled = true;
+      try { await anLoadPage(); renderAnalytics(root); }
+      catch (e) { toast("error: " + e.message); more.disabled = false; }
+    };
+    list.append(el("div", { className: "an-more" }, more));
+  }
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
@@ -1686,6 +1883,7 @@ const VIEWS = {
   flags: ["#view-flags", renderFlags],
   worktrees: ["#view-worktrees", renderWorktrees],
   map: ["#view-map", renderMap],
+  analytics: ["#view-analytics", renderAnalytics],
   scripts: ["#view-scripts", renderScripts],
 };
 async function load(tab) {

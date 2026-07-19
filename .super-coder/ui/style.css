@@ -629,3 +629,30 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .flow-wrap.flow-hover .flow-wire.lit { stroke: var(--accent); stroke-width: 2px; }
 
 .flow-hint { font-size: .82rem; text-align: center; margin-top: .4rem; }
+
+/* ── Analytics tab (doc #11) ── */
+.an-filters { display: flex; gap: .8rem; align-items: end; margin-bottom: .6rem; flex-wrap: wrap; }
+.an-filter { display: flex; flex-direction: column; gap: .2rem; }
+.an-select { background: var(--accent2); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: .3rem .5rem; font-size: .85rem; }
+.an-summary { margin-bottom: .6rem; }
+.an-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 6px; margin-bottom: .6rem; }
+.an-usage-row { font-size: .85rem; padding: .2rem 0; }
+.an-day + .an-day { margin-top: 6px; }
+.sess { border-top: 1px solid var(--line); }
+.sess:first-of-type { border-top: none; }
+.sess-head { display: flex; gap: .5rem; align-items: center; padding: .35rem 0;
+  cursor: pointer; list-style: none; font-size: .85rem; }
+.sess-head::-webkit-details-marker { display: none; }
+.sess-time { color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sess-model { color: var(--dim); font-size: .78rem; white-space: nowrap; }
+.sess-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sess-tok { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--accent); white-space: nowrap; }
+.sess-body { padding: .2rem 0 .6rem 1rem; }
+.sess-full-title { font-size: .85rem; margin-bottom: .3rem; }
+.sess-ref { display: block; color: var(--dim); font-size: .72rem; margin-top: .3rem;
+  overflow-wrap: anywhere; }
+.an-sprint { border-left: 2px solid var(--accent); padding-left: .6rem; margin: .4rem 0; }
+.an-sprint-head { display: flex; gap: .5rem; align-items: center; font-size: .85rem; padding: .2rem 0; }
+.an-more { text-align: center; margin: .8rem 0; }
