@@ -17,7 +17,10 @@ Attribution: harness session → archive by (cwd → shell, time-window). A
 shell's window runs from an archive's started_at to the same shell's next
 started_at (open-ended for the latest). Worktree cwds map to the shell whose
 shortname names the worktree; the repo root maps to admin-flavor shells.
-Residual ambiguity stays archive_id=NULL — visible, flagged unattributed,
+When no window matches (rows predating lifecycle archives) but the cwd
+resolves to exactly one shell, shell_id is still set — the shell mapping is
+deterministic on its own, only the archive needs the window. Residual
+ambiguity stays NULL — visible, flagged unattributed,
 never guessed. cwd is transient (attribution runs within the sweep batch);
 rows that stay NULL keep their spend visible in the totals regardless.
 
@@ -125,8 +128,12 @@ def _shell_for_cwd(cwd: str, by_wt: dict, admins: list) -> list[int]:
         name = cwd[len(wt_prefix):].split("/", 1)[0]
         sid = by_wt.get(name)
         return [sid] if sid else []
-    # repo root (or a subdir outside the worktrees) → admin-flavor shells
-    return admins
+    # repo root (or an in-repo subdir outside the worktrees) → admin-flavor
+    # shells; anything off-repo maps to nothing (parsers filter those out,
+    # this is the defensive backstop)
+    if cwd == root or cwd.startswith(root + "/"):
+        return admins
+    return []
 
 
 def _windows(con) -> dict[int, list]:
@@ -144,31 +151,44 @@ def _windows(con) -> dict[int, list]:
     return per
 
 
-def _attribute(con, batch: list[dict], log) -> int:
+def _attribute(con, batch: list[dict], log) -> "tuple[int, int]":
     by_wt, admins = _cwd_shells(con)
     windows = _windows(con)
-    attributed = 0
+    attributed = shell_only = 0
     for r in batch:
         if not r.get("cwd"):
             continue
+        sids = _shell_for_cwd(r["cwd"], by_wt, admins)
         t = _iso_epoch(r.get("started_at") or r.get("ended_at"))
-        if t is None:
-            continue
         hits = []
-        for sid in _shell_for_cwd(r["cwd"], by_wt, admins):
-            for aid, harness, start, end in windows.get(sid, []):
-                if harness == r["harness"] and start is not None \
-                        and start <= t and (end is None or t < end):
-                    hits.append((aid, sid))
-        if len(hits) != 1:
-            continue  # 0 = predates lifecycle rows; >1 = ambiguous — stays NULL
-        aid, sid = hits[0]
-        cur = con.execute(
-            "UPDATE session_token_usage SET archive_id=?, shell_id=? "
-            "WHERE harness=? AND harness_session_ref=? AND model IS ? AND archive_id IS NULL",
-            (aid, sid, r["harness"], r["harness_session_ref"], r["model"]))
-        attributed += cur.rowcount
-    return attributed
+        if t is not None:
+            for sid in sids:
+                for aid, harness, start, end in windows.get(sid, []):
+                    if harness == r["harness"] and start is not None \
+                            and start <= t and (end is None or t < end):
+                        hits.append((aid, sid))
+        if len(hits) == 1:
+            aid, sid = hits[0]
+            cur = con.execute(
+                "UPDATE session_token_usage SET archive_id=?, shell_id=? "
+                "WHERE harness=? AND harness_session_ref=? AND model IS ? AND archive_id IS NULL",
+                (aid, sid, r["harness"], r["harness_session_ref"], r["model"]))
+            attributed += cur.rowcount
+        elif len(sids) == 1:
+            # No usable archive window (predates lifecycle rows, or ambiguous)
+            # but the shell itself is deterministic from cwd alone — worktree
+            # name IS the shortname; repo root maps to the sole admin shell.
+            # Shell-level attribution keeps flavor rollups (favorite model)
+            # fed by pre-lifecycle history; archive_id stays NULL so a later
+            # window match can still land the full attribution.
+            cur = con.execute(
+                "UPDATE session_token_usage SET shell_id=? "
+                "WHERE harness=? AND harness_session_ref=? AND model IS ? "
+                "AND archive_id IS NULL AND shell_id IS NULL",
+                (sids[0], r["harness"], r["harness_session_ref"], r["model"]))
+            shell_only += cur.rowcount
+        # else: cwd ambiguous (multiple admin shells) or off-repo — stays NULL
+    return attributed, shell_only
 
 
 def _backfill_ended(con) -> int:
@@ -181,7 +201,8 @@ def _backfill_ended(con) -> int:
     return cur.rowcount
 
 
-def sweep(only: "str | None" = None, quiet: bool = False) -> dict:
+def sweep(only: "str | None" = None, quiet: bool = False,
+          full: bool = False) -> dict:
     notes: list[str] = []
 
     def log(msg: str):
@@ -195,7 +216,8 @@ def sweep(only: "str | None" = None, quiet: bool = False) -> dict:
         counts = {"insert": 0, "update": 0}
         batch: list[dict] = []
         for mod in _load_parsers(only, log):
-            since = _since_fn(con, mod.HARNESS, mod.PARSER_VERSION)
+            since = (lambda ref: None) if full \
+                else _since_fn(con, mod.HARNESS, mod.PARSER_VERSION)
             try:
                 rows = mod.sweep(REPO_ROOT, since, log)
             except Exception as e:  # plugin stance: loud, never fatal to the sweep
@@ -204,15 +226,16 @@ def sweep(only: "str | None" = None, quiet: bool = False) -> dict:
             for r in rows:
                 counts[_upsert(con, r, captured_at)] += 1
                 batch.append(r)
-        attributed = _attribute(con, batch, log)
+        attributed, shell_only = _attribute(con, batch, log)
         ended = _backfill_ended(con)
         con.commit()
         summary = {"inserted": counts["insert"], "updated": counts["update"],
-                   "attributed": attributed, "ended_backfilled": ended,
-                   "notes": notes}
+                   "attributed": attributed, "shell_attributed": shell_only,
+                   "ended_backfilled": ended, "notes": notes}
         if not quiet:
             print(f"analytics: {counts['insert']} new, {counts['update']} refreshed, "
-                  f"{attributed} attributed, {ended} archive end(s) backfilled")
+                  f"{attributed} attributed, {shell_only} shell-only, "
+                  f"{ended} archive end(s) backfilled")
         return summary
     finally:
         con.close()
@@ -220,9 +243,12 @@ def sweep(only: "str | None" = None, quiet: bool = False) -> dict:
 
 def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: sc analytics sweep [--harness <name>] [--quiet]\n"
+        print("usage: sc analytics sweep [--harness <name>] [--quiet] [--full]\n"
               "  parse each harness's on-disk usage data for THIS repo into\n"
-              "  session_token_usage (incremental, idempotent)")
+              "  session_token_usage (incremental, idempotent)\n"
+              "  --full ignores the incremental watermark and re-parses every\n"
+              "  session — use once to backfill shell attribution on rows\n"
+              "  swept before it existed")
         return 0
     if argv[0] != "sweep":
         print(f"sc analytics: unknown command '{argv[0]}' (try: sweep)", file=sys.stderr)
@@ -235,7 +261,7 @@ def main(argv: list[str]) -> int:
         if only not in token_parsers.HARNESSES:
             print(f"sc analytics: unknown harness '{only}'", file=sys.stderr)
             return 2
-    sweep(only=only, quiet=quiet)
+    sweep(only=only, quiet=quiet, full="--full" in argv)
     return 0
 
 
