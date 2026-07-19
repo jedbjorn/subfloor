@@ -639,7 +639,13 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-panels { display: flex; gap: 6px; margin-bottom: .6rem; }  /* one line, always */
 .an-panel { flex: 1 1 0; min-width: 0; }
 .an-usage-row { font-size: .8rem; padding: .15rem 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
+  text-overflow: ellipsis; white-space: nowrap; display: flex;
+  align-items: center; gap: .35rem; }
+.an-id { color: var(--accent); font-variant-numeric: tabular-nums; flex: none; }
+.an-row-label { overflow: hidden; text-overflow: ellipsis; }
+.an-copy { flex: none; background: none; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--dim); font-size: .7rem; line-height: 1; padding: .1rem .25rem; cursor: pointer; }
+.an-copy:hover { color: var(--ink); border-color: var(--accent); }
 .an-day + .an-day { margin-top: 6px; }
 .sess { border-top: 1px solid var(--line); }
 .sess:first-of-type { border-top: none; }

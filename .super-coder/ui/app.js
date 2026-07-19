@@ -1987,11 +1987,26 @@ async function renderAnalytics(root) {
   // counts are window-scoped server-side; outstanding is current-state.
   const sprintTitles = usage.sprint_titles || {};
   const panels = el("div", { className: "an-panels" });
+  // items: strings, or {id, label} — an id renders as #id with a copy button
+  // so the number can ride straight into a Roadmap/Docs/Flags search.
   const panel = (label, valueText, items) => {
     const p = el("div", { className: "card an-panel" });
     p.append(microlabel(label), el("div", { className: "an-panel-value" }, valueText));
-    for (const it of (items || []).slice(0, 5))
-      p.append(el("div", { className: "an-usage-row" }, it));
+    for (const it of (items || []).slice(0, 5)) {
+      const row = el("div", { className: "an-usage-row" });
+      if (it && typeof it === "object") {
+        const num = "#" + it.id;
+        const btn = el("button", { className: "an-copy", type: "button", title: `copy ${num}` }, "⧉");
+        btn.onclick = () => navigator.clipboard.writeText(num)
+          .then(() => toast(`copied ${num}`), () => toast("copy failed"));
+        row.append(el("span", { className: "an-id" }, num), btn,
+                   el("span", { className: "an-row-label" }, it.label || ""));
+        row.title = `${num} ${it.label || ""}`;
+      } else {
+        row.append(it);
+      }
+      p.append(row);
+    }
     return p;
   };
   if ((usage.favorite_models || []).length) {
@@ -2007,11 +2022,11 @@ async function renderAnalytics(root) {
     peak.value ? [peak.date.toLocaleDateString(undefined,
       { weekday: "short", month: "short", day: "numeric" }) + " — all models"] : []));
   panels.append(panel("Features shipped", String((usage.features_shipped || []).length),
-    (usage.features_shipped || []).map((f) => f.title)));
+    (usage.features_shipped || []).map((f) => ({ id: f.feature_id, label: f.title }))));
   panels.append(panel("Specs shipped", String((usage.specs_shipped || []).length),
-    (usage.specs_shipped || []).map((s) => s.title || s.feature_title || "#" + s.document_id)));
+    (usage.specs_shipped || []).map((s) => ({ id: s.document_id, label: s.title || s.feature_title }))));
   panels.append(panel("Docs outstanding", String((usage.docs_outstanding || []).length),
-    (usage.docs_outstanding || []).map((f) => f.title)));
+    (usage.docs_outstanding || []).map((f) => ({ id: f.feature_id, label: f.title }))));
   root.append(panels);
 
   // session history — grouped by LOCAL day, newest first; within a day,
