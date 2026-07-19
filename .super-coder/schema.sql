@@ -79,7 +79,7 @@ END;
 -- operator picks the harness at launch and gets that harness's model. run.py
 -- reads these to resolve the launch model + annotate the picker; is_default marks
 -- the picker's pre-selected harness for a flavor. model is harness-specific (codex
--- bare id "gpt-5.4" / claude alias "sonnet" / opencode "provider/model"); NULL =
+-- bare id "gpt-5.6-sol" / claude alias "fable" / opencode "provider/model"); NULL =
 -- let the harness pick its own. Reshaped + reseeded in migrations/0007.
 CREATE TABLE flavor_defaults (
     flavor     TEXT    NOT NULL,

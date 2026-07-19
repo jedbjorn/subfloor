@@ -2598,20 +2598,20 @@ INSERT INTO shell_messages (message_id, from_shell_id, to_shell_id, body, create
 DELETE FROM watched_prs;
 
 DELETE FROM flavor_defaults;
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('dev', 'codex', 'gpt-5.5', 1);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('dev', 'codex', 'gpt-5.6-sol', 1);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('dev', 'claude', 'opus', 0);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('dev', 'opencode', 'ollama-cloud/qwen3-coder-next', 0);
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('cartographer', 'codex', 'gpt-5.4', 0);
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('cartographer', 'claude', 'sonnet', 1);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('cartographer', 'codex', 'gpt-5.6-terra', 1);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('cartographer', 'claude', 'sonnet', 0);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('cartographer', 'opencode', 'ollama-cloud/glm-5.2', 0);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('planner', 'codex', 'gpt-5.5', 0);
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('planner', 'claude', 'opus', 1);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('planner', 'claude', 'fable', 1);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('planner', 'opencode', 'ollama-cloud/deepseek-v4-pro', 0);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('reviewer', 'codex', 'gpt-5.5', 0);
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('reviewer', 'claude', 'opus', 1);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('reviewer', 'claude', 'fable', 1);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('reviewer', 'opencode', 'ollama-cloud/glm-5.2', 0);
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('admin', 'codex', 'gpt-5.5', 1);
-INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('admin', 'claude', 'sonnet', 0);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('admin', 'codex', 'gpt-5.5', 0);
+INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('admin', 'claude', 'opus', 1);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('admin', 'opencode', 'ollama-cloud/deepseek-v4-pro', 0);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('devops', 'codex', 'gpt-5.5', 1);
 INSERT INTO flavor_defaults (flavor, harness, model, is_default) VALUES ('devops', 'claude', 'sonnet', 0);
