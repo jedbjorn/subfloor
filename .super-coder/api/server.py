@@ -456,7 +456,7 @@ def _card_status(statuses: str, archive_id) -> str:
 
 
 def get_analytics_sessions(con, q) -> dict:
-    days = max(1, min(int(q.get("days", ["7"])[0]), 90))
+    days = max(1, min(int(q.get("days", ["7"])[0]), 183))  # up to the UI's 6-month range chip
     before = (q.get("before", [""])[0] or "").strip() or None
     upper = before or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     lower = (datetime.fromisoformat(upper.replace("Z", "+00:00"))

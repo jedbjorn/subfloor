@@ -1682,10 +1682,17 @@ async function renderWorktrees(root, opts = {}) {
 // day-grouping and displayed times are LOCAL — translated here at render,
 // never on the server. The tab load runs an incremental sweep first so the
 // view reflects harness data as of now.
-let anFilters = { harness: "", provider: "", model: "" };
+let anFilters = { harness: "", model: "" };  // provider intentionally absent — harness + model identify the slice
 let anSessions = [];      // accumulated cards across "More" pages
 let anNextBefore = null;  // cursor for the next page (null = no older rows)
 let anDaysLoaded = 0;     // window size loaded so far (7 per page)
+let anClass = "input_tokens";  // the stat card selected for the graph
+
+const AN_CLASSES = [
+  ["input_tokens", "Input"], ["output_tokens", "Output"],
+  ["cache_read_tokens", "Cache read"], ["cache_write_tokens", "Cache write"],
+  ["reasoning_tokens", "Reasoning"],
+];
 
 const fmtTok = (n) => n == null ? "—"
   : n >= 1e9 ? (n / 1e9).toFixed(1) + "B"
@@ -1705,11 +1712,161 @@ function anQuery(extra = {}) {
   return s ? "?" + s : "";
 }
 
-async function anLoadPage() {
-  const d = await api("/analytics/sessions" + anQuery(anNextBefore ? { before: anNextBefore, days: 7 } : { days: 7 }));
+const AN_RANGES = [["1W", 7], ["1M", 30], ["3M", 90], ["6M", 180]];
+let anRange = 7;          // the active time chip, in days
+
+async function anLoadPage(days) {
+  const d = await api("/analytics/sessions" + anQuery({
+    ...(anNextBefore ? { before: anNextBefore } : {}), days }));
   anSessions.push(...d.sessions);
   anNextBefore = d.next_before;
-  anDaysLoaded += 7;
+  anDaysLoaded += days;
+}
+
+// ── chart: local-day buckets + a monotone-cubic spline ──
+// Buckets come from the loaded session cards (not a second endpoint), so the
+// stat cards, the graph, and the list below always agree — same window, same
+// filters, same local-day boundaries. Empty days are measured zero, not gaps.
+function anBuckets(cls) {
+  const days = Math.max(anDaysLoaded, 7);
+  const keyOf = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  const buckets = [];
+  const byKey = {};
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 864e5);
+    const b = { key: keyOf(d), date: d, value: 0 };
+    buckets.push(b);
+    byKey[b.key] = b;
+  }
+  for (const c of anSessions) {
+    if (!c.started_at) continue;
+    const b = byKey[keyOf(new Date(c.started_at))];
+    if (b) b.value += c[cls] || 0;
+  }
+  return buckets;
+}
+
+// Monotone cubic interpolation (Fritsch–Carlson, d3 curveMonotoneX shape):
+// smooth through every point with no overshoot — a spend series never dips
+// below what was measured just to look curvy.
+function monotonePath(pts) {
+  if (pts.length < 2) return "";
+  const n = pts.length;
+  const dx = [], dy = [], m = [];
+  for (let i = 0; i < n - 1; i++) {
+    dx.push(pts[i + 1][0] - pts[i][0]);
+    dy.push(pts[i + 1][1] - pts[i][1]);
+    m.push(dy[i] / (dx[i] || 1));
+  }
+  const t = [m[0]];
+  for (let i = 1; i < n - 1; i++)
+    t.push(m[i - 1] * m[i] <= 0 ? 0
+      : 3 * (dx[i - 1] + dx[i]) / ((2 * dx[i] + dx[i - 1]) / m[i - 1] + (dx[i] + 2 * dx[i - 1]) / m[i]));
+  t.push(m[n - 2]);
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = dx[i] / 3;
+    d += `C${pts[i][0] + h},${pts[i][1] + h * t[i]} ` +
+         `${pts[i + 1][0] - h},${pts[i + 1][1] - h * t[i + 1]} ` +
+         `${pts[i + 1][0]},${pts[i + 1][1]}`;
+  }
+  return d;
+}
+
+const niceMax = (v) => {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const s of [1, 2, 5, 10]) if (v <= s * p) return s * p;
+  return 10 * p;
+};
+
+function anChartLabel() {
+  const cls = AN_CLASSES.find(([k]) => k === anClass)[1];
+  const scope = [anFilters.harness || "all harnesses", anFilters.model].filter(Boolean).join(" · ");
+  return `${cls} tokens — last ${Math.max(anDaysLoaded, 7)} days — ${scope}`;
+}
+
+const SVG = "http://www.w3.org/2000/svg";
+const svgEl = (t, attrs = {}) => {
+  const n = document.createElementNS(SVG, t);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  return n;
+};
+
+function anChart(cls) {
+  const buckets = anBuckets(cls);
+  const W = 860, H = 180, L = 48, R = 14, T = 10, B = 22;
+  const iw = W - L - R, ih = H - T - B;
+  const ymax = niceMax(Math.max(...buckets.map((b) => b.value)));
+  const x = (i) => L + (buckets.length === 1 ? iw / 2 : (i / (buckets.length - 1)) * iw);
+  const y = (v) => T + ih - (v / ymax) * ih;
+  const pts = buckets.map((b, i) => [x(i), y(b.value)]);
+
+  const wrap = el("div", { className: "an-chart-wrap", tabIndex: 0 });
+  wrap.append(el("div", { className: "an-chart-title" }, anChartLabel()));
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "an-chart" });
+
+  // recessive hairline grid + clean y ticks (0 / mid / max)
+  for (const v of [0, ymax / 2, ymax]) {
+    svg.append(svgEl("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: "an-grid" }));
+    const tick = svgEl("text", { x: L - 6, y: y(v) + 3, class: "an-tick", "text-anchor": "end" });
+    tick.textContent = fmtTok(v);
+    svg.append(tick);
+  }
+  // x labels: first, middle, last day (local)
+  const xLabel = (i, anchor) => {
+    const t2 = svgEl("text", { x: x(i), y: H - 6, class: "an-tick", "text-anchor": anchor });
+    t2.textContent = buckets[i].date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return t2;
+  };
+  svg.append(xLabel(0, "start"), xLabel(Math.floor(buckets.length / 2), "middle"),
+             xLabel(buckets.length - 1, "end"));
+
+  const line = monotonePath(pts);
+  svg.append(svgEl("path", { d: `${line}L${x(buckets.length - 1)},${y(0)}L${x(0)},${y(0)}Z`, class: "an-area" }));
+  svg.append(svgEl("path", { d: line, class: "an-line" }));
+
+  // crosshair + tooltip: aim at a day, never at the 2px line; arrows work too
+  const cross = svgEl("line", { y1: T, y2: T + ih, class: "an-cross", visibility: "hidden" });
+  const dot = svgEl("circle", { r: 4, class: "an-dot", visibility: "hidden" });
+  svg.append(cross, dot);
+  const tip = el("div", { className: "an-tip", hidden: true });
+  wrap.append(svg, tip);
+
+  let cur = -1;
+  const show = (i) => {
+    cur = i;
+    const [px, py] = pts[i];
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px);
+    cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", px); dot.setAttribute("cy", py);
+    dot.setAttribute("visibility", "visible");
+    tip.replaceChildren(
+      el("b", {}, (buckets[i].value || 0).toLocaleString()),
+      " ", el("span", { className: "muted" },
+        buckets[i].date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })));
+    tip.hidden = false;
+    const frac = (px - L) / iw;
+    tip.style.left = `calc(${(px / W) * 100}% - ${Math.round(frac * tip.offsetWidth)}px)`;
+    tip.style.top = `${Math.max(0, (py / H) * 100 - 18)}%`;
+  };
+  const hide = () => { cur = -1; cross.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden"); tip.hidden = true; };
+  svg.addEventListener("pointermove", (e) => {
+    const r = svg.getBoundingClientRect();
+    const px = ((e.clientX - r.left) / r.width) * W;
+    let best = 0;
+    for (let i = 1; i < pts.length; i++) if (Math.abs(pts[i][0] - px) < Math.abs(pts[best][0] - px)) best = i;
+    show(best);
+  });
+  svg.addEventListener("pointerleave", hide);
+  wrap.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowRight") { show(Math.min(cur + 1, pts.length - 1)); e.preventDefault(); }
+    else if (e.key === "ArrowLeft") { show(Math.max(cur - 1, 0)); e.preventDefault(); }
+    else if (e.key === "Escape") hide();
+  });
+  wrap.addEventListener("blur", hide);
+  return wrap;
 }
 
 function anSelect(label, key, values, onChange) {
@@ -1758,42 +1915,64 @@ function anSessionCard(c, sprintTitles) {
 async function renderAnalytics(root) {
   root.replaceChildren(el("div", { className: "muted" }, "sweeping harness data…"));
   try { await api("/analytics/sweep", "POST"); } catch { /* sweep is best-effort; show what's stored */ }
-  const winFrom = new Date(Date.now() - Math.max(anDaysLoaded, 7) * 864e5).toISOString().slice(0, 19) + "Z";
-  let filters, tokens, usage;
+  let filters, usage;
   try {
-    [filters, tokens, usage] = await Promise.all([
-      api("/analytics/filters"),
-      api("/analytics/tokens" + anQuery({ from: winFrom })),
-      api("/analytics/usage")]);
-    if (!anSessions.length && anNextBefore === null && !anDaysLoaded) await anLoadPage();
+    [filters, usage] = await Promise.all([
+      api("/analytics/filters"), api("/analytics/usage")]);
+    if (!anSessions.length && !anDaysLoaded) await anLoadPage(anRange);
   } catch (e) {
     root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
     return;
   }
   root.replaceChildren();
 
-  // filter row — applies to the summary, usage panels, and the list
+  // filter row — harness + model scope everything below (provider is
+  // deliberately absent: harness + model already identify the slice); the
+  // segmented time chips sit right and set the whole window
   const reset = (k) => (v) => {
     anFilters[k] = v;
     anSessions = []; anNextBefore = null; anDaysLoaded = 0;
     renderAnalytics(root);
   };
+  const rangeSeg = el("div", { className: "filters seg an-range" });
+  for (const [label, days] of AN_RANGES) {
+    const chip = el("button", { className: "chip" + (anRange === days && anDaysLoaded <= days ? " on" : ""),
+      type: "button", textContent: label });
+    chip.onclick = () => {
+      anRange = days;
+      anSessions = []; anNextBefore = null; anDaysLoaded = 0;
+      renderAnalytics(root);
+    };
+    rangeSeg.append(chip);
+  }
   root.append(el("div", { className: "an-filters" },
     anSelect("Harness", "harness", filters.harnesses, reset("harness")),
-    anSelect("Provider", "provider", filters.providers, reset("provider")),
-    anSelect("Model", "model", filters.models, reset("model"))));
+    anSelect("Model", "model", filters.models, reset("model")),
+    rangeSeg));
 
-  // summary strip — totals for the loaded window
-  const t = tokens.totals || {};
-  const strip = el("div", { className: "card an-summary" });
-  strip.append(microlabel(`Tokens — last ${Math.max(anDaysLoaded, 7)} days` +
-    (anFilters.harness || anFilters.provider || anFilters.model ? " (filtered)" : "")));
-  strip.append(statRow([
-    ["input", fmtTok(t.input)], ["output", fmtTok(t.output)],
-    ["cache read", fmtTok(t.cache_read)], ["cache write", fmtTok(t.cache_write)],
-    ...(t.reasoning != null ? [["reasoning", fmtTok(t.reasoning)]] : []),
-  ]));
-  root.append(strip);
+  // stat cards + the graph under them: click a card to graph that class over
+  // the selected window. Totals and buckets both come from the loaded session
+  // cards, so cards, graph, and the list below always agree.
+  const totals = {};
+  for (const [k] of AN_CLASSES)
+    totals[k] = anSessions.reduce((t, c) => c[k] == null ? t : (t ?? 0) + c[k], null);
+  const graphBox = el("div", {});
+  const cardRow = el("div", { className: "an-cards" });
+  const drawCards = () => {
+    cardRow.replaceChildren();
+    for (const [k, label] of AN_CLASSES) {
+      if (k === "reasoning_tokens" && totals[k] == null) continue;  // not exposed in this slice
+      const c = el("button", { className: "an-card" + (anClass === k ? " on" : ""), type: "button" });
+      c.append(el("span", { className: "an-card-label" }, label),
+               el("span", { className: "an-card-value" }, fmtTok(totals[k] ?? 0)));
+      c.onclick = () => { anClass = k; drawCards(); graphBox.replaceChildren(anChart(anClass)); };
+      cardRow.append(c);
+    }
+  };
+  if (anClass === "reasoning_tokens" && totals.reasoning_tokens == null) anClass = "input_tokens";
+  drawCards();
+  graphBox.append(anChart(anClass));
+  root.append(el("div", { className: "card an-summary" }, cardRow, graphBox));
 
   // usage panels — favorite model per flavor, recent sprints, recent features
   const sprintTitles = {};
@@ -1867,7 +2046,7 @@ async function renderAnalytics(root) {
     const more = el("button", { className: "act", type: "button", textContent: "More ↓ (7 more days)" });
     more.onclick = async () => {
       more.disabled = true;
-      try { await anLoadPage(); renderAnalytics(root); }
+      try { await anLoadPage(7); renderAnalytics(root); }
       catch (e) { toast("error: " + e.message); more.disabled = false; }
     };
     list.append(el("div", { className: "an-more" }, more));

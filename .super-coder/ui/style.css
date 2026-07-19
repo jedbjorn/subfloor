@@ -656,3 +656,31 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-sprint { border-left: 2px solid var(--accent); padding-left: .6rem; margin: .4rem 0; }
 .an-sprint-head { display: flex; gap: .5rem; align-items: center; font-size: .85rem; padding: .2rem 0; }
 .an-more { text-align: center; margin: .8rem 0; }
+
+/* ── Analytics: stat cards + spline graph + range chips ── */
+.an-range { margin-left: auto; align-self: center; }
+.an-range .chip { border-radius: 0; }
+.an-range .chip:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
+.an-range .chip:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
+.an-cards { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: .5rem; }
+.an-card { flex: 1 1 120px; background: var(--accent2); border: 1px solid var(--line);
+  border-radius: 8px; padding: .5rem .7rem; display: flex; flex-direction: column;
+  gap: .15rem; cursor: pointer; text-align: left; color: var(--dim); transition: border-color .12s; }
+.an-card:hover { border-color: var(--accent); }
+.an-card.on { border-color: var(--accent); color: var(--ink);
+  box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
+.an-card-label { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
+.an-card-value { font-size: 1.25rem; font-weight: 600; color: var(--ink); }
+.an-chart-wrap { position: relative; outline: none; }
+.an-chart-title { font-size: .8rem; color: var(--dim); margin: .35rem 0 .25rem; }
+.an-chart { width: 100%; height: auto; display: block; }
+.an-grid { stroke: var(--line-soft); stroke-width: 1; }
+.an-tick { fill: var(--dim); font-size: 10px; }
+.an-line { fill: none; stroke: var(--accent); stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round; }
+.an-area { fill: var(--accent); opacity: .1; }
+.an-cross { stroke: var(--dim); stroke-width: 1; }
+.an-dot { fill: var(--accent); stroke: var(--bg); stroke-width: 2; }
+.an-tip { position: absolute; background: var(--menu-bg); border: 1px solid var(--menu-border);
+  border-radius: 6px; padding: .25rem .5rem; font-size: .78rem;
+  pointer-events: none; white-space: nowrap; box-shadow: var(--menu-shadow); }
