@@ -53,7 +53,7 @@ HARNESS_PROVIDER = {
 # format flavor_defaults already stores for that harness.
 PREFIXED_HARNESSES = {"opencode"}
 
-CLAUDE_ALIASES = ["opus", "sonnet", "haiku"]
+CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 
 # Bump when the response/cache shape changes — a cached payload from another
 # version is ignored (treated as no cache) instead of being served to a
@@ -74,8 +74,8 @@ PROVIDER_APIS = {
 # The ids the engine ships in flavor_defaults — surfaced only when every live
 # source fails AND no cache exists, so the datalist is never empty.
 STATIC_FLOOR = {
-    "claude": ["opus", "sonnet", "haiku"],
-    "codex": ["gpt-5.5", "gpt-5.4-mini"],
+    "claude": ["fable", "opus", "sonnet", "haiku"],
+    "codex": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5"],
     "vibe": ["devstral-latest", "codestral-latest"],
     "opencode": ["ollama-cloud/deepseek-v4-pro", "ollama-cloud/glm-5.1",
                  "ollama-cloud/qwen3-coder-next", "ollama-cloud/gpt-oss:20b"],
@@ -223,8 +223,8 @@ def _fresh(cached: dict) -> bool:
         return False
 
 
-_FLOOR_FAMILY = {"opus": "claude-opus", "sonnet": "claude-sonnet",
-                 "haiku": "claude-haiku"}
+_FLOOR_FAMILY = {"fable": "claude-fable", "opus": "claude-opus",
+                 "sonnet": "claude-sonnet", "haiku": "claude-haiku"}
 
 
 def _floor() -> dict[str, dict]:

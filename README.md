@@ -380,8 +380,9 @@ then `./sc enter`.
 > **OpenCode is the exception.** Its `opencode auth login` for **API-key** providers is a paste-the-key prompt, not an OAuth callback, so it works at **either level** — host or inside the container (`./sc enter`). Because `~/.config/opencode` + `~/.local/share/opencode` are bind-mounted read-write, a key entered on either side lands in the same `auth.json`. (OAuth-based OpenCode providers still follow the host rule above.)
 
 A note on Codex models: driven by a **ChatGPT account** (not an API key), Codex
-exposes `gpt-5.5` and `gpt-5.4-mini` — the flavor defaults are set to those.
-Plain API-only ids (e.g. `gpt-5.4`) return a 400 on a ChatGPT account.
+exposes the `gpt-5.6` line (`gpt-5.6-sol`, `gpt-5.6-terra`) and `gpt-5.5` — the
+flavor defaults are set from those. Plain API-only ids return a 400 on a
+ChatGPT account.
 
 ## Harnesses & models
 
@@ -418,27 +419,27 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 
 | Flavor | Job | Codex | Claude | OpenCode (open-weights) |
 |---|---|---|---|---|
-| **planner** | architecture, plans | `gpt-5.5` | `sonnet` ★ | `deepseek-v4-pro` |
-| **reviewer** | adversarial review | `gpt-5.5` | `opus` ★ | `glm-5.2` |
-| **dev** | write the code | `gpt-5.4-mini` ★ | `sonnet` | `qwen3-coder-next` |
-| **cartographer** | map the repo | `gpt-5.4-mini` ★ | `haiku` | `qwen3-coder-next` |
-| **admin** | own the substrate, maintain `main` | `gpt-5.5` ★ | `sonnet` | `deepseek-v4-pro` |
+| **planner** | architecture, plans | `gpt-5.5` | `fable` ★ | `deepseek-v4-pro` |
+| **reviewer** | adversarial review | `gpt-5.5` | `fable` ★ | `glm-5.2` |
+| **dev** | write the code | `gpt-5.6-sol` ★ | `opus` | `qwen3-coder-next` |
+| **cartographer** | map the repo | `gpt-5.6-terra` ★ | `sonnet` | `glm-5.2` |
+| **admin** | own the substrate, maintain `main` | `gpt-5.5` | `opus` ★ | `deepseek-v4-pro` |
 
 ★ = the harness the picker pre-selects for that flavor.
 
-The logic, four rules:
+The logic — defaults are set from **sprint success telemetry** (which
+model/flavor pairings actually land reviewed, merged work across the fleet),
+re-fit as the telemetry moves, plus three standing rules:
 
-- **Bookends premium, middle fast.** Planner and reviewer are *low-volume,
-  high-leverage reasoning* — one good plan or one sharp review pays for the
-  premium model. Dev and cartographer are *high-volume mechanical work* (bulk
-  code, file mapping), where a fast, cheap, coding-tuned model wins on
-  cost-per-token because the volume is highest.
-- **Bookends default to Claude.** Planner (`sonnet`) and reviewer (`opus`) are the
-  two roles whose picker default is Claude, not Codex — these are the reasoning
-  bookends, and Claude is preferred for planning and adversarial review. The
-  reviewer in particular runs a *different lineage than the code it reviews*, so it
-  isn't blind to the same mistakes a GPT model made authoring it — adversarial
-  *diversity*, not a second opinion from the same brain.
+- **Bookends premium.** Planner and reviewer are *low-volume, high-leverage
+  reasoning* — one good plan or one sharp review pays for the premium model
+  (`fable` on both). Dev and cartographer are the volume roles; telemetry
+  currently favors the `gpt-5.6` line there (`sol` writing code, `terra`
+  mapping), which also keeps the bulk volume on the flat-billed ChatGPT plan.
+- **Reviewer runs a different lineage than the code it reviews**, so it isn't
+  blind to the same mistakes the authoring model made — adversarial
+  *diversity*, not a second opinion from the same brain. With devs on GPT and
+  review on Claude, the current fit preserves this.
 - **Three lineages, always.** Every flavor offers Codex (OpenAI), Claude
   (Anthropic), and OpenCode (open-weights via Ollama Cloud) — pick any provider for
   any role at launch. The OpenCode column is constrained to **MIT- or
@@ -447,7 +448,7 @@ The logic, four rules:
   available on the provider.
 - **Admin decisions carry real risk** (a wrong rollback is data loss), so the
   one shell that maintains `main` (see *How shells share one repo*, next)
-  defaults premium on Codex.
+  defaults premium — currently `opus` on Claude.
 
 > [!class2]
 > **Vibe and Kimi Code sit outside this matrix.** Neither takes a model from the launch seam. Vibe selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`, and takes no headless boot. Kimi Code selects via `default_model` in `~/.kimi-code/config.toml` (its `-m` wants a user-local alias, not a portable model id) — it *does* boot headless (`kimi -p`), on that configured default (`./sc run` covers claude · codex · opencode · kimi).

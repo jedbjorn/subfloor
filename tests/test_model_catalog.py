@@ -84,8 +84,8 @@ class BuildTest(NoCLI):
         self.assertEqual([f["family"] for f in fams], ["fable", "opus"],
                          "families sort by newest release")
         by = {f["family"]: f for f in fams}
-        self.assertEqual(by["fable"]["latest"], "claude-fable-5",
-                         "no alias → newest concrete id")
+        self.assertEqual(by["fable"]["latest"], "fable",
+                         "aliased family → the self-tracking alias")
         self.assertEqual(by["opus"]["latest"], "opus",
                          "aliased family → the self-tracking alias")
         self.assertEqual(by["opus"]["n"], 2)
@@ -182,6 +182,8 @@ class CatalogCacheTest(NoCLI):
                       for f in got["harnesses"]["claude"]["families"]}
         self.assertEqual(floor_fams.get("opus"), "opus",
                          "floor still offers alias family chips")
+        self.assertEqual(floor_fams.get("fable"), "fable",
+                         "fable ships in the floor with its self-tracking alias")
 
 
 if __name__ == "__main__":
