@@ -266,7 +266,7 @@ INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (14, 'Sprint eventing — GitHub→inbox daemon + headless worker boot', 'shipped', 0, 1, NULL, '2026-07-12 16:58:16', '2026-07-13 05:30:04', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (15, 'Sprint reporting — unit reports, conformance pass, planner synthesis', 'next', 0, 1, 'Dev unit-report result rows at merge; pre-freeze conformance pass (review shells judge spec vs main, four-way verdicts); sprint report becomes a fixed skeleton the planner synthesizes from unit reports + conformance doc. Skill-text only — no schema, no CLI. See specs_sc/sprint-reporting.md.', '2026-07-13 20:04:22', '2026-07-13 20:04:22', 1);
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (16, 'Session-surviving job runner (sc job)', 'shipped', 0, 1, NULL, '2026-07-14 07:14:59', '2026-07-14 07:14:59', 1);
-INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (17, 'Token & session analytics', 'next', 0, 1, 'Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness''s on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history, harness/provider/model filters, sprint clusters). Tokens only, no pricing, v1.', '2026-07-19 08:17:13', '2026-07-19 08:17:13', 1);
+INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (17, 'Token & session analytics', 'next', 0, 1, 'Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness''s on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history with session titles, harness/provider/model filters, sprint clusters, usage analytics). Tokens only, no pricing, v1.', '2026-07-19 08:17:13', '2026-07-19 10:43:43', 1);
 
 DELETE FROM documents;
 INSERT INTO documents (document_id, feature_id, kind, seq, title, frozen, frozen_date, body, render_path, created_at, updated_at) VALUES (1, 1, 'spec', 1, 'super-coder — Founding Spec', 1, '2026-06-04', '---
@@ -2443,7 +2443,7 @@ title: Token & Session Analytics — Spec
 tags: [super-coder, spec, analytics, telemetry, harness]
 date: 2026-07-19
 project: super-coder
-purpose: Self-tracked token + session analytics
+purpose: Self-tracked token + session + usage analytics
 ---
 
 # Token & Session Analytics — Spec
@@ -2460,10 +2460,16 @@ surface it in the GUI.
 What ships:
 
 - **Session history** — every session with shell, harness, provider, model,
-  started, ended. Listed newest-first, grouped by day, default 7 days,
-  "More" loads 7 more. Sprint-spawned sessions cluster under their sprint.
+  started, ended, and a **session title** (native where the harness stores
+  one, first-prompt-derived otherwise). Listed newest-first, grouped by day,
+  default 7 days, "More" loads 7 more. Collapsed cards carry the basics with
+  the title truncated at 100 chars; expanded cards carry the full title and
+  per-class detail. Sprint-spawned sessions cluster under their sprint.
 - **Token analytics** — input / output / cache-read / cache-write (+
   reasoning where exposed), filterable by harness, provider, model.
+- **Usage analytics** — behavioral reads over the same data: favorite model
+  per shell flavor, recent sprints, recent features. Read-time queries only;
+  no extra capture.
 
 ```stats
 :::class1
@@ -2497,28 +2503,45 @@ carry over; the capture boundary does not.
 
 ## Recon — per harness
 
-Verified on the host, 2026-07-19. Every harness except kimi confirmed
-parseable.
+Verified on the host, 2026-07-19 — kimi against a live K3 session (QA pass,
+session 0213). All five harnesses confirmed parseable.
 
 | Harness | Source | Token fields | Fidelity |
 |---|---|---|---|
-| claude | `~/.claude/projects/<dir>/*.jsonl` — per-request `usage` | input, output, cache_creation, cache_read + model per request | Full |
-| opencode | `~/.local/share/opencode/opencode.db` — `session` table | tokens_input/output/reasoning/cache_read/cache_write, model, cost, time_created/updated | Full — plain SQL read |
-| codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` — `token_count` events | input, cached_input, output, reasoning (per-turn `last_token_usage`) | Good — no cache-write class |
-| vibe | `~/.vibe/logs/session/<id>/meta.json` | start/end time, session_prompt_tokens, session_completion_tokens, working_directory | Partial — no cache split |
-| kimi | nothing on disk here (never run on host) | unknown | Recon at build |
+| claude | `~/.claude/projects/<dir>/*.jsonl` — per-request `usage` | input, output, cache_creation, cache_read + model per request | Full — **dedupe by `message.id` required** (see notes) |
+| opencode | `~/.local/share/opencode/opencode.db` — `session` table | tokens_input/output/reasoning/cache_read/cache_write, title, model JSON, cost, time_created/updated | Full — plain SQL read |
+| codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` — `token_count` events | input (⊇ cached_input), output (⊇ reasoning) — last event''s `total_token_usage` is cumulative | Good — no cache-write class |
+| vibe | `~/.vibe/logs/session/<id>/meta.json` | `stats.session_prompt_tokens` / `session_completion_tokens`, title, model, start/end, working_directory | Partial — no cache split |
+| kimi | `~/.kimi-code/sessions/wd_*/session_*/` — `state.json` + `agents/*/wire.jsonl` `usage.record` events | inputOther, output, inputCacheRead, inputCacheCreation — 1:1 to the four classes, per-event model | Full — cleanest source |
 
 Notes:
 
-- **opencode** is the easiest: per-session totals are pre-aggregated in its
-  SQLite `session` table, including cache write and reasoning.
-- **codex** rollout events carry both `total_token_usage` and per-turn
-  `last_token_usage`; summing `last_token_usage` gives session totals. Model
-  id extraction from `session_meta` is unverified — Preparation task.
-- **vibe** `meta.json` also carries `working_directory`, `start_time`,
-  `end_time` — enough for lifecycle + input/output totals. Model field TBD.
-- **kimi**: if its CLI exposes no usage, kimi sessions still appear in
-  history (lifecycle from `run.py`) with token status `no_usage`.
+- **claude** transcripts repeat the same `usage` object on every
+  content-block line of a multi-block response (verified: 286 usage lines,
+  141 unique message ids in one transcript — naive summing overcounts ~2×).
+  Dedupe by `message.id` (or `requestId`) — **in-file and cross-file**,
+  since resume/fork can copy lines into a new session file. No native
+  title; derive from the first user message (transcript, or
+  `~/.claude/history.jsonl` sessionId→display map).
+- **opencode** is the easiest: per-session totals pre-aggregated, native
+  `title`. The `model` column is **JSON**
+  (`{"id","providerID","variant"}`) — provider comes straight from
+  `providerID`; fold `variant` into the model label when present.
+- **codex**: take the **last** `token_count` event''s `total_token_usage`
+  (cumulative) — do not sum per-turn values. Model id lives in
+  `turn_context.payload.model`; provider in
+  `session_meta.payload.model_provider`. cwd in both. No native title;
+  derive from first user message.
+- **vibe** `meta.json`: model = `config.active_model`, provider from
+  `config.models[].provider`; native `title` (+ `title_source`); lifecycle
+  from `start_time`/`end_time`; repo filter from
+  `environment.working_directory`.
+- **kimi** (`kimi-code` CLI): `state.json` carries
+  `createdAt`/`updatedAt`, `workDir` (worktree-precise), native `title`
+  (+ `isCustomTitle`), `lastPrompt`. `usage.record` events sum per
+  (session × model); `llm.request` events carry `provider`/`model`
+  natively. Sessions can run multiple agents (swarm mode) — sum across
+  `agents/*/wire.jsonl`. `harness_session_ref` = session dir.
 
 ## Data model
 
@@ -2555,9 +2578,10 @@ granularity is a later option for claude only.
 | shell_id | INTEGER NULL | denormalized for filtering |
 | harness | TEXT NOT NULL | claude/opencode/codex/vibe/kimi |
 | harness_session_ref | TEXT NOT NULL | transcript path / session id / rollout file / session dir |
-| provider | TEXT | anthropic/openai/mistral/moonshot/… |
+| provider | TEXT | anthropic/openai/mistral/kimi/… |
 | model | TEXT | |
-| started_at / ended_at | TEXT | from harness data |
+| title | TEXT NULL | harness-side session title (native or first-prompt derived); UI truncates |
+| started_at / ended_at | TEXT | from harness data (ISO UTC) |
 | input_tokens | INTEGER NULL | fresh (uncached) input |
 | output_tokens | INTEGER NULL | |
 | cache_read_tokens | INTEGER NULL | |
@@ -2568,12 +2592,20 @@ granularity is a later option for claude only.
 | captured_at | TEXT | sweep time |
 
 `UNIQUE(harness, harness_session_ref, model)` — the idempotency key; parsers
-upsert, re-sweeps never double-count.
+upsert, re-sweeps never double-count. "Unattributed" is `archive_id IS
+NULL`, **not** a fourth status value.
 
 > [!class4]
 > Token classes are normalized to dos-arch''s four (fresh input / cache read /
 > cache write / output) plus nullable reasoning. A harness that can''t fill a
 > class leaves it NULL — NULL means "not exposed", 0 means "measured zero".
+> **Per-harness subset rules** (or classes double-count): codex
+> `input_tokens` includes `cached_input_tokens` → fresh-input = input −
+> cached_input, cache_read = cached_input; codex `reasoning_output_tokens`
+> is inside `output_tokens`. kimi''s `inputOther` is already fresh input — no
+> arithmetic. opencode caveat: its columns are `NOT NULL DEFAULT 0`, so
+> "not exposed" and "measured zero" are indistinguishable at that layer —
+> trust opencode''s numbers as-is.
 
 ## Capture
 
@@ -2585,7 +2617,7 @@ graph LR
   H2[opencode.db]:::class2 --> P
   H3[codex rollout]:::class2 --> P
   H4[vibe meta.json]:::class2 --> P
-  H5[kimi TBD]:::class4 --> P
+  H5[kimi wire.jsonl]:::class2 --> P
   P --> U["upsert session_token_usage"]:::class3
   U --> A["attribute to archive_id"]:::class3
 ```
@@ -2593,24 +2625,36 @@ graph LR
 - **Collector**: `sc analytics sweep` (script + `./sc` subcommand). Scans
   each harness''s data dir, filters to sessions belonging to **this fork''s
   repo directory**, upserts rows. Runs: at `run.py` boot (pre-session,
-  cheap incremental), on demand, and from the GUI analytics tab load.
+  incremental), on demand, and from the GUI analytics tab load.
+  **Incrementality**: skip source files whose mtime ≤ the row''s last
+  `captured_at` — the first full sweep of harness history is large; every
+  later sweep touches only what changed.
+- **Repo filtering (claude)**: read the `cwd` field on the JSONL lines, not
+  the project-dir name — the dir-name dash-encoding is lossy (`/` and `-`
+  encode identically). Harness sessions launched **outside** `run.py` in a
+  fork''s repo dir are swept and shown unattributed — deliberate: it is real
+  spend on this repo.
 - **Parsers**: `scripts/token_parsers/<harness>.py`, each pinning
   `parser_version` to the format shape it expects. On shape mismatch: write
   what it can with `status=''partial''` and log loudly — never skip silently,
-  never write zeros as if measured.
+  never write zeros as if measured. Parsers also fill `title` (native field
+  or first-user-message fallback).
 - **Attribution**: match harness session → archive by (repo directory,
-  time-window overlap with `started_at`/`ended_at`). Worktree shells have
-  distinct cwds, which disambiguates parallel dev shells. Residual ambiguity
-  → row stays `archive_id=NULL` (still visible in analytics, flagged
-  unattributed).
+  time-window overlap with `started_at`/`ended_at`). An archive whose
+  `ended_at` is still NULL is treated as open-ended until that shell''s next
+  `started_at`. Worktree shells have distinct cwds, which disambiguates
+  parallel dev shells. Residual ambiguity → row stays `archive_id=NULL`
+  (still visible in analytics, flagged unattributed).
 - **Real-time path (claude only, v1)**: adapter `merge_json` injects a
   `SessionEnd` hook (same seam as branch-guard) POSTing the transcript path
-  to `POST /_sc/mem/telemetry`; server runs the claude parser inline. The
-  sweep remains the backstop for missed hooks. codex `notify` / opencode
-  plugin push are later enhancements — the sweep already covers them.
-- **Provider derivation**: parser-level default (codex→openai, vibe→mistral,
-  kimi→moonshot), model-string prefix for opencode (`anthropic/…`), model
-  catalog lookup as fallback.
+  to `POST /_sc/mem/telemetry`; server validates the ref resolves under the
+  expected harness data dir, then runs the claude parser inline. The sweep
+  remains the backstop for missed hooks. codex `notify` / opencode plugin
+  push are later enhancements — the sweep already covers them.
+- **Provider derivation**: native fields where the harness exposes them
+  (opencode `providerID`, kimi `llm.request.provider`, codex
+  `session_meta.model_provider`); parser-level default for vibe (mistral);
+  model catalog lookup as fallback.
 
 ## API
 
@@ -2619,29 +2663,40 @@ rest of `/api/*`):
 
 - `GET /api/analytics/sessions?before=<ISO>&days=7&harness=&provider=&model=&shell=`
   → `{days: [{date, sprints: [...], sessions: [...]}], next_before}` —
-  session rows carry shell, harness, provider, model, started/ended, token
-  sums, sprint_ref. Cursor-paged: "More" re-calls with `next_before`.
+  session rows carry shell, harness, provider, model, title, started/ended,
+  token sums, sprint_ref, status. Cursor-paged: "More" re-calls with
+  `next_before`.
 - `GET /api/analytics/tokens?from=&to=&group_by=day|model|provider|harness&…filters`
   → `{totals: {input, output, cache_read, cache_write, reasoning}, series}`.
+- `GET /api/analytics/usage` → `{favorite_models: [{flavor, model,
+  sessions}], recent_sprints: [...], recent_features: [...]}` — read-time
+  aggregation; flavor joins through the attributed `shell_id`, features via
+  sprint_ref → tracker doc → `feature_id`.
 - `GET /api/analytics/filters` → distinct harnesses/providers/models/shells
   present in the data (populates dropdowns).
 - `POST /_sc/mem/telemetry` (token-scoped namespace) — hook ingest:
-  `{harness, harness_session_ref}`; server parses + upserts inline.
+  `{harness, harness_session_ref}`; server validates + parses + upserts
+  inline.
 
 ## UI
 
 New **Analytics** tab in `ui/app.js` (vanilla JS, no framework — house
-style):
+style). Timestamps are stored UTC and **translated to local time at
+render** — day-grouping and displayed times are local.
 
 - **Filter row**: harness / provider / model selects (from
-  `/api/analytics/filters`), default All. Filters apply to both the summary
-  and the list.
+  `/api/analytics/filters`), default All. Filters apply to the summary,
+  the usage panels, and the list.
 - **Summary strip**: token totals for the loaded window — input, output,
   cache read, cache write.
+- **Usage panels**: favorite model per shell flavor, recent sprints,
+  recent features (from `/api/analytics/usage`).
 - **Session history**: grouped by day, newest first. 7 days initially;
-  **More** loads 7 more via cursor. Row: started–ended time, shell,
-  harness, model, provider, per-class token counts. `status` shown when not
-  `ok` (no_usage / partial / unattributed).
+  **More** loads 7 more via cursor. **Collapsed card**: started–ended
+  time, shell, harness, model, provider, title truncated at 100 chars,
+  total tokens. **Expanded card**: full title, per-class token counts,
+  sprint_ref, harness_session_ref, `status` when not `ok` (no_usage /
+  partial / unattributed).
 - **Sprint grouping**: within a day, sessions sharing a `sprint_ref` render
   clustered under a sprint header with rolled-up totals; solo sessions list
   flat.
@@ -2652,13 +2707,12 @@ style):
 No sprint entity exists in the data model today — a sprint is a workflow
 (tracker document + spec_tasks + typed messages). The linkage:
 
-- Sprint orchestration sets `SC_SPRINT_REF=<sprint slug/tracker doc id>` in
-  the env when spawning headless workers; `run.py open_session` persists it
-  to the archive row. The orchestrating parent session sets its own the same
-  way.
-- Preparation task: confirm the headless spawn path (sprint eventing,
-  worker boot) threads env through, and pick the ref format (tracker
-  document_id is the natural key).
+- Sprint orchestration sets `SC_SPRINT_REF=<tracker document_id>` in the
+  env when spawning headless workers; `run.py open_session` persists it to
+  the archive row. The orchestrating parent session sets its own the same
+  way. **Env threading is verified** (QA pass): `job.py` spawns inherit the
+  caller''s environment and `run.py` builds the exec env from
+  `{**os.environ}` — no new plumbing needed.
 
 > [!class2]
 > Deliberately thin: no sprints table, no FK — a nullable tag on the session
@@ -2674,7 +2728,7 @@ Out of scope for v1:
   ground truth being bought here.
 - **Per-request rows** — claude could support them; v1 stays per
   session × model.
-- **Push capture for codex/opencode** — sweep covers them; `notify` /
+- **Push capture for codex/opencode/kimi** — sweep covers them; `notify` /
   plugin seams are enhancements.
 - **Retention/rollup** — row volume is tiny (sessions × models, not
   requests).
@@ -2684,17 +2738,17 @@ Risks, with stance:
 | Risk | Stance |
 |---|---|
 | Harness format drift (all parsers) | Accepted (plugin stance): parser_version pin, `partial` status, loud log, fix forward |
-| kimi data shape unknown | Build-phase recon; lifecycle-only fallback keeps history complete |
-| codex model id extraction unverified | Preparation task before build |
-| Attribution ambiguity (same repo, overlapping sessions) | claude hook gives exact refs; worktrees give distinct cwds; residue stays unattributed, never guessed |
+| claude usage duplication (multi-block lines, resume/fork file copies) | Dedupe by `message.id` in-file and cross-file — verified hazard, ~2× overcount if skipped |
+| Attribution ambiguity (same repo, overlapping sessions) | claude hook gives exact refs; worktrees give distinct cwds; NULL `ended_at` = open-ended until next session; residue stays unattributed, never guessed |
 | Old sessions predate lifecycle columns | Sweep still ingests harness-side history — token rows exist unattributed; archives stay NULL |
 
 ## Build plan
 
-Three-session cadence (FnB, 2026-07-19): **spec** (this doc, session 0213) →
-**QA** (next session — adversarial pass on this spec, resolve Preparation
-unknowns that don''t need code) → **build** (third session, task-tracked via
-the spec skill).
+Cadence (FnB, 2026-07-19): **spec + QA** landed together in session 0213 —
+the QA pass (adversarial review + live recon on all five harnesses,
+including kimi against a running K3 session) resolved every Preparation
+unknown except the migration number (build-time trivial). **Build** is the
+next session, task-tracked via the spec skill.
 
 ```linear
 Spec authored :::class3 -> QA pass :::class1 -> Build :::class2 -> Verify on real sessions :::class4
@@ -2702,20 +2756,24 @@ Spec authored :::class3 -> QA pass :::class1 -> Build :::class2 -> Verify on rea
 
 Task shape for the build session:
 
-1. Preparation — kimi recon, codex model field, vibe model field, sprint
-   spawn env path, migration number.
-2. Migration — archive lifecycle columns + `session_token_usage`.
-3. `run.py` — persist started_at/harness/provider/model/sprint_ref at
+1. Migration — archive lifecycle columns + `session_token_usage`
+   (incl. `title`); next free migration number.
+2. `run.py` — persist started_at/harness/provider/model/sprint_ref at
    `open_session`.
-4. Collector + claude parser (transcript JSONL).
-5. opencode + codex parsers.
-6. vibe + kimi parsers (kimi per recon; lifecycle-only fallback).
-7. `/api/analytics/*` routes + `/_sc/mem/telemetry` ingest.
-8. claude `SessionEnd` hook via adapter `merge_json`.
-9. UI Analytics tab (filters, summary, 7-day list + More, sprint clusters).
-10. Verification — real sessions on ≥3 harnesses, re-sweep idempotency,
-    render + snapshot + render-check.
-', 'specs_sc/token-session-analytics.md', '2026-07-19 08:17:18', '2026-07-19 08:17:18');
+3. Collector + claude parser (transcript JSONL; message-id dedup, cwd
+   filter, title from first prompt).
+4. opencode + codex parsers (JSON model column; last cumulative total +
+   subset normalization).
+5. vibe + kimi parsers (meta.json; wire.jsonl usage.record, multi-agent
+   sum).
+6. `/api/analytics/*` routes (sessions, tokens, usage, filters) +
+   `/_sc/mem/telemetry` ingest with ref validation.
+7. claude `SessionEnd` hook via adapter `merge_json`.
+8. UI Analytics tab (filters, summary, usage panels, 7-day list + More,
+   collapsed/expanded cards, sprint clusters; UTC→local at render).
+9. Verification — real sessions on ≥3 harnesses, re-sweep idempotency,
+   render + snapshot + render-check.
+', 'specs_sc/token-session-analytics.md', '2026-07-19 08:17:18', '2026-07-19 10:43:43');
 
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
