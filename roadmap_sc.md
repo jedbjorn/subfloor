@@ -74,6 +74,11 @@ Dev unit-report result rows at merge; pre-freeze conformance pass (review shells
 
 _No open flags._
 
+### Token & session analytics · owner: `cc`
+Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness's on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history, harness/provider/model filters, sprint clusters). Tokens only, no pricing, v1.
+
+_No open flags._
+
 ### B6 — Commit→PR automation · owner: `cc`
 edit→snapshot→render→commit→PR; per-shell-branch concurrency. The snapshot button is the manual precursor.
 
