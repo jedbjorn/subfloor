@@ -112,6 +112,15 @@ def sh(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True)
 
 
+# Repo basenames that identify the SOURCE repo (canonical set — update.py and
+# map_repo.py key off this too). Both names stay valid through the
+# super-coder → subfloor rename: GitHub redirects the old URL, so either can
+# appear in a checkout's origin. Getting this wrong is not cosmetic — a source
+# repo misread as a fork gets its tracked engine `git rm --cached`-ed by the
+# B7 untrack migration (this fired on the dogfood repo the day of the rename).
+SOURCE_REPO_NAMES = ("super-coder", "subfloor")
+
+
 def origin_basename() -> str | None:
     p = sh("git", "-C", str(REPO_ROOT), "remote", "get-url", "origin")
     if p.returncode != 0:
@@ -120,9 +129,10 @@ def origin_basename() -> str | None:
 
 
 def is_source_repo() -> bool:
-    """The super-coder source repo's origin is …/super-coder. A fork's origin is
-    its own repo (super-coder is a separate, differently-named remote)."""
-    return origin_basename() == "super-coder"
+    """The source repo's origin is …/super-coder or …/subfloor. A fork's origin
+    is its own repo (the engine upstream is a separate, differently-named
+    remote)."""
+    return origin_basename() in SOURCE_REPO_NAMES
 
 
 def already_installed() -> bool:
@@ -452,16 +462,18 @@ def ensure_gitignore(repo_root: Path = REPO_ROOT) -> bool:
 
 
 def sc_remote() -> str | None:
-    """The remote pointing at super-coder (the bootstrap checkout added it)."""
+    """The remote pointing at the engine upstream (the bootstrap checkout
+    added it) — matched by either name across the super-coder → subfloor
+    rename."""
     named = None
     for line in sh("git", "-C", str(REPO_ROOT), "remote", "-v").stdout.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
         name, url = parts[0], parts[1]
-        if "super-coder" in url:
+        if any(n in url for n in SOURCE_REPO_NAMES):
             return name
-        if name == "super-coder":
+        if name in SOURCE_REPO_NAMES:
             named = name
     return named
 
