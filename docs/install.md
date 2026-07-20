@@ -39,7 +39,7 @@ boot a shell:
 cd your-repo                                                  # an existing git repo
 
 # 1. Pull in the engine + entry script (files only, no history merge):
-git remote add super-coder https://github.com/jedbjorn/super-coder.git
+git remote add super-coder https://github.com/jedbjorn/subfloor.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 

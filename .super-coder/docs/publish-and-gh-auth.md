@@ -8,7 +8,7 @@ purpose: How the Review GUI's snapshot/publish work, how they authenticate to Gi
 
 # Publish, GitHub auth & the webapp event log
 
-[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/main/.super-coder/docs/publish-and-gh-auth.md)
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/.super-coder/docs/publish-and-gh-auth.md)
 
 ## What snapshot & publish do
 

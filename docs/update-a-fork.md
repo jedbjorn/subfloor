@@ -42,7 +42,7 @@ new floor.
   engine branch. `--ref <tag|sha>` pins the materialize to a specific upstream
   version instead of the branch head — hold a fork at a known-good engine and
   move deliberately.
-- Missing remote? `git remote add super-coder https://github.com/jedbjorn/super-coder.git`
+- Missing remote? `git remote add super-coder https://github.com/jedbjorn/subfloor.git`
 
 > [!class4]
 > **Local engine edits block the update — never silently overwritten.** The

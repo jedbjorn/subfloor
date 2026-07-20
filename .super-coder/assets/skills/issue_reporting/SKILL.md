@@ -58,10 +58,10 @@ The issue is public: NEVER paste api keys, tokens, secrets, or private paths.
 
 ```bash
 # 1. dedup — someone may have hit it first
-gh issue list --repo jedbjorn/super-coder --search "<symptom keywords>" --state all
+gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
 
 # 2. file — title: [<fork>] <area>: <one-line symptom>
-gh issue create --repo jedbjorn/super-coder \
+gh issue create --repo jedbjorn/subfloor \
   --title "[<fork>] <area>: <symptom>" \
   --body "$(cat <<'EOF'
 - engine ref: <sha from .sc-state/engine.ref>
@@ -75,7 +75,7 @@ EOF
 )"
 ```
 
-`jedbjorn/super-coder` = engine upstream; confirm: `git remote get-url super-coder`.
+`jedbjorn/subfloor` = engine upstream; confirm: `git remote get-url super-coder`.
 
 Dedup hit -> comment your engine ref + repro on the existing issue; do NOT
 file a duplicate.
