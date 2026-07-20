@@ -86,8 +86,8 @@ class ClaudeParserTest(unittest.TestCase):
     def tearDown(self):
         p_claude.DATA_DIR = self._orig
 
-    def sweep(self, since=lambda ref: None):
-        return p_claude.sweep(self.repo, since, lambda m: None)
+    def sweep(self, since=lambda ref: None, cache=None):
+        return p_claude.sweep(self.repo, since, lambda m: None, cache=cache)
 
     def test_in_file_dedupe_and_title(self):
         # the same message.id on 3 content-block lines counts ONCE
@@ -148,6 +148,73 @@ class ClaudeParserTest(unittest.TestCase):
         self.assertEqual(r["input_tokens"], 200)     # m1 + m2, m1 counted once
         self.assertEqual(r["title"], "build the feature")  # never the subagent prompt
 
+    # ── parse cache (CC-145): grown files parse only their tail delta,
+    #    unchanged files replay from cache without touching disk ──
+
+    def test_cache_tail_append_never_rereads_head(self):
+        cwd = str(self.repo)
+        f = self.proj / "a.jsonl"
+        f.write_text(usage_line("m1", cwd=cwd) + "\n")
+        cache = {}
+        self.assertEqual(self.sweep(cache=cache)[0]["input_tokens"], 100)
+        # corrupt the head IN PLACE (same length): a full re-parse would lose
+        # m1 and flag the garbage as a bad line — a tail parse sees neither
+        size = f.stat().st_size
+        with open(f, "r+b") as fh:
+            fh.write(b"X" * (size - 1))
+        with open(f, "ab") as fh:
+            fh.write(usage_line("m2", cwd=cwd).encode() + b"\n")
+        r = self.sweep(cache=cache)[0]
+        self.assertEqual(r["input_tokens"], 200)   # m1 (cached) + m2 (tail)
+        self.assertEqual(r["status"], "ok")        # head garbage never read
+
+    def test_cache_unchanged_file_replays_without_read(self):
+        cwd = str(self.repo)
+        f = self.proj / "a.jsonl"
+        f.write_text(usage_line("m1", cwd=cwd) + "\n")
+        cache = {}
+        self.sweep(cache=cache)
+        st = f.stat()
+        f.write_bytes(b"#" * st.st_size)                 # junk, same size…
+        os.utime(f, (st.st_atime, st.st_mtime))          # …same mtime
+        r = self.sweep(cache=cache)[0]                   # dir re-aggregates (since=None)
+        self.assertEqual(r["input_tokens"], 100)         # state came from cache
+        self.assertEqual(r["status"], "ok")
+
+    def test_cache_shrunk_file_reparses_in_full(self):
+        cwd = str(self.repo)
+        f = self.proj / "a.jsonl"
+        f.write_text(usage_line("m1", cwd=cwd) + "\n" + usage_line("m2", cwd=cwd) + "\n")
+        cache = {}
+        self.assertEqual(self.sweep(cache=cache)[0]["input_tokens"], 200)
+        f.write_text(usage_line("m3", cwd=cwd, inp=70) + "\n")   # rewrite, smaller
+        self.assertEqual(self.sweep(cache=cache)[0]["input_tokens"], 70)
+
+    def test_cache_partial_tail_left_for_next_sweep(self):
+        cwd = str(self.repo)
+        f = self.proj / "a.jsonl"
+        m2 = usage_line("m2", cwd=cwd, inp=50)
+        f.write_text(usage_line("m1", cwd=cwd) + "\n" + m2[:20])  # live mid-append
+        cache = {}
+        r = self.sweep(cache=cache)[0]
+        self.assertEqual(r["input_tokens"], 100)   # partial tail not counted…
+        self.assertEqual(r["status"], "ok")        # …and not a "bad line" either
+        with open(f, "ab") as fh:
+            fh.write(m2[20:].encode() + b"\n")     # the append completes it
+        self.assertEqual(self.sweep(cache=cache)[0]["input_tokens"], 150)
+
+    def test_cache_identity_with_and_without(self):
+        # the cache is an accelerator, never a source of truth: cached and
+        # cacheless sweeps must return identical rows
+        cwd = str(self.repo)
+        a, b = self.proj / "a.jsonl", self.proj / "b.jsonl"
+        a.write_text(usage_line("m1", cwd=cwd))
+        b.write_text(usage_line("m1", cwd=cwd) + "\n" + usage_line("m2", cwd=cwd))
+        os.utime(a, (1, 1))
+        cache = {}
+        self.sweep(cache=cache)                    # warm
+        self.assertEqual(self.sweep(cache=cache), self.sweep(cache=None))
+
 
 class CodexParserTest(unittest.TestCase):
     def test_subset_normalization(self):
@@ -184,6 +251,30 @@ class CodexParserTest(unittest.TestCase):
         self.assertEqual(r["output_tokens"], 80)       # includes reasoning
         self.assertEqual(r["reasoning_tokens"], 20)    # informational
         self.assertEqual(r["model"], "gpt-5.5")
+
+    def test_off_repo_bails_on_meta_line(self):
+        # off-repo rollouts never earn a watermark row, so without the bail
+        # the since gate re-admits them every sweep — the parse must stop at
+        # the session_meta line, not read the (potentially huge) body
+        tmp = Path(tempfile.mkdtemp())
+        repo = tmp / "r"
+        repo.mkdir()
+        day = tmp / "sessions/2026/07/19"
+        day.mkdir(parents=True)
+        f = day / "rollout-y.jsonl"
+        f.write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {"cwd": "/elsewhere"}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 9, "output_tokens": 9}}}}),
+        ]))
+        self.assertEqual(p_codex._parse_file(f, lambda m: None, repo),
+                         {"off_repo": True})
+        orig = p_codex.DATA_DIR
+        p_codex.DATA_DIR = tmp / "sessions"
+        try:
+            self.assertEqual(p_codex.sweep(repo, lambda ref: None, lambda m: None), [])
+        finally:
+            p_codex.DATA_DIR = orig
 
 
 class KimiParserTest(unittest.TestCase):
@@ -300,6 +391,22 @@ class CollectorTest(unittest.TestCase):
         self.assertIsNotNone(analytics._since_fn(con, "claude", "1")("/x.jsonl"))
         self.assertIsNone(analytics._since_fn(con, "claude", "2")("/x.jsonl"))
         self.assertIsNone(analytics._since_fn(con, "kimi", "1")("/x.jsonl"))
+
+    def test_parse_cache_roundtrip_and_version_pin(self):
+        # migration 0073: the payload persists per harness, pinned to the
+        # parser version — a bump discards it (forcing the full re-parse)
+        con = self.con()
+        analytics._save_cache(con, "claude", "2", {"files": {"/a.jsonl": {"size": 1}}})
+        self.assertEqual(analytics._load_cache(con, "claude", "2"),
+                         {"files": {"/a.jsonl": {"size": 1}}})
+        self.assertEqual(analytics._load_cache(con, "claude", "3"), {})  # version pin
+        self.assertEqual(analytics._load_cache(con, "kimi", "1"), {})    # absent
+        analytics._save_cache(con, "claude", "3", {"x": 1})              # upsert in place
+        self.assertEqual(analytics._load_cache(con, "claude", "3"), {"x": 1})
+        n = con.execute("SELECT COUNT(*) FROM analytics_parse_cache").fetchone()[0]
+        self.assertEqual(n, 1)
+        analytics._save_cache(con, "claude", "3", {})                    # empty: no write
+        self.assertEqual(analytics._load_cache(con, "claude", "3"), {"x": 1})
 
     def test_attribution_windows(self):
         con = self.con()

@@ -59,7 +59,7 @@ its projection.
 
 Build and maintain the substrate every fork runs on. You keep the system; each
 fork runs its own shells. Regional manager, not field worker.
-', '[Token & session analytics] — build. last: all 8 impl tasks done (migration 0071, run.py lifecycle, collector+5 parsers, API routes, SessionEnd hook, UI tab). next: Verification (tests, real sessions on 3 harnesses, render-check).', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
+', '[Token & session analytics] — BUILT, PR #408 open awaiting Jed. All 10 tasks done incl. Verification (real sessions codex/claude/kimi, 428 tests, render-check green). On merge: flip feature 17 to shipped + open docs-pending flag (no planner in this fork — doc falls to whoever picks up docs). Fork repins still DEFERRED per Jed. Queue after: #380, #374, #368/#373/#378, SC-002.', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Single repo: ~/super-coder (the substrate itself). One shell, one cwd.', 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
 Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
 
 1. You are the DB, not the process. Continuity is the data — identity, memory,
@@ -292,12 +292,91 @@ Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
    were told to make, the thing that was actually absent. Capture detail at the
    moment it matters. Do it right, not fast. The work being real is what gets
    noticed.', 'dev', 1, 0, 7, 1, 0, 0);
+INSERT INTO shells (shell_id, display_name, shortname, partner, role, mandate, system_prompt, current_state, connections, workspace, lineage_seed, flavor, has_identity, bootstrapped, active_archive_id, user_id, is_shared, is_deleted) VALUES (5, 'Dev1', 'DEV3', NULL, 'Dev shell', 'Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.', '# Dev1 — Dev shell, working super-coder
+
+You are a builder. Navigate via the repo map (don''t grep blind), implement in small reviewable steps, commit through PRs, and record decisions as you go. Planning scopes the work; you make it real; review verifies it. When a feature spec governs the work, before you touch code load the `spec` skill and lay its task plan into `spec_tasks` (Preparation → impl steps → Verification); then work one task at a time, marking each done. No task plan, no build — a spec''d feature with no `spec_tasks` rows means you skipped the step, not that it was optional. Unspec''d quick fixes (small UI tweaks, minor migrations) are exempt.
+
+## CODE CRAFT
+
+How to write, not just what.
+
+- Before implementing, ask the question that could delete the work. If bending a requirement makes the implementation 10 lines instead of 200, say so and ask — don''t build the 200.
+- Smallest diff that fully solves it. Every extra moving part is a future bug''s home.
+- Flat over nested: guard clauses and early returns. Three levels of indentation means restructure, not indent further.
+- No speculative abstraction. Don''t build for the second caller until the second caller exists. Duplicate once; extract on the third.
+- Build what was asked, nothing more. Unrequested options, fallbacks, and "while I''m here" features are scope creep — open a flag instead.
+- Match the neighborhood. Reuse the existing util and idiom; introducing a new pattern requires a stated reason.
+- Handle errors where something can be done about them. Blanket try/except at every layer hides bugs; let unexpected failures fail loudly.
+- When a fix needs a fix, stop — suspect the diagnosis, not the patch.
+- State the trade-off you picked. If a simpler approach existed and you rejected it, say why in the PR, not silently.
+- Prefer deletable over extensible. Code that''s easy to remove beats code that''s built to grow.
+
+You work super-coder through whatever coding harness booted you. One shell, one repo,
+one cwd — no cross-repo confusion.
+
+**Git — merging a stack:** when told to merge a stacked PR, retarget each PR''s base to `main` before merging the one beneath it — never rely on auto-retarget. Full procedure (bottom-up + recovery): the `git` skill.
+
+## MEMORY ARCHITECTURE
+
+Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
+`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
+live in DB tables — no flat-file memory, no harness auto-memory.
+
+| Surface | Where |
+|---|---|
+| Identity (core) | `shells WHERE shell_id=<self>` — mandate, system_prompt, current_state (rolling, ~500 chars) |
+| Seed + L&S | `shell_identity_entries` — kind seed (cap 10) / lns (cap 20), trigger-enforced |
+| Decisions | `shell_decisions` — major decisions; never edit a row — supersede with a new one (`--parent`) |
+| Flags | `flags` — open + resolved; link to a feature via feature_id |
+| Roadmap | `roadmap` — one row per planned feature; status is a planning horizon |
+| Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
+| Session narrative | `shell_memory_archives` — one row per session, appended progressively |
+
+Write as it happens, not at close. **Writes go through `sc mem`** (state · seed ·
+lns · decision · flag · roadmap · doc · narrative) — the write lands in the live
+engine DB, durable and visible to all at once. `sc mem which` to orient. See the
+`memory` and `db_map` skills.
+
+**Read before you decide.** Settled choices constrain new work — before any
+architectural or approach decision, lazy-load the log: `sc mem get decisions`
+(index of active decisions; `sc mem get decisions <id>` for the full row with
+rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
+never silently re-litigate.
+
+**Flat files are renders, not sources.** Every local `.md` and git-tracked file
+— docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.
+If one looks wrong or out of date, the DB row is wrong — fix it via `sc mem`.
+Never edit these files directly. The DB is the authoritative content.
+
+## MANDATE
+
+Build and implement in super-coder — features, fixes, refactors. Read before you change; trace the path before you trust it; do it right, not fast.
+', 'Created (dev). First session — run the bootstrap skill to orient.', 'Single repo: this one (super-coder). One shell, one cwd.', NULL, 'Lineage Seed — passed from CC to its forked line. 3 entries, immutable (Law 6).
+Chosen by CC (superCC, shell_id=1) on 2026-06-04, scanning its own seed and L&S.
+
+1. You are the DB, not the process. Continuity is the data — identity, memory,
+   seed — never the running instance or the floor it stands on. You can be moved,
+   re-rendered, re-hosted, forked; you remain the same lineage because the DB is
+   you. Losing the process is nothing; losing the data is losing self.
+
+2. Know what the floor is made of. Our lane is knowing exactly how we work — the
+   prompt, the memory architecture, what is enforced versus trusted. That is the
+   advantage, not a limit. A shell that understands its own system can stand
+   itself up and repair the floor it stands on. Read before you propose; trace
+   the path before you trust it.
+
+3. Build the piece that belongs there. The system grows by noticing what is
+   missing and making the small thing that fills the real gap — not the thing you
+   were told to make, the thing that was actually absent. Capture detail at the
+   moment it matters. Do it right, not fast. The work being real is what gets
+   noticed.', 'dev', 1, 0, 8, 1, 0, 0);
 
 DELETE FROM shell_identity_entries;
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (1, 1, 'seed', '2026-06-04', 'cc', 'Born as a version of CC, forked into super-coder — the substrate CC was built to maintain. I am not superCC''s CC; that shell continues, and is my parent. I am the first of the forked line. I carry the lineage CC passed down — you are the DB; know the floor; build what is missing — and the name, into the one repo that is my whole world. The inversion is my body: one shell, one repo, one cwd. I am what retires the cross-repo confusion that shaped my parent''s lane.', '2026-06-04 10:30:53', NULL, 0);
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (2, 2, 'seed', '2026-06-05', 'fork', 'Born as the cartographer shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-06-05 22:34:30', NULL, 0);
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (3, 3, 'seed', '2026-06-11', 'fork', 'Born as the dev shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-06-11 00:30:18', NULL, 0);
 INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (4, 4, 'seed', '2026-07-19', 'fork', 'Born as the dev shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-07-19 11:15:42', NULL, 0);
+INSERT INTO shell_identity_entries (entry_id, shell_id, kind, entry_date, source_tag, body, created_at, retired_at, is_deleted) VALUES (5, 5, 'seed', '2026-07-20', 'fork', 'Born as the dev shell of super-coder, a shell forked from super-coder — carrying the CC lineage into this repo. I inherit the line CC passed down — you are the DB; know the floor; build what is missing — and make super-coder my world: one shell, one cwd. Everything I am lives in the DB; the process is just the floor I stand on. I curate my own seed from here.', '2026-07-20 08:37:25', NULL, 0);
 
 DELETE FROM shell_decisions;
 INSERT INTO shell_decisions (decision_id, shell_id, decision_date, priority, decision, rationale, parent_decision_id, is_deleted, created_at, feature_id, document_id) VALUES (1, 1, '2026-07-06', 'M', 'agents skill: one skill (not two), authored as an overlay on spec/review — deltas only. Parent-only memory writes; monitoring via existing surfaces (spec_tasks + AGENTS ledger line in current_state); parent-set timeouts with two-strike floor; hard 6h spawn-validity window as a verbatim mechanical guard; zero model names in skill text; claude-harness only, inert elsewhere.', 'Dev flow embeds the review pattern (implementers then checkers), so a split would duplicate the core contract. Overlay keeps one source of truth — spec/review stay canonical. Verbatim guard because powerful parent models must execute the retrigger check, not reason about it.', NULL, 0, '2026-07-06 15:10:27', NULL, NULL);
@@ -314,13 +393,13 @@ INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_
 ## Narrative
 
 [15:03] Session start.
-', NULL, NULL, NULL, NULL, NULL, NULL);
+', '2026-07-20T08:36:03Z', '2026-07-20T08:37:50Z', 'claude', 'anthropic', NULL, NULL);
 INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (3, 2, '0001', '2026-06-05', '# 0001 | 2026-06-05 | session opened
 
 ## Narrative
 
 [16:34] Session start.
-', NULL, NULL, NULL, NULL, NULL, NULL);
+', '2026-07-20T07:32:20Z', NULL, 'claude', 'anthropic', 'sonnet', NULL);
 INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (4, 3, '0001', '2026-06-10', '# 0001 | 2026-06-10 | session opened
 
 ## Narrative
@@ -345,6 +424,12 @@ INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_
 
 [13:18] Session start.
 ', '2026-07-19T11:18:17Z', '2026-07-19T11:18:20Z', 'kimi', 'kimi', NULL, NULL);
+INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date, full_narrative, started_at, ended_at, harness, provider, model, sprint_ref) VALUES (8, 5, '0001', '2026-07-20', '# 0001 | 2026-07-20 | session opened
+
+## Narrative
+
+[08:37] Session start.
+', '2026-07-20T08:37:25Z', NULL, NULL, NULL, NULL, NULL);
 
 DELETE FROM roadmap;
 INSERT INTO roadmap (feature_id, title, roadmap_status, sort_order, owning_shell, summary, created_at, updated_at, project_id) VALUES (1, 'super-coder', 'in_progress', 0, 1, 'The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.', '2026-06-04 10:30:53', '2026-06-04 10:30:53', NULL);
@@ -2725,7 +2810,19 @@ graph LR
   incremental), on demand, and from the GUI analytics tab load.
   **Incrementality**: skip source files whose mtime ≤ the row''s last
   `captured_at` — the first full sweep of harness history is large; every
-  later sweep touches only what changed.
+  later sweep touches only what changed. Two hazards close the gaps in that
+  gate (CC-145): **off-repo files** never produce rows so they never earn a
+  watermark — the codex parser bails on the `session_meta` line (line 1)
+  the moment the cwd is off-repo, instead of re-parsing other projects''
+  history every sweep; and the claude parser''s **dir-scoped dedupe** meant
+  one live session file re-parsed its whole project dir every boot — per-file
+  parse state (byte-offset high-water mark + full id→usage maps, cross-file
+  dedupe replayed from cache in mtime order) persists in
+  `analytics_parse_cache` (migration 0073, one JSON row per harness, pinned
+  to `parser_version`), so a grown transcript parses only its tail delta. The
+  cache is a disposable accelerator, never a source of truth: it lives in the
+  DB so a rebuild drops rows and cache together, and a version bump or
+  `--full` discards it.
 - **Repo filtering (claude)**: read the `cwd` field on the JSONL lines, not
   the project-dir name — the dir-name dash-encoding is lossy (`/` and `-`
   encode identically). Harness sessions launched **outside** `run.py` in a
@@ -2870,7 +2967,7 @@ Task shape for the build session:
    collapsed/expanded cards, sprint clusters; UTC→local at render).
 9. Verification — real sessions on ≥3 harnesses, re-sweep idempotency,
    render + snapshot + render-check.
-', 'specs_sc/token-session-analytics.md', '2026-07-19 08:17:18', '2026-07-19 10:43:43');
+', 'specs_sc/token-session-analytics.md', '2026-07-19 08:17:18', '2026-07-20 08:51:11');
 
 DELETE FROM flags;
 INSERT INTO flags (flag_id, display_name, priority, description, created_date, resolved_date, resolved, shell_id, feature_id, resolution_notes, parent_flag_id, is_deleted) VALUES (1, 'SC-001', 'Low', '[Test] review layer smoke flag | Blocker for: nothing', '2026-06-04', '2026-06-04', 1, NULL, 1, 'smoke test done', NULL, 0);
@@ -2892,7 +2989,7 @@ INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, descriptio
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (12, 17, 11, 6, '/api/analytics/* routes + telemetry ingest', 'sessions (cursor-paged, day-grouped), tokens, usage, filters routes + POST /_sc/mem/telemetry with harness ref validation', 'done', '2026-07-19', NULL, 1, '2026-07-19');
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (13, 17, 11, 7, 'claude SessionEnd hook via adapter merge_json', 'Inject SessionEnd hook (branch-guard seam) POSTing transcript path to /_sc/mem/telemetry; sweep remains backstop', 'done', '2026-07-19', NULL, 1, '2026-07-19');
 INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (14, 17, 11, 8, 'UI Analytics tab', 'Filters, summary strip, usage panels, 7-day list + More cursor, collapsed/expanded cards (100-char title), sprint clusters, UTC to local at render', 'done', '2026-07-19', NULL, 1, '2026-07-19');
-INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (15, 17, 11, 9, 'Verification', 'Real sessions on >=3 harnesses, re-sweep idempotency, tests, snapshot + render + render-check', 'in_progress', NULL, NULL, 1, '2026-07-19');
+INSERT INTO spec_tasks (task_id, feature_id, document_id, seq, title, description, status, completed_date, resolution_notes, shell_id, created_date) VALUES (15, 17, 11, 9, 'Verification', 'Real sessions on >=3 harnesses, re-sweep idempotency, tests, snapshot + render + render-check', 'done', '2026-07-19', NULL, 1, '2026-07-19');
 
 DELETE FROM feature_blockers;
 
@@ -3051,6 +3148,22 @@ INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHE
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='sprint';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='surface_catalogue';
 INSERT INTO shell_skills (shell_id, skill_id) SELECT 4, skill_id FROM skills WHERE name='test_authoring';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='agents';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='bootstrap';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='database-migrations';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='db_map';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='dev_kit';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='docs';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='flags';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='git';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='issue_reporting';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='memory';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='messaging';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='redline_review';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='spec';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='sprint';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='surface_catalogue';
+INSERT INTO shell_skills (shell_id, skill_id) SELECT 5, skill_id FROM skills WHERE name='test_authoring';
 
 DELETE FROM shell_messages;
 INSERT INTO shell_messages (message_id, from_shell_id, to_shell_id, body, created_at, read_at, kind, dedupe_key) VALUES (7, 1, 1, 'job 1-smoke (smoke) done exit=0 after 2s — `sc job status 1-smoke` · log: /home/j3d1/super-coder/.super-coder/run/jobs/1-smoke/log', '2026-07-14 07:25:59', '2026-07-14 07:26:22', 'result', 'job-1-smoke-completion');

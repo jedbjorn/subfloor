@@ -41,7 +41,13 @@ def _title_from(payload: dict) -> "str | None":
     return text[:TITLE_CAP]
 
 
-def _parse_file(path: Path, log) -> "dict | None":
+def _parse_file(path: Path, log, repo_root) -> "dict | None":
+    """Full parse of one rollout — except off-repo files, which bail on the
+    session_meta line (line 1 in practice). The bail matters: off-repo files
+    never produce rows, so they never get a captured_at watermark, and without
+    it the since_epoch gate re-admits them on EVERY sweep — a perpetual full
+    re-parse of every other project's codex history (hundreds of MB) just to
+    re-discover their cwd is elsewhere."""
     meta = last_tc = title = model = None
     ts_first = ts_last = None
     try:
@@ -65,6 +71,8 @@ def _parse_file(path: Path, log) -> "dict | None":
             t = rec.get("type")
             if t == "session_meta":
                 meta = p
+                if not in_repo(p.get("cwd"), repo_root):
+                    return {"off_repo": True}
             elif t == "turn_context":
                 model = p.get("model") or model
             elif t == "event_msg" and p.get("type") == "token_count":
@@ -79,7 +87,7 @@ def _parse_file(path: Path, log) -> "dict | None":
             "started_at": norm_iso(ts_first), "ended_at": norm_iso(ts_last)}
 
 
-def sweep(repo_root, since_epoch, log) -> list[dict]:
+def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
     if not DATA_DIR.is_dir():
         return []
     rows: list[dict] = []
@@ -87,8 +95,8 @@ def sweep(repo_root, since_epoch, log) -> list[dict]:
         last = since_epoch(str(path))
         if last is not None and path.stat().st_mtime <= last:
             continue
-        parsed = _parse_file(path, log)
-        if parsed is None:
+        parsed = _parse_file(path, log, repo_root)
+        if parsed is None or parsed.get("off_repo"):
             continue
         cwd = parsed["meta"].get("cwd")
         if not in_repo(cwd, repo_root):

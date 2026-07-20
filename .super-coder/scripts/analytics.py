@@ -30,6 +30,7 @@ harness activity (refreshed while a session is still live).
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +75,41 @@ def _load_parsers(only: "str | None", log) -> list:
         except ImportError as e:
             log(f"analytics: no parser for '{name}' ({e}) — skipped")
     return mods
+
+
+def _load_cache(con, harness: str, parser_version: str) -> dict:
+    """This harness's persisted parse cache (migration 0073) — {} on a
+    version mismatch, corrupt payload, or a pre-0073 DB. The cache is a
+    disposable accelerator: any miss just means a fuller re-parse."""
+    try:
+        r = con.execute(
+            "SELECT parser_version, payload FROM analytics_parse_cache WHERE harness=?",
+            (harness,)).fetchone()
+    except db_driver.OperationalError:
+        return {}
+    if r and r["parser_version"] == parser_version:
+        try:
+            c = json.loads(r["payload"])
+            if isinstance(c, dict):
+                return c
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {}
+
+
+def _save_cache(con, harness: str, parser_version: str, cache: dict) -> None:
+    if not cache:
+        return
+    try:
+        con.execute(
+            "INSERT INTO analytics_parse_cache (harness, parser_version, payload, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(harness) DO UPDATE SET "
+            "parser_version=excluded.parser_version, payload=excluded.payload, "
+            "updated_at=excluded.updated_at",
+            (harness, parser_version, json.dumps(cache, separators=(",", ":")),
+             _now_iso()))
+    except (db_driver.OperationalError, TypeError, ValueError):
+        pass  # pre-0073 DB or unserializable state — never block the sweep
 
 
 def _since_fn(con, harness: str, parser_version: str):
@@ -218,11 +254,13 @@ def sweep(only: "str | None" = None, quiet: bool = False,
         for mod in _load_parsers(only, log):
             since = (lambda ref: None) if full \
                 else _since_fn(con, mod.HARNESS, mod.PARSER_VERSION)
+            cache = {} if full else _load_cache(con, mod.HARNESS, mod.PARSER_VERSION)
             try:
-                rows = mod.sweep(REPO_ROOT, since, log)
+                rows = mod.sweep(REPO_ROOT, since, log, cache=cache)
             except Exception as e:  # plugin stance: loud, never fatal to the sweep
                 log(f"analytics: {mod.HARNESS} parser failed: {e!r}")
                 continue
+            _save_cache(con, mod.HARNESS, mod.PARSER_VERSION, cache)
             for r in rows:
                 counts[_upsert(con, r, captured_at)] += 1
                 batch.append(r)

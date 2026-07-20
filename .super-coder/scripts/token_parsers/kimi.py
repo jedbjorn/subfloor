@@ -33,7 +33,7 @@ USAGE_MAP = {  # wire.jsonl usage.record field → row key, 1:1
 }
 
 
-def sweep(repo_root, since_epoch, log) -> list[dict]:
+def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
     if not DATA_DIR.is_dir():
         return []
     rows: list[dict] = []

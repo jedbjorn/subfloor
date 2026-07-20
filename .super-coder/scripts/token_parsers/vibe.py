@@ -31,7 +31,7 @@ def _provider(cfg: dict, model: "str | None") -> str:
     return "mistral"
 
 
-def sweep(repo_root, since_epoch, log) -> list[dict]:
+def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
     if not DATA_DIR.is_dir():
         return []
     rows: list[dict] = []
