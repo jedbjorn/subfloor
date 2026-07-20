@@ -11,7 +11,7 @@ purpose: Forkable shell substrate for a repo
 [![license: MIT](https://img.shields.io/badge/license-MIT-6b46c1?style=flat-square)](LICENSE)
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/README.md)
 
-# super-coder
+# Subfloor
 
 **[Quick start](docs/quick-start.md) · [Full documentation](docs/README.md)**
 
