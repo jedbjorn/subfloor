@@ -1,3 +1,4 @@
+
 # CONFORMANCE: Visual QA CI — Playwright viewport screenshots
 
 **Sprint:** doc #14 (feature #19) · **Spec:** doc #13 · **Judged:** `main` @ `90545e6`
@@ -160,3 +161,79 @@ ratified. The Medium (F1) is a real advisory-contract violation on a plausible
 fork shape and deserves an explicit ruling (fix unit vs accepted-boundary
 ratification) before the spec freezes; the five Lows are spec-text hygiene and
 a ship-gated docs task.
+
+
+---
+
+## Verdict delta — F1 re-check (2026-07-20 · task #88 · REV2)
+
+**Scope:** the F1 surface only, after fix unit 3 (PR #443, merged as `6e3615e`;
+the kickoff cited the pre-squash branch head `6ced66e` — trees verified
+identical outside `.super-coder/`). Ratified call referenced: **RC6** — `ci`
+output resolved via a validated config `output` key; shim reads it as a step
+output with `'gallery'` fallback; managed marker v2→v3 (REV1-ratified).
+Method unchanged: spec-vs-code on `main` @`6e3615e`; suites re-run green
+(30 + 11 hermetic tests, incl. 3 new tracked-gallery regressions).
+
+**(a) Row 24 — absent config, tracked `gallery/`: as-specced, strengthened.**
+`cmd_ci` no longer touches the gallery before it knows it will capture: the
+unconfigured branch publishes the neutral comment + step summary with
+`write=False` — nothing created, nothing modified. Regression test asserts a
+tracked `gallery/` file survives byte-identical and the dir gains no entries.
+The path-skip neutral (row 25) got the same non-destructive treatment.
+
+**(b) Row 35 / F1 — resolved: deviated-silently → deviated-intentionally (RC6).**
+Configured run against a tracked non-runner `gallery/`: `prepare_gallery`
+raises *before* any `rmtree`, `cmd_ci` catches it, publishes the ✗ sticky
+comment + step summary with now-actionable guidance ("choose another config
+key 'output'"), and exits 1 — a published failure, never a bare red.
+Invalid-config runs degrade the same way (combined error; summary write
+skipped when the dir isn't runner-owned). `rmtree` still fires only on a dir
+carrying the full runner `summary.json` key set. **F1 (Medium) closed as
+verified-fixed; flag REV2-001 (#10) closed.**
+
+**(c) `output` escape — verified end-to-end.** `_relative_output` validation
+(non-empty string; NUL/CR/LF rejected — no `GITHUB_OUTPUT` line injection;
+relative; no `..`; not `.`), default `"gallery"`; example config carries the
+key and stays valid + inactive; `cmd_ci` re-roots the gallery at the
+configured path and writes `output=<path>` to `GITHUB_OUTPUT` on every branch
+before any exit; shim v3 tags the run step `id: visual_qa` and uploads
+`${{ steps.visual_qa.outputs.output || 'gallery' }}/` (fallback covers a
+runner crash before the write); `ensure_workflows` numeric compare (v2 < v3)
+refreshes seeded shims and leaves unmanaged ones alone; distribution tests pin
+the exact marker + upload-path strings. Implemented exactly as ratified.
+
+### F7 · Low · note — collision/neutral artifact still ships fork-owned `gallery/` content
+On the two paths where the runner produced nothing but the fork tracks
+`gallery/` (unconfigured-neutral, and the collision red), `output=gallery` has
+already been written, so the `if: always()` upload publishes the fork's own
+tracked content under `visual-qa-gallery` for the retention period. Residual
+sliver of F1's original complaint — harmless (repo-visible content) but
+confusing and wasteful. Cheap fix: append a second `output=` line pointing at
+a runner-owned empty path once it's known nothing was produced
+(`GITHUB_OUTPUT` is last-write-wins) — or ratify as accepted.
+
+**Notes (no verdict change):**
+- Spec text still lacks an `output` row in §Fork config's schema and a
+  tracked-`gallery/` row in the edge-case table — spec-hygiene for the
+  freeze, same bucket as F2/F4/F5.
+- `detect_init_config` scaffold omits `output` (valid — default applies)
+  while the example lists it. Key-surface inconsistency, cosmetic.
+- Neutral runs no longer upload any artifact (nothing is written;
+  `if-no-files-found: warn`). The spec requires the upload *step* to always
+  run, not that neutral runs produce files — conformant; noted as a behavior
+  change from the pre-fix build.
+- F3 (shim length): +2 lines (now ~66); verdict unchanged.
+
+**Corrections to the original pass (clerical, mine):** the pre-fix test count
+was 27 + 11, not "28 + 11"; and the totals line miscounted — the table's 46
+rows summed to 35 as-specced · 6 deviated-intentionally · 3 deviated-silently
+· 2 unimplemented, not 36/6/3/2.
+
+**Revised totals:** 46 judged — 35 as-specced · 7 deviated-intentionally ·
+2 deviated-silently · 2 unimplemented. **Findings open: 0 Major · 0 Medium ·
+6 Low** (F2–F7; F1 resolved).
+
+**Verdict: F1 surface conformant.** Fix unit 3 implements RC6 exactly as
+ratified; no Medium remains. The freeze still owes the spec-text hygiene
+(F2/F4/F5 + the two notes above) and the ship-gated feature doc (F6).
