@@ -5,8 +5,9 @@ Layered, best-effort sources. The GUI's model field stays free text, so none
 of this is load-bearing — a source that fails just thins the suggestions:
 
   1. models.dev/api.json — the keyless catalog OpenCode itself consumes.
-     One fetch covers all four harness providers (anthropic / openai /
-     mistral / ollama-cloud), with release dates for newest-first sorting.
+     One fetch covers all five harness providers (anthropic / openai /
+     mistral / ollama-cloud / kimi-for-coding), with release dates for
+     newest-first sorting.
   2. Provider list-models APIs — only when the matching env key is present.
      Harness logins are OAuth, not API keys, so these are usually absent.
   3. `opencode models` CLI — exactly what the local install can resolve.
@@ -42,12 +43,18 @@ TTL_HOURS = 24
 TIMEOUT = 8
 MODELS_DEV_URL = "https://models.dev/api.json"
 
-# harness -> models.dev provider key
+# harness -> models.dev provider key. kimi maps to "kimi-for-coding" (the
+# Kimi Code plan), not the general "moonshotai" API provider: its ids are the
+# ones the CLI actually reports (k3 / kimi-for-coding[-highspeed]), so the GUI
+# datalist suggests what a kimi session can really select. Provider attribution
+# for analytics is NOT sourced here — run.py's session_provider pins kimi to
+# "kimi" to match its native wire.jsonl, regardless of this catalog mapping.
 HARNESS_PROVIDER = {
     "claude": "anthropic",
     "codex": "openai",
     "vibe": "mistral",
     "opencode": "ollama-cloud",
+    "kimi": "kimi-for-coding",
 }
 # opencode model ids are provider-prefixed ("ollama-cloud/<model>") — the
 # format flavor_defaults already stores for that harness.

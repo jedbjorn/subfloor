@@ -576,9 +576,9 @@ def session_provider(harness: str, model: "str | None") -> "str | None":
     """Boot-time provider for the archive row. opencode model ids are
     provider-prefixed ("ollama-cloud/<model>") — the prefix wins; otherwise the
     harness's home provider (claude→anthropic, codex→openai, vibe→mistral).
-    kimi is absent from model_catalog's map (models.dev has no kimi key) but its
-    wire.jsonl reports provider="kimi" natively — pin the same value here so
-    boot-row and sweep-row providers agree."""
+    model_catalog maps kimi→"kimi-for-coding" for the model datalist, but its
+    wire.jsonl reports provider="kimi" natively — pin that value here (ahead of
+    the map lookup) so boot-row and sweep-row providers agree."""
     if harness in model_catalog.PREFIXED_HARNESSES and model and "/" in model:
         return model.split("/", 1)[0]
     if harness == "kimi":
