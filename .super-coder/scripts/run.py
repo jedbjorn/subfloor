@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from datetime import date, datetime, timezone
@@ -49,6 +50,7 @@ import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
+import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
 
@@ -416,10 +418,11 @@ def pick_harness(detected: list[str], default: str, first: bool) -> str | None:
     # --first and non-TTY (verify/CI) never prompt — take the default silently.
     if first or not sys.stdin.isatty():
         return dflt
-    print("\nHarness:")
+    print(f"\n{style.bold('Harness:')}")
     for i, h in enumerate(detected, 1):
-        mark = "  (default)" if h == dflt else ""
-        print(f"  {i}. {h}{mark}")
+        mark = style.dim("  (default)") if h == dflt else ""
+        name = style.bold(h) if h == dflt else h
+        print(f"  {style.dim(f'{i}.')} {name}{mark}")
     while True:
         choice = input(f"\nPick (1-{len(detected)}, Enter for {dflt}): ").strip()
         if not choice:
@@ -541,15 +544,19 @@ def pick_shell(shells: list, requested: str | None,
     # it always reads 1, 2, 3… down the screen. shell_id is global and
     # non-contiguous, so showing it here made the numbering jump around within a
     # group; position tracks the display order instead.
-    print(f"\n{'#':>3}  {'Name':<16}{'Shortname':<14}{'Default (harness · model)'}")
+    print(style.dim(f"\n{'#':>3}  {'Name':<16}{'Shortname':<14}"
+                    f"{'Default (harness · model)'}"))
     _sentinel = object()
     cur_flavor: object = _sentinel
     for n, s in enumerate(shells, 1):
         if s["flavor"] != cur_flavor:
             cur_flavor = s["flavor"]
-            print(f"\n{cur_flavor or '(bespoke)'}")
-        print(f"{n:>3}  {(s['display_name'] or ''):<16}"
-              f"{(s['shortname'] or ''):<14}{_default_label(defaults, s['flavor'])}")
+            print(f"\n{style.accent(cur_flavor or '(bespoke)')}")
+        num = style.dim(f"{n:>3}")
+        name = style.bold("{:<16}".format(s["display_name"] or ""))
+        short = "{:<14}".format(s["shortname"] or "")
+        print(f"{num}  {name}{short}"
+              f"{style.dim(_default_label(defaults, s['flavor']))}")
     while True:
         choice = input("\nPick (#): ").strip()
         if choice.isdigit() and 1 <= int(choice) <= len(shells):
@@ -644,6 +651,28 @@ def atomic_write(path: Path, content: str) -> None:
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
+def _port_listening(port: int) -> bool:
+    """Is anything serving on 127.0.0.1:port right now? Best-effort, fast."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def review_gui_panel(api_port: int, has_key: bool) -> str:
+    """The one URL the operator always needs — every fork serves the review
+    GUI on its own port, so every boot restates it, prominently."""
+    url = f"http://127.0.0.1:{api_port}"
+    status = (style.green("up") if _port_listening(api_port)
+              else style.yellow("not running — ./sc serve"))
+    token = "SC_API_TOKEN set" if has_key else "no api key"
+    return style.panel([
+        f"{style.bold('Review GUI')}  {style.cyan(style.bold(url))}",
+        f"{status}{style.dim(' · api on the same port · ' + token)}",
+    ])
+
+
 def main() -> None:
     args = sys.argv[1:]
     first = "--first" in args
@@ -682,6 +711,10 @@ def main() -> None:
     requested = positional[0] if positional else None
     if headless and not requested:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]')
+
+    # Wordmark banner — interactive boots only; headless/verify logs stay clean.
+    if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():
+        print(style.banner(REPO_ROOT.name))
 
     con = open_db()
     # Self-heal stale engine skills before anything this boot reads them
@@ -842,7 +875,7 @@ def main() -> None:
     for name in ("CLAUDE.md", "AGENTS.md"):
         atomic_write(work_dir / name, content)
 
-    print(f"\n→ booted {full['display_name']} "
+    print(f"\n→ booted {style.bold(full['display_name'])} "
           f"(shell_id={full['shell_id']}, session={session_id})")
     if work_dir != REPO_ROOT:
         print(f"→ worktree: {work_dir}")
@@ -857,7 +890,7 @@ def main() -> None:
         print(f"→ analytics: {sweep_note}")
     print(f"→ wrote {work_dir / 'CLAUDE.md'}")
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
-    if api_port and full["api_key"]:
+    if headless and api_port and full["api_key"]:
         print(f"→ api: http://127.0.0.1:{api_port} (SC_API_TOKEN set)")
     print(f"→ skills: {len(skills['written'])} written, "
           f"{len(skills['skipped'])} unchanged → .claude/skills/")
@@ -867,7 +900,8 @@ def main() -> None:
     adapter = load_adapter(harness)
     emitted = emit_adapter(adapter, work_dir)
     resolve_opencode_plugins(work_dir)  # engine-relative plugin path → absolute (loads in worktrees)
-    print(f"→ harness: {harness} (reads {adapter.get('boot_artifact', 'AGENTS.md')})")
+    print(f"→ harness: {style.bold(harness)} "
+          f"(reads {adapter.get('boot_artifact', 'AGENTS.md')})")
     if emitted:
         print(f"→ emitted {', '.join(emitted)}")
 
@@ -941,6 +975,12 @@ def main() -> None:
             src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
             print(f"→ model: {hmodel} ({src})")
         print(f"→ headless prompt: {(prompt or DEFAULT_HEADLESS_PROMPT)[:120]}")
+
+    # Close the boot summary with the review GUI — the link lives in a different
+    # place per fork, so every interactive boot restates it where it can't be
+    # missed. Headless/verify keep the plain `→ api:` line instead.
+    if not headless and not os.environ.get("RENDER_ONLY") and api_port:
+        print(f"\n{review_gui_panel(api_port, bool(full['api_key']))}")
 
     if os.environ.get("RENDER_ONLY"):
         print("→ RENDER_ONLY set — not exec'ing the harness.")

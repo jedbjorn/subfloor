@@ -1081,7 +1081,11 @@ case "$cmd" in
       -p "127.0.0.1:$p:$p" \
       -p "127.0.0.1:$dp:$dp" \
       "$IMG" ./sc serve --port "$p" >/dev/null
-    echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+      printf '\033[1m→ sandbox up\033[0m · \033[1mReview GUI  \033[36mhttp://127.0.0.1:%s\033[0m\n' "$p"
+    else
+      echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
+    fi
     echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
     echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
     # Bring the VM broker up alongside the sandbox when a VM is linked (self-skips
