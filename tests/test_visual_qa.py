@@ -96,6 +96,7 @@ class ConfigTest(unittest.TestCase):
         self.assertIsNone(config["paths"])
         self.assertEqual(config["services"], [])
         self.assertEqual(config["artifact_retention_days"], 14)
+        self.assertEqual(config["output"], "gallery")
 
     def test_invalid_contract_branches_are_rejected_with_specific_errors(self):
         cases = (
@@ -114,6 +115,14 @@ class ConfigTest(unittest.TestCase):
             (
                 {"serve": "x", "routes": ["/"], "port": True},
                 "'port' must be an integer",
+            ),
+            (
+                {"serve": "x", "routes": ["/"], "output": "../gallery"},
+                "'output' must be a non-root path within the fork checkout",
+            ),
+            (
+                {"serve": "x", "routes": ["/"], "output": "bad\npath"},
+                "'output' must be a non-empty string",
             ),
             (
                 {
@@ -588,6 +597,80 @@ class ModeTest(unittest.TestCase):
         self.assertEqual(
             publish.call_args.args[0]["reason"], "No configured app paths changed."
         )
+
+    def test_ci_uses_validated_config_output_instead_of_tracked_gallery(self):
+        self.write_config(
+            output="artifacts/visual-qa",
+            viewports=[{"name": "phone", "width": 375, "height": 812}],
+        )
+        tracked = self.repo / "gallery" / "app-image.png"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"fork-owned")
+
+        @contextmanager
+        def app(_config, _repo, log):
+            log.write("ready\n")
+            yield "http://app", {}
+
+        github_output = self.repo / "github-output"
+        code = visual_qa.cmd_ci(
+            argparse.Namespace(),
+            repo=self.repo,
+            environ={"GITHUB_OUTPUT": str(github_output)},
+            changed_paths=lambda *_args, **_kwargs: None,
+            installer=lambda: None,
+            app_context=app,
+            capture_factory=capture_factory({"default": OK}, []),
+        )
+
+        output = self.repo / "artifacts" / "visual-qa"
+        self.assertEqual(code, 0)
+        self.assertEqual(tracked.read_bytes(), b"fork-owned")
+        self.assertEqual(
+            [path.name for path in tracked.parent.iterdir()], [tracked.name]
+        )
+        self.assertTrue((output / "root" / "phone.png").is_file())
+        self.assertEqual(
+            json.loads((output / "summary.json").read_text())["outcome"], "passed"
+        )
+        self.assertEqual(github_output.read_text(), "output=artifacts/visual-qa\n")
+
+    def test_ci_gallery_collision_publishes_failure_without_touching_fork_files(self):
+        self.write_config()
+        tracked = self.repo / "gallery" / "tracked-app-file.txt"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"keep me")
+        step_summary = self.repo / "step-summary.md"
+        github_output = self.repo / "github-output"
+        installer = mock.Mock(side_effect=AssertionError("installer called"))
+        app = mock.Mock(side_effect=AssertionError("app called"))
+
+        with mock.patch.object(visual_qa, "post_sticky_comment") as post:
+            code = visual_qa.cmd_ci(
+                argparse.Namespace(),
+                repo=self.repo,
+                environ={
+                    "GITHUB_OUTPUT": str(github_output),
+                    "GITHUB_STEP_SUMMARY": str(step_summary),
+                },
+                installer=installer,
+                app_context=app,
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(installer.call_count, 0)
+        self.assertEqual(app.call_count, 0)
+        self.assertEqual(tracked.read_bytes(), b"keep me")
+        self.assertEqual(
+            [path.name for path in tracked.parent.iterdir()], [tracked.name]
+        )
+        body = post.call_args.args[0]
+        self.assertIn("### ✗ Visual QA could not run", body)
+        self.assertIn("choose another config key 'output'", body)
+        written_summary = step_summary.read_text()
+        self.assertIn("### ✗ Visual QA could not run", written_summary)
+        self.assertIn("choose another config key 'output'", written_summary)
+        self.assertEqual(github_output.read_text(), "output=gallery\n")
 
     def test_ci_runs_mock_capture_and_fails_only_when_all_routes_fail(self):
         self.write_config(

@@ -10,5 +10,6 @@
   "viewports": "default",
   "paths": ["src/**", "static/**", "package.json"],
   "services": [],
+  "output": "gallery",
   "artifact_retention_days": 14
 }
