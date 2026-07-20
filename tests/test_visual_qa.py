@@ -248,6 +248,75 @@ class GalleryTest(unittest.TestCase):
         )
 
 
+class PrepareGalleryTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name)
+
+    def test_non_runner_directory_is_rejected_without_losing_contents(self):
+        gallery = self.repo / "gallery"
+        gallery.mkdir()
+        owned = gallery / "tracked-app-file.txt"
+        owned.write_bytes(b"keep me")
+
+        with self.assertRaisesRegex(
+            visual_qa.VisualQaError,
+            "gallery directory exists and isn't visual-QA output",
+        ):
+            visual_qa.prepare_gallery(gallery)
+
+        self.assertEqual(owned.read_bytes(), b"keep me")
+        self.assertEqual([path.name for path in gallery.iterdir()], [owned.name])
+
+    def test_malformed_summary_is_not_accepted_as_runner_ownership(self):
+        gallery = self.repo / "gallery"
+        gallery.mkdir()
+        summary = gallery / "summary.json"
+        summary.write_text('{"outcome": "passed"}\n')
+
+        with self.assertRaisesRegex(
+            visual_qa.VisualQaError,
+            "gallery directory exists and isn't visual-QA output",
+        ):
+            visual_qa.prepare_gallery(gallery)
+
+        self.assertEqual(summary.read_text(), '{"outcome": "passed"}\n')
+
+    def test_runner_gallery_is_cleared_before_reuse(self):
+        gallery = self.repo / "gallery"
+        gallery.mkdir()
+        summary = {
+            "generated_at": "2026-07-20T00:00:00Z",
+            "outcome": "passed",
+            "routes_total": 1,
+            "routes_failed": 0,
+            "routes": [],
+        }
+        (gallery / "summary.json").write_text(json.dumps(summary))
+        stale = gallery / "root" / "desktop.png"
+        stale.parent.mkdir()
+        stale.write_bytes(b"old")
+
+        visual_qa.prepare_gallery(gallery)
+        self.assertEqual(list(gallery.iterdir()), [])
+
+    def test_empty_gallery_is_reused_without_error(self):
+        gallery = self.repo / "gallery"
+        gallery.mkdir()
+
+        visual_qa.prepare_gallery(gallery)
+        self.assertEqual(list(gallery.iterdir()), [])
+
+    def test_absent_gallery_is_created(self):
+        absent = self.repo / "new-gallery"
+
+        visual_qa.prepare_gallery(absent)
+
+        self.assertTrue(absent.is_dir())
+        self.assertEqual(list(absent.iterdir()), [])
+
+
 class CommentTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

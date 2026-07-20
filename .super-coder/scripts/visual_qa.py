@@ -454,8 +454,33 @@ def ci_app(
 
 
 def prepare_gallery(gallery: Path) -> None:
-    if gallery.exists():
-        shutil.rmtree(gallery)
+    if not gallery.exists():
+        gallery.mkdir(parents=True)
+        return
+    if not gallery.is_dir():
+        raise VisualQaError(f"gallery path exists and isn't a directory: {gallery}")
+    if not any(gallery.iterdir()):
+        return
+
+    summary_path = gallery / "summary.json"
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        summary = None
+    required_keys = {
+        "generated_at",
+        "outcome",
+        "routes_total",
+        "routes_failed",
+        "routes",
+    }
+    if not isinstance(summary, dict) or not required_keys.issubset(summary):
+        raise VisualQaError(
+            f"gallery directory exists and isn't visual-QA output: {gallery}; "
+            "move it or choose another --output directory"
+        )
+
+    shutil.rmtree(gallery)
     gallery.mkdir(parents=True)
 
 
