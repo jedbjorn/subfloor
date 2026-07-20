@@ -25,7 +25,7 @@ class VisualQaTemplateTest(unittest.TestCase):
     def test_workflow_is_the_fixed_managed_shim(self):
         text = (TEMPLATES / "subfloor-visual-qa.yml").read_text()
 
-        self.assertTrue(text.startswith("# managed-by: subfloor — visual-qa shim v2\n"))
+        self.assertTrue(text.startswith("# managed-by: subfloor — visual-qa shim v3\n"))
         self.assertIn("pull_request:\n", text)
         self.assertIn("workflow_dispatch:\n", text)
         self.assertIn("contents: read\n", text)
@@ -37,6 +37,8 @@ class VisualQaTemplateTest(unittest.TestCase):
         self.assertNotIn("playwright==", text)
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", text)
         self.assertIn("if: always()\n        uses: actions/upload-artifact@v4", text)
+        self.assertIn("id: visual_qa\n        run: ./sc visual-qa ci", text)
+        self.assertIn("path: ${{ steps.visual_qa.outputs.output || 'gallery' }}/", text)
 
     def test_example_config_is_valid_and_inactive(self):
         config = json.loads((TEMPLATES / "visual-qa.example.json").read_text())
@@ -54,6 +56,7 @@ class VisualQaTemplateTest(unittest.TestCase):
                 "viewports": "default",
                 "paths": ["src/**", "static/**", "package.json"],
                 "services": [],
+                "output": "gallery",
                 "artifact_retention_days": 14,
             },
         )
@@ -187,7 +190,7 @@ class VisualQaUpdateTest(unittest.TestCase):
 
     def test_older_managed_workflow_is_refreshed_but_example_is_preserved(self):
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v1\nold\n")
+        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v2\nold\n")
         self.example.parent.mkdir(parents=True)
         self.example.write_text("fork note\n")
 
@@ -215,14 +218,14 @@ class VisualQaUpdateTest(unittest.TestCase):
 
     def test_same_or_newer_managed_version_is_not_rewritten(self):
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v2\nfuture\n")
+        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v3\nfuture\n")
         self.example.parent.mkdir(parents=True)
         self.example.write_text("existing\n")
 
         self.assertEqual(self.reconcile(), ("current", []))
         self.assertEqual(
             self.workflow.read_text(),
-            "# managed-by: subfloor — visual-qa shim v2\nfuture\n",
+            "# managed-by: subfloor — visual-qa shim v3\nfuture\n",
         )
         self.assertEqual(self.example.read_text(), "existing\n")
 

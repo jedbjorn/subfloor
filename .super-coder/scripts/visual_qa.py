@@ -69,6 +69,21 @@ def _string_list(value: object, key: str, *, allow_empty: bool = True) -> list[s
     return list(value)
 
 
+def _relative_output(value: object, key: str = "output") -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(character in value for character in ("\0", "\r", "\n"))
+    ):
+        raise VisualQaError(f"config key '{key}' must be a non-empty string")
+    output = Path(value.strip())
+    if output.is_absolute() or ".." in output.parts or output == Path("."):
+        raise VisualQaError(
+            f"config key '{key}' must be a non-root path within the fork checkout"
+        )
+    return output.as_posix()
+
+
 def _validate_viewports(value: object) -> list[dict[str, object]]:
     if value == "default":
         return [dict(viewport) for viewport in DEFAULT_VIEWPORTS]
@@ -131,6 +146,7 @@ def validate_config(raw: object) -> dict[str, object]:
         "paths",
         "services",
         "artifact_retention_days",
+        "output",
     }
     unknown = set(raw) - known
     if unknown:
@@ -190,6 +206,7 @@ def validate_config(raw: object) -> dict[str, object]:
             minimum=1,
             maximum=90,
         ),
+        "output": _relative_output(raw.get("output", DEFAULT_GALLERY.as_posix())),
     }
 
 
@@ -453,7 +470,7 @@ def ci_app(
             service.stop(log)
 
 
-def prepare_gallery(gallery: Path) -> None:
+def prepare_gallery(gallery: Path, *, output_hint: str = "config key 'output'") -> None:
     if not gallery.exists():
         gallery.mkdir(parents=True)
         return
@@ -477,7 +494,7 @@ def prepare_gallery(gallery: Path) -> None:
     if not isinstance(summary, dict) or not required_keys.issubset(summary):
         raise VisualQaError(
             f"gallery directory exists and isn't visual-QA output: {gallery}; "
-            "move it or choose another --output directory"
+            f"move it or choose another {output_hint}"
         )
 
     shutil.rmtree(gallery)
@@ -711,7 +728,12 @@ article{{background:#1d1d1d;padding:1rem;border-radius:.5rem}}img{{width:100%;he
 
 
 def result_summary(
-    gallery: Path, outcome: str, *, reason: str | None = None, error: str | None = None
+    gallery: Path,
+    outcome: str,
+    *,
+    reason: str | None = None,
+    error: str | None = None,
+    write: bool = True,
 ) -> dict[str, object]:
     summary: dict[str, object] = {
         "generated_at": _utc_now(),
@@ -724,7 +746,8 @@ def result_summary(
         summary["reason"] = reason
     if error:
         summary["error"] = error
-    write_gallery(gallery, summary)
+    if write:
+        write_gallery(gallery, summary)
     return summary
 
 
@@ -906,6 +929,20 @@ def write_step_summary(body: str, *, environ: dict[str, str] | None = None) -> N
         print(f"visual-qa: could not write GITHUB_STEP_SUMMARY: {exc}", file=sys.stderr)
 
 
+def write_workflow_output(
+    name: str, value: str, *, environ: dict[str, str] | None = None
+) -> None:
+    env = dict(os.environ) if environ is None else environ
+    target = env.get("GITHUB_OUTPUT")
+    if not target:
+        return
+    try:
+        with Path(target).open("a") as output:
+            print(f"{name}={value}", file=output)
+    except OSError as exc:
+        print(f"visual-qa: could not write GITHUB_OUTPUT: {exc}", file=sys.stderr)
+
+
 def publish_result(
     summary: dict[str, object], *, environ: dict[str, str] | None = None
 ) -> str:
@@ -1049,7 +1086,7 @@ def cmd_run(
     if output.is_absolute() or ".." in output.parts or output in (Path("."), Path("")):
         raise VisualQaError("--output must be a non-root path within the fork checkout")
     gallery = repo / output
-    prepare_gallery(gallery)
+    prepare_gallery(gallery, output_hint="--output directory")
     summary = capture_gallery(
         config, base_url, gallery, capture_factory=capture_factory
     )
@@ -1081,20 +1118,32 @@ def cmd_ci(
 ) -> int:
     env = dict(os.environ) if environ is None else environ
     gallery = repo / DEFAULT_GALLERY
-    prepare_gallery(gallery)
     try:
         config = load_config(repo)
     except VisualQaError as exc:
-        summary = result_summary(gallery, "failed", error=str(exc))
+        write_workflow_output("output", DEFAULT_GALLERY.as_posix(), environ=env)
+        try:
+            prepare_gallery(gallery)
+            write_summary = True
+            error = str(exc)
+        except Exception as prepare_exc:
+            write_summary = False
+            error = f"{exc}; gallery preparation also failed: {prepare_exc}"
+        summary = result_summary(gallery, "failed", error=error, write=write_summary)
         publish_result(summary, environ=env)
-        print(f"visual-qa: {exc}", file=sys.stderr)
+        print(f"visual-qa: {error}", file=sys.stderr)
         return 1
+
+    if config is not None:
+        gallery = repo / Path(str(config["output"]))
+    write_workflow_output("output", gallery.relative_to(repo).as_posix(), environ=env)
 
     if config is None:
         summary = result_summary(
             gallery,
             "neutral",
             reason="Visual QA is not configured — run `./sc visual-qa init`.",
+            write=False,
         )
         publish_result(summary, environ=env)
         print("visual-qa: not configured — neutral pass")
@@ -1103,11 +1152,25 @@ def cmd_ci(
     changed = changed_paths(repo, environ=env)
     if should_skip(config["paths"], changed):
         summary = result_summary(
-            gallery, "neutral", reason="No configured app paths changed."
+            gallery,
+            "neutral",
+            reason="No configured app paths changed.",
+            write=False,
         )
         publish_result(summary, environ=env)
         print("visual-qa: no app paths changed — neutral pass")
         return 0
+
+    try:
+        prepare_gallery(gallery)
+    except Exception as exc:
+        error = (
+            str(exc) if isinstance(exc, VisualQaError) else f"unexpected error: {exc}"
+        )
+        summary = result_summary(gallery, "failed", error=error, write=False)
+        publish_result(summary, environ=env)
+        print(f"visual-qa: {error}", file=sys.stderr)
+        return 1
 
     boot_log = gallery / "boot.log"
     try:
