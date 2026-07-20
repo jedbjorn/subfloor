@@ -1,8 +1,8 @@
 ---
-title: SUBFLOOR
+title: subfloor
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
 date: 2026-07-20
-project: Subfloor
+project: subfloor
 purpose: Forkable shell substrate for a repo
 ---
 
@@ -11,7 +11,7 @@ purpose: Forkable shell substrate for a repo
 [![license: MIT](https://img.shields.io/badge/license-MIT-6b46c1?style=flat-square)](LICENSE)
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/README.md)
 
-# Subfloor
+# subfloor
 
 **[Quick start](docs/quick-start.md) · [Full documentation](docs/README.md)**
 
@@ -30,7 +30,7 @@ Free to use, open source, MIT License.
 > [!class2]
 > **Repo:** [github.com/jedbjorn/subfloor](https://github.com/jedbjorn/subfloor) — source, issues, and releases.
 
-![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cover.png)
+![subfloor's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cover.png)
 
 ### The headliners
 
@@ -80,7 +80,7 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 > [!class4]
 > **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.** `./sc doctor` reports what it finds and the exact next command. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
 
-Drop super-coder into an existing git repo and boot a shell:
+Drop subfloor into an existing git repo and boot a shell:
 
 ```bash
 cd your-repo                                                  # an existing git repo
@@ -101,7 +101,7 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 ./sc enter                      # auth + pick a shell + pick a harness + boot
 
 # 5. Commit the install (engine is gitignored — only sc + .sc-state + config track):
-git add -A && git commit -m "chore: install super-coder"
+git add -A && git commit -m "chore: install subfloor"
 ```
 
 That's the happy path — you're talking to a planner shell in your repo, with a
