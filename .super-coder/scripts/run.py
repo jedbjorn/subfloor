@@ -525,8 +525,54 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
+def _liveness_note(shell, snap: "dict | None") -> str:
+    """Picker row annotation from the liveness snapshot: '(busy)' — a live
+    harness session holds the worktree; '(orphan?)' — the slot is held only by
+    survivors of closed terminals / dead parents; '(Exempt)' — the admin boots
+    at the repo root, outside the worktree signal, so it is never marked or
+    guarded. Empty when dormant or when no snapshot was taken (non-TTY)."""
+    if shell["flavor"] == "admin":
+        return style.dim("  (Exempt)")
+    if not snap:
+        return ""
+    state = shell_liveness.session_state(shell["shortname"] or "", snap)
+    if state == "busy":
+        return style.yellow("  (busy)")
+    if state == "orphan":
+        return style.yellow("  (orphan?)")
+    return ""
+
+
+def confirm_live(shell, snap: "dict | None") -> bool:
+    """Interactive twin of the headless liveness refusal: booting a shell whose
+    worktree already hosts a live session runs two sessions against one tree +
+    one memory row set, so warn and put the call to the operator. True → boot
+    (dormant, admin-exempt, no snapshot, or the operator said yes)."""
+    if not snap or shell["flavor"] == "admin" or not shell["shortname"]:
+        return True
+    state = shell_liveness.session_state(shell["shortname"], snap)
+    if state is None:
+        return True
+    pids, orphans = shell_liveness.orphan_split(shell["shortname"], snap)
+    if state == "orphan":
+        print(style.yellow(
+            f"\n  ⚠ {shell['shortname']} slot is held by an ORPHANED session "
+            f"(pid {', '.join(map(str, orphans))} — terminal closed / parent "
+            f"gone)."))
+        print(style.dim(
+            f"    Verify it is idle (`ps -o etime=,stat= -p {orphans[0]}`; no "
+            f"busy children), `kill` it, then boot. An orphan can still be "
+            f"mid-work — never kill unverified."))
+    else:
+        print(style.yellow(
+            f"\n  ⚠ {shell['shortname']} already has a live session "
+            f"(pid {', '.join(map(str, pids))}) — one shell, one session."))
+    return input("  Boot anyway? [y/N]: ").strip().lower() in ("y", "yes")
+
+
 def pick_shell(shells: list, requested: str | None,
-               first: bool, defaults: dict | None = None):
+               first: bool, defaults: dict | None = None,
+               snap: "dict | None" = None):
     defaults = defaults or {}
     if not shells:
         sys.exit("FATAL: no shells available to this user.")
@@ -557,11 +603,18 @@ def pick_shell(shells: list, requested: str | None,
         name = style.bold("{:<16}".format(s["display_name"] or ""))
         short = "{:<14}".format(s["shortname"] or "")
         print(f"{num}  {name}{short}"
-              f"{style.dim(_default_label(defaults, s['flavor']))}")
+              f"{style.dim(_default_label(defaults, s['flavor']))}"
+              f"{_liveness_note(s, snap)}")
+    if snap and snap.get("indeterminate"):
+        print(style.dim(f"\n  ⚠ {snap['indeterminate']} harness process(es) "
+                        f"with unreadable cwd — liveness markers are partial."))
     while True:
         choice = input("\nPick (#): ").strip()
         if choice.isdigit() and 1 <= int(choice) <= len(shells):
-            return shells[int(choice) - 1]
+            chosen = shells[int(choice) - 1]
+            if not confirm_live(chosen, snap):
+                continue          # operator declined — back to the picker
+            return chosen
         print("  invalid choice")
 
 
@@ -739,12 +792,24 @@ def main() -> None:
 
     user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
-    chosen = pick_shell(list_shells(con, user["user_id"]), requested, first, fdefaults)
+    # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
+    # boot list can mark occupied shells — (busy) / (orphan?) / (Exempt) — and
+    # confirm before booting into a live worktree. Headless keeps its own lazy
+    # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
+    snap = (shell_liveness.compute()
+            if not headless and sys.stdin.isatty() else None)
+    chosen = pick_shell(list_shells(con, user["user_id"]), requested, first,
+                        fdefaults, snap)
+    # Direct interactive boots (`./sc enter dev3`) skip the picker and its
+    # confirm — run the same guard here. Picker path already confirmed.
+    if requested and not headless and not confirm_live(chosen, snap):
+        sys.exit(f"aborted — shell '{chosen['shortname']}' has a live session "
+                 f"(one shell, one session; see shell_liveness)")
 
-    # Liveness guard (headless only): one shell, one session. A headless boot
+    # Liveness guard (headless): one shell, one session. A headless boot
     # into a worktree that already hosts a live harness would run two sessions
     # of the same shell against one tree + one memory row set. Interactive
-    # boots keep the operator's judgment; `sc run` is scripted, so it refuses.
+    # boots warn + confirm (above); `sc run` is scripted, so it refuses.
     # Admin boots at the repo root (no worktree signal), so it isn't guarded.
     if headless and chosen["shortname"] and chosen["flavor"] != "admin":
         snap = shell_liveness.compute()
