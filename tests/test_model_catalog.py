@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the model-catalog service (api/model_catalog.py).
 
-The catalog is layered and best-effort: models.dev (keyless, all four
+The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → `opencode models` CLI →
 cache → static floor. Payload v2 is family-first: per harness `families`
 (newest-first; claude families with a CLI alias resolve `latest` to the
@@ -41,6 +41,11 @@ MODELS_DEV = {
                                                "family": "devstral"}}},
     "ollama-cloud": {"models": {"deepseek-v4-pro": {"release_date": "2026-02-02",
                                                     "family": "deepseek"}}},
+    "kimi-for-coding": {"models": {
+        "k3": {"name": "Kimi K3", "release_date": "2026-07-16", "family": "kimi-k3"},
+        "kimi-for-coding": {"name": "Kimi K2.7 Code",
+                            "release_date": "2026-06-12", "family": "kimi-k2"},
+    }},
 }
 
 
@@ -77,6 +82,9 @@ class BuildTest(NoCLI):
         self.assertEqual(ids(got["harnesses"]["codex"]), ["gpt-5.5"])
         self.assertEqual(ids(got["harnesses"]["opencode"]),
                          ["ollama-cloud/deepseek-v4-pro"])
+        # kimi maps to the kimi-for-coding provider; ids stay bare (not
+        # provider-prefixed like opencode) — the form the CLI reports.
+        self.assertEqual(ids(got["harnesses"]["kimi"]), ["k3", "kimi-for-coding"])
         self.assertEqual(got["sources"], ["models.dev"])
 
     def test_families_newest_first_alias_latest(self):
