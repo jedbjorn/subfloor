@@ -10,7 +10,7 @@ Contract — every module exposes:
 
     HARNESS = "<name>"
     PARSER_VERSION = "<pin>"        # bumped when the expected format shape changes
-    def sweep(repo_root, since_epoch, log) -> list[dict]
+    def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]
 
   repo_root    Path — only sessions whose recorded cwd is this repo (root or a
                .sc-worktrees/ tree) are returned; the cwd rides on the row as a
@@ -19,6 +19,13 @@ Contract — every module exposes:
                epoch, for mtime-gated incremental skips. None = never captured.
   log          callable(str) — parser-level notices (shape drift, skipped
                files). Loud by design.
+  cache        dict — parser-owned incremental state, mutated in place; the
+               collector persists it per harness (analytics_parse_cache,
+               migration 0073) pinned to PARSER_VERSION, and passes {} on a
+               version mismatch or --full. A DISPOSABLE accelerator, never a
+               source of truth: parsers must produce identical rows with
+               cache={}. Only claude uses it today (per-file byte-offset
+               tail parsing, CC-145).
 
 Row keys: harness, harness_session_ref, provider, model, title, started_at,
 ended_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,

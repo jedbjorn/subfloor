@@ -194,7 +194,19 @@ graph LR
   incremental), on demand, and from the GUI analytics tab load.
   **Incrementality**: skip source files whose mtime ≤ the row's last
   `captured_at` — the first full sweep of harness history is large; every
-  later sweep touches only what changed.
+  later sweep touches only what changed. Two hazards close the gaps in that
+  gate (CC-145): **off-repo files** never produce rows so they never earn a
+  watermark — the codex parser bails on the `session_meta` line (line 1)
+  the moment the cwd is off-repo, instead of re-parsing other projects'
+  history every sweep; and the claude parser's **dir-scoped dedupe** meant
+  one live session file re-parsed its whole project dir every boot — per-file
+  parse state (byte-offset high-water mark + full id→usage maps, cross-file
+  dedupe replayed from cache in mtime order) persists in
+  `analytics_parse_cache` (migration 0073, one JSON row per harness, pinned
+  to `parser_version`), so a grown transcript parses only its tail delta. The
+  cache is a disposable accelerator, never a source of truth: it lives in the
+  DB so a rebuild drops rows and cache together, and a version bump or
+  `--full` discards it.
 - **Repo filtering (claude)**: read the `cwd` field on the JSONL lines, not
   the project-dir name — the dir-name dash-encoding is lossy (`/` and `-`
   encode identically). Harness sessions launched **outside** `run.py` in a

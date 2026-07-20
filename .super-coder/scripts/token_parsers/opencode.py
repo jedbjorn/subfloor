@@ -50,7 +50,7 @@ def _model_label(raw: "str | None", log) -> tuple:
     return mid, m.get("providerID")
 
 
-def sweep(repo_root, since_epoch, log) -> list[dict]:
+def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
     if not DB.exists():
         return []
     rows: list[dict] = []
