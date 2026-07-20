@@ -25,7 +25,7 @@ class VisualQaTemplateTest(unittest.TestCase):
     def test_workflow_is_the_fixed_managed_shim(self):
         text = (TEMPLATES / "subfloor-visual-qa.yml").read_text()
 
-        self.assertTrue(text.startswith("# managed-by: subfloor — visual-qa shim v1\n"))
+        self.assertTrue(text.startswith("# managed-by: subfloor — visual-qa shim v2\n"))
         self.assertIn("pull_request:\n", text)
         self.assertIn("workflow_dispatch:\n", text)
         self.assertIn("contents: read\n", text)
@@ -35,6 +35,7 @@ class VisualQaTemplateTest(unittest.TestCase):
         self.assertIn('checkout "$engine_ref" -- .super-coder', text)
         self.assertIn("hashFiles('.super-coder/scripts/visual_qa.py')", text)
         self.assertNotIn("playwright==", text)
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", text)
         self.assertIn("if: always()\n        uses: actions/upload-artifact@v4", text)
 
     def test_example_config_is_valid_and_inactive(self):
@@ -186,7 +187,7 @@ class VisualQaUpdateTest(unittest.TestCase):
 
     def test_older_managed_workflow_is_refreshed_but_example_is_preserved(self):
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v0\nold\n")
+        self.workflow.write_text("# managed-by: subfloor — visual-qa shim v1\nold\n")
         self.example.parent.mkdir(parents=True)
         self.example.write_text("fork note\n")
 
