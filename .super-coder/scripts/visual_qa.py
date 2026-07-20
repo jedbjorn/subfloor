@@ -1137,6 +1137,30 @@ def cmd_ci(
     if config is not None:
         gallery = repo / Path(str(config["output"]))
     write_workflow_output("output", gallery.relative_to(repo).as_posix(), environ=env)
+
+    if config is None:
+        summary = result_summary(
+            gallery,
+            "neutral",
+            reason="Visual QA is not configured — run `./sc visual-qa init`.",
+            write=False,
+        )
+        publish_result(summary, environ=env)
+        print("visual-qa: not configured — neutral pass")
+        return 0
+
+    changed = changed_paths(repo, environ=env)
+    if should_skip(config["paths"], changed):
+        summary = result_summary(
+            gallery,
+            "neutral",
+            reason="No configured app paths changed.",
+            write=False,
+        )
+        publish_result(summary, environ=env)
+        print("visual-qa: no app paths changed — neutral pass")
+        return 0
+
     try:
         prepare_gallery(gallery)
     except Exception as exc:
@@ -1147,25 +1171,6 @@ def cmd_ci(
         publish_result(summary, environ=env)
         print(f"visual-qa: {error}", file=sys.stderr)
         return 1
-
-    if config is None:
-        summary = result_summary(
-            gallery,
-            "neutral",
-            reason="Visual QA is not configured — run `./sc visual-qa init`.",
-        )
-        publish_result(summary, environ=env)
-        print("visual-qa: not configured — neutral pass")
-        return 0
-
-    changed = changed_paths(repo, environ=env)
-    if should_skip(config["paths"], changed):
-        summary = result_summary(
-            gallery, "neutral", reason="No configured app paths changed."
-        )
-        publish_result(summary, environ=env)
-        print("visual-qa: no app paths changed — neutral pass")
-        return 0
 
     boot_log = gallery / "boot.log"
     try:

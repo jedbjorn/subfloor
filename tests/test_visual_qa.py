@@ -571,10 +571,43 @@ class ModeTest(unittest.TestCase):
             summary["reason"],
             "Visual QA is not configured — run `./sc visual-qa init`.",
         )
+        self.assertFalse((self.repo / "gallery").exists())
+
+    def test_ci_without_config_ignores_tracked_gallery_and_publishes_neutral(self):
+        tracked = self.repo / "gallery" / "tracked-app-file.txt"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"keep me")
+        step_summary = self.repo / "step-summary.md"
+        github_output = self.repo / "github-output"
+        installer = mock.Mock(side_effect=AssertionError("installer called"))
+        app = mock.Mock(side_effect=AssertionError("app called"))
+
+        with mock.patch.object(visual_qa, "post_sticky_comment") as post:
+            code = visual_qa.cmd_ci(
+                argparse.Namespace(),
+                repo=self.repo,
+                environ={
+                    "GITHUB_OUTPUT": str(github_output),
+                    "GITHUB_STEP_SUMMARY": str(step_summary),
+                },
+                installer=installer,
+                app_context=app,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(installer.call_count, 0)
+        self.assertEqual(app.call_count, 0)
+        self.assertEqual(tracked.read_bytes(), b"keep me")
         self.assertEqual(
-            json.loads((self.repo / "gallery" / "summary.json").read_text())["outcome"],
-            "neutral",
+            [path.name for path in tracked.parent.iterdir()], [tracked.name]
         )
+        body = post.call_args.args[0]
+        self.assertIn("### ◻ Visual QA skipped", body)
+        self.assertIn("Visual QA is not configured", body)
+        written_summary = step_summary.read_text()
+        self.assertIn("### ◻ Visual QA skipped", written_summary)
+        self.assertIn("Visual QA is not configured", written_summary)
+        self.assertEqual(github_output.read_text(), "output=gallery\n")
 
     def test_ci_path_skip_is_neutral_and_does_not_cross_capture_boundaries(self):
         self.write_config(paths=["src/**"])
