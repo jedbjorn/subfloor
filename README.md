@@ -36,26 +36,26 @@ Free to use, open source, MIT License.
   **across providers** — devs on Codex, reviewers on Claude, the planner woken
   by events, workers booted headless per task. Zero scheduled polling: typed
   message rows, one PR-watch daemon, and session-surviving jobs carry the
-  whole coordination. ([*Sprints*](docs/sprints.md))
+  whole coordination. ([*Sprints*](docs/README.md#sprints))
 - **A standing team, not a session.** Shells are DB rows — identity, memory,
   decisions, skills — that survive every session and boot on any of four
   harnesses; the same shell can run Claude Code today and OpenCode tomorrow.
-  ([*The loop*](docs/the-loop.md) · [*Harnesses & models*](docs/harnesses-and-models.md))
+  ([*The loop*](docs/README.md#the-loop) · [*Harnesses & models*](docs/README.md#harnesses--models))
 - **Sidecars + brokers: capability without credentials.** A sandboxed shell
   tests against real Postgres, drives a real Windows VM, reaches tailnet
   hosts, bounces the host's pm2 stack, and reads the live app DB — while the
   DSN, the SSH key, the tailnet identity, and every route stay on the host,
   behind unix-socket brokers with fail-closed allowlists.
-  ([*Opt-in features*](docs/features.md))
+  ([*Opt-in features*](docs/README.md#opt-in-features))
 - **Worktrees + guardrails.** Every shell boots into its own git worktree on
   a base pinned to `origin/main`; a branch-guard blocks work on `main` in
   every harness; merging stays the operator's gate. Parallel shells, no
   clobbering, no surprise commits.
-  ([*Shells & worktrees*](docs/shells-and-worktrees.md))
+  ([*Shells & worktrees*](docs/README.md#shells--worktrees))
 - **Self-updating, in place.** `./sc update` pulls the new engine and
   migrates the DB under the fork's feet — memory intact, sound
   `./sc rollback`, and `./sc eject` the day you'd rather own it outright.
-  ([*Update a fork*](docs/update-a-fork.md))
+  ([*Update a fork*](docs/README.md#update-a-fork))
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
@@ -71,12 +71,12 @@ graph TD
 ```
 
 How the overlay works — every property injected through an extension point the
-harness already ships, nothing patched, nothing forked: [*Architecture*](docs/architecture.md).
+harness already ships, nothing patched, nothing forked: [*Architecture*](docs/README.md#architecture).
 
 ## Quick start
 
 > [!class4]
-> **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.** `./sc doctor` reports what it finds and the exact next command. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/install.md).
+> **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.** `./sc doctor` reports what it finds and the exact next command. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
 
 Drop super-coder into an existing git repo and boot a shell:
 
@@ -104,25 +104,28 @@ git add -A && git commit -m "chore: install super-coder"
 
 That's the happy path — you're talking to a planner shell in your repo, with a
 whole team behind it. Installer internals and harness sign-in, step by step:
-[*Install*](docs/install.md).
+[*Install*](docs/README.md#install).
 
 ## Docs
 
-| Page | What's in it |
+One page, ten sections — [docs/README.md](docs/README.md), or tab through it
+themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
+
+| Section | What's in it |
 |---|---|
-| [**Architecture**](docs/architecture.md) | The harness-overlay model, the engine/fork boundary, the repo layout |
-| [**Install**](docs/install.md) | Prerequisites, install & launch, installer internals, harness sign-in |
-| [**The loop**](docs/the-loop.md) | The everyday cycle: map → spec → build → review → freeze → verify |
-| [**Harnesses & models**](docs/harnesses-and-models.md) | Plans over API keys; which model each role runs, and why |
-| [**Shells & worktrees**](docs/shells-and-worktrees.md) | How a whole team shares one repo without clobbering it |
-| [**Sprints**](docs/sprints.md) | The multi-shell mode: declared pushes on a zero-polling event loop |
-| [**Update a fork**](docs/update-a-fork.md) | `./sc update` / `rollback`; customize vs upstream vs eject |
-| [**CLI & dev kit**](docs/cli.md) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
-| [**Opt-in features**](docs/features.md) | pg sidecar · Windows Test VM · tailnet / pm2 / db brokers |
-| [**Review GUI**](docs/review-gui.md) | The localhost GUI's nine tabs + token & session analytics |
+| [**Architecture**](docs/README.md#architecture) | The harness-overlay model, the engine/fork boundary, the repo layout |
+| [**Install**](docs/README.md#install) | Prerequisites, install & launch, installer internals, harness sign-in |
+| [**The loop**](docs/README.md#the-loop) | The everyday cycle: map → spec → build → review → freeze → verify |
+| [**Harnesses & models**](docs/README.md#harnesses--models) | Plans over API keys; which model each role runs, and why |
+| [**Shells & worktrees**](docs/README.md#shells--worktrees) | How a whole team shares one repo without clobbering it |
+| [**Sprints**](docs/README.md#sprints) | The multi-shell mode: declared pushes on a zero-polling event loop |
+| [**Update a fork**](docs/README.md#update-a-fork) | `./sc update` / `rollback`; customize vs upstream vs eject |
+| [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
+| [**Opt-in features**](docs/README.md#opt-in-features) | pg sidecar · Windows Test VM · tailnet / pm2 / db brokers |
+| [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's nine tabs + token & session analytics |
 
 > [!class2]
-> **Reading these docs.** Every page is themed markdown — GitHub renders it fine; the **Open in md-converter** badge up top serves the intended themed render. Swap the badge URL's `README.md` for any `docs/` path to read that page themed.
+> **Reading the docs.** The docs are themed markdown — GitHub renders the page fine, and the md-converter link above serves the intended render: one tab per section, arrow keys to move between them.
 
 ## License
 
