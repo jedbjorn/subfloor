@@ -14,7 +14,7 @@ purpose: Self-tracked token + session + usage analytics
 
 # Token & Session Analytics — Spec
 
-[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/main/specs_sc/token-session-analytics.md)
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/specs_sc/token-session-analytics.md)
 
 ## Overview
 
