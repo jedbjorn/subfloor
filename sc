@@ -906,6 +906,8 @@ case "$cmd" in
   # ── session-surviving local jobs: detached supervised one-shots whose
   # completion posts a result row to the starting shell's inbox ──
   job)               exec "$PY" "$S/job.py" "$@" ;;
+  # Advisory viewport screenshots for fork apps (CI + local capture + init).
+  visual-qa)         exec "$PY" "$S/visual_qa.py" "$@" ;;
   # Raw read passthrough to the engine + map DBs, resolved by absolute path so no
   # skill example ever needs a cwd-relative `sqlite3 .super-coder/…` (which pulls a
   # shell into `cd`-ing to the root — the cwd trap). Read-only is ENFORCED
@@ -1166,6 +1168,7 @@ super-coder — forkable shell substrate
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
   ./sc job wait <id>       bounded foreground wait, ≤550s slice — exit 0 done · 2 still running
                              (drain your inbox between slices); list/status/tail/kill complete the set
+  ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
   sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.

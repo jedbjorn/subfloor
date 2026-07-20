@@ -1,4 +1,4 @@
-# managed-by: subfloor — visual-qa shim v1
+# managed-by: subfloor — visual-qa shim v2
 # Edits are overwritten by `make update`. Delete the managed-by line to take
 # ownership; subfloor will then leave this file alone.
 name: Subfloor Visual QA
@@ -52,6 +52,8 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               print(f"retention={days}", file=out)
       - run: ./sc visual-qa ci
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Upload Visual QA gallery
         if: always()
         uses: actions/upload-artifact@v4
