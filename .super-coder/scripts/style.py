@@ -59,14 +59,18 @@ class _Spinner:
         if not self._active:
             return
         self._thread = threading.Thread(target=self._spin, daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except RuntimeError:
+            self._thread = None
+            self._active = False
 
     def stop(self) -> None:
         if self._thread is None or self._stopped:
             return
         self._stopped = True
         self._stop.set()
-        self._thread.join(timeout=0.2)
+        self._thread.join()
         sys.stdout.write("\r\x1b[2K")
         sys.stdout.flush()
 

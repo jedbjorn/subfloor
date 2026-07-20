@@ -833,7 +833,6 @@ def main() -> None:
         ).fetchone()
         api_port = ports_mod.resolve().get("port")
 
-        spinner.label = "syncing worktree"
         # Every shell gets an isolated git worktree so parallel shells can work on
         # separate branches without clobbering each other — planner/reviewer commit
         # their own artifacts (specs, snapshots, state) there too. All artifacts
@@ -845,6 +844,7 @@ def main() -> None:
         work_dir = REPO_ROOT
         sync_note = None
         if chosen["shortname"] and chosen["flavor"] != "admin":
+            spinner.label = "syncing worktree"
             work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
             ensure_worktree(work_dir, chosen["shortname"])
             sync_note = sync_worktree(work_dir, chosen["shortname"])
@@ -852,7 +852,6 @@ def main() -> None:
             if harness == "codex":
                 trust_note = trust_codex_worktree(work_dir)
 
-        spinner.label = "pruning merged branches"
         # Repo-global branch hygiene: delete local branches whose PR is provably
         # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
         # checked-out branch). The unattended subset of the git_cleanup skill, run
@@ -862,6 +861,7 @@ def main() -> None:
         # not mutate) and opt-out-able per fork via SC_NO_AUTOPRUNE=1.
         prune_note = None
         if not os.environ.get("SC_NO_AUTOPRUNE") and not os.environ.get("RENDER_ONLY"):
+            spinner.label = "pruning merged branches"
             try:
                 prune_note = git_prune.status_line(git_prune.prune(fetch=False))
             except Exception:
