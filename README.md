@@ -6,14 +6,14 @@ project: super-coder
 purpose: Forkable shell substrate for a repo
 ---
 
-[![tests](https://img.shields.io/github/actions/workflow/status/jedbjorn/super-coder/tests.yml?style=flat-square&label=tests)](https://github.com/jedbjorn/super-coder/actions/workflows/tests.yml)
-[![render-check](https://img.shields.io/github/actions/workflow/status/jedbjorn/super-coder/render-check.yml?style=flat-square&label=render-check)](https://github.com/jedbjorn/super-coder/actions/workflows/render-check.yml)
+[![tests](https://img.shields.io/github/actions/workflow/status/jedbjorn/subfloor/tests.yml?style=flat-square&label=tests)](https://github.com/jedbjorn/subfloor/actions/workflows/tests.yml)
+[![render-check](https://img.shields.io/github/actions/workflow/status/jedbjorn/subfloor/render-check.yml?style=flat-square&label=render-check)](https://github.com/jedbjorn/subfloor/actions/workflows/render-check.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-6b46c1?style=flat-square)](LICENSE)
-[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/main/README.md)
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/README.md)
 
 # super-coder
 
-![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/demo.gif)
+![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
 ## Overview
 
@@ -26,9 +26,9 @@ host path).
 Free to use, open source, MIT License.
 
 > [!class2]
-> **Repo:** [github.com/jedbjorn/super-coder](https://github.com/jedbjorn/super-coder) — source, issues, and releases.
+> **Repo:** [github.com/jedbjorn/subfloor](https://github.com/jedbjorn/subfloor) — source, issues, and releases.
 
-![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cover.png)
+![super-coder's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cover.png)
 
 ### The headliners
 
@@ -84,7 +84,7 @@ Drop super-coder into an existing git repo and boot a shell:
 cd your-repo                                                  # an existing git repo
 
 # 1. Pull in the engine + entry script (files only, no history merge):
-git remote add super-coder https://github.com/jedbjorn/super-coder.git
+git remote add super-coder https://github.com/jedbjorn/subfloor.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 

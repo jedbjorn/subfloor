@@ -8,7 +8,7 @@ purpose: Host-side broker so sandboxed forks can drive the test VM
 
 # Windows VM Broker — Spec
 
-[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/super-coder/blob/main/.super-coder/docs/windows-vm-broker.md)
+[![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/.super-coder/docs/windows-vm-broker.md)
 
 ## Overview
 

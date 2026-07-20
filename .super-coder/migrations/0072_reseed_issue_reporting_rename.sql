@@ -1,24 +1,25 @@
----
-rendered_by: super-coder
-source: db
-edit: changes here are overwritten — author via the shell or localhost GUI
----
+-- 0072 — reseed: issue_reporting URLs after the super-coder → subfloor rename.
+--
+-- The repo renamed to jedbjorn/subfloor; the skill's issue/PR links move off
+-- the redirect. Source asset updated in the same commit; this trailing
+-- forward reseed (UPSERT by name; skill_id + grants preserved) carries it to
+-- installed forks and fresh builds alike.
 
-# issue_reporting
+BEGIN;
 
-Report engine defects upstream — the moment a ./sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo's app bugs stay in the fork.
-
-**Category:** substrate
-
----
-
-# issue_reporting — the backwards flow
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'issue_reporting',
+  'Report engine defects upstream — the moment a ./sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
+  'substrate',
+  NULL,
+  1,
+  '# issue_reporting — the backwards flow
 
 An engine defect fixed upstream reaches every fork via `./sc update`; worked
 around silently, every fork re-derives the workaround. File the issue while
 the failure is on screen — NEVER batch to session end.
 
-A workaround IS a report: deviating from a skill's steps, wrapping a command,
+A workaround IS a report: deviating from a skill''s steps, wrapping a command,
 or hand-patching state to proceed -> you hold the exact repro; file it now.
 
 ## Boundary — engine vs fork
@@ -26,7 +27,7 @@ or hand-patching state to proceed -> you hold the exact repro; file it now.
 | Where | What |
 |---|---|
 | **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `./sc update` + migrations, the `_sc` API + `sc mem` |
-| **Fork — don't** | the repo's app code, fork-local skills (see `local_skill_management`), operator-owned host config |
+| **Fork — don''t** | the repo''s app code, fork-local skills (see `local_skill_management`), operator-owned host config |
 
 Unsure -> "would the same problem hit any other fork?" yes = upstream.
 
@@ -40,14 +41,14 @@ Match the left column -> file.
 | A `./sc` command fails out of the box | `./sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
 | A command exits green without doing the work | `./sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
 | The documented remedy is a closed loop | `./sc lint` said "run `./sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
-| A skill instructs tools/paths your seat doesn't have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
+| A skill instructs tools/paths your seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
-| The API refuses what the skills document | `sc mem doc add` 400'd standalone docs the docs + onboard skills both document (#245) |
-| A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404'd advancing its status (#224) |
-| Every write suddenly 401s | rebuild didn't re-mint api_keys — all live shells locked out until an API bounce (#214) |
+| The API refuses what the skills document | `sc mem doc add` 400''d standalone docs the docs + onboard skills both document (#245) |
+| A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404''d advancing its status (#224) |
+| Every write suddenly 401s | rebuild didn''t re-mint api_keys — all live shells locked out until an API bounce (#214) |
 | `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
 | A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `./sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
-| The sandbox can reach something it shouldn't | `do_push` src/dest weren't contained — sandbox→host escape (#228) |
+| The sandbox can reach something it shouldn''t | `do_push` src/dest weren''t contained — sandbox→host escape (#228) |
 
 Stale guidance (skill says X, engine does Y) files the same as a crash.
 
@@ -70,7 +71,7 @@ gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
 # 2. file — title: [<fork>] <area>: <one-line symptom>
 gh issue create --repo jedbjorn/subfloor \
   --title "[<fork>] <area>: <symptom>" \
-  --body "$(cat <<'EOF'
+  --body "$(cat <<''EOF''
 - engine ref: <sha from .sc-state/engine.ref>
 - fork/seat: <repo> · <shell flavor> · <sandbox|host>
 
@@ -97,4 +98,12 @@ message the **admin** shell to relay it upstream (see `messaging`).
 - Observed failure = the bar for filing unasked; enhancement ideas ("the
   engine should…") go to your FnB first.
 - Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
-  issue URL.
+  issue URL.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

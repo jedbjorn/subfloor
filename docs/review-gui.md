@@ -36,9 +36,9 @@ rolling content PR. How they authenticate to GitHub (`gh auth login` or a scoped
 `GET /api/logs`, last 20 events) for seeing what a publish actually did:
 [`.super-coder/docs/publish-and-gh-auth.md`](../.super-coder/docs/publish-and-gh-auth.md).
 
-![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-tab.png)
+![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-tab.png)
 
-![Review GUI, Worktrees tab — live git-hygiene report: dirty worktrees, each branch ahead/behind its base, and prunable merged branches](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/worktrees-tab.png)
+![Review GUI, Worktrees tab — live git-hygiene report: dirty worktrees, each branch ahead/behind its base, and prunable merged branches](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/worktrees-tab.png)
 
 ### Roadmap views — Board & Flow
 
@@ -55,7 +55,7 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
   prerequisite must land before what it blocks. The graph is kept acyclic, so it
   reads cleanly stage by stage.
 
-![Review GUI, Roadmap tab — Flow view: features grouped by work-stream across the planning stages, with blocker dependencies wired between cards](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/roadmap-flow.png)
+![Review GUI, Roadmap tab — Flow view: features grouped by work-stream across the planning stages, with blocker dependencies wired between cards](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-flow.png)
 
 > [!class2]
 > **Drive it from the shell, too.** `./sc mem roadmap project <feature_id> <work-stream>`
@@ -133,7 +133,7 @@ usage panels (favorite model by flavor, peak day, features and specs shipped,
 docs outstanding), and a session history grouped by local day with sprint
 clusters and per-session token rollups.
 
-![Review GUI, Analytics tab — token-class stat cards with harness and model filters, the total-tokens spend graph, usage panels (favorite model by flavor, peak day, features and specs shipped, docs outstanding), and the day-grouped session history](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/analytics.png)
+![Review GUI, Analytics tab — token-class stat cards with harness and model filters, the total-tokens spend graph, usage panels (favorite model by flavor, peak day, features and specs shipped, docs outstanding), and the day-grouped session history](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/analytics.png)
 
 The same reads are served as JSON at `/api/analytics/*` (session window +
 cursor, token totals and series, filters) for anything outside the GUI.

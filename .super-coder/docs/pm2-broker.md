@@ -6,7 +6,7 @@ pm2-supervised app stack without holding any host access. Third sibling of the
 [tailnet broker](tailscale-broker.md); same shape, different backend.
 
 Upstreamed from a fork's deploy-confirmation gap
-([super-coder#254](https://github.com/jedbjorn/super-coder/issues/254)): an
+([super-coder#254](https://github.com/jedbjorn/subfloor/issues/254)): an
 admin shell mandated to own its fork's infra could not see or bounce the pm2
 stack it was responsible for.
 

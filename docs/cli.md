@@ -42,7 +42,7 @@ sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` 
 ./sc help                # all commands
 ```
 
-![The ./sc enter shell picker — authenticate, then choose a shell and its per-flavor harness and model defaults before boot](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/images/cli-picker.png)
+![The ./sc enter shell picker — authenticate, then choose a shell and its per-flavor harness and model defaults before boot](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cli-picker.png)
 
 **Choosing a harness.** The boot artifact is dual-written every launch
 (`CLAUDE.md` for Claude Code, `AGENTS.md` for the rest), so any installed harness
