@@ -226,7 +226,7 @@ def ensure_worktree(work_dir: Path, shortname: str) -> None:
         sys.exit(f"FATAL: could not create worktree at {work_dir}:\n{result.stderr.strip()}")
 
 
-def link_worktree_map(work_dir: Path) -> None:
+def link_worktree_map(work_dir: Path) -> "str | None":
     """Point a shell worktree's .sc-state/map.db at the ROOT's map DB.
 
     The dr_* repo map is a single derived cache at the main repo root (built by
@@ -251,7 +251,7 @@ def link_worktree_map(work_dir: Path) -> None:
         sc_state.mkdir(parents=True, exist_ok=True)
         if link.is_symlink():
             if link.readlink() == target:
-                return
+                return None
             link.unlink()
         elif link.exists():
             link.unlink()  # empty/stale per-worktree shadow — root is canonical
@@ -261,10 +261,11 @@ def link_worktree_map(work_dir: Path) -> None:
                 p.unlink()
         link.symlink_to(target)
     except OSError as e:
-        print(f"→ map link: skipped ({e})")
+        return f"→ map link: skipped ({e})"
+    return None
 
 
-def trust_codex_worktree(work_dir: Path) -> None:
+def trust_codex_worktree(work_dir: Path) -> "str | None":
     """Mark a codex shell's worktree as a trusted project in codex's config, so
     its project-local .codex/hooks.json (the branch-guard) actually LOADS.
 
@@ -286,14 +287,14 @@ def trust_codex_worktree(work_dir: Path) -> None:
     try:
         text = cfg.read_text() if cfg.exists() else ""
         if header in text:
-            return  # already trusted (codex writes exactly this stanza)
+            return None  # already trusted (codex writes exactly this stanza)
         home.mkdir(parents=True, exist_ok=True)
         sep = "" if (not text or text.endswith("\n")) else "\n"
         with cfg.open("a") as f:
             f.write(f'{sep}\n{header}\ntrust_level = "trusted"\n')
-        print(f"→ codex: trusted worktree layer (hooks load) → {cfg}")
+        return f"→ codex: trusted worktree layer (hooks load) → {cfg}"
     except OSError as e:
-        print(f"→ codex trust: skipped ({e})")
+        return f"→ codex trust: skipped ({e})"
 
 
 def _git(work_dir: Path, *args: str, timeout: int = 15) -> "subprocess.CompletedProcess[str]":
@@ -784,96 +785,109 @@ def main() -> None:
                or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
 
-    # Now that the harness is known, resolve THIS flavor's model for it (the
-    # (flavor, harness) cell). None when the flavor has no entry for the chosen
-    # harness (e.g. opencode as a manual fallback) — then the harness picks its own.
-    flavor_model = fdef["models"].get(harness) if fdef else None
+    feedback = not headless and not os.environ.get("RENDER_ONLY")
+    map_note = None
+    trust_note = None
+    with style.spinner("sweeping analytics", enabled=feedback) as spinner:
+        # Now that the harness is known, resolve THIS flavor's model for it (the
+        # (flavor, harness) cell). None when the flavor has no entry for the chosen
+        # harness (e.g. opencode as a manual fallback) — then the harness picks its own.
+        flavor_model = fdef["models"].get(harness) if fdef else None
 
-    # Pre-session analytics sweep (doc #11): pull harness-side usage data into
-    # session_token_usage + backfill the PREVIOUS session's ended_at. MUST run
-    # before open_session — the stub-reuse check there relies on the previous
-    # boot's session being attributed to its archive already. Incremental
-    # (mtime-gated), so steady-state cost is near zero; the first-ever sweep of
-    # harness history is the one large pass. Best-effort like the prune — a
-    # broken parser must never block a boot. Skipped under RENDER_ONLY
-    # (headless verify must not mutate).
-    sweep_note = None
-    if not os.environ.get("RENDER_ONLY"):
-        try:
-            import analytics
-            s = analytics.sweep(quiet=True)
-            if s["inserted"] or s["updated"]:
-                sweep_note = (f"{s['inserted']} new, {s['updated']} refreshed "
-                              f"session-usage row(s)")
-        except Exception:
-            sweep_note = None
+        # Pre-session analytics sweep (doc #11): pull harness-side usage data into
+        # session_token_usage + backfill the PREVIOUS session's ended_at. MUST run
+        # before open_session — the stub-reuse check there relies on the previous
+        # boot's session being attributed to its archive already. Incremental
+        # (mtime-gated), so steady-state cost is near zero; the first-ever sweep of
+        # harness history is the one large pass. Best-effort like the prune — a
+        # broken parser must never block a boot. Skipped under RENDER_ONLY
+        # (headless verify must not mutate).
+        sweep_note = None
+        if not os.environ.get("RENDER_ONLY"):
+            try:
+                import analytics
+                s = analytics.sweep(quiet=True)
+                if s["inserted"] or s["updated"]:
+                    sweep_note = (f"{s['inserted']} new, {s['updated']} refreshed "
+                                  f"session-usage row(s)")
+            except Exception:
+                sweep_note = None
 
-    # The model this launch will actually route (headless resolves via flags →
-    # flavor default; interactive routes the flavor default). None = the harness
-    # picks its own — recorded as NULL, honest about what we know at boot.
-    session_model = (resolve_headless_model(flag_model, fdef, harness)
-                     if headless else flavor_model)
-    session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
-        "harness": harness,
-        "provider": session_provider(harness, session_model),
-        "model": session_model,
-        "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
-    })
+        spinner.label = "opening session"
+        # The model this launch will actually route (headless resolves via flags →
+        # flavor default; interactive routes the flavor default). None = the harness
+        # picks its own — recorded as NULL, honest about what we know at boot.
+        session_model = (resolve_headless_model(flag_model, fdef, harness)
+                         if headless else flavor_model)
+        session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
+            "harness": harness,
+            "provider": session_provider(harness, session_model),
+            "model": session_model,
+            "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+        })
 
-    full = con.execute(
-        "SELECT shell_id, display_name, shortname, partner, role, mandate, "
-        "current_state, system_prompt, connections, flavor, api_key FROM shells WHERE shell_id=?",
-        (chosen["shell_id"],),
-    ).fetchone()
-    api_port = ports_mod.resolve().get("port")
+        full = con.execute(
+            "SELECT shell_id, display_name, shortname, partner, role, mandate, "
+            "current_state, system_prompt, connections, flavor, api_key FROM shells WHERE shell_id=?",
+            (chosen["shell_id"],),
+        ).fetchone()
+        api_port = ports_mod.resolve().get("port")
 
-    # Every shell gets an isolated git worktree so parallel shells can work on
-    # separate branches without clobbering each other — planner/reviewer commit
-    # their own artifacts (specs, snapshots, state) there too. All artifacts
-    # (CLAUDE.md, AGENTS.md, skills, harness config) land in the worktree root;
-    # the harness is exec'd from there. The ONE exception is the admin flavor:
-    # it maintains `main` itself (engine updates, migrations, applying approved
-    # patches), so it boots in the repo root — no worktree, no shell/* branch.
-    # The branch-guard exempts it via SC_SHELL_FLAVOR (exported at exec below).
-    work_dir = REPO_ROOT
-    sync_note = None
-    if chosen["shortname"] and chosen["flavor"] != "admin":
-        work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
-        ensure_worktree(work_dir, chosen["shortname"])
-        sync_note = sync_worktree(work_dir, chosen["shortname"])
-        link_worktree_map(work_dir)  # .sc-state/map.db -> root's map DB (heals shadows)
-        if harness == "codex":
-            trust_codex_worktree(work_dir)  # so codex loads the worktree's branch-guard hook
+        spinner.label = "syncing worktree"
+        # Every shell gets an isolated git worktree so parallel shells can work on
+        # separate branches without clobbering each other — planner/reviewer commit
+        # their own artifacts (specs, snapshots, state) there too. All artifacts
+        # (CLAUDE.md, AGENTS.md, skills, harness config) land in the worktree root;
+        # the harness is exec'd from there. The ONE exception is the admin flavor:
+        # it maintains `main` itself (engine updates, migrations, applying approved
+        # patches), so it boots in the repo root — no worktree, no shell/* branch.
+        # The branch-guard exempts it via SC_SHELL_FLAVOR (exported at exec below).
+        work_dir = REPO_ROOT
+        sync_note = None
+        if chosen["shortname"] and chosen["flavor"] != "admin":
+            work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
+            ensure_worktree(work_dir, chosen["shortname"])
+            sync_note = sync_worktree(work_dir, chosen["shortname"])
+            map_note = link_worktree_map(work_dir)
+            if harness == "codex":
+                trust_note = trust_codex_worktree(work_dir)
 
-    # Repo-global branch hygiene: delete local branches whose PR is provably
-    # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
-    # checked-out branch). The unattended subset of the git_cleanup skill, run
-    # once per boot from whichever shell launches next. Best-effort and silent:
-    # soft-fails so it never blocks a launch, and surfaces a line only when it
-    # actually removed something. Skipped under RENDER_ONLY (headless verify must
-    # not mutate) and opt-out-able per fork via SC_NO_AUTOPRUNE=1.
-    prune_note = None
-    if not os.environ.get("SC_NO_AUTOPRUNE") and not os.environ.get("RENDER_ONLY"):
-        try:
-            prune_note = git_prune.status_line(git_prune.prune(fetch=False))
-        except Exception:
-            prune_note = None
+        spinner.label = "pruning merged branches"
+        # Repo-global branch hygiene: delete local branches whose PR is provably
+        # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
+        # checked-out branch). The unattended subset of the git_cleanup skill, run
+        # once per boot from whichever shell launches next. Best-effort and silent:
+        # soft-fails so it never blocks a launch, and surfaces a line only when it
+        # actually removed something. Skipped under RENDER_ONLY (headless verify must
+        # not mutate) and opt-out-able per fork via SC_NO_AUTOPRUNE=1.
+        prune_note = None
+        if not os.environ.get("SC_NO_AUTOPRUNE") and not os.environ.get("RENDER_ONLY"):
+            try:
+                prune_note = git_prune.status_line(git_prune.prune(fetch=False))
+            except Exception:
+                prune_note = None
 
-    content = compose_boot(con, full, user, session_id, archive_id,
-                           work_dir=work_dir if work_dir != REPO_ROOT else None,
-                           sync_note=sync_note,
-                           api_key=full["api_key"],
-                           api_port=api_port)
+        spinner.label = "rendering boot doc + skills"
+        content = compose_boot(con, full, user, session_id, archive_id,
+                               work_dir=work_dir if work_dir != REPO_ROOT else None,
+                               sync_note=sync_note,
+                               api_key=full["api_key"],
+                               api_port=api_port)
 
-    # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
-    # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
-    skills = flat.render_skill_md(con, full["shell_id"], work_dir)
-    con.close()
+        # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
+        # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
+        skills = flat.render_skill_md(con, full["shell_id"], work_dir)
+        con.close()
 
-    # One compose, two outputs — Claude Code reads CLAUDE.md, the AGENTS.md
-    # harnesses read AGENTS.md. Both at the working directory root.
-    for name in ("CLAUDE.md", "AGENTS.md"):
-        atomic_write(work_dir / name, content)
+        # One compose, two outputs — Claude Code reads CLAUDE.md, the AGENTS.md
+        # harnesses read AGENTS.md. Both at the working directory root.
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            atomic_write(work_dir / name, content)
+
+    if map_note:
+        print(map_note)
+    if trust_note:
+        print(trust_note)
 
     print(f"\n→ booted {style.bold(full['display_name'])} "
           f"(shell_id={full['shell_id']}, session={session_id})")
