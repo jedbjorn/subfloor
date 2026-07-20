@@ -94,30 +94,35 @@ def run_script(name: str) -> None:
 
 
 def is_source_repo() -> bool:
-    """The super-coder SOURCE repo (origin basename == super-coder) tracks the
-    engine as its canonical source — it must NEVER untrack or materialize over
-    it. A fork's origin is its own repo (super-coder is a separate remote)."""
+    """The SOURCE repo (origin basename in install.SOURCE_REPO_NAMES — both
+    names valid across the super-coder → subfloor rename) tracks the engine as
+    its canonical source — it must NEVER untrack or materialize over it. A
+    fork's origin is its own repo (the engine upstream is a separate remote).
+    A miss here is destructive: the fork branch below git-rm-caches the
+    engine — exactly what hit the dogfood repo the day origin was renamed."""
     url = git("remote", "get-url", "origin", check=False).stdout.strip()
-    return bool(url) and url.rstrip("/").split("/")[-1].removesuffix(".git") == "super-coder"
+    return bool(url) and (url.rstrip("/").split("/")[-1].removesuffix(".git")
+                          in install_mod.SOURCE_REPO_NAMES)
 
 
 def super_coder_remote() -> str:
-    """The remote pointing at super-coder. Prefer a URL match (robust to a
-    rename), else a remote literally named 'super-coder'."""
+    """The remote pointing at the engine upstream. Prefer a URL match (either
+    name across the super-coder → subfloor rename), else a remote literally
+    named after it."""
     named = None
     for line in git("remote", "-v", check=False).stdout.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
         name, url = parts[0], parts[1]
-        if "super-coder" in url:
+        if any(n in url for n in install_mod.SOURCE_REPO_NAMES):
             return name
-        if name == "super-coder":
+        if name in install_mod.SOURCE_REPO_NAMES:
             named = name
     if named:
         return named
-    sys.exit("update: no super-coder remote found. Add it:\n"
-             "  git remote add super-coder https://github.com/jedbjorn/super-coder.git")
+    sys.exit("update: no engine upstream remote found. Add it:\n"
+             "  git remote add super-coder https://github.com/jedbjorn/subfloor.git")
 
 
 def _engine_paths_at(ref: str) -> list[str]:
