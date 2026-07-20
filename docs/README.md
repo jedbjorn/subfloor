@@ -1,12 +1,12 @@
 ---
-title: super-coder — Docs
+title: subfloor — Docs
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
 date: 2026-07-20
-project: super-coder
+project: subfloor
 purpose: The full documentation, ten sections
 ---
 
-# super-coder — Docs
+# subfloor — Docs
 
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md)
 
@@ -18,7 +18,7 @@ on GitHub this reads as one long page with the same anchors.
 ### A harness overlay
 
 A coding harness ships the **loop** — model, tools, context window — and
-forgets everything else between sessions. super-coder is a **harness
+forgets everything else between sessions. subfloor is a **harness
 overlay**: it supplies the properties a harness doesn't keep, and injects
 every one of them through an extension point the harness itself already
 ships — nothing patched, nothing forked:
@@ -33,12 +33,12 @@ ships — nothing patched, nothing forked:
 
 The overlay makes the harness you rent behave like it has all of this built
 in — without touching its loop. Think **distro over kernel**: the kernel (the
-harness) runs the process; the distro (super-coder) gives it users, packages,
+harness) runs the process; the distro (subfloor) gives it users, packages,
 init, and permissions. Four harnesses, one overlay, zero forks of anyone's
 loop — that is what harness-agnostic means in practice, and it's why a fork
 is cheap: same overlay, whichever kernel you rent underneath.
 
-This repo is also **dogfood**: super-coder maintains super-coder. Its own
+This repo is also **dogfood**: subfloor maintains subfloor. Its own
 `.super-coder/` engine manages the maintainer shell that builds it.
 
 ```stats
@@ -87,7 +87,7 @@ that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 
 **Preparation**
 
-One-time host setup — get this right and the rest is `./sc install`. super-coder
+One-time host setup — get this right and the rest is `./sc install`. subfloor
 runs the harness in a **docker sandbox**; the installer bootstraps everything
 else. The host needs a container engine, a few base tools, and one signed-in
 coding harness.
@@ -104,7 +104,7 @@ coding harness.
 
 **Install & launch**
 
-With the prerequisites in place, drop super-coder into an existing git repo and
+With the prerequisites in place, drop subfloor into an existing git repo and
 boot a shell:
 
 ```bash
@@ -126,7 +126,7 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 ./sc enter                      # auth + pick a shell + pick a harness + boot
 
 # 5. Commit the install (engine is gitignored — only sc + .sc-state + config track):
-git add -A && git commit -m "chore: install super-coder"
+git add -A && git commit -m "chore: install subfloor"
 ```
 
 That's the happy path. Each step is covered in depth below — installer internals,
@@ -138,10 +138,10 @@ arc from a fresh repo through ship-and-loop, see [*The loop*](#the-loop).
 > [!class2]
 > **UI** Shells · Scripts · **Shells** seeds the starting team — planner · 2×dev · reviewer · admin · cartographer
 
-super-coder installs **alongside** your code — it renders to `_sc` dirs, so it
+subfloor installs **alongside** your code — it renders to `_sc` dirs, so it
 never collides with your repo's own `/docs`, `/specs`, or skills. A fork
 inherits the **system** (schema + the skill catalogue + the render chain), never
-super-coder's own memory or roadmap.
+subfloor's own memory or roadmap.
 
 > [!class4]
 > **Requirements: `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the four harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with only `python3` + `sqlite3` (and a harness on `PATH`).
@@ -174,7 +174,7 @@ checks the daemon is reachable and points you here if not — it never does setu
   ```
 
 The commands are the five steps in the Quick start above — pull the engine in
-via git (no history merge; super-coder never touches your repo's own
+via git (no history merge; subfloor never touches your repo's own
 `Makefile`), `./sc install`, sign in, launch, commit.
 
 `./sc install` does the rest: checks requirements, **installs the harness CLIs**
@@ -182,14 +182,14 @@ via git (no history merge; super-coder never touches your repo's own
 npm — if any are missing; `--skip-harness-install` to detect only), wires your `.gitignore`,
 **makes the engine a gitignored dependency** (`git rm -r --cached .super-coder` —
 files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
-super-coder's own per-instance content** (a fork inherits the *system* — schema +
+subfloor's own per-instance content** (a fork inherits the *system* — schema +
 skill catalogue + render chain — never the memory or roadmap), builds the system
 DB, seeds your fork's **starting team** (your user + a planner-flavor *primary*
 carrying the CC Lineage Seed and its own genesis seed, plus two `dev`, a
 `reviewer`, the `admin` that owns `main`, and the singleton **Cartographer**
 repo-map owner), and renders. So after install
 your git surfaces show only your project — the engine no longer appears in
-`git status`. It refuses to run in the super-coder source repo or on an
+`git status`. It refuses to run in the subfloor source repo or on an
 already-installed fork (guarding against content loss).
 
 Interactive by default (prompts for your **primary** shell's name/role/mandate —
@@ -664,7 +664,7 @@ from `shell_messages`.
 > [!class2]
 > **UI** Scripts (migrate · rebuild) · **Shells** admin
 
-Ship an improvement to super-coder, pull it into each fork — **in place**, with
+Ship an improvement to subfloor, pull it into each fork — **in place**, with
 no loss of memory. The shell updates its own substrate: it pulls the new engine,
 applies new migrations under its own feet, and the next boot stands on the new
 floor with every row intact. (The shell-facing version of this is the
@@ -672,7 +672,7 @@ floor with every row intact. (The shell-facing version of this is the
 
 ```bash
 ./sc update                     # fetch + materialize the engine, reconcile in place
-git add -A && git commit -m "chore: update super-coder"   # commits only .sc-state/ + _sc
+git add -A && git commit -m "chore: update subfloor"   # commits only .sc-state/ + _sc
 ```
 
 `./sc update` fetches the engine from the `super-coder` remote and
@@ -700,7 +700,7 @@ new floor.
 > materialize is a wholesale overwrite, so the engine keeps a hash manifest
 > (written at install and after every materialize) and `./sc update` refuses
 > when an engine file was locally modified since — listing the files and the
-> real options: revert the edit, **upstream it** (PR super-coder — the strong
+> real options: revert the edit, **upstream it** (PR subfloor — the strong
 > default), `--force` to knowingly discard it, or `./sc eject` to own the
 > engine outright (see *Customize a fork vs diverge from it*, next).
 
@@ -743,7 +743,7 @@ fits the **fork-owned extension points**, you never touch engine files, and
 | **Your project** | Everything outside `.super-coder/` — the engine never touches it |
 
 **Upstream (when the extension points don't reach).** Need an actual engine
-change? **PR it to super-coder first.** If one fork needs it, the next fork
+change? **PR it to subfloor first.** If one fork needs it, the next fork
 probably does too — that's how the engine grows (dos-arch is exactly this
 proving-ground loop). Your fork then picks the change up through a normal
 `./sc update`, still on the lifeline.
@@ -1322,7 +1322,7 @@ git-tracked text. See `.super-coder/README.md` for the full model.
 > [!class2]
 > **Every token, every harness** — swept from what the CLIs already write to disk; no wrapper, no proxy, nothing in the model path
 
-super-coder never calls a model itself — it launches harness CLIs — so token
+subfloor never calls a model itself — it launches harness CLIs — so token
 telemetry is **pull-based**: each harness already writes usage data to disk
 (claude transcripts — subagents included, codex rollouts, kimi wire logs, the
 opencode DB, vibe session metas), and a per-harness parser normalizes what it

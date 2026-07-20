@@ -1,16 +1,16 @@
 ---
-title: super-coder — Quick start
+title: subfloor — Quick start
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
 date: 2026-07-20
-project: super-coder
+project: subfloor
 purpose: Install, first boot, the daily loop
 ---
 
-# super-coder — Quick start
+# subfloor — Quick start
 
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/quick-start.md)
 
-The guided tour — what super-coder is, getting it running, your first boot,
+The guided tour — what subfloor is, getting it running, your first boot,
 and the daily rhythm. This page walks; the [full documentation](README.md)
 specifies. Every flag, table, and option lives there, and each section below
 points at the tab that carries it.
@@ -24,7 +24,7 @@ whatever coding harness you point at it: Claude Code, OpenCode, Codex, Mistral
 Vibe, or Kimi Code.
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
-tools, the model API are the harness's job. super-coder owns who is working —
+tools, the model API are the harness's job. subfloor owns who is working —
 identity, memory, and content that survive every session — and renders a boot
 artifact the harness reads natively.
 
