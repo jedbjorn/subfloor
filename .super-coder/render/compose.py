@@ -32,6 +32,35 @@ MAP_DISCREPANCY_BLOCK = (
     "from what the map *does* show — healing it is the cartographer's job, on its "
     "next boot."
 )
+# PROJECT vs ENGINE renders by repo position (`{{project_vs_engine}}` slot).
+# A fork consumes the engine as a gitignored dependency; the SOURCE repo
+# (origin basename in install.SOURCE_REPO_NAMES — the dogfood repo whose
+# shells build subfloor itself) IS the engine and has no upstream. Same
+# pipeline, described from each end — so source shells stop hunting for an
+# upstream that is them, and fork shells keep the never-edit-engine rule.
+PROJECT_VS_ENGINE_FORK = (
+    "**Your project is this repo** — everything except `.super-coder/`.\n"
+    "`.super-coder/` is the **engine** you run on (your memory + identity\n"
+    "substrate), a gitignored dependency — do not treat it as the project or edit\n"
+    "it. Engine changes are authored upstream in subfloor (formerly super-coder)\n"
+    "and delivered here by `./sc update` — never authored here."
+)
+PROJECT_VS_ENGINE_SOURCE = (
+    "**This repo IS the engine source — you are upstream.** `.super-coder/` is\n"
+    "tracked here and is your work surface: engine changes are authored in this\n"
+    "repo, land via branch → PR → merge, and reach every fork through *their*\n"
+    "`./sc update`. There is no upstream above you to receive fixes from or file\n"
+    "issues to — you are where engine fixes come from.\n"
+    "\n"
+    "Getting your own updates: after an engine change merges, sync with main and\n"
+    "run `./sc update` — in this repo it skips fetch/materialize (the engine is\n"
+    "already here) and reconciles in place: migrations, skills catalogue, repo\n"
+    "map, snapshot. Restart your session to boot onto the new floor.\n"
+    "\n"
+    "Engine skills speak fork-language. Where a skill says \"never edit\n"
+    "`.super-coder/`\" or \"report/file it upstream\", that guidance is for forks —\n"
+    "here you author the fix directly instead."
+)
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 
@@ -213,7 +242,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  archive_id: int, work_dir: "Path | None" = None,
                  sync_note: "str | None" = None,
                  api_key: "str | None" = None,
-                 api_port: "int | None" = None) -> str:
+                 api_port: "int | None" = None,
+                 source_mode: bool = False) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -221,9 +251,14 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     operates from a worktree rather than the repo root. sync_note is the
     launcher's worktree-drift status (run.sync_worktree) — surfaced alongside
     so a stale or divergent worktree is ambient knowledge, not something the
-    shell must remember to check.
+    shell must remember to check. source_mode flips PROJECT vs ENGINE to the
+    source-repo variant (caller decides via install.is_source_repo() — compose
+    stays a pure render, no git).
     """
     template = TEMPLATE_PATH.read_text().rstrip()
+    template = template.replace(
+        "{{project_vs_engine}}",
+        PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK)
     shell_id = shell["shell_id"]
     counts = fetch_counts(con, shell_id)
 

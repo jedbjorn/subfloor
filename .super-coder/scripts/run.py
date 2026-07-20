@@ -871,6 +871,7 @@ def main() -> None:
         content = compose_boot(con, full, user, session_id, archive_id,
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
+                               source_mode=install.is_source_repo(),
                                api_key=full["api_key"],
                                api_port=api_port)
 

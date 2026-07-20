@@ -22,10 +22,7 @@ One memory system, not two. Auto-memory is disabled by design.
 
 ## PROJECT vs ENGINE
 
-**Your project is this repo** — everything except `.super-coder/`.
-`.super-coder/` is the **engine** you run on (your memory + identity
-substrate), a gitignored dependency — do not treat it as the project or edit
-it. Engine changes are authored upstream in super-coder, never here.
+{{project_vs_engine}}
 
 ---
 
