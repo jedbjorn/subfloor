@@ -36,6 +36,14 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 MANIFEST = ENGINE / "engine.manifest"
 
+# Fork-facing templates are materialized through the templates directory in
+# ENGINE_PATHS below. Keep their exact paths named here so distribution tests
+# can guard both the template files and their engine-manifest coverage.
+FORK_TEMPLATE_PATHS = (
+    ".super-coder/templates/fork/subfloor-visual-qa.yml",
+    ".super-coder/templates/fork/visual-qa.example.json",
+)
+
 # The ENGINE = system content that propagates to every fork; all of it is safe
 # to materialize from the super-coder remote (it is wholesale-replaced, never
 # fork-edited). The per-instance set is deliberately NOT listed, so a materialize

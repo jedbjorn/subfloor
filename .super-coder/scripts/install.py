@@ -120,6 +120,11 @@ def sh(*args: str) -> subprocess.CompletedProcess:
 # B7 untrack migration (this fired on the dogfood repo the day of the rename).
 SOURCE_REPO_NAMES = ("super-coder", "subfloor")
 
+VISUAL_QA_TEMPLATE_TARGETS = {
+    "subfloor-visual-qa.yml": Path(".github/workflows/subfloor-visual-qa.yml"),
+    "visual-qa.example.json": Path(".sc-state/visual-qa.example.json"),
+}
+
 
 def origin_basename() -> str | None:
     p = sh("git", "-C", str(REPO_ROOT), "remote", "get-url", "origin")
@@ -133,6 +138,33 @@ def is_source_repo() -> bool:
     is its own repo (the engine upstream is a separate, differently-named
     remote)."""
     return origin_basename() in SOURCE_REPO_NAMES
+
+
+def seed_visual_qa_files(
+    repo_root: Path = REPO_ROOT,
+    template_root: Path | None = None,
+    *,
+    source_repo: bool | None = None,
+) -> list[Path]:
+    """Seed Visual QA's fork-owned workflow and inactive example config.
+
+    Existing files are always preserved. The source repository owns the
+    templates but must never receive the fork-facing copies.
+    """
+    source = source_repo if source_repo is not None else is_source_repo()
+    if source:
+        return []
+
+    templates = template_root or ENGINE / "templates" / "fork"
+    written: list[Path] = []
+    for template_name, relative_target in VISUAL_QA_TEMPLATE_TARGETS.items():
+        target = repo_root / relative_target
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(templates / template_name, target)
+        written.append(relative_target)
+    return written
 
 
 def already_installed() -> bool:
@@ -631,6 +663,16 @@ def main(argv: list[str]) -> int:
         redlines.mkdir()
         (redlines / ".gitkeep").write_text("")
         print(f"  created {redlines.relative_to(REPO_ROOT)}/")
+
+    # 3.7 Seed the fork-tracked Visual QA shim + inactive example config. The
+    # live config remains opt-in at .sc-state/visual-qa.json.
+    step("Seeding Visual QA CI")
+    visual_qa_files = seed_visual_qa_files()
+    if visual_qa_files:
+        for path in visual_qa_files:
+            print(f"  created {path}")
+    else:
+        print("  (already present or source repo)")
 
     # 4. Strip super-coder's per-instance content -----------------------------
     step("Stripping super-coder's per-instance content (a fork inherits the system, not the memory)")
