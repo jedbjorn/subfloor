@@ -10,6 +10,8 @@ purpose: Forkable shell substrate for a repo
 
 # super-coder
 
+![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/super-coder/main/docs/demo.gif)
+
 ## Overview
 
 A **forkable shell substrate for a single code repository.** You install it into
