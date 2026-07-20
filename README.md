@@ -1,5 +1,5 @@
 ---
-title: super-coder
+title: SUBFLOOR
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
 date: 2026-07-20
 project: super-coder
