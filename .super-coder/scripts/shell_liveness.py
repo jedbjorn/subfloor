@@ -294,6 +294,20 @@ def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
             [p["pid"] for p in procs if p.get("orphaned")])
 
 
+def session_state(shortname: str, snap: dict) -> "str | None":
+    """One shell's slot verdict, the shape the picker annotation needs:
+    'busy' (a working session holds the worktree), 'orphan' (EVERY session pid
+    is an orphan — closed terminal / dead parent still holding the slot), or
+    None (dormant, or liveness unsupported). A single live session among
+    orphans wins: someone is working there → 'busy'."""
+    if not snap.get("supported"):
+        return None
+    pids, orphans = orphan_split(shortname, snap)
+    if not pids:
+        return None
+    return "orphan" if len(orphans) == len(pids) else "busy"
+
+
 def _print_text(d: dict) -> None:
     if not d.get("supported"):
         print(f"{d['repo']['name']}: liveness unsupported — {d.get('note','')}")

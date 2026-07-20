@@ -86,6 +86,38 @@ class OrphanSplitTest(unittest.TestCase):
         self.assertEqual(([], []), shell_liveness.orphan_split("ghost", self.SNAP))
 
 
+class SessionStateTest(unittest.TestCase):
+    """session_state shapes the picker annotation: 'busy' / 'orphan' / None."""
+
+    SNAP = {
+        "supported": True,
+        "processes": [
+            {"pid": 100, "shortname": "dev1", "orphaned": "tty-gone"},
+            {"pid": 101, "shortname": "dev1", "orphaned": None},
+            {"pid": 200, "shortname": "dev2", "orphaned": "detached"},
+            {"pid": 300, "shortname": None, "orphaned": None},  # admin root
+        ],
+    }
+
+    def test_live_session_wins_over_orphan_sibling(self):
+        # One working session among orphans → someone is there → busy.
+        self.assertEqual("busy", shell_liveness.session_state("dev1", self.SNAP))
+
+    def test_all_orphaned_is_orphan(self):
+        self.assertEqual("orphan", shell_liveness.session_state("dev2", self.SNAP))
+
+    def test_dormant_shell_is_none(self):
+        self.assertIsNone(shell_liveness.session_state("ghost", self.SNAP))
+
+    def test_case_insensitive_shortname(self):
+        self.assertEqual("orphan", shell_liveness.session_state("DEV2", self.SNAP))
+
+    def test_unsupported_snapshot_is_none(self):
+        # Non-Linux: no /proc → no verdicts, the picker degrades to unmarked.
+        self.assertIsNone(shell_liveness.session_state(
+            "dev2", {"supported": False, "processes": self.SNAP["processes"]}))
+
+
 class ComputeSmokeTest(unittest.TestCase):
     """compute() against the real /proc: shape only, no liveness assumptions."""
 
