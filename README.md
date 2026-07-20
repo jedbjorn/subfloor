@@ -13,6 +13,8 @@ purpose: Forkable shell substrate for a repo
 
 # super-coder
 
+**[Quick start](docs/quick-start.md) · [Full documentation](docs/README.md)**
+
 ![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
 ## Overview
@@ -104,7 +106,8 @@ git add -A && git commit -m "chore: install super-coder"
 
 That's the happy path — you're talking to a planner shell in your repo, with a
 whole team behind it. Installer internals and harness sign-in, step by step:
-[*Install*](docs/README.md#install).
+[*Install*](docs/README.md#install). First boot and the daily loop, guided:
+[*Quick start*](docs/quick-start.md).
 
 ## Docs
 
