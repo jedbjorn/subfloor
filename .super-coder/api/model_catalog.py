@@ -19,13 +19,13 @@ Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
 dirty the tree and trip the publish guard) with a TTL; a failed refresh serves
 the stale cache and says so.
 
-Payload (v2) is family-first, matching the picker: per harness, `families`
+Payload (v3) is family-first, matching the picker: per harness, `families`
 ([{family, latest, release_date, n}], newest-first — "pick opus / sonnet /
 fable / deepseek and track its latest") plus the flat `models` list for
 sub-version search. For claude, a family with a CLI alias (opus / sonnet /
-haiku) resolves `latest` to the alias — an alias floats to the newest model
-in its family, so the stored value never goes stale; families without one
-(the fable case) resolve to the newest concrete id.
+haiku / fable) resolves `latest` to the alias — an alias floats to the newest
+model in its family, so the stored value never goes stale. Entries also carry
+their route source, local availability, CLI version, and effort support.
 """
 from __future__ import annotations
 
@@ -33,12 +33,14 @@ import json
 import os
 import shutil
 import subprocess
+import tomllib
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 CACHE = ENGINE / "logs" / "model_catalog.json"
+ADAPTERS = ENGINE / "adapters"
 TTL_HOURS = 24
 TIMEOUT = 8
 MODELS_DEV_URL = "https://models.dev/api.json"
@@ -65,7 +67,7 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # Bump when the response/cache shape changes — a cached payload from another
 # version is ignored (treated as no cache) instead of being served to a
 # client that expects the new shape.
-PAYLOAD_VERSION = 2
+PAYLOAD_VERSION = 3
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -98,9 +100,18 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
 
 
 def _entry(mid: str, release_date: str = "", name: str = "",
-           family: str | None = None) -> dict:
+           family: str | None = None, *, source: str = "models.dev",
+           availability: str = "advisory", provider: str | None = None,
+           provider_model: str | None = None,
+           supported_efforts: list[str] | None = None,
+           default_effort: str | None = None,
+           cli_version: str | None = None) -> dict:
     return {"id": mid, "release_date": release_date, "name": name or mid,
-            "family": family}
+            "family": family, "source": source,
+            "availability": availability, "provider": provider,
+            "provider_model": provider_model or mid,
+            "supported_efforts": supported_efforts or [],
+            "default_effort": default_effort, "cli_version": cli_version}
 
 
 def _from_models_dev(fetch) -> dict[str, list[dict]]:
@@ -111,8 +122,9 @@ def _from_models_dev(fetch) -> dict[str, list[dict]]:
         entries = []
         for mid, m in models.items():
             full = f"{provider}/{mid}" if harness in PREFIXED_HARNESSES else mid
-            entries.append(_entry(full, m.get("release_date") or "",
-                                  m.get("name") or mid, m.get("family")))
+            entries.append(_entry(
+                full, m.get("release_date") or "", m.get("name") or mid,
+                m.get("family"), provider=provider, provider_model=mid))
         entries.sort(key=lambda e: e["release_date"], reverse=True)
         out[harness] = entries
     return out
@@ -154,7 +166,9 @@ def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
             continue  # opportunistic — a bad key never degrades the catalog
         ids = [m.get("id") for m in data.get("data") or [] if m.get("id")]
         if ids:
-            out[harness] = [_entry(i) for i in ids]
+            out[harness] = [
+                _entry(i, source=f"{HARNESS_PROVIDER[harness]}-api",
+                       provider=HARNESS_PROVIDER[harness]) for i in ids]
     return out
 
 
@@ -176,12 +190,105 @@ def _from_opencode_cli(run) -> list[dict]:
     ids = sorted({line.strip() for line in r.stdout.splitlines()
                   if "/" in line.strip() and " " not in line.strip()},
                  key=lambda i: (not i.startswith("ollama-cloud/"), i))
-    return [_entry(i) for i in ids]
+    return [_entry(i, source="opencode-cli", availability="available",
+                   provider=i.split("/", 1)[0]) for i in ids]
+
+
+def _cli_version(binary: str, run) -> str | None:
+    try:
+        r = run([binary, "--version"], capture_output=True, text=True,
+                timeout=5)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return (r.stdout or r.stderr).strip().splitlines()[0] or None
+
+
+def _from_claude_cli(run) -> list[dict]:
+    """Claude's aliases are the portable local launch selectors.
+
+    Claude Code does not expose an account-scoped list-models command, so the
+    installed CLI proves selector syntax while models.dev supplies concrete
+    family members for advisory browsing.
+    """
+    if not shutil.which("claude"):
+        return []
+    version = _cli_version("claude", run)
+    return [
+        _entry(alias, name=f"Claude {alias.title()} (alias)",
+               family=f"claude-{alias}", source="claude-cli",
+               availability="available", provider="anthropic",
+               supported_efforts=["low", "medium", "high", "max"],
+               default_effort="high", cli_version=version)
+        for alias in CLAUDE_ALIASES
+    ]
+
+
+def _from_codex_cache(env, run) -> list[dict]:
+    """Read the signed-in Codex CLI's own model cache.
+
+    This is stronger evidence than the public OpenAI model list: it describes
+    what this installed ChatGPT-backed CLI was actually offered, including its
+    supported reasoning-effort levels.
+    """
+    if not shutil.which("codex"):
+        return []
+    root = Path(env.get("CODEX_HOME") or (Path.home() / ".codex"))
+    try:
+        data = json.loads((root / "models_cache.json").read_text())
+    except Exception:  # noqa: BLE001  (missing/corrupt = no local evidence)
+        return []
+    version = _cli_version("codex", run)
+    entries = []
+    for m in data.get("models") or []:
+        mid = m.get("slug")
+        if not mid or m.get("visibility") == "hide":
+            continue
+        efforts = [e.get("effort") for e in m.get("supported_reasoning_levels") or []
+                   if e.get("effort")]
+        entries.append(_entry(
+            mid, name=m.get("display_name") or mid, family=m.get("family"),
+            source="codex-cache", availability="available", provider="openai",
+            supported_efforts=efforts,
+            default_effort=m.get("default_reasoning_level"), cli_version=version))
+    return entries
+
+
+def _from_kimi_config(env, run) -> list[dict]:
+    """Read Kimi's exact user-defined aliases without touching credentials."""
+    if not shutil.which("kimi"):
+        return []
+    root = Path(env.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
+    try:
+        data = tomllib.loads((root / "config.toml").read_text())
+    except Exception:  # noqa: BLE001
+        return []
+    version = _cli_version("kimi", run)
+    entries = []
+    for alias, cfg in (data.get("models") or {}).items():
+        if not isinstance(cfg, dict) or not cfg.get("model"):
+            continue
+        effective = {**cfg, **(cfg.get("overrides") or {})}
+        entries.append(_entry(
+            alias, name=effective.get("display_name") or cfg["model"],
+            family=f"kimi-{cfg['model']}", source="kimi-config",
+            availability="available", provider=cfg.get("provider"),
+            provider_model=cfg["model"],
+            supported_efforts=effective.get("support_efforts") or [],
+            default_effort=effective.get("default_effort"),
+            cli_version=version))
+    return entries
 
 
 def _merge(base: list[dict], extra: list[dict]) -> list[dict]:
     seen = {e["id"] for e in base}
     return base + [e for e in extra if e["id"] not in seen]
+
+
+def _prefer(preferred: list[dict], advisory: list[dict]) -> list[dict]:
+    """Put locally authoritative entries first and replace duplicate ids."""
+    return _merge(preferred, advisory)
 
 
 def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
@@ -200,8 +307,18 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
     oc = _from_opencode_cli(run)
     if oc:
-        harnesses["opencode"] = _merge(harnesses.get("opencode", []), oc)
+        harnesses["opencode"] = _prefer(oc, harnesses.get("opencode", []))
         sources.append("opencode-cli")
+    local = {
+        "claude": _from_claude_cli(run),
+        "codex": _from_codex_cache(env, run),
+        "kimi": _from_kimi_config(env, run),
+    }
+    for harness, entries in local.items():
+        if not entries:
+            continue
+        harnesses[harness] = _prefer(entries, harnesses.get(harness, []))
+        sources.append(entries[0]["source"])
     if not sources:
         raise RuntimeError("; ".join(errors) or "no catalog sources available")
     return {"v": PAYLOAD_VERSION,
@@ -237,13 +354,72 @@ _FLOOR_FAMILY = {"fable": "claude-fable", "opus": "claude-opus",
 def _floor() -> dict[str, dict]:
     out = {}
     for h, ids in STATIC_FLOOR.items():
-        entries = [_entry(i, family=_FLOOR_FAMILY.get(i)) for i in ids]
+        entries = [_entry(i, family=_FLOOR_FAMILY.get(i), source="static",
+                          availability="fallback") for i in ids]
         out[h] = {"families": _families(h, entries), "models": entries}
     return out
 
 
+def _headless_supported(harness: str) -> bool:
+    try:
+        cfg = json.loads((ADAPTERS / harness / "adapter.json").read_text())
+    except Exception:  # noqa: BLE001
+        return False
+    return bool((cfg.get("headless") or {}).get("launch"))
+
+
+def persist_routes(con, payload: dict) -> None:
+    """Upsert a refresh payload into the disposable runtime route table.
+
+    A failed refresh marks carried-forward rows stale but never deletes them.
+    Older DBs mid-update simply lack the table; the advisory picker continues
+    to work from the JSON payload until migrations land.
+    """
+    try:
+        con.execute("UPDATE model_routes SET stale=1, last_error=?",
+                    (payload.get("error"),))
+    except Exception:
+        return
+    seen_at = payload.get("fetched_at") or datetime.now(timezone.utc).isoformat()
+    stale = int(bool(payload.get("stale")))
+    for harness, block in (payload.get("harnesses") or {}).items():
+        headless = int(_headless_supported(harness))
+        for entry in block.get("models") or []:
+            efforts = entry.get("supported_efforts") or []
+            con.execute(
+                "INSERT INTO model_routes ("
+                "harness, selector, provider, provider_model, display_name, family, "
+                "source, availability, headless_supported, high_effort_supported, "
+                "default_effort, supported_efforts, cli_version, last_seen_at, stale, "
+                "last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(harness, selector) DO UPDATE SET "
+                "provider=excluded.provider, provider_model=excluded.provider_model, "
+                "display_name=excluded.display_name, family=excluded.family, "
+                "source=excluded.source, availability=excluded.availability, "
+                "headless_supported=excluded.headless_supported, "
+                "high_effort_supported=excluded.high_effort_supported, "
+                "default_effort=excluded.default_effort, "
+                "supported_efforts=excluded.supported_efforts, "
+                "cli_version=excluded.cli_version, last_seen_at=excluded.last_seen_at, "
+                "stale=excluded.stale, last_error=excluded.last_error",
+                (harness, entry["id"], entry.get("provider"),
+                 entry.get("provider_model"), entry.get("name"), entry.get("family"),
+                 entry.get("source") or "unknown",
+                 entry.get("availability") or "advisory", headless,
+                 int("high" in efforts), entry.get("default_effort"),
+                 json.dumps(efforts), entry.get("cli_version"), seen_at, stale,
+                 payload.get("error")))
+    con.commit()
+
+
+def _served(payload: dict, con=None) -> dict:
+    if con is not None:
+        persist_routes(con, payload)
+    return payload
+
+
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
-            run=subprocess.run) -> dict:
+            run=subprocess.run, con=None) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -251,15 +427,15 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     carries `stale` + `fetched_at` so the GUI can say how current it is."""
     cached = _load_cache()
     if cached and not refresh and _fresh(cached):
-        return {**cached, "stale": False}
+        return _served({**cached, "stale": False}, con)
     try:
         fresh = build(fetch, env, run)
     except Exception as e:  # noqa: BLE001
         if cached:
-            return {**cached, "stale": True, "error": str(e)}
-        return {"v": PAYLOAD_VERSION, "fetched_at": None,
-                "sources": ["static"], "stale": True,
-                "error": str(e), "harnesses": _floor()}
+            return _served({**cached, "stale": True, "error": str(e)}, con)
+        return _served({"v": PAYLOAD_VERSION, "fetched_at": None,
+                        "sources": ["static"], "stale": True,
+                        "error": str(e), "harnesses": _floor()}, con)
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(fresh, indent=1) + "\n")
-    return {**fresh, "stale": False}
+    return _served({**fresh, "stale": False}, con)

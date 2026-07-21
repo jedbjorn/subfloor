@@ -933,6 +933,7 @@ case "$cmd" in
   # Token & session analytics — sweep each harness's on-disk usage data for
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
+  models)       exec "$PY" "$S/models.py" "$@" ;;
   seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
   # Skill catalogue write surface — grants/retirement by name, loud on a miss
   # (the raw-SQL grant's silent no-op class). Snapshot is still the persist step.
@@ -1168,6 +1169,9 @@ super-coder — forkable shell substrate
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
   ./sc job wait <id>       bounded foreground wait, ≤550s slice — exit 0 done · 2 still running
                              (drain your inbox between slices); list/status/tail/kill complete the set
+  ./sc models refresh      refresh local model routes (same action as Shells → Refresh models)
+  ./sc models resolve <h> <model> [--shell <shortname>]
+                             print one exact, locally runnable high-effort sprint call; list [harness] shows routes
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
@@ -1191,9 +1195,9 @@ super-coder — forkable shell substrate
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
-                             opencode) to drain the shell's inbox and act; -p "<prompt>" overrides the
+                             opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
                              default prompt · --harness <h> · -m <model> (else flavor_defaults);
-                             refuses a shell that already has a live session
+                             --effort defaults to high; refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm (YES) + DB backup, then down + launch — recreate fresh (--yes skips the prompt)
   ./sc build               (re)build the sandbox image

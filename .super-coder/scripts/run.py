@@ -16,7 +16,8 @@ Usage:
     python3 .super-coder/scripts/run.py [shortname] [--first]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
 
-Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]`):
+Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
+[--effort <level>]`):
 the same render-then-exec path minus the picker and the TTY. The harness runs
 non-interactively via its adapter's `headless` block (claude -p · codex exec ·
 opencode run), streams a final message, and exits — the ephemeral-worker
@@ -71,8 +72,41 @@ def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
     return fdef["models"].get(harness) if fdef else None
 
 
+def _headless_effort_args(hcfg: dict, effort: "str | None",
+                          harness: str = "?") -> list[str]:
+    if not effort:
+        return []
+    ecfg = hcfg.get("effort") or {}
+    if ecfg.get("flag"):
+        return [ecfg["flag"], effort]
+    if ecfg.get("config_flag") and ecfg.get("config_key"):
+        return [ecfg["config_flag"], f'{ecfg["config_key"]}="{effort}"']
+    if ecfg.get("env"):
+        return []
+    raise ValueError(
+        f"harness '{harness}' cannot apply effort '{effort}'")
+
+
+def headless_effort_env(adapter: dict, effort: "str | None") -> dict[str, str]:
+    ecfg = ((adapter.get("headless") or {}).get("effort") or {})
+    return {ecfg["env"]: effort} if effort and ecfg.get("env") else {}
+
+
+def validate_headless_request(adapter: dict, model: "str | None",
+                              effort: "str | None") -> None:
+    hcfg = adapter.get("headless") or {}
+    harness = adapter.get("harness", "?")
+    if not hcfg.get("launch"):
+        raise ValueError(f"harness '{harness}' has no headless adapter")
+    if model and not hcfg.get("model_flag"):
+        raise ValueError(
+            f"harness '{harness}' cannot apply requested model '{model}'")
+    _headless_effort_args(hcfg, effort, harness)
+
+
 def headless_command(adapter: dict, prompt: str, model: "str | None" = None,
-                     sandbox_flags: "list[str] | None" = None) -> "list[str] | None":
+                     sandbox_flags: "list[str] | None" = None,
+                     effort: "str | None" = None) -> "list[str] | None":
     """The non-interactive exec argv from the adapter's `headless` block —
     launch prefix + model flag + sandbox flags + the prompt as the final
     positional. None when the harness declares no headless block (e.g. vibe,
@@ -80,11 +114,16 @@ def headless_command(adapter: dict, prompt: str, model: "str | None" = None,
     hcfg = adapter.get("headless")
     if not hcfg or not hcfg.get("launch"):
         return None
+    validate_headless_request(adapter, model, effort)
     cmd = list(hcfg["launch"])
-    if model and hcfg.get("model_flag"):
+    if model:
         cmd += [hcfg["model_flag"], model]
+    cmd += _headless_effort_args(hcfg, effort, adapter.get("harness", "?"))
     cmd += list(sandbox_flags or [])
-    cmd.append(prompt)
+    if hcfg.get("prompt_flag"):
+        cmd += [hcfg["prompt_flag"], prompt]
+    else:
+        cmd.append(prompt)
     return cmd
 
 
@@ -736,6 +775,7 @@ def main() -> None:
     # Headless adds -p/--prompt and -m/--model (value-taking, same rule).
     flag_harness = None
     flag_model = None
+    flag_effort = None
     prompt = None
     positional = []
     i = 0
@@ -749,6 +789,10 @@ def main() -> None:
             flag_model = args[i + 1] if i + 1 < len(args) else None
             i += 2
             continue
+        if a == "--effort":
+            flag_effort = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
         if a in ("-p", "--prompt"):
             prompt = args[i + 1] if i + 1 < len(args) else None
             i += 2
@@ -757,6 +801,8 @@ def main() -> None:
             flag_harness = a.split("=", 1)[1]
         elif a.startswith("--model="):
             flag_model = a.split("=", 1)[1]
+        elif a.startswith("--effort="):
+            flag_effort = a.split("=", 1)[1]
         elif a.startswith("--prompt="):
             prompt = a.split("=", 1)[1]
         elif not a.startswith("-"):
@@ -764,7 +810,8 @@ def main() -> None:
         i += 1
     requested = positional[0] if positional else None
     if headless and not requested:
-        sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]')
+        sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
+                 '[-m <model>] [--effort <level>]')
 
     # Wordmark banner — interactive boots only; headless/verify logs stay clean.
     if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():
@@ -850,6 +897,20 @@ def main() -> None:
                or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
 
+    # Resolve + validate the complete headless route before opening a session.
+    # `sc run` is the sprint-worker primitive, so high effort is its default;
+    # the orchestration skill passes it explicitly as well for auditability.
+    flavor_model = fdef["models"].get(harness) if fdef else None
+    session_model = (resolve_headless_model(flag_model, fdef, harness)
+                     if headless else flavor_model)
+    session_effort = flag_effort or ("high" if headless else None)
+    adapter = load_adapter(harness)
+    if headless:
+        try:
+            validate_headless_request(adapter, session_model, session_effort)
+        except ValueError as e:
+            sys.exit(f"sc run: {e}")
+
     feedback = not headless and not os.environ.get("RENDER_ONLY")
     map_note = None
     trust_note = None
@@ -857,8 +918,6 @@ def main() -> None:
         # Now that the harness is known, resolve THIS flavor's model for it (the
         # (flavor, harness) cell). None when the flavor has no entry for the chosen
         # harness (e.g. opencode as a manual fallback) — then the harness picks its own.
-        flavor_model = fdef["models"].get(harness) if fdef else None
-
         # Pre-session analytics sweep (doc #11): pull harness-side usage data into
         # session_token_usage + backfill the PREVIOUS session's ended_at. MUST run
         # before open_session — the stub-reuse check there relies on the previous
@@ -882,8 +941,6 @@ def main() -> None:
         # The model this launch will actually route (headless resolves via flags →
         # flavor default; interactive routes the flavor default). None = the harness
         # picks its own — recorded as NULL, honest about what we know at boot.
-        session_model = (resolve_headless_model(flag_model, fdef, harness)
-                         if headless else flavor_model)
         session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
             "harness": harness,
             "provider": session_provider(harness, session_model),
@@ -977,7 +1034,6 @@ def main() -> None:
 
     # Harness was resolved up front (override / picker / default); the adapter
     # seam owns the launch command + any harness-specific config to emit.
-    adapter = load_adapter(harness)
     emitted = emit_adapter(adapter, work_dir)
     resolve_opencode_plugins(work_dir)  # engine-relative plugin path → absolute (loads in worktrees)
     print(f"→ harness: {style.bold(harness)} "
@@ -1047,13 +1103,15 @@ def main() -> None:
     if headless:
         hmodel = session_model  # resolved up front (persisted on the archive row)
         headless_cmd = headless_command(
-            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags)
+            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags,
+            session_effort)
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
                      f"use claude, codex, opencode, or kimi")
         if hmodel:
             src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
             print(f"→ model: {hmodel} ({src})")
+        print(f"→ effort: {session_effort}")
         print(f"→ headless prompt: {(prompt or DEFAULT_HEADLESS_PROMPT)[:120]}")
 
     # Close the boot summary with the review GUI — the link lives in a different
@@ -1077,7 +1135,9 @@ def main() -> None:
 
     cmd = (headless_cmd if headless else
            (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags)
-    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()}, **sandbox_env}
+    effort_env = headless_effort_env(adapter, session_effort) if headless else {}
+    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+           **sandbox_env, **effort_env}
     # The booted shell's flavor, inherited by everything the harness spawns.
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.

@@ -100,6 +100,18 @@ class SchemaTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(idx, "live-watch partial index missing")
 
+    def test_model_routes_runtime_table_is_migrated(self):
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(model_routes)")}
+        self.assertTrue({"harness", "selector", "availability",
+                         "high_effort_supported", "stale"}.issubset(cols))
+
+    def test_sprint_orchestration_seed_matches_source_asset(self):
+        asset = (ENGINE / "assets" / "skills" / "sprint_orchestration" /
+                 "SKILL.md").read_text().split("---", 2)[2].strip()
+        body = self.con.execute(
+            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
+        self.assertEqual(body, asset)
+
 
 # ── daemon core: diff_events (pure) ──────────────────────────────────────────
 
@@ -558,13 +570,17 @@ class HeadlessTest(unittest.TestCase):
             None, {"default_harness": None, "models": {}}, "claude"))
 
     def test_claude_headless_argv(self):
-        cmd = run.headless_command(self.adapter("claude"), "do the task", "opus")
-        self.assertEqual(cmd, ["claude", "-p", "--model", "opus", "do the task"])
+        cmd = run.headless_command(
+            self.adapter("claude"), "do the task", "opus", effort="high")
+        self.assertEqual(cmd, ["claude", "--model", "opus", "--effort", "high",
+                               "-p", "do the task"])
 
     def test_codex_headless_argv(self):
         cmd = run.headless_command(self.adapter("codex"), "do it", "gpt-5.4",
-                                   ["--dangerously-bypass-approvals-and-sandbox"])
+                                   ["--dangerously-bypass-approvals-and-sandbox"],
+                                   effort="high")
         self.assertEqual(cmd, ["codex", "exec", "-m", "gpt-5.4",
+                               "-c", 'model_reasoning_effort="high"',
                                "--dangerously-bypass-approvals-and-sandbox", "do it"])
 
     def test_opencode_headless_argv(self):
@@ -579,15 +595,23 @@ class HeadlessTest(unittest.TestCase):
         self.assertIsNone(run.headless_command(self.adapter("vibe"), "p"))
 
     def test_kimi_headless_argv(self):
-        cmd = run.headless_command(self.adapter("kimi"), "do it")
-        self.assertEqual(cmd, ["kimi", "-p", "do it"])
+        cmd = run.headless_command(
+            self.adapter("kimi"), "do it", "kimi-code/k3", effort="high")
+        self.assertEqual(cmd, ["kimi", "-m", "kimi-code/k3", "-p", "do it"])
+        self.assertEqual(
+            run.headless_effort_env(self.adapter("kimi"), "high"),
+            {"KIMI_MODEL_THINKING_EFFORT": "high"})
 
-    def test_kimi_takes_no_model_from_the_seam(self):
-        # kimi declares no model_flag (its -m wants a config.toml alias, not a
-        # portable id) — a resolved model must NOT leak into the argv, where it
-        # would land between -p and its prompt value.
-        cmd = run.headless_command(self.adapter("kimi"), "p", "k3")
-        self.assertEqual(cmd, ["kimi", "-p", "p"])
+    def test_unroutable_model_fails_instead_of_silent_drop(self):
+        adapter = self.adapter("kimi")
+        del adapter["headless"]["model_flag"]
+        with self.assertRaisesRegex(ValueError, "cannot apply requested model"):
+            run.headless_command(adapter, "p", "kimi-code/k3", effort="high")
+
+    def test_harness_without_effort_control_fails_high_effort(self):
+        with self.assertRaisesRegex(ValueError, "cannot apply effort"):
+            run.headless_command(
+                self.adapter("opencode"), "p", "zai/glm", effort="high")
 
     def test_prompt_is_the_final_positional(self):
         cmd = run.headless_command(self.adapter("claude"), "trailing prompt", "opus",

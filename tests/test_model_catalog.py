@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -25,7 +26,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
+sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog as mc  # noqa: E402
+import models as routes_cli  # noqa: E402
 
 MODELS_DEV = {
     "anthropic": {"models": {
@@ -125,13 +128,115 @@ class BuildTest(NoCLI):
                                         "not a model line\n")
             got = mc.build(fetch=fetch_ok, env={}, run=run)
         self.assertEqual(ids(got["harnesses"]["opencode"]),
-                         ["ollama-cloud/deepseek-v4-pro", "ollama-cloud/glm-5.1",
-                          "zprovider/zeta"])
+                         ["ollama-cloud/glm-5.1", "zprovider/zeta",
+                          "ollama-cloud/deepseek-v4-pro"])
         self.assertIn("opencode-cli", got["sources"])
 
     def test_all_sources_down_raises(self):
         with self.assertRaises(RuntimeError):
             mc.build(fetch=fetch_down, env={}, run=None)
+
+
+class LocalRouteDiscoveryTest(unittest.TestCase):
+    def test_codex_cache_is_locally_available_with_efforts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "models_cache.json").write_text(json.dumps({"models": [{
+                "slug": "gpt-local", "display_name": "GPT Local",
+                "visibility": "list", "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    {"effort": "medium"}, {"effort": "high"}],
+            }]}))
+            run = mock.Mock(return_value=mock.Mock(
+                returncode=0, stdout="codex-cli 9.9\n", stderr=""))
+            with mock.patch.object(
+                    mc.shutil, "which",
+                    side_effect=lambda name: "/bin/codex" if name == "codex" else None):
+                got = mc.build(fetch=fetch_down, env={"CODEX_HOME": tmp}, run=run)
+        model = got["harnesses"]["codex"]["models"][0]
+        self.assertEqual(model["id"], "gpt-local")
+        self.assertEqual(model["availability"], "available")
+        self.assertEqual(model["source"], "codex-cache")
+        self.assertIn("high", model["supported_efforts"])
+
+    def test_kimi_config_selector_is_alias_not_provider_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.toml").write_text(
+                'default_model = "kimi-code/k3"\n'
+                '[models."kimi-code/k3"]\n'
+                'provider = "managed:kimi-code"\nmodel = "k3"\n'
+                'display_name = "K3"\nsupport_efforts = ["low", "high"]\n'
+                'default_effort = "high"\n')
+            run = mock.Mock(return_value=mock.Mock(
+                returncode=0, stdout="0.27.0\n", stderr=""))
+            with mock.patch.object(
+                    mc.shutil, "which",
+                    side_effect=lambda name: "/bin/kimi" if name == "kimi" else None):
+                got = mc.build(fetch=fetch_down, env={"KIMI_CODE_HOME": tmp}, run=run)
+        model = got["harnesses"]["kimi"]["models"][0]
+        self.assertEqual(model["id"], "kimi-code/k3")
+        self.assertEqual(model["provider_model"], "k3")
+        self.assertEqual(model["availability"], "available")
+
+
+class RoutePersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.row_factory = sqlite3.Row
+        migration = ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
+        self.con.executescript(migration.read_text())
+
+    def tearDown(self):
+        self.con.close()
+
+    def test_persist_marks_exact_high_effort_route_runnable(self):
+        payload = {
+            "fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+            "harnesses": {"kimi": {"models": [mc._entry(
+                "kimi-code/k3", source="kimi-config", availability="available",
+                provider="managed:kimi-code", provider_model="k3",
+                supported_efforts=["low", "high"])]}},
+        }
+        mc.persist_routes(self.con, payload)
+        row = self.con.execute(
+            "SELECT selector, availability, headless_supported, "
+            "high_effort_supported, stale FROM model_routes").fetchone()
+        self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
+
+    def test_failed_refresh_keeps_route_and_marks_it_stale(self):
+        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+                 "harnesses": {"claude": {"models": [mc._entry(
+                     "fable", source="claude-cli", availability="available",
+                     supported_efforts=["high"])]}}}
+        mc.persist_routes(self.con, fresh)
+        mc.persist_routes(self.con, {"fetched_at": None, "stale": True,
+                                     "error": "network down", "harnesses": {}})
+        row = self.con.execute(
+            "SELECT stale, last_error FROM model_routes WHERE selector='fable'").fetchone()
+        self.assertEqual(tuple(row), (1, "network down"))
+
+    def test_resolver_returns_exact_high_effort_sc_run_call(self):
+        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+                 "harnesses": {"codex": {"models": [mc._entry(
+                     "gpt-5.6-sol", source="codex-cache",
+                     availability="available", supported_efforts=["high"])]}}}
+        mc.persist_routes(self.con, fresh)
+        got = routes_cli.resolve(
+            self.con, "codex", "gpt-5.6-sol", shell="DEV3")
+        self.assertTrue(got["ok"])
+        self.assertEqual(
+            got["command"],
+            ["./sc", "run", "DEV3", "--harness", "codex", "-m",
+             "gpt-5.6-sol", "--effort", "high"])
+
+    def test_resolver_rejects_unverified_high_effort(self):
+        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+                 "harnesses": {"kimi": {"models": [mc._entry(
+                     "kimi-code/legacy", source="kimi-config",
+                     availability="available", supported_efforts=[])]}}}
+        mc.persist_routes(self.con, fresh)
+        got = routes_cli.resolve(self.con, "kimi", "kimi-code/legacy")
+        self.assertFalse(got["ok"])
+        self.assertIn("high-effort", got["error"])
 
 
 class CatalogCacheTest(NoCLI):
