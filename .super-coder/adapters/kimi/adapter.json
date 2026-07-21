@@ -4,6 +4,14 @@
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},
+  "session_control": {
+    "launch": ["python3", "{adapter_dir}/kimi-session.py"],
+    "capabilities": {
+      "provider": "kimi",
+      "transport": "authenticated-loopback-rest-v1",
+      "normal_steer": false
+    }
+  },
   "headless": {
     "launch": ["kimi"],
     "prompt_flag": "-p",
