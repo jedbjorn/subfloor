@@ -71,7 +71,7 @@ class _LabelRecorder:
 
 class ShellStatusTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.shell = {"shortname": "DEV1", "flavor": "dev"}
+        self.shell = {"shortname": "DEV1", "flavor": "dev", "current_state": ""}
         self.snap = {"supported": True, "processes": [], "indeterminate": 0}
 
     def test_status_colors_and_labels(self) -> None:
@@ -94,6 +94,27 @@ class ShellStatusTest(unittest.TestCase):
         self.assertEqual("Exempt      ", run._shell_status(admin, self.snap))
         self.assertEqual("Unknown     ", run._shell_status(self.shell, partial))
         self.assertEqual("Unknown     ", run._shell_status(self.shell, unsupported))
+
+    def test_sprint_reservation_replaces_only_available(self) -> None:
+        sprint_shell = {
+            **self.shell,
+            "current_state": "working notes\nSPRINT doc=21 unit=4 status=waiting",
+        }
+        with mock.patch.object(style, "ON", True), mock.patch.object(
+                run.shell_liveness, "session_state", return_value=None):
+            self.assertEqual("\x1b[38;5;214mSprint\x1b[0m      ",
+                             run._shell_status(sprint_shell, self.snap))
+
+        for state, expected in (("busy", "Busy"), ("orphan", "Orphaned")):
+            with self.subTest(state=state), mock.patch.object(
+                    run.shell_liveness, "session_state", return_value=state):
+                self.assertEqual(expected,
+                                 run._shell_status(sprint_shell, self.snap).strip())
+
+        partial = {**self.snap, "indeterminate": 1}
+        with mock.patch.object(run.shell_liveness, "session_state", return_value=None):
+            self.assertEqual("Unknown",
+                             run._shell_status(sprint_shell, partial).strip())
 
     def test_picker_has_a_dedicated_status_column(self) -> None:
         shell = {**self.shell, "display_name": "Dev One"}

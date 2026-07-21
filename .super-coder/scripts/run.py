@@ -527,7 +527,8 @@ def authenticate(con, interactive: bool = True):
 
 def list_shells(con, user_id: int) -> list:
     return con.execute(
-        "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor FROM shells "
+        "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor, "
+        "current_state FROM shells "
         "WHERE (user_id=? OR is_shared=1) AND COALESCE(is_deleted,0)=0 "
         "ORDER BY flavor IS NULL, flavor, shell_id",
         (user_id,),
@@ -566,8 +567,15 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
+def _is_sprint_reserved(shell) -> bool:
+    """True while the sprint skill's reservation marker is in current_state."""
+    current_state = dict(shell).get("current_state") or ""
+    return any(line.strip().startswith("SPRINT doc=")
+               for line in current_state.splitlines())
+
+
 def _shell_status(shell, snap: "dict | None") -> str:
-    """Styled, fixed-width picker status derived from the liveness snapshot."""
+    """Styled picker status derived from liveness plus sprint reservation."""
     if shell["flavor"] == "admin":
         label, paint = "Exempt", style.dim
     elif not snap or not snap.get("supported"):
@@ -580,6 +588,8 @@ def _shell_status(shell, snap: "dict | None") -> str:
             label, paint = "Orphaned", style.red
         elif snap.get("indeterminate"):
             label, paint = "Unknown", style.dim
+        elif _is_sprint_reserved(shell):
+            label, paint = "Sprint", style.amber
         else:
             label, paint = "Available", style.green
     return f"{paint(label)}{' ' * (12 - len(label))}"
@@ -862,7 +872,8 @@ def main() -> None:
     user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
     # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
-    # boot list can show shell status — Busy / Orphaned / Available / Exempt — and
+    # boot list can show shell status — Busy / Orphaned / Sprint / Available /
+    # Exempt — and
     # confirm before booting into a live worktree. Headless keeps its own lazy
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
