@@ -104,6 +104,45 @@ class ControlMutationTest(unittest.TestCase):
             "SELECT COUNT(*) FROM session_wake_jobs"
         ).fetchone()[0])
 
+    def test_manage_rejects_approval_prompting_posture_without_mutation(self):
+        message_id = add_message(self.con)
+        self.con.execute(
+            "UPDATE shell_session_bindings SET control_capabilities=? "
+            "WHERE binding_id=20",
+            (json.dumps({
+                "deliver": True,
+                "resume": True,
+                "settings": {
+                    "sandbox": "workspace-write",
+                    "approval_policy": "on-request",
+                },
+            }),),
+        )
+        self.con.commit()
+
+        payload, error = server.manage_session_control(self.con, 1, 20)
+
+        self.assertIsNone(payload)
+        self.assertEqual(
+            "managed wake requires approval_policy='never' or "
+            "sandbox='danger-full-access' so a headless turn cannot request approval",
+            error,
+        )
+        self.assertEqual(
+            ("dormant", 0, None),
+            tuple(self.con.execute(
+                "SELECT state, managed, last_error FROM shell_session_bindings "
+                "WHERE binding_id=20"
+            ).fetchone()),
+        )
+        self.assertEqual(
+            [],
+            [tuple(row) for row in self.con.execute(
+                "SELECT binding_id, trigger_message_id FROM session_wake_jobs "
+                "WHERE trigger_message_id=?", (message_id,)
+            )],
+        )
+
     def test_release_cancels_queue_but_keeps_message_unread(self):
         message_id = add_message(self.con)
         server.manage_session_control(self.con, 1, 20)

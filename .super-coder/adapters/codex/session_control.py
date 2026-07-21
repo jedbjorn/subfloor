@@ -178,6 +178,7 @@ class CodexAdapter:
         return "error"
 
     def deliver(self, binding: dict, prompt: str) -> None:
+        common_session_control.validate_managed_wake_posture(_capabilities(binding))
         if not _capabilities(binding).get("active_delivery"):
             raise RuntimeError("Codex active delivery is unsupported by this CLI version")
         endpoint, _path = self._endpoint(binding)
@@ -220,6 +221,7 @@ class CodexAdapter:
                 raise RuntimeError(f"Codex wake turn ended {final.get('status') or 'unknown'}")
 
     def resume(self, binding: dict, prompt: str) -> None:
+        common_session_control.validate_managed_wake_posture(_capabilities(binding))
         if not _capabilities(binding).get("resume"):
             raise RuntimeError("Codex CLI resume capability is unavailable")
         if not self.resume_probe().get("resume"):

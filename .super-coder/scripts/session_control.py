@@ -65,6 +65,26 @@ class ProviderBusy(SessionControlError):
     """The provider became active after its status probe; defer without retry cost."""
 
 
+MANAGED_WAKE_POSTURE_ERROR = (
+    "managed wake requires approval_policy='never' or "
+    "sandbox='danger-full-access' so a headless turn cannot request approval"
+)
+
+
+def validate_managed_wake_posture(capabilities: Mapping[str, object]) -> None:
+    """Reject recorded settings that can prompt without an interactive client."""
+    settings = capabilities.get("settings")
+    if not isinstance(settings, Mapping):
+        return
+    if "approval_policy" not in settings and "sandbox" not in settings:
+        return
+    if (
+        settings.get("approval_policy") != "never"
+        and settings.get("sandbox") != "danger-full-access"
+    ):
+        raise SessionControlError(MANAGED_WAKE_POSTURE_ERROR)
+
+
 def _require_state(state: str) -> None:
     if state not in BINDING_STATES:
         raise UnknownBindingState(f"unknown session binding state: {state!r}")

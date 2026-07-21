@@ -214,6 +214,24 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(rpc.waits, ["turn/completed"])
         self.assertNotIn("turn/steer", [method for method, _params in rpc.requests])
 
+    def test_approval_prompting_delivery_refuses_before_opening_transport(self):
+        row = binding()
+        capabilities = json.loads(row["control_capabilities"])
+        capabilities["settings"].update(
+            sandbox="workspace-write", approval_policy="on-request"
+        )
+        row["control_capabilities"] = json.dumps(capabilities)
+        opened: list[str] = []
+        adapter = adapter_module.CodexAdapter(
+            client_factory=lambda endpoint: opened.append(endpoint),
+            endpoint_available=lambda _path: True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "managed wake requires"):
+            adapter.deliver(row, "check inbox")
+
+        self.assertEqual(opened, [])
+
     def test_active_race_refuses_turn_start_and_never_steers(self):
         rpc = RpcFixture("active")
         adapter = adapter_module.CodexAdapter(
@@ -267,6 +285,26 @@ class AdapterTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "failed the resume capability probe"):
             adapter.resume(binding(), "check inbox")
+        self.assertEqual(calls, [])
+
+    def test_approval_prompting_resume_refuses_before_probe_or_spawn(self):
+        row = binding()
+        capabilities = json.loads(row["control_capabilities"])
+        capabilities["settings"].update(
+            sandbox="workspace-write", approval_policy="on-request"
+        )
+        row["control_capabilities"] = json.dumps(capabilities)
+        probes: list[bool] = []
+        calls: list[list[str]] = []
+        adapter = adapter_module.CodexAdapter(
+            resume_runner=lambda _row, command, _cwd: calls.append(command),
+            resume_probe=lambda: probes.append(True),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "managed wake requires"):
+            adapter.resume(row, "check inbox")
+
+        self.assertEqual(probes, [])
         self.assertEqual(calls, [])
 
     def test_host_resume_pins_effective_sandbox_approval_and_effort(self):

@@ -1256,6 +1256,11 @@ def manage_session_control(con, shell_id: int, binding_id: int | None = None):
         if not any(capabilities.get(name) for name in ("deliver", "resume")):
             con.rollback()
             return None, "binding has neither deliver nor resume capability"
+        try:
+            session_control.validate_managed_wake_posture(capabilities)
+        except session_control.SessionControlError as exc:
+            con.rollback()
+            return None, str(exc)
         other = con.execute(
             "SELECT binding_id FROM shell_session_bindings "
             "WHERE shell_id=? AND managed=1 AND binding_id!=?",
