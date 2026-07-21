@@ -140,6 +140,15 @@ def load_adapter(harness: str) -> dict:
             "emit": [], "env": {}}
 
 
+def session_control_launch(adapter: dict) -> list[str] | None:
+    """Resolve an adapter's controlled interactive launcher, if declared."""
+    launch = ((adapter.get("session_control") or {}).get("launch") or [])
+    if not launch:
+        return None
+    adapter_dir = ADAPTERS / adapter["harness"]
+    return [str(value).replace("{adapter_dir}", str(adapter_dir)) for value in launch]
+
+
 def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Copy the adapter's harness-specific config files (e.g. opencode.json) to
     `root` (the working directory). These are emitted artifacts (gitignored),
@@ -999,7 +1008,8 @@ def main() -> None:
             sys.exit(f"session resume refused: {e}")
 
         binding = resume_binding
-        if (not binding and adapter.get("session_control")
+        if (not binding and chosen["flavor"] == "planner"
+                and adapter.get("session_control")
                 and not os.environ.get("RENDER_ONLY")):
             binding = session_supervisor.ensure_binding(
                 con, archive_id=archive_id, shell_id=chosen["shell_id"],
@@ -1198,7 +1208,8 @@ def main() -> None:
     if not headless and ncfg.get("flag") and full["display_name"]:
         name_args = [ncfg["flag"], full["display_name"]]
 
-    cmd = (headless_cmd if headless else
+    controlled_cmd = session_control_launch(adapter) if binding and not headless else None
+    cmd = (headless_cmd if headless else controlled_cmd or
            (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags)
     effort_env = headless_effort_env(adapter, session_effort) if headless else {}
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
@@ -1215,6 +1226,9 @@ def main() -> None:
     # so it is absent from worktrees; a worktree-relative path failed open). This
     # just saves a subshell per edit on the normal launch path.
     env["SC_ENGINE_DIR"] = str(ENGINE)
+    if binding:
+        env["SC_SESSION_BINDING_ID"] = str(binding["binding_id"])
+        env["SC_SESSION_MODEL"] = str(session_model or flavor_model or "")
     # The shell's HOME worktree — the dir we exec the harness from (below). The
     # branch-guard reads it to judge "outside your worktree" against the assigned
     # tree, not the live cwd: a shell whose cwd has drifted to the repo root (to

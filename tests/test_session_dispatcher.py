@@ -162,6 +162,32 @@ class DispatchTest(unittest.TestCase):
             tuple(binding),
         )
 
+    def test_active_provider_turn_keeps_job_queued_without_attempt_or_steer(self):
+        message_id = add_message(self.con)
+        adapter = FakeAdapter(state="active")
+        self.assertEqual(0, self.poll(adapter))
+        self.assertEqual((0, 0), (adapter.deliveries, adapter.resumes))
+        self.assertEqual([(message_id, "queued", 0, None)], self.jobs())
+        state = self.con.execute(
+            "SELECT state FROM shell_session_bindings WHERE binding_id=20"
+        ).fetchone()[0]
+        self.assertEqual(state, "idle")
+
+    def test_provider_busy_race_undoes_claim_without_burning_retry(self):
+        message_id = add_message(self.con)
+
+        def became_busy(_binding, _prompt):
+            raise session_control.ProviderBusy("turn raced active")
+
+        adapter = FakeAdapter(deliver=became_busy)
+        self.assertEqual(1, self.poll(adapter))
+        self.assertEqual((1, 0), (adapter.deliveries, adapter.resumes))
+        self.assertEqual([(message_id, "queued", 0, None)], self.jobs())
+        state = self.con.execute(
+            "SELECT state FROM shell_session_bindings WHERE binding_id=20"
+        ).fetchone()[0]
+        self.assertEqual(state, "idle")
+
     def test_dormant_probe_cannot_resume_over_a_validated_live_owner(self):
         message_id = add_message(self.con)
         adapter = FakeAdapter(state="dormant")

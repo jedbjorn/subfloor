@@ -61,6 +61,10 @@ class StaleBindingState(SessionControlError):
         )
 
 
+class ProviderBusy(SessionControlError):
+    """The provider became active after its status probe; defer without retry cost."""
+
+
 def _require_state(state: str) -> None:
     if state not in BINDING_STATES:
         raise UnknownBindingState(f"unknown session binding state: {state!r}")
