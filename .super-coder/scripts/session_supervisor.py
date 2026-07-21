@@ -526,7 +526,7 @@ def supervise(cmd: list[str], *, cwd: Path, env: dict[str, str],
     """Run one harness process group and forward cancellation to all children."""
     child: subprocess.Popen | None = None
     forwarded: int | None = None
-    previous: dict[int, object] = {}
+    previous: dict[signal.Signals, object] = {}
 
     def forward(signum, _frame) -> None:
         nonlocal forwarded
@@ -574,6 +574,6 @@ def supervise(cmd: list[str], *, cwd: Path, env: dict[str, str],
         raise
     finally:
         for sig, handler in previous.items():
-            signal.signal(sig, handler)
+            signal.signal(sig, handler)  # type: ignore[arg-type]
         if child is not None and on_exited:
             on_exited(child.pid, child.returncode if child.returncode is not None else -1)

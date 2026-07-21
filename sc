@@ -901,6 +901,11 @@ case "$cmd" in
   watch-daemon-down) sc_watch_daemon_down ;;
   watch-daemon-install)   sc_watch_daemon_install ;;
   watch-daemon-uninstall) sc_watch_daemon_uninstall ;;
+  # Provider-neutral planner wake control. `session-control` is the internal,
+  # token-scoped adapter client; the public operator `session` surface lands
+  # with the sprint's status/analytics unit.
+  session-control)    exec "$PY" "$S/session_cli.py" "$@" ;;
+  session-dispatcher) exec "$PY" "$S/session_dispatcher.py" "$@" ;;
   # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
   persist)           sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
@@ -941,7 +946,7 @@ case "$cmd" in
   ports)        exec "$PY" "$S/ports.py" show ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
-  serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
+  serve)        exec "$PY" "$S/service_supervisor.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
   # Bake/re-bake the clean snapshot — HOST-side, deliberately NOT a broker verb:
@@ -1164,6 +1169,10 @@ super-coder — forkable shell substrate
   ./sc watch list          live PR watches (--all includes retired)
   ./sc watch inbox         block until this shell has unread messages, then exit — the zero-token
                              inbox watcher; arm as a background task and its exit is your wake-up
+  ./sc session-control …  internal token-scoped binding client for provider adapters
+                             (status/manage/release/retry/bind/channel)
+  ./sc session-dispatcher  run the provider-neutral wake dispatcher in the foreground
+                             (`./sc serve` supervises it automatically)
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
