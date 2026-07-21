@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the launcher's TTY-only spinner."""
+"""Regression tests for launcher styling and its TTY-only spinner."""
 from __future__ import annotations
 
 import io
@@ -67,6 +67,47 @@ class _LabelRecorder:
     def label(self, value: str) -> None:
         self._label = value
         self._labels.append(value)
+
+
+class ShellStatusTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.shell = {"shortname": "DEV1", "flavor": "dev"}
+        self.snap = {"supported": True, "processes": [], "indeterminate": 0}
+
+    def test_status_colors_and_labels(self) -> None:
+        cases = (
+            ("busy", "\x1b[38;5;214mBusy\x1b[0m        "),
+            ("orphan", "\x1b[31mOrphaned\x1b[0m    "),
+            (None, "\x1b[32mAvailable\x1b[0m   "),
+        )
+        with mock.patch.object(style, "ON", True):
+            for state, expected in cases:
+                with self.subTest(state=state), mock.patch.object(
+                        run.shell_liveness, "session_state", return_value=state):
+                    self.assertEqual(expected, run._shell_status(self.shell, self.snap))
+
+    def test_admin_and_indeterminate_states_are_explicit(self) -> None:
+        admin = {"shortname": "ADMIN", "flavor": "admin"}
+        partial = {**self.snap, "indeterminate": 1}
+        unsupported = {"supported": False, "processes": []}
+
+        self.assertEqual("Exempt      ", run._shell_status(admin, self.snap))
+        self.assertEqual("Unknown     ", run._shell_status(self.shell, partial))
+        self.assertEqual("Unknown     ", run._shell_status(self.shell, unsupported))
+
+    def test_picker_has_a_dedicated_status_column(self) -> None:
+        shell = {**self.shell, "display_name": "Dev One"}
+        stdout = _Stdout(tty=False)
+        stdin = _Stdout(tty=True)
+
+        with mock.patch.object(run.sys, "stdout", stdout), \
+             mock.patch.object(run.sys, "stdin", stdin), \
+             mock.patch("builtins.input", return_value="1"):
+            chosen = run.pick_shell([shell], None, False, snap=self.snap)
+
+        self.assertIs(shell, chosen)
+        self.assertIn("Shortname     Status      Default", stdout.getvalue())
+        self.assertIn("DEV1          Available", stdout.getvalue())
 
 
 class SpinnerTest(unittest.TestCase):

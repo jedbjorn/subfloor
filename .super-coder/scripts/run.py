@@ -525,22 +525,23 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
-def _liveness_note(shell, snap: "dict | None") -> str:
-    """Picker row annotation from the liveness snapshot: '(busy)' — a live
-    harness session holds the worktree; '(orphan?)' — the slot is held only by
-    survivors of closed terminals / dead parents; '(Exempt)' — the admin boots
-    at the repo root, outside the worktree signal, so it is never marked or
-    guarded. Empty when dormant or when no snapshot was taken (non-TTY)."""
+def _shell_status(shell, snap: "dict | None") -> str:
+    """Styled, fixed-width picker status derived from the liveness snapshot."""
     if shell["flavor"] == "admin":
-        return style.dim("  (Exempt)")
-    if not snap:
-        return ""
-    state = shell_liveness.session_state(shell["shortname"] or "", snap)
-    if state == "busy":
-        return style.yellow("  (busy)")
-    if state == "orphan":
-        return style.yellow("  (orphan?)")
-    return ""
+        label, paint = "Exempt", style.dim
+    elif not snap or not snap.get("supported"):
+        label, paint = "Unknown", style.dim
+    else:
+        state = shell_liveness.session_state(shell["shortname"] or "", snap)
+        if state == "busy":
+            label, paint = "Busy", style.amber
+        elif state == "orphan":
+            label, paint = "Orphaned", style.red
+        elif snap.get("indeterminate"):
+            label, paint = "Unknown", style.dim
+        else:
+            label, paint = "Available", style.green
+    return f"{paint(label)}{' ' * (12 - len(label))}"
 
 
 def confirm_live(shell, snap: "dict | None") -> bool:
@@ -591,7 +592,7 @@ def pick_shell(shells: list, requested: str | None,
     # it always reads 1, 2, 3… down the screen. shell_id is global and
     # non-contiguous, so showing it here made the numbering jump around within a
     # group; position tracks the display order instead.
-    print(style.dim(f"\n{'#':>3}  {'Name':<16}{'Shortname':<14}"
+    print(style.dim(f"\n{'#':>3}  {'Name':<16}{'Shortname':<14}{'Status':<12}"
                     f"{'Default (harness · model)'}"))
     _sentinel = object()
     cur_flavor: object = _sentinel
@@ -602,9 +603,8 @@ def pick_shell(shells: list, requested: str | None,
         num = style.dim(f"{n:>3}")
         name = style.bold("{:<16}".format(s["display_name"] or ""))
         short = "{:<14}".format(s["shortname"] or "")
-        print(f"{num}  {name}{short}"
-              f"{style.dim(_default_label(defaults, s['flavor']))}"
-              f"{_liveness_note(s, snap)}")
+        print(f"{num}  {name}{short}{_shell_status(s, snap)}"
+              f"{style.dim(_default_label(defaults, s['flavor']))}")
     if snap and snap.get("indeterminate"):
         print(style.dim(f"\n  ⚠ {snap['indeterminate']} harness process(es) "
                         f"with unreadable cwd — liveness markers are partial."))
@@ -793,7 +793,7 @@ def main() -> None:
     user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
     # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
-    # boot list can mark occupied shells — (busy) / (orphan?) / (Exempt) — and
+    # boot list can show shell status — Busy / Orphaned / Available / Exempt — and
     # confirm before booting into a live worktree. Headless keeps its own lazy
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
