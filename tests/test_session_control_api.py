@@ -19,6 +19,7 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402
+import session_dispatcher as dispatcher  # noqa: E402
 
 
 def build_db(path: str = ":memory:") -> sqlite3.Connection:
@@ -133,7 +134,7 @@ class ControlMutationTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(("dispatching", 1), tuple(row))
 
-    def test_retry_resets_only_failed_unread_jobs(self):
+    def test_retry_resets_failed_unread_jobs_and_dispatches_again(self):
         failed = add_message(self.con)
         done = add_message(self.con)
         self.con.execute(
@@ -163,6 +164,37 @@ class ControlMutationTest(unittest.TestCase):
                 "SELECT trigger_message_id, state, attempt_count, last_error "
                 "FROM session_wake_jobs ORDER BY trigger_message_id")],
         )
+
+        adapter = mock.Mock()
+        adapter.status.return_value = "dormant"
+
+        def acknowledge(_binding, _prompt):
+            self.con.execute(
+                "UPDATE shell_messages SET read_at=datetime('now') "
+                "WHERE message_id=?", (failed,)
+            )
+            self.con.commit()
+
+        adapter.resume.side_effect = acknowledge
+        attempted = dispatcher.poll_once(
+            self.con,
+            adapter_factory=lambda _binding: adapter,
+            api_probe=lambda _binding, _base: True,
+            reconcile=lambda _con, _binding_id, **_kwargs: "vacant",
+            lease_preflight=lambda _con, _binding_id, **_kwargs: None,
+            attempt_log=mock.Mock(),
+        )
+        self.assertEqual(1, attempted)
+        adapter.resume.assert_called_once()
+        self.assertEqual(
+            [(failed, "done", 1, None), (done, "done", 1, None)],
+            [tuple(row) for row in self.con.execute(
+                "SELECT trigger_message_id, state, attempt_count, last_error "
+                "FROM session_wake_jobs ORDER BY trigger_message_id")],
+        )
+        self.assertEqual("dormant", self.con.execute(
+            "SELECT state FROM shell_session_bindings WHERE binding_id=20"
+        ).fetchone()[0])
 
     def test_binding_patch_rejects_remote_endpoint_without_partial_write(self):
         payload, error = server.patch_session_binding(
@@ -219,6 +251,20 @@ class ControlMutationTest(unittest.TestCase):
             "SELECT state, managed FROM shell_session_bindings WHERE binding_id=20"
         ).fetchone()
         self.assertEqual(("dormant", 0), tuple(row))
+
+        self.con.execute(
+            "UPDATE shell_session_bindings SET state='dispatching' "
+            "WHERE binding_id=20"
+        )
+        self.con.commit()
+        payload, error = server.patch_session_binding(
+            self.con, 1, 20, {"state": "idle"}
+        )
+        self.assertIsNone(payload)
+        self.assertEqual("dispatching is owned by the dispatcher", error)
+        self.assertEqual("dispatching", self.con.execute(
+            "SELECT state FROM shell_session_bindings WHERE binding_id=20"
+        ).fetchone()[0])
 
     def test_channel_registration_uses_fenced_supervisor_and_stays_scoped(self):
         with mock.patch.object(

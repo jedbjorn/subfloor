@@ -439,6 +439,20 @@ def poll_once(
             if status not in ADAPTER_STATES:
                 raise RuntimeError(f"adapter returned invalid status {status!r}")
 
+            if (
+                binding["state"] == "starting"
+                and status == "dormant"
+                and owner in ("vacant", "stale-cleared")
+                and binding["native_session_id"]
+            ):
+                session_control.transition_binding(
+                    con, binding_id, expected="starting", target="dormant"
+                )
+                con.commit()
+                binding = binding_row(con, binding_id)
+                if binding is None:
+                    continue
+
             running = con.execute(
                 "SELECT COUNT(*) FROM session_wake_jobs "
                 "WHERE binding_id=? AND state='running'", (binding_id,)

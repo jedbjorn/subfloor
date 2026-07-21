@@ -1398,6 +1398,9 @@ def patch_session_binding(con, shell_id: int, binding_id: int, body: dict):
         if binding is None:
             con.rollback()
             return None, "no such session binding"
+        if "state" in body and binding["state"] == "dispatching":
+            con.rollback()
+            return None, "dispatching is owned by the dispatcher"
         native = body.get("native_session_id")
         if native is not None and con.execute(
                 "SELECT 1 FROM shell_session_bindings "
