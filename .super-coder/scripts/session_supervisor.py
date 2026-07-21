@@ -22,9 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+import session_control
+
 
 PROC = Path("/proc")
-FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+FORWARDED_SIGNALS = EXIT_SIGNALS + (signal.SIGWINCH,)
 
 
 class LeaseConflict(RuntimeError):
@@ -282,11 +285,13 @@ def claim_lease(con, binding_id: int, pid: int, *, repo_root: Path,
                 f"{','.join(map(str, owner_pids))}")
 
         generation = row["lease_generation"] + 1
+        session_control.transition_binding(
+            con, binding_id, expected=row["state"], target=state)
         cur = con.execute(
             "UPDATE shell_session_bindings SET lease_pid=?, lease_start_ticks=?, "
-            "lease_generation=?, state=?, last_error=NULL, updated_at=datetime('now') "
+            "lease_generation=?, last_error=NULL, updated_at=datetime('now') "
             "WHERE binding_id=? AND lease_generation=?",
-            (pid, identity.start_ticks, generation, state, binding_id,
+            (pid, identity.start_ticks, generation, binding_id,
              row["lease_generation"]),
         )
         if cur.rowcount != 1:
@@ -301,24 +306,38 @@ def claim_lease(con, binding_id: int, pid: int, *, repo_root: Path,
 def release_lease(con, binding_id: int, pid: int, start_ticks: int,
                   generation: int, *, error: str | None = None) -> bool:
     """Release only the exact generation this supervisor acquired."""
-    row = con.execute(
-        "SELECT native_session_id FROM shell_session_bindings WHERE binding_id=?",
-        (binding_id,),
-    ).fetchone()
-    if not row:
-        return False
-    target = "error" if error or not row["native_session_id"] else "dormant"
-    last_error = error or (None if row["native_session_id"]
-                           else "native session id unavailable when owner exited")
-    cur = con.execute(
-        "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
-        "state=?, last_error=?, updated_at=datetime('now') "
-        "WHERE binding_id=? AND lease_pid=? AND lease_start_ticks=? "
-        "AND lease_generation=?",
-        (target, last_error, binding_id, pid, start_ticks, generation),
-    )
-    con.commit()
-    return cur.rowcount == 1
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = con.execute(
+            "SELECT state, native_session_id FROM shell_session_bindings "
+            "WHERE binding_id=? AND lease_pid=? AND lease_start_ticks=? "
+            "AND lease_generation=?",
+            (binding_id, pid, start_ticks, generation),
+        ).fetchone()
+        if not row:
+            con.rollback()
+            return False
+        if row["state"] == "released":
+            target = "released"
+        else:
+            target = "error" if error or not row["native_session_id"] else "dormant"
+        last_error = error or (None if row["native_session_id"]
+                               else "native session id unavailable when owner exited")
+        session_control.transition_binding(
+            con, binding_id, expected=row["state"], target=target)
+        cur = con.execute(
+            "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
+            "last_error=?, updated_at=datetime('now') WHERE binding_id=? "
+            "AND lease_pid=? AND lease_start_ticks=? AND lease_generation=?",
+            (last_error, binding_id, pid, start_ticks, generation),
+        )
+        if cur.rowcount != 1:
+            raise LeaseConflict(f"binding {binding_id} lease changed concurrently")
+        con.commit()
+        return True
+    except Exception:
+        con.rollback()
+        raise
 
 
 def register_active_channel(con, binding_id: int, pid: int, *,
@@ -386,36 +405,51 @@ def _reconcile_active_channel(con, row: dict, *, repo_root: Path,
 def reconcile_binding(con, binding_id: int, *, repo_root: Path,
                       proc_root: Path = PROC) -> str:
     """Validate recorded ownership before a claim or dispatcher decision."""
-    row = _binding_context(con, binding_id)
-    channel_cleared = _reconcile_active_channel(
-        con, row, repo_root=repo_root, proc_root=proc_root)
-    status, pids = _recorded_owner_status(
-        row, repo_root=repo_root, proc_root=proc_root)
-    if status in ("vacant", "live"):
-        if channel_cleared:
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = _binding_context(con, binding_id)
+        channel_cleared = _reconcile_active_channel(
+            con, row, repo_root=repo_root, proc_root=proc_root)
+        status, pids = _recorded_owner_status(
+            row, repo_root=repo_root, proc_root=proc_root)
+        if status in ("vacant", "live"):
+            if channel_cleared:
+                con.commit()
+            else:
+                con.rollback()
+            return status
+        if status == "orphan-group":
+            target = "released" if row["state"] == "released" else "error"
+            session_control.transition_binding(
+                con, binding_id, expected=row["state"], target=target)
+            con.execute(
+                "UPDATE shell_session_bindings SET last_error=?, "
+                "updated_at=datetime('now') WHERE binding_id=?",
+                ("recorded owner exited but process group survives: "
+                 + ",".join(map(str, pids)), binding_id),
+            )
             con.commit()
-        return status
-    if status == "orphan-group":
+            return status
+
+        if row["state"] in ("released", "error"):
+            target = row["state"]
+        else:
+            target = "dormant" if row.get("native_session_id") else "error"
+        error = (None if row.get("native_session_id")
+                 else "stale owner and no native session id")
+        session_control.transition_binding(
+            con, binding_id, expected=row["state"], target=target)
         con.execute(
-            "UPDATE shell_session_bindings SET state='error', last_error=?, "
-            "updated_at=datetime('now') WHERE binding_id=?",
-            ("recorded owner exited but process group survives: "
-             + ",".join(map(str, pids)), binding_id),
+            "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
+            "last_error=?, updated_at=datetime('now') WHERE binding_id=? "
+            "AND lease_pid=? AND lease_start_ticks=?",
+            (error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
         )
         con.commit()
-        return status
-
-    target = "dormant" if row.get("native_session_id") else "error"
-    error = (None if row.get("native_session_id")
-             else "stale owner and no native session id")
-    con.execute(
-        "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
-        "state=?, last_error=?, updated_at=datetime('now') "
-        "WHERE binding_id=? AND lease_pid=? AND lease_start_ticks=?",
-        (target, error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
-    )
-    con.commit()
-    return "stale-cleared"
+        return "stale-cleared"
+    except Exception:
+        con.rollback()
+        raise
 
 
 def _normalize_returncode(returncode: int, forwarded_signal: int | None) -> int:
@@ -448,47 +482,57 @@ def supervise(cmd: list[str], *, cwd: Path, env: dict[str, str],
               on_started: Callable[[int], None] | None = None,
               on_exited: Callable[[int, int], None] | None = None,
               popen: Callable[..., subprocess.Popen] = subprocess.Popen,
-              killpg: Callable[[int, int], None] = os.killpg) -> int:
+              killpg: Callable[[int, int], None] = os.killpg,
+              group_grace: float = 2.0) -> int:
     """Run one harness process group and forward cancellation to all children."""
-    child = popen(cmd, cwd=str(cwd), env=env, start_new_session=True)
+    child: subprocess.Popen | None = None
     forwarded: int | None = None
     previous: dict[int, object] = {}
 
     def forward(signum, _frame) -> None:
         nonlocal forwarded
-        forwarded = forwarded or signum
-        if child.poll() is None:
+        if signum in EXIT_SIGNALS:
+            forwarded = forwarded or signum
+        if child is not None and child.poll() is None:
             try:
                 killpg(child.pid, signum)
             except (ProcessLookupError, PermissionError):
                 pass
 
     try:
+        # Install before Popen: cancellation in the fork/exec window is held in
+        # ``forwarded`` and relayed immediately once the child PID is known.
         for sig in FORWARDED_SIGNALS:
             previous[sig] = signal.getsignal(sig)
             signal.signal(sig, forward)
+        if forwarded is not None:
+            return _normalize_returncode(0, forwarded)
+        child = popen(cmd, cwd=str(cwd), env=env, start_new_session=True)
+        if forwarded is not None:
+            forward(forwarded, None)
         if on_started:
             on_started(child.pid)
         returncode = child.wait()
         # If the leader exits but a daemonized descendant remains in its group,
         # do not recreate #439 under a different PID.
-        terminate_group(child.pid, grace=0, killpg=killpg)
+        terminate_group(child.pid, grace=group_grace, killpg=killpg)
         return _normalize_returncode(returncode, forwarded)
     except BaseException:
-        try:
-            killpg(child.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            child.wait(timeout=5)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
+        if child is not None:
             try:
-                killpg(child.pid, signal.SIGKILL)
+                killpg(child.pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+            try:
+                child.wait(timeout=5)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    killpg(child.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
         raise
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-        if on_exited:
+        if child is not None and on_exited:
             on_exited(child.pid, child.returncode if child.returncode is not None else -1)

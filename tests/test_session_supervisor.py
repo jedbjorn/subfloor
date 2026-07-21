@@ -15,8 +15,11 @@ from pathlib import Path
 
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
+SCHEMA = ENGINE / "schema.sql"
+MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import run  # noqa: E402
+import session_control  # noqa: E402
 import session_supervisor as supervisor  # noqa: E402
 
 
@@ -284,6 +287,63 @@ class ConcurrentLeaseTest(unittest.TestCase):
         self.assertEqual("foreground", row["state"])
 
 
+class MigratedStateMachineIntegrationTest(unittest.TestCase):
+    def test_lease_edges_use_migrated_compare_and_set_state_machine(self):
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        con.executescript(SCHEMA.read_text())
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            con.executescript(migration.read_text())
+        con.executescript(
+            "INSERT INTO users (user_id, username, is_active) VALUES (1, 'T', 1);"
+            "INSERT INTO shells (shell_id, display_name, shortname, flavor, "
+            "system_prompt, user_id) VALUES (1, 'Planner', 'DEV1', 'planner', 'x', 1);"
+            "INSERT INTO shell_memory_archives "
+            "(archive_id, shell_id, session_id, date, harness, provider, model) "
+            "VALUES (10, 1, '0007', '2026-07-21', 'claude', 'anthropic', 'opus');"
+        )
+        binding = supervisor.ensure_binding(
+            con, archive_id=10, shell_id=1, harness="claude")
+        proc = FakeProc(self)
+        repo = proc.root / "repo"
+        worktree = repo / ".sc-worktrees" / "dev1"
+        proc.add(401, ticks=41, command=("claude",), cwd=worktree)
+
+        generation = supervisor.claim_lease(
+            con, binding["binding_id"], 401, repo_root=repo,
+            state="foreground", proc_root=proc.root)
+        row = con.execute(
+            "SELECT state, lease_pid, lease_start_ticks, lease_generation "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],),
+        ).fetchone()
+        self.assertEqual(("foreground", 401, 41, generation), tuple(row))
+
+        self.assertTrue(supervisor.release_lease(
+            con, binding["binding_id"], 401, 41, generation))
+        row = con.execute(
+            "SELECT state, lease_pid, lease_start_ticks, last_error "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],),
+        ).fetchone()
+        self.assertEqual(
+            ("error", None, None, "native session id unavailable when owner exited"),
+            tuple(row),
+        )
+
+        proc.add(402, ticks=42, command=("claude",), cwd=worktree)
+        with self.assertRaises(session_control.InvalidStateTransition):
+            supervisor.claim_lease(
+                con, binding["binding_id"], 402, repo_root=repo,
+                state="foreground", proc_root=proc.root)
+        row = con.execute(
+            "SELECT state, lease_pid, lease_generation FROM shell_session_bindings "
+            "WHERE binding_id=?", (binding["binding_id"],),
+        ).fetchone()
+        self.assertEqual(("error", None, generation), tuple(row))
+
+
 class ArchiveReuseTest(unittest.TestCase):
     def test_resume_reuses_exact_archive_without_creating_or_rewriting_it(self):
         con = make_db()
@@ -333,11 +393,36 @@ class SuperviseTest(unittest.TestCase):
             ["claude"], cwd=Path.cwd(), env=dict(os.environ),
             on_started=started, on_exited=lambda pid, code: exited.append((pid, code)),
             popen=lambda *args, **kwargs: Child(),
-            killpg=lambda pid, sig: calls.append((pid, sig)))
+            killpg=lambda pid, sig: calls.append((pid, sig)), group_grace=0)
         self.assertEqual(128 + signal.SIGTERM, rc)
         self.assertEqual((4321, signal.SIGTERM), calls[0])
         self.assertIn((4321, signal.SIGKILL), calls)
         self.assertEqual([(4321, 0)], exited)
+
+    def test_signal_arriving_inside_spawn_window_is_relayed_after_pid_capture(self):
+        calls: list[tuple[int, int]] = []
+
+        class Child:
+            pid = 5432
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        def spawning(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return Child()
+
+        rc = supervisor.supervise(
+            ["claude"], cwd=Path.cwd(), env=dict(os.environ), popen=spawning,
+            killpg=lambda pid, sig: calls.append((pid, sig)), group_grace=0)
+        self.assertEqual(128 + signal.SIGTERM, rc)
+        self.assertEqual((5432, signal.SIGTERM), calls[0])
+        self.assertNotIn((os.getpid(), signal.SIGTERM), calls)
 
     def test_cancelling_supervisor_terminates_real_descendant_group(self):
         tmp = tempfile.TemporaryDirectory()
