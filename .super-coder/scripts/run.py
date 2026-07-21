@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -54,6 +55,7 @@ import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
+import session_supervisor  # noqa: E402  — process groups + fenced planner ownership
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
@@ -680,11 +682,24 @@ def session_provider(harness: str, model: "str | None") -> "str | None":
 
 
 def open_session(con, shell_id: int,
-                 lifecycle: "dict | None" = None) -> tuple[str, int]:
+                 lifecycle: "dict | None" = None,
+                 reuse_archive_id: "int | None" = None) -> tuple[str, int]:
     """`lifecycle` carries the launch telemetry persisted onto the archive row
     (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
     NOT written here: run.py execs the harness, so no code runs at exit; the
     analytics sweep backfills it from harness session data."""
+    if reuse_archive_id is not None:
+        row = con.execute(
+            "SELECT archive_id, session_id FROM shell_memory_archives "
+            "WHERE archive_id=? AND shell_id=?", (reuse_archive_id, shell_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("resume archive does not belong to the selected shell")
+        con.execute("UPDATE shells SET active_archive_id=? WHERE shell_id=?",
+                    (row["archive_id"], shell_id))
+        con.commit()
+        return row["session_id"], row["archive_id"]
+
     life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             **(lifecycle or {})}
     life_cols = ["started_at", "harness", "provider", "model", "sprint_ref"]
@@ -776,6 +791,7 @@ def main() -> None:
     flag_harness = None
     flag_model = None
     flag_effort = None
+    flag_binding = None
     prompt = None
     positional = []
     i = 0
@@ -793,6 +809,10 @@ def main() -> None:
             flag_effort = args[i + 1] if i + 1 < len(args) else None
             i += 2
             continue
+        if a == "--session-binding":
+            flag_binding = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
         if a in ("-p", "--prompt"):
             prompt = args[i + 1] if i + 1 < len(args) else None
             i += 2
@@ -803,6 +823,8 @@ def main() -> None:
             flag_model = a.split("=", 1)[1]
         elif a.startswith("--effort="):
             flag_effort = a.split("=", 1)[1]
+        elif a.startswith("--session-binding="):
+            flag_binding = a.split("=", 1)[1]
         elif a.startswith("--prompt="):
             prompt = a.split("=", 1)[1]
         elif not a.startswith("-"):
@@ -911,6 +933,19 @@ def main() -> None:
         except ValueError as e:
             sys.exit(f"sc run: {e}")
 
+    resume_binding = None
+    if flag_binding:
+        try:
+            resume_binding = session_supervisor.binding_for_resume(
+                con, int(flag_binding), shell_id=chosen["shell_id"], harness=harness)
+        except (TypeError, ValueError) as e:
+            sys.exit(f"session resume refused: {e}")
+        pinned_model = resume_binding.get("archive_model")
+        if flag_model and pinned_model and flag_model != pinned_model:
+            sys.exit("session resume refused: requested model differs from the "
+                     "binding's pinned archive model")
+        session_model = pinned_model or session_model
+
     feedback = not headless and not os.environ.get("RENDER_ONLY")
     map_note = None
     trust_note = None
@@ -941,12 +976,28 @@ def main() -> None:
         # The model this launch will actually route (headless resolves via flags →
         # flavor default; interactive routes the flavor default). None = the harness
         # picks its own — recorded as NULL, honest about what we know at boot.
-        session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
-            "harness": harness,
-            "provider": session_provider(harness, session_model),
-            "model": session_model,
-            "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
-        })
+        try:
+            session_id, archive_id = open_session(
+                con, chosen["shell_id"], lifecycle={
+                    "harness": harness,
+                    "provider": session_provider(harness, session_model),
+                    "model": session_model,
+                    "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+                }, reuse_archive_id=(resume_binding or {}).get("archive_id"))
+        except ValueError as e:
+            sys.exit(f"session resume refused: {e}")
+
+        binding = resume_binding
+        if (not binding and adapter.get("session_control")
+                and not os.environ.get("RENDER_ONLY")):
+            binding = session_supervisor.ensure_binding(
+                con, archive_id=archive_id, shell_id=chosen["shell_id"],
+                harness=harness,
+                native_session_id=os.environ.get("SC_NATIVE_SESSION_ID") or None,
+                capabilities=json.dumps(
+                    (adapter.get("session_control") or {}).get("capabilities") or {},
+                    sort_keys=True),
+            )
 
         full = con.execute(
             "SELECT shell_id, display_name, shortname, partner, role, mandate, "
@@ -1014,6 +1065,9 @@ def main() -> None:
 
     print(f"\n→ booted {style.bold(full['display_name'])} "
           f"(shell_id={full['shell_id']}, session={session_id})")
+    if binding:
+        native = binding.get("native_session_id") or "pending"
+        print(f"→ session binding: {binding['binding_id']} · {harness}={native}")
     if work_dir != REPO_ROOT:
         print(f"→ worktree: {work_dir}")
         print(f"→ sync: {sync_note}")
@@ -1179,8 +1233,60 @@ def main() -> None:
     if not headless:
         set_terminal_tab_title(full["display_name"])
     os.chdir(work_dir)
-    print(f"→ exec {' '.join(cmd)}\n")
-    os.execvpe(cmd[0], cmd, env)
+    print(f"→ supervise {' '.join(cmd)}\n")
+
+    lease: dict[str, int] = {}
+
+    def lease_preflight() -> None:
+        if not binding:
+            return
+        lease_con = open_db()
+        try:
+            session_supervisor.preflight_lease(
+                lease_con, binding["binding_id"], repo_root=REPO_ROOT)
+        finally:
+            lease_con.close()
+
+    def lease_started(pid: int) -> None:
+        if not binding:
+            return
+        lease_con = open_db()
+        try:
+            generation = session_supervisor.claim_lease(
+                lease_con, binding["binding_id"], pid, repo_root=REPO_ROOT,
+                state="dispatching" if headless else "foreground",
+                supervisor_pid=os.getpid())
+            identity = session_supervisor.read_process(pid)
+            if not identity:  # claim_lease already validated it; fail closed on a race.
+                raise RuntimeError("harness process vanished while recording its lease")
+            lease.update(pid=pid, start_ticks=identity.start_ticks,
+                         generation=generation)
+        finally:
+            lease_con.close()
+
+    def lease_exited(_pid: int, returncode: int) -> None:
+        if not binding or not lease:
+            return
+        lease_con = open_db()
+        try:
+            session_supervisor.release_lease(
+                lease_con, binding["binding_id"], lease["pid"],
+                lease["start_ticks"], lease["generation"],
+                error=(f"harness exited {returncode}" if returncode not in (0, -signal.SIGINT,
+                                                                           -signal.SIGTERM)
+                       else None),
+            )
+        finally:
+            lease_con.close()
+
+    try:
+        rc = session_supervisor.supervise(
+            cmd, cwd=work_dir, env=env, on_pre_spawn=lease_preflight,
+            on_started=lease_started,
+            on_exited=lease_exited)
+    except (OSError, RuntimeError, session_supervisor.LeaseConflict) as e:
+        sys.exit(f"session launch refused: {e}")
+    raise SystemExit(rc)
 
 
 def set_terminal_tab_title(name: str) -> None:

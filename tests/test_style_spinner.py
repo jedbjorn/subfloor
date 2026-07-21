@@ -273,7 +273,7 @@ class BootPhaseLabelTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(run, "set_terminal_tab_title"))
             stack.enter_context(mock.patch.object(run.os, "chdir"))
             stack.enter_context(mock.patch.object(
-                run.os, "execvpe", side_effect=_ExecReached))
+                run.session_supervisor, "supervise", side_effect=_ExecReached))
             with self.assertRaises(_ExecReached):
                 run.main()
 
