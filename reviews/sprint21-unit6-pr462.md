@@ -112,3 +112,38 @@ still owed here. Flag SC-463.
 quick. Lows go to the sprint report; none block. Everything else checked out
 under an adversarial pass that specifically tried to break resume posture,
 route/effort preservation, lease fencing, and auth handling — and failed.
+
+---
+
+# Re-review @ a8c539a (fix push for SC-463)
+
+**Diff since d8d06f0:** one commit (`fix(session): remove Kimi runtime token on
+exit`) — 2 files, +78/-0. No scope creep.
+
+## SC-463 fix verified
+
+- `token_path(binding_id).unlink(missing_ok=True)` added to the launcher's
+  `finally`, after server terminate/kill and drain join, before `log.close()`.
+- **No NameError path:** `binding_id` resolves at `main()` entry (line 135),
+  before the `try` at 183 — every route into the `finally` has it bound.
+- **Correct ordering:** the token is removed only after the server that honors
+  it is dead; no window where the file outlives a live server on this path.
+- **Early-failure safe:** `missing_ok=True` covers probe refusal,
+  `wait_for_server` timeout, and Popen failure — paths where the token was
+  never written.
+- **Test is genuine** (`test_runtime_token_file_is_removed_when_server_exits`):
+  drives the real `main()` with mocks, asserts exact token content
+  (`runtime-secret\n`) exists mid-lifecycle (inside the client factory, which
+  fires after `write_private`) and that the file is absent after `main()`
+  returns. Removing the fix line turns it red. `RUN_DIR` is patched as a
+  module global, which `token_path` reads at call time — the patch takes.
+- **Residual accepted:** a SIGKILLed launcher still strands a token until the
+  next launch O_TRUNCs it or the release surface cleans up — in-process code
+  cannot handle SIGKILL. Release-while-server-lives cleanup is unit 7's
+  (`sc session release`), per the ratified U6/DEV3 boundary judgement on the
+  sprint board.
+
+## Verdict
+
+**review-clean.** SC-463 fixed and verified; flag #20 closed. Checks green at
+a8c539a. Lows L1–L6 stand as sprint-report notes, non-blocking.
