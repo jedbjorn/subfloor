@@ -143,3 +143,68 @@ any assertion that `supervise()` restores prior signal handlers.
 **2 Medium (F1, F2) block merge; 6 Lows to the sprint report.** No Major: the
 #439 scenario itself is correctly closed and the lease model is sound. Fix
 F1/F2, push, re-request — re-review will be scoped to those seams.
+
+---
+
+# RE-REVIEW: fix push `a054855` — 2026-07-21
+
+Scoped to F1/F2 per the fix request (message #141). One commit
+(`fix(session): close lease lifecycle races`), CI all green at `a054855`.
+
+## F1 — VERIFIED FIXED (both halves)
+
+**(a) reconciler vs live cleanup.** Migration 0078 adds nullable
+`supervisor_pid`/`supervisor_start_ticks`; `claim_lease` records the run.py
+supervisor (identity-validated: `command_matches("run.py")` + cwd within the
+binding worktree, start-ticks pinned against PID reuse). `_recorded_owner_status`
+checks the supervisor *after* the live-leader check and *before* the
+group-survivor check, so a dead leader with a live recorded supervisor is
+`cleanup`, not `orphan-group`; `reconcile_binding` treats `cleanup` like
+`live` — no fence, lease intact. Verified against production reality, not just
+the fake-proc tests: run.py `os.chdir(work_dir)` at run.py:1235 precedes claim,
+so `/proc/<pid>/cwd` is the worktree; `sc boot` execs `"$PY" "$S/run.py"`, so
+the cmdline carries `run.py`. A SIGKILLed supervisor fails the ticks/identity
+match and the orphan fence still fires — the #439 direction is preserved.
+
+**(b) release must degrade, not raise.** `release_lease` now treats
+`error`/`released` as terminal: same-state target, existing `last_error`
+preserved (the passed `error` is deliberately discarded — the state that moved
+first owns the narrative), lease + supervisor columns cleared.
+`is_transition_allowed` permits same-state refresh by design (documented in
+session_control), so `error→error` is a legal edge, not an accident. The exact
+crash path I flagged (release after an orphan fence) is now a test and passes.
+
+## F2 — VERIFIED FIXED
+
+`preflight_lease` = `reconcile_binding` + refuse any status outside
+`("vacant", "stale-cleared")` — so `live`, `cleanup`, and a just-fenced
+`orphan-group` all refuse *before* `Popen`, via the new `on_pre_spawn` hook
+(runs after handler install, before spawn). The post-spawn `claim_lease`
+remains the atomic gate, so a preflight/claim race between two boots still
+resolves to exactly one owner. Traced `supervise`'s failure path: a pre-spawn
+LeaseConflict leaves `child is None` → no group kill, no `on_exited`, handlers
+restored, exception reaches run.py's `session launch refused` guard.
+
+## Coverage check
+
+New tests hit every shape from my findings: cleanup-status during shutdown
+(reconcile returns `cleanup`, state untouched, release → `dormant`), release
+after an error fence (state preserved, lease cleared), released terminal
+refresh, preflight refusal on a live owner, and Popen non-invocation after a
+failed preflight (asserted via the injected `popen`).
+
+## Residual notes (Low, fold into sprint report)
+
+- The new supervisor-identity `ValueError`s in `claim_lease` widen L2's
+  uncaught-ValueError surface; practically unreachable (run.py chdirs first)
+  but they ride the same fix when L2 is addressed.
+- No test exercises `claim_lease`'s supervisor-identity rejection paths.
+- `expected_command="run.py"` is hardcoded; a future rename of the engine
+  entry degrades `cleanup` detection silently — fail-safe direction (over-
+  fencing, never adoption), so noted only.
+
+## Verdict
+
+**review-clean.** F1/F2 closed and regression-covered; no new Major/Medium
+introduced by the fix. Merge authority unlocked for DEV4 (checks green at
+`a054855`, sprint 21 ACTIVE).
