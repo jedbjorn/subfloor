@@ -375,6 +375,83 @@ class LauncherTest(unittest.TestCase):
             self.assertEqual(path.read_text(), "runtime-secret\n")
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_runtime_token_file_is_removed_when_server_exits(self):
+        class Connection:
+            def execute(self, _query, _params):
+                return self
+
+            def fetchone(self):
+                return {
+                    "binding_id": 8,
+                    "native_session_id": None,
+                    "control_capabilities": json.dumps({
+                        "settings": {"model": "kimi-code/k3", "effort": "high"}
+                    }),
+                }
+
+            def close(self):
+                return None
+
+        server = mock.Mock(stdout=None, returncode=0)
+        server.wait.return_value = 0
+        server.poll.return_value = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            runtime_token = run_dir / "kimi-8.token"
+
+            def client(endpoint, token):
+                self.assertEqual((endpoint, token), (EXPECTED_ENDPOINT, "runtime-secret"))
+                self.assertEqual(runtime_token.read_text(), "runtime-secret\n")
+                return mock.Mock()
+
+            with (
+                mock.patch.dict(
+                    "os.environ", {"SC_SESSION_BINDING_ID": "8"}, clear=False
+                ),
+                mock.patch.object(launcher_module, "RUN_DIR", run_dir),
+                mock.patch.object(
+                    launcher_module,
+                    "probe_kimi",
+                    return_value={
+                        "create": True,
+                        "server_command": ["kimi", "server", "run"],
+                        "cli_version": "0.27.0",
+                    },
+                ),
+                mock.patch.object(
+                    launcher_module.db_driver,
+                    "connect",
+                    side_effect=[Connection(), Connection()],
+                ),
+                mock.patch.object(launcher_module.subprocess, "Popen", return_value=server),
+                mock.patch.object(
+                    launcher_module,
+                    "wait_for_server",
+                    return_value=(EXPECTED_ENDPOINT, "runtime-secret"),
+                ),
+                mock.patch.object(launcher_module, "KimiClient", side_effect=client),
+                mock.patch.object(
+                    launcher_module,
+                    "configure_session",
+                    return_value=(
+                        "session-native-1",
+                        {
+                            "model": "kimi-code/k3",
+                            "cwd": str(ROOT),
+                            "effort": "high",
+                            "permission_mode": "auto",
+                        },
+                    ),
+                ),
+                mock.patch.object(
+                    launcher_module.session_supervisor, "register_native_session"
+                ),
+                mock.patch.object(launcher_module.webbrowser, "open"),
+            ):
+                self.assertEqual(launcher_module.main(), 0)
+
+            self.assertFalse(runtime_token.exists())
+
     def test_new_session_pins_k3_effort_and_auto_permission(self):
         class Client:
             def __init__(self):

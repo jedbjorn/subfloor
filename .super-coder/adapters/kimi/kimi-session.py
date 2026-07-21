@@ -235,6 +235,7 @@ def main() -> int:
                 server.wait()
         if drain is not None:
             drain.join(timeout=1)
+        token_path(binding_id).unlink(missing_ok=True)
         log.close()
 
 
