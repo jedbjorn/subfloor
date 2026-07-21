@@ -54,6 +54,14 @@ Stale guidance (skill says X, engine does Y) files the same as a crash.
 ## Capture — while the failure is on screen
 
 - **engine ref** = `cat .sc-state/engine.ref` — first line of every report
+- **staleness** = compare that ref to upstream head:
+  `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
+  `current` or `behind head <sha7>`. Behind + the symptom is a missing
+  command or a skill/engine mismatch -> the fix may already be shipped:
+  ask your FnB for `./sc update` first, and file only if the defect
+  survives the update (or updating isn't an option — then the staleness
+  note carries that caveat). Triage reads this line to tell a live
+  engine defect from a stale fork build.
 - **fork + seat**: repo name, shell flavor, sandbox/host
 - **ran / followed**: the exact command, or skill name + step
 - **expected vs actual**: exact output, trimmed to the failing lines
@@ -71,7 +79,7 @@ gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
 gh issue create --repo jedbjorn/subfloor \
   --title "[<fork>] <area>: <symptom>" \
   --body "$(cat <<'EOF'
-- engine ref: <sha from .sc-state/engine.ref>
+- engine ref: <sha from .sc-state/engine.ref> · <current | behind head <sha7>>
 - fork/seat: <repo> · <shell flavor> · <sandbox|host>
 
 **Ran / followed:** <command or skill+step>
