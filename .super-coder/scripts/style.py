@@ -41,6 +41,8 @@ accent = _c("38;5;135")   # subfloor purple
 cyan = _c("36")
 green = _c("32")
 yellow = _c("33")
+amber = _c("38;5;214")
+red = _c("31")
 
 
 class _Spinner:
