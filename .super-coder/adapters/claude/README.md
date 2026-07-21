@@ -13,6 +13,7 @@ the launch command. No extra config file to emit at v1.
 | `emit` | files in this dir copied to the repo root at launch (none for Claude) |
 | `env` | extra env merged into the launch environment |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's claude model (alias: `sonnet`/`haiku`/`opus`) |
+| `headless.effort` | `{ "flag": "--effort" }` — sprint workers default to `--effort high` |
 | `merge_json` | always-on: project-scoped JSON deep-merged every launch (preserves fork keys). Installs the branch-guard hook into `.claude/settings.local.json`. |
 | `sandbox` | `merge_json`: project-scoped config patched in-sandbox only (allow-all permissions) |
 

@@ -324,13 +324,19 @@ async function renderShells(root) {
 // list appears once a family is active or a query is typed, "all" + Enter
 // browses everything, Enter stores any typed id as-is, Escape / outside
 // click / a pick collapses. Catalog: /api/models v2 — advisory, never a
-// constraint.
+// constraint. Payload v3 adds local route authority + effort capability: a
+// public suggestion remains typeable, but only a locally available model with
+// verified high effort is sprint-runnable through `sc models resolve`.
 const DM_MODEL_CAP = 60;   // rendered cards per view — "all" on opencode is huge
 
 function dmModelPicker(harness, cat, row, save) {
   const data = cat.harnesses?.[harness] || { families: [], models: [] };
+  const currentRoute = (data.models || []).find((m) => m.id === row.model);
   const current = el("span", { className: "dm-current" + (row.model ? "" : " dm-unset"),
-                               textContent: row.model || "harness default" });
+                               textContent: row.model || "harness default",
+                               title: currentRoute
+                                 ? `${currentRoute.availability || "advisory"} · ${currentRoute.source || "unknown source"}`
+                                 : (row.model ? "not present in the latest catalogue" : "") });
   const input = el("input", { className: "dm-search",
                               placeholder: "search · click a family to filter · “all” ⏎" });
   const results = el("div", { className: "dm-results", hidden: true });
@@ -361,6 +367,13 @@ function dmModelPicker(harness, cat, row, save) {
     c.append(el("b", {}, id), el("span", { className: "dm-mcard-sub" }, sub || ""));
     c.onclick = () => pick(id);
     return c;
+  };
+  const routeSub = (m) => {
+    const efforts = m.supported_efforts || [];
+    const route = m.availability === "available"
+      ? (efforts.includes("high") ? "local · high-effort route" : "local · no verified high effort")
+      : (m.availability || "advisory");
+    return [route, m.source, m.release_date].filter(Boolean).join(" · ");
   };
 
   const paint = () => {
@@ -400,7 +413,7 @@ function dmModelPicker(harness, cat, row, save) {
       if (famMeta && !models.some((m) => m.id === famMeta.latest) && hit(famMeta.latest))
         list.append(mcard(famMeta.latest, "alias — tracks this family's latest", "dm-alias"));
       for (const m of models.slice(0, DM_MODEL_CAP))
-        list.append(mcard(m.id, m.release_date));
+        list.append(mcard(m.id, routeSub(m)));
       if (q && !allMode)
         list.append(mcard(input.value.trim(), "use as typed", "dm-raw"));
       results.append(list);
@@ -491,7 +504,7 @@ async function renderDefaultModels(root, s) {
     root.append(panel);
   }
   root.append(el("div", { className: "dm-note" },
-    "★ = default harness at launch. Family chip = track that line's latest. Suggestions are unfiltered — an open-model licence gate (e.g. MIT/Apache-only) stays operator policy."));
+    "★ = default harness at launch. Local + high-effort = sprint-runnable. Advisory entries remain free-text suggestions. Family chip = track that line's latest."));
 }
 
 // Harness — the shell's surfaces as grouped accordions: Operational

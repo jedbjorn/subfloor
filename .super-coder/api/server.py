@@ -2089,7 +2089,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/models":
                 q = parse_qs(urlparse(self.path).query)
                 return self._send(200, model_catalog.catalog(
-                    refresh=q.get("refresh", ["0"])[0] in ("1", "true")))
+                    refresh=q.get("refresh", ["0"])[0] in ("1", "true"),
+                    con=con))
             if path.startswith("/api/shells/"):
                 sid = int(path.rsplit("/", 1)[1])
                 shell = get_shell(con, sid)

@@ -18,7 +18,10 @@ catch-all; kimi is the native Moonshot path.
 | `launch` | argv exec'd to start the harness (`kimi` — cwd is the workspace; no dir flag exists) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (none — kimi reads `~/.kimi-code` + `AGENTS.md`) |
-| `headless.launch` | non-interactive argv (`kimi -p` — the prompt is `-p`'s option value, appended last) |
+| `headless.launch` | non-interactive base argv (`kimi`) |
+| `headless.prompt_flag` | `-p`; run.py emits it immediately before the prompt value |
+| `headless.model_flag` | `-m`; the selector must be an alias discovered from `~/.kimi-code/config.toml` |
+| `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; sprint headless boots set it to `high` |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox, interactive launches only (`--yolo`) |
 
 **`--yolo` (sandbox, interactive only):** auto-approves all actions inside the
@@ -32,12 +35,13 @@ flag at all. This adapter is why the sandbox seam splits `launch_flags`
 other. On the no-docker host path (`./sc boot`), kimi keeps its normal
 per-action approval prompts.
 
-**No `model` field:** kimi takes no model from the launch seam. Its `-m` flag
-selects a model *alias* defined in `~/.kimi-code/config.toml` (`[models."…"]`) —
-user-local names, not portable provider ids — so routing a flavor-default model
-here would be meaningless; kimi uses its configured `default_model` (or
-`/model` in-session). For the same reason the headless block declares no
-`model_flag` and kimi has no `flavor_defaults` seeds or model-catalog entry.
+**No interactive `model` field:** Kimi's `-m` selects a user-local alias from
+`~/.kimi-code/config.toml`, not a portable provider id, so an interactive flavor
+default remains unsafe. Headless sprint boots are different: Refresh models
+discovers the exact local aliases (for example `kimi-code/k3`), the resolver
+accepts only a locally available high-effort route, and the adapter emits
+`kimi -m <alias> -p <prompt>`. A requested selector that cannot be applied fails
+before the worker session opens.
 
 **Skills:** kimi does not read `.claude/skills/` (its discovery dirs are
 `.kimi-code/skills/` + `.agents/skills/`), so like codex/vibe it loads skills

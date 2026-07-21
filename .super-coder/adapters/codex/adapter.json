@@ -5,7 +5,11 @@
   "emit": [".codex/hooks.json"],
   "env": {},
   "model": { "flag": "--model" },
-  "headless": { "launch": ["codex", "exec"], "model_flag": "-m" },
+  "headless": {
+    "launch": ["codex", "exec"],
+    "model_flag": "-m",
+    "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" }
+  },
   "sandbox": {
     "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"],
     "headless_flags": ["--dangerously-bypass-approvals-and-sandbox"]

@@ -4,6 +4,11 @@
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},
-  "headless": { "launch": ["kimi", "-p"] },
+  "headless": {
+    "launch": ["kimi"],
+    "prompt_flag": "-p",
+    "model_flag": "-m",
+    "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" }
+  },
   "sandbox": { "launch_flags": ["--yolo"] }
 }

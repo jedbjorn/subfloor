@@ -20,6 +20,7 @@ billing. opencode stays as the universal metered catch-all.
 | `emit` | files copied to the repo root at launch (`.codex/hooks.json` — the branch-guard hook) |
 | `env` | extra env merged into the launch environment |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
+| `headless.effort` | maps sprint `high` to `-c model_reasoning_effort="high"` |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox (`SC_SANDBOX`) |
 
 ## Branch-guard hook
