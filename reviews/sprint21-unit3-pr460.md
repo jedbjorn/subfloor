@@ -2,7 +2,9 @@
 
 - **Reviewer:** REV1 · **Author:** DEV3 · **Spec:** doc #20 (feature 14) · **Sprint:** doc #21
 - **Head reviewed:** `3987995` (`feat/session-wake-dispatcher-api`) — all 6 checks green
-- **Verdict:** **2 blocking findings** — 1 Major (flag #17 / SC-460), 1 Medium (flag #18 / SC-461); 4 Lows for the report. Merge blocked until Major + Medium are fixed.
+- **Verdict (initial):** **2 blocking findings** — 1 Major (flag #17 / SC-460), 1 Medium (flag #18 / SC-461); 4 Lows for the report. Merge blocked until Major + Medium are fixed.
+- **Re-review head:** `6883ca2` (fix commit `fix(session): restore retry and dispatch fences`) — all 6 checks green
+- **Final verdict:** **review-clean.** Both blockers fixed and verified (addendum below); flags #17/#18 closed. Lows L1/L2/L4 stand as report notes; L3 addressed for the two blocking paths.
 
 ## Scope reviewed
 
@@ -116,6 +118,53 @@ to cover the source-state case.
 - `sc serve` arg compatibility preserved (old server only ever parsed
   `--port`); container launch path (`./sc serve --port`) unchanged; dispatcher
   gets its own heartbeat row and status surface via GET.
+
+## Re-review addendum — fix commit `6883ca2` (verified 2026-07-21)
+
+One commit, exactly the two flagged seams plus tests; no unrelated scope.
+
+**SC-460 (Major) — fixed.** `poll_once` now advances a stalled `starting`
+binding before the claim: when DB state is `starting`, the adapter probe is
+`dormant`, the reconciled owner is `vacant`/`stale-cleared`, and
+`native_session_id` is set, it runs `transition_binding(expected="starting",
+target="dormant")` and commits. Verified:
+
+- `starting → dormant` is a legal edge in the unit-1 state machine.
+- The transition is a CAS; concurrent interference raises `StaleBindingState`,
+  which the loop's error handler surfaces as `last_error` — not silent.
+- Placement is pre-claim inside the per-binding loop, after reconcile and the
+  probe, with its own commit — no nesting with `claim_batch`'s
+  `BEGIN IMMEDIATE`; the retried binding dispatches in the *same* cycle.
+- The guard is exactly as narrow as proposed: a fresh `starting` binding with
+  no native ID is untouched (launch is units 4–6 scope), and a non-dormant
+  probe or non-vacant owner leaves the conservative stall in place.
+- Test: `test_retry_resets_only_failed_unread_jobs` grew into
+  `test_retry_resets_failed_unread_jobs_and_dispatches_again` — drives
+  error → retry → poll_once → resume delivered, jobs done, binding `dormant`.
+  This is the missing test named in L3; it would have caught the original bug.
+
+**SC-461 (Medium) — fixed.** `patch_session_binding` now refuses any PATCH
+carrying `state` when the *current* state is `dispatching`
+("dispatching is owned by the dispatcher"). Verified:
+
+- The guard reads the row inside the handler's `BEGIN IMMEDIATE`, and the
+  dispatcher's claim/finish also run under `BEGIN IMMEDIATE`, so the check
+  serializes against the dispatcher — no TOCTOU window.
+- The dispatcher's own return path writes state directly
+  (`_return_binding_state`), not via PATCH, so its exit from `dispatching` is
+  unaffected; release/retry/manage are separate endpoints with their own
+  guards, also unaffected. An adapter status-PATCH racing a live turn now gets
+  a truthful refusal instead of unfencing the binding.
+- Test: `test_binding_patch_cannot_bypass_dispatch_or_release_operations`
+  extended with the source-state case — PATCH `dispatching → idle` refused,
+  state unchanged. (Minor non-defect: a PATCH with `state: null` during
+  `dispatching` is refused where it would have been a no-op — harmless
+  over-refusal.)
+
+**Lows:** L1 (misleading 400 on channel fencing refusals), L2 (foreground
+return-state dropped to idle), L4 (1s crash-loop restart without backoff)
+stand as report notes. L3's two blocking-path gaps are now covered; the
+one-shell coverage nits within it remain notes.
 
 ## Batch-terminal note (not a defect)
 
