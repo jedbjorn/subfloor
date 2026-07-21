@@ -51,6 +51,8 @@ CREATE TABLE shell_session_bindings (
   managed INTEGER NOT NULL DEFAULT 0,
   lease_pid INTEGER,
   lease_start_ticks INTEGER,
+  supervisor_pid INTEGER,
+  supervisor_start_ticks INTEGER,
   active_channel_pid INTEGER,
   active_channel_start_ticks INTEGER,
   active_channel_heartbeat_at TEXT,
@@ -169,6 +171,10 @@ class BindingTest(unittest.TestCase):
         generation = supervisor.claim_lease(
             self.con, self.binding["binding_id"], 100, repo_root=self.repo,
             state="foreground", proc_root=self.proc.root)
+        with self.assertRaisesRegex(supervisor.LeaseConflict, r"not vacant \(live\)"):
+            supervisor.preflight_lease(
+                self.con, self.binding["binding_id"], repo_root=self.repo,
+                proc_root=self.proc.root)
         with self.assertRaisesRegex(supervisor.LeaseConflict, "live owner pid 100"):
             supervisor.claim_lease(
                 self.con, self.binding["binding_id"], 101, repo_root=self.repo,
@@ -218,6 +224,58 @@ class BindingTest(unittest.TestCase):
                          (row["lease_pid"], row["lease_start_ticks"], row["state"]))
         self.assertEqual("recorded owner exited but process group survives: 101",
                          row["last_error"])
+        self.assertTrue(supervisor.release_lease(
+            self.con, self.binding["binding_id"], 100, 10,
+            row["lease_generation"]))
+        row = self.row()
+        self.assertEqual((None, None, "error",
+                          "recorded owner exited but process group survives: 101"),
+                         (row["lease_pid"], row["lease_start_ticks"], row["state"],
+                          row["last_error"]))
+
+    def test_live_supervisor_authorizes_cleanup_after_leader_exit(self):
+        self.proc.add(90, ticks=9, command=("python", "/engine/run.py"),
+                      cwd=self.worktree)
+        self.proc.add(100, ticks=10, command=("claude",), cwd=self.worktree)
+        supervisor.register_native_session(
+            self.con, self.binding["binding_id"], "native-a")
+        generation = supervisor.claim_lease(
+            self.con, self.binding["binding_id"], 100, repo_root=self.repo,
+            state="foreground", supervisor_pid=90, proc_root=self.proc.root)
+        self.proc.remove(100)
+        self.proc.add(101, ticks=11, pgrp=100, command=("python", "worker.py"),
+                      cwd=self.worktree)
+
+        self.assertEqual("cleanup", supervisor.reconcile_binding(
+            self.con, self.binding["binding_id"], repo_root=self.repo,
+            proc_root=self.proc.root))
+        row = self.row()
+        self.assertEqual(("foreground", 100, 90),
+                         (row["state"], row["lease_pid"], row["supervisor_pid"]))
+        self.assertTrue(supervisor.release_lease(
+            self.con, self.binding["binding_id"], 100, 10, generation))
+        row = self.row()
+        self.assertEqual(("dormant", None, None, None),
+                         (row["state"], row["lease_pid"], row["supervisor_pid"],
+                          row["last_error"]))
+
+    def test_release_clears_lease_without_leaving_released_state(self):
+        self.proc.add(100, ticks=10, command=("claude",), cwd=self.worktree)
+        generation = supervisor.claim_lease(
+            self.con, self.binding["binding_id"], 100, repo_root=self.repo,
+            state="foreground", proc_root=self.proc.root)
+        session_control.transition_binding(
+            self.con, self.binding["binding_id"], expected="foreground",
+            target="released")
+        self.con.commit()
+
+        self.assertTrue(supervisor.release_lease(
+            self.con, self.binding["binding_id"], 100, 10, generation,
+            error="ignored terminal error"))
+        row = self.row()
+        self.assertEqual(("released", None, None, None),
+                         (row["state"], row["lease_pid"], row["lease_start_ticks"],
+                          row["last_error"]))
 
     def test_active_channel_pid_reuse_is_cleared_not_heartbeated(self):
         self.proc.add(200, ticks=20, command=("python", "watcher.py"),
@@ -371,6 +429,23 @@ class ArchiveReuseTest(unittest.TestCase):
 
 
 class SuperviseTest(unittest.TestCase):
+    def test_preflight_refuses_before_popen(self):
+        spawned = False
+
+        def refuse() -> None:
+            raise supervisor.LeaseConflict("live owner")
+
+        def popen(*args, **kwargs):
+            nonlocal spawned
+            spawned = True
+            raise AssertionError("Popen must not run after a failed preflight")
+
+        with self.assertRaisesRegex(supervisor.LeaseConflict, "live owner"):
+            supervisor.supervise(
+                ["claude"], cwd=Path.cwd(), env=dict(os.environ),
+                on_pre_spawn=refuse, popen=popen)
+        self.assertFalse(spawned)
+
     def test_forwarded_signal_targets_process_group_and_controls_exit_status(self):
         calls: list[tuple[int, int]] = []
         exited: list[tuple[int, int]] = []

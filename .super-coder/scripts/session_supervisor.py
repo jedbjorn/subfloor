@@ -247,6 +247,13 @@ def _recorded_owner_status(row: dict, *, repo_root: Path,
     if process_matches(pid, ticks, expected_command=row["harness"],
                        expected_worktree=worktree, proc_root=proc_root):
         return "live", [pid]
+    supervisor_pid = row.get("supervisor_pid")
+    supervisor_ticks = row.get("supervisor_start_ticks")
+    if (supervisor_pid is not None and supervisor_ticks is not None
+            and process_matches(
+                supervisor_pid, supervisor_ticks, expected_command="run.py",
+                expected_worktree=worktree, proc_root=proc_root)):
+        return "cleanup", [supervisor_pid]
     survivors = process_group_members(
         pid, expected_worktree=worktree, expected_command=row["harness"],
         proc_root=proc_root)
@@ -256,7 +263,8 @@ def _recorded_owner_status(row: dict, *, repo_root: Path,
 
 
 def claim_lease(con, binding_id: int, pid: int, *, repo_root: Path,
-                state: str, proc_root: Path = PROC) -> int:
+                state: str, supervisor_pid: int | None = None,
+                proc_root: Path = PROC) -> int:
     """Atomically fence one validated process as the binding owner."""
     if state not in ("foreground", "dispatching"):
         raise ValueError(f"invalid owner state {state!r}")
@@ -269,6 +277,14 @@ def claim_lease(con, binding_id: int, pid: int, *, repo_root: Path,
             raise ValueError("new lease PID does not match the binding harness")
         if not _within(identity.cwd, worktree):
             raise ValueError("new lease PID is outside the binding worktree")
+        supervisor_identity = None
+        if supervisor_pid is not None:
+            supervisor_identity = read_process(supervisor_pid, proc_root)
+            if (not supervisor_identity
+                    or not command_matches(supervisor_identity.command, "run.py")):
+                raise ValueError("supervisor PID does not match run.py")
+            if not _within(supervisor_identity.cwd, worktree):
+                raise ValueError("supervisor PID is outside the binding worktree")
 
         owner_status, owner_pids = _recorded_owner_status(
             row, repo_root=repo_root, proc_root=proc_root)
@@ -283,15 +299,23 @@ def claim_lease(con, binding_id: int, pid: int, *, repo_root: Path,
             raise LeaseConflict(
                 f"binding {binding_id} has surviving process-group members "
                 f"{','.join(map(str, owner_pids))}")
+        if owner_status == "cleanup":
+            raise LeaseConflict(
+                f"binding {binding_id} is being cleaned by supervisor pid "
+                f"{owner_pids[0]}")
 
         generation = row["lease_generation"] + 1
         session_control.transition_binding(
             con, binding_id, expected=row["state"], target=state)
         cur = con.execute(
             "UPDATE shell_session_bindings SET lease_pid=?, lease_start_ticks=?, "
-            "lease_generation=?, last_error=NULL, updated_at=datetime('now') "
+            "supervisor_pid=?, supervisor_start_ticks=?, lease_generation=?, "
+            "last_error=NULL, updated_at=datetime('now') "
             "WHERE binding_id=? AND lease_generation=?",
-            (pid, identity.start_ticks, generation, binding_id,
+            (pid, identity.start_ticks,
+             supervisor_identity.pid if supervisor_identity else None,
+             supervisor_identity.start_ticks if supervisor_identity else None,
+             generation, binding_id,
              row["lease_generation"]),
         )
         if cur.rowcount != 1:
@@ -303,13 +327,24 @@ def claim_lease(con, binding_id: int, pid: int, *, repo_root: Path,
         raise
 
 
+def preflight_lease(con, binding_id: int, *, repo_root: Path,
+                    proc_root: Path = PROC) -> None:
+    """Refuse a known owner before spawning; the post-spawn claim stays atomic."""
+    status = reconcile_binding(
+        con, binding_id, repo_root=repo_root, proc_root=proc_root)
+    if status not in ("vacant", "stale-cleared"):
+        raise LeaseConflict(
+            f"binding {binding_id} owner is not vacant ({status})")
+
+
 def release_lease(con, binding_id: int, pid: int, start_ticks: int,
                   generation: int, *, error: str | None = None) -> bool:
     """Release only the exact generation this supervisor acquired."""
     con.execute("BEGIN IMMEDIATE")
     try:
         row = con.execute(
-            "SELECT state, native_session_id FROM shell_session_bindings "
+            "SELECT state, native_session_id, last_error "
+            "FROM shell_session_bindings "
             "WHERE binding_id=? AND lease_pid=? AND lease_start_ticks=? "
             "AND lease_generation=?",
             (binding_id, pid, start_ticks, generation),
@@ -317,17 +352,19 @@ def release_lease(con, binding_id: int, pid: int, start_ticks: int,
         if not row:
             con.rollback()
             return False
-        if row["state"] == "released":
-            target = "released"
+        if row["state"] in ("error", "released"):
+            target = row["state"]
+            last_error = row["last_error"]
         else:
             target = "error" if error or not row["native_session_id"] else "dormant"
-        last_error = error or (None if row["native_session_id"]
-                               else "native session id unavailable when owner exited")
+            last_error = error or (None if row["native_session_id"]
+                                   else "native session id unavailable when owner exited")
         session_control.transition_binding(
             con, binding_id, expected=row["state"], target=target)
         cur = con.execute(
             "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
-            "last_error=?, updated_at=datetime('now') WHERE binding_id=? "
+            "supervisor_pid=NULL, supervisor_start_ticks=NULL, last_error=?, "
+            "updated_at=datetime('now') WHERE binding_id=? "
             "AND lease_pid=? AND lease_start_ticks=? AND lease_generation=?",
             (last_error, binding_id, pid, start_ticks, generation),
         )
@@ -412,7 +449,7 @@ def reconcile_binding(con, binding_id: int, *, repo_root: Path,
             con, row, repo_root=repo_root, proc_root=proc_root)
         status, pids = _recorded_owner_status(
             row, repo_root=repo_root, proc_root=proc_root)
-        if status in ("vacant", "live"):
+        if status in ("vacant", "live", "cleanup"):
             if channel_cleared:
                 con.commit()
             else:
@@ -441,7 +478,8 @@ def reconcile_binding(con, binding_id: int, *, repo_root: Path,
             con, binding_id, expected=row["state"], target=target)
         con.execute(
             "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
-            "last_error=?, updated_at=datetime('now') WHERE binding_id=? "
+            "supervisor_pid=NULL, supervisor_start_ticks=NULL, last_error=?, "
+            "updated_at=datetime('now') WHERE binding_id=? "
             "AND lease_pid=? AND lease_start_ticks=?",
             (error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
         )
@@ -479,6 +517,7 @@ def terminate_group(process_group: int, *, grace: float = 5.0,
 
 
 def supervise(cmd: list[str], *, cwd: Path, env: dict[str, str],
+              on_pre_spawn: Callable[[], None] | None = None,
               on_started: Callable[[int], None] | None = None,
               on_exited: Callable[[int, int], None] | None = None,
               popen: Callable[..., subprocess.Popen] = subprocess.Popen,
@@ -507,6 +546,8 @@ def supervise(cmd: list[str], *, cwd: Path, env: dict[str, str],
             signal.signal(sig, forward)
         if forwarded is not None:
             return _normalize_returncode(0, forwarded)
+        if on_pre_spawn:
+            on_pre_spawn()
         child = popen(cmd, cwd=str(cwd), env=env, start_new_session=True)
         if forwarded is not None:
             forward(forwarded, None)

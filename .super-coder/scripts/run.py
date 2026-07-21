@@ -1237,6 +1237,16 @@ def main() -> None:
 
     lease: dict[str, int] = {}
 
+    def lease_preflight() -> None:
+        if not binding:
+            return
+        lease_con = open_db()
+        try:
+            session_supervisor.preflight_lease(
+                lease_con, binding["binding_id"], repo_root=REPO_ROOT)
+        finally:
+            lease_con.close()
+
     def lease_started(pid: int) -> None:
         if not binding:
             return
@@ -1244,7 +1254,8 @@ def main() -> None:
         try:
             generation = session_supervisor.claim_lease(
                 lease_con, binding["binding_id"], pid, repo_root=REPO_ROOT,
-                state="dispatching" if headless else "foreground")
+                state="dispatching" if headless else "foreground",
+                supervisor_pid=os.getpid())
             identity = session_supervisor.read_process(pid)
             if not identity:  # claim_lease already validated it; fail closed on a race.
                 raise RuntimeError("harness process vanished while recording its lease")
@@ -1270,7 +1281,8 @@ def main() -> None:
 
     try:
         rc = session_supervisor.supervise(
-            cmd, cwd=work_dir, env=env, on_started=lease_started,
+            cmd, cwd=work_dir, env=env, on_pre_spawn=lease_preflight,
+            on_started=lease_started,
             on_exited=lease_exited)
     except (OSError, RuntimeError, session_supervisor.LeaseConflict) as e:
         sys.exit(f"session launch refused: {e}")
