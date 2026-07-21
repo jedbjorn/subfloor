@@ -5,6 +5,14 @@
   "emit": [".codex/hooks.json"],
   "env": {},
   "model": { "flag": "--model" },
+  "session_control": {
+    "launch": ["python3", "{adapter_dir}/codex-session.py"],
+    "capabilities": {
+      "provider": "codex",
+      "transport": "unix-websocket-v2",
+      "normal_steer": false
+    }
+  },
   "headless": {
     "launch": ["codex", "exec"],
     "model_flag": "-m",

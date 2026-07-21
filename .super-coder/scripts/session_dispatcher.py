@@ -127,8 +127,10 @@ class AttemptLog:
 
 def binding_row(con: sqlite3.Connection, binding_id: int) -> dict | None:
     row = con.execute(
-        "SELECT b.*, s.shortname, s.flavor, s.api_key "
+        "SELECT b.*, s.shortname, s.flavor, s.api_key, "
+        "a.model AS archive_model, a.provider AS archive_provider "
         "FROM shell_session_bindings b JOIN shells s ON s.shell_id=b.shell_id "
+        "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
         "WHERE b.binding_id=?",
         (binding_id,),
     ).fetchone()
@@ -298,6 +300,29 @@ def finish_batch(
         ).fetchone()[0]
         con.commit()
         return BatchResult(acknowledged, queued, failed)
+    except Exception:
+        con.rollback()
+        raise
+
+
+def defer_busy_batch(con: sqlite3.Connection, batch: WakeBatch,
+                     *, return_state: str = "idle") -> BatchResult:
+    """Undo a claim when the provider became busy before transport started."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        marks = ",".join("?" for _ in batch.wake_ids)
+        cur = con.execute(
+            f"UPDATE session_wake_jobs SET state='queued', "
+            f"attempt_count=attempt_count-1, available_at=datetime('now'), "
+            f"started_at=NULL, finished_at=NULL, last_error=NULL "
+            f"WHERE wake_id IN ({marks}) AND state='running'",
+            batch.wake_ids,
+        )
+        if cur.rowcount != len(batch.wake_ids):
+            raise RuntimeError("wake batch changed while deferring busy provider")
+        _return_binding_state(con, batch.binding_id, return_state, None)
+        con.commit()
+        return BatchResult(acknowledged=0, queued=len(batch.wake_ids), failed=0)
     except Exception:
         con.rollback()
         raise
@@ -511,6 +536,15 @@ def poll_once(
                     adapter.deliver(binding, WAKE_PROMPT)
                     return_state = "idle"
                 result = finish_batch(con, batch, return_state=return_state)
+            except session_control.ProviderBusy as exc:
+                result = defer_busy_batch(
+                    con, batch,
+                    return_state="dormant" if status == "dormant" else "idle",
+                )
+                attempt_log.write(
+                    binding_id, "provider-busy", queued=result.queued, error=exc
+                )
+                continue
             except Exception as exc:
                 result = finish_batch(
                     con, batch,
