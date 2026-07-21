@@ -1409,13 +1409,27 @@ def patch_session_binding(con, shell_id: int, binding_id: int, body: dict):
         if state is not None:
             session_control.transition_binding(
                 con, binding_id, expected=binding["state"], target=state)
-        if body:
-            fields = list(body)
+        for field in (
+                "native_session_id", "control_endpoint", "control_capabilities",
+                "cli_version"):
+            if field not in body:
+                continue
+            # Keep the SQL text literal per field.  The field roster is tiny and
+            # security tooling should not need to infer the whitelist above.
+            if field == "native_session_id":
+                sql = ("UPDATE shell_session_bindings SET native_session_id=?, "
+                       "updated_at=datetime('now') WHERE binding_id=?")
+            elif field == "control_endpoint":
+                sql = ("UPDATE shell_session_bindings SET control_endpoint=?, "
+                       "updated_at=datetime('now') WHERE binding_id=?")
+            elif field == "control_capabilities":
+                sql = ("UPDATE shell_session_bindings SET control_capabilities=?, "
+                       "updated_at=datetime('now') WHERE binding_id=?")
+            else:
+                sql = ("UPDATE shell_session_bindings SET cli_version=?, "
+                       "updated_at=datetime('now') WHERE binding_id=?")
             con.execute(
-                "UPDATE shell_session_bindings SET "
-                + ", ".join(f"{field}=?" for field in fields)
-                + ", updated_at=datetime('now') WHERE binding_id=?",
-                [body[field] for field in fields] + [binding_id],
+                sql, (body[field], binding_id),
             )
         con.commit()
     except Exception:
