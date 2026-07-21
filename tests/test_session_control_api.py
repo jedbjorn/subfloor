@@ -143,6 +143,46 @@ class ControlMutationTest(unittest.TestCase):
             )],
         )
 
+    def test_manage_rejects_kimi_manual_permission_without_mutation(self):
+        message_id = add_message(self.con)
+        self.con.execute(
+            "UPDATE shell_session_bindings SET harness='kimi', "
+            "control_capabilities=? WHERE binding_id=20",
+            (json.dumps({
+                "deliver": True,
+                "resume": True,
+                "settings": {
+                    "model": "kimi-code/k3",
+                    "effort": "high",
+                    "permission_mode": "manual",
+                },
+            }),),
+        )
+        self.con.commit()
+
+        payload, error = server.manage_session_control(self.con, 1, 20)
+
+        self.assertIsNone(payload)
+        self.assertEqual(
+            "managed wake requires permission_mode='auto' or 'yolo' "
+            "so an injected turn cannot request approval",
+            error,
+        )
+        self.assertEqual(
+            ("dormant", 0, None),
+            tuple(self.con.execute(
+                "SELECT state, managed, last_error FROM shell_session_bindings "
+                "WHERE binding_id=20"
+            ).fetchone()),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM session_wake_jobs WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()[0],
+        )
+
     def test_release_cancels_queue_but_keeps_message_unread(self):
         message_id = add_message(self.con)
         server.manage_session_control(self.con, 1, 20)

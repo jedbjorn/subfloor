@@ -2,8 +2,9 @@
 
 Kimi Code (`kimi`, Moonshot AI's coding CLI — repo `MoonshotAI/kimi-code`, the
 TypeScript successor to the legacy Python `kimi-cli`) reads the boot artifact
-(`AGENTS.md`) natively — already emitted by the render chain — so the adapter
-carries only the launch command, a headless block, and a sandbox approval flag.
+(`AGENTS.md`) natively — already emitted by the render chain. Managed planner
+sessions additionally run through Kimi's authenticated loopback web server;
+workers and unmanaged shells keep the terminal CLI.
 
 **Why it exists:** the Kimi-models sibling of the claude/codex/vibe harnesses —
 a first-party CLI billed against a Kimi membership (Moderato / Allegretto /
@@ -23,6 +24,20 @@ catch-all; kimi is the native Moonshot path.
 | `headless.model_flag` | `-m`; the selector must be an alias discovered from `~/.kimi-code/config.toml` |
 | `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; sprint headless boots set it to `high` |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox, interactive launches only (`--yolo`) |
+
+### Managed planner session control
+
+The controlled launcher probes the installed command tree because Kimi 0.27
+uses `kimi server run` while 0.28 uses `kimi web`. It binds an OS-selected
+loopback port, keeps bearer auth enabled, stores the token only in a mode-0600
+runtime file, creates or resumes the binding's native session, and opens the
+web client. The binding records the effective `kimi-code/k3` route, thinking
+effort, cwd, and Kimi-native `permission_mode=auto` posture.
+
+Wake delivery reads the session's busy state before submitting a normal prompt.
+It never calls Kimi's steer endpoint. When the local server is gone, the
+dispatcher can run a fenced `kimi --session <id> --model kimi-code/k3 --prompt
+<prompt>` turn with the recorded thinking effort.
 
 **`--yolo` (sandbox, interactive only):** auto-approves all actions inside the
 container, where the container itself is the safety boundary (matches how

@@ -1229,6 +1229,7 @@ def main() -> None:
     if binding:
         env["SC_SESSION_BINDING_ID"] = str(binding["binding_id"])
         env["SC_SESSION_MODEL"] = str(session_model or flavor_model or "")
+        env["SC_SESSION_EFFORT"] = str(session_effort or "")
     # The shell's HOME worktree — the dir we exec the harness from (below). The
     # branch-guard reads it to judge "outside your worktree" against the assigned
     # tree, not the live cwd: a shell whose cwd has drifted to the repo root (to
