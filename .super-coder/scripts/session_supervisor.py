@@ -204,6 +204,29 @@ def binding_for_resume(con, binding_id: int, *, shell_id: int,
     return dict(row)
 
 
+def binding_for_enter(con, shell_id: int, *, new_session: bool = False) -> dict | None:
+    """Return the shell's managed binding for an interactive enter.
+
+    A managed binding owns the planner's conversation until the operator
+    releases it.  Bare ``sc enter`` therefore reuses it, while an explicit new
+    session must fail before a second archive can be opened.
+    """
+    row = con.execute(
+        "SELECT b.*, a.session_id, a.model AS archive_model, "
+        "a.provider AS archive_provider FROM shell_session_bindings b "
+        "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
+        "WHERE b.shell_id=? AND b.managed=1",
+        (shell_id,),
+    ).fetchone()
+    if not row:
+        return None
+    if new_session:
+        raise ValueError(
+            f"--new-session requires releasing managed binding {row['binding_id']} first"
+        )
+    return dict(row)
+
+
 def register_native_session(con, binding_id: int, native_session_id: str, *,
                             control_endpoint: str | None = None,
                             capabilities: str = "{}",

@@ -13,7 +13,7 @@ Flow:
     5. exec the harness  (skipped when RENDER_ONLY=1 — used to verify headless)
 
 Usage:
-    python3 .super-coder/scripts/run.py [shortname] [--first]
+    python3 .super-coder/scripts/run.py [shortname] [--first] [--new-session]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
 
 Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
@@ -702,11 +702,13 @@ def session_provider(harness: str, model: "str | None") -> "str | None":
 
 def open_session(con, shell_id: int,
                  lifecycle: "dict | None" = None,
-                 reuse_archive_id: "int | None" = None) -> tuple[str, int]:
+                 reuse_archive_id: "int | None" = None,
+                 force_new: bool = False) -> tuple[str, int]:
     """`lifecycle` carries the launch telemetry persisted onto the archive row
     (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
     NOT written here: run.py execs the harness, so no code runs at exit; the
-    analytics sweep backfills it from harness session data."""
+    analytics sweep backfills it from harness session data. ``force_new`` skips
+    unused-stub reuse for an explicit operator-requested session boundary."""
     if reuse_archive_id is not None:
         row = con.execute(
             "SELECT archive_id, session_id FROM shell_memory_archives "
@@ -726,9 +728,9 @@ def open_session(con, shell_id: int,
     # opened session 0001, or a prior launch did no work) — avoids phantom empty
     # sessions and the incidental first-snapshot diff. The reused stub becomes
     # THIS launch's session, so its lifecycle is overwritten with this launch's.
-    active = con.execute(
+    active = (None if force_new else con.execute(
         "SELECT active_archive_id FROM shells WHERE shell_id=?", (shell_id,)
-    ).fetchone()[0]
+    ).fetchone()[0])
     if active:
         row = con.execute(
             "SELECT archive_id, session_id, full_narrative FROM shell_memory_archives "
@@ -804,6 +806,7 @@ def main() -> None:
     args = sys.argv[1:]
     first = "--first" in args
     headless = "--headless" in args
+    new_session = "--new-session" in args
     # --harness <name> / --harness=<name> forces the harness and skips the
     # picker; its value must not be mistaken for the shell shortname positional.
     # Headless adds -p/--prompt and -m/--model (value-taking, same rule).
@@ -920,6 +923,21 @@ def main() -> None:
             print(f"→ liveness: {snap['indeterminate']} unreadable harness process(es) — "
                   f"proceeding, but liveness was indeterminate")
 
+    if new_session and flag_binding:
+        sys.exit("session launch refused: --new-session cannot be combined with "
+                 "--session-binding")
+    try:
+        enter_binding = (None if flag_binding else
+                         session_supervisor.binding_for_enter(
+                             con, chosen["shell_id"], new_session=new_session))
+    except ValueError as e:
+        sys.exit(f"session launch refused: {e}")
+    # Headless workers keep their existing ephemeral behavior unless the
+    # dispatcher names a binding explicitly.  Automatic attachment is the
+    # interactive `sc enter` contract only.
+    if headless:
+        enter_binding = None
+
     # This shell's flavor default (advisory): the harness it boots with. The
     # model is resolved AFTER the harness pick — a flavor names a model PER
     # harness, so the model tracks whichever harness the operator lands on. Both
@@ -936,6 +954,7 @@ def main() -> None:
     ensure_harness_path()
     default_harness = flavor_harness or _configured_harness() or "claude"
     harness = (flag_harness or os.environ.get("HARNESS")
+               or (enter_binding or {}).get("harness")
                or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
 
@@ -953,11 +972,17 @@ def main() -> None:
         except ValueError as e:
             sys.exit(f"sc run: {e}")
 
-    resume_binding = None
+    resume_binding = enter_binding
     if flag_binding:
         try:
+            resume_binding = {"binding_id": int(flag_binding)}
+        except (TypeError, ValueError) as e:
+            sys.exit(f"session resume refused: {e}")
+    if resume_binding:
+        try:
             resume_binding = session_supervisor.binding_for_resume(
-                con, int(flag_binding), shell_id=chosen["shell_id"], harness=harness)
+                con, resume_binding["binding_id"], shell_id=chosen["shell_id"],
+                harness=harness)
         except (TypeError, ValueError) as e:
             sys.exit(f"session resume refused: {e}")
         pinned_model = resume_binding.get("archive_model")
@@ -1003,7 +1028,8 @@ def main() -> None:
                     "provider": session_provider(harness, session_model),
                     "model": session_model,
                     "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
-                }, reuse_archive_id=(resume_binding or {}).get("archive_id"))
+                }, reuse_archive_id=(resume_binding or {}).get("archive_id"),
+                force_new=new_session)
         except ValueError as e:
             sys.exit(f"session resume refused: {e}")
 
