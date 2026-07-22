@@ -164,11 +164,13 @@ def apply_retired(con) -> list[str]:
     flipped: list[str] = []
     for name in sorted(engine):
         want = 1 if name in retired else 0
-        cur = con.execute(
-            "UPDATE skills SET is_deleted=? WHERE name=? AND is_deleted<>?",
-            (want, name, want))
-        if cur.rowcount:
-            flipped.append(name)
+        row = con.execute(
+            "SELECT is_deleted FROM skills WHERE name=?", (name,)).fetchone()
+        if row is None or row[0] == want:
+            continue
+        con.execute(
+            "UPDATE skills SET is_deleted=? WHERE name=?", (want, name))
+        flipped.append(name)
     if flipped:
         con.commit()
     return flipped
