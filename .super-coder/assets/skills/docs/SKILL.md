@@ -79,7 +79,10 @@ re-decide a settled choice.
 Write through `sc mem doc add` (routes through the engine API): `--body-file`
 reads the markdown from a file (no shell-escaping a long body); `--seq`
 auto-increments within `(feature, kind)`; it renders + snapshots for you
-(pipeline = the `snapshot` skill):
+(pipeline = the `snapshot` skill). The render+snapshot is serialized by one
+in-process API lock — sufficient because these artifacts only ever come from
+manual admin-shell or GUI actions (single writer by design; cross-process
+concurrency is out of scope for v1, decision #20 / roadmap #21).
 ```
 # a doc against a feature (kind='doc'); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
