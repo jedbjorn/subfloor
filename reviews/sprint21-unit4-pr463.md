@@ -98,3 +98,23 @@ resolves L1.
 Fix SC-464 (bounded, in-adapter), push, re-request review. Lows are report
 notes, not gates. Unit 7 should inherit L2 (status rendering) and L4 (interval
 validation) context.
+
+---
+
+# Re-review — fix push @14dc36a (2026-07-22)
+
+- **Diff:** one commit `14dc36a fix(session): abort dead Claude ack waits` — `adapters/claude/session_control.py` +45, `tests/test_claude_session_control.py` +33. Checks: all 6 green. Suite re-run locally at the SHA: 20/20 OK.
+- **Verdict: review-clean.** SC-464 (flag #21) fixed as prescribed; L1 resolved in the same change. No Majors, no Mediums.
+
+## SC-464 fix, traced
+- `_wait_for_ack` now polls at `ACK_POLL_INTERVAL=1.5` and every `BINDING_RECHECK_INTERVAL=5.0` re-reads the binding (`_current_delivery_binding`, fresh row) and raises RuntimeError when `_delivery_owner_lost`: lease vacant (`lease_pid`/`lease_start_ticks` NULL) **and** `active_channel_ready` false (channel cleared, or heartbeat missing/outside the −5..90s window).
+- The raise exits `deliver` into the dispatcher's `except Exception → finish_batch(..., error=exc)` — batch requeued on the 15s/60s/5m ladder, dispatcher loop continues, next `poll_once` reconciles the dead owner (`stale-cleared → dormant`) and recovery proceeds via fenced resume. The wedge SC-464 named is bounded.
+- The abort's lease-vacancy premise holds because lease release is done by an actor *independent* of the wedged dispatcher: run.py's `supervise` traps SIGHUP/SIGINT/SIGTERM/SIGQUIT, forwards to the harness group, and `lease_exited → release_lease` NULLs the lease on exit. So terminal-close (SIGHUP), SIGTERM, and harness-only OOM kills all unblock the wait in ~5–95s (lease release + heartbeat staleness + ≤6s recheck cadence).
+- `_current_delivery_binding` raising on a vanished row is also correct (requeue, not crash). Row's `active_channel_heartbeat_at` is the sqlite `datetime('now')` string; `_timestamp` parses it and assumes UTC — matches writer.
+- Tests: abort case asserts no sleep after loss; keep-waiting subtests cover owner-live/watcher-dead and owner-dead/watcher-live; prior single-poll test updated to the new interval. Deterministic clock/now/reader injection — no timing flake surface.
+
+## New Low
+- **L7** — residual liveness hole: a hard kill of the *whole* group including run.py (`kill -9 -<pgid>`) leaves the lease populated-but-stale; nothing reconciles it while the dispatcher is blocked in this very wait (reconcile runs only at the top of `poll_once`, same thread), so `lease_vacant` never turns true and the wait still runs to the 4h `ACK_TIMEOUT`. All *supervised* death modes are covered, so this is a note, not a gate. Hardening: make the 5s recheck call `reconcile_binding` (or validate `lease_pid`+`start_ticks` via `process_matches`) instead of a raw SELECT.
+
+## Standing Lows
+L2–L6 unchanged (report notes; L2/L4 context for unit 7). L1 closed by this push.
