@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>interface-stream spike</title>
+<link rel="stylesheet" href="/vendor/xterm/xterm.css">
+<style>
+  body { background:#1a1a1a; color:#ccc; font:13px monospace; margin:12px; }
+  #bar input { background:#111; color:#ccc; border:1px solid #444; width:110px; }
+  #bar button { margin-left:4px; }
+  #status { margin:8px 0; white-space:pre; color:#8f8; }
+  #term { border:1px solid #444; display:inline-block; padding:4px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  token <input id="token" value="spike">
+  session <input id="sid">
+  role <input id="role" value="writer" size="6">
+  lease <input id="lease" placeholder="lease token (writer)">
+  cols <input id="cols" value="80" size="3">
+  rows <input id="rows" value="24" size="3">
+  <button id="leasebtn">take lease</button>
+  <button id="connect">connect</button>
+  <button id="wake">wake</button>
+</div>
+<div id="status">disconnected</div>
+<div id="term"></div>
+<script src="/vendor/xterm/xterm.js"></script>
+<script src="/client.js"></script>
+</body>
+</html>
