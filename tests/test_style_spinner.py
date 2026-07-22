@@ -333,8 +333,6 @@ class BootPhaseLabelTest(unittest.TestCase):
                 run.style, "spinner", side_effect=recording_spinner))
             stack.enter_context(mock.patch.object(
                 run, "open_session", return_value=("0001", 1)))
-            stack.enter_context(mock.patch.object(
-                run.session_supervisor, "supersede_for_enter", return_value=None))
             stack.enter_context(mock.patch.object(run.ports_mod, "resolve", return_value={}))
             stack.enter_context(mock.patch.object(run, "ensure_worktree"))
             stack.enter_context(mock.patch.object(run, "sync_worktree", sync))
@@ -355,7 +353,7 @@ class BootPhaseLabelTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(run, "set_terminal_tab_title"))
             stack.enter_context(mock.patch.object(run.os, "chdir"))
             stack.enter_context(mock.patch.object(
-                run.session_supervisor, "supervise", side_effect=_ExecReached))
+                run.os, "execvpe", side_effect=_ExecReached))
             with self.assertRaises(_ExecReached):
                 run.main()
 

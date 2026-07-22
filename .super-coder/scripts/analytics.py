@@ -13,8 +13,7 @@ upsert is a manual UPDATE-then-INSERT rather than ON CONFLICT because
 distinct in UNIQUE indexes — ON CONFLICT would re-insert those rows on
 every sweep. Updates never touch archive_id/shell_id (attribution owns them).
 
-Attribution: harness session → archive by exact native binding first, then
-(cwd → shell, time-window). A
+Attribution: harness session → archive by (cwd → shell, time-window). A
 shell's window runs from an archive's started_at to the same shell's next
 started_at (open-ended for the latest). Worktree cwds map to the shell whose
 shortname names the worktree; the repo root maps to admin-flavor shells.
@@ -193,22 +192,6 @@ def _attribute(con, batch: list[dict], log) -> "tuple[int, int]":
     windows = _windows(con)
     attributed = shell_only = 0
     for r in batch:
-        native_id = r.get("native_session_id")
-        if native_id:
-            exact = con.execute(
-                "SELECT archive_id, shell_id FROM shell_session_bindings "
-                "WHERE harness=? AND native_session_id=?",
-                (r["harness"], native_id),
-            ).fetchone()
-            if exact:
-                cur = con.execute(
-                    "UPDATE session_token_usage SET archive_id=?, shell_id=? "
-                    "WHERE harness=? AND harness_session_ref=? AND model IS ?",
-                    (exact["archive_id"], exact["shell_id"], r["harness"],
-                     r["harness_session_ref"], r["model"]),
-                )
-                attributed += cur.rowcount
-                continue
         if not r.get("cwd"):
             continue
         sids = _shell_for_cwd(r["cwd"], by_wt, admins)
