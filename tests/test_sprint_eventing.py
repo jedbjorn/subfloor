@@ -31,11 +31,21 @@ ADAPTERS = ENGINE / "adapters"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 import mem  # noqa: E402
+import pr_poller  # noqa: E402
 import run  # noqa: E402
 import server  # noqa: E402
 import watch  # noqa: E402
 
 TOKEN = "test-token-cafebabe"
+
+
+def _baseline_node():
+    """The fake immediate GitHub read behind registration (PENDING = the
+    watch arms mid-flight, exactly like the real baseline path)."""
+    return {"state": "OPEN", "headRefOid": "abc1234def",
+            "reviews": {"totalCount": 0, "nodes": []},
+            "commits": {"nodes": [{"commit": {"statusCheckRollup":
+                                              {"state": "PENDING"}}}]}}
 
 
 def build_db(path: "Path | None" = None) -> sqlite3.Connection:
@@ -284,127 +294,10 @@ class DiffEventsTest(unittest.TestCase):
         self.assertIn("abc1234", events[0])
 
 
-# ── daemon core: poll_once against a real DB, injectable fetch ───────────────
-
-class PollOnceTest(unittest.TestCase):
-    def setUp(self):
-        self.con = build_db()
-        seed_shells(self.con)
-        # PR 1 watched by BOTH shells (fan-out from one fetch); PR 2 by shell 1.
-        self.con.executescript(
-            "INSERT INTO watched_prs (repo, pr_number, shell_id) VALUES "
-            "('o/r', 1, 1), ('o/r', 1, 2), ('o/r', 2, 1);")
-        self.con.commit()
-
-    def tearDown(self):
-        self.con.close()
-
-    @staticmethod
-    def gh_node(state="OPEN", sha="abc1234def", checks=None, reviews=0):
-        return {"state": state, "headRefOid": sha,
-                "reviews": {"totalCount": reviews, "nodes": []},
-                "commits": {"nodes": [{"commit": {"statusCheckRollup":
-                                                  ({"state": checks} if checks else None)}}]}}
-
-    def fetch_returning(self, pr1, pr2):
-        # prs are sorted → r0 = ('o/r', 1), r1 = ('o/r', 2)
-        return lambda q: {"r0": {"pullRequest": pr1}, "r1": {"pullRequest": pr2}}
-
-    def messages(self):
-        return self.con.execute(
-            "SELECT from_shell_id, to_shell_id, kind, body FROM shell_messages "
-            "ORDER BY message_id").fetchall()
-
-    def test_first_poll_baselines_silently(self):
-        n = watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"), self.gh_node(checks="PENDING")))
-        self.assertEqual(n, 0)
-        seen = self.con.execute(
-            "SELECT last_seen FROM watched_prs WHERE closed_at IS NULL").fetchall()
-        self.assertEqual(len(seen), 3)
-        self.assertTrue(all(r["last_seen"] for r in seen))
-
-    def test_transition_fans_out_to_every_subscriber(self):
-        watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"), self.gh_node(checks="PENDING")))
-        n = watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="SUCCESS"), self.gh_node(checks="PENDING")))
-        self.assertEqual(n, 2)  # PR 1 green → one pr_event per subscriber
-        msgs = self.messages()
-        self.assertEqual({m["to_shell_id"] for m in msgs}, {1, 2})
-        for m in msgs:
-            self.assertEqual(m["kind"], "pr_event")
-            self.assertEqual(m["from_shell_id"], m["to_shell_id"])  # self-addressed wake-up
-            self.assertIn("checks green", m["body"])
-
-    def test_merge_emits_final_event_and_retires_the_watch(self):
-        watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"), self.gh_node(checks="PENDING")))
-        watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"), self.gh_node(state="MERGED", checks="SUCCESS")))
-        live = self.con.execute(
-            "SELECT repo, pr_number FROM watched_prs WHERE closed_at IS NULL").fetchall()
-        self.assertEqual({(r["repo"], r["pr_number"]) for r in live}, {("o/r", 1)})
-        bodies = [m["body"] for m in self.messages()]
-        self.assertTrue(any("merged" in b for b in bodies))
-        # retired watch is not polled again — next cycle only queries PR 1
-        n = watch.poll_once(self.con, lambda q: (self.assertNotIn("number: 2", q)
-                                                 or {"r0": {"pullRequest": self.gh_node(checks="PENDING")}}))
-        self.assertEqual(n, 0)
-
-    def test_early_merge_keeps_watch_until_checks_conclude(self):
-        # The #375 incident, end to end: merge lands while checks are PENDING
-        # → merge event now, watch stays live, conclusion event + retirement
-        # when the already-running workflows finish.
-        watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"), self.gh_node(checks="PENDING")))
-        n = watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"),
-            self.gh_node(state="MERGED", checks="PENDING")))
-        self.assertEqual(n, 1)                    # merge event only, PR 2's single subscriber
-        live = self.con.execute(
-            "SELECT pr_number FROM watched_prs WHERE closed_at IS NULL").fetchall()
-        self.assertEqual({r["pr_number"] for r in live}, {1, 2})  # PR 2 retained
-        n = watch.poll_once(self.con, self.fetch_returning(
-            self.gh_node(checks="PENDING"),
-            self.gh_node(state="MERGED", checks="SUCCESS")))
-        self.assertEqual(n, 1)                    # the deferred conclusion
-        bodies = [m["body"] for m in self.messages() if "#2" in m["body"]]
-        self.assertEqual(len(bodies), 2)          # merge + conclusion, nothing else
-        self.assertIn("checks still pending, watch retained", bodies[0])
-        self.assertIn("checks green", bodies[1])
-        self.assertIn("watch retired", bodies[1])
-        live = self.con.execute(
-            "SELECT pr_number FROM watched_prs WHERE closed_at IS NULL").fetchall()
-        self.assertEqual({r["pr_number"] for r in live}, {1})     # now retired
-
-    def test_failed_fetch_changes_nothing(self):
-        n = watch.poll_once(self.con, lambda q: None)
-        self.assertEqual(n, 0)
-        self.assertTrue(all(r["last_seen"] is None for r in self.con.execute(
-            "SELECT last_seen FROM watched_prs").fetchall()))
-
-    def test_unreadable_pr_keeps_its_watch(self):
-        watch.poll_once(self.con, self.fetch_returning(None, self.gh_node(checks="PENDING")))
-        rows = self.con.execute(
-            "SELECT pr_number, last_seen FROM watched_prs WHERE closed_at IS NULL").fetchall()
-        self.assertEqual(len(rows), 3)
-        self.assertTrue(all(r["last_seen"] is None for r in rows if r["pr_number"] == 1))
-
-    def test_no_live_watches_skips_the_fetch(self):
-        self.con.execute("UPDATE watched_prs SET closed_at=datetime('now')")
-        self.con.commit()
-        n = watch.poll_once(self.con, lambda q: self.fail("fetched with no live watches"))
-        self.assertEqual(n, 0)
-
-    def test_build_query_batches_and_aliases(self):
-        q = watch.build_query([("o/r", 1), ("other/repo", 22)])
-        self.assertIn('r0: repository(owner: "o", name: "r")', q)
-        self.assertIn('r1: repository(owner: "other", name: "repo")', q)
-        self.assertIn("pullRequest(number: 22)", q)
-
-
 # ── daemon heartbeat (#359): beat upsert + liveness rendering ────────────────
+# The poll-cycle coverage that used to ride this file's PollOnceTest moved to
+# tests/test_pr_poller.py with the polling cutover (spec #20 task #85): the
+# retired daemon verb's exit-clean contract is covered there too.
 
 class HeartbeatTest(unittest.TestCase):
     def setUp(self):
@@ -425,43 +318,13 @@ class HeartbeatTest(unittest.TestCase):
         rows = self.beat_rows()
         self.assertEqual([(r["name"], r["interval_s"]) for r in rows], [("watch", 30)])
 
-    def test_daemon_once_beats_even_with_no_watches(self):
-        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
-        build_db(tmp).close()
-        old = watch.DB_PATH
-        watch.DB_PATH = tmp
-        try:
-            self.assertEqual(watch.main(["daemon", "--once"]), 0)
-        finally:
-            watch.DB_PATH = old
-        con = sqlite3.connect(tmp)
-        try:
-            self.assertEqual(con.execute(
-                "SELECT COUNT(*) FROM daemon_heartbeats WHERE name='watch'"
-            ).fetchone()[0], 1)
-        finally:
-            con.close()
 
-    def test_beat_failure_never_blocks_the_poll(self):
-        # Pre-0068 DB (code newer than schema): the beat raises, the poll must
-        # still run — heartbeat error, not poll error, and never a crash.
-        import contextlib
-        import io
-        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
-        con = build_db(tmp)
-        con.execute("DROP TABLE daemon_heartbeats")
-        con.commit()
-        con.close()
-        old = watch.DB_PATH
-        watch.DB_PATH = tmp
-        out = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(out):
-                self.assertEqual(watch.main(["daemon", "--once"]), 0)
-        finally:
-            watch.DB_PATH = old
-        self.assertIn("heartbeat error", out.getvalue())
-        self.assertNotIn("poll error", out.getvalue())
+class BuildQueryTest(unittest.TestCase):
+    def test_build_query_batches_and_aliases(self):
+        q = watch.build_query([("o/r", 1), ("other/repo", 22)])
+        self.assertIn('r0: repository(owner: "o", name: "r")', q)
+        self.assertIn('r1: repository(owner: "other", name: "repo")', q)
+        self.assertIn("pullRequest(number: 22)", q)
 
 
 class DaemonLineTest(unittest.TestCase):
@@ -502,9 +365,16 @@ class ApiTest(unittest.TestCase):
         for mod in (mem, watch):
             mod.SC_API_BASE = f"http://127.0.0.1:{cls.port}"
             mod.SC_API_TOKEN = TOKEN
+        # Registration takes an immediate GitHub baseline (spec #20 task #85)
+        # — hermetic suite, so the gh seam is faked at the module global the
+        # server resolves at call time.
+        cls._real_fetch = pr_poller.gh_fetch
+        pr_poller.gh_fetch = lambda q: pr_poller.GhResult(
+            data={"r0": {"pullRequest": _baseline_node()}})
 
     @classmethod
     def tearDownClass(cls):
+        pr_poller.gh_fetch = cls._real_fetch
         cls.httpd.shutdown()
         cls.httpd.server_close()
 
@@ -542,7 +412,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(self.q(
             "SELECT 1 FROM watched_prs WHERE pr_number=15")), 1)
 
-    def test_retired_watch_rearms_with_fresh_baseline(self):
+    def test_retired_watch_reregisters_as_new_row_keeping_history(self):
         watch.main(["pr", "own/repo", "16"])
         con = sqlite3.connect(self.db)
         con.execute("UPDATE watched_prs SET closed_at=datetime('now'), "
@@ -550,9 +420,31 @@ class ApiTest(unittest.TestCase):
         con.commit()
         con.close()
         watch.main(["pr", "own/repo", "16"])
-        row = self.q("SELECT closed_at, last_seen FROM watched_prs WHERE pr_number=16")[0]
-        self.assertIsNone(row["closed_at"])
-        self.assertIsNone(row["last_seen"])
+        rows = self.q("SELECT closed_at, last_seen FROM watched_prs "
+                      "WHERE pr_number=16 ORDER BY watch_id")
+        # The 0080 cutover: the closed row is RETAINED (with its fingerprint)
+        # and re-registration inserts a fresh row holding the new baseline.
+        self.assertEqual(len(rows), 2)
+        self.assertIsNotNone(rows[0]["closed_at"])
+        self.assertEqual(rows[0]["last_seen"], '{"state":"MERGED"}')
+        self.assertIsNone(rows[1]["closed_at"])
+        self.assertIn('"checks": "PENDING"', rows[1]["last_seen"])
+
+    def test_failed_baseline_creates_no_watch(self):
+        real = pr_poller.gh_fetch
+        pr_poller.gh_fetch = lambda q: pr_poller.GhResult(error="connect timeout")
+        try:
+            with self.assertRaises(SystemExit):   # _api dies on the 502
+                watch.main(["pr", "own/repo", "18"])
+        finally:
+            pr_poller.gh_fetch = real
+        self.assertEqual(self.q("SELECT 1 FROM watched_prs WHERE pr_number=18"), [])
+
+    def test_registration_stores_the_baseline(self):
+        watch.main(["pr", "own/repo", "19"])
+        row = self.q("SELECT last_seen FROM watched_prs WHERE pr_number=19")[0]
+        self.assertIn('"state": "OPEN"', row["last_seen"])
+        self.assertIn('"sha": "abc1234def"', row["last_seen"])
 
     def test_list_shows_live_watches(self):
         watch.main(["pr", "own/repo", "17"])
@@ -684,9 +576,13 @@ class DaemonLivenessApiTest(unittest.TestCase):
         cls.thread.start()
         watch.SC_API_BASE = f"http://127.0.0.1:{cls.port}"
         watch.SC_API_TOKEN = TOKEN
+        cls._real_fetch = pr_poller.gh_fetch
+        pr_poller.gh_fetch = lambda q: pr_poller.GhResult(
+            data={"r0": {"pullRequest": _baseline_node()}})
 
     @classmethod
     def tearDownClass(cls):
+        pr_poller.gh_fetch = cls._real_fetch
         cls.httpd.shutdown()
         cls.httpd.server_close()
 

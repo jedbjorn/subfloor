@@ -58,6 +58,7 @@ import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
+import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
@@ -1997,12 +1998,15 @@ class Handler(BaseHTTPRequestHandler):
     # `shell` names another subscriber (the sprint skill registers the planner
     # at PR open — the recipient-naming precedent of `message send`). The list
     # is a shared read like /roadmap: single-operator fork, the planner needs
-    # the whole board. The daemon never calls these — it owns the DB side
-    # (last_seen, closed_at) directly.
+    # the whole board. Since the polling cutover (spec #20 task #85, decision
+    # #19) the service's own scheduler is the sole poller and DB writer:
+    # registration takes an immediate GitHub baseline (no baseline, no armed
+    # watch), `--sprint` scopes a watch to an ACTIVE sprint document, and
+    # /_sc/watches/reconcile is the operator's explicit one-shot poll.
 
     def _daemon_state(self, con) -> "dict | None":
-        """Watcher-daemon liveness (#359): the heartbeat row → age + verdict.
-        Stale = beat older than 3× the daemon's own poll interval (one slow gh
+        """Poller liveness (#359): the heartbeat row → age + verdict.
+        Stale = beat older than 3× the poller's own interval (one slow gh
         call + the sleep fit comfortably inside). None = never run (or a
         pre-0068 DB with no heartbeat table yet) — the client renders both
         None and stale as "watches are NOT being polled"."""
@@ -2026,13 +2030,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             q = parse_qs(urlparse(self.path).query)
             include_closed = q.get("all", ["0"])[0] in ("1", "true", "yes")
+            active = pr_poller.active_sprint_doc_ids(con)
             sql = ("SELECT w.watch_id, w.repo, w.pr_number, w.shell_id, "
-                   "s.shortname, w.created_at, w.closed_at FROM watched_prs w "
+                   "s.shortname, w.created_at, w.closed_at, w.sprint_doc_id "
+                   "FROM watched_prs w "
                    "JOIN shells s ON s.shell_id = w.shell_id")
             if not include_closed:
                 sql += " WHERE w.closed_at IS NULL"
             sql += " ORDER BY w.repo, w.pr_number, w.watch_id"
-            return self._send(200, {"watches": rows(con.execute(sql)),
+            ws = rows(con.execute(sql))
+            for w in ws:
+                w["armed"] = (w.get("closed_at") is None
+                              and w.get("sprint_doc_id") in active)
+            return self._send(200, {"watches": ws,
                                     "daemon": self._daemon_state(con)})
         except Exception as e:
             return self._fail(e)
@@ -2052,6 +2062,16 @@ class Handler(BaseHTTPRequestHandler):
                 pr = None
             if not repo or repo.count("/") != 1 or pr is None:
                 return self._send(400, {"error": "repo (owner/name) and pr_number (int) required"})
+            sprint_doc_id = body.get("sprint_doc_id")
+            if sprint_doc_id is not None:
+                try:
+                    sprint_doc_id = int(sprint_doc_id)
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "sprint_doc_id must be an int"})
+                if not pr_poller.is_active_sprint(con, sprint_doc_id):
+                    return self._send(409, {"error":
+                        f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
+                        "SPRINT doc — watches arm only to active sprints"})
             target = sid
             if body.get("shell"):
                 r = con.execute(
@@ -2060,32 +2080,67 @@ class Handler(BaseHTTPRequestHandler):
                 if r is None:
                     return self._send(404, {"error": f"shell '{body['shell']}' unknown"})
                 target = r[0]
-            # Idempotent by (repo, pr, shell): a live duplicate returns the
-            # existing watch; a retired one re-arms (fresh baseline — last_seen
-            # cleared so the first poll re-fingerprints, not diffs stale state).
+            # Idempotent by (repo, pr, shell, scope): a live duplicate in the
+            # SAME scope returns the existing watch. A live UNSCOPED watch
+            # registered with --sprint is rebound (explicit re-arm — legacy
+            # dormant watches become polled only this way). A retired watch is
+            # NOT reopened: registration inserts a new row so closed history
+            # is retained (0080 cutover).
             existing = con.execute(
-                "SELECT watch_id, closed_at FROM watched_prs "
-                "WHERE repo=? AND pr_number=? AND shell_id=?",
-                (repo, pr, target)).fetchone()
-            # daemon liveness rides every registration response (#359): a
-            # watch registered while nobody is polling must say so up front.
+                "SELECT watch_id, sprint_doc_id FROM watched_prs "
+                "WHERE repo=? AND pr_number=? AND shell_id=? AND closed_at IS NULL "
+                "AND COALESCE(sprint_doc_id, 0) = COALESCE(?, 0)",
+                (repo, pr, target, sprint_doc_id)).fetchone()
             daemon = self._daemon_state(con)
             if existing is not None:
-                if existing["closed_at"] is None:
-                    return self._send(200, {"watch_id": existing["watch_id"],
-                                            "existing": True, "daemon": daemon})
+                return self._send(200, {"watch_id": existing["watch_id"],
+                                        "existing": True, "daemon": daemon})
+            unscoped = None
+            if sprint_doc_id is not None:
+                unscoped = con.execute(
+                    "SELECT watch_id FROM watched_prs "
+                    "WHERE repo=? AND pr_number=? AND shell_id=? "
+                    "AND closed_at IS NULL AND sprint_doc_id IS NULL",
+                    (repo, pr, target)).fetchone()
+            # Registration baseline (spec: an immediate GitHub read, normalized
+            # and stored BEFORE arming; a failed baseline creates no armed
+            # watch and returns a retryable sanitized error). The gh call
+            # happens before the INSERT so a failure leaves no row at all.
+            fp, err = pr_poller.baseline_read(repo, pr)
+            if fp is None:
+                return self._send(502, {"error":
+                    f"baseline read failed (retryable): {err}",
+                    "retryable": True, "daemon": daemon})
+            if unscoped is not None:
                 con.execute(
-                    "UPDATE watched_prs SET closed_at=NULL, last_seen=NULL, "
-                    "created_at=datetime('now') WHERE watch_id=?",
-                    (existing["watch_id"],))
+                    "UPDATE watched_prs SET sprint_doc_id=?, last_seen=? "
+                    "WHERE watch_id=?",
+                    (sprint_doc_id, json.dumps(fp), unscoped["watch_id"]))
                 con.commit()
-                return self._send(201, {"watch_id": existing["watch_id"],
-                                        "reopened": True, "daemon": daemon})
+                return self._send(200, {"watch_id": unscoped["watch_id"],
+                                        "rebound": True, "daemon": daemon})
             cur = con.execute(
-                "INSERT INTO watched_prs (repo, pr_number, shell_id) VALUES (?, ?, ?)",
-                (repo, pr, target))
+                "INSERT INTO watched_prs (repo, pr_number, shell_id, last_seen, "
+                "sprint_doc_id) VALUES (?, ?, ?, ?, ?)",
+                (repo, pr, target, json.dumps(fp), sprint_doc_id))
             con.commit()
             return self._send(201, {"watch_id": cur.lastrowid, "daemon": daemon})
+        except Exception as e:
+            return self._fail(e)
+        finally:
+            con.close()
+
+    def _watches_reconcile(self):
+        """Operator's explicit one-shot poll (spec: startup + explicit
+        reconciliation are the two non-interval triggers). Synchronous —
+        the response IS the cycle's summary."""
+        sid = self._require_shell_auth()
+        if sid is None:
+            return
+        con = db()
+        try:
+            summary = pr_poller.poll_cycle(con, source="reconcile")
+            return self._send(200, summary)
         except Exception as e:
             return self._fail(e)
         finally:
@@ -2231,6 +2286,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._mem_post(path, self._body())
         if path == "/_sc/watches":
             return self._watches_post(self._body())
+        if path == "/_sc/watches/reconcile":
+            return self._watches_reconcile()
         con = db()
         try:
             if path == "/api/flags":
@@ -2479,6 +2536,13 @@ def main(argv):
         con.close()
     if recon.get("parks") or recon.get("batches_delivery_unknown"):
         print(f"server: interface reconcile {recon}")
+    # Watched-PR poller (spec #20 task #85, decision #19): this service is the
+    # fork's SOLE GitHub poller — the legacy host `sc watch daemon` (direct-DB
+    # writer) is retired by the same commit that enables this scheduler, which
+    # is the cutover gate: no second writer can be started by any supervised
+    # path. Bounded interval only while ACTIVE sprint watches exist, plus the
+    # startup pass inside the thread; self-disables when gh is absent.
+    pr_poller.Poller(DB_PATH).start()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
