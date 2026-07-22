@@ -2,7 +2,7 @@
 rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
-feature: Sprint eventing — GitHub→inbox daemon + headless worker boot
+feature: Interface chats and interactive planner wake
 roadmap_status: in_progress
 frozen: false
 ---
