@@ -97,10 +97,18 @@ def _require_api() -> None:
 
 _RETRIES = 3          # extra attempts beyond the first
 _RETRY_PAUSE = 2.0    # seconds between attempts (503 may override via Retry-After)
+_TIMEOUT = 10         # default per-request HTTP timeout (seconds)
+# Doc add/edit/freeze commit fast but then SYNCHRONOUSLY run snapshot+render
+# server-side (each subprocess capped at 180s — up to ~360s, plus queueing on
+# the shared content-write lock behind another serialize or a Publish). With
+# the generic timeout a slow success surfaced as "API unreachable" and a PATCH
+# retry re-ran the whole serialize (SC-013). Doc writes carry their own budget.
+_DOC_WRITE_TIMEOUT = 420
 
 
 def _api(method: str, path: str, payload: "dict | None" = None,
-         idempotent: "bool | None" = None) -> dict:
+         idempotent: "bool | None" = None,
+         timeout: "float | None" = None) -> dict:
     """POST/PATCH/GET to the engine API; die loud on any error.
 
     Retries (#331 — multi-shell write contention on the engine DB):
@@ -115,6 +123,8 @@ def _api(method: str, path: str, payload: "dict | None" = None,
     """
     if idempotent is None:
         idempotent = method in ("GET", "PATCH")
+    if timeout is None:
+        timeout = _TIMEOUT
     url = SC_API_BASE.rstrip("/") + path
     data = json.dumps(payload).encode() if payload is not None else None
     headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
@@ -124,7 +134,7 @@ def _api(method: str, path: str, payload: "dict | None" = None,
     for attempt in range(1 + _RETRIES):
         last = attempt == _RETRIES
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code == 503 and not last:
@@ -519,7 +529,11 @@ def cmd_oriented(args) -> int:
 
 def cmd_doc(args) -> int:
     if args.doc_cmd == "freeze":
-        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze")
+        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze",
+                 timeout=_DOC_WRITE_TIMEOUT)
+        if r.get("already_frozen"):
+            print(f"mem: document #{args.document_id} was already frozen "
+                  f"(freeze is idempotent)")
         rc = _finish_api(f"mem: document #{args.document_id} frozen")
         return _note_serialize(r) or rc
     if args.doc_cmd == "edit":
@@ -532,7 +546,8 @@ def cmd_doc(args) -> int:
             payload["render_path"] = args.render_path
         if not payload:
             die("nothing to edit — pass at least one of --title / --body-file / --render-path")
-        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}", payload)
+        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}", payload,
+                 timeout=_DOC_WRITE_TIMEOUT)
         rc = _finish_api(f"mem: document #{args.document_id} edited")
         return _note_serialize(r) or rc
     body_text = Path(args.body_file).read_text()
@@ -542,7 +557,8 @@ def cmd_doc(args) -> int:
               "seq": args.seq,
               "title": args.title,
               "body": body_text,
-              "render_path": args.render_path})
+              "render_path": args.render_path},
+             timeout=_DOC_WRITE_TIMEOUT)
     rc = _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
                      f" ('{args.title}', {len(body_text)} chars)")
     return _note_serialize(r) or rc

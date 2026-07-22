@@ -20,7 +20,9 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -431,6 +433,119 @@ class ApiMemTest(unittest.TestCase):
             self.assertIsNotNone(
                 self.q("SELECT document_id FROM documents WHERE title='spec ser2'"))
         finally:
+            server.run_snapshot_render = real_rsr
+            server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    # ── SC-012: doc write vs Publish — ONE shared serialization boundary ──────
+    def test_doc_write_and_publish_share_one_lock(self):
+        # Doc-write serialize, /api/snapshot, and Publish all write the same
+        # non-atomic files (content.sql + flat renders) and Publish switches
+        # branches — per-path private locks let them interleave. Force a Publish
+        # to sit inside its critical section, then prove a concurrent doc
+        # write's serialize cannot enter until the Publish releases the lock.
+        self.run_mem("roadmap", "add", "feat race")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat race'")[0]
+        body = self.tmp / "race.md"
+        body.write_text("# race\n")
+        self.run_mem("doc", "add", "spec race", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec race'")[0]
+        server.serialize_doc_write = self._real_serialize
+        real_publish = server.git_publish
+        real_rsr = server.run_snapshot_render
+        in_publish = threading.Event()
+        release = threading.Event()
+        overlap = []
+
+        def fake_publish():
+            in_publish.set()
+            release.wait(5)
+            return {"ok": True, "output": "published (test stub)", "pr_url": None}
+
+        def fake_rsr():
+            # runs inside serialize_doc_write's lock hold — if Publish is still
+            # inside ITS section (release unset), the two paths interleaved
+            overlap.append(in_publish.is_set() and not release.is_set())
+            return "snapshot+render (test stub)"
+
+        server.git_publish = fake_publish
+        server.run_snapshot_render = fake_rsr
+        publish_rc = []
+
+        def do_publish():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/api/publish", data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                publish_rc.append(resp.status)
+
+        try:
+            t = threading.Thread(target=do_publish)
+            t.start()
+            self.assertTrue(in_publish.wait(5), "publish never entered its section")
+            # hold the Publish inside its section while the doc write arrives;
+            # the timer releases it well after an unshared lock would overlap
+            threading.Timer(0.5, release.set).start()
+            self.assertEqual(
+                self.run_mem("doc", "edit", str(did), "--title", "spec race v2"), 0)
+            t.join(10)
+            self.assertEqual(publish_rc, [200])
+            self.assertEqual(overlap, [False])  # serialize ran AFTER publish released
+        finally:
+            release.set()
+            server.git_publish = real_publish
+            server.run_snapshot_render = real_rsr
+            server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    # ── SC-013: a slow successful serialize is still a successful write ────────
+    def test_doc_write_slow_serializer_succeeds(self):
+        # The post-write snapshot+render can legitimately run for minutes; the
+        # generic client timeout turned that slow SUCCESS into "API unreachable"
+        # and a PATCH retry re-ran the serialize. Doc writes carry their own
+        # budget — shrink the generic timeout below the serializer's runtime and
+        # prove add/edit/freeze still succeed; freeze is idempotent on retry.
+        # A urlopen spy pins the wiring: doc writes must USE the doc budget,
+        # everything else the generic one (without it a slow-enough-to-pass
+        # stub could let a hardcoded timeout slip through).
+        server.serialize_doc_write = self._real_serialize
+        real_rsr = server.run_snapshot_render
+        server.run_snapshot_render = lambda: (time.sleep(1.0), "slow ok")[1]
+        real_timeout = mem._TIMEOUT
+        mem._TIMEOUT = 0.5  # any call on the generic budget now times out
+        timeouts = []
+        real_urlopen = mem.urllib.request.urlopen
+
+        def spy(req, timeout=None):
+            timeouts.append(timeout)
+            return real_urlopen(req, timeout=timeout)
+
+        mem.urllib.request.urlopen = spy
+        try:
+            self.run_mem("roadmap", "add", "feat slow")
+            fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat slow'")[0]
+            body = self.tmp / "slow.md"
+            body.write_text("# slow\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(
+                    self.run_mem("doc", "add", "spec slow", "--body-file", str(body),
+                                 "--feature", str(fid)), 0)
+                did = self.q(
+                    "SELECT document_id FROM documents WHERE title='spec slow'")[0]
+                self.assertEqual(
+                    self.run_mem("doc", "edit", str(did), "--title", "spec slow v2"), 0)
+                self.assertEqual(self.run_mem("doc", "freeze", str(did)), 0)
+                # retry of a committed freeze (the ambiguous-timeout case):
+                # success again, flagged already_frozen — not a 409
+                self.assertEqual(self.run_mem("doc", "freeze", str(did)), 0)
+            out = buf.getvalue()
+            self.assertIn("already frozen", out)
+            self.assertNotIn("WARNING", out)
+            self.assertEqual(
+                self.q("SELECT frozen FROM documents WHERE document_id=?", did)[0], 1)
+            self.assertEqual(timeouts, [0.5] + [mem._DOC_WRITE_TIMEOUT] * 4)
+        finally:
+            mem.urllib.request.urlopen = real_urlopen
+            mem._TIMEOUT = real_timeout
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 

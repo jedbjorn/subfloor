@@ -837,9 +837,14 @@ def run_snapshot_render() -> str:
     return (snap["output"] + "\n" + rend["output"]).strip()
 
 
-# Serializes two snapshot/render subprocesses against each other — concurrent
-# mem doc writes would otherwise interleave writes to content.sql / the mirror.
-_serialize_lock = threading.Lock()
+# ONE serialization boundary for every path that writes the non-atomic
+# snapshot/render outputs (content.sql + the flat-render mirror) or moves the
+# main checkout's branches: mem doc writes (serialize_doc_write), the header
+# '/api/snapshot' shortcut, and '/api/publish' (git_publish). These were once
+# per-path private locks — a doc write could interleave its content.sql/render
+# writes with a Publish's branch checkout/staging (SC-012). Held at the caller
+# level only: run_snapshot_render() itself never takes it, so nothing re-enters.
+_CONTENT_WRITE_LOCK = threading.Lock()
 
 
 def serialize_doc_write() -> dict:
@@ -850,7 +855,7 @@ def serialize_doc_write() -> dict:
     is rare enough that the synchronous pair costs nothing that matters.
     Never raises: the DB write is already committed, so a serialize failure
     comes back as {"ok": False, ...} for the caller to surface instead."""
-    with _serialize_lock:
+    with _CONTENT_WRITE_LOCK:
         try:
             return {"ok": True, "output": run_snapshot_render()}
         except RuntimeError as e:
@@ -867,12 +872,12 @@ def serialize_doc_write() -> dict:
 # accumulate. Push + PR need a GitHub token (SC_GH_TOKEN / GH_TOKEN); `./sc
 # launch` forwards it into the sandbox. Without a token the change is still
 # COMMITTED locally (the unpushed branch is kept so the commit isn't lost) — only
-# push/PR is skipped, with a clear message. A module lock serializes concurrent
-# publishes (one git index).
+# push/PR is skipped, with a clear message. Concurrent publishes — and every
+# other content-write path — serialize on _CONTENT_WRITE_LOCK (one git index,
+# one set of snapshot outputs), taken by the /api/publish endpoint.
 BASE_BRANCH = "main"
 PUBLISH_BRANCH = "sc_gui_content"
 _STASH_MSG = "sc-publish: stray non-content work"
-_PUBLISH_LOCK = threading.Lock()
 # The git-tracked text the DB rebuilds from + the flat renders. NOT the .db
 # (gitignored). schema.sql + migrations are engine paths: TRACKED in the source
 # repo, GITIGNORED in a fork (B7) — git_publish() filters ignored paths so the
@@ -1931,7 +1936,12 @@ class Handler(BaseHTTPRequestHandler):
                 if r is None:
                     return self._send(404, {"error": "no such document"})
                 if r[0]:
-                    return self._send(409, {"error": "document is already frozen"})
+                    # Idempotent (SC-013): a retry after an ambiguous timeout —
+                    # the freeze committed but the response was lost — must read
+                    # as the success it was, not a 409. The re-serialize also
+                    # heals any drift a lost post-freeze serialize left behind.
+                    return self._send(200, {"ok": True, "already_frozen": True,
+                                            "serialize": serialize_doc_write()})
                 con.execute(
                     "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
                     (did,))
@@ -2244,7 +2254,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, analytics.sweep(quiet=True))
             if path == "/api/snapshot":
                 try:
-                    out = run_snapshot_render()
+                    with _CONTENT_WRITE_LOCK:
+                        out = run_snapshot_render()
                 except Exception as e:
                     # run_snapshot_render raises on a failed serialize/render; log
                     # the failure before re-raising so it's in the rolling log too.
@@ -2253,7 +2264,7 @@ class Handler(BaseHTTPRequestHandler):
                 log_event("snapshot", ok=True, detail=out)
                 return self._send(200, {"output": out})
             if path == "/api/publish":
-                with _PUBLISH_LOCK:
+                with _CONTENT_WRITE_LOCK:
                     r = git_publish()
                 return self._send(200 if r["ok"] else 500, r)
             if path.startswith("/api/scripts/"):
