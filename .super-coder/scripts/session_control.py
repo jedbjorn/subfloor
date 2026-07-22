@@ -78,10 +78,12 @@ def validate_managed_wake_posture(capabilities: Mapping[str, object]) -> None:
         return
     if (
         "permission_mode" in settings
-        and settings.get("permission_mode") not in ("auto", "yolo")
+        and settings.get("permission_mode")
+        not in ("auto", "yolo", "bypassPermissions")
     ):
         raise SessionControlError(
-            "managed wake requires permission_mode='auto' or 'yolo' "
+            "managed wake requires permission_mode='auto', 'yolo', or "
+            "'bypassPermissions' "
             "so an injected turn cannot request approval"
         )
     if "approval_policy" not in settings and "sandbox" not in settings:

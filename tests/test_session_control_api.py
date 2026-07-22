@@ -164,7 +164,8 @@ class ControlMutationTest(unittest.TestCase):
 
         self.assertIsNone(payload)
         self.assertEqual(
-            "managed wake requires permission_mode='auto' or 'yolo' "
+            "managed wake requires permission_mode='auto', 'yolo', or "
+            "'bypassPermissions' "
             "so an injected turn cannot request approval",
             error,
         )

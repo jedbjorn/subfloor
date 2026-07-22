@@ -13,9 +13,23 @@ the launch command. No extra config file to emit at v1.
 | `emit` | files in this dir copied to the repo root at launch (none for Claude) |
 | `env` | extra env merged into the launch environment |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's claude model (alias: `sonnet`/`haiku`/`opus`) |
+| `session_control` | controlled planner launcher + background inbox-watcher transport |
 | `headless.effort` | `{ "flag": "--effort" }` — sprint workers default to `--effort high` |
 | `merge_json` | always-on: project-scoped JSON deep-merged every launch (preserves fork keys). Installs the branch-guard hook into `.claude/settings.local.json`. |
 | `sandbox` | `merge_json`: project-scoped config patched in-sandbox only (allow-all permissions) |
+
+## Managed planner session control
+
+The controlled launcher supplies a UUID with `--session-id`, records the exact
+model, effort, cwd, and Claude-native permission posture, then keeps that UUID
+for every planner turn. `./sc watch inbox` registers and heartbeats its exact
+PID/start-ticks as Claude's active channel; without a fresh watcher, a live
+foreground session stays queued instead of being treated as deliverable.
+
+When the foreground process is gone, the dispatcher uses a lease-fenced
+`claude --resume <uuid> ... -p <prompt>` turn with the recorded route and
+permissions. It never resumes while a validated foreground owner is live, and
+delivery is complete only after the planner marks the inbox message read.
 
 ## Branch-guard hook
 
