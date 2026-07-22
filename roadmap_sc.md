@@ -24,14 +24,26 @@ _No open flags._
 New engine skill 'agents' (--agents [model]) for dev + reviewer flavors: delegate spec execution to implementer waves and reviews to adversarial finding-panels. Overlay on spec/review; parent-only memory writes; wave checkpoints as monitoring; parent-set timeouts (two-strike floor); AGENTS spawn ledger with hard 6h validity window as a verbatim guard. See specs_sc/agents-skill.md.
 
 **Blockers:**
-- `SC-001` [Docs] agents skill shipped, doc pending | Blocker for: agents feature doc
-
-### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
-
-**Blockers:**
-- `SC-002` [Docs] sprint eventing shipped (PR #338), feature doc pending — and the loop is unproven until a real sprint runs on it | Blocker for: eventing feature doc + first eventing sprint
+- `SC-001` [Docs] sprint eventing shipped (PR #338), feature doc pending — eventing loop PROVEN by sprint 14 (f19 Visual QA CI, 2026-07-20): full event-driven cycle ran end-to-end, zero scheduled polls | Blocker for: eventing feature doc
 
 ### Session-surviving job runner (sc job) · owner: `cc`
+
+_No open flags._
+
+### Boot spinner — launch feedback after harness pick · owner: `PLN1`
+Interactive ./sc enter|boot goes silent 7-10s between the harness pick and the boot summary (git fetch + gh pr list dominate). Add a TTY-only ASCII spinner with phase labels in style.py, wrapped around the silent region of run.py main(). No headless/CI output change. Spec: specs_sc/boot-spinner.md.
+
+**Blockers:**
+- `SC-004` [Docs] Boot spinner PR #437 pending merge; after landing, freeze correction spec 15 and update the feature doc from shipped code | Blocker for: Boot spinner correction record
+
+### Visual QA CI — Playwright viewport screenshots · owner: `PLN1`
+
+**Blockers:**
+- Visual QA CI spec (#13) live in DB; git render/snapshot pending FnB GUI Snapshot — sc mem doc pipeline defect filed as subfloor#434 | Blocker for: spec render in specs_sc/
+- [Docs] Visual QA CI shipped (PRs #438/#442/#443), feature doc pending (conformance F6) | Blocker for: f19 feature doc
+
+### Sprint model routing catalogue · owner: `DEV3`
+Self-healing locally authoritative model routes populated by Refresh models; exact sprint resolver, Kimi model routing, and high-effort launches across supported harnesses.
 
 _No open flags._
 
@@ -61,6 +73,12 @@ _No open flags._
 The substrate itself: data layer we build, harness we rent. v1 targets Claude Code + OpenCode; GUI review layer; fork + reseed.
 
 _No open flags._
+
+### Sprint eventing — GitHub→inbox daemon + headless worker boot · owner: `cc`
+
+**Blockers:**
+- `SC-002` [Docs] sprint eventing shipped (PR #338), feature doc pending — and the loop is unproven until a real sprint runs on it | Blocker for: eventing feature doc + first eventing sprint
+- `SC-007` [Docs] Sprint planner session-control spec #20 lives ONLY in the live engine DB — sc mem doc add/edit materializes neither specs_sc/sprint-planner-session-control.md nor a .sc-state/content.sql snapshot (render+snapshot pipeline defect, upstream subfloor#434). 2026-07-22: body materially revised with 6 spec-debt write-backs (retry semantics J2, arming posture validation J5, effort=config-effective-at-launch J4, transition-edge table J1, error-state sc enter retry-first recovery SC-466, F3 watcher re-arm softened). The pending FnB GUI Snapshot must capture CURRENT live-DB state so these write-backs reach git; until then a DB rebuild would lose spec #20 entirely. | Blocker for: reviewable flat render + durable snapshot of feature 14 spec seq 2
 
 ### Token & session analytics · owner: `cc`
 Self-tracked token spend + session history across all harnesses (claude/opencode/codex/vibe/kimi). Sweep-parse each harness's on-disk usage data into session_token_usage; session lifecycle columns on archives; /api/analytics/* + GUI Analytics tab (7-day paged history with session titles, harness/provider/model filters, sprint clusters, usage analytics). Tokens only, no pricing, v1.
