@@ -535,13 +535,28 @@ def authenticate(con, interactive: bool = True):
 # ── Shell selection ─────────────────────────────────────────────────────────
 
 def list_shells(con, user_id: int) -> list:
-    return con.execute(
+    shells = [dict(row) for row in con.execute(
         "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor, "
         "current_state FROM shells "
         "WHERE (user_id=? OR is_shared=1) AND COALESCE(is_deleted,0)=0 "
         "ORDER BY flavor IS NULL, flavor, shell_id",
         (user_id,),
-    ).fetchall()
+    ).fetchall()]
+    refs_by_shell = [_sprint_doc_refs(shell) for shell in shells]
+    referenced = set().union(*refs_by_shell)
+    active = set()
+    if referenced:
+        placeholders = ",".join("?" for _ in referenced)
+        docs = con.execute(
+            f"SELECT document_id, frozen, body FROM documents "
+            f"WHERE kind='doc' AND document_id IN ({placeholders})",
+            tuple(sorted(referenced)),
+        ).fetchall()
+        active = {doc["document_id"] for doc in docs
+                  if _sprint_doc_is_active(doc)}
+    for shell, refs in zip(shells, refs_by_shell):
+        shell["sprint_reserved"] = bool(refs & active)
+    return shells
 
 
 def flavor_defaults(con) -> dict:
@@ -576,11 +591,36 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
-def _is_sprint_reserved(shell) -> bool:
-    """True while the sprint skill's reservation marker is in current_state."""
+def _sprint_doc_refs(shell) -> set[int]:
+    """Tracker document ids named by current_state's sprint marker lines."""
     current_state = dict(shell).get("current_state") or ""
-    return any(line.strip().startswith("SPRINT doc=")
-               for line in current_state.splitlines())
+    refs = set()
+    prefix = "SPRINT doc="
+    for line in current_state.splitlines():
+        marker = line.strip()
+        if not marker.startswith(prefix):
+            continue
+        value = marker[len(prefix):].split(maxsplit=1)[0]
+        if value.isdigit():
+            refs.add(int(value))
+    return refs
+
+
+def _sprint_doc_is_active(doc) -> bool:
+    """The tracker contract says ACTIVE, and freeze has not revoked authority."""
+    if doc["frozen"]:
+        return False
+    for line in (doc["body"] or "").splitlines():
+        field, separator, value = line.strip().partition(":")
+        if field == "status" and separator:
+            status = value.strip().split(maxsplit=1)
+            return bool(status) and status[0] == "ACTIVE"
+    return False
+
+
+def _is_sprint_reserved(shell) -> bool:
+    """Picker-only annotation computed by list_shells; never a boot gate."""
+    return bool(dict(shell).get("sprint_reserved"))
 
 
 def _shell_status(shell, snap: "dict | None") -> str:

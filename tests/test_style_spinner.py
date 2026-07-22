@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import sys
 import threading
 import time
@@ -99,6 +100,7 @@ class ShellStatusTest(unittest.TestCase):
         sprint_shell = {
             **self.shell,
             "current_state": "working notes\nSPRINT doc=21 unit=4 status=waiting",
+            "sprint_reserved": True,
         }
         with mock.patch.object(style, "ON", True), mock.patch.object(
                 run.shell_liveness, "session_state", return_value=None):
@@ -115,6 +117,63 @@ class ShellStatusTest(unittest.TestCase):
         with mock.patch.object(run.shell_liveness, "session_state", return_value=None):
             self.assertEqual("Unknown",
                              run._shell_status(sprint_shell, partial).strip())
+
+    def test_only_active_unfrozen_sprint_docs_reserve_shells(self) -> None:
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        con.executescript("""
+            CREATE TABLE shells (
+                shell_id INTEGER PRIMARY KEY,
+                display_name TEXT,
+                shortname TEXT,
+                mandate TEXT,
+                is_shared INTEGER NOT NULL DEFAULT 0,
+                flavor TEXT,
+                current_state TEXT,
+                user_id INTEGER,
+                is_deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE documents (
+                document_id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                frozen INTEGER NOT NULL DEFAULT 0,
+                body TEXT
+            );
+            INSERT INTO documents VALUES
+                (21, 'doc', 0, '# SPRINT: active\nstatus: ACTIVE'),
+                (22, 'doc', 0, '# SPRINT: closed\nstatus: CLOSED'),
+                (23, 'doc', 1, '# SPRINT: frozen\nstatus: ACTIVE'),
+                (24, 'doc', 0, '# SPRINT: malformed\nstatus:');
+            INSERT INTO shells VALUES
+                (1, 'Active', 'DEV1', '', 0, 'dev', 'SPRINT doc=21 unit=1', 1, 0),
+                (2, 'Closed', 'DEV2', '', 0, 'dev', 'SPRINT doc=22 unit=2', 1, 0),
+                (3, 'Frozen', 'REV1', '', 0, 'reviewer', 'SPRINT doc=23 reviewing=2', 1, 0),
+                (4, 'Missing', 'DEV3', '', 0, 'dev', 'SPRINT doc=999 unit=3', 1, 0),
+                (5, 'Bad marker', 'DEV4', '', 0, 'dev', 'SPRINT doc=oops unit=4', 1, 0),
+                (6, 'Bad tracker', 'DEV5', '', 0, 'dev', 'SPRINT doc=24 unit=5', 1, 0);
+        """)
+
+        shells = {shell["shortname"]: shell
+                  for shell in run.list_shells(con, user_id=1)}
+
+        self.assertEqual(
+            {"DEV1": True, "DEV2": False, "REV1": False,
+             "DEV3": False, "DEV4": False, "DEV5": False},
+            {name: shell["sprint_reserved"] for name, shell in shells.items()},
+        )
+        with mock.patch.object(
+                run.shell_liveness, "session_state", return_value=None):
+            self.assertEqual(
+                "Sprint", run._shell_status(shells["DEV1"], self.snap).strip())
+            self.assertEqual(
+                "Available", run._shell_status(shells["DEV2"], self.snap).strip())
+
+    def test_sprint_annotation_never_blocks_boot(self) -> None:
+        sprint_shell = {**self.shell, "sprint_reserved": True}
+        with mock.patch.object(
+                run.shell_liveness, "session_state", return_value=None):
+            self.assertTrue(run.confirm_live(sprint_shell, self.snap))
 
     def test_picker_has_a_dedicated_status_column(self) -> None:
         shell = {**self.shell, "display_name": "Dev One"}
