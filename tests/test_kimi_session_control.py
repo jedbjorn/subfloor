@@ -110,8 +110,20 @@ class ProbeTest(unittest.TestCase):
         self.assertNotIn("--dangerous-bypass-auth", probe["server_command"])
         self.assertTrue(probe["active_delivery"])
 
-    def test_unknown_version_fails_closed_for_server_but_retains_tested_resume(self):
+    def test_newer_version_is_accepted_on_feature_probe_evidence(self):
         probe = kimi_http.probe_kimi(self.runner("0.29.0", web=True))
+        self.assertEqual(
+            probe["server_command"],
+            ["kimi", "web", "--port", "0", "--foreground", "--no-open"],
+        )
+        self.assertEqual(
+            (probe["create"], probe["deliver"], probe["active_delivery"]),
+            (True, True, True),
+        )
+        self.assertTrue(probe["resume"])
+
+    def test_older_version_fails_closed_for_server_but_retains_tested_resume(self):
+        probe = kimi_http.probe_kimi(self.runner("0.26.3", web=True))
         self.assertEqual(
             (probe["create"], probe["deliver"], probe["active_delivery"]),
             (False, False, False),

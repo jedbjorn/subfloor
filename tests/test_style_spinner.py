@@ -334,7 +334,7 @@ class BootPhaseLabelTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 run, "open_session", return_value=("0001", 1)))
             stack.enter_context(mock.patch.object(
-                run.session_supervisor, "binding_for_enter", return_value=None))
+                run.session_supervisor, "supersede_for_enter", return_value=None))
             stack.enter_context(mock.patch.object(run.ports_mod, "resolve", return_value={}))
             stack.enter_context(mock.patch.object(run, "ensure_worktree"))
             stack.enter_context(mock.patch.object(run, "sync_worktree", sync))

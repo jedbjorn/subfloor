@@ -145,8 +145,14 @@ def expected_worktree(repo_root: Path, shortname: str | None,
 def ensure_binding(con, *, archive_id: int, shell_id: int, harness: str,
                    native_session_id: str | None = None,
                    control_endpoint: str | None = None,
-                   capabilities: str = "{}", cli_version: str | None = None) -> dict:
-    """Create the binding for an archive, or verify/reuse that exact binding."""
+                   capabilities: str = "{}", cli_version: str | None = None,
+                   managed: bool = False) -> dict:
+    """Create the binding for an archive, or verify/reuse that exact binding.
+
+    ``managed`` applies only at INSERT — an existing row is returned as-is.
+    The caller must have cleared any prior managed row for the shell first
+    (the partial unique index allows exactly one)."""
+
     row = con.execute(
         "SELECT * FROM shell_session_bindings WHERE archive_id=?", (archive_id,)
     ).fetchone()
@@ -175,10 +181,10 @@ def ensure_binding(con, *, archive_id: int, shell_id: int, harness: str,
     cur = con.execute(
         "INSERT INTO shell_session_bindings "
         "(archive_id, shell_id, harness, native_session_id, control_endpoint, "
-        "control_capabilities, cli_version, state) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'starting')",
+        "control_capabilities, cli_version, managed, state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting')",
         (archive_id, shell_id, harness, native_session_id, control_endpoint,
-         capabilities, cli_version),
+         capabilities, cli_version, 1 if managed else 0),
     )
     con.commit()
     return dict(con.execute(
@@ -204,34 +210,92 @@ def binding_for_resume(con, binding_id: int, *, shell_id: int,
     return dict(row)
 
 
-def binding_for_enter(con, shell_id: int, *, new_session: bool = False) -> dict | None:
-    """Return the shell's managed binding for an interactive enter.
+def supersede_for_enter(con, shell_id: int, *, repo_root: Path,
+                        proc_root: Path = PROC) -> dict | None:
+    """Release the shell's resumable bindings so an interactive enter starts fresh.
 
-    A managed binding owns the planner's conversation until the operator
-    releases it.  Bare ``sc enter`` therefore reuses it, while an explicit new
-    session must fail before a second archive can be opened.
+    Interactive enter never resumes a native harness conversation — dormant
+    resume is the dispatcher's headless path, and a stale binding must never
+    wedge ``sc enter`` (#483/#484).  Any binding that would otherwise be
+    resumed — the shell's managed binding, or one parked on the shell's active
+    archive (the unused-stub shape that resurrected an errored row, #484) — is
+    released here: state -> released, ``managed`` cleared, queued/failed wake
+    jobs cancelled.  ``last_error`` is deliberately kept: the original adapter
+    error must stay visible after recovery.  Provider credential/socket files
+    are per-binding-id, so the stale ones are inert once a fresh binding (new
+    id) exists — no cleanup needed here.
+
+    Returns the superseded row (the managed one when several matched — its
+    harness still hints the picker), or None when there is nothing to
+    supersede.  Raises while a validated owner (or its orphaned group) still
+    holds a binding — never release under a live session.
     """
-    row = con.execute(
-        "SELECT b.*, a.session_id, a.model AS archive_model, "
-        "a.provider AS archive_provider, s.shortname FROM shell_session_bindings b "
-        "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
-        "JOIN shells s ON s.shell_id=b.shell_id "
-        "WHERE b.shell_id=? AND b.managed=1",
-        (shell_id,),
-    ).fetchone()
-    if not row:
-        return None
-    if row["state"] == "error":
-        raise ValueError(
-            f"managed binding {row['binding_id']} is in error; run "
-            f"./sc session retry {row['shortname']} to recover it, or "
-            f"./sc session release {row['shortname']} before starting a new session"
-        )
-    if new_session:
-        raise ValueError(
-            f"--new-session requires releasing managed binding {row['binding_id']} first"
-        )
-    return dict(row)
+    # The ownership fence and release are one write transaction. Otherwise a
+    # dispatcher can claim the binding after reconciliation and before the
+    # release, leaving a live lease on a row we just marked released (#485).
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        rows = con.execute(
+            "SELECT b.*, a.session_id, a.model AS archive_model, "
+            "a.provider AS archive_provider, s.shortname, s.flavor "
+            "FROM shell_session_bindings b "
+            "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
+            "JOIN shells s ON s.shell_id=b.shell_id "
+            "WHERE b.shell_id=? AND (b.managed=1 OR b.archive_id="
+            "(SELECT active_archive_id FROM shells WHERE shell_id=?))",
+            (shell_id, shell_id),
+        ).fetchall()
+        if not rows:
+            con.rollback()
+            return None
+
+        for row in rows:
+            status = _reconcile_binding_locked(
+                con, row["binding_id"], repo_root=repo_root,
+                proc_root=proc_root)
+            current = _binding_context(con, row["binding_id"])
+            if status not in ("vacant", "stale-cleared"):
+                raise ValueError(
+                    f"session binding {row['binding_id']} is held by a live owner "
+                    f"({status}) — attach to the running session, or "
+                    f"./sc session release {row['shortname']} first"
+                )
+            # claim_batch moves to dispatching before the resume child can
+            # register its lease. No PID in that window does not mean vacant;
+            # releasing here could start a fresh interactive writer alongside
+            # a headless turn that has already been claimed.
+            if current["state"] == "dispatching":
+                raise ValueError(
+                    f"session binding {row['binding_id']} has a dispatch in progress; "
+                    "wait for it to finish before starting a fresh session"
+                )
+
+        primary = None
+        for row in rows:
+            current = _binding_context(con, row["binding_id"])
+            if current["state"] != "released":
+                session_control.transition_binding(
+                    con, row["binding_id"], expected=current["state"],
+                    target="released")
+            con.execute(
+                "UPDATE shell_session_bindings SET managed=0, "
+                "updated_at=datetime('now') WHERE binding_id=?",
+                (row["binding_id"],),
+            )
+            con.execute(
+                "UPDATE session_wake_jobs SET state='cancelled', "
+                "finished_at=datetime('now'), "
+                "last_error='superseded by interactive enter' "
+                "WHERE binding_id=? AND state IN ('queued','failed')",
+                (row["binding_id"],),
+            )
+            if primary is None or row["managed"]:
+                primary = row
+        con.commit()
+        return dict(primary)
+    except Exception:
+        con.rollback()
+        raise
 
 
 def register_native_session(con, binding_id: int, native_session_id: str, *,
@@ -469,52 +533,54 @@ def _reconcile_active_channel(con, row: dict, *, repo_root: Path,
     return True
 
 
+def _reconcile_binding_locked(con, binding_id: int, *, repo_root: Path,
+                              proc_root: Path = PROC) -> str:
+    """Validate ownership inside the caller's active write transaction."""
+    row = _binding_context(con, binding_id)
+    _reconcile_active_channel(con, row, repo_root=repo_root, proc_root=proc_root)
+    status, pids = _recorded_owner_status(
+        row, repo_root=repo_root, proc_root=proc_root)
+    if status in ("vacant", "live", "cleanup"):
+        return status
+    if status == "orphan-group":
+        target = "released" if row["state"] == "released" else "error"
+        session_control.transition_binding(
+            con, binding_id, expected=row["state"], target=target)
+        con.execute(
+            "UPDATE shell_session_bindings SET last_error=?, "
+            "updated_at=datetime('now') WHERE binding_id=?",
+            ("recorded owner exited but process group survives: "
+             + ",".join(map(str, pids)), binding_id),
+        )
+        return status
+
+    if row["state"] in ("released", "error"):
+        target = row["state"]
+    else:
+        target = "dormant" if row.get("native_session_id") else "error"
+    error = (None if row.get("native_session_id")
+             else "stale owner and no native session id")
+    session_control.transition_binding(
+        con, binding_id, expected=row["state"], target=target)
+    con.execute(
+        "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
+        "supervisor_pid=NULL, supervisor_start_ticks=NULL, last_error=?, "
+        "updated_at=datetime('now') WHERE binding_id=? "
+        "AND lease_pid=? AND lease_start_ticks=?",
+        (error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
+    )
+    return "stale-cleared"
+
+
 def reconcile_binding(con, binding_id: int, *, repo_root: Path,
                       proc_root: Path = PROC) -> str:
     """Validate recorded ownership before a claim or dispatcher decision."""
     con.execute("BEGIN IMMEDIATE")
     try:
-        row = _binding_context(con, binding_id)
-        channel_cleared = _reconcile_active_channel(
-            con, row, repo_root=repo_root, proc_root=proc_root)
-        status, pids = _recorded_owner_status(
-            row, repo_root=repo_root, proc_root=proc_root)
-        if status in ("vacant", "live", "cleanup"):
-            if channel_cleared:
-                con.commit()
-            else:
-                con.rollback()
-            return status
-        if status == "orphan-group":
-            target = "released" if row["state"] == "released" else "error"
-            session_control.transition_binding(
-                con, binding_id, expected=row["state"], target=target)
-            con.execute(
-                "UPDATE shell_session_bindings SET last_error=?, "
-                "updated_at=datetime('now') WHERE binding_id=?",
-                ("recorded owner exited but process group survives: "
-                 + ",".join(map(str, pids)), binding_id),
-            )
-            con.commit()
-            return status
-
-        if row["state"] in ("released", "error"):
-            target = row["state"]
-        else:
-            target = "dormant" if row.get("native_session_id") else "error"
-        error = (None if row.get("native_session_id")
-                 else "stale owner and no native session id")
-        session_control.transition_binding(
-            con, binding_id, expected=row["state"], target=target)
-        con.execute(
-            "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
-            "supervisor_pid=NULL, supervisor_start_ticks=NULL, last_error=?, "
-            "updated_at=datetime('now') WHERE binding_id=? "
-            "AND lease_pid=? AND lease_start_ticks=?",
-            (error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
-        )
+        status = _reconcile_binding_locked(
+            con, binding_id, repo_root=repo_root, proc_root=proc_root)
         con.commit()
-        return "stale-cleared"
+        return status
     except Exception:
         con.rollback()
         raise

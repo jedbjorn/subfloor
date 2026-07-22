@@ -8,7 +8,10 @@ import subprocess
 from collections.abc import Callable
 
 
-TESTED_VERSIONS = frozenset({(2, 1)})
+# Validated version floor — newer CLIs are accepted on feature-probe evidence
+# (the flag detection below), older ones fail closed. Support-latest policy:
+# a version bump alone never disables session control.
+MIN_TESTED_VERSION = (2, 1)
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -42,7 +45,7 @@ def probe_claude(
     match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", version_text)
     version = tuple(map(int, match.groups())) if match else None
     help_text = _output(help_result)
-    known = bool(version and version[:2] in TESTED_VERSIONS)
+    known = bool(version and version[:2] >= MIN_TESTED_VERSION)
     create = (
         known
         and help_result.returncode == 0

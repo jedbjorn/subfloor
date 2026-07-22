@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import IO
 
 
-TESTED_SERVER_VERSIONS = frozenset({(0, 27), (0, 28)})
+# Validated version floor — newer CLIs are accepted on feature-probe evidence
+# (the command-tree detection below), older ones fail closed. Support-latest
+# policy: a version bump alone never disables session control.
+MIN_TESTED_SERVER_VERSION = (0, 27)
 DEFAULT_TURN_TIMEOUT = 4 * 60 * 60
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[^\s,;]+"),
@@ -84,7 +87,7 @@ def probe_kimi(
 
     version_text = _output(version_result).strip()
     version = _version_tuple(version_text)
-    known_server = bool(version and version[:2] in TESTED_SERVER_VERSIONS)
+    known_server = bool(version and version[:2] >= MIN_TESTED_SERVER_VERSION)
     root_help = _output(root_result)
     server_help = _output(server_result)
     web_help = _output(web_result)

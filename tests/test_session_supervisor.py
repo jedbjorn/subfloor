@@ -68,6 +68,17 @@ CREATE TABLE shell_session_bindings (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (harness, native_session_id)
 );
+CREATE TABLE session_wake_jobs (
+  wake_id INTEGER PRIMARY KEY,
+  binding_id INTEGER NOT NULL,
+  trigger_message_id INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  last_error TEXT
+);
 """
 
 
@@ -412,7 +423,7 @@ class MigratedStateMachineIntegrationTest(unittest.TestCase):
         self.assertEqual(("error", None, generation), tuple(row))
 
 
-class ArchiveReuseTest(unittest.TestCase):
+class SupersedeForEnterTest(unittest.TestCase):
     def _managed_binding(self, con):
         binding = supervisor.ensure_binding(
             con, archive_id=10, shell_id=1, harness="claude",
@@ -423,60 +434,210 @@ class ArchiveReuseTest(unittest.TestCase):
         con.commit()
         return binding
 
-    def test_bare_enter_selects_dormant_managed_binding_and_exact_archive(self):
-        con = make_db()
-        self.addCleanup(con.close)
-        binding = self._managed_binding(con)
+    def _binding_row(self, con, binding_id):
+        return con.execute(
+            "SELECT state, managed, last_error, native_session_id "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding_id,)).fetchone()
 
-        selected = supervisor.binding_for_enter(con, 1)
-        self.assertEqual(
-            (binding["binding_id"], 10, "0007", "claude", "native-7", "dormant", 1),
-            (selected["binding_id"], selected["archive_id"], selected["session_id"],
-             selected["harness"], selected["native_session_id"], selected["state"],
-             selected["managed"]),
-        )
-        session_id, archive_id = run.open_session(
-            con, 1, reuse_archive_id=selected["archive_id"])
-        self.assertEqual(("0007", 10), (session_id, archive_id))
-        self.assertEqual(1, con.execute(
-            "SELECT COUNT(*) FROM shell_memory_archives").fetchone()[0])
-
-    def test_new_session_is_refused_while_managed_binding_exists(self):
-        con = make_db()
-        self.addCleanup(con.close)
-        binding = self._managed_binding(con)
-
-        with self.assertRaisesRegex(
-                ValueError,
-                rf"--new-session requires releasing managed binding {binding['binding_id']} first"):
-            supervisor.binding_for_enter(con, 1, new_session=True)
-        self.assertEqual(1, con.execute(
-            "SELECT COUNT(*) FROM shell_memory_archives").fetchone()[0])
-        self.assertIsNone(con.execute(
-            "SELECT active_archive_id FROM shells WHERE shell_id=1").fetchone()[0])
-
-    def test_new_session_opens_new_archive_after_binding_release(self):
+    def test_bare_enter_supersedes_dormant_managed_binding(self):
         con = make_db()
         self.addCleanup(con.close)
         binding = self._managed_binding(con)
         con.execute(
-            "UPDATE shell_session_bindings SET state='released', managed=0 "
-            "WHERE binding_id=?", (binding["binding_id"],))
-        con.execute("UPDATE shells SET active_archive_id=10 WHERE shell_id=1")
-        con.execute(
-            "UPDATE shell_memory_archives SET full_narrative="
-            "'# 0007\\n[00:00] Session start.' WHERE archive_id=10")
+            "INSERT INTO session_wake_jobs (binding_id, trigger_message_id, state) "
+            "VALUES (?, 1, 'queued'), (?, 2, 'failed'), (?, 3, 'done')",
+            (binding["binding_id"],) * 3)
         con.commit()
 
-        self.assertIsNone(supervisor.binding_for_enter(con, 1, new_session=True))
+        superseded = supervisor.supersede_for_enter(con, 1, repo_root=Path("/none"))
+        self.assertEqual(
+            (binding["binding_id"], 10, "0007", "claude", "native-7", "dormant", 1),
+            (superseded["binding_id"], superseded["archive_id"],
+             superseded["session_id"], superseded["harness"],
+             superseded["native_session_id"], superseded["state"],
+             superseded["managed"]),
+        )
+        self.assertEqual(("released", 0, None, "native-7"),
+                         tuple(self._binding_row(con, binding["binding_id"])))
+        jobs = con.execute(
+            "SELECT state, last_error FROM session_wake_jobs "
+            "WHERE binding_id=? ORDER BY trigger_message_id",
+            (binding["binding_id"],)).fetchall()
+        self.assertEqual(
+            [("cancelled", "superseded by interactive enter"),
+             ("cancelled", "superseded by interactive enter"),
+             ("done", None)],
+            [tuple(job) for job in jobs])
+
+        # The fresh session opens a NEW archive and rebinds managed=1 on it.
         session_id, archive_id = run.open_session(
             con, 1, lifecycle={"harness": "claude", "provider": "anthropic",
                                "model": "opus"}, force_new=True)
         self.assertEqual(("0008", 11), (session_id, archive_id))
-        rows = con.execute(
-            "SELECT archive_id, session_id FROM shell_memory_archives ORDER BY archive_id"
-        ).fetchall()
-        self.assertEqual([(10, "0007"), (11, "0008")], [tuple(row) for row in rows])
+        fresh = supervisor.ensure_binding(
+            con, archive_id=archive_id, shell_id=1, harness="claude", managed=True)
+        managed = con.execute(
+            "SELECT binding_id, archive_id, state FROM shell_session_bindings "
+            "WHERE managed=1").fetchall()
+        self.assertEqual([(fresh["binding_id"], 11, "starting")],
+                         [tuple(row) for row in managed])
+
+    def test_error_binding_is_superseded_with_error_preserved(self):
+        # #484 regression: a failed bootstrap must never wedge the next enter.
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = self._managed_binding(con)
+        con.execute(
+            "UPDATE shell_session_bindings SET state='error', "
+            "last_error='Codex 0.145.0 is not validated' WHERE binding_id=?",
+            (binding["binding_id"],))
+        con.commit()
+
+        superseded = supervisor.supersede_for_enter(con, 1, repo_root=Path("/none"))
+        self.assertEqual(binding["binding_id"], superseded["binding_id"])
+        self.assertEqual(
+            ("released", 0, "Codex 0.145.0 is not validated", "native-7"),
+            tuple(self._binding_row(con, binding["binding_id"])))
+
+    def test_unmanaged_binding_on_active_archive_is_superseded(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = supervisor.ensure_binding(
+            con, archive_id=10, shell_id=1, harness="claude",
+            native_session_id="native-7")
+        con.execute(
+            "UPDATE shell_session_bindings SET state='dormant' WHERE binding_id=?",
+            (binding["binding_id"],))
+        con.execute("UPDATE shells SET active_archive_id=10 WHERE shell_id=1")
+        con.commit()
+
+        superseded = supervisor.supersede_for_enter(con, 1, repo_root=Path("/none"))
+        self.assertEqual(binding["binding_id"], superseded["binding_id"])
+        self.assertEqual(("released", 0, None, "native-7"),
+                         tuple(self._binding_row(con, binding["binding_id"])))
+
+    def test_unmanaged_binding_off_active_archive_is_left_alone(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        supervisor.ensure_binding(
+            con, archive_id=10, shell_id=1, harness="claude",
+            native_session_id="native-7")
+        con.commit()
+        self.assertIsNone(
+            supervisor.supersede_for_enter(con, 1, repo_root=Path("/none")))
+        row = con.execute(
+            "SELECT state, managed FROM shell_session_bindings").fetchone()
+        self.assertEqual(("starting", 0), tuple(row))
+
+    def test_no_binding_returns_none_and_writes_nothing(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        self.assertIsNone(
+            supervisor.supersede_for_enter(con, 1, repo_root=Path("/none")))
+        self.assertEqual(0, con.execute(
+            "SELECT COUNT(*) FROM shell_session_bindings").fetchone()[0])
+
+    def test_live_owner_refuses_supersede_without_touching_the_binding(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = self._managed_binding(con)
+        proc = FakeProc(self)
+        repo = proc.root / "repo"
+        worktree = repo / ".sc-worktrees" / "dev1"
+        proc.add(501, ticks=51, command=("claude",), cwd=worktree)
+        con.execute(
+            "UPDATE shell_session_bindings SET lease_pid=501, "
+            "lease_start_ticks=51, state='foreground' WHERE binding_id=?",
+            (binding["binding_id"],))
+        con.commit()
+
+        with self.assertRaisesRegex(ValueError, "live owner"):
+            supervisor.supersede_for_enter(
+                con, 1, repo_root=repo, proc_root=proc.root)
+        row = con.execute(
+            "SELECT state, managed, lease_pid FROM shell_session_bindings "
+            "WHERE binding_id=?", (binding["binding_id"],)).fetchone()
+        self.assertEqual(("foreground", 1, 501), tuple(row))
+
+    def test_dispatch_claim_before_lease_refuses_without_cancelling_work(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = self._managed_binding(con)
+        con.execute(
+            "UPDATE shell_session_bindings SET state='dispatching' "
+            "WHERE binding_id=?", (binding["binding_id"],))
+        con.execute(
+            "INSERT INTO session_wake_jobs "
+            "(binding_id, trigger_message_id, state, attempt_count) "
+            "VALUES (?, 1, 'running', 1)", (binding["binding_id"],))
+        con.commit()
+
+        with self.assertRaisesRegex(ValueError, "dispatch in progress"):
+            supervisor.supersede_for_enter(con, 1, repo_root=Path("/none"))
+
+        row = con.execute(
+            "SELECT state, managed, lease_pid, lease_start_ticks "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("dispatching", 1, None, None), tuple(row))
+        job = con.execute(
+            "SELECT state, attempt_count, finished_at, last_error "
+            "FROM session_wake_jobs WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("running", 1, None, None), tuple(job))
+
+    def test_reconcile_and_release_hold_one_write_lock(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = str(Path(tmp.name) / "supersede.db")
+        con = make_db(path)
+        self.addCleanup(con.close)
+        binding = supervisor.ensure_binding(
+            con, archive_id=10, shell_id=1, harness="claude",
+            native_session_id="native-7", managed=True)
+        con.execute(
+            "UPDATE shell_session_bindings SET state='dormant' "
+            "WHERE binding_id=?", (binding["binding_id"],))
+        con.commit()
+        proc = FakeProc(self)
+        repo = proc.root / "repo"
+        worktree = repo / ".sc-worktrees" / "dev1"
+        proc.add(502, ticks=52, command=("claude",), cwd=worktree)
+        original = supervisor._reconcile_binding_locked
+
+        def competing_claim(*args, **kwargs):
+            contender = sqlite3.connect(path, timeout=0)
+            contender.row_factory = sqlite3.Row
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    supervisor.claim_lease(
+                        contender, binding["binding_id"], 502,
+                        repo_root=repo, state="foreground", proc_root=proc.root)
+            finally:
+                contender.close()
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+                supervisor, "_reconcile_binding_locked",
+                side_effect=competing_claim):
+            superseded = supervisor.supersede_for_enter(
+                con, 1, repo_root=repo, proc_root=proc.root)
+
+        self.assertEqual(binding["binding_id"], superseded["binding_id"])
+        row = con.execute(
+            "SELECT state, managed, lease_pid, lease_start_ticks "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("released", 0, None, None), tuple(row))
+
+        contender = sqlite3.connect(path, timeout=0)
+        contender.row_factory = sqlite3.Row
+        self.addCleanup(contender.close)
+        with self.assertRaises(session_control.InvalidStateTransition):
+            supervisor.claim_lease(
+                contender, binding["binding_id"], 502,
+                repo_root=repo, state="foreground", proc_root=proc.root)
 
     def test_resume_reuses_exact_archive_without_creating_or_rewriting_it(self):
         con = make_db()
@@ -520,7 +681,7 @@ class EnterMainFlowTest(unittest.TestCase):
         con.commit()
         return binding
 
-    def _run_until_open(self, con, argv):
+    def _run_until_open(self, con, argv, *, render_only=False):
         chosen = {"shell_id": 1, "shortname": "DEV1", "flavor": "planner"}
         defaults = {
             "planner": {"default_harness": "codex", "models": {
@@ -530,7 +691,8 @@ class EnterMainFlowTest(unittest.TestCase):
         def capture(*args, **kwargs):
             raise self.OpenReached(args, kwargs)
 
-        with mock.patch.dict(run.os.environ, {"RENDER_ONLY": "1"}, clear=True), \
+        env = {"RENDER_ONLY": "1"} if render_only else {}
+        with mock.patch.dict(run.os.environ, env, clear=True), \
                 mock.patch.object(run.sys, "argv", ["run.py", *argv]), \
                 mock.patch.object(run.sys, "stdin", mock.Mock(isatty=lambda: False)), \
                 mock.patch.object(run, "open_db", return_value=con), \
@@ -538,6 +700,10 @@ class EnterMainFlowTest(unittest.TestCase):
                 mock.patch.object(run, "flavor_defaults", return_value=defaults), \
                 mock.patch.object(run, "list_shells", return_value=[chosen]), \
                 mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills",
+                                  return_value=[]), \
+                mock.patch("analytics.sweep",
+                          return_value={"inserted": 0, "updated": 0}), \
                 mock.patch.object(run, "load_adapter", return_value={
                     "launch": ["claude"], "emit": [], "env": {},
                     "session_control": {"capabilities": {}},
@@ -545,36 +711,36 @@ class EnterMainFlowTest(unittest.TestCase):
                 mock.patch.object(run, "open_session", side_effect=capture):
             run.main()
 
-    def test_bare_enter_routes_main_through_managed_binding_archive(self):
-        con = make_db()
-        self.addCleanup(con.close)
-        self._managed_binding(con)
-
-        with self.assertRaises(self.OpenReached) as reached:
-            self._run_until_open(con, ["DEV1"])
-        self.assertEqual((con, 1), reached.exception.call_args[:2])
-        self.assertEqual(10, reached.exception.call_kwargs["reuse_archive_id"])
-        self.assertFalse(reached.exception.call_kwargs["force_new"])
-        self.assertEqual(
-            {"harness": "claude", "provider": "anthropic", "model": "opus",
-             "sprint_ref": None},
-            reached.exception.call_kwargs["lifecycle"],
-        )
-
-    def test_new_session_flag_is_refused_by_main_before_archive_open(self):
+    def test_bare_enter_supersedes_and_opens_fresh_archive(self):
         con = make_db()
         self.addCleanup(con.close)
         binding = self._managed_binding(con)
 
-        with self.assertRaisesRegex(
-                SystemExit,
-                rf"session launch refused: --new-session requires releasing managed binding "
-                rf"{binding['binding_id']} first"):
-            self._run_until_open(con, ["DEV1", "--new-session"])
-        self.assertEqual(1, con.execute(
-            "SELECT COUNT(*) FROM shell_memory_archives").fetchone()[0])
+        with self.assertRaises(self.OpenReached) as reached:
+            self._run_until_open(con, ["DEV1"])
+        self.assertEqual((con, 1), reached.exception.call_args[:2])
+        self.assertIsNone(reached.exception.call_kwargs["reuse_archive_id"])
+        self.assertTrue(reached.exception.call_kwargs["force_new"])
+        row = con.execute(
+            "SELECT state, managed FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("released", 0), tuple(row))
 
-    def test_error_binding_refuses_before_archive_open_with_remedies(self):
+    def test_new_session_flag_supersedes_instead_of_refusing(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = self._managed_binding(con)
+
+        with self.assertRaises(self.OpenReached) as reached:
+            self._run_until_open(con, ["DEV1", "--new-session"])
+        self.assertTrue(reached.exception.call_kwargs["force_new"])
+        row = con.execute(
+            "SELECT state, managed FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("released", 0), tuple(row))
+
+    def test_error_binding_is_superseded_not_refused(self):
+        # #484 regression at the main() level: the next enter starts fresh.
         con = make_db()
         self.addCleanup(con.close)
         binding = self._managed_binding(con)
@@ -585,38 +751,40 @@ class EnterMainFlowTest(unittest.TestCase):
         )
         con.commit()
 
-        with self.assertRaisesRegex(
-                SystemExit,
-                rf"session launch refused: managed binding {binding['binding_id']} is in "
-                rf"error; run \./sc session retry DEV1 to recover it, or "
-                rf"\./sc session release DEV1 before starting a new session"):
+        with self.assertRaises(self.OpenReached) as reached:
             self._run_until_open(con, ["DEV1"])
-        self.assertEqual(1, con.execute(
-            "SELECT COUNT(*) FROM shell_memory_archives").fetchone()[0])
-        self.assertIsNone(con.execute(
-            "SELECT active_archive_id FROM shells WHERE shell_id=1").fetchone()[0])
+        self.assertIsNone(reached.exception.call_kwargs["reuse_archive_id"])
+        self.assertTrue(reached.exception.call_kwargs["force_new"])
         row = con.execute(
             "SELECT state, managed, lease_pid, last_error "
             "FROM shell_session_bindings WHERE binding_id=?",
             (binding["binding_id"],),
         ).fetchone()
-        self.assertEqual(("error", 1, None, "transport failed"), tuple(row))
+        self.assertEqual(("released", 0, None, "transport failed"), tuple(row))
 
-    def test_released_new_session_reaches_open_with_force_new(self):
+    def test_render_only_never_supersedes(self):
+        # Headless verify must not mutate: the binding survives untouched.
         con = make_db()
         self.addCleanup(con.close)
         binding = self._managed_binding(con)
-        con.execute(
-            "UPDATE shell_session_bindings SET state='released', managed=0 "
-            "WHERE binding_id=?", (binding["binding_id"],))
-        con.commit()
 
         with self.assertRaises(self.OpenReached) as reached:
-            self._run_until_open(
-                con, ["DEV1", "--harness", "claude", "--new-session"])
-        self.assertEqual((con, 1), reached.exception.call_args[:2])
+            self._run_until_open(con, ["DEV1"], render_only=True)
         self.assertIsNone(reached.exception.call_kwargs["reuse_archive_id"])
-        self.assertTrue(reached.exception.call_kwargs["force_new"])
+        self.assertFalse(reached.exception.call_kwargs["force_new"])
+        row = con.execute(
+            "SELECT state, managed FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("dormant", 1), tuple(row))
+
+    def test_no_binding_enter_opens_without_supersede(self):
+        con = make_db()
+        self.addCleanup(con.close)
+
+        with self.assertRaises(self.OpenReached) as reached:
+            self._run_until_open(con, ["DEV1", "--harness", "claude"])
+        self.assertIsNone(reached.exception.call_kwargs["reuse_archive_id"])
+        self.assertFalse(reached.exception.call_kwargs["force_new"])
 
 
 class SuperviseTest(unittest.TestCase):

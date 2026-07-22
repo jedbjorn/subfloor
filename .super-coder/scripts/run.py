@@ -966,17 +966,20 @@ def main() -> None:
     if new_session and flag_binding:
         sys.exit("session launch refused: --new-session cannot be combined with "
                  "--session-binding")
-    try:
-        enter_binding = (None if flag_binding else
-                         session_supervisor.binding_for_enter(
-                             con, chosen["shell_id"], new_session=new_session))
-    except ValueError as e:
-        sys.exit(f"session launch refused: {e}")
-    # Headless workers keep their existing ephemeral behavior unless the
-    # dispatcher names a binding explicitly.  Automatic attachment is the
-    # interactive `sc enter` contract only.
-    if headless:
-        enter_binding = None
+    # Interactive enter ALWAYS starts a fresh session — a native harness
+    # conversation is never resumed here (dormant resume is the dispatcher's
+    # headless path, and a stale binding must never wedge `sc enter`: #483/#484).
+    # Any binding that would otherwise be resumed — the shell's managed binding,
+    # or one parked on the active archive — is superseded now (released, audit
+    # kept) and rebound fresh below.  Headless workers keep their existing
+    # ephemeral behavior unless the dispatcher names a binding explicitly.
+    superseded = None
+    if not flag_binding and not headless and not os.environ.get("RENDER_ONLY"):
+        try:
+            superseded = session_supervisor.supersede_for_enter(
+                con, chosen["shell_id"], repo_root=REPO_ROOT)
+        except ValueError as e:
+            sys.exit(f"session launch refused: {e}")
 
     # This shell's flavor default (advisory): the harness it boots with. The
     # model is resolved AFTER the harness pick — a flavor names a model PER
@@ -994,7 +997,7 @@ def main() -> None:
     ensure_harness_path()
     default_harness = flavor_harness or _configured_harness() or "claude"
     harness = (flag_harness or os.environ.get("HARNESS")
-               or (enter_binding or {}).get("harness")
+               or (superseded or {}).get("harness")
                or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
 
@@ -1012,7 +1015,7 @@ def main() -> None:
         except ValueError as e:
             sys.exit(f"sc run: {e}")
 
-    resume_binding = enter_binding
+    resume_binding = None
     if flag_binding:
         try:
             resume_binding = {"binding_id": int(flag_binding)}
@@ -1069,12 +1072,17 @@ def main() -> None:
                     "model": session_model,
                     "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
                 }, reuse_archive_id=(resume_binding or {}).get("archive_id"),
-                force_new=new_session)
+                force_new=new_session or superseded is not None)
         except ValueError as e:
             sys.exit(f"session resume refused: {e}")
 
         binding = resume_binding
-        if (not binding and chosen["flavor"] == "planner"
+        # Fresh binding for the fresh session: always after a supersede (any
+        # flavor — the superseded binding's managed flag carries over), plus the
+        # standing planner-first-boot case.  Native id starts NULL so the
+        # controlled launcher opens a NEW provider conversation.
+        if (not binding
+                and (superseded is not None or chosen["flavor"] == "planner")
                 and adapter.get("session_control")
                 and not os.environ.get("RENDER_ONLY")):
             binding = session_supervisor.ensure_binding(
@@ -1084,6 +1092,7 @@ def main() -> None:
                 capabilities=json.dumps(
                     (adapter.get("session_control") or {}).get("capabilities") or {},
                     sort_keys=True),
+                managed=bool(superseded and superseded.get("managed")),
             )
 
         full = con.execute(
@@ -1155,6 +1164,13 @@ def main() -> None:
     if binding:
         native = binding.get("native_session_id") or "pending"
         print(f"→ session binding: {binding['binding_id']} · {harness}={native}")
+    if superseded is not None:
+        print(f"→ superseded binding {superseded['binding_id']} "
+              f"({superseded['harness']}) — released; fresh session started")
+        if superseded.get("managed") and not binding:
+            print(f"→ warning: managed wake inactive until "
+                  f"./sc session manage {chosen['shortname']} "
+                  f"(harness '{harness}' has no session control)")
     if work_dir != REPO_ROOT:
         print(f"→ worktree: {work_dir}")
         print(f"→ sync: {sync_note}")

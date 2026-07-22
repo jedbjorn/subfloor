@@ -154,8 +154,15 @@ class VersionProbeTest(unittest.TestCase):
         self.assertTrue(result["resume"])
         self.assertFalse(result["normal_steer"])
 
-    def test_unknown_version_fails_active_closed_but_keeps_smoke_tested_resume(self):
+    def test_newer_version_is_accepted_on_feature_probe_evidence(self):
         result = codex_rpc.probe_codex(self.runner_for("0.145.0"))
+        self.assertEqual(result["cli_version"], "0.145.0")
+        self.assertTrue(result["create"])
+        self.assertTrue(result["active_delivery"])
+        self.assertTrue(result["resume"])
+
+    def test_older_version_fails_active_closed_but_keeps_smoke_tested_resume(self):
+        result = codex_rpc.probe_codex(self.runner_for("0.143.9"))
         self.assertFalse(result["create"])
         self.assertFalse(result["active_delivery"])
         self.assertTrue(result["resume"])

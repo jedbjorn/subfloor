@@ -19,7 +19,9 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 
 import db_driver  # type: ignore[import-not-found]  # noqa: E402
 import session_supervisor  # type: ignore[import-not-found]  # noqa: E402
-from codex_rpc import AppServerClient, probe_codex  # noqa: E402
+from codex_rpc import (  # noqa: E402
+    MIN_SUPPORTED_MAJOR, MIN_SUPPORTED_MINOR, AppServerClient, probe_codex,
+)
 
 
 def socket_path(binding_id: int) -> Path:
@@ -56,7 +58,8 @@ def main() -> int:
     if not probe["create"]:
         raise SystemExit(
             f"Codex {probe.get('cli_version') or 'unknown'} is not validated for "
-            f"app-server session control (expected 0.144.x)"
+            f"app-server session control "
+            f"(requires codex-cli >= {MIN_SUPPORTED_MAJOR}.{MIN_SUPPORTED_MINOR})"
         )
 
     RUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
