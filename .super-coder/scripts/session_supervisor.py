@@ -213,13 +213,20 @@ def binding_for_enter(con, shell_id: int, *, new_session: bool = False) -> dict 
     """
     row = con.execute(
         "SELECT b.*, a.session_id, a.model AS archive_model, "
-        "a.provider AS archive_provider FROM shell_session_bindings b "
+        "a.provider AS archive_provider, s.shortname FROM shell_session_bindings b "
         "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
+        "JOIN shells s ON s.shell_id=b.shell_id "
         "WHERE b.shell_id=? AND b.managed=1",
         (shell_id,),
     ).fetchone()
     if not row:
         return None
+    if row["state"] == "error":
+        raise ValueError(
+            f"managed binding {row['binding_id']} is in error; run "
+            f"./sc session retry {row['shortname']} to recover it, or "
+            f"./sc session release {row['shortname']} before starting a new session"
+        )
     if new_session:
         raise ValueError(
             f"--new-session requires releasing managed binding {row['binding_id']} first"

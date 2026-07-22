@@ -574,6 +574,34 @@ class EnterMainFlowTest(unittest.TestCase):
         self.assertEqual(1, con.execute(
             "SELECT COUNT(*) FROM shell_memory_archives").fetchone()[0])
 
+    def test_error_binding_refuses_before_archive_open_with_remedies(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = self._managed_binding(con)
+        con.execute(
+            "UPDATE shell_session_bindings SET state='error', "
+            "last_error='transport failed' WHERE binding_id=?",
+            (binding["binding_id"],),
+        )
+        con.commit()
+
+        with self.assertRaisesRegex(
+                SystemExit,
+                rf"session launch refused: managed binding {binding['binding_id']} is in "
+                rf"error; run \./sc session retry DEV1 to recover it, or "
+                rf"\./sc session release DEV1 before starting a new session"):
+            self._run_until_open(con, ["DEV1"])
+        self.assertEqual(1, con.execute(
+            "SELECT COUNT(*) FROM shell_memory_archives").fetchone()[0])
+        self.assertIsNone(con.execute(
+            "SELECT active_archive_id FROM shells WHERE shell_id=1").fetchone()[0])
+        row = con.execute(
+            "SELECT state, managed, lease_pid, last_error "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],),
+        ).fetchone()
+        self.assertEqual(("error", 1, None, "transport failed"), tuple(row))
+
     def test_released_new_session_reaches_open_with_force_new(self):
         con = make_db()
         self.addCleanup(con.close)
