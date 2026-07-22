@@ -37,6 +37,7 @@ import subprocess
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -790,6 +791,237 @@ def atomic_write(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content)
     os.replace(tmp, path)
+
+
+# ── Programmatic launch (Interface pane entrypoint, spec #20) ──────────────
+
+class LaunchError(Exception):
+    """A prepare_launch refusal: bad shell, unresolvable route, or a harness
+    that cannot take the requested model/effort. The caller (interface_exec)
+    maps this to its own exit code; it never reaches the operator as a
+    traceback."""
+
+
+class LaunchPlan(NamedTuple):
+    """Everything an engine-driven launcher needs to BECOME the harness:
+    the exec argv, the fully-injected env, the cwd to exec from, and the
+    session identifiers the launcher reports back to the API."""
+    argv: list[str]
+    env: dict[str, str]
+    cwd: str
+    session_id: str
+    archive_id: int
+    harness: str
+    model: "str | None"
+    effort: "str | None"
+    cli_version: "str | None"
+
+
+def _cli_version(binary: str) -> "str | None":
+    """Best-effort `<binary> --version` first line, for the session_start
+    hook's cli_version telemetry. Cheap and never load-bearing: any failure
+    (not on PATH, slow, odd output) degrades to None."""
+    path = shutil.which(binary)
+    if not path:
+        return None
+    try:
+        out = subprocess.run([path, "--version"],
+                             capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    lines = (out.stdout or out.stderr or "").strip().splitlines()
+    return lines[0].strip() if lines else None
+
+
+def prepare_launch(*, shell_id: int, harness: "str | None" = None,
+                   model: "str | None" = None, effort: "str | None" = None,
+                   headless_prompt: "str | None" = None) -> LaunchPlan:
+    """Prepare a launch exactly as main() would, without any TTY.
+
+    Spec #20 (sprint 25 seq 5): starting an Interface chat uses the NORMAL
+    harness, model, effort, permission, worktree, render, boot, and archive
+    paths. This is that path as a library call: it runs main()'s boot
+    pipeline step-for-step — authenticate, session archive, worktree
+    ensure/sync, boot-doc + skill render, adapter emit + config merges,
+    sandbox permission flags, env injection — and returns the plan instead
+    of exec'ing. What it deliberately does NOT do: pickers (harness/model
+    resolve from the argument or the shell's flavor_defaults, never a
+    prompt), the liveness confirm (the Interface reservation capability is
+    the gate — the caller refuses before this runs), the banner/spinner/
+    boot summary, tab titles, and git_prune (a hygiene sweep for human
+    boots; an engine-driven pane launch must never delete branches).
+
+    Raises LaunchError on a refusal it owns; shared helpers that predate
+    this seam (open_db, authenticate, ensure_worktree) still sys.exit, so
+    callers must also treat SystemExit as a refusal."""
+    headless = headless_prompt is not None
+    con = open_db()
+    # Same best-effort skill heal as main() — compose's SKILLS block reads
+    # what this repairs. RENDER_ONLY never mutates, here as there.
+    if not os.environ.get("RENDER_ONLY"):
+        try:
+            seed_skills.sync_engine_skills(con)
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+
+    user = authenticate(con, interactive=False)
+    fdefaults = flavor_defaults(con)
+    # The shell pick, non-interactively: the reservation names the shell_id;
+    # it must be one this user could have picked (own or shared, not deleted).
+    row = con.execute(
+        "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor, "
+        "current_state FROM shells "
+        "WHERE shell_id=? AND (user_id=? OR is_shared=1) "
+        "AND COALESCE(is_deleted,0)=0",
+        (shell_id, user["user_id"]),
+    ).fetchone()
+    if row is None:
+        con.close()
+        raise LaunchError(
+            f"shell_id {shell_id} is not launchable by '{user['username']}' "
+            "(unknown, deleted, or neither owned nor shared)")
+    chosen = dict(row)
+
+    # Harness route, picker-free: the reservation's harness wins; else this
+    # flavor's default harness; else instance.json / 'claude' — the same
+    # fallback chain main() feeds its picker as the default.
+    fdef = fdefaults.get(chosen["flavor"])
+    ensure_harness_path()
+    harness = (harness or (fdef["default_harness"] if fdef else None)
+               or _configured_harness() or "claude")
+    adapter = load_adapter(harness)
+
+    # Model route: an explicit model wins; else the (flavor, harness) cell,
+    # exactly main()'s flavor_defaults routing. Effort mirrors main(): a
+    # headless plan defaults to high; the interactive TUI path has no effort
+    # seam in the adapters (main() ignores --effort there too), so it is
+    # recorded on the plan but not applied.
+    flavor_model = fdef["models"].get(harness) if fdef else None
+    session_model = model or flavor_model
+    session_effort = effort or ("high" if headless else None)
+    if headless:
+        try:
+            validate_headless_request(adapter, session_model, session_effort)
+        except ValueError as e:
+            con.close()
+            raise LaunchError(str(e)) from e
+
+    # Pre-session analytics sweep — same correctness dependency as main():
+    # open_session's stub-reuse check relies on the previous boot's usage
+    # already being attributed. Best-effort; RENDER_ONLY never mutates.
+    if not os.environ.get("RENDER_ONLY"):
+        try:
+            import analytics
+            analytics.sweep(quiet=True)
+        except Exception:
+            pass
+
+    session_id, archive_id = open_session(con, shell_id, lifecycle={
+        "harness": harness,
+        "provider": session_provider(harness, session_model),
+        "model": session_model,
+        "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+    })
+
+    full = con.execute(
+        "SELECT shell_id, display_name, shortname, partner, role, mandate, "
+        "current_state, system_prompt, connections, flavor, api_key FROM shells WHERE shell_id=?",
+        (shell_id,),
+    ).fetchone()
+    api_port = ports_mod.resolve().get("port")
+
+    # Worktree: identical rule to main() — every non-admin shell boots in
+    # .sc-worktrees/<shortname>; admin boots at the repo root.
+    work_dir = REPO_ROOT
+    sync_note = None
+    if chosen["shortname"] and chosen["flavor"] != "admin":
+        work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
+        ensure_worktree(work_dir, chosen["shortname"])
+        sync_note = sync_worktree(work_dir, chosen["shortname"])
+        link_worktree_map(work_dir)
+        if harness == "codex":
+            trust_codex_worktree(work_dir)
+
+    content = compose_boot(con, full, user, session_id, archive_id,
+                           work_dir=work_dir if work_dir != REPO_ROOT else None,
+                           sync_note=sync_note,
+                           source_mode=install.is_source_repo(),
+                           api_key=full["api_key"],
+                           api_port=api_port)
+    flat.render_skill_md(con, full["shell_id"], work_dir)
+    con.close()
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        atomic_write(work_dir / name, content)
+
+    # Adapter seam: emitted config, plugin path resolution, always-on and
+    # sandbox-only JSON merges — the same permission/config files a normal
+    # boot writes.
+    emit_adapter(adapter, work_dir)
+    resolve_opencode_plugins(work_dir)
+    apply_merge_json(adapter, work_dir)
+    apply_sandbox(adapter, work_dir)
+
+    # Interactive model routing (main()'s non-headless block): the adapter
+    # declares a launch flag or a config-file key for the resolved model.
+    model_args: list[str] = []
+    mcfg = adapter.get("model") or {}
+    if headless:
+        pass
+    elif session_model and mcfg.get("flag"):
+        model_args = [mcfg["flag"], session_model]
+    elif session_model and mcfg.get("file"):
+        mfile = work_dir / mcfg["file"]
+        if mfile.exists():
+            try:
+                cfg = json.loads(mfile.read_text())
+            except (json.JSONDecodeError, OSError):
+                cfg = {}
+            cfg[mcfg.get("key", "model")] = session_model
+            atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
+
+    # Sandbox elevation, main()'s split kept: launch_flags for the TUI,
+    # headless_flags for a non-interactive plan, plus sandbox-only env.
+    sandbox_flags: list[str] = []
+    sandbox_env: dict[str, str] = {}
+    if os.environ.get("SC_SANDBOX"):
+        scfg = adapter.get("sandbox") or {}
+        key = "headless_flags" if headless else "launch_flags"
+        sandbox_flags = list(scfg.get(key) or [])
+        sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
+
+    name_args: list[str] = []
+    ncfg = adapter.get("name") or {}
+    if not headless and ncfg.get("flag") and full["display_name"]:
+        name_args = [ncfg["flag"], full["display_name"]]
+
+    if headless:
+        argv = headless_command(adapter, headless_prompt, session_model,
+                                sandbox_flags, session_effort)
+        if argv is None:
+            raise LaunchError(f"harness '{harness}' has no headless adapter")
+    else:
+        argv = list(adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags
+
+    # Env injection, verbatim from main()'s exec block: adapter env, sandbox
+    # env, effort env, then the engine's own SC_* contract + PATH prepend.
+    effort_env = headless_effort_env(adapter, session_effort) if headless else {}
+    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+           **sandbox_env, **effort_env}
+    env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
+    env["SC_API_TOKEN"] = full["api_key"] or ""
+    env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
+    env["SC_ENGINE_DIR"] = str(ENGINE)
+    env["SC_SHELL_WORKTREE"] = str(work_dir)
+    env["SC_ROOT"] = str(REPO_ROOT)
+    env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
+
+    return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
+                      session_id=session_id, archive_id=archive_id,
+                      harness=harness, model=session_model,
+                      effort=session_effort, cli_version=_cli_version(argv[0]))
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

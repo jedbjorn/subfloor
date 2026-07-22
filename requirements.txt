@@ -1,0 +1,6 @@
+# super-coder engine pins (this repo IS the engine — see AGENTS.md).
+# websockets: the Interface one-port HTTP+WS transport (api/transport.py,
+# spec #20). The sandbox IMAGE bakes this same pin into its own python (see
+# .super-coder/Dockerfile); this manifest keeps host-side and .venv installs
+# (`./sc deps`) on the identical version.
+websockets==16.1.1

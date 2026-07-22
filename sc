@@ -985,6 +985,9 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
+  # Interface pane entrypoint (internal; spec #20) — consumes the single-use
+  # launch token the API wrote, then becomes the shell's harness TUI.
+  interface-exec)  exec "$PY" "$S/interface_exec.py" "$@" ;;
   # Headless boot (sprint eventing): same render-then-exec path as boot, minus
   # the picker and the TTY. In-container primitive like boot — the planner
   # calls it to stand up an ephemeral worker; also the no-docker host path.
