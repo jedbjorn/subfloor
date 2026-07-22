@@ -300,7 +300,38 @@ class AdapterTest(unittest.TestCase):
             sleeper=sleeps.append,
             clock=lambda: next(clocks),
         )
-        self.assertEqual(sleeps, [0.2])
+        self.assertEqual(sleeps, [adapter_module.ACK_POLL_INTERVAL])
+
+    def test_ack_waiter_aborts_when_owner_and_watcher_are_gone(self):
+        clocks = iter([0.0, adapter_module.BINDING_RECHECK_INTERVAL])
+        with self.assertRaisesRegex(RuntimeError, "owner and inbox watcher"):
+            adapter_module._wait_for_ack(
+                binding(),
+                unread=lambda _row: 1,
+                binding_reader=lambda _row: binding(owner=False, watcher=False),
+                sleeper=lambda _seconds: self.fail("lost delivery slept again"),
+                clock=lambda: next(clocks),
+                now=lambda: NOW,
+            )
+
+    def test_ack_waiter_keeps_waiting_while_owner_or_watcher_is_live(self):
+        for current_binding in (
+            binding(owner=True, watcher=False),
+            binding(owner=False, watcher=True),
+        ):
+            with self.subTest(current_binding=current_binding):
+                unread = iter([1, 0])
+                clocks = iter([0.0, adapter_module.BINDING_RECHECK_INTERVAL])
+                sleeps: list[float] = []
+                adapter_module._wait_for_ack(
+                    binding(),
+                    unread=lambda _row: next(unread),
+                    binding_reader=lambda _row: current_binding,
+                    sleeper=sleeps.append,
+                    clock=lambda: next(clocks),
+                    now=lambda: NOW,
+                )
+                self.assertEqual(sleeps, [adapter_module.ACK_POLL_INTERVAL])
 
     def test_missing_watcher_queues_without_assuming_foreground_delivery(self):
         adapter = self.adapter(unread=lambda _row: 1)

@@ -26,6 +26,8 @@ from claude_cli import probe_claude  # noqa: E402
 
 CHANNEL_HEARTBEAT_MAX_AGE = 90
 ACK_TIMEOUT = 4 * 60 * 60
+ACK_POLL_INTERVAL = 1.5
+BINDING_RECHECK_INTERVAL = 5.0
 
 
 def _capabilities(binding: dict) -> dict:
@@ -166,18 +168,55 @@ def _running_unread(binding: dict) -> int:
         con.close()
 
 
+def _current_delivery_binding(binding: dict) -> dict:
+    con = db_driver.connect(DB_PATH)
+    try:
+        row = con.execute(
+            "SELECT lease_pid, lease_start_ticks, active_channel_pid, "
+            "active_channel_start_ticks, active_channel_heartbeat_at "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Claude session binding disappeared during delivery")
+        return dict(row)
+    finally:
+        con.close()
+
+
+def _delivery_owner_lost(binding: dict, *, now: datetime) -> bool:
+    lease_vacant = (
+        binding.get("lease_pid") is None
+        or binding.get("lease_start_ticks") is None
+    )
+    return lease_vacant and not active_channel_ready(binding, now=now)
+
+
 def _wait_for_ack(
     binding: dict,
     *,
     unread: Callable[[dict], int] = _running_unread,
+    binding_reader: Callable[[dict], dict] = _current_delivery_binding,
     sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> None:
-    deadline = clock() + ACK_TIMEOUT
+    started = clock()
+    deadline = started + ACK_TIMEOUT
+    next_binding_check = started + BINDING_RECHECK_INTERVAL
     while unread(binding):
-        if clock() >= deadline:
+        current = clock()
+        if current >= deadline:
             raise TimeoutError("Claude inbox wake was not acknowledged before timeout")
-        sleeper(0.2)
+        if current >= next_binding_check:
+            current_binding = binding_reader(binding)
+            if _delivery_owner_lost(current_binding, now=now()):
+                raise RuntimeError(
+                    "Claude delivery owner and inbox watcher disappeared before "
+                    "acknowledgement"
+                )
+            next_binding_check = current + BINDING_RECHECK_INTERVAL
+        sleeper(ACK_POLL_INTERVAL)
 
 
 class ClaudeAdapter:
