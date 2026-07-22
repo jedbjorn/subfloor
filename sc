@@ -1203,8 +1203,8 @@ super-coder — forkable shell substrate
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
   ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
-  ./sc enter               attach an interactive session: auth + pick shell + pick harness + boot
-  ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
+  ./sc enter [--new-session]  attach an interactive session; managed bindings resume by default
+  ./sc enter-<shortname> [--new-session]  attach that shell directly; new session requires release
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
