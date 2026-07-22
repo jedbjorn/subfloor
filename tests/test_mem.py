@@ -75,9 +75,17 @@ class ApiMemTest(unittest.TestCase):
         # mem reads these into module globals at import — set them directly.
         mem.SC_API_BASE = f"http://127.0.0.1:{cls.port}"
         mem.SC_API_TOKEN = TOKEN
+        # Doc writes trigger a server-side snapshot+render against REPO_ROOT
+        # (subfloor#434) — stub it class-wide so tests never touch the real
+        # main tree; the hook itself is covered by test_doc_write_serializes.
+        # staticmethod: a plain function stored on the class would come back
+        # bound via self._real_serialize and eat an unwanted `self`.
+        cls._real_serialize = staticmethod(server.serialize_doc_write)
+        server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
     @classmethod
     def tearDownClass(cls):
+        server.serialize_doc_write = cls._real_serialize
         cls.httpd.shutdown()
         cls.httpd.server_close()
 
@@ -388,6 +396,43 @@ class ApiMemTest(unittest.TestCase):
         tid = self.q("SELECT task_id FROM spec_tasks WHERE title='task C'")[0]
         self.run_mem("task", "done", str(tid))
         self.assertEqual(self.q("SELECT status FROM spec_tasks WHERE task_id=?", tid)[0], "done")
+
+    # ── doc writes serialize headlessly (subfloor#434) ───────────────────────
+    def test_doc_write_serializes(self):
+        # Real hook, fake subprocess pair: assert the wiring, not the scripts.
+        server.serialize_doc_write = self._real_serialize
+        calls = []
+        real_rsr = server.run_snapshot_render
+        server.run_snapshot_render = lambda: calls.append(1) or "snapshot+render ok"
+        try:
+            self.run_mem("roadmap", "add", "feat ser")
+            fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat ser'")[0]
+            body = self.tmp / "ser.md"
+            body.write_text("# ser\nbody\n")
+            self.assertEqual(
+                self.run_mem("doc", "add", "spec ser", "--body-file", str(body),
+                             "--feature", str(fid)), 0)
+            did = self.q("SELECT document_id FROM documents WHERE title='spec ser'")[0]
+            self.assertEqual(
+                self.run_mem("doc", "edit", str(did), "--title", "spec ser v2"), 0)
+            self.assertEqual(self.run_mem("doc", "freeze", str(did)), 0)
+            self.assertEqual(len(calls), 3)  # add + edit + freeze each serialize once
+            # a failed serialize never fails the write — the row commits, the
+            # CLI warns and exits nonzero so the drift is visible
+            def boom():
+                raise RuntimeError("snapshot failed:\nbroken")
+            server.run_snapshot_render = boom
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = self.run_mem("doc", "add", "spec ser2", "--body-file",
+                                  str(body), "--feature", str(fid))
+            self.assertEqual(rc, 1)
+            self.assertIn("WARNING", buf.getvalue())
+            self.assertIsNotNone(
+                self.q("SELECT document_id FROM documents WHERE title='spec ser2'"))
+        finally:
+            server.run_snapshot_render = real_rsr
+            server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
     # ── task cancel: honest terminal state after a feature split (#342) ───────
     def test_task_cancel_with_notes(self):

@@ -837,6 +837,26 @@ def run_snapshot_render() -> str:
     return (snap["output"] + "\n" + rend["output"]).strip()
 
 
+# Serializes two snapshot/render subprocesses against each other — concurrent
+# mem doc writes would otherwise interleave writes to content.sql / the mirror.
+_serialize_lock = threading.Lock()
+
+
+def serialize_doc_write() -> dict:
+    """Re-snapshot + re-render after a mem doc write, so `sc mem doc add/edit/
+    freeze` lands on disk headlessly — the git-tracked flat render and
+    .sc-state/content.sql move with the write, no GUI Publish (subfloor#434).
+    The API is the admin surface (run_script sets SC_ADMIN), and a doc write
+    is rare enough that the synchronous pair costs nothing that matters.
+    Never raises: the DB write is already committed, so a serialize failure
+    comes back as {"ok": False, ...} for the caller to surface instead."""
+    with _serialize_lock:
+        try:
+            return {"ok": True, "output": run_snapshot_render()}
+        except RuntimeError as e:
+            return {"ok": False, "output": str(e)}
+
+
 # ── Publish: serialize → render → commit → push → open/update one PR ──────────
 # Ephemeral-branch model: each publish (re)creates the local branch from HEAD,
 # commits the serialized content + renders onto it, force-pushes, opens/updates
@@ -1683,7 +1703,8 @@ class Handler(BaseHTTPRequestHandler):
                      body.get("body") or None,
                      body.get("render_path") or None))
                 con.commit()
-                return self._send(201, {"document_id": cur.lastrowid})
+                return self._send(201, {"document_id": cur.lastrowid,
+                                        "serialize": serialize_doc_write()})
 
             if path == "/_sc/mem/narrative":
                 text = (body.get("text") or "").strip()
@@ -1915,7 +1936,8 @@ class Handler(BaseHTTPRequestHandler):
                     "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
                     (did,))
                 con.commit()
-                return self._send(200, {"ok": True})
+                return self._send(200, {"ok": True,
+                                        "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/docs/{id}
             if len(parts) == 4 and parts[2] == "docs":
@@ -1925,7 +1947,10 @@ class Handler(BaseHTTPRequestHandler):
                         (did,)).fetchone():
                     return self._send(404, {"error": "no such document"})
                 ok, err = patch_document(con, did, body)
-                return self._send(200 if ok else 400, {"ok": ok, "error": err})
+                if not ok:
+                    return self._send(400, {"ok": ok, "error": err})
+                return self._send(200, {"ok": ok,
+                                        "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/messages/{id}/read
             if len(parts) == 5 and parts[2] == "messages" and parts[4] == "read":

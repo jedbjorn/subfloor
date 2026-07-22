@@ -519,8 +519,9 @@ def cmd_oriented(args) -> int:
 
 def cmd_doc(args) -> int:
     if args.doc_cmd == "freeze":
-        _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze")
-        return _finish_api(f"mem: document #{args.document_id} frozen")
+        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze")
+        rc = _finish_api(f"mem: document #{args.document_id} frozen")
+        return _note_serialize(r) or rc
     if args.doc_cmd == "edit":
         payload: dict = {}
         if args.title is not None:
@@ -531,8 +532,9 @@ def cmd_doc(args) -> int:
             payload["render_path"] = args.render_path
         if not payload:
             die("nothing to edit — pass at least one of --title / --body-file / --render-path")
-        _api("PATCH", f"/_sc/mem/docs/{args.document_id}", payload)
-        return _finish_api(f"mem: document #{args.document_id} edited")
+        r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}", payload)
+        rc = _finish_api(f"mem: document #{args.document_id} edited")
+        return _note_serialize(r) or rc
     body_text = Path(args.body_file).read_text()
     r = _api("POST", "/_sc/mem/docs",
              {"feature_id": args.feature,
@@ -541,8 +543,25 @@ def cmd_doc(args) -> int:
               "title": args.title,
               "body": body_text,
               "render_path": args.render_path})
-    return _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
-                       f" ('{args.title}', {len(body_text)} chars)")
+    rc = _finish_api(f"mem: {args.kind} document #{r.get('document_id', '')} added"
+                     f" ('{args.title}', {len(body_text)} chars)")
+    return _note_serialize(r) or rc
+
+
+def _note_serialize(r: dict) -> int:
+    """Surface the server-side snapshot+render that follows a doc write
+    (subfloor#434): the flat file + content.sql refresh headlessly on the main
+    checkout. A failed serialize never fails the write — it prints a warning
+    and exits nonzero so the drift is visible, not silent."""
+    s = r.get("serialize") if isinstance(r, dict) else None
+    if not s:
+        return 0
+    if s.get("ok"):
+        print("  (snapshot + flat render refreshed on the main checkout)")
+        return 0
+    print(f"  WARNING: post-write snapshot/render failed — the DB row is live "
+          f"but the flat file + content.sql did not refresh:\n{s.get('output')}")
+    return 1
 
 
 def cmd_narrative(args) -> int:
