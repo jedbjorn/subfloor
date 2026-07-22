@@ -112,6 +112,20 @@ class SchemaTest(unittest.TestCase):
             "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
         self.assertEqual(body, asset)
 
+    def test_sprint_orchestration_requires_plan_billing_by_default(self):
+        body = self.con.execute(
+            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
+        self.assertIn("two routine routing questions to the FnB", body)
+        self.assertIn("Billing gate — Plan billing only by default.", body)
+        self.assertIn("env -u CODEX_API_KEY codex login status", body)
+        self.assertIn("env -u ANTHROPIC_API_KEY claude auth status --json", body)
+        self.assertIn("env -u CODEX_API_KEY ./sc run", body)
+        self.assertIn("env -u ANTHROPIC_API_KEY ./sc run", body)
+        self.assertIn("Usage Credits disabled", body)
+        self.assertIn("Auto top-up off and flexible-credit balance\n0", body)
+        self.assertIn("Choosing a harness/model is not permission", body)
+        self.assertIn("No standing invariant or recorded exception -> do not launch", body)
+
 
 # ── daemon core: diff_events (pure) ──────────────────────────────────────────
 
