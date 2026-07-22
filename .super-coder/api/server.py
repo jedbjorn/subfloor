@@ -840,11 +840,23 @@ def run_snapshot_render() -> str:
 # ONE serialization boundary for every path that writes the non-atomic
 # snapshot/render outputs (content.sql + the flat-render mirror) or moves the
 # main checkout's branches: mem doc writes (serialize_doc_write), the header
-# '/api/snapshot' shortcut, and '/api/publish' (git_publish). These were once
-# per-path private locks — a doc write could interleave its content.sql/render
-# writes with a Publish's branch checkout/staging (SC-012). Held at the caller
-# level only: run_snapshot_render() itself never takes it, so nothing re-enters.
+# '/api/snapshot' shortcut, the '/api/scripts/{snapshot,render}' maintenance
+# routes, and '/api/publish' (git_publish). These were once per-path private
+# locks — a doc write could interleave its content.sql/render writes with a
+# Publish's branch checkout/staging (SC-012). Held at the caller level only:
+# run_snapshot_render() itself never takes it, so nothing re-enters.
+#
+# Publish takes the lock around its LOCAL section only (SC-013) — branch moves,
+# the serialize, the commit — never across push/GitHub I/O: those carry no
+# timeout, and a queued doc write's 420s budget (_DOC_WRITE_TIMEOUT in
+# scripts/mem.py) is a real completion bound only when the lock queue is
+# bounded too.
 _CONTENT_WRITE_LOCK = threading.Lock()
+
+# The whitelisted maintenance scripts that write the same non-atomic outputs —
+# run_script takes no lock itself, so the /api/scripts/ endpoint wraps these
+# keys (the other scripts don't touch content.sql or the flat renders).
+_CONTENT_WRITE_SCRIPTS = frozenset({"snapshot", "render"})
 
 
 def serialize_doc_write() -> dict:
@@ -874,7 +886,9 @@ def serialize_doc_write() -> dict:
 # COMMITTED locally (the unpushed branch is kept so the commit isn't lost) — only
 # push/PR is skipped, with a clear message. Concurrent publishes — and every
 # other content-write path — serialize on _CONTENT_WRITE_LOCK (one git index,
-# one set of snapshot outputs), taken by the /api/publish endpoint.
+# one set of snapshot outputs), which git_publish() holds around its LOCAL
+# section only; the push + PR upsert run lock-free so no queued writer waits
+# on network I/O (SC-013).
 BASE_BRANCH = "main"
 PUBLISH_BRANCH = "sc_gui_content"
 _STASH_MSG = "sc-publish: stray non-content work"
@@ -976,46 +990,63 @@ def _redact(s: str, token: str) -> str:
 
 def git_publish() -> dict:
     out: list[str] = []
-    # state survives into the finally so cleanup knows whether the commit reached
+    # state survives into the cleanup so it knows whether the commit reached
     # origin (safe to drop the local branch) or only exists locally (keep it).
     state: dict = {"ok": True, "pr_url": None, "pushed": False}
-    try:
-        # 1. Get onto a clean BASE and (re)create the ephemeral branch BEFORE any
-        #    snapshot writes. The old order serialized first, which dirtied
-        #    whatever branch the tree happened to be on; if a prior run had left it
-        #    stranded on the publish branch, the next publish could then neither
-        #    delete that branch (it was current) nor check out main (the dirty,
-        #    regenerated content blocked it) — a self-perpetuating stuck state.
-        #    Preparing the branch first means the serialize lands on the publish
-        #    branch and can never block its own creation.
-        if _prepare_branch(out, state):
-            # 2. serialize the DB → git-tracked text + render the flat files.
-            out.append(run_snapshot_render())
-            # 3. stage → commit → push → open/update one PR.
-            _publish_content(out, state)
-    except Exception as e:
-        state["ok"] = False
-        out.append(f"✗ publish error: {e}")
-    finally:
-        # Always land back on main and drop the ephemeral local branch — runs even
-        # if a step raised or returned early, so the tree never stays stranded on
-        # the publish branch.
-        _land_on_base(out, state)
-        # Restore any stray non-content work stashed by _prepare_branch — only now,
-        # once we're back on base, so it lands where it was taken from. Non-content
-        # files are identical across base/publish tips, so pop can't conflict; if it
-        # somehow does, keep the stash and tell the operator loudly rather than drop.
-        if state.get("stashed"):
-            n = state["stashed"]
-            pop = _git("stash", "pop")
-            if pop.returncode == 0:
-                out.append(f"(restored {n} stashed non-content file(s))")
-            else:
-                out.append(f"⚠ {n} stashed non-content file(s) NOT restored — run "
-                           f"'git stash pop' manually:\n{pop.stderr.strip()}")
+    committed = False
+    # The LOCAL phase is ONE bounded critical section under _CONTENT_WRITE_LOCK:
+    # branch moves, the content.sql/render write, and the commit are what race
+    # the other content writers — and they are bounded (the serialize
+    # subprocesses carry 180s timeouts; local git touches no network). The push
+    # + PR upsert below run AFTER the lock is released (SC-013): a queued doc
+    # write waits only for this section, never for GitHub I/O with no timeout,
+    # so its 420s client budget is a real completion bound.
+    with _CONTENT_WRITE_LOCK:
+        try:
+            # 1. Get onto a clean BASE and (re)create the ephemeral branch BEFORE
+            #    any snapshot writes. The old order serialized first, which
+            #    dirtied whatever branch the tree happened to be on; if a prior
+            #    run had left it stranded on the publish branch, the next publish
+            #    could then neither delete that branch (it was current) nor check
+            #    out main (the dirty, regenerated content blocked it) — a
+            #    self-perpetuating stuck state. Preparing the branch first means
+            #    the serialize lands on the publish branch and can never block
+            #    its own creation.
+            if _prepare_branch(out, state):
+                # 2. serialize the DB → git-tracked text + render the flat files.
+                out.append(run_snapshot_render())
+                # 3. stage → commit (local only — push/PR happen lock-free below).
+                committed = _commit_content(out, state)
+        except Exception as e:
+            state["ok"] = False
+            out.append(f"✗ publish error: {e}")
+        finally:
+            # Always land back on main — runs even if a step raised or returned
+            # early, so the tree never stays stranded on the publish branch. The
+            # local branch itself is dropped only after the push's fate is known
+            # (_drop_publish_branch below).
+            _land_on_base(out)
+            # Restore any stray non-content work stashed by _prepare_branch — only
+            # now, once we're back on base, so it lands where it was taken from.
+            # Non-content files are identical across base/publish tips, so pop
+            # can't conflict; if it somehow does, keep the stash and tell the
+            # operator loudly rather than drop.
+            if state.get("stashed"):
+                n = state["stashed"]
+                pop = _git("stash", "pop")
+                if pop.returncode == 0:
+                    out.append(f"(restored {n} stashed non-content file(s))")
+                else:
+                    out.append(f"⚠ {n} stashed non-content file(s) NOT restored — run "
+                               f"'git stash pop' manually:\n{pop.stderr.strip()}")
+    # 4. Network phase — lock released: force-push + open/update the ONE PR.
+    if committed and state["ok"]:
+        _push_and_pr(out, state)
+    # 5. Local branch cleanup, keyed on whether the commit reached origin.
+    _drop_publish_branch(out, state, committed)
     # Record the full end-to-end trace (success OR failure) so a publish that
     # "looked done" can be inspected after the fact — the gap that made the live
-    # incident unexplainable. _land_on_base above appends to `out`, so log here.
+    # incident unexplainable. The steps above append to `out`, so log here.
     log_event("publish", ok=state["ok"], pushed=state["pushed"],
               pr_url=state["pr_url"], detail=out)
     return {"ok": state["ok"], "output": "\n".join(out), "pr_url": state["pr_url"]}
@@ -1097,10 +1128,12 @@ def _prepare_branch(out: list, state: dict) -> bool:
     return True
 
 
-def _publish_content(out: list, state: dict) -> None:
+def _commit_content(out: list, state: dict) -> bool:
+    """Stage the publishable text + renders on the ephemeral branch and commit
+    if anything changed — LOCAL work inside _CONTENT_WRITE_LOCK. Returns True
+    only when a commit was created (i.e. there is something to push)."""
     # The ephemeral branch is already created clean from base by _prepare_branch,
     # and the snapshot+render has written the publishable content onto it.
-    # 3. stage the publishable text + renders; commit if anything changed.
     #    Filter to paths that exist — `git add` is fatal on a missing pathspec, and
     #    a minimal fork may lack some (e.g. docs_sc/ before any doc is authored).
     #    Drop gitignored paths too: in a fork the engine (schema/migrations) is
@@ -1115,7 +1148,7 @@ def _publish_content(out: list, state: dict) -> None:
     staged = _git("diff", "--cached", "--name-only").stdout.strip()
     if not staged:
         out.append(f"✓ no content changes vs {BASE_BRANCH} — nothing to publish")
-        return
+        return False
     n = len(staged.splitlines())
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     msg = (f"gui: publish content edits ({n} file{'s' if n != 1 else ''})\n\n"
@@ -1125,20 +1158,28 @@ def _publish_content(out: list, state: dict) -> None:
     if c.returncode != 0:
         state["ok"] = False
         out.append("✗ commit failed:\n" + (c.stderr or c.stdout).strip())
-        return
+        return False
     out.append(f"committed {n} file(s)")
+    return True
 
-    # 4. token gate: committed locally either way, but push/PR needs a token.
+
+def _push_and_pr(out: list, state: dict) -> None:
+    """Network phase: force-push the ephemeral branch and upsert the ONE PR.
+    Runs AFTER _CONTENT_WRITE_LOCK is released (SC-013) — none of this is
+    timeout-bounded, so no queued content writer may ever wait on it. The tree
+    is back on base by now; the push addresses the branch by ref, not by
+    checkout."""
+    # token gate: committed locally either way, but push/PR needs a token.
     token = _gh_token()
     if not token:
         out.append("⚠ committed locally, but no GH_TOKEN — can't push or open a "
                    "PR. Set SC_GH_TOKEN, or `./sc launch` with a host gh login.")
         return
 
-    # 5. force-push: the branch is recreated from HEAD each publish (one commit
-    #    ahead of main — the full current state), so it intentionally overwrites
-    #    the prior rolling head. Only publish ever writes this branch, so --force
-    #    is safe and force-with-lease's tracking-ref dance is unnecessary.
+    # force-push: the branch is recreated from HEAD each publish (one commit
+    # ahead of main — the full current state), so it intentionally overwrites
+    # the prior rolling head. Only publish ever writes this branch, so --force
+    # is safe and force-with-lease's tracking-ref dance is unnecessary.
     url = _origin_https()
     if not url:
         state["ok"] = False
@@ -1153,7 +1194,7 @@ def _publish_content(out: list, state: dict) -> None:
     state["pushed"] = True
     out.append(f"force-pushed {PUBLISH_BRANCH} → origin")
 
-    # 6. upsert ONE PR — no merge; the open PR is the gate the FnB merges.
+    # upsert ONE PR — no merge; the open PR is the gate the FnB merges.
     env = {**os.environ, "GH_TOKEN": token}
 
     def gh(*args):
@@ -1178,11 +1219,9 @@ def _publish_content(out: list, state: dict) -> None:
     state["pr_url"] = pr_url
 
 
-def _land_on_base(out: list, state: dict) -> None:
-    """Return to main and drop the ephemeral local branch — the pushed remote
-    branch + its PR are what persist. If the commit was NOT pushed (no token /
-    push failed), KEEP the local branch so its commit isn't lost; the live DB is
-    still the source of truth and a later `snapshot` regenerates the same text."""
+def _land_on_base(out: list) -> None:
+    """Return to main. The ephemeral local branch is left in place here —
+    _drop_publish_branch drops or keeps it once the push's fate is known."""
     now = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if now != BASE_BRANCH:
         # If a step raised after the snapshot but before the commit, the publish
@@ -1194,16 +1233,24 @@ def _land_on_base(out: list, state: dict) -> None:
             out.append(f"⚠ left on {now} — couldn't return to {BASE_BRANCH}:\n"
                        f"{co.stderr.strip()}")
             return
+    out.append(f"↩ back on {BASE_BRANCH}")
+
+
+def _drop_publish_branch(out: list, state: dict, committed: bool) -> None:
+    """Drop the local ephemeral branch once its commit reached origin; KEEP it
+    when the commit exists only locally (no token / push failed) so it isn't
+    lost — the live DB is still the source of truth and a later `snapshot`
+    regenerates the same text. A branch this run never committed on holds
+    nothing, so it is dropped too."""
     local_exists = _git("rev-parse", "--verify", "--quiet",
                         f"refs/heads/{PUBLISH_BRANCH}").returncode == 0
-    if local_exists and state["pushed"]:
+    if not local_exists:
+        return
+    if state["pushed"] or not committed:
         _git("branch", "-D", PUBLISH_BRANCH)
-        out.append(f"↩ back on {BASE_BRANCH}; local {PUBLISH_BRANCH} cleaned up")
-    elif local_exists:
-        out.append(f"↩ back on {BASE_BRANCH}; kept local {PUBLISH_BRANCH} "
-                   "(unpushed commit preserved)")
+        out.append(f"local {PUBLISH_BRANCH} cleaned up")
     else:
-        out.append(f"↩ back on {BASE_BRANCH}")
+        out.append(f"kept local {PUBLISH_BRANCH} (unpushed commit preserved)")
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -2264,11 +2311,23 @@ class Handler(BaseHTTPRequestHandler):
                 log_event("snapshot", ok=True, detail=out)
                 return self._send(200, {"output": out})
             if path == "/api/publish":
-                with _CONTENT_WRITE_LOCK:
-                    r = git_publish()
+                # No lock here: git_publish() takes _CONTENT_WRITE_LOCK around
+                # its LOCAL section itself (SC-013) — wrapping the whole call
+                # would hold the lock across push/GitHub I/O (and deadlock:
+                # the lock is not re-entrant).
+                r = git_publish()
                 return self._send(200 if r["ok"] else 500, r)
             if path.startswith("/api/scripts/"):
-                r = run_script(path.rsplit("/", 1)[1])
+                key = path.rsplit("/", 1)[1]
+                # snapshot/render write the same non-atomic outputs as a
+                # doc-write serialize — run them under the shared lock
+                # (SC-012). The other maintenance scripts don't touch those
+                # files and stay lock-free.
+                if key in _CONTENT_WRITE_SCRIPTS:
+                    with _CONTENT_WRITE_LOCK:
+                        r = run_script(key)
+                else:
+                    r = run_script(key)
                 if r is None:
                     return self._send(404, {"error": "no such script"})
                 return self._send(200 if r["ok"] else 500, r)

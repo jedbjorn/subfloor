@@ -438,11 +438,12 @@ class ApiMemTest(unittest.TestCase):
 
     # ── SC-012: doc write vs Publish — ONE shared serialization boundary ──────
     def test_doc_write_and_publish_share_one_lock(self):
-        # Doc-write serialize, /api/snapshot, and Publish all write the same
-        # non-atomic files (content.sql + flat renders) and Publish switches
-        # branches — per-path private locks let them interleave. Force a Publish
-        # to sit inside its critical section, then prove a concurrent doc
-        # write's serialize cannot enter until the Publish releases the lock.
+        # Doc-write serialize, /api/snapshot, /api/scripts/{snapshot,render},
+        # and Publish's local phase all write the same non-atomic files
+        # (content.sql + flat renders) and Publish switches branches. Force a
+        # Publish to sit inside its local critical section (its _prepare_branch
+        # runs under the lock), then prove a concurrent doc write's serialize
+        # cannot enter until the Publish releases the lock.
         self.run_mem("roadmap", "add", "feat race")
         fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat race'")[0]
         body = self.tmp / "race.md"
@@ -451,16 +452,19 @@ class ApiMemTest(unittest.TestCase):
                      "--feature", str(fid))
         did = self.q("SELECT document_id FROM documents WHERE title='spec race'")[0]
         server.serialize_doc_write = self._real_serialize
-        real_publish = server.git_publish
+        real_prepare = server._prepare_branch
+        real_land = server._land_on_base
+        real_drop = server._drop_publish_branch
         real_rsr = server.run_snapshot_render
         in_publish = threading.Event()
         release = threading.Event()
         overlap = []
 
-        def fake_publish():
+        def fake_prepare(out, state):
+            # runs inside git_publish's locked local section
             in_publish.set()
             release.wait(5)
-            return {"ok": True, "output": "published (test stub)", "pr_url": None}
+            return False  # no serialize/commit follows; nothing to push
 
         def fake_rsr():
             # runs inside serialize_doc_write's lock hold — if Publish is still
@@ -468,7 +472,11 @@ class ApiMemTest(unittest.TestCase):
             overlap.append(in_publish.is_set() and not release.is_set())
             return "snapshot+render (test stub)"
 
-        server.git_publish = fake_publish
+        server._prepare_branch = fake_prepare
+        # no real git against the test checkout: the local phase is stubbed
+        # short and the branch never exists
+        server._land_on_base = lambda out: None
+        server._drop_publish_branch = lambda out, state, committed: None
         server.run_snapshot_render = fake_rsr
         publish_rc = []
 
@@ -492,7 +500,212 @@ class ApiMemTest(unittest.TestCase):
             self.assertEqual(overlap, [False])  # serialize ran AFTER publish released
         finally:
             release.set()
-            server.git_publish = real_publish
+            server._prepare_branch = real_prepare
+            server._land_on_base = real_land
+            server._drop_publish_branch = real_drop
+            server.run_snapshot_render = real_rsr
+            server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    def test_scripts_content_writers_share_the_lock(self):
+        # SC-012: /api/scripts/snapshot and /api/scripts/render call the same
+        # content writers as the header shortcut — they must queue on the same
+        # lock as a doc-write serialize, not bypass it. Hold a scripts/snapshot
+        # call inside the lock and prove a concurrent doc write waits.
+        self.run_mem("roadmap", "add", "feat scr")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat scr'")[0]
+        body = self.tmp / "scr.md"
+        body.write_text("# scr\n")
+        self.run_mem("doc", "add", "spec scr", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec scr'")[0]
+        server.serialize_doc_write = self._real_serialize
+        real_run_script = server.run_script
+        real_rsr = server.run_snapshot_render
+        in_script = threading.Event()
+        release = threading.Event()
+        overlap = []
+
+        def fake_run_script(key):
+            # the endpoint wraps snapshot/render in _CONTENT_WRITE_LOCK, so
+            # this stub runs INSIDE the lock hold for those keys
+            in_script.set()
+            release.wait(5)
+            return {"ok": True, "code": 0, "output": f"{key} (test stub)"}
+
+        def fake_rsr():
+            # runs inside serialize_doc_write's lock hold — if the scripts
+            # route still bypassed the lock, the script would still be inside
+            # its section (release unset) when this runs
+            overlap.append(in_script.is_set() and not release.is_set())
+            return "snapshot+render (test stub)"
+
+        server.run_script = fake_run_script
+        server.run_snapshot_render = fake_rsr
+        script_rc = []
+
+        def do_script():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/api/scripts/snapshot",
+                data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                script_rc.append(resp.status)
+
+        try:
+            t = threading.Thread(target=do_script)
+            t.start()
+            self.assertTrue(in_script.wait(5), "script never entered its section")
+            threading.Timer(0.5, release.set).start()
+            self.assertEqual(
+                self.run_mem("doc", "edit", str(did), "--title", "spec scr v2"), 0)
+            t.join(10)
+            self.assertEqual(script_rc, [200])
+            self.assertEqual(overlap, [False])  # serialize ran AFTER the script released
+        finally:
+            release.set()
+            server.run_script = real_run_script
+            server.run_snapshot_render = real_rsr
+            server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    # ── SC-013: Publish's network phase never blocks a queued doc write ───────
+    def test_publish_network_phase_holds_no_lock(self):
+        # The 420s doc-write budget is a completion bound only if the lock
+        # queue is bounded: Publish must hold _CONTENT_WRITE_LOCK for its local
+        # serialize/commit only, NOT across push + GitHub I/O (no timeout).
+        # Park a Publish inside its network phase and prove a concurrent doc
+        # write completes without waiting for it — under the old whole-call
+        # lock it would have queued behind the blocked push.
+        self.run_mem("roadmap", "add", "feat net")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat net'")[0]
+        body = self.tmp / "net.md"
+        body.write_text("# net\n")
+        self.run_mem("doc", "add", "spec net", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec net'")[0]
+        server.serialize_doc_write = self._real_serialize
+        real_prepare = server._prepare_branch
+        real_commit = server._commit_content
+        real_land = server._land_on_base
+        real_drop = server._drop_publish_branch
+        real_push_pr = server._push_and_pr
+        real_rsr = server.run_snapshot_render
+        in_network = threading.Event()
+        release = threading.Event()
+        serialize_during_network = []
+
+        def fake_push_pr(out, state):
+            # the network phase — OUTSIDE the lock by design
+            in_network.set()
+            release.wait(30)
+
+        def fake_rsr():
+            # serves Publish's local serialize (before the network phase) AND
+            # the doc write's serialize — only the doc write's can see
+            # in_network set
+            serialize_during_network.append(
+                in_network.is_set() and not release.is_set())
+            return "serialize (test stub)"
+
+        server._prepare_branch = lambda out, state: True
+        server._commit_content = lambda out, state: True
+        server._land_on_base = lambda out: None
+        server._drop_publish_branch = lambda out, state, committed: None
+        server._push_and_pr = fake_push_pr
+        server.run_snapshot_render = fake_rsr
+        publish_rc = []
+
+        def do_publish():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/api/publish", data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                publish_rc.append(resp.status)
+
+        try:
+            t = threading.Thread(target=do_publish)
+            t.start()
+            self.assertTrue(in_network.wait(5),
+                            "publish never reached its network phase")
+            # The doc write runs on the main thread (mem.main sets signal
+            # handlers — main-thread only). If Publish still held the lock
+            # across its network phase, this would queue behind the blocked
+            # push until release.wait(30) above timed out — so the wall clock
+            # is the verdict: lock-free network phase = sub-second; lock held
+            # = ~30s.
+            start = time.monotonic()
+            self.assertEqual(
+                self.run_mem("doc", "edit", str(did), "--title", "spec net v2"), 0)
+            elapsed = time.monotonic() - start
+            self.assertLess(
+                elapsed, 10,
+                "doc write queued behind Publish's network phase — "
+                "the lock is held across network I/O again")
+            # the doc write's serialize really ran while Publish sat in its
+            # network phase (Publish's own local serialize saw neither flag)
+            self.assertEqual(serialize_during_network, [False, True])
+            release.set()
+            t.join(10)
+            self.assertEqual(publish_rc, [200])
+        finally:
+            release.set()
+            server._prepare_branch = real_prepare
+            server._commit_content = real_commit
+            server._land_on_base = real_land
+            server._drop_publish_branch = real_drop
+            server._push_and_pr = real_push_pr
+            server.run_snapshot_render = real_rsr
+            server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    def test_doc_write_queued_behind_slow_holder_succeeds(self):
+        # SC-013: the doc-write budget covers QUEUEING behind another content
+        # writer's bounded critical section, not just a slow serialize of its
+        # own. A slow /api/snapshot holds the lock; a concurrent doc write
+        # queues behind it, then succeeds — with the generic timeout shrunk
+        # below the hold, only the doc budget makes that possible.
+        self.run_mem("roadmap", "add", "feat queue")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat queue'")[0]
+        body = self.tmp / "queue.md"
+        body.write_text("# queue\n")
+        self.run_mem("doc", "add", "spec queue", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec queue'")[0]
+        server.serialize_doc_write = self._real_serialize
+        real_rsr = server.run_snapshot_render
+        entered = threading.Event()
+
+        def slow_rsr():
+            # 1.5s inside the lock, per caller — the holder (/api/snapshot)
+            # and then the queued doc write each pay it
+            entered.set()
+            time.sleep(1.5)
+            return "slow ok"
+
+        server.run_snapshot_render = slow_rsr
+        real_timeout = mem._TIMEOUT
+        mem._TIMEOUT = 0.5  # any call on the generic budget now times out
+        holder_rc = []
+
+        def do_snapshot():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/api/snapshot", data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                holder_rc.append(resp.status)
+
+        try:
+            t = threading.Thread(target=do_snapshot)
+            t.start()
+            self.assertTrue(entered.wait(5), "snapshot never entered the lock")
+            start = time.monotonic()
+            self.assertEqual(
+                self.run_mem("doc", "edit", str(did), "--title", "spec queue v2"), 0)
+            elapsed = time.monotonic() - start
+            t.join(10)
+            self.assertEqual(holder_rc, [200])
+            # really queued behind the holder (no bypass), yet well within the
+            # doc-write budget — the bounded critical section is what a queued
+            # writer ever waits on
+            self.assertGreaterEqual(elapsed, 1.0)
+            self.assertLess(elapsed, mem._DOC_WRITE_TIMEOUT)
+        finally:
+            mem._TIMEOUT = real_timeout
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
