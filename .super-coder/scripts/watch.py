@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
-"""sc watch — the sprint-eventing surface: PR watches, the GitHub watcher
-daemon, and the zero-token inbox watcher.
+"""sc watch — the sprint-eventing surface: PR watches and the zero-token
+inbox watcher.
 
-Spec: specs_sc/sprint-eventing.md. Four verbs, two vantages:
+Spec: specs_sc/sprint-eventing.md + spec #20 (polling cutover). Three verbs,
+one vantage — everything shell-side rides the engine API (token identity,
+the `sc mem` doctrine):
 
-Shell-side (over the engine API, token identity — the `sc mem` doctrine):
-    ./sc watch pr <owner/repo> <n> [--shell <shortname>]   register a watch
+    ./sc watch pr <owner/repo> <n> [--shell <shortname>] [--sprint <doc-id>]
+                                                           register a watch
                                                            (defaults to the
-                                                           calling shell)
+                                                           calling shell;
+                                                           --sprint arms it
+                                                           to an ACTIVE sprint)
     ./sc watch list [--all]                                live watches
     ./sc watch inbox [--interval 30] [--timeout 21600]     block until this
                                                            shell has unread
                                                            messages, then exit
+    ./sc watch reconcile                                   explicit one-shot
+                                                           poll (operator)
 
-Host-side (direct DB — engine code, like run.py; never run by a shell):
-    ./sc watch daemon [--interval 75] [--once]             the fork's ONE
-                                                           GitHub poller
-
-The daemon is the fork's single GitHub subscriber: every live `watched_prs`
-row is folded into ONE batched GraphQL query per poll (~1% of an authenticated
-rate limit at 60–90s), each PR is diffed against its stored `last_seen`
-fingerprint, and every transition becomes a `pr_event` row in shell_messages
-addressed to the watch's shell. Events: checks concluded (green or red),
-review submitted, merged, closed. On close — and on merge with no checks
-still running — the final event is emitted and `closed_at` set: the watch
-retires itself. A merge with checks still PENDING retains the watch (#375):
-the merge event is emitted immediately, the watch stays live until the
-rollup concludes, then the green/red event retires it — an early merge must
-not swallow the terminal CI verdict the planner is waiting on. The daemon
-only ever writes message rows + its own registry state: it never boots
-shells, never marks anything read, never touches git. Each cycle it also beats a heartbeat row
-(daemon_heartbeats) so `list`/`pr` can say whether anybody is actually
-polling (#359) — a dead daemon otherwise leaves watches reporting "live"
-with no eventing behind them.
+Polling: the supervised engine service is the fork's SOLE GitHub poller
+(spec #20 task #85, decision #19) — the legacy host `sc watch daemon` (a
+direct-DB writer) is RETIRED: the `daemon` verb here now prints the retirement
+notice and exits clean so legacy nohup/systemd supervision stops instead of
+racing the service. Registration performs an immediate GitHub read and stores
+the normalized baseline before arming; the service then polls armed watches
+(live, scoped to an ACTIVE sprint) on a bounded interval, and every semantic
+transition becomes an idempotent `pr_event` row (+ wake item when a binding is
+armed) addressed to the watch's shell. Events: checks concluded (green or
+red), review submitted, merged, closed. On close — and on merge with no
+checks still running — the final event is emitted and `closed_at` set: the
+watch retires itself. A merge with checks still PENDING retains the watch
+(#375). Unscoped legacy watches stay readable but dormant until rebound to an
+ACTIVE sprint. The poller only ever writes message rows + its own registry
+state: it never boots shells, never marks anything read, never touches git,
+never injects terminal input.
 
 A `pr_event` body is one line — repo, PR, what changed, head SHA. Detail
 lives in `gh`; the message is the wake-up, not the payload.
@@ -41,9 +43,6 @@ lives in `gh`; the message is the wake-up, not the payload.
 cheap local API read (zero harness turns, zero tokens) and exits the moment
 the shell has unread mail — armed as a background task, its exit is the
 wake-up. Re-arm after draining the inbox.
-
-Supervision (daemon): `./sc launch` brings it up, `./sc down` stops it —
-the broker model (nohup + pidfile via the sc dispatcher).
 """
 from __future__ import annotations
 
@@ -51,7 +50,6 @@ import argparse
 import json
 import os
 import signal
-import subprocess
 import sys
 import time
 import urllib.error
@@ -59,16 +57,27 @@ import urllib.request
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
-DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
-import db_driver  # noqa: E402
+import pr_poller  # noqa: E402
 
 # API proxy — run.py injects these at boot (token = the shell's api_key).
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
 SC_API_BASE = os.environ.get("SC_API_BASE", "")
 
-CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
+# The normalized-GitHub core moved to pr_poller with the polling cutover
+# (spec #20 task #85); re-exported here for the suites that import it from
+# watch (the pure diff behavior is unchanged).
+CONCLUDED = pr_poller.CONCLUDED
+build_query = pr_poller.build_query
+fingerprint = pr_poller.fingerprint
+beat = pr_poller.beat
+
+
+def diff_events(prev, cur, repo, number):
+    """Compat adapter over pr_poller.transitions: (event bodies, terminal?)."""
+    events, terminal = pr_poller.transitions(prev, cur, repo, number)
+    return [e["body"] for e in events], terminal
 
 
 def die(msg: str) -> "NoReturn":  # noqa: F821
@@ -118,14 +127,15 @@ def _age_str(seconds: int) -> str:
 def daemon_line(d: "dict | None") -> str:
     """Render the /_sc/watches `daemon` block as the liveness line (#359):
     a watch is only as live as its poller, and `list` saying "live" while the
-    daemon is dead was the lying half of the dos-arch incident."""
-    dead = "watches are NOT being polled (host: ./sc watch-daemon-up)"
+    poller is dead was the lying half of the dos-arch incident. The poller is
+    the engine service's scheduler thread since the cutover (decision #19)."""
+    dead = "watches are NOT being polled (engine service poller down — restart: ./sc restart)"
     if not d or not d.get("beat_at"):
-        return f"  daemon: never run — {dead}"
+        return f"  poller: never run — {dead}"
     age = _age_str(int(d.get("age_s") or 0))
     if d.get("stale"):
-        return f"  daemon: STALE — last poll {age} ago ({d['beat_at']}Z); {dead}"
-    return f"  daemon: live — last poll {age} ago (interval {d.get('interval_s')}s)"
+        return f"  poller: STALE — last poll {age} ago ({d['beat_at']}Z); {dead}"
+    return f"  poller: live — last poll {age} ago (interval {d.get('interval_s')}s)"
 
 
 def cmd_pr(args) -> int:
@@ -136,17 +146,31 @@ def cmd_pr(args) -> int:
     payload: dict = {"repo": repo, "pr_number": args.number}
     if args.shell:
         payload["shell"] = args.shell
+    if args.sprint:
+        payload["sprint_doc_id"] = args.sprint
     r = _api("POST", "/_sc/watches", payload)
     who = args.shell or "you"
     if r.get("existing"):
         print(f"watch: {repo}#{args.number} already watched for {who} (watch #{r['watch_id']})")
+    elif r.get("rebound"):
+        print(f"watch: {repo}#{args.number} rebound to sprint doc {args.sprint} for {who} "
+              f"(watch #{r['watch_id']}, baseline armed)")
     else:
-        state = "re-armed" if r.get("reopened") else "registered"
-        print(f"watch: {repo}#{args.number} {state} for {who} (watch #{r['watch_id']})")
-        print("  (pr_event rows land in the shell's inbox as the daemon sees transitions)")
+        print(f"watch: {repo}#{args.number} registered for {who} (watch #{r['watch_id']}, baseline armed)")
+        print("  (pr_event rows land in the shell's inbox as the service poller sees transitions)")
     d = r.get("daemon")
     if not d or not d.get("beat_at") or d.get("stale"):
         print(daemon_line(d))
+    return 0
+
+
+def cmd_reconcile(args) -> int:
+    """Explicit one-shot poll of every armed watch (operator recovery)."""
+    _require_api()
+    r = _api("POST", "/_sc/watches/reconcile")
+    print(f"watch: reconcile — {r.get('watches', 0)} armed watch(es), "
+          f"{r.get('repos', 0)} repo(s) polled, {r.get('events', 0)} event(s), "
+          f"{r.get('errors', 0)} error(s), {r.get('skipped_backoff', 0)} in backoff")
     return 0
 
 
@@ -160,6 +184,12 @@ def cmd_list(args) -> int:
         return 0
     for w in ws:
         state = f"closed {w['closed_at']}" if w.get("closed_at") else "live"
+        if not w.get("closed_at"):
+            if w.get("sprint_doc_id"):
+                state += f", sprint #{w['sprint_doc_id']}"
+                state += " (armed)" if w.get("armed") else " (dormant — sprint not ACTIVE)"
+            else:
+                state += ", dormant (unscoped — rebind with `sc watch pr … --sprint <doc>`)"
         print(f"  #{w['watch_id']} {w['repo']}#{w['pr_number']} → {w['shortname']} "
               f"({state}, since {w['created_at']})")
     return 0
@@ -216,219 +246,43 @@ def _api_soft(method: str, path: str) -> dict:
         raise _ApiDown(str(exc)) from exc
 
 
-# ── Daemon: fingerprint + diff (pure — the tested core) ──────────────────────
-
-def build_query(prs: "list[tuple[str, int]]") -> str:
-    """One batched GraphQL query over every (repo, pr) pair. Aliases are
-    positional (r0, r1, …) so the response maps back by index regardless of
-    characters in repo names."""
-    parts = []
-    for i, (repo, number) in enumerate(prs):
-        owner, name = repo.split("/", 1)
-        parts.append(
-            f'r{i}: repository(owner: "{owner}", name: "{name}") {{'
-            f' pullRequest(number: {number}) {{'
-            f' state headRefOid'
-            f' reviews(last: 1) {{ totalCount nodes {{ state }} }}'
-            f' commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}'
-            f' }} }}')
-    return "query { " + " ".join(parts) + " }"
-
-
-def fingerprint(node: "dict | None") -> "dict | None":
-    """Collapse a GraphQL pullRequest node to the compared surface. None when
-    the PR was unreadable this poll (deleted repo, bad number, partial error)."""
-    if not node:
-        return None
-    commits = (node.get("commits") or {}).get("nodes") or []
-    rollup = (commits[0].get("commit") or {}).get("statusCheckRollup") if commits else None
-    reviews = node.get("reviews") or {}
-    review_nodes = reviews.get("nodes") or []
-    return {
-        "state": node.get("state"),                       # OPEN | MERGED | CLOSED
-        "sha": node.get("headRefOid"),
-        "checks": (rollup or {}).get("state"),            # SUCCESS/FAILURE/ERROR/PENDING/None
-        "reviews": reviews.get("totalCount") or 0,
-        "review_state": review_nodes[0].get("state") if review_nodes else None,
-    }
-
-
-def diff_events(prev: "dict | None", cur: dict, repo: str, number: int) -> "tuple[list[str], bool]":
-    """The daemon's core: (event bodies, terminal?) for one PR transition.
-
-    prev None = first poll of a fresh watch: baseline silently, EXCEPT states
-    that are already conclusive (checks concluded, merged, closed) — a watch
-    registered moments after the transition must still wake its shell, or the
-    event-driven loop drops its first link. Review history is never replayed
-    from a baseline (stale reviews aren't a wake-up).
-
-    A head-SHA change resets the checks comparison implicitly: the fingerprint
-    compares (sha, checks) together, so a new push going green is a fresh
-    transition even if the old head was green too.
-
-    Merge is terminal ONLY once no checks are still running (#375): a PR
-    merged while its rollup is PENDING keeps its watch — the merge event
-    fires now, the checks conclusion fires (and retires the watch) when the
-    already-running workflows finish. Retiring at merge dropped that verdict
-    on the floor and silently stalled the planner's sprint gate. Close
-    without merge retires immediately regardless — its pending checks get
-    cancelled, no conclusion is coming."""
-    events: list[str] = []
-    sha7 = (cur.get("sha") or "")[:7]
-    tag = f"{repo}#{number}"
-
-    merged = cur.get("state") == "MERGED"
-    checks = cur.get("checks")
-    checks_pending = checks is not None and checks not in CONCLUDED  # PENDING/EXPECTED
-    terminal = cur.get("state") == "CLOSED" or (merged and not checks_pending)
-
-    checks_changed = prev is None or (prev.get("checks"), prev.get("sha")) != (checks, cur.get("sha"))
-    if checks in CONCLUDED and checks_changed:
-        word = "green" if checks == "SUCCESS" else "red"
-        # On a retained post-merge watch this conclusion is the retiring event.
-        tail = " — watch retired" if merged and prev is not None and prev.get("state") == "MERGED" else ""
-        events.append(f"pr_event {tag}: checks {word} ({checks}) @ {sha7}{tail}")
-
-    if prev is not None and (cur.get("reviews") or 0) > (prev.get("reviews") or 0):
-        state = cur.get("review_state") or "REVIEW"
-        events.append(f"pr_event {tag}: review submitted ({state}) @ {sha7}")
-
-    if merged and (prev is None or prev.get("state") != "MERGED"):
-        if checks_pending:
-            events.append(f"pr_event {tag}: merged @ {sha7} — checks still pending, watch retained")
-        else:
-            events.append(f"pr_event {tag}: merged @ {sha7} — watch retired")
-    elif cur.get("state") == "CLOSED" and (prev is None or prev.get("state") != "CLOSED"):
-        events.append(f"pr_event {tag}: closed without merge — watch retired")
-    return events, terminal
-
-
-# ── Daemon: poll loop (host-side, direct DB + gh) ─────────────────────────────
-
-def _gh_graphql(query: str) -> "dict | None":
-    """Run the batched query through the host's authenticated `gh`. Returns the
-    `data` object, or None on any failure (logged; the loop just tries again —
-    a missed poll is a delayed event, never a lost one)."""
-    try:
-        out = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={query}"],
-            capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"watch daemon: gh unavailable ({e})", flush=True)
-        return None
-    if out.returncode != 0:
-        # gh exits non-zero on partial GraphQL errors but still prints data —
-        # use it if parseable (one bad watch must not blind the rest).
-        try:
-            return json.loads(out.stdout).get("data")
-        except Exception:
-            print(f"watch daemon: gh api graphql failed: {out.stderr.strip()[:300]}", flush=True)
-            return None
-    try:
-        return json.loads(out.stdout).get("data")
-    except Exception as e:
-        print(f"watch daemon: unparseable gh output ({e})", flush=True)
-        return None
-
-
-def poll_once(con, fetch=_gh_graphql) -> int:
-    """One daemon cycle: read live watches, one batched fetch, diff each PR,
-    emit pr_event rows, persist fingerprints, retire terminal watches.
-    Returns the number of events emitted. `fetch` is injectable for tests."""
-    watches = con.execute(
-        "SELECT watch_id, repo, pr_number, shell_id, last_seen "
-        "FROM watched_prs WHERE closed_at IS NULL "
-        "ORDER BY repo, pr_number, watch_id").fetchall()
-    if not watches:
-        return 0
-    # One query node per distinct (repo, pr); a PR watched by several shells
-    # fans its events out to each subscriber from the same fetch.
-    prs = sorted({(w["repo"], w["pr_number"]) for w in watches})
-    data = fetch(build_query(prs))
-    if data is None:
-        return 0
-    snaps = {pr: fingerprint((data.get(f"r{i}") or {}).get("pullRequest"))
-             for i, pr in enumerate(prs)}
-    emitted = 0
-    for w in watches:
-        cur = snaps.get((w["repo"], w["pr_number"]))
-        if cur is None:
-            continue  # unreadable this poll — keep the watch, try next cycle
-        prev = json.loads(w["last_seen"]) if w["last_seen"] else None
-        events, terminal = diff_events(prev, cur, w["repo"], w["pr_number"])
-        for body in events:
-            con.execute(
-                "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind) "
-                "VALUES (?, ?, ?, 'pr_event')",
-                (w["shell_id"], w["shell_id"], body))
-            emitted += 1
-        con.execute(
-            "UPDATE watched_prs SET last_seen=?" +
-            (", closed_at=datetime('now')" if terminal else "") +
-            " WHERE watch_id=?",
-            (json.dumps(cur), w["watch_id"]))
-    con.commit()
-    return emitted
-
-
-def beat(con, interval: int) -> None:
-    """Heartbeat (#359): one UPSERT per poll cycle — idle cycles included —
-    so the watch surface can tell "no transition yet" from "nobody watching"."""
-    con.execute(
-        "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
-        "VALUES ('watch', datetime('now'), ?) "
-        "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at, "
-        "interval_s=excluded.interval_s", (interval,))
-    con.commit()
-
+# ── Retired daemon verb (spec #20 task #85, decision #19) ────────────────────
 
 def cmd_daemon(args) -> int:
-    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
-        die(f"no usable DB at {DB_PATH} — rebuild with ./sc rebuild")
-    interval = args.interval or int(os.environ.get("SC_WATCH_INTERVAL", "75"))
-    print(f"watch daemon: polling every {interval}s · db {DB_PATH}", flush=True)
-    while True:
-        con = db_driver.connect(DB_PATH)
-        try:
-            # The beat must never block the poll: on a pre-0068 DB (code newer
-            # than schema — a dev tree between migrate runs) the table is
-            # missing, and a beat raising into the poll's except would turn a
-            # working daemon into a dead-with-noise one. Liveness degrades to
-            # "never run"; eventing keeps flowing.
-            try:
-                beat(con, interval)
-            except Exception as e:
-                print(f"watch daemon: heartbeat error ({e})", flush=True)
-            n = poll_once(con)
-            if n:
-                print(f"watch daemon: {n} pr_event(s) emitted", flush=True)
-        except Exception as e:
-            # Never die on a poll: a daemon crash silently reverts the fork to
-            # the polling world. Log and keep the loop.
-            print(f"watch daemon: poll error ({e})", flush=True)
-        finally:
-            con.close()
-        if args.once:
-            return 0
-        time.sleep(interval)
+    """RETIRED — the host watch daemon (a direct-DB writer) is cut over: the
+    supervised engine service is the fork's sole GitHub poller. Exit CLEAN (0)
+    so legacy nohup/systemd supervision (Restart=on-failure) stops instead of
+    crash-looping against the new single-poller world."""
+    print("watch daemon: RETIRED (spec #20, decision #19) — the engine service "
+          "is now the sole PR poller.\n"
+          "  nothing to run; polling lives in the supervised API service "
+          "(starts with ./sc launch).\n"
+          "  remove legacy supervision: ./sc watch-daemon-down · "
+          "./sc watch-daemon-uninstall", flush=True)
+    return 0
 
 
 # ── arg parsing ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sc watch",
-                                description="PR watches, inbox watcher, GitHub watcher daemon")
+                                description="PR watches, inbox watcher, explicit reconcile")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("pr", help="register a PR watch (defaults to the calling shell)")
     sp.add_argument("repo", help="owner/name")
     sp.add_argument("number", type=int, help="PR number")
     sp.add_argument("--shell", help="subscribe another shell (e.g. the planner) instead of you")
+    sp.add_argument("--sprint", type=int, default=0, metavar="DOC_ID",
+                    help="arm the watch to an ACTIVE sprint document (polls only while it stays ACTIVE)")
     sp.set_defaults(fn=cmd_pr)
 
     sp = sub.add_parser("list", help="live watches (--all includes retired)")
     sp.add_argument("--all", action="store_true")
     sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("reconcile", help="explicit one-shot poll of every armed watch (operator)")
+    sp.set_defaults(fn=cmd_reconcile)
 
     sp = sub.add_parser("inbox", help="block until this shell has unread messages, then exit (arm as a background task)")
     sp.add_argument("--interval", type=int, default=30, help="poll seconds (default 30)")
@@ -436,10 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="give up after N seconds (default 21600 = 6h; 0 = never)")
     sp.set_defaults(fn=cmd_inbox)
 
-    sp = sub.add_parser("daemon", help="HOST-side: the fork's one GitHub poller (launch/down supervise it)")
-    sp.add_argument("--interval", type=int, default=0,
-                    help="poll seconds (default $SC_WATCH_INTERVAL or 75)")
-    sp.add_argument("--once", action="store_true", help="single poll cycle, then exit")
+    sp = sub.add_parser("daemon", help="RETIRED (decision #19) — prints the cutover notice and exits clean")
+    sp.add_argument("--interval", type=int, default=0, help=argparse.SUPPRESS)
+    sp.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
     sp.set_defaults(fn=cmd_daemon)
     return p
 

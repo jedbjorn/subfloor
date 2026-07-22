@@ -285,40 +285,44 @@ CREATE TABLE shell_messages (
     -- for wake-eligible traffic, added by migration 0078 (same precedent).
 );
 
--- ── Watched PRs (sprint eventing — subscription registry + daemon state) ────
--- One row per (repo, PR, subscriber shell). `./sc watch pr` registers; the
--- GitHub watcher daemon (`./sc watch daemon`, supervised by launch/down) polls
--- every live watch on one batched query, diffs against last_seen, and writes a
--- `pr_event` message row to the owning shell on each transition. On merge or
--- close it emits the final event and sets closed_at — the watch retires
--- itself. See migrations/0059_sprint_eventing.sql (convergent — carries an
--- existing fork).
+-- ── Watched PRs (sprint eventing — subscription registry + poller state) ────
+-- One ACTIVE watch per (repo, PR, subscriber shell, sprint scope); closed rows
+-- are retained as history. `./sc watch pr` registers (with an immediate GitHub
+-- baseline); the supervised engine service is the sole poller (spec #20,
+-- decision #19 — the legacy host `sc watch daemon` is retired): it polls every
+-- live sprint-scoped watch on batched queries, diffs against last_seen, and
+-- writes an idempotent `pr_event` message row to the owning shell on each
+-- semantic transition. On merge or close it emits the final event and sets
+-- closed_at — the watch retires itself. Unscoped (sprint_doc_id NULL) watches
+-- stay readable but dormant until rebound to an ACTIVE sprint.
+-- See migrations/0059_sprint_eventing.sql (convergent — carries an existing
+-- fork) and 0080_pr_polling_cutover.sql (uniqueness rebuild + active index).
 
 CREATE TABLE watched_prs (
     watch_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     repo           TEXT    NOT NULL,          -- owner/name
     pr_number      INTEGER NOT NULL,
     shell_id       INTEGER NOT NULL REFERENCES shells(shell_id),
-    last_seen      TEXT,                      -- JSON: checks/review/state fingerprint
+    last_seen      TEXT,                      -- JSON: normalized fingerprint
     created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
-    closed_at      TEXT,                      -- set on merge/close; NULL = live
-    UNIQUE (repo, pr_number, shell_id)
+    closed_at      TEXT                       -- set on merge/close; NULL = live
     -- sprint_doc_id INTEGER REFERENCES documents(document_id) — sprint scoping,
     -- added by migration 0078 (same migration-only ADD COLUMN precedent as
-    -- shell_messages.kind above). The uniqueness rebuild into one active watch
-    -- per binding/repo/PR is the polling cutover's migration (spec #20 task 36).
+    -- shell_messages.kind above). The one-active-watch-per-scope uniqueness
+    -- (idx_watched_prs_active, partial on closed_at IS NULL with
+    -- COALESCE(sprint_doc_id, 0)) rides in migration 0080's table rebuild.
 );
 
--- Daemon liveness (#359): the watcher daemon UPSERTs its row once per poll
--- cycle; the /_sc/watches API turns beat age into a live/stale/never verdict
--- so `./sc watch list` can't report watches "live" with nobody polling.
--- See migrations/0068_watch_daemon_heartbeat.sql (convergent — carries an
--- existing fork).
+-- Poller liveness (#359): the engine service's PR poller UPSERTs its row once
+-- per poll cycle; the /_sc/watches API turns beat age into a live/stale/never
+-- verdict so `./sc watch list` can't report watches "live" with nobody
+-- polling. See migrations/0068_watch_daemon_heartbeat.sql (convergent —
+-- carries an existing fork).
 
 CREATE TABLE daemon_heartbeats (
-    name        TEXT PRIMARY KEY,              -- 'watch' — one row per daemon
+    name        TEXT PRIMARY KEY,              -- 'watch' — one row per poller
     beat_at     TEXT    NOT NULL,              -- datetime('now') at last poll cycle
-    interval_s  INTEGER NOT NULL               -- the daemon's configured poll interval
+    interval_s  INTEGER NOT NULL               -- the poller's configured poll interval
 );
 
 -- ── Interface (spec #20: Interface-backed planner wake) ─────────────────────
