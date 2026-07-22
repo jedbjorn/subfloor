@@ -901,11 +901,6 @@ case "$cmd" in
   watch-daemon-down) sc_watch_daemon_down ;;
   watch-daemon-install)   sc_watch_daemon_install ;;
   watch-daemon-uninstall) sc_watch_daemon_uninstall ;;
-  # Provider-neutral planner wake control. `session-control` stays the internal,
-  # token-scoped adapter client; `session` is the public shortname-based surface.
-  session)            exec "$PY" "$S/session_cli.py" --operator "$@" ;;
-  session-control)    exec "$PY" "$S/session_cli.py" "$@" ;;
-  session-dispatcher) exec "$PY" "$S/session_dispatcher.py" "$@" ;;
   # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
   persist)           sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
@@ -946,7 +941,7 @@ case "$cmd" in
   ports)        exec "$PY" "$S/ports.py" show ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
-  serve)        exec "$PY" "$S/service_supervisor.py" "$@" ;;
+  serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
   # ── Windows VM broker (HOST-side primitive — runs where virsh + the key live) ──
   vm-broker)         exec "$PY" "$ENGINE/api/vm_broker.py" "$@" ;;
   # Bake/re-bake the clean snapshot — HOST-side, deliberately NOT a broker verb:
@@ -1169,14 +1164,6 @@ super-coder — forkable shell substrate
   ./sc watch list          live PR watches (--all includes retired)
   ./sc watch inbox         block until this shell has unread messages, then exit — the zero-token
                              inbox watcher; arm as a background task and its exit is your wake-up
-  ./sc session-control …  internal token-scoped binding client for provider adapters
-                             (status/manage/release/retry/bind/channel)
-  ./sc session status [shortname]
-  ./sc session manage <shortname> --sprint <ref>
-  ./sc session release <shortname> [--after-turn] · retry <shortname>
-                             inspect and manage provider-neutral planner wake
-  ./sc session-dispatcher  run the provider-neutral wake dispatcher in the foreground
-                             (`./sc serve` supervises it automatically)
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
@@ -1203,9 +1190,8 @@ super-coder — forkable shell substrate
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
   ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
-  ./sc enter [--new-session]  attach an interactive session — always starts a FRESH session;
-                             a managed binding is superseded (released + rebound), never resumed
-  ./sc enter-<shortname> [--new-session]  attach that shell directly (same fresh-session rule)
+  ./sc enter               attach an interactive session: auth + pick shell + pick harness + boot
+  ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·

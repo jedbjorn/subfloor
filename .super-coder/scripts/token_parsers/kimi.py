@@ -84,8 +84,7 @@ def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
         common = dict(harness=HARNESS, ref=str(sess_dir), parser_version=PARSER_VERSION,
                       provider=provider or "kimi", title=state.get("title"),
                       started_at=norm_iso(state.get("createdAt")),
-                      ended_at=norm_iso(state.get("updatedAt")), cwd=cwd,
-                      native_session_id=state.get("id"))
+                      ended_at=norm_iso(state.get("updatedAt")), cwd=cwd)
         if not per_model:
             rows.append(row(model=None, status="no_usage", **common))
             continue

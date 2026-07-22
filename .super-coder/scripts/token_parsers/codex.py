@@ -105,7 +105,7 @@ def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
                       provider=parsed["meta"].get("model_provider"),
                       model=parsed["model"], title=parsed["title"],
                       started_at=parsed["started_at"], ended_at=parsed["ended_at"],
-                      cwd=cwd, native_session_id=parsed["meta"].get("id"))
+                      cwd=cwd)
         total = (parsed["last_tc"] or {}).get("total_token_usage")
         if not total:
             rows.append(row(status="no_usage", **common))

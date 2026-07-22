@@ -6,14 +6,6 @@
   "env": {},
   "model": { "flag": "--model" },
   "name": { "flag": "--name" },
-  "session_control": {
-    "launch": ["python3", "{adapter_dir}/claude-session.py"],
-    "capabilities": {
-      "provider": "claude",
-      "transport": "background-task-inbox-v1",
-      "normal_steer": false
-    }
-  },
   "headless": {
     "launch": ["claude"],
     "prompt_flag": "-p",

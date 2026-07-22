@@ -59,8 +59,6 @@ import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
-import session_control  # noqa: E402  (planner wake state + job reconstruction)
-import session_supervisor  # noqa: E402  (active-channel PID fencing)
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
@@ -204,7 +202,6 @@ def get_shell(con, sid: int) -> dict | None:
         "SELECT decision_id, decision_date, priority, decision FROM shell_decisions "
         "WHERE shell_id=? AND COALESCE(is_deleted,0)=0 ORDER BY decision_id DESC "
         "LIMIT 25", (sid,)))
-    shell["session_control"] = get_session_control_overview(con, sid)
     return shell
 
 
@@ -488,19 +485,14 @@ def get_analytics_sessions(con, q) -> dict:
         marks = ",".join("?" for _ in aids)
         arch = {a["archive_id"]: dict(a) for a in con.execute(
             f"SELECT a.archive_id, a.session_id, a.sprint_ref, s.shortname, "
-            f"s.display_name, s.flavor, b.state AS control_state, "
-            f"b.managed AS control_managed FROM shell_memory_archives a "
-            f"JOIN shells s ON s.shell_id=a.shell_id "
-            f"LEFT JOIN shell_session_bindings b ON b.archive_id=a.archive_id "
-            f"WHERE a.archive_id IN ({marks})",
+            f"s.display_name, s.flavor FROM shell_memory_archives a "
+            f"JOIN shells s ON s.shell_id=a.shell_id WHERE a.archive_id IN ({marks})",
             aids)}
     for c in cards:
         a = arch.get(c["archive_id"]) or {}
         c["shell"] = a.get("shortname")
         c["shell_session"] = a.get("session_id")
         c["sprint_ref"] = a.get("sprint_ref")
-        c["control_state"] = a.get("control_state")
-        c["control_managed"] = bool(a.get("control_managed"))
         c["status"] = _card_status(c.pop("statuses"), c["archive_id"])
         c["unattributed"] = c["archive_id"] is None
     older = con.execute(
@@ -590,24 +582,9 @@ def get_analytics_usage(con, q) -> dict:
         "SELECT DISTINCT a.sprint_ref, d.title FROM shell_memory_archives a "
         "LEFT JOIN documents d ON CAST(d.document_id AS TEXT) = a.sprint_ref "
         "WHERE a.sprint_ref IS NOT NULL")}
-    controlled_shell_ids = [r[0] for r in con.execute(
-        "SELECT DISTINCT b.shell_id FROM shell_session_bindings b "
-        "JOIN shells s ON s.active_archive_id=b.archive_id "
-        "WHERE COALESCE(s.is_deleted,0)=0 ORDER BY b.shell_id"
-    )]
-    control = []
-    for shell_id in controlled_shell_ids:
-        overview = get_session_control_overview(con, shell_id)
-        if overview is None:
-            continue
-        shell = con.execute(
-            "SELECT shortname FROM shells WHERE shell_id=?", (shell_id,)
-        ).fetchone()
-        control.append({"shortname": shell[0], **overview})
     return {"favorite_models": sorted(fav.values(), key=lambda f: f["flavor"]),
             "features_shipped": features_shipped, "specs_shipped": specs_shipped,
-            "docs_outstanding": docs_outstanding, "sprint_titles": sprint_titles,
-            "session_control": control}
+            "docs_outstanding": docs_outstanding, "sprint_titles": sprint_titles}
 
 
 def get_analytics_filters(con) -> dict:
@@ -1204,433 +1181,6 @@ def _land_on_base(out: list, state: dict) -> None:
         out.append(f"↩ back on {BASE_BRANCH}")
 
 
-# ── Token-scoped session control ──────────────────────────────────────────────
-
-SESSION_BINDING_EDITABLE = {
-    "native_session_id", "control_endpoint", "control_capabilities",
-    "cli_version", "state",
-}
-
-
-def _owned_binding(con, shell_id: int, binding_id: int | None = None):
-    if binding_id is not None:
-        return con.execute(
-            "SELECT * FROM shell_session_bindings "
-            "WHERE binding_id=? AND shell_id=?", (binding_id, shell_id)
-        ).fetchone()
-    return con.execute(
-        "SELECT b.* FROM shell_session_bindings b "
-        "JOIN shells s ON s.active_archive_id=b.archive_id "
-        "WHERE s.shell_id=? AND b.shell_id=s.shell_id", (shell_id,)
-    ).fetchone()
-
-
-def get_session_control(con, shell_id: int, binding_id: int | None = None):
-    binding = _owned_binding(con, shell_id, binding_id)
-    beat = con.execute(
-        "SELECT beat_at, interval_s, "
-        "CAST((julianday('now')-julianday(beat_at))*86400 AS INTEGER) AS age_s "
-        "FROM daemon_heartbeats WHERE name='session-dispatcher'"
-    ).fetchone()
-    if binding is None:
-        return {"binding": None, "jobs": {},
-                "dispatcher": dict(beat) if beat else None}
-    counts = {
-        row["state"]: row["n"] for row in con.execute(
-            "SELECT state, COUNT(*) AS n FROM session_wake_jobs "
-            "WHERE binding_id=? GROUP BY state", (binding["binding_id"],)
-        )
-    }
-    archive = con.execute(
-        "SELECT session_id, harness, provider, model, sprint_ref "
-        "FROM shell_memory_archives WHERE archive_id=?", (binding["archive_id"],)
-    ).fetchone()
-    last_delivery = con.execute(
-        "SELECT MAX(finished_at) FROM session_wake_jobs "
-        "WHERE binding_id=? AND state='done'", (binding["binding_id"],)
-    ).fetchone()[0]
-    visible = {
-        key: binding[key] for key in (
-            "binding_id", "archive_id", "shell_id", "harness",
-            "native_session_id", "control_endpoint", "control_capabilities",
-            "cli_version", "state", "managed", "lease_pid",
-            "lease_start_ticks", "active_channel_pid",
-            "active_channel_start_ticks", "active_channel_heartbeat_at",
-            "lease_generation", "last_error", "created_at", "updated_at",
-        )
-    }
-    owner = "none"
-    owner_pid = None
-    if binding["lease_pid"]:
-        owner, owner_pid = "lease", binding["lease_pid"]
-    elif binding["active_channel_pid"]:
-        owner, owner_pid = "active-channel", binding["active_channel_pid"]
-    errors = counts.get("failed", 0) + int(
-        binding["state"] == "error" or bool(binding["last_error"])
-    )
-    return {
-        "binding": visible,
-        "archive": dict(archive) if archive else None,
-        "jobs": counts,
-        "summary": {
-            "queued": counts.get("queued", 0),
-            "errors": errors,
-            "owner": owner,
-            "owner_pid": owner_pid,
-            "last_delivery": last_delivery,
-        },
-        "dispatcher": dict(beat) if beat else None,
-    }
-
-
-def get_session_control_overview(con, shell_id: int) -> dict | None:
-    """Safe compact status for GUI surfaces; omit endpoints/capabilities/PIDs."""
-    payload = get_session_control(con, shell_id)
-    binding = payload.get("binding")
-    if binding is None:
-        return None
-    archive = payload.get("archive") or {}
-    summary = payload.get("summary") or {}
-    return {
-        "binding_id": binding["binding_id"],
-        "engine_session_id": archive.get("session_id"),
-        "harness": binding["harness"],
-        "model": archive.get("model"),
-        "state": binding["state"],
-        "managed": bool(binding["managed"]),
-        "queued": summary.get("queued", 0),
-        "errors": summary.get("errors", 0),
-        "last_delivery": summary.get("last_delivery"),
-    }
-
-
-def _binding_capabilities(binding) -> dict:
-    try:
-        capabilities = json.loads(binding["control_capabilities"] or "{}")
-    except (TypeError, json.JSONDecodeError):
-        return {}
-    return capabilities if isinstance(capabilities, dict) else {}
-
-
-def manage_session_control(con, shell_id: int, binding_id: int | None = None,
-                           sprint_ref: str | None = None):
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        binding = _owned_binding(con, shell_id, binding_id)
-        if binding is None:
-            con.rollback()
-            return None, "no session binding for this shell"
-        if not binding["native_session_id"]:
-            con.rollback()
-            return None, "native session id is not registered"
-        capabilities = _binding_capabilities(binding)
-        if not any(capabilities.get(name) for name in ("deliver", "resume")):
-            con.rollback()
-            return None, "binding has neither deliver nor resume capability"
-        try:
-            session_control.validate_managed_wake_posture(capabilities)
-        except session_control.SessionControlError as exc:
-            con.rollback()
-            return None, str(exc)
-        other = con.execute(
-            "SELECT binding_id FROM shell_session_bindings "
-            "WHERE shell_id=? AND managed=1 AND binding_id!=?",
-            (shell_id, binding["binding_id"]),
-        ).fetchone()
-        if other:
-            con.rollback()
-            return None, f"binding {other['binding_id']} is already managed"
-        if binding["state"] == "dispatching":
-            con.rollback()
-            return None, "cannot manage a binding while dispatching"
-        if sprint_ref is not None:
-            sprint_ref = str(sprint_ref).strip()
-            if not sprint_ref:
-                con.rollback()
-                return None, "sprint reference is required"
-            if not sprint_ref.isdigit() or con.execute(
-                    "SELECT 1 FROM documents WHERE document_id=?",
-                    (int(sprint_ref),)).fetchone() is None:
-                con.rollback()
-                return None, f"unknown sprint document {sprint_ref!r}"
-        if binding["state"] in ("released", "error"):
-            session_control.transition_binding(
-                con, binding["binding_id"], expected=binding["state"],
-                target="starting")
-        con.execute(
-            "UPDATE shell_session_bindings SET managed=1, last_error=NULL, "
-            "updated_at=datetime('now') WHERE binding_id=?",
-            (binding["binding_id"],),
-        )
-        if sprint_ref is not None:
-            con.execute(
-                "UPDATE shell_memory_archives SET sprint_ref=? WHERE archive_id=?",
-                (sprint_ref, binding["archive_id"]),
-            )
-        # A prior release deliberately cancelled its queued audit rows.  Re-manage
-        # reactivates only rows whose messages are still unread.
-        con.execute(
-            "UPDATE session_wake_jobs SET state='queued', attempt_count=0, "
-            "available_at=datetime('now'), started_at=NULL, finished_at=NULL, "
-            "last_error=NULL WHERE binding_id=? AND state='cancelled' "
-            "AND EXISTS (SELECT 1 FROM shell_messages m "
-            "WHERE m.message_id=session_wake_jobs.trigger_message_id "
-            "AND m.read_at IS NULL)", (binding["binding_id"],)
-        )
-        session_control.reconstruct_wake_jobs(con)
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    return get_session_control(con, shell_id, binding["binding_id"]), None
-
-
-SESSION_CREDENTIAL_DIR = ENGINE / "run" / "session-control"
-
-
-def _binding_credential_paths(binding) -> list[Path]:
-    """Return provider-declared ephemeral credentials after strict path checks."""
-    capabilities = _binding_capabilities(binding)
-    declared: list[object] = []
-    if capabilities.get("token_file"):
-        declared.append(capabilities["token_file"])
-    extra = capabilities.get("credential_files") or []
-    if isinstance(extra, list):
-        declared.extend(extra)
-    root = SESSION_CREDENTIAL_DIR.resolve()
-    prefix = f"{binding['harness']}-{binding['binding_id']}."
-    paths: list[Path] = []
-    for raw in declared:
-        path = Path(str(raw)).resolve()
-        if path.parent != root or not path.name.startswith(prefix):
-            raise session_control.SessionControlError(
-                "provider credential path is outside the binding runtime scope"
-            )
-        if path not in paths:
-            paths.append(path)
-    return paths
-
-
-def _remove_binding_credentials(binding) -> None:
-    for path in _binding_credential_paths(binding):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise session_control.SessionControlError(
-                f"could not remove provider runtime credential {path.name}: {exc}"
-            ) from exc
-
-
-def release_session_control(con, shell_id: int, binding_id: int | None = None):
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        binding = _owned_binding(con, shell_id, binding_id)
-        if binding is None:
-            con.rollback()
-            return None, "no session binding for this shell"
-        if binding["state"] == "dispatching":
-            con.rollback()
-            return None, "binding is dispatching; release after the turn exits"
-        try:
-            _remove_binding_credentials(binding)
-        except session_control.SessionControlError as exc:
-            con.rollback()
-            return None, str(exc)
-        if binding["state"] != "released":
-            session_control.transition_binding(
-                con, binding["binding_id"], expected=binding["state"],
-                target="released")
-        con.execute(
-            "UPDATE shell_session_bindings SET managed=0, last_error=NULL, "
-            "updated_at=datetime('now') WHERE binding_id=?",
-            (binding["binding_id"],),
-        )
-        con.execute(
-            "UPDATE session_wake_jobs SET state='cancelled', "
-            "finished_at=datetime('now'), last_error='binding released' "
-            "WHERE binding_id=? AND state IN ('queued','failed')",
-            (binding["binding_id"],),
-        )
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    return get_session_control(con, shell_id, binding["binding_id"]), None
-
-
-def retry_session_control(con, shell_id: int, binding_id: int | None = None):
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        binding = _owned_binding(con, shell_id, binding_id)
-        if binding is None:
-            con.rollback()
-            return None, "no session binding for this shell"
-        if binding["state"] != "error":
-            con.rollback()
-            return None, "retry requires a binding in error"
-        session_control.transition_binding(
-            con, binding["binding_id"], expected="error", target="starting")
-        con.execute(
-            "UPDATE shell_session_bindings SET last_error=NULL, "
-            "updated_at=datetime('now') WHERE binding_id=?",
-            (binding["binding_id"],),
-        )
-        con.execute(
-            "UPDATE session_wake_jobs SET state='queued', attempt_count=0, "
-            "available_at=datetime('now'), started_at=NULL, finished_at=NULL, "
-            "last_error=NULL WHERE binding_id=? AND state='failed' "
-            "AND EXISTS (SELECT 1 FROM shell_messages m "
-            "WHERE m.message_id=session_wake_jobs.trigger_message_id "
-            "AND m.read_at IS NULL)", (binding["binding_id"],)
-        )
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    return get_session_control(con, shell_id, binding["binding_id"]), None
-
-
-def _shell_id_for_shortname(con, shortname: str) -> int | None:
-    row = con.execute(
-        "SELECT shell_id FROM shells WHERE lower(shortname)=lower(?) "
-        "AND COALESCE(is_deleted,0)=0", (shortname.strip(),)
-    ).fetchone()
-    return int(row[0]) if row else None
-
-
-def operator_session_control(con, shortname: str, action: str = "status",
-                             *, sprint_ref: str | None = None):
-    """Local operator surface used by ``sc session`` and the review GUI."""
-    shell_id = _shell_id_for_shortname(con, shortname)
-    if shell_id is None:
-        return None, f"unknown shell {shortname!r}"
-    if action == "status":
-        return get_session_control(con, shell_id), None
-    if action == "manage":
-        if sprint_ref is None:
-            return None, "sprint reference is required"
-        return manage_session_control(con, shell_id, sprint_ref=sprint_ref)
-    if action == "release":
-        return release_session_control(con, shell_id)
-    if action == "retry":
-        return retry_session_control(con, shell_id)
-    return None, f"unknown session action {action!r}"
-
-
-def _local_control_endpoint(value: str) -> bool:
-    if not value:
-        return True
-    if value.startswith("/"):
-        return True
-    parsed = urlparse(value)
-    if parsed.scheme == "unix":
-        return bool(parsed.path and parsed.path.startswith("/"))
-    return (parsed.scheme in ("http", "https")
-            and parsed.hostname in ("127.0.0.1", "localhost", "::1")
-            and parsed.username is None and parsed.password is None)
-
-
-def patch_session_binding(con, shell_id: int, binding_id: int, body: dict):
-    body = dict(body)
-    unknown = set(body) - SESSION_BINDING_EDITABLE
-    if unknown:
-        return None, f"unknown field(s): {', '.join(sorted(unknown))}"
-    if "control_endpoint" in body and not _local_control_endpoint(
-            str(body["control_endpoint"] or "")):
-        return None, "control_endpoint must be a local socket or loopback URL"
-    capabilities = body.get("control_capabilities")
-    if capabilities is not None:
-        if not isinstance(capabilities, dict):
-            return None, "control_capabilities must be an object"
-        body = {**body, "control_capabilities": json.dumps(
-            capabilities, sort_keys=True, separators=(",", ":"))}
-    if "native_session_id" in body and not str(body["native_session_id"] or "").strip():
-        return None, "native_session_id cannot be empty"
-    if "native_session_id" in body:
-        body["native_session_id"] = str(body["native_session_id"]).strip()
-    if body.get("state") in ("dispatching", "released"):
-        return None, "dispatching/released are owned by dispatcher/release operations"
-
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        binding = _owned_binding(con, shell_id, binding_id)
-        if binding is None:
-            con.rollback()
-            return None, "no such session binding"
-        if "state" in body and binding["state"] == "dispatching":
-            con.rollback()
-            return None, "dispatching is owned by the dispatcher"
-        native = body.get("native_session_id")
-        if native is not None and con.execute(
-                "SELECT 1 FROM shell_session_bindings "
-                "WHERE harness=? AND native_session_id=? AND binding_id!=?",
-                (binding["harness"], native, binding_id)).fetchone():
-            con.rollback()
-            return None, "native session id is already bound"
-        state = body.pop("state", None)
-        if state is not None:
-            session_control.transition_binding(
-                con, binding_id, expected=binding["state"], target=state)
-        for field in (
-                "native_session_id", "control_endpoint", "control_capabilities",
-                "cli_version"):
-            if field not in body:
-                continue
-            # Keep the SQL text literal per field.  The field roster is tiny and
-            # security tooling should not need to infer the whitelist above.
-            if field == "native_session_id":
-                sql = ("UPDATE shell_session_bindings SET native_session_id=?, "
-                       "updated_at=datetime('now') WHERE binding_id=?")
-            elif field == "control_endpoint":
-                sql = ("UPDATE shell_session_bindings SET control_endpoint=?, "
-                       "updated_at=datetime('now') WHERE binding_id=?")
-            elif field == "control_capabilities":
-                sql = ("UPDATE shell_session_bindings SET control_capabilities=?, "
-                       "updated_at=datetime('now') WHERE binding_id=?")
-            else:
-                sql = ("UPDATE shell_session_bindings SET cli_version=?, "
-                       "updated_at=datetime('now') WHERE binding_id=?")
-            con.execute(
-                sql, (body[field], binding_id),
-            )
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    return get_session_control(con, shell_id, binding_id), None
-
-
-def update_session_channel(con, shell_id: int, body: dict):
-    try:
-        binding_id = int(body.get("binding_id"))
-    except (TypeError, ValueError):
-        return None, "binding_id required"
-    binding = _owned_binding(con, shell_id, binding_id)
-    if binding is None:
-        return None, "no such session binding"
-    action = body.get("action")
-    try:
-        pid = int(body.get("pid"))
-        ticks = int(body.get("start_ticks")) if body.get("start_ticks") is not None else None
-    except (TypeError, ValueError):
-        return None, "pid/start_ticks must be integers"
-    if action == "register":
-        actual = session_supervisor.register_active_channel(
-            con, binding_id, pid, repo_root=REPO_ROOT)
-        return {"binding_id": binding_id, "pid": pid, "start_ticks": actual}, None
-    if ticks is None:
-        return None, "start_ticks required"
-    if action == "heartbeat":
-        if not session_supervisor.heartbeat_active_channel(con, binding_id, pid, ticks):
-            return None, "active channel identity changed"
-        return {"binding_id": binding_id, "heartbeat": True}, None
-    if action == "clear":
-        if not session_supervisor.clear_active_channel(con, binding_id, pid, ticks):
-            return None, "active channel identity changed"
-        return {"binding_id": binding_id, "cleared": True}, None
-    return None, "action must be register, heartbeat, or clear"
-
-
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -1737,72 +1287,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "Authorization: Bearer <token> required"})
             return None
         return shell_id
-
-    # -- /_sc/session-control token-scoped binding + wake controls --
-
-    def _session_get(self):
-        sid = self._require_shell_auth()
-        if sid is None:
-            return
-        q = parse_qs(urlparse(self.path).query)
-        raw_binding = q.get("binding", [None])[0]
-        try:
-            binding_id = int(raw_binding) if raw_binding is not None else None
-            con = db()
-            try:
-                return self._send(200, get_session_control(con, sid, binding_id))
-            finally:
-                con.close()
-        except ValueError:
-            return self._send(400, {"error": "invalid binding id"})
-        except Exception as exc:
-            return self._fail(exc)
-
-    def _session_post(self, path: str, body: dict):
-        sid = self._require_shell_auth()
-        if sid is None:
-            return
-        con = db()
-        try:
-            raw_binding = body.get("binding_id")
-            binding_id = int(raw_binding) if raw_binding is not None else None
-            if path == "/_sc/session-control/manage":
-                payload, error = manage_session_control(con, sid, binding_id)
-            elif path == "/_sc/session-control/release":
-                payload, error = release_session_control(con, sid, binding_id)
-            elif path == "/_sc/session-control/retry":
-                payload, error = retry_session_control(con, sid, binding_id)
-            elif path == "/_sc/session-control/channel":
-                payload, error = update_session_channel(con, sid, body)
-            else:
-                return self._send(404, {"error": "not found"})
-            return self._send(409 if error else 200,
-                              {"error": error} if error else payload)
-        except (TypeError, ValueError):
-            return self._send(400, {"error": "invalid binding id"})
-        except Exception as exc:
-            return self._fail(exc)
-        finally:
-            con.close()
-
-    def _session_patch(self, path: str, body: dict):
-        sid = self._require_shell_auth()
-        if sid is None:
-            return
-        parts = path.strip("/").split("/")
-        if len(parts) != 4 or parts[:3] != ["_sc", "session-control", "bindings"]:
-            return self._send(404, {"error": "not found"})
-        con = db()
-        try:
-            payload, error = patch_session_binding(con, sid, int(parts[3]), body)
-            return self._send(400 if error else 200,
-                              {"error": error} if error else payload)
-        except ValueError:
-            return self._send(400, {"error": "invalid binding id or state"})
-        except Exception as exc:
-            return self._fail(exc)
-        finally:
-            con.close()
 
     # -- /mem/* token-scoped shell memory endpoints --
 
@@ -2569,8 +2053,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f.read_text(), ctype)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
-        if path == "/_sc/session-control":
-            return self._session_get()
         if path == "/_sc/watches":
             return self._watches_get()
         if not path.startswith("/api/"):
@@ -2598,11 +2080,6 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = ports_mod.resolve()
                 return self._send(200, {"ok": True, "repo": cfg.get("repo"),
                                         "port": cfg.get("port")})
-            if path.startswith("/api/session-control/status/"):
-                shortname = path.rsplit("/", 1)[1]
-                payload, error = operator_session_control(con, shortname)
-                return self._send(404 if error else 200,
-                                  {"error": error} if error else payload)
             if path == "/api/shells":
                 return self._send(200, {"shells": get_shells(con)})
             if path == "/api/shell-templates":
@@ -2704,23 +2181,10 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
-        if path.startswith("/_sc/session-control/"):
-            return self._session_post(path, self._body())
         if path == "/_sc/watches":
             return self._watches_post(self._body())
         con = db()
         try:
-            if path.startswith("/api/session-control/"):
-                parts = path.strip("/").split("/")
-                if len(parts) != 4 or parts[:2] != ["api", "session-control"]:
-                    return self._send(404, {"error": "not found"})
-                action, shortname = parts[2], parts[3]
-                body = self._body()
-                payload, error = operator_session_control(
-                    con, shortname, action, sprint_ref=body.get("sprint_ref")
-                )
-                return self._send(409 if error else 200,
-                                  {"error": error} if error else payload)
             if path == "/api/flags":
                 fid, err = create_flag(con, self._body())
                 return self._send(400 if err else 201,
@@ -2844,8 +2308,6 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_patch(path)
-        if path.startswith("/_sc/session-control/"):
-            return self._session_patch(path, self._body())
         body = self._body()
         con = db()
         try:

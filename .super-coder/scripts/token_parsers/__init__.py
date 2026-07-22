@@ -27,7 +27,7 @@ Contract — every module exposes:
                cache={}. Only claude uses it today (per-file byte-offset
                tail parsing, CC-145).
 
-Row keys: harness, harness_session_ref, native_session_id (transient), provider, model, title, started_at,
+Row keys: harness, harness_session_ref, provider, model, title, started_at,
 ended_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 reasoning_tokens, status ('ok'|'partial'|'no_usage'), parser_version, cwd
 (transient). Token-class rule: NULL means "not exposed by this harness",
@@ -84,7 +84,7 @@ def row(*, harness: str, ref: str, parser_version: str, provider=None,
         model=None, title=None, started_at=None, ended_at=None,
         input_tokens=None, output_tokens=None, cache_read_tokens=None,
         cache_write_tokens=None, reasoning_tokens=None, status="ok",
-        cwd=None, native_session_id=None) -> dict:
+        cwd=None) -> dict:
     return {
         "harness": harness, "harness_session_ref": ref,
         "parser_version": parser_version, "provider": provider,
@@ -95,5 +95,4 @@ def row(*, harness: str, ref: str, parser_version: str, provider=None,
         "cache_write_tokens": cache_write_tokens,
         "reasoning_tokens": reasoning_tokens,
         "status": status, "cwd": cwd,
-        "native_session_id": native_session_id,
     }

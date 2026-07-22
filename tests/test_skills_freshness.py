@@ -98,10 +98,6 @@ class SkillsFreshnessTest(unittest.TestCase):
 
     def test_sync_engine_skills_is_noop_when_fresh(self):
         self.assertEqual(seed_skills.sync_engine_skills(self.con), [])
-        self.assertFalse(
-            self.con.in_transaction,
-            "a no-op boot heal must not strand an implicit transaction",
-        )
 
     def test_sync_engine_skills_heals_stale(self):
         self.con.execute(
