@@ -69,6 +69,29 @@ class PublicSessionCliTest(unittest.TestCase):
             mock.call("POST", "release", "PLN1", {}),
         ], request.call_args_list)
 
+    def test_release_without_binding_reaches_server_for_both_wait_modes(self):
+        released = {"binding": None, "released": False}
+        for flags in ([], ["--after-turn"]):
+            with self.subTest(flags=flags):
+                args = session_cli.build_operator_parser().parse_args(
+                    ["release", "DEV3", *flags]
+                )
+                with mock.patch.object(
+                    session_cli, "operator_api",
+                    side_effect=[{"binding": None}, released],
+                ) as request, mock.patch.object(
+                    session_cli.time, "sleep"
+                ) as sleep, mock.patch.object(
+                    session_cli, "print_status"
+                ) as print_status:
+                    self.assertEqual(0, args.fn(args))
+                self.assertEqual([
+                    mock.call("GET", "status", "DEV3"),
+                    mock.call("POST", "release", "DEV3", {}),
+                ], request.call_args_list)
+                print_status.assert_called_once_with(released)
+                sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

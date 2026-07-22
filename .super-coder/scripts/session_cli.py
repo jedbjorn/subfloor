@@ -165,7 +165,7 @@ def cmd_operator_action(args) -> int:
     if args.action == "release":
         while True:
             status = operator_api("GET", "status", args.shortname)
-            if status.get("binding", {}).get("state") == "dispatching":
+            if (status.get("binding") or {}).get("state") == "dispatching":
                 if not args.after_turn:
                     die("binding is dispatching; pass --after-turn to wait for release")
                 time.sleep(1)
