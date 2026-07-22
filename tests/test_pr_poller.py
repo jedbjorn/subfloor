@@ -484,6 +484,38 @@ class CutoverTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_beat_failure_never_blocks_the_poll(self):
+        # Pre-0068 DB (code newer than schema): the beat raises, the poll must
+        # still run — heartbeat error, not cycle error, and never a crash.
+        import contextlib
+        import io
+        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
+        con = build_db(tmp)
+        seed_shells(con)
+        seed_sprint_doc(con, 100)
+        con.execute("INSERT INTO watched_prs (repo, pr_number, shell_id, "
+                    "sprint_doc_id) VALUES ('o/r', 1, 1, 100)")
+        con.execute("DROP TABLE daemon_heartbeats")
+        con.commit()
+        con.close()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            poller = pr_poller.Poller(tmp, interval=30,
+                                      fetch=fetch_ok(gh_node(checks="PENDING")))
+            poller.start()
+            time.sleep(0.5)     # the first iteration runs before the first wait
+            poller.stop()
+            poller.join(timeout=5)
+        self.assertIn("heartbeat error", out.getvalue())
+        self.assertNotIn("cycle error", out.getvalue())
+        con = sqlite3.connect(tmp)
+        con.row_factory = sqlite3.Row
+        try:
+            self.assertIsNotNone(con.execute(
+                "SELECT last_seen FROM watched_prs").fetchone()["last_seen"])
+        finally:
+            con.close()
+
     def test_scheduler_self_disables_without_gh(self):
         import shutil
         old = shutil.which

@@ -437,7 +437,7 @@ class Poller(threading.Thread):
         import db_driver
         return db_driver.connect(self._db_path)
 
-    def run(self) -> None:  # pragma: no cover — exercised via poll_cycle tests
+    def run(self) -> None:  # pragma: no cover — thread loop; scheduler tests drive it
         if self._fetch is None and shutil.which("gh") is None:
             print("pr-poller: gh CLI not found — PR polling disabled "
                   "(install gh + login to enable)", flush=True)
@@ -447,7 +447,14 @@ class Poller(threading.Thread):
             try:
                 con = self._db()
                 try:
-                    beat(con, self._interval)
+                    try:
+                        beat(con, self._interval)
+                    except Exception as e:
+                        # The beat is ancillary liveness; polling is the
+                        # mission (#359). A beat raising into the cycle's
+                        # except would turn a working poller into a
+                        # dead-with-noise one — log and keep polling.
+                        print(f"pr-poller: heartbeat error ({e})", flush=True)
                     # The DB read is cheap and local; the bounded GitHub poll
                     # happens only while ACTIVE sprint watches exist.
                     if armed_watches(con):
