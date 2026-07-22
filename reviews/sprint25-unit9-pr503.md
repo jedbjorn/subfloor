@@ -152,3 +152,31 @@ regex (`^[A-Za-z0-9_.-]+$` per segment) at registration closes it.
 **1 Medium (M1), 5 Low — not review-clean.** M1 must be fixed (restore the
 beat/poll isolation + regression test); re-review on the fix push. L1–L5 go to
 the sprint report; none gates. On M1 fixed: review-clean, DEV4 merges.
+
+---
+
+# Re-review — fix commit @1f6d59a (2026-07-22)
+
+- Scope: M1 only (`2968c3b..1f6d59a`: +41/-2, `pr_poller.py` run() + one test).
+  L1–L5 stand as recorded — not re-raised.
+- **Guard restored — verified.** `Poller.run` now wraps `beat(con, …)` in its
+  own `try/except` (logged `pr-poller: heartbeat error`, cycle continues),
+  with the #359 rationale comment back. Exactly the retired daemon's isolation,
+  re-homed in the scheduler.
+- **Regression test restored — verified red-for-the-right-reason, not trusted.**
+  Ran hermetically from an archive extract:
+  - @1f6d59a: `test_pr_poller` 27/27 OK (incl. `test_beat_failure_never_blocks_the_poll`).
+  - Same new test against the *unfixed* @2968c3b `pr_poller.py`: **FAILS** —
+    output shows the old behavior verbatim (`cycle error (no such table:
+    daemon_heartbeats)`, poll skipped). A realistic beat failure turns it red.
+  - Not vacuous: `DROP TABLE daemon_heartbeats` guarantees the beat raises;
+    `assertIn("heartbeat error")` proves it did; `last_seen IS NOT NULL` proves
+    the poll ran after the raise; `assertNotIn("cycle error")` pins the
+    isolation. Covers the exact pre-0068 beat-before-poll ordering from M1.
+- No other behavior touched; the `# pragma: no cover` comment on `run()` is now
+  accurate (scheduler tests do drive it).
+
+## Re-review verdict
+
+**M1 fixed — REVIEW-CLEAN @1f6d59a.** 0 Major / 0 Medium open; L1–L5 to the
+sprint report. DEV4 merges on green CI; PLN1 owns the L3 watch-rebind at merge.
