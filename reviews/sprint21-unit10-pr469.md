@@ -1,5 +1,51 @@
 # Review — Sprint 21 unit 10: PR #469 vs conformance doc #22 F1 / spec doc #20
 
+## Re-review @12a6792 (2026-07-22) — **review-clean**
+
+Fix commit `12a6792 fix(session): surface managed binding recovery` (branch
+rebased onto main; a020f34 = rebased original, README deltas are main's #470/#471).
+Checks at head: tests ✅ verify ✅ render-check ✅ CodeQL ×3 ✅.
+
+M1 (SC-466, flag #23) verified fixed — dev took the refuse-early option:
+
+- `binding_for_enter` now raises ValueError when the selected managed binding is
+  in state `error`, *before* the `new_session` check and before main ever reaches
+  `open_session` — so no archive is created and no harness child is spawned
+  (the old failure fired post-spawn in `claim_lease`). main's existing
+  `except ValueError → sys.exit("session launch refused: …")` at run.py:929-934
+  surfaces it.
+- The message names both sanctioned exits with correct real signatures —
+  verified against session_cli.py operator parser: `./sc session retry
+  <shortname>` (error→starting per J1; starting→foreground is an allowed claim
+  edge, so enter works after retry) and `./sc session release <shortname>`.
+  Shortname comes from a new `JOIN shells` (FK-sound; no column collision —
+  only `s.shortname` is selected).
+- Ordering bonus: `--new-session` on an errored binding now gets the
+  retry-or-release message (both exits named) instead of the bare release
+  demand — strictly better than the old funnel-to-release.
+- Regression test `test_error_binding_refuses_before_archive_open_with_remedies`
+  is load-bearing: drives real `main()` with `open_session` patched to raise a
+  sentinel, so a refusal placed any later fails the test; asserts exact
+  SystemExit message, archive count unchanged, no `active_archive_id`, and the
+  binding row byte-identical (`error`, `managed=1`, `lease_pid` None,
+  `last_error` preserved).
+
+New observation, Low (extends L2, not a gate): the raise fires before the
+`if headless: enter_binding = None` reset (run.py:938), so a bare headless
+`./sc run <shortname>` of a shell whose managed binding is errored is now
+refused too — even though headless would have discarded the binding. No
+automated caller hits this (the wake dispatcher delivers via adapters, never
+via `sc run`; and it names bindings with `--session-binding` when it does
+boot), and the refusal is fail-closed with the same actionable message — but
+it contradicts the adjacent "headless keeps its existing ephemeral behavior"
+comment. Same family as L2; fold into any future cleanup of that leak.
+
+L1/L2/L3 stand as report notes (L3's enter-on-error half is now covered; the
+harness-mismatch path remains untested). Verdict: **review-clean** — every
+Medium fixed; merge unlocked under sprint authority.
+
+---
+
 - PR: #469 `fix(session): attach managed enter bindings` (fix/managed-enter-binding @6b54ac8, DEV4)
 - Scope: conformance F1 (Medium) — `./sc enter <planner>` managed-binding attach by
   default + `--new-session` refusal until release, in run.py.
