@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""Internal token-scoped client for provider session-control adapters.
-
-The public operator surface (``sc session`` plus GUI status) lands in sprint
-unit 7.  This lower-level client exists now so provider adapters never write
-binding rows directly.
-"""
+"""Session-control CLI: public operator commands plus adapter-only internals."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import NoReturn
 
 
-API_BASE = os.environ.get("SC_API_BASE", "")
+ENGINE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ENGINE / "scripts"))
+import ports as ports_mod  # noqa: E402
+
+API_BASE = os.environ.get("SC_API_BASE", "") or (
+    f"http://127.0.0.1:{ports_mod.resolve().get('port')}"
+)
 API_TOKEN = os.environ.get("SC_API_TOKEN", "")
 
 
@@ -25,11 +28,12 @@ def die(message: str) -> NoReturn:
     sys.exit(f"session-control: {message}")
 
 
-def api(method: str, path: str, payload: dict | None = None) -> dict:
-    if not API_BASE or not API_TOKEN:
+def api(method: str, path: str, payload: dict | None = None,
+        *, token_required: bool = True) -> dict:
+    if not API_BASE or (token_required and not API_TOKEN):
         die("SC_API_BASE + SC_API_TOKEN are required; boot through ./sc enter")
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    headers = ({"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {})
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
@@ -59,12 +63,21 @@ def print_status(payload: dict) -> None:
         return
     native = binding.get("native_session_id") or "pending"
     managed = "managed" if binding.get("managed") else "manual"
-    jobs = payload.get("jobs") or {}
-    queued = jobs.get("queued", 0)
+    archive = payload.get("archive") or {}
+    summary = payload.get("summary") or {}
+    queued = summary.get("queued", (payload.get("jobs") or {}).get("queued", 0))
+    errors = summary.get("errors", (payload.get("jobs") or {}).get("failed", 0))
+    engine_session = archive.get("session_id") or "pending"
+    model = archive.get("model") or "harness default"
+    owner = summary.get("owner") or "none"
     print(
-        f"binding {binding['binding_id']} · {binding['harness']}={native} · "
-        f"{binding['state']} · {managed} · queued={queued}"
+        f"binding {binding['binding_id']} · engine={engine_session} · "
+        f"{binding['harness']}={native} · model={model} · "
+        f"{binding['state']} · {managed} · owner={owner} · "
+        f"queued={queued} · errors={errors}"
     )
+    if summary.get("last_delivery"):
+        print(f"  last delivery: {summary['last_delivery']}")
     if binding.get("last_error"):
         print(f"  error: {binding['last_error']}")
 
@@ -124,6 +137,52 @@ def cmd_channel(args) -> int:
     return 0
 
 
+def operator_api(method: str, action: str, shortname: str,
+                 payload: dict | None = None) -> dict:
+    target = urllib.parse.quote(shortname, safe="")
+    return api(
+        method, f"/api/session-control/{action}/{target}", payload,
+        token_required=False,
+    )
+
+
+def cmd_operator_status(args) -> int:
+    if args.shortname:
+        print_status(operator_api("GET", "status", args.shortname))
+        return 0
+    print_status(api("GET", "/_sc/session-control"))
+    return 0
+
+
+def cmd_operator_manage(args) -> int:
+    print_status(operator_api(
+        "POST", "manage", args.shortname, {"sprint_ref": args.sprint}
+    ))
+    return 0
+
+
+def cmd_operator_action(args) -> int:
+    if args.action == "release":
+        while True:
+            status = operator_api("GET", "status", args.shortname)
+            if (status.get("binding") or {}).get("state") == "dispatching":
+                if not args.after_turn:
+                    die("binding is dispatching; pass --after-turn to wait for release")
+                time.sleep(1)
+                continue
+            try:
+                result = operator_api("POST", "release", args.shortname, {})
+                break
+            except SystemExit as exc:
+                if not args.after_turn or "dispatching" not in str(exc):
+                    raise
+                time.sleep(1)
+        print_status(result)
+        return 0
+    print_status(operator_api("POST", args.action, args.shortname, {}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sc session-control")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -158,8 +217,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_operator_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sc session")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    status = sub.add_parser("status")
+    status.add_argument("shortname", nargs="?")
+    status.set_defaults(fn=cmd_operator_status)
+
+    manage = sub.add_parser("manage")
+    manage.add_argument("shortname")
+    manage.add_argument("--sprint", required=True)
+    manage.set_defaults(fn=cmd_operator_manage)
+
+    release = sub.add_parser("release")
+    release.add_argument("shortname")
+    release.add_argument("--after-turn", action="store_true")
+    release.set_defaults(fn=cmd_operator_action, action="release")
+
+    retry = sub.add_parser("retry")
+    retry.add_argument("shortname")
+    retry.set_defaults(fn=cmd_operator_action, action="retry", after_turn=False)
+    return parser
+
+
 def main(argv: list[str]) -> int:
-    args = build_parser().parse_args(argv)
+    operator = bool(argv and argv[0] == "--operator")
+    if operator:
+        argv = argv[1:]
+    args = (build_operator_parser() if operator else build_parser()).parse_args(argv)
     return args.fn(args)
 
 

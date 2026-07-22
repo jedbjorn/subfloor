@@ -901,9 +901,9 @@ case "$cmd" in
   watch-daemon-down) sc_watch_daemon_down ;;
   watch-daemon-install)   sc_watch_daemon_install ;;
   watch-daemon-uninstall) sc_watch_daemon_uninstall ;;
-  # Provider-neutral planner wake control. `session-control` is the internal,
-  # token-scoped adapter client; the public operator `session` surface lands
-  # with the sprint's status/analytics unit.
+  # Provider-neutral planner wake control. `session-control` stays the internal,
+  # token-scoped adapter client; `session` is the public shortname-based surface.
+  session)            exec "$PY" "$S/session_cli.py" --operator "$@" ;;
   session-control)    exec "$PY" "$S/session_cli.py" "$@" ;;
   session-dispatcher) exec "$PY" "$S/session_dispatcher.py" "$@" ;;
   # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
@@ -1171,6 +1171,10 @@ super-coder — forkable shell substrate
                              inbox watcher; arm as a background task and its exit is your wake-up
   ./sc session-control …  internal token-scoped binding client for provider adapters
                              (status/manage/release/retry/bind/channel)
+  ./sc session status [shortname]
+  ./sc session manage <shortname> --sprint <ref>
+  ./sc session release <shortname> [--after-turn] · retry <shortname>
+                             inspect and manage provider-neutral planner wake
   ./sc session-dispatcher  run the provider-neutral wake dispatcher in the foreground
                              (`./sc serve` supervises it automatically)
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it

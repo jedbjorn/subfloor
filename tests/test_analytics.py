@@ -100,6 +100,7 @@ class ClaudeParserTest(unittest.TestCase):
         self.assertEqual(rows[0]["cache_write_tokens"], 5)
         self.assertEqual(rows[0]["title"], "fix the bug")
         self.assertEqual(rows[0]["provider"], "anthropic")
+        self.assertEqual(rows[0]["native_session_id"], "a")
 
     def test_cross_file_dedupe(self):
         # fork copies m1's line into b.jsonl; only b's fresh m2 may count there
@@ -226,7 +227,8 @@ class CodexParserTest(unittest.TestCase):
         f = day / "rollout-x.jsonl"
         lines = [
             json.dumps({"type": "session_meta", "timestamp": "2026-07-19T10:00:00Z",
-                        "payload": {"cwd": str(repo), "model_provider": "openai"}}),
+                        "payload": {"id": "thread-x", "cwd": str(repo),
+                                    "model_provider": "openai"}}),
             json.dumps({"type": "turn_context", "payload": {"model": "gpt-5.5"}}),
             # cumulative totals — the LAST event wins, never the sum
             json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
@@ -251,6 +253,7 @@ class CodexParserTest(unittest.TestCase):
         self.assertEqual(r["output_tokens"], 80)       # includes reasoning
         self.assertEqual(r["reasoning_tokens"], 20)    # informational
         self.assertEqual(r["model"], "gpt-5.5")
+        self.assertEqual(r["native_session_id"], "thread-x")
 
     def test_off_repo_bails_on_meta_line(self):
         # off-repo rollouts never earn a watermark row, so without the bail
@@ -287,7 +290,7 @@ class KimiParserTest(unittest.TestCase):
             (sess / "agents" / agent).mkdir(parents=True)
         (sess / "state.json").write_text(json.dumps({
             "createdAt": "2026-07-19T10:00:00Z", "updatedAt": "2026-07-19T10:30:00Z",
-            "title": "swarm run", "workDir": str(repo)}))
+            "id": "session-1", "title": "swarm run", "workDir": str(repo)}))
         rec = {"type": "usage.record", "model": "kimi-code/k3",
                "usage": {"inputOther": 10, "output": 5, "inputCacheRead": 7,
                          "inputCacheCreation": 0}}
@@ -308,6 +311,7 @@ class KimiParserTest(unittest.TestCase):
         self.assertEqual(r["cache_write_tokens"], 0)   # measured zero, not NULL
         self.assertEqual(r["provider"], "kimi")
         self.assertEqual(r["title"], "swarm run")
+        self.assertEqual(r["native_session_id"], "session-1")
 
 
 class OpencodeParserTest(unittest.TestCase):
@@ -454,6 +458,48 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(con.execute("SELECT ended_at FROM shell_memory_archives "
                                      "WHERE archive_id=10").fetchone()[0],
                          "2026-07-19T10:30:00Z")
+
+    def test_native_binding_attribution_precedes_fallback_without_duplicate_rows(self):
+        con = self.con()
+        con.execute(
+            "INSERT INTO shell_memory_archives "
+            "(archive_id, shell_id, session_id, date, started_at, harness) "
+            "VALUES (30, 2, '0009', '2026-07-19', '2026-07-19T11:00:00Z', 'codex')"
+        )
+        con.execute(
+            "INSERT INTO shell_session_bindings "
+            "(binding_id, archive_id, shell_id, harness, native_session_id, "
+            "state, managed) VALUES (40, 30, 2, 'codex', 'thread-exact', "
+            "'dormant', 1)"
+        )
+        base = {
+            "harness": "codex", "harness_session_ref": "/rollout.jsonl",
+            "native_session_id": "thread-exact", "provider": "openai",
+            "title": None, "started_at": "2020-01-01T00:00:00Z",
+            "ended_at": None, "input_tokens": 2, "output_tokens": 3,
+            "cache_read_tokens": None, "cache_write_tokens": None,
+            "reasoning_tokens": None, "status": "ok", "parser_version": "1",
+            "cwd": "/outside/the/repo",
+        }
+        batch = [{**base, "model": "m1"}, {**base, "model": "m2"}]
+        for row in batch:
+            analytics._upsert(con, row, "2026-07-19T13:00:00Z")
+        con.commit()
+
+        attributed, shell_only = analytics._attribute(con, batch, lambda _m: None)
+        con.commit()
+
+        self.assertEqual((2, 0), (attributed, shell_only))
+        got = [tuple(row) for row in con.execute(
+            "SELECT model, archive_id, shell_id, input_tokens, output_tokens "
+            "FROM session_token_usage ORDER BY model"
+        )]
+        self.assertEqual([
+            ("m1", 30, 2, 2, 3), ("m2", 30, 2, 2, 3),
+        ], got)
+        self.assertEqual(2, con.execute(
+            "SELECT COUNT(*) FROM session_token_usage"
+        ).fetchone()[0])
 
     def test_shell_only_attribution(self):
         """Rows predating lifecycle archives still get shell_id from cwd alone;

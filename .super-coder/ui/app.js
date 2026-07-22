@@ -514,6 +514,11 @@ async function renderDefaultModels(root, s) {
 function renderHarness(root, s) {
   const groups = [{ title: "Operational", items: [
     { label: "CURRENT STATE", text: s.current_state || "", editable: true },
+    ...(s.session_control ? [{
+      label: "SESSION CONTROL",
+      text: `${s.session_control.state} · queued=${s.session_control.queued} · errors=${s.session_control.errors}`,
+      node: sessionControlStatus(s.session_control),
+    }] : []),
     ...(s.system_prompt ? [{ label: "SYSTEM PROMPT", text: s.system_prompt }] : []),
   ] }];
 
@@ -550,6 +555,22 @@ function renderHarness(root, s) {
     for (const sec of g.items) panel.append(accordion(sec, s));
   }
   root.append(panel);
+}
+
+function sessionControlStatus(c, { shortname = null } = {}) {
+  const box = el("div", { className: "session-control-status" });
+  const stateClass = c.state === "error" || c.errors ? " warn" : (c.managed ? " ok" : "");
+  box.append(el("div", { className: "session-control-line" },
+    ...(shortname ? [el("b", { className: "mono" }, shortname)] : []),
+    el("span", { className: "pill" + stateClass }, c.state),
+    el("span", { className: "pill" }, c.managed ? "managed" : "manual"),
+    el("span", { className: "pill" + (c.queued ? " warn" : "") }, `queued ${c.queued || 0}`),
+    el("span", { className: "pill" + (c.errors ? " warn" : "") }, `errors ${c.errors || 0}`)));
+  box.append(el("div", { className: "muted" },
+    [c.harness, c.model, c.engine_session_id ? `engine ${c.engine_session_id}` : null,
+     c.last_delivery ? `last ${localTime(c.last_delivery)}` : null]
+      .filter(Boolean).join(" · ")));
+  return box;
 }
 
 function entryList(entries) {
@@ -1900,6 +1921,9 @@ function anSessionCard(c, sprintTitles) {
   head.append(el("span", { className: "pill" + (c.unattributed ? " warn" : "") },
     c.unattributed ? "unattributed" : c.shell || "?"));
   head.append(el("span", { className: "pill" }, c.harness));
+  if (c.control_state) head.append(el("span", {
+    className: "pill" + (c.control_state === "error" ? " warn" : ""),
+  }, c.control_managed ? c.control_state : `${c.control_state} · manual`));
   if (c.models) head.append(el("span", { className: "sess-model" }, c.models));
   const title = c.title || "";
   head.append(el("span", { className: "sess-title" },
@@ -1920,7 +1944,6 @@ function anSessionCard(c, sprintTitles) {
   if (c.sprint_ref) meta.push(["sprint", sprintTitles[c.sprint_ref] || "#" + c.sprint_ref]);
   if (c.status !== "ok") meta.push(["status", c.status]);
   if (meta.length) body.append(statRow(meta));
-  body.append(el("code", { className: "sess-ref" }, c.harness_session_ref));
   row.append(body);
   return row;
 }
@@ -1964,6 +1987,14 @@ async function renderAnalytics(root) {
     anSelect("Harness", "harness", filters.harnesses, reset("harness")),
     anSelect("Model", "model", filters.models, reset("model")),
     rangeSeg));
+
+  if (usage.session_control?.length) {
+    const control = el("div", { className: "card session-control-card" },
+      microlabel("Planner sessions"));
+    for (const c of usage.session_control)
+      control.append(sessionControlStatus(c, { shortname: c.shortname }));
+    root.append(control);
+  }
 
   // stat cards, then the graph in ITS OWN card: no card selected = the
   // combined total is graphed; clicking a card graphs that class, clicking it

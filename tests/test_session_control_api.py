@@ -104,6 +104,90 @@ class ControlMutationTest(unittest.TestCase):
             "SELECT COUNT(*) FROM session_wake_jobs"
         ).fetchone()[0])
 
+    def test_status_contract_includes_archive_owner_delivery_and_counts(self):
+        message_id = add_message(self.con)
+        self.con.execute(
+            "UPDATE shell_memory_archives SET model='model-x', sprint_ref='21' "
+            "WHERE archive_id=10"
+        )
+        self.con.execute(
+            "INSERT INTO session_wake_jobs "
+            "(binding_id, trigger_message_id, state, finished_at) "
+            "VALUES (20, ?, 'done', '2026-07-22 05:00:00')", (message_id,)
+        )
+        self.con.execute(
+            "UPDATE shell_session_bindings SET lease_pid=88 WHERE binding_id=20"
+        )
+        self.con.commit()
+
+        payload = server.get_session_control(self.con, 1, 20)
+
+        self.assertEqual(("0001", "model-x", "21"), (
+            payload["archive"]["session_id"], payload["archive"]["model"],
+            payload["archive"]["sprint_ref"],
+        ))
+        self.assertEqual(("lease", 88, 0, 0, "2026-07-22 05:00:00"), (
+            payload["summary"]["owner"], payload["summary"]["owner_pid"],
+            payload["summary"]["queued"], payload["summary"]["errors"],
+            payload["summary"]["last_delivery"],
+        ))
+
+    def test_gui_overviews_are_compact_and_credential_free(self):
+        self.con.execute(
+            "UPDATE shell_session_bindings SET control_endpoint='unix:///secret.sock', "
+            "control_capabilities=? WHERE binding_id=20",
+            (json.dumps({
+                "deliver": True,
+                "token_file": "/runtime/fake-20.token",
+            }),),
+        )
+        self.con.commit()
+
+        shell_status = server.get_shell(self.con, 1)["session_control"]
+        analytics_status = server.get_analytics_usage(
+            self.con, {}
+        )["session_control"][0]
+
+        expected = {
+            "binding_id", "engine_session_id", "harness", "model", "state",
+            "managed", "queued", "errors", "last_delivery",
+        }
+        self.assertEqual(expected, set(shell_status))
+        self.assertEqual(expected | {"shortname"}, set(analytics_status))
+        self.assertNotIn("token", json.dumps([shell_status, analytics_status]))
+        self.assertNotIn("endpoint", json.dumps([shell_status, analytics_status]))
+
+    def test_manage_records_valid_sprint_and_rejects_unknown_one(self):
+        self.con.execute(
+            "INSERT INTO roadmap (feature_id, title, roadmap_status) "
+            "VALUES (1, 'f', 'in_progress')"
+        )
+        self.con.execute(
+            "INSERT INTO documents (document_id, title, kind, body, feature_id) "
+            "VALUES (21, 'SPRINT: x', 'doc', 'status: ACTIVE', 1)"
+        )
+        self.con.commit()
+
+        payload, error = server.manage_session_control(
+            self.con, 1, 20, sprint_ref="21"
+        )
+        self.assertIsNone(error)
+        self.assertEqual("21", payload["archive"]["sprint_ref"])
+        again, again_error = server.manage_session_control(
+            self.con, 1, 20, sprint_ref="21"
+        )
+        self.assertIsNone(again_error)
+        self.assertEqual(20, again["binding"]["binding_id"])
+
+        denied, denied_error = server.manage_session_control(
+            self.con, 1, 20, sprint_ref="999"
+        )
+        self.assertIsNone(denied)
+        self.assertEqual("unknown sprint document '999'", denied_error)
+        self.assertEqual("21", self.con.execute(
+            "SELECT sprint_ref FROM shell_memory_archives WHERE archive_id=10"
+        ).fetchone()[0])
+
     def test_manage_rejects_approval_prompting_posture_without_mutation(self):
         message_id = add_message(self.con)
         self.con.execute(
@@ -199,6 +283,46 @@ class ControlMutationTest(unittest.TestCase):
         self.assertIsNone(self.con.execute(
             "SELECT read_at FROM shell_messages WHERE message_id=?", (message_id,)
         ).fetchone()[0])
+
+    def test_release_removes_provider_declared_runtime_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            token = runtime / "fake-20.token"
+            token.write_text("secret")
+            self.con.execute(
+                "UPDATE shell_session_bindings SET control_capabilities=? "
+                "WHERE binding_id=20",
+                (json.dumps({"deliver": True, "token_file": str(token)}),),
+            )
+            self.con.commit()
+            with mock.patch.object(server, "SESSION_CREDENTIAL_DIR", runtime):
+                payload, error = server.release_session_control(self.con, 1, 20)
+            self.assertIsNone(error)
+            self.assertEqual("released", payload["binding"]["state"])
+            self.assertFalse(token.exists())
+
+    def test_release_rejects_credential_path_outside_binding_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            runtime.mkdir()
+            outside = Path(tmp) / "do-not-delete.token"
+            outside.write_text("secret")
+            self.con.execute(
+                "UPDATE shell_session_bindings SET control_capabilities=? "
+                "WHERE binding_id=20",
+                (json.dumps({"deliver": True, "token_file": str(outside)}),),
+            )
+            self.con.commit()
+            with mock.patch.object(server, "SESSION_CREDENTIAL_DIR", runtime):
+                payload, error = server.release_session_control(self.con, 1, 20)
+            self.assertIsNone(payload)
+            self.assertEqual(
+                "provider credential path is outside the binding runtime scope", error
+            )
+            self.assertTrue(outside.exists())
+            self.assertEqual("dormant", self.con.execute(
+                "SELECT state FROM shell_session_bindings WHERE binding_id=20"
+            ).fetchone()[0])
 
     def test_release_refuses_running_dispatch_without_mutation(self):
         self.con.execute(
@@ -426,6 +550,38 @@ class TokenScopeHttpTest(unittest.TestCase):
                 "ORDER BY binding_id"
             ).fetchall()
         self.assertEqual([(20, 1), (21, 0)], rows)
+
+    def test_public_operator_routes_target_shortname_and_require_valid_sprint(self):
+        status, payload = self.request(
+            "GET", "/api/session-control/status/PLN2"
+        )
+        self.assertEqual((200, 21, "0001", "native-2"), (
+            status, payload["binding"]["binding_id"],
+            payload["archive"]["session_id"],
+            payload["binding"]["native_session_id"],
+        ))
+
+        status, payload = self.request(
+            "POST", "/api/session-control/manage/PLN2",
+            body={"sprint_ref": "404"},
+        )
+        self.assertEqual((409, "unknown sprint document '404'"),
+                         (status, payload["error"]))
+
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT INTO documents (document_id, title, kind, body) "
+                "VALUES (21, 'SPRINT: x', 'doc', 'status: ACTIVE')"
+            )
+            con.commit()
+        status, payload = self.request(
+            "POST", "/api/session-control/manage/PLN2",
+            body={"sprint_ref": "21"},
+        )
+        self.assertEqual((200, 21, 1, "21"), (
+            status, payload["binding"]["binding_id"],
+            payload["binding"]["managed"], payload["archive"]["sprint_ref"],
+        ))
 
 
 if __name__ == "__main__":
