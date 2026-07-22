@@ -230,52 +230,72 @@ def supersede_for_enter(con, shell_id: int, *, repo_root: Path,
     supersede.  Raises while a validated owner (or its orphaned group) still
     holds a binding — never release under a live session.
     """
-    rows = con.execute(
-        "SELECT b.*, a.session_id, a.model AS archive_model, "
-        "a.provider AS archive_provider, s.shortname, s.flavor "
-        "FROM shell_session_bindings b "
-        "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
-        "JOIN shells s ON s.shell_id=b.shell_id "
-        "WHERE b.shell_id=? AND (b.managed=1 OR b.archive_id="
-        "(SELECT active_archive_id FROM shells WHERE shell_id=?))",
-        (shell_id, shell_id),
-    ).fetchall()
-    if not rows:
-        return None
-    # Fence first, write second: reconcile commits/rolls back internally, so it
-    # must run before any mutation on this connection.
-    for row in rows:
-        status = reconcile_binding(con, row["binding_id"], repo_root=repo_root,
-                                   proc_root=proc_root)
-        if status not in ("vacant", "stale-cleared"):
-            raise ValueError(
-                f"session binding {row['binding_id']} is held by a live owner "
-                f"({status}) — attach to the running session, or "
-                f"./sc session release {row['shortname']} first"
+    # The ownership fence and release are one write transaction. Otherwise a
+    # dispatcher can claim the binding after reconciliation and before the
+    # release, leaving a live lease on a row we just marked released (#485).
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        rows = con.execute(
+            "SELECT b.*, a.session_id, a.model AS archive_model, "
+            "a.provider AS archive_provider, s.shortname, s.flavor "
+            "FROM shell_session_bindings b "
+            "JOIN shell_memory_archives a ON a.archive_id=b.archive_id "
+            "JOIN shells s ON s.shell_id=b.shell_id "
+            "WHERE b.shell_id=? AND (b.managed=1 OR b.archive_id="
+            "(SELECT active_archive_id FROM shells WHERE shell_id=?))",
+            (shell_id, shell_id),
+        ).fetchall()
+        if not rows:
+            con.rollback()
+            return None
+
+        for row in rows:
+            status = _reconcile_binding_locked(
+                con, row["binding_id"], repo_root=repo_root,
+                proc_root=proc_root)
+            current = _binding_context(con, row["binding_id"])
+            if status not in ("vacant", "stale-cleared"):
+                raise ValueError(
+                    f"session binding {row['binding_id']} is held by a live owner "
+                    f"({status}) — attach to the running session, or "
+                    f"./sc session release {row['shortname']} first"
+                )
+            # claim_batch moves to dispatching before the resume child can
+            # register its lease. No PID in that window does not mean vacant;
+            # releasing here could start a fresh interactive writer alongside
+            # a headless turn that has already been claimed.
+            if current["state"] == "dispatching":
+                raise ValueError(
+                    f"session binding {row['binding_id']} has a dispatch in progress; "
+                    "wait for it to finish before starting a fresh session"
+                )
+
+        primary = None
+        for row in rows:
+            current = _binding_context(con, row["binding_id"])
+            if current["state"] != "released":
+                session_control.transition_binding(
+                    con, row["binding_id"], expected=current["state"],
+                    target="released")
+            con.execute(
+                "UPDATE shell_session_bindings SET managed=0, "
+                "updated_at=datetime('now') WHERE binding_id=?",
+                (row["binding_id"],),
             )
-    primary = None
-    for row in rows:
-        current = _binding_context(con, row["binding_id"])
-        if current["state"] != "released":
-            session_control.transition_binding(
-                con, row["binding_id"], expected=current["state"],
-                target="released")
-        con.execute(
-            "UPDATE shell_session_bindings SET managed=0, "
-            "updated_at=datetime('now') WHERE binding_id=?",
-            (row["binding_id"],),
-        )
-        con.execute(
-            "UPDATE session_wake_jobs SET state='cancelled', "
-            "finished_at=datetime('now'), "
-            "last_error='superseded by interactive enter' "
-            "WHERE binding_id=? AND state IN ('queued','failed')",
-            (row["binding_id"],),
-        )
-        if primary is None or row["managed"]:
-            primary = row
-    con.commit()
-    return dict(primary)
+            con.execute(
+                "UPDATE session_wake_jobs SET state='cancelled', "
+                "finished_at=datetime('now'), "
+                "last_error='superseded by interactive enter' "
+                "WHERE binding_id=? AND state IN ('queued','failed')",
+                (row["binding_id"],),
+            )
+            if primary is None or row["managed"]:
+                primary = row
+        con.commit()
+        return dict(primary)
+    except Exception:
+        con.rollback()
+        raise
 
 
 def register_native_session(con, binding_id: int, native_session_id: str, *,
@@ -513,52 +533,54 @@ def _reconcile_active_channel(con, row: dict, *, repo_root: Path,
     return True
 
 
+def _reconcile_binding_locked(con, binding_id: int, *, repo_root: Path,
+                              proc_root: Path = PROC) -> str:
+    """Validate ownership inside the caller's active write transaction."""
+    row = _binding_context(con, binding_id)
+    _reconcile_active_channel(con, row, repo_root=repo_root, proc_root=proc_root)
+    status, pids = _recorded_owner_status(
+        row, repo_root=repo_root, proc_root=proc_root)
+    if status in ("vacant", "live", "cleanup"):
+        return status
+    if status == "orphan-group":
+        target = "released" if row["state"] == "released" else "error"
+        session_control.transition_binding(
+            con, binding_id, expected=row["state"], target=target)
+        con.execute(
+            "UPDATE shell_session_bindings SET last_error=?, "
+            "updated_at=datetime('now') WHERE binding_id=?",
+            ("recorded owner exited but process group survives: "
+             + ",".join(map(str, pids)), binding_id),
+        )
+        return status
+
+    if row["state"] in ("released", "error"):
+        target = row["state"]
+    else:
+        target = "dormant" if row.get("native_session_id") else "error"
+    error = (None if row.get("native_session_id")
+             else "stale owner and no native session id")
+    session_control.transition_binding(
+        con, binding_id, expected=row["state"], target=target)
+    con.execute(
+        "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
+        "supervisor_pid=NULL, supervisor_start_ticks=NULL, last_error=?, "
+        "updated_at=datetime('now') WHERE binding_id=? "
+        "AND lease_pid=? AND lease_start_ticks=?",
+        (error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
+    )
+    return "stale-cleared"
+
+
 def reconcile_binding(con, binding_id: int, *, repo_root: Path,
                       proc_root: Path = PROC) -> str:
     """Validate recorded ownership before a claim or dispatcher decision."""
     con.execute("BEGIN IMMEDIATE")
     try:
-        row = _binding_context(con, binding_id)
-        channel_cleared = _reconcile_active_channel(
-            con, row, repo_root=repo_root, proc_root=proc_root)
-        status, pids = _recorded_owner_status(
-            row, repo_root=repo_root, proc_root=proc_root)
-        if status in ("vacant", "live", "cleanup"):
-            if channel_cleared:
-                con.commit()
-            else:
-                con.rollback()
-            return status
-        if status == "orphan-group":
-            target = "released" if row["state"] == "released" else "error"
-            session_control.transition_binding(
-                con, binding_id, expected=row["state"], target=target)
-            con.execute(
-                "UPDATE shell_session_bindings SET last_error=?, "
-                "updated_at=datetime('now') WHERE binding_id=?",
-                ("recorded owner exited but process group survives: "
-                 + ",".join(map(str, pids)), binding_id),
-            )
-            con.commit()
-            return status
-
-        if row["state"] in ("released", "error"):
-            target = row["state"]
-        else:
-            target = "dormant" if row.get("native_session_id") else "error"
-        error = (None if row.get("native_session_id")
-                 else "stale owner and no native session id")
-        session_control.transition_binding(
-            con, binding_id, expected=row["state"], target=target)
-        con.execute(
-            "UPDATE shell_session_bindings SET lease_pid=NULL, lease_start_ticks=NULL, "
-            "supervisor_pid=NULL, supervisor_start_ticks=NULL, last_error=?, "
-            "updated_at=datetime('now') WHERE binding_id=? "
-            "AND lease_pid=? AND lease_start_ticks=?",
-            (error, binding_id, row["lease_pid"], row["lease_start_ticks"]),
-        )
+        status = _reconcile_binding_locked(
+            con, binding_id, repo_root=repo_root, proc_root=proc_root)
         con.commit()
-        return "stale-cleared"
+        return status
     except Exception:
         con.rollback()
         raise

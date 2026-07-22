@@ -560,6 +560,85 @@ class SupersedeForEnterTest(unittest.TestCase):
             "WHERE binding_id=?", (binding["binding_id"],)).fetchone()
         self.assertEqual(("foreground", 1, 501), tuple(row))
 
+    def test_dispatch_claim_before_lease_refuses_without_cancelling_work(self):
+        con = make_db()
+        self.addCleanup(con.close)
+        binding = self._managed_binding(con)
+        con.execute(
+            "UPDATE shell_session_bindings SET state='dispatching' "
+            "WHERE binding_id=?", (binding["binding_id"],))
+        con.execute(
+            "INSERT INTO session_wake_jobs "
+            "(binding_id, trigger_message_id, state, attempt_count) "
+            "VALUES (?, 1, 'running', 1)", (binding["binding_id"],))
+        con.commit()
+
+        with self.assertRaisesRegex(ValueError, "dispatch in progress"):
+            supervisor.supersede_for_enter(con, 1, repo_root=Path("/none"))
+
+        row = con.execute(
+            "SELECT state, managed, lease_pid, lease_start_ticks "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("dispatching", 1, None, None), tuple(row))
+        job = con.execute(
+            "SELECT state, attempt_count, finished_at, last_error "
+            "FROM session_wake_jobs WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("running", 1, None, None), tuple(job))
+
+    def test_reconcile_and_release_hold_one_write_lock(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = str(Path(tmp.name) / "supersede.db")
+        con = make_db(path)
+        self.addCleanup(con.close)
+        binding = supervisor.ensure_binding(
+            con, archive_id=10, shell_id=1, harness="claude",
+            native_session_id="native-7", managed=True)
+        con.execute(
+            "UPDATE shell_session_bindings SET state='dormant' "
+            "WHERE binding_id=?", (binding["binding_id"],))
+        con.commit()
+        proc = FakeProc(self)
+        repo = proc.root / "repo"
+        worktree = repo / ".sc-worktrees" / "dev1"
+        proc.add(502, ticks=52, command=("claude",), cwd=worktree)
+        original = supervisor._reconcile_binding_locked
+
+        def competing_claim(*args, **kwargs):
+            contender = sqlite3.connect(path, timeout=0)
+            contender.row_factory = sqlite3.Row
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    supervisor.claim_lease(
+                        contender, binding["binding_id"], 502,
+                        repo_root=repo, state="foreground", proc_root=proc.root)
+            finally:
+                contender.close()
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+                supervisor, "_reconcile_binding_locked",
+                side_effect=competing_claim):
+            superseded = supervisor.supersede_for_enter(
+                con, 1, repo_root=repo, proc_root=proc.root)
+
+        self.assertEqual(binding["binding_id"], superseded["binding_id"])
+        row = con.execute(
+            "SELECT state, managed, lease_pid, lease_start_ticks "
+            "FROM shell_session_bindings WHERE binding_id=?",
+            (binding["binding_id"],)).fetchone()
+        self.assertEqual(("released", 0, None, None), tuple(row))
+
+        contender = sqlite3.connect(path, timeout=0)
+        contender.row_factory = sqlite3.Row
+        self.addCleanup(contender.close)
+        with self.assertRaises(session_control.InvalidStateTransition):
+            supervisor.claim_lease(
+                contender, binding["binding_id"], 502,
+                repo_root=repo, state="foreground", proc_root=proc.root)
+
     def test_resume_reuses_exact_archive_without_creating_or_rewriting_it(self):
         con = make_db()
         self.addCleanup(con.close)
