@@ -66,6 +66,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
+import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
@@ -320,6 +321,14 @@ def migrate_or_rebuild() -> None:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
+    # Spec #20: update/materialize refuses while live Interface state exists
+    # (non-ended session, unreleased binding, nonterminal batch, input
+    # ambiguity) — same guard as rebuild, before any structural change.
+    reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
+    if reasons:
+        sys.exit(
+            "update: refusing — live Interface state exists; drain/reconcile "
+            "it first:\n  - " + "\n  - ".join(reasons))
     rebuild_mod.backup_existing()  # restore point before any structural change
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
