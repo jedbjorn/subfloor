@@ -1886,6 +1886,11 @@ class Handler(BaseHTTPRequestHandler):
                 if "status" in body and body["status"] not in TASK_STATUSES:
                     return self._send(400, {"error": f"status must be one of "
                                             f"{', '.join(sorted(TASK_STATUSES))}"})
+                if "title" in body:
+                    # same invariant as task add — an edit may not blank the title
+                    body["title"] = (body.get("title") or "").strip()
+                    if not body["title"]:
+                        return self._send(400, {"error": "title must be non-empty"})
                 if body.get("status") == "done":
                     body.setdefault("completed_date", date.today().isoformat())
                 ok, err = patch_columns(con, "spec_tasks", "task_id", tid,
