@@ -109,8 +109,14 @@ class ProbeTest(unittest.TestCase):
             (True, True, True),
         )
 
-    def test_unknown_version_fails_active_closed_but_keeps_flag_tested_resume(self):
+    def test_newer_version_is_accepted_on_feature_probe_evidence(self):
         probe = probe_claude(self.runner("2.2.0 (Claude Code)"))
+        self.assertTrue(probe["create"])
+        self.assertTrue(probe["active_delivery"])
+        self.assertTrue(probe["resume"])
+
+    def test_older_version_fails_active_closed_but_keeps_flag_tested_resume(self):
+        probe = probe_claude(self.runner("2.0.9 (Claude Code)"))
         self.assertFalse(probe["create"])
         self.assertFalse(probe["active_delivery"])
         self.assertTrue(probe["resume"])

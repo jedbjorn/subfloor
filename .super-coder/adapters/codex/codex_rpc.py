@@ -27,12 +27,16 @@ class CodexRpcError(RuntimeError):
     """The app-server returned a JSON-RPC error."""
 
 
-SUPPORTED_MAJOR = 0
-SUPPORTED_MINOR = 144
+# Validated version floor. Newer CLIs are accepted on feature-probe evidence
+# (the --help detection below is the real capability gate); older ones fail
+# closed. Support-latest policy: a version bump alone must never wedge a
+# launch (#483) — protocol drift in a future CLI fails loudly at RPC time.
+MIN_SUPPORTED_MAJOR = 0
+MIN_SUPPORTED_MINOR = 144
 
 
 def probe_codex(run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> dict:
-    """Probe the installed CLI and fail active control closed on unknown versions."""
+    """Probe the installed CLI; versions below the floor fail active control closed."""
     version_call = run(
         ["codex", "--version"], capture_output=True, text=True, timeout=5, check=False
     )
@@ -50,8 +54,8 @@ def probe_codex(run: Callable[..., subprocess.CompletedProcess] = subprocess.run
     app_text = (app_help.stdout or "") + (app_help.stderr or "")
     resume_text = (resume_help.stdout or "") + (resume_help.stderr or "")
     known_version = bool(
-        match and int(match.group(1)) == SUPPORTED_MAJOR
-        and int(match.group(2)) == SUPPORTED_MINOR
+        match and (int(match.group(1)), int(match.group(2)))
+        >= (MIN_SUPPORTED_MAJOR, MIN_SUPPORTED_MINOR)
     )
     unix_transport = app_help.returncode == 0 and "unix://" in app_text and "--listen" in app_text
     resume = resume_help.returncode == 0 and "SESSION_ID" in resume_text
