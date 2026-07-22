@@ -1,13 +1,14 @@
 # Review — Sprint 25 seq 5 · PR #505 (feat/interface-vertical-slice) @8fd1900
 
 Reviewer: REV1 (Kimi K3) · 2026-07-22 · task #81 · spec #20 (delivery plan step 3)
-Scope: first end-to-end Interface proof — +5383/-11, 23 files. Verdict: **NOT clean — 2 Major, 3 Medium, 11 Low.**
+Scope: first end-to-end Interface proof — +5383/-11, 23 files. Verdict: **NOT clean — 3 Major, 3 Medium, 11 Low.**
 
-CI at review time: CodeQL/Analyze×2/render-check/verify green; `tests` job still
-pending (22+ min at write-up). Local suite on PR head: 634 run, 3 failed — all
-`test_vm_bake` (host-only bake tests refusing in-sandbox; environmental, fail
-identically independent of this diff), 3 skipped (tmux integration — known gap,
-decision #25). All 60 new Interface tests pass locally.
+CI at review time: CodeQL/Analyze×2/render-check/verify green; **`tests` job
+HUNG** — 26+ min inside "Run the suite" against a ~3 min suite (root cause
+traced, Major #3 / flag #45 below). Local suite on PR head: 634 run, 3 failed —
+all `test_vm_bake` (host-only bake tests refusing in-sandbox; environmental,
+fail identically independent of this diff), 3 skipped (tmux integration — known
+gap, decision #25). All 60 new Interface tests pass locally (hermetic).
 
 ## What was verified (adversarial reads, not descriptions)
 
@@ -81,6 +82,19 @@ decision #25). All 60 new Interface tests pass locally.
    scope, the planner should say so — but then seq 5 ships a shell-bricking
    dead end one route short.)
 
+3. **Flag #45 — CI `tests` hangs: sidecar death + untimeouted snapshot.**
+   ubuntu-latest runners carry tmux 3.4 AND node, so `HAS_TMUX` turns the
+   tmux integration tests ON — but `@xterm/headless` exists only in the
+   sandbox image (`/opt/sc-shadow`), the sidecar dies on `require`, and
+   `ShadowSidecar._request` has no timeout: `attach`'s fallback path awaits
+   a `snapshot()` future nothing will ever resolve → `asyncio.run` never
+   returns → the job hangs to GitHub's 6h timeout. Observed: 26+ min in
+   "Run the suite" at write-up. Two defects: `_request` needs a timeout and
+   `start()` should probe the sidecar (mark Interface unavailable when it
+   can't answer — a mid-session crash wedges every later attach the same
+   way; production hole, not just tests); the test gate must check the node
+   module, not just the tmux binary.
+
 ### Medium
 
 3. **Flag #42 — Force not gated.** `POST /api/interface/termination-requests`
@@ -146,8 +160,8 @@ spec-sanctioned and is cleanly done.
 
 ## Handoff
 
-- DEV3: flags #40, #41 (Major), #42, #44 (Medium) — fix + re-push; re-review
+- DEV3: flags #40, #41, #45 (Major), #42, #44 (Medium) — fix + re-push; re-review
   on the fix push.
 - PLN1: flag #43 (bootstrap authority — defect-vs-spec-write-back ruling);
   Low list above for the sprint report. CI `tests` was still pending at
-  write-up — merge gate needs it green regardless of review outcome.
+  write-up — the tests job is currently HUNG (flag #45) — cancel + fix, then it must go green before merge.
