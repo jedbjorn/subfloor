@@ -1,11 +1,22 @@
----
-name: docs
-description: Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.
-category: substrate
-common: false
----
+-- 0077 — reseed: docs skill — single-writer note.
+--
+-- Sprint 25 ruling (decision #20) deferred SC-012/013/014: rendered artifacts
+-- (content.sql + flat renders) are created only by manual admin-shell or GUI
+-- actions, so a single in-process API lock suffices and cross-process
+-- concurrency is out of scope for v1 (roadmap #21). The docs skill's Author
+-- section now says so. Source asset updated in the same commit; this trailing
+-- forward reseed (UPSERT by name; skill_id + grants preserved) carries it to
+-- installed forks and fresh builds alike.
 
-# docs — author & review documents
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'docs',
+  'Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
+  'substrate',
+  NULL,
+  0,
+  '# docs — author & review documents
 
 The DB owns document bodies: a `documents` row is the source — NEVER author a
 loose `.md` file as the canonical body. `sc render` writes the read-only flat
@@ -22,10 +33,10 @@ copy to `specs_sc/` / `docs_sc/`; the GUI opens it rendered in md-converter.
 
 Feature = the `roadmap` row; exists from `brainstorm` onward, before any spec.
 Specs hang off the feature, not off each other: several unfrozen specs per
-feature, each a `documents (kind='spec')` row, ordered by `seq`. No
+feature, each a `documents (kind=''spec'')` row, ordered by `seq`. No
 feature-to-feature links; no second roadmap row for related work — related
 work = another spec under the same feature. Freeze = the ship-time record of
-what was built to; it never gates the feature's other specs.
+what was built to; it never gates the feature''s other specs.
 
 | state | test | meaning |
 |---|---|---|
@@ -33,7 +44,7 @@ what was built to; it never gates the feature's other specs.
 | **active** | unfrozen + has rows in `spec_tasks` | the spec being built now |
 | **backlog** | unfrozen, no task plan | the pile, ordered by `seq` |
 
-The **doc** (`kind='doc'`) = the feature's readable face — write it when the
+The **doc** (`kind=''doc''`) = the feature''s readable face — write it when the
 first spec ships, under the same `feature_id`. Sibling of the specs, not a
 parent.
 
@@ -46,7 +57,7 @@ work-stream in the same act:
 
 ```
 sc mem get projects   # existing work-streams — pick the fit
-sc mem get roadmap    # this feature's current project_id
+sc mem get roadmap    # this feature''s current project_id
 ```
 
 | case | action |
@@ -54,20 +65,20 @@ sc mem get roadmap    # this feature's current project_id
 | new feature | create pre-assigned: `sc mem roadmap add "<title>" --project <shortname>` |
 | existing + Ungrouped | `sc mem roadmap project <feature_id> <shortname>` |
 | no fitting stream | `sc mem project add <shortname> "<title>" --purpose "…"` -> then assign |
-| already correctly assigned | no-op — don't churn |
+| already correctly assigned | no-op — don''t churn |
 
 Auto-assign when only one plausible fit / it clearly belongs to an existing
 stream. Surface to the FnB only when ambiguous — several streams fit, or a
-new stream you're unsure how to name. Exempt (as with stages): work that
-isn't a feature/spec (a quick fix) needs no work-stream.
+new stream you''re unsure how to name. Exempt (as with stages): work that
+isn''t a feature/spec (a quick fix) needs no work-stream.
 
 ## Review first
 
-Before writing — don't duplicate, don't re-litigate:
+Before writing — don''t duplicate, don''t re-litigate:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
-sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"   # repo's own docs (map db)
+sc map-sql "SELECT path FROM dr_filepath WHERE role=''doc'';"   # repo''s own docs (map db)
 ```
 
 Spec touches a recorded decision -> honor it, or supersede explicitly: say so
@@ -84,10 +95,10 @@ in-process API lock — sufficient because these artifacts only ever come from
 manual admin-shell or GUI actions (single writer by design; cross-process
 concurrency is out of scope for v1, decision #20 / roadmap #21).
 ```
-# a doc against a feature (kind='doc'); DB owns the body:
+# a doc against a feature (kind=''doc''); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
 
-# a feature's next spec stage (kind='spec'); seq auto-advances:
+# a feature''s next spec stage (kind=''spec''); seq auto-advances:
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
@@ -101,17 +112,17 @@ sc mem doc edit <document_id> --body-file ./draft.md
 sc mem doc edit <document_id> --title "New title" --render-path specs_sc/….md
 ```
 
-## Freeze + document on ship — the planner's handoff
+## Freeze + document on ship — the planner''s handoff
 
 Shipping is a two-shell act (keeps `shipped` honest):
 
 - **dev**: flips `roadmap_status = shipped` + opens a **docs-pending** flag
-  (`spec` skill, Step 5) — `shipped` never silently claims a doc that doesn't
+  (`spec` skill, Step 5) — `shipped` never silently claims a doc that doesn''t
   exist yet.
 - **planner**: on that flag (arrives in your inbox per the `flags` skill), do
   the paperwork:
 
-1. **Freeze the shipped spec** — immutable thereafter; the feature's other
+1. **Freeze the shipped spec** — immutable thereafter; the feature''s other
    specs stay unfrozen and unaffected. NEVER edit a frozen spec (open a new
    spec under the same feature); the GUI and render layer both refuse edits
    to frozen docs:
@@ -144,7 +155,7 @@ markdown to `body`; render + md-converter own presentation.
 # Authoring format (themed-markdown)
 
 The `body` you write IS themed-markdown — the format md-converter renders.
-Your job = structure; styling = the renderer's job. NEVER write visual
+Your job = structure; styling = the renderer''s job. NEVER write visual
 instructions (colors, fonts, sizes, themes) — apply the four semantic
 classes; the theme picks colors.
 
@@ -310,7 +321,15 @@ GitHub, dropped from the render by the preamble rule):
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/<owner>/<repo>/blob/<branch>/<path>)
 ```
 
-Fill `<owner>/<repo>/<branch>/<path>` with the file's GitHub location (any
+Fill `<owner>/<repo>/<branch>/<path>` with the file''s GitHub location (any
 subdirectory depth). Public repos only — the badge fetches the raw file in
-the reader's browser (no server/auth). Destination unknown -> keep the
-placeholders and tell the user to fill them.
+the reader''s browser (no server/auth). Destination unknown -> keep the
+placeholders and tell the user to fill them.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

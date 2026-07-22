@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Tests for publish's cleanup contract (server._land_on_base + _drop_publish_branch).
+"""Tests for publish's cleanup contract (server._land_on_base).
 
 Stdlib `unittest`, real git in a tmpdir — matching test_git_prune.py's
 no-dependency style. The full git_publish() round-trip shells out to snapshot/
 render + a real remote + `gh`, so it isn't unit-testable here; what IS isolable
 (and is the behavior change) is the ephemeral-branch cleanup: always land back
-on main, then drop the local branch ONLY when its commit reached origin, keep
-it otherwise so an unpushed commit isn't lost (SC-013 split the cleanup from
-the landing: the push now runs lock-free after the local section, so the
-branch's fate is known only later). server._git binds cwd to the module global
-REPO_ROOT at call time, so pointing that at a tmp repo retargets the whole
-helper.
+on main, drop the local branch ONLY when its commit reached origin, keep it
+otherwise so an unpushed commit isn't lost. server._git binds cwd to the
+module global REPO_ROOT at call time, so pointing that at a tmp repo retargets
+the whole helper.
 
 Run:
     python3 tests/test_publish_cleanup.py
@@ -70,45 +68,21 @@ class LandOnBaseTest(unittest.TestCase):
         server.REPO_ROOT = self._orig_root
         subprocess.run(["rm", "-rf", str(self.tmp)])
 
-    def test_lands_back_on_base(self) -> None:
-        # Whatever the push's fate, the tree returns to main; the local branch
-        # is left in place for _drop_publish_branch.
-        out: list[str] = []
-        server._land_on_base(out)
-        self.assertEqual(current_branch(self.repo), server.BASE_BRANCH)
-        self.assertIn(server.PUBLISH_BRANCH, local_branches(self.repo))
-        self.assertEqual(out, [f"↩ back on {server.BASE_BRANCH}"])
-
     def test_pushed_drops_local_branch(self) -> None:
         # commit reached origin → the local branch is disposable.
-        server._land_on_base([])
         out: list[str] = []
-        server._drop_publish_branch(out, {"ok": True, "pr_url": "x", "pushed": True},
-                                    committed=True)
+        server._land_on_base(out, {"ok": True, "pr_url": "x", "pushed": True})
         self.assertEqual(current_branch(self.repo), server.BASE_BRANCH)
         self.assertNotIn(server.PUBLISH_BRANCH, local_branches(self.repo))
         self.assertTrue(any("cleaned up" in line for line in out))
 
     def test_unpushed_keeps_local_branch(self) -> None:
         # no token / push failed → keep the branch so the commit isn't lost.
-        server._land_on_base([])
         out: list[str] = []
-        server._drop_publish_branch(out, {"ok": True, "pr_url": None, "pushed": False},
-                                    committed=True)
+        server._land_on_base(out, {"ok": True, "pr_url": None, "pushed": False})
         self.assertEqual(current_branch(self.repo), server.BASE_BRANCH)
         self.assertIn(server.PUBLISH_BRANCH, local_branches(self.repo))
         self.assertTrue(any("kept local" in line for line in out))
-
-    def test_uncommitted_branch_is_dropped(self) -> None:
-        # Nothing was committed this run (no content changes / a step raised
-        # before the commit) — the branch holds nothing, so it goes.
-        git(self.repo, "checkout", server.BASE_BRANCH)
-        git(self.repo, "branch", "-f", server.PUBLISH_BRANCH, server.BASE_BRANCH)
-        out: list[str] = []
-        server._drop_publish_branch(out, {"ok": True, "pr_url": None, "pushed": False},
-                                    committed=False)
-        self.assertNotIn(server.PUBLISH_BRANCH, local_branches(self.repo))
-        self.assertTrue(any("cleaned up" in line for line in out))
 
     def test_already_on_base_is_a_noop_return(self) -> None:
         # Nothing to do but report — e.g. branch creation failed earlier so we
@@ -116,9 +90,7 @@ class LandOnBaseTest(unittest.TestCase):
         git(self.repo, "checkout", server.BASE_BRANCH)
         git(self.repo, "branch", "-D", server.PUBLISH_BRANCH)
         out: list[str] = []
-        server._land_on_base(out)
-        server._drop_publish_branch(out, {"ok": False, "pr_url": None,
-                                          "pushed": False}, committed=False)
+        server._land_on_base(out, {"ok": False, "pr_url": None, "pushed": False})
         self.assertEqual(current_branch(self.repo), server.BASE_BRANCH)
         self.assertEqual(out, [f"↩ back on {server.BASE_BRANCH}"])
 
