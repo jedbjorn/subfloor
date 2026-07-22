@@ -204,6 +204,7 @@ def get_shell(con, sid: int) -> dict | None:
         "SELECT decision_id, decision_date, priority, decision FROM shell_decisions "
         "WHERE shell_id=? AND COALESCE(is_deleted,0)=0 ORDER BY decision_id DESC "
         "LIMIT 25", (sid,)))
+    shell["session_control"] = get_session_control_overview(con, sid)
     return shell
 
 
@@ -487,14 +488,19 @@ def get_analytics_sessions(con, q) -> dict:
         marks = ",".join("?" for _ in aids)
         arch = {a["archive_id"]: dict(a) for a in con.execute(
             f"SELECT a.archive_id, a.session_id, a.sprint_ref, s.shortname, "
-            f"s.display_name, s.flavor FROM shell_memory_archives a "
-            f"JOIN shells s ON s.shell_id=a.shell_id WHERE a.archive_id IN ({marks})",
+            f"s.display_name, s.flavor, b.state AS control_state, "
+            f"b.managed AS control_managed FROM shell_memory_archives a "
+            f"JOIN shells s ON s.shell_id=a.shell_id "
+            f"LEFT JOIN shell_session_bindings b ON b.archive_id=a.archive_id "
+            f"WHERE a.archive_id IN ({marks})",
             aids)}
     for c in cards:
         a = arch.get(c["archive_id"]) or {}
         c["shell"] = a.get("shortname")
         c["shell_session"] = a.get("session_id")
         c["sprint_ref"] = a.get("sprint_ref")
+        c["control_state"] = a.get("control_state")
+        c["control_managed"] = bool(a.get("control_managed"))
         c["status"] = _card_status(c.pop("statuses"), c["archive_id"])
         c["unattributed"] = c["archive_id"] is None
     older = con.execute(
@@ -584,9 +590,24 @@ def get_analytics_usage(con, q) -> dict:
         "SELECT DISTINCT a.sprint_ref, d.title FROM shell_memory_archives a "
         "LEFT JOIN documents d ON CAST(d.document_id AS TEXT) = a.sprint_ref "
         "WHERE a.sprint_ref IS NOT NULL")}
+    controlled_shell_ids = [r[0] for r in con.execute(
+        "SELECT DISTINCT b.shell_id FROM shell_session_bindings b "
+        "JOIN shells s ON s.active_archive_id=b.archive_id "
+        "WHERE COALESCE(s.is_deleted,0)=0 ORDER BY b.shell_id"
+    )]
+    control = []
+    for shell_id in controlled_shell_ids:
+        overview = get_session_control_overview(con, shell_id)
+        if overview is None:
+            continue
+        shell = con.execute(
+            "SELECT shortname FROM shells WHERE shell_id=?", (shell_id,)
+        ).fetchone()
+        control.append({"shortname": shell[0], **overview})
     return {"favorite_models": sorted(fav.values(), key=lambda f: f["flavor"]),
             "features_shipped": features_shipped, "specs_shipped": specs_shipped,
-            "docs_outstanding": docs_outstanding, "sprint_titles": sprint_titles}
+            "docs_outstanding": docs_outstanding, "sprint_titles": sprint_titles,
+            "session_control": control}
 
 
 def get_analytics_filters(con) -> dict:
@@ -1220,6 +1241,14 @@ def get_session_control(con, shell_id: int, binding_id: int | None = None):
             "WHERE binding_id=? GROUP BY state", (binding["binding_id"],)
         )
     }
+    archive = con.execute(
+        "SELECT session_id, harness, provider, model, sprint_ref "
+        "FROM shell_memory_archives WHERE archive_id=?", (binding["archive_id"],)
+    ).fetchone()
+    last_delivery = con.execute(
+        "SELECT MAX(finished_at) FROM session_wake_jobs "
+        "WHERE binding_id=? AND state='done'", (binding["binding_id"],)
+    ).fetchone()[0]
     visible = {
         key: binding[key] for key in (
             "binding_id", "archive_id", "shell_id", "harness",
@@ -1230,8 +1259,49 @@ def get_session_control(con, shell_id: int, binding_id: int | None = None):
             "lease_generation", "last_error", "created_at", "updated_at",
         )
     }
-    return {"binding": visible, "jobs": counts,
-            "dispatcher": dict(beat) if beat else None}
+    owner = "none"
+    owner_pid = None
+    if binding["lease_pid"]:
+        owner, owner_pid = "lease", binding["lease_pid"]
+    elif binding["active_channel_pid"]:
+        owner, owner_pid = "active-channel", binding["active_channel_pid"]
+    errors = counts.get("failed", 0) + int(
+        binding["state"] == "error" or bool(binding["last_error"])
+    )
+    return {
+        "binding": visible,
+        "archive": dict(archive) if archive else None,
+        "jobs": counts,
+        "summary": {
+            "queued": counts.get("queued", 0),
+            "errors": errors,
+            "owner": owner,
+            "owner_pid": owner_pid,
+            "last_delivery": last_delivery,
+        },
+        "dispatcher": dict(beat) if beat else None,
+    }
+
+
+def get_session_control_overview(con, shell_id: int) -> dict | None:
+    """Safe compact status for GUI surfaces; omit endpoints/capabilities/PIDs."""
+    payload = get_session_control(con, shell_id)
+    binding = payload.get("binding")
+    if binding is None:
+        return None
+    archive = payload.get("archive") or {}
+    summary = payload.get("summary") or {}
+    return {
+        "binding_id": binding["binding_id"],
+        "engine_session_id": archive.get("session_id"),
+        "harness": binding["harness"],
+        "model": archive.get("model"),
+        "state": binding["state"],
+        "managed": bool(binding["managed"]),
+        "queued": summary.get("queued", 0),
+        "errors": summary.get("errors", 0),
+        "last_delivery": summary.get("last_delivery"),
+    }
 
 
 def _binding_capabilities(binding) -> dict:
@@ -1242,7 +1312,8 @@ def _binding_capabilities(binding) -> dict:
     return capabilities if isinstance(capabilities, dict) else {}
 
 
-def manage_session_control(con, shell_id: int, binding_id: int | None = None):
+def manage_session_control(con, shell_id: int, binding_id: int | None = None,
+                           sprint_ref: str | None = None):
     con.execute("BEGIN IMMEDIATE")
     try:
         binding = _owned_binding(con, shell_id, binding_id)
@@ -1272,6 +1343,16 @@ def manage_session_control(con, shell_id: int, binding_id: int | None = None):
         if binding["state"] == "dispatching":
             con.rollback()
             return None, "cannot manage a binding while dispatching"
+        if sprint_ref is not None:
+            sprint_ref = str(sprint_ref).strip()
+            if not sprint_ref:
+                con.rollback()
+                return None, "sprint reference is required"
+            if not sprint_ref.isdigit() or con.execute(
+                    "SELECT 1 FROM documents WHERE document_id=?",
+                    (int(sprint_ref),)).fetchone() is None:
+                con.rollback()
+                return None, f"unknown sprint document {sprint_ref!r}"
         if binding["state"] in ("released", "error"):
             session_control.transition_binding(
                 con, binding["binding_id"], expected=binding["state"],
@@ -1281,6 +1362,11 @@ def manage_session_control(con, shell_id: int, binding_id: int | None = None):
             "updated_at=datetime('now') WHERE binding_id=?",
             (binding["binding_id"],),
         )
+        if sprint_ref is not None:
+            con.execute(
+                "UPDATE shell_memory_archives SET sprint_ref=? WHERE archive_id=?",
+                (sprint_ref, binding["archive_id"]),
+            )
         # A prior release deliberately cancelled its queued audit rows.  Re-manage
         # reactivates only rows whose messages are still unread.
         con.execute(
@@ -1299,6 +1385,42 @@ def manage_session_control(con, shell_id: int, binding_id: int | None = None):
     return get_session_control(con, shell_id, binding["binding_id"]), None
 
 
+SESSION_CREDENTIAL_DIR = ENGINE / "run" / "session-control"
+
+
+def _binding_credential_paths(binding) -> list[Path]:
+    """Return provider-declared ephemeral credentials after strict path checks."""
+    capabilities = _binding_capabilities(binding)
+    declared: list[object] = []
+    if capabilities.get("token_file"):
+        declared.append(capabilities["token_file"])
+    extra = capabilities.get("credential_files") or []
+    if isinstance(extra, list):
+        declared.extend(extra)
+    root = SESSION_CREDENTIAL_DIR.resolve()
+    prefix = f"{binding['harness']}-{binding['binding_id']}."
+    paths: list[Path] = []
+    for raw in declared:
+        path = Path(str(raw)).resolve()
+        if path.parent != root or not path.name.startswith(prefix):
+            raise session_control.SessionControlError(
+                "provider credential path is outside the binding runtime scope"
+            )
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _remove_binding_credentials(binding) -> None:
+    for path in _binding_credential_paths(binding):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise session_control.SessionControlError(
+                f"could not remove provider runtime credential {path.name}: {exc}"
+            ) from exc
+
+
 def release_session_control(con, shell_id: int, binding_id: int | None = None):
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -1309,6 +1431,11 @@ def release_session_control(con, shell_id: int, binding_id: int | None = None):
         if binding["state"] == "dispatching":
             con.rollback()
             return None, "binding is dispatching; release after the turn exits"
+        try:
+            _remove_binding_credentials(binding)
+        except session_control.SessionControlError as exc:
+            con.rollback()
+            return None, str(exc)
         if binding["state"] != "released":
             session_control.transition_binding(
                 con, binding["binding_id"], expected=binding["state"],
@@ -1361,6 +1488,33 @@ def retry_session_control(con, shell_id: int, binding_id: int | None = None):
         con.rollback()
         raise
     return get_session_control(con, shell_id, binding["binding_id"]), None
+
+
+def _shell_id_for_shortname(con, shortname: str) -> int | None:
+    row = con.execute(
+        "SELECT shell_id FROM shells WHERE lower(shortname)=lower(?) "
+        "AND COALESCE(is_deleted,0)=0", (shortname.strip(),)
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def operator_session_control(con, shortname: str, action: str = "status",
+                             *, sprint_ref: str | None = None):
+    """Local operator surface used by ``sc session`` and the review GUI."""
+    shell_id = _shell_id_for_shortname(con, shortname)
+    if shell_id is None:
+        return None, f"unknown shell {shortname!r}"
+    if action == "status":
+        return get_session_control(con, shell_id), None
+    if action == "manage":
+        if sprint_ref is None:
+            return None, "sprint reference is required"
+        return manage_session_control(con, shell_id, sprint_ref=sprint_ref)
+    if action == "release":
+        return release_session_control(con, shell_id)
+    if action == "retry":
+        return retry_session_control(con, shell_id)
+    return None, f"unknown session action {action!r}"
 
 
 def _local_control_endpoint(value: str) -> bool:
@@ -2444,6 +2598,11 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = ports_mod.resolve()
                 return self._send(200, {"ok": True, "repo": cfg.get("repo"),
                                         "port": cfg.get("port")})
+            if path.startswith("/api/session-control/status/"):
+                shortname = path.rsplit("/", 1)[1]
+                payload, error = operator_session_control(con, shortname)
+                return self._send(404 if error else 200,
+                                  {"error": error} if error else payload)
             if path == "/api/shells":
                 return self._send(200, {"shells": get_shells(con)})
             if path == "/api/shell-templates":
@@ -2551,6 +2710,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._watches_post(self._body())
         con = db()
         try:
+            if path.startswith("/api/session-control/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4 or parts[:2] != ["api", "session-control"]:
+                    return self._send(404, {"error": "not found"})
+                action, shortname = parts[2], parts[3]
+                body = self._body()
+                payload, error = operator_session_control(
+                    con, shortname, action, sprint_ref=body.get("sprint_ref")
+                )
+                return self._send(409 if error else 200,
+                                  {"error": error} if error else payload)
             if path == "/api/flags":
                 fid, err = create_flag(con, self._body())
                 return self._send(400 if err else 201,

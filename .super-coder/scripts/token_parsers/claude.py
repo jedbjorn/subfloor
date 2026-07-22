@@ -240,7 +240,8 @@ def sweep(repo_root, since_epoch, log, cache=None) -> list[dict]:
             common = dict(harness=HARNESS, parser_version=PARSER_VERSION,
                           provider="anthropic", title=agg["title"],
                           started_at=agg["started_at"],
-                          ended_at=agg["ended_at"], cwd=agg["cwd"])
+                          ended_at=agg["ended_at"], cwd=agg["cwd"],
+                          native_session_id=Path(ref).stem)
             if not agg["per_model"]:
                 rows.append(row(ref=ref, model=None, status="no_usage", **common))
                 continue
