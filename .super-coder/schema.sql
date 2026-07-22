@@ -281,6 +281,8 @@ CREATE TABLE shell_messages (
     -- dedupe_key TEXT — idempotent send (#333), added by migration 0062
     -- (same migration-only precedent; unique partial index
     -- idx_shell_messages_dedupe rides in the migration).
+    -- sprint_doc_id INTEGER REFERENCES documents(document_id) — sprint scoping
+    -- for wake-eligible traffic, added by migration 0078 (same precedent).
 );
 
 -- ── Watched PRs (sprint eventing — subscription registry + daemon state) ────
@@ -301,6 +303,10 @@ CREATE TABLE watched_prs (
     created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
     closed_at      TEXT,                      -- set on merge/close; NULL = live
     UNIQUE (repo, pr_number, shell_id)
+    -- sprint_doc_id INTEGER REFERENCES documents(document_id) — sprint scoping,
+    -- added by migration 0078 (same migration-only ADD COLUMN precedent as
+    -- shell_messages.kind above). The uniqueness rebuild into one active watch
+    -- per binding/repo/PR is the polling cutover's migration (spec #20 task 36).
 );
 
 -- Daemon liveness (#359): the watcher daemon UPSERTs its row once per poll
@@ -314,6 +320,304 @@ CREATE TABLE daemon_heartbeats (
     beat_at     TEXT    NOT NULL,              -- datetime('now') at last poll cycle
     interval_s  INTEGER NOT NULL               -- the daemon's configured poll interval
 );
+
+-- ── Interface (spec #20: Interface-backed planner wake) ─────────────────────
+-- Durable state for the API-brokered interactive chat surface: one generation
+-- per shell, exact-identity sessions, writer leases, metadata-only input
+-- state, idempotency keys, sprint planner bindings, wake items/batches,
+-- action receipts, PR poll audit, and alerts. Volatile runtime tables
+-- (interface_writer_leases, interface_input_state, pr_poll_runs) are
+-- deliberately NOT in snapshot.py's PER_INSTANCE_TABLES; volatile columns
+-- (tmux socket, PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
+-- See migrations/0078_interface_sessions.sql (convergent — carries an
+-- existing fork) and scripts/interface_state.py (app-level edge maps — keep
+-- in sync with the transition triggers below).
+
+CREATE TABLE interface_generations (
+    shell_id        INTEGER NOT NULL REFERENCES shells(shell_id),
+    generation      INTEGER NOT NULL CHECK (generation > 0),
+    hook_token_hash TEXT,                      -- volatile hash; snapshot-excluded
+    last_hook_seq   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at        TEXT,
+    PRIMARY KEY (shell_id, generation)
+);
+
+CREATE TABLE interface_sessions (
+    session_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    shell_id             INTEGER NOT NULL REFERENCES shells(shell_id),
+    generation           INTEGER NOT NULL CHECK (generation > 0),
+    archive_id           INTEGER REFERENCES shell_memory_archives(archive_id),
+    harness              TEXT,               -- claude/codex/kimi
+    model_route          TEXT,
+    cli_version          TEXT,
+    worktree             TEXT,
+    tmux_socket          TEXT,               -- volatile; snapshot-excluded
+    tmux_session         TEXT,
+    tmux_window          TEXT,
+    tmux_pane_id         TEXT,               -- immutable tmux pane id
+    pane_pid             INTEGER,            -- volatile; snapshot-excluded
+    pane_start_ticks    INTEGER,            -- volatile; snapshot-excluded
+    harness_pid          INTEGER,            -- volatile; snapshot-excluded
+    harness_start_ticks INTEGER,            -- volatile; snapshot-excluded
+    occupancy            TEXT NOT NULL DEFAULT 'reserved'
+                         CHECK (occupancy IN
+                             ('reserved','occupied','unreconciled','ended')),
+    lifecycle            TEXT NOT NULL DEFAULT 'starting'
+                         CHECK (lifecycle IN
+                             ('starting','idle','busy','approval','user_input',
+                              'stopping','lost','error','ended')),
+    reservation_expires_at TEXT,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    occupied_at          TEXT,
+    ended_at             TEXT,
+    end_reason           TEXT,
+    error_detail         TEXT,
+    UNIQUE (shell_id, generation),
+    FOREIGN KEY (shell_id, generation)
+        REFERENCES interface_generations(shell_id, generation)
+);
+
+CREATE TABLE interface_writer_leases (
+    lease_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     INTEGER NOT NULL REFERENCES interface_sessions(session_id),
+    shell_id       INTEGER NOT NULL,
+    generation     INTEGER NOT NULL,
+    client_id      TEXT NOT NULL,            -- browser tab / CLI instance id
+    token_hash     TEXT NOT NULL,            -- volatile credential hash
+    next_input_seq INTEGER NOT NULL DEFAULT 1, -- expected monotonic client seq
+    heartbeat_at   TEXT,                     -- volatile
+    acquired_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    revoked_at     TEXT,
+    revoke_reason  TEXT,
+    FOREIGN KEY (shell_id, generation)
+        REFERENCES interface_generations(shell_id, generation)
+);
+
+CREATE TABLE interface_input_state (
+    session_id          INTEGER PRIMARY KEY
+                        REFERENCES interface_sessions(session_id),
+    shell_id            INTEGER NOT NULL,
+    generation          INTEGER NOT NULL,
+    composer            TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK (composer IN ('clean','dirty','unknown')),
+    delivery            TEXT NOT NULL DEFAULT 'normal'
+                        CHECK (delivery IN ('normal','delivery_unknown')),
+    pending_seq         INTEGER,          -- reserved, not yet acked (no bytes)
+    pending_reserved_at TEXT,
+    forwarded_seq       INTEGER NOT NULL DEFAULT 0, -- highest forwarded seq
+    last_human_input_at TEXT,
+    last_submit_seq     INTEGER,          -- seq proven by fenced submit callback
+    certified_by        TEXT,             -- client_id of certifying writer
+    certified_seq       INTEGER,
+    certified_at        TEXT,
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (shell_id, generation)
+        REFERENCES interface_generations(shell_id, generation)
+);
+
+CREATE TABLE interface_idempotency_keys (
+    actor_scope       TEXT NOT NULL,     -- operator / browser:<session> / cli
+    operation         TEXT NOT NULL,
+    idem_key          TEXT NOT NULL,
+    request_hash      TEXT NOT NULL,     -- reuse with a different body → 409
+    response_status   INTEGER,
+    response_resource TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at        TEXT NOT NULL,
+    PRIMARY KEY (actor_scope, operation, idem_key)
+);
+
+CREATE TABLE sprint_planner_bindings (
+    binding_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    sprint_doc_id    INTEGER NOT NULL REFERENCES documents(document_id),
+    planner_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
+    session_id       INTEGER NOT NULL REFERENCES interface_sessions(session_id),
+    shell_id         INTEGER NOT NULL,   -- = planner_shell_id (generation FK)
+    generation       INTEGER NOT NULL,
+    armed_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    released_at      TEXT,
+    release_reason   TEXT,
+    FOREIGN KEY (shell_id, generation)
+        REFERENCES interface_generations(shell_id, generation)
+);
+
+CREATE TABLE planner_wake_batches (
+    batch_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    binding_id      INTEGER NOT NULL REFERENCES sprint_planner_bindings(binding_id),
+    shell_id        INTEGER NOT NULL,
+    generation      INTEGER NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (state IN
+                        ('queued','submitting','running','complete',
+                         'delivery_unknown')),
+    input_seq_fence INTEGER,
+    submit_hook_seq INTEGER,
+    stop_hook_seq   INTEGER,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    submitted_at    TEXT,
+    completed_at    TEXT,
+    FOREIGN KEY (shell_id, generation)
+        REFERENCES interface_generations(shell_id, generation)
+);
+
+CREATE TABLE planner_wake_items (
+    item_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    binding_id      INTEGER NOT NULL REFERENCES sprint_planner_bindings(binding_id),
+    message_id      INTEGER NOT NULL REFERENCES shell_messages(message_id),
+    batch_id        INTEGER REFERENCES planner_wake_batches(batch_id),
+    state           TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (state IN
+                        ('queued','batched','submitting','running','done',
+                         'reconcile','quarantined','cancelled')),
+    completed_wakes INTEGER NOT NULL DEFAULT 0,
+    ambiguity       TEXT,
+    error           TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    done_at         TEXT,
+    UNIQUE (binding_id, message_id)
+);
+
+CREATE TABLE planner_action_receipts (
+    receipt_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id     INTEGER REFERENCES shell_messages(message_id),
+    operation      TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    idem_key       TEXT NOT NULL UNIQUE, -- derived from message+operation+target
+    state          TEXT NOT NULL DEFAULT 'intent'
+                   CHECK (state IN ('intent','complete','unknown','reconciled')),
+    result_detail  TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at   TEXT,
+    reconciled_at  TEXT
+);
+
+-- pr_poll_observations.run_id is deliberately NOT a REFERENCES: runs are
+-- volatile (excluded from snapshot) while transition/blind-window observations
+-- are durable audit — the linkage outlives its target.
+CREATE TABLE pr_poll_runs (
+    run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo        TEXT,
+    source      TEXT NOT NULL,           -- scheduler / startup / reconcile
+    watch_count INTEGER NOT NULL DEFAULT 0,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    status      TEXT NOT NULL DEFAULT 'running'
+                CHECK (status IN ('running','ok','error','rate_limited')),
+    error       TEXT                     -- sanitized
+);
+
+CREATE TABLE pr_poll_observations (
+    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id    INTEGER NOT NULL REFERENCES watched_prs(watch_id),
+    run_id      INTEGER,                 -- audit linkage only (runs are volatile)
+    head_sha    TEXT,
+    fingerprint TEXT,                    -- normalized JSON; never raw payloads
+    transition  TEXT,                    -- semantic transition key; NULL = none
+    blind_window INTEGER NOT NULL DEFAULT 0,
+    observed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE planner_alerts (
+    alert_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER REFERENCES interface_sessions(session_id),
+    binding_id  INTEGER REFERENCES sprint_planner_bindings(binding_id),
+    message_id  INTEGER REFERENCES shell_messages(message_id),
+    watch_id    INTEGER REFERENCES watched_prs(watch_id),
+    severity    TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
+    reason      TEXT NOT NULL,
+    dedupe_key  TEXT NOT NULL,           -- app-computed: refs + reason
+    opened_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT
+);
+
+-- Transition validators — the DB backstop (app pre-checks for friendly
+-- errors via scripts/interface_state.py; keep the edge sets in sync).
+
+CREATE TRIGGER trg_interface_sessions_occupancy
+BEFORE UPDATE OF occupancy ON interface_sessions
+WHEN NEW.occupancy <> OLD.occupancy AND NOT (
+    (OLD.occupancy = 'reserved'     AND NEW.occupancy IN ('occupied','unreconciled','ended')) OR
+    (OLD.occupancy = 'occupied'     AND NEW.occupancy IN ('unreconciled','ended')) OR
+    (OLD.occupancy = 'unreconciled' AND NEW.occupancy IN ('occupied','ended'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal interface occupancy transition');
+END;
+
+CREATE TRIGGER trg_interface_sessions_lifecycle
+BEFORE UPDATE OF lifecycle ON interface_sessions
+WHEN NEW.lifecycle <> OLD.lifecycle AND NOT (
+    (OLD.lifecycle = 'starting'   AND NEW.lifecycle IN ('idle','stopping','lost','error','ended')) OR
+    (OLD.lifecycle = 'idle'       AND NEW.lifecycle IN ('busy','stopping','lost')) OR
+    (OLD.lifecycle = 'busy'       AND NEW.lifecycle IN ('idle','approval','user_input','error','stopping','lost')) OR
+    (OLD.lifecycle = 'approval'   AND NEW.lifecycle IN ('busy','error','stopping','lost')) OR
+    (OLD.lifecycle = 'user_input' AND NEW.lifecycle IN ('busy','error','stopping','lost')) OR
+    (OLD.lifecycle = 'stopping'   AND NEW.lifecycle IN ('ended','lost','error')) OR
+    (OLD.lifecycle = 'lost'       AND NEW.lifecycle IN ('ended','stopping')) OR
+    (OLD.lifecycle = 'error'      AND NEW.lifecycle IN ('ended','stopping'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal interface lifecycle transition');
+END;
+
+CREATE TRIGGER trg_interface_input_composer
+BEFORE UPDATE OF composer ON interface_input_state
+WHEN NEW.composer <> OLD.composer AND NOT (
+    (OLD.composer = 'unknown' AND NEW.composer IN ('clean','dirty')) OR
+    (OLD.composer = 'clean'   AND NEW.composer IN ('dirty','unknown')) OR
+    (OLD.composer = 'dirty'   AND NEW.composer IN ('clean','unknown'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal composer transition');
+END;
+
+CREATE TRIGGER trg_interface_input_delivery
+BEFORE UPDATE OF delivery ON interface_input_state
+WHEN NEW.delivery <> OLD.delivery AND NOT (
+    (OLD.delivery = 'normal'           AND NEW.delivery = 'delivery_unknown') OR
+    (OLD.delivery = 'delivery_unknown' AND NEW.delivery = 'normal')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal delivery transition');
+END;
+
+CREATE TRIGGER trg_pwi_state
+BEFORE UPDATE OF state ON planner_wake_items
+WHEN NEW.state <> OLD.state AND NOT (
+    (OLD.state = 'queued'      AND NEW.state IN ('batched','quarantined','cancelled')) OR
+    (OLD.state = 'batched'     AND NEW.state IN ('queued','submitting','cancelled')) OR
+    (OLD.state = 'submitting'  AND NEW.state IN ('queued','running','cancelled')) OR
+    (OLD.state = 'running'     AND NEW.state IN ('done','reconcile','queued','cancelled')) OR
+    (OLD.state = 'reconcile'   AND NEW.state IN ('queued','done','cancelled')) OR
+    (OLD.state = 'quarantined' AND NEW.state IN ('queued','cancelled'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal wake item transition');
+END;
+
+CREATE TRIGGER trg_pwb_state
+BEFORE UPDATE OF state ON planner_wake_batches
+WHEN NEW.state <> OLD.state AND NOT (
+    (OLD.state = 'queued'           AND NEW.state IN ('submitting','complete')) OR
+    (OLD.state = 'submitting'       AND NEW.state IN ('queued','running','delivery_unknown')) OR
+    (OLD.state = 'running'          AND NEW.state IN ('complete','delivery_unknown')) OR
+    (OLD.state = 'delivery_unknown' AND NEW.state = 'complete')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal wake batch transition');
+END;
+
+CREATE TRIGGER trg_par_state
+BEFORE UPDATE OF state ON planner_action_receipts
+WHEN NEW.state <> OLD.state AND NOT (
+    (OLD.state = 'intent'  AND NEW.state IN ('complete','unknown')) OR
+    (OLD.state = 'unknown' AND NEW.state = 'reconciled')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal action receipt transition');
+END;
 
 -- ── Skills (system content — seeded from assets/, propagates) ────────────────
 
@@ -434,3 +738,28 @@ CREATE INDEX idx_watched_prs_live ON watched_prs(closed_at) WHERE closed_at IS N
 CREATE INDEX idx_dr_filepath_role ON dr_filepath(role);
 CREATE INDEX idx_dr_filepath_lang ON dr_filepath(lang);
 CREATE INDEX idx_dr_dependency_mgr ON dr_dependency(manager);
+
+-- Interface (0078; the migration-only idx_shell_messages_sprint rides 0078
+-- because its column does)
+CREATE UNIQUE INDEX idx_interface_generations_live
+    ON interface_generations(shell_id) WHERE ended_at IS NULL;
+CREATE UNIQUE INDEX idx_interface_sessions_live
+    ON interface_sessions(shell_id) WHERE occupancy <> 'ended';
+CREATE UNIQUE INDEX idx_interface_writer_leases_current
+    ON interface_writer_leases(session_id) WHERE revoked_at IS NULL;
+CREATE INDEX idx_interface_idem_expiry
+    ON interface_idempotency_keys(expires_at);
+CREATE UNIQUE INDEX idx_spb_live_planner
+    ON sprint_planner_bindings(planner_shell_id) WHERE released_at IS NULL;
+CREATE UNIQUE INDEX idx_spb_live_sprint
+    ON sprint_planner_bindings(sprint_doc_id) WHERE released_at IS NULL;
+CREATE UNIQUE INDEX idx_pwb_live
+    ON planner_wake_batches(binding_id)
+    WHERE state IN ('queued','submitting','running');
+CREATE INDEX idx_pwi_binding_state
+    ON planner_wake_items(binding_id, state);
+CREATE INDEX idx_pwi_batch ON planner_wake_items(batch_id);
+CREATE INDEX idx_ppo_watch
+    ON pr_poll_observations(watch_id, observed_at);
+CREATE UNIQUE INDEX idx_planner_alerts_open
+    ON planner_alerts(dedupe_key) WHERE resolved_at IS NULL;

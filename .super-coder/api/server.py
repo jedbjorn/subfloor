@@ -56,6 +56,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
+import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
@@ -2466,6 +2467,18 @@ def main(argv):
     # auth path resolves against; a `make launch/restart` thus self-heals keys
     # (no separate `./sc update` step). New shells are still keyed at creation.
     backfill_shell_api_keys.backfill(str(DB_PATH))
+    # Interface startup reconciliation (spec #20): idempotent, once per boot —
+    # parks any crash-window pending input as delivery_unknown (never
+    # replays), recovers wake batches from durable hook-sequence evidence,
+    # repairs expired reservations, revokes stale writer leases. No-ops on a
+    # pre-0078 DB.
+    con = db_driver.connect(DB_PATH)
+    try:
+        recon = interface_reconcile.startup_reconcile(con)
+    finally:
+        con.close()
+    if recon.get("parks") or recon.get("batches_delivery_unknown"):
+        print(f"server: interface reconcile {recon}")
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which

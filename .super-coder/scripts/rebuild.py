@@ -37,6 +37,7 @@ import db_driver    # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import map_repo     # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
+import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
 
 
@@ -158,6 +159,16 @@ def main(argv: list[str]) -> int:
     if "--no-backup" not in argv:
         backup_existing()
     keys = read_existing_keys()
+    # Spec #20: a rebuild destroys the live DB, so it refuses while any live
+    # Interface state would be lost — non-ended session, unreleased binding,
+    # nonterminal wake batch, or input ambiguity. Same fail-closed shape as
+    # read_existing_keys (#279): abort while the outgoing DB still exists.
+    reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
+    if reasons:
+        sys.exit(
+            "rebuild: refusing — live Interface state exists; the clean "
+            "operator drain path is required first:\n  - "
+            + "\n  - ".join(reasons))
     for suffix in ("", "-wal", "-shm"):
         p = Path(str(DB_PATH) + suffix)
         if p.exists():

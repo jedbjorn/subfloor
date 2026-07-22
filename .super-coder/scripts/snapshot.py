@@ -76,10 +76,42 @@ PER_INSTANCE_TABLES = [
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
+    # ── Interface (spec #20, 0078) — durable audit only. Live rows are
+    # row-filtered OUT (SNAPSHOT_ROW_FILTERS below): snapshot may run while a
+    # chat is live, and rebuild/update refuse while any live state exists, so
+    # content.sql only ever carries closed/terminal rows. Volatile columns
+    # (tmux socket, PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
+    # Fully volatile tables (interface_writer_leases, interface_input_state,
+    # pr_poll_runs) are NOT in this list — a rebuild rederives them empty.
+    "interface_generations",
+    "interface_sessions",
+    "interface_idempotency_keys",
+    "sprint_planner_bindings",
+    "planner_wake_batches",
+    "planner_wake_items",
+    "planner_action_receipts",
+    "pr_poll_observations",
+    "planner_alerts",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/map_content.sql by snapshot_map() below, not here.
 ]
+
+# Row-level projection for tables whose LIVE rows must not reach content.sql
+# (spec #20: snapshot preserves closed session/binding audit, terminal/
+# quarantined wake audit, and transition/blind-window observations — and may
+# run while a chat is live). The dump still DELETEs the whole table on load;
+# rows outside the filter simply never existed as far as the rebuild knows.
+SNAPSHOT_ROW_FILTERS = {
+    "interface_generations": "WHERE ended_at IS NOT NULL",
+    "interface_sessions": "WHERE occupancy = 'ended'",
+    "sprint_planner_bindings": "WHERE released_at IS NOT NULL",
+    "planner_wake_batches": "WHERE state IN ('complete','delivery_unknown')",
+    "planner_wake_items":
+        "WHERE state IN ('done','reconcile','quarantined','cancelled')",
+    "pr_poll_observations":
+        "WHERE transition IS NOT NULL OR blind_window <> 0",
+}
 
 
 def quote(v) -> str:
@@ -189,6 +221,11 @@ def dump_local_skills(con) -> list[str]:
 SENSITIVE_COLUMNS = {
     "shells": {"api_key", "api_key_rotated_at"},
     "users": {"password_hash", "password_salt"},
+    # Interface (0078): exact-identity fencing + credential hashes are
+    # volatile runtime state — never serialized even on ended audit rows.
+    "interface_generations": {"hook_token_hash"},
+    "interface_sessions": {"tmux_socket", "pane_pid", "pane_start_ticks",
+                           "harness_pid", "harness_start_ticks"},
 }
 
 
@@ -202,7 +239,9 @@ def dump_table(con, table: str) -> list[str]:
     if not cols:
         return []
     collist = ", ".join(cols)
-    rows = con.execute(f"SELECT {collist} FROM {table} ORDER BY rowid").fetchall()
+    where = SNAPSHOT_ROW_FILTERS.get(table, "")
+    rows = con.execute(
+        f"SELECT {collist} FROM {table} {where} ORDER BY rowid").fetchall()
     lines = [f"DELETE FROM {table};"]
     for row in rows:
         vals = ", ".join(quote(v) for v in row)
