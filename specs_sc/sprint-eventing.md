@@ -3,7 +3,7 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Sprint eventing — GitHub→inbox daemon + headless worker boot
-roadmap_status: shipped
+roadmap_status: in_progress
 frozen: true
 title: Sprint eventing — daemon + headless boot
 tags: [sprints, messaging, daemon, orchestration, cross-provider]

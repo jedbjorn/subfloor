@@ -18,9 +18,9 @@ purpose: How to run and wait on long local work with sc job
 
 `./sc job` runs a long local command — a test suite, a bench, a build —
 as a detached, supervised one-shot that outlives the session that
-started it. When the job exits, its completion arrives as a `result`
-row in YOUR inbox: the same wake-up path PR events use, so the sprint
-loop needs nothing new to act on it.
+started it. When the job exits, its completion arrives as a durable
+`result` row in YOUR inbox. An ordinary unmanaged shell is not booted
+automatically when that row lands.
 
 Reach for it whenever work must outlive the turn. A harness background
 task is session-scoped — in a headless (`-p`) boot it dies with the
@@ -45,10 +45,11 @@ check the log before trusting anything).
 
 ## The two ways to wait
 
-**Fire-and-wake (default).** Start the job, report its id if someone
-is waiting on it, end the turn. The completion `result` row wakes you
-through the normal inbox path — nothing polls, nothing is parked on
-the session.
+**Detached completion.** Start the job, report its id if someone is
+waiting on it, and end the turn only when no immediate continuation
+depends on the result. The completion `result` row remains in your inbox
+for the next session. If work must continue as soon as the job finishes,
+use wait-slice or arrange an explicit planner re-boot.
 
 **Wait-slice (the result decides this turn's next step).**
 `./sc job wait <id>` blocks up to 550 seconds in the foreground and
@@ -61,8 +62,8 @@ what landed, then slice again. Exit `1` = no such job / lost.
 Always pass `--timeout` for anything that can wedge: the supervisor
 SIGTERMs the job's whole process group at the deadline (SIGKILL after
 a grace period), records `timeout`, and still sends the completion
-row. A deadlocked suite becomes a bounded failure with a wake-up, not
-a silent hole. `kill` is the manual version, same group-kill, same
+row. A deadlocked suite becomes a bounded failure with a durable result,
+not a silent hole. `kill` is the manual version, same group-kill, same
 completion row.
 
 ## How it works
