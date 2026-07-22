@@ -28,7 +28,7 @@ flags, repo map, worktrees, and token use.
 
 ![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
-### Getting Started- the typical new user journey
+### Getting Started
 
 A good first run starts with the **Cartographer Shell**. It maps your repository
 and adds short descriptions so every other Shell can get oriented without
