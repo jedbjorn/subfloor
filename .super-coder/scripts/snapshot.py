@@ -103,6 +103,7 @@ PER_INSTANCE_TABLES = [
 # run while a chat is live). The dump still DELETEs the whole table on load;
 # rows outside the filter simply never existed as far as the rebuild knows.
 SNAPSHOT_ROW_FILTERS = {
+    "interface_generations": "WHERE ended_at IS NOT NULL",
     "interface_sessions": "WHERE occupancy = 'ended'",
     "sprint_planner_bindings": "WHERE released_at IS NOT NULL",
     "planner_wake_batches": "WHERE state IN ('complete','delivery_unknown')",

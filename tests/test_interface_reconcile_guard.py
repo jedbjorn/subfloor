@@ -167,8 +167,19 @@ class LiveRefusalGuardTest(unittest.TestCase):
     def test_live_session_blocks(self):
         self._occupied_session()
         reasons = interface_reconcile.live_refusal_reasons(self.db)
+        self.assertTrue(any("occupied" in r for r in reasons))
+        self.assertTrue(any("generation" in r for r in reasons),
+                        "a live generation is itself live state")
+
+    def test_live_generation_blocks_with_all_sessions_ended(self):
+        sid = self._occupied_session()
+        self.con.execute(
+            "UPDATE interface_sessions SET occupancy='ended', lifecycle="
+            "'ended', ended_at=datetime('now') WHERE session_id=?", (sid,))
+        self.con.commit()
+        reasons = interface_reconcile.live_refusal_reasons(self.db)
         self.assertEqual(len(reasons), 1)
-        self.assertIn("occupied", reasons[0])
+        self.assertIn("generation 1/1 is live", reasons[0])
 
     def test_armed_binding_blocks(self):
         sid = self._occupied_session()
@@ -203,6 +214,8 @@ class LiveRefusalGuardTest(unittest.TestCase):
             "UPDATE sprint_planner_bindings SET released_at=datetime('now')")
         self.con.execute(
             "UPDATE interface_sessions SET occupancy='ended'")
+        self.con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now')")
         self.con.commit()
         self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
 

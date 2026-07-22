@@ -170,6 +170,14 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.assertNotIn(SECRET_HOOK_HASH, out)
         self.assertNotIn("hook_token_hash", out)
 
+    def test_generations_keep_ended_only(self):
+        # A LIVE generation must never serialize: a rebuild would restore it
+        # and idx_interface_generations_live would brick that shell's next
+        # New chat (flag #36). Ended generations are durable audit.
+        out = self._dump("interface_generations")
+        self.assertNotIn("VALUES (1, 1,", out, "live generation leaked")
+        self.assertIn("VALUES (1, 2,", out, "ended generation audit dropped")
+
     def test_bindings_keep_released_only(self):
         out = self._dump("sprint_planner_bindings")
         self.assertIn("'sprint_closed'", out)

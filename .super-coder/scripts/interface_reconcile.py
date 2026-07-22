@@ -42,15 +42,10 @@ def _has_table(con, name: str) -> bool:
     ).fetchone() is not None
 
 
-def _alert(con, *, severity: str, reason: str, session_id=None,
-           binding_id=None) -> None:
-    """Raise an alert, deduplicated while open (partial unique index)."""
-    dedupe = f"{session_id or '-'}|{binding_id or '-'}|{reason}"
-    con.execute(
-        "INSERT OR IGNORE INTO planner_alerts "
-        "(session_id, binding_id, severity, reason, dedupe_key) "
-        "VALUES (?,?,?,?,?)",
-        (session_id, binding_id, severity, reason, dedupe))
+def _alert(con, **kw) -> None:
+    """Raise an alert, deduplicated while open — interface_broker owns the
+    helper (it parks live too); kept here as a thin alias for readability."""
+    interface_broker._alert(con, **kw)
 
 
 def startup_reconcile(con) -> dict:
@@ -67,11 +62,7 @@ def startup_reconcile(con) -> dict:
         "SELECT session_id FROM interface_input_state WHERE pending_seq IS NOT NULL"
     ).fetchall()
     for (session_id,) in parked:
-        interface_state.transition(con, "composer", session_id, "unknown")
-        interface_state.transition(con, "delivery", session_id,
-                                   "delivery_unknown")
-        _alert(con, severity="critical", reason="crash_window_delivery_unknown",
-               session_id=session_id)
+        interface_broker.park_delivery_unknown(con, session_id)
         counts["parks"] += 1
 
     # 2. Batch recovery — durable hook-sequence evidence or park.
@@ -138,6 +129,14 @@ def live_refusal_reasons(db_path) -> list[str]:
         if not _has_table(con, "interface_sessions"):
             return []
         reasons = []
+        rows = con.execute(
+            "SELECT shell_id, generation FROM interface_generations "
+            "WHERE ended_at IS NULL").fetchall()
+        for shell_id, generation in rows:
+            reasons.append(
+                f"generation {shell_id}/{generation} is live — end it first "
+                "(a rebuilt live generation bricks that shell's next New "
+                "chat)")
         rows = con.execute(
             "SELECT session_id, shell_id, occupancy FROM interface_sessions "
             "WHERE occupancy <> 'ended'").fetchall()

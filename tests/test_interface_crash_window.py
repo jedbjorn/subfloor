@@ -74,8 +74,8 @@ def build_engine_db(path: Path) -> None:
             "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
             "VALUES (?,?,?,'test','sp',1,0,1,1)", (sid, f"S{sid}", f"s{sid}"))
     con.execute(
-        "INSERT INTO documents (document_id, kind, title) "
-        "VALUES (1,'doc','SPRINT: test')")
+        "INSERT INTO documents (document_id, kind, title, body) "
+        "VALUES (1,'doc','SPRINT: test','# SPRINT: test\nstatus: ACTIVE')")
     con.commit()
     con.close()
 
@@ -332,6 +332,168 @@ class CrashWindowTest(unittest.TestCase):
             interface_broker.record_hook(self.con, 1, 1, 1, "turn_stop")
         with self.assertRaises(interface_broker.BrokerError):
             interface_broker.record_hook(self.con, 1, 1, 0, "turn_stop")
+
+    # ── fresh-lease sequence continuity (flag #34) ──────────────────────
+    def test_fresh_lease_continues_session_sequence(self):
+        rec = Recorder("ok")
+        interface_broker.accept_human_input(self.con, self.sid, 1, 10, writer=rec)
+        interface_broker.accept_human_input(self.con, self.sid, 2, 10, writer=rec)
+        # Service restart: the lease dies, the session's forwarded_seq is 2.
+        self._reconnect()
+        interface_reconcile.startup_reconcile(self.con)
+        lease = interface_broker.acquire_writer(self.con, self.sid, "tab-2", "tok-2")
+        next_seq = self.con.execute(
+            "SELECT next_input_seq FROM interface_writer_leases WHERE lease_id=?",
+            (lease,)).fetchone()[0]
+        self.assertEqual(next_seq, 3,
+                         "a fresh lease must continue the session sequence, "
+                         "not reseed to 1")
+        rec2 = Recorder("ok")
+        # The client's legitimate next frame is accepted (no gap-wedge)...
+        ack = interface_broker.accept_human_input(
+            self.con, self.sid, 3, 10, writer=rec2)
+        self.assertEqual(ack, {"ack": 3, "duplicate": False})
+        self.assertEqual(rec2.writes, [10])
+        # ...and an already-forwarded sequence is a duplicate ack, never a
+        # false acceptance of new bytes.
+        dup = interface_broker.accept_human_input(
+            self.con, self.sid, 2, 10, writer=rec2)
+        self.assertEqual(dup, {"ack": 2, "duplicate": True})
+        self.assertEqual(rec2.writes, [10])
+
+    def test_not_delivered_resend_with_forwarded_seq_nonzero(self):
+        # forwarded_seq=1 when the crash wedges seq 2: the not_delivered
+        # resend path must work past the degenerate forwarded_seq=0 case.
+        rec = Recorder("ok")
+        interface_broker.accept_human_input(self.con, self.sid, 1, 10, writer=rec)
+        crash = Recorder("crash_before_write")
+        with self.assertRaises(Crash):
+            interface_broker.accept_human_input(
+                self.con, self.sid, 2, 20, writer=crash)
+        self._reconnect()
+        interface_reconcile.startup_reconcile(self.con)
+        interface_broker.reconcile_input(self.con, self.sid, "not_delivered")
+        self.con.commit()
+        self.assertEqual(self._input()["forwarded_seq"], 1)
+        interface_broker.certify_clean(self.con, self.sid, "op", 1)
+        interface_broker.acquire_writer(self.con, self.sid, "tab-2", "tok-2")
+        rec2 = Recorder("ok")
+        ack = interface_broker.accept_human_input(
+            self.con, self.sid, 2, 20, writer=rec2)
+        self.assertEqual(ack, {"ack": 2, "duplicate": False})
+        self.assertEqual(rec2.writes, [20], "the resent frame forwards once")
+        self.assertEqual(self._input()["forwarded_seq"], 2)
+
+    # ── live park on write failure without process death (flag #35) ─────
+    def test_write_failure_without_crash_parks_live(self):
+        class TmuxError(Exception):
+            pass
+
+        def failing_writer(_len):
+            raise TmuxError("tmux send-keys failed")
+
+        with self.assertRaises(TmuxError):
+            interface_broker.accept_human_input(
+                self.con, self.sid, 1, 10, writer=failing_writer)
+        # No restart, no reconciliation yet — the park is immediate.
+        ist = self._input()
+        self.assertEqual(ist["composer"], "unknown")
+        self.assertEqual(ist["delivery"], "delivery_unknown")
+        self.assertEqual(ist["pending_seq"], 1, "evidence must survive")
+        lease = self.con.execute(
+            "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
+            "WHERE session_id=?", (self.sid,)).fetchone()
+        self.assertIsNotNone(lease[0], "writer must be revoked live")
+        self.assertEqual(lease[1], "write_failure")
+        alert = self.con.execute(
+            "SELECT 1 FROM planner_alerts "
+            "WHERE reason='crash_window_delivery_unknown' AND resolved_at IS "
+            "NULL").fetchone()
+        self.assertIsNotNone(alert, "a live write failure must alert")
+        # The way out is the same operator reconciliation as the crash window.
+        interface_broker.reconcile_input(self.con, self.sid, "not_delivered")
+        self.con.commit()
+        interface_broker.certify_clean(self.con, self.sid, "op", 0)
+        interface_broker.acquire_writer(self.con, self.sid, "tab-2", "tok-2")
+        rec = Recorder("ok")
+        ack = interface_broker.accept_human_input(
+            self.con, self.sid, 1, 10, writer=rec)
+        self.assertEqual(ack, {"ack": 1, "duplicate": False})
+
+    # ── fenced submit hook + input lock (flag #33) ──────────────────────
+    def test_input_lock_rejects_human_frame_during_submit(self):
+        self._arm_and_submit()
+        rec = Recorder("ok")
+        with self.assertRaises(interface_broker.BrokerError):
+            interface_broker.accept_human_input(
+                self.con, self.sid, 1, 10, writer=rec)
+        self.assertEqual(rec.writes, [], "locked frame must never be written")
+        ist = self._input()
+        self.assertIsNone(ist["pending_seq"])
+        self.assertEqual(ist["composer"], "clean")
+
+    def test_submit_hook_fenced_against_later_human_input(self):
+        batch, _ = self._arm_and_submit()  # fence = forwarded_seq+1 = 1
+        # A human frame slipped in before the lock engaged (the race the
+        # fence exists for): seq 1 was accepted after the wake submitted.
+        self.con.execute(
+            "UPDATE interface_input_state SET forwarded_seq=1, composer='dirty'"
+            " WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        # The Enter that fires this hook is the human's — it must NOT
+        # manufacture the batch's durable submit evidence.
+        interface_broker.record_hook(self.con, 1, 1, 1, "prompt_submit")
+        row = self.con.execute(
+            "SELECT state, submit_hook_seq FROM planner_wake_batches "
+            "WHERE batch_id=?", (batch,)).fetchone()
+        self.assertEqual(row[0], "delivery_unknown",
+                         "an unfenced hook parks the batch, never promotes it")
+        self.assertIsNone(row[1], "no submit evidence may be stamped")
+        self.assertEqual(self._input()["composer"], "dirty",
+                         "a later human sequence keeps the composer dirty")
+        alert = self.con.execute(
+            "SELECT 1 FROM planner_alerts "
+            "WHERE reason='wake_batch_delivery_unknown' AND resolved_at IS "
+            "NULL").fetchone()
+        self.assertIsNotNone(alert)
+        # Decision #22 re-proof under the fixed fence: recovery finds no
+        # manufactured evidence and keeps the park — never a blind resubmit.
+        self._reconnect()
+        interface_reconcile.startup_reconcile(self.con)
+        state = self.con.execute(
+            "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+            (batch,)).fetchone()[0]
+        self.assertEqual(state, "delivery_unknown")
+
+    def test_unfenced_hook_cannot_clear_unknown_composer(self):
+        self._arm_and_submit()
+        self.con.execute(
+            "UPDATE interface_input_state SET composer='unknown' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        interface_broker.record_hook(self.con, 1, 1, 1, "prompt_submit")
+        self.assertEqual(self._input()["composer"], "unknown",
+                         "only exact recovery + certification clears unknown")
+
+    def test_session_end_hook_ends_generation(self):
+        self._arm_and_submit()
+        interface_broker.record_hook(self.con, 1, 1, 1, "prompt_submit")
+        interface_broker.record_hook(self.con, 1, 1, 2, "turn_stop")
+        # lifecycle walks busy -> idle -> stopping before the end hook.
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle='stopping' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        interface_broker.record_hook(self.con, 1, 1, 3, "session_end")
+        ended = self.con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0]
+        self.assertIsNotNone(ended,
+                             "a proven session end must end the generation — "
+                             "else a rebuild resurrects it and bricks New chat")
+        # Hooks for the ended generation are rejected from here on.
+        with self.assertRaises(interface_broker.BrokerError):
+            interface_broker.record_hook(self.con, 1, 1, 4, "prompt_submit")
 
 
 if __name__ == "__main__":
