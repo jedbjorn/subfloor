@@ -6,7 +6,7 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 
 # sprint
 
-Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.
+Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the managed session dispatcher wakes the planner, and the planner explicitly boots workers. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.
 
 **Category:** craft
 
@@ -26,13 +26,13 @@ pass). Planner side (declare / monitor / close / report) =
 You are in a sprint ONLY when a planner `task` message names you a
 participant and points at a sprint doc. No kickoff -> this skill is inert.
 
-**You never poll on a schedule.** The sprint is event-driven: the planner
-wakes you with `task` rows (often by booting you headless — `./sc run` —
-with the task as your prompt), the GitHub watcher daemon turns your PR's
-transitions into `pr_event` rows for the planner, and you report every
-state change back as a `result` row. A session that has nothing left to
-act on ends; the next event boots the next one. Your memory, archives,
-and messages accrete across boots — an ephemeral session is still you.
+**You never poll on a schedule.** The planner sends durable `task` rows and
+explicitly boots workers (often headless with `./sc run`). The GitHub watcher
+daemon turns your PR transitions into `pr_event` rows; the session dispatcher
+delivers those unread events only to the planner's managed binding. You report
+every state change as a `result` row. A message does not boot an ordinary
+worker by itself; a live inbox check or an explicit planner boot starts your
+next turn. Memory, archives, and messages persist across those turns.
 
 ## The sprint doc — one board, planner-owned
 
@@ -103,11 +103,12 @@ with the session, silently — "the harness will wake me" is false there.
 Never park a suite, bench, build, or watcher on one. Long local work
 goes through `./sc job`, two patterns:
 
-- **Fire-and-wake (default):** `./sc job start [--label <x>]
+- **Detached completion:** `./sc job start [--label <x>]
   [--timeout <s>] -- <cmd>` — the job survives your session; completion
-  lands in YOUR inbox as a `result` row, and the normal event loop (your
-  next boot's inbox drain) acts on it. If the sprint waits on the
-  outcome, report the job id to the planner, then end the turn.
+  lands in YOUR inbox as a `result` row. That row is durable, but it does
+  not autonomously boot an ordinary worker. Use this only when no immediate
+  continuation depends on the result; otherwise use wait-slice or arrange an
+  explicit planner re-boot rather than ending the turn on an assumed wake.
 - **Wait-slice (the result decides THIS turn's next step):**
   `./sc job wait <id>` blocks ≤550s in the foreground — exit 0 =
   finished · 2 = still running. Between slices drain your inbox
@@ -150,10 +151,10 @@ for real code dependencies.
 
 **3. Build.** Your dependency not yet merged? Build and commit locally,
 but do NOT open your PR out of turn — the planner's next `task` row (sent
-on your upstream's merge event) is your turn signal; a booted-headless
-session simply ends here and the planner re-boots you when the chain
-reaches you. Don't schedule a watcher; don't poll. Upstream visibly
-stalls from where you sit -> `result` row to the planner; don't sit
+after the managed planner receives your upstream's merge event) is your turn
+signal; a booted-headless session simply ends here and the planner explicitly
+re-boots you when the chain reaches you. Don't schedule a watcher; don't poll.
+Upstream visibly stalls from where you sit -> `result` row to the planner; don't sit
 silent behind a stuck link.
 
 **4. Take your turn** the moment your dependency is on `main` (your
@@ -177,8 +178,9 @@ without a watch is invisible to the sprint.
 
 **5. Babysit CI while live.** `gh pr checks <your-pr> --watch` blocks in
 your session at zero scheduled cost — use it while you're booted; if your
-session ends first, the daemon's red/green event reaches the planner and
-a `task` row re-boots you. Never a cron, never a scheduled wake.
+session ends first, the daemon's red/green event reaches the managed planner.
+The planner sends any needed `task` row and explicitly re-boots you. Never a
+cron, never a scheduled model wake.
 
 Triage before fixing: is the failure in something your diff touches? Does
 `main` show the same failure? Does the log say timeout / runner died /
@@ -250,9 +252,9 @@ Gate the units the doc's `reviewer` column assigns you. Method = the base
 `review` skill (adversarial, verify-don't-trust, review against the unit's
 scope); this overlay changes only pace and severity:
 
-1. **Wake = a review request.** A dev's `ready for review` message — or a
-   planner `task` row booting you headless with the request as prompt —
-   is next-in-queue work; a waiting review stalls the chain exactly like
+1. **Wake = an explicit review turn.** A dev's `ready for review` message is
+   durable; a live inbox check or the planner booting you headless starts the
+   next-in-queue work. A waiting review stalls the chain exactly like
    red CI. Keep a `SPRINT doc=<id> reviewing=<seq,seq,…>` line in
    `current_state`. No trackers, no scheduled polls.
 2. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
@@ -312,9 +314,9 @@ between two units — are yours to catch.
 
 ## Stance
 
-- No scheduled polling, ever: `task` rows and headless boots wake you;
-  `pr_event` rows wake the planner; the sprint doc tells you what a wake
-  means.
+- No scheduled model polling, ever: only a live inbox check or explicit
+  `./sc run` starts a worker turn; unread events wake the managed planner
+  binding. The sprint doc tells every turn what it means.
 - Nothing that must outlive the turn rides a harness background task —
   local long work goes through `./sc job`; measurement claims are
   CI-vs-CI on one runner.
