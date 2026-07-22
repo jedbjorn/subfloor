@@ -114,7 +114,7 @@ graph TD
 How the overlay works — every property injected through an extension point the
 harness already ships, nothing patched, nothing forked: [*Architecture*](docs/README.md#architecture).
 
-## Quick start
+## Install quickstart
 
 > [!class4]
 > **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.** `./sc doctor` reports what it finds and the exact next command. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
