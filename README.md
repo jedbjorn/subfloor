@@ -55,7 +55,8 @@ If you are ever unsure what is happening, open the Review GUI or boot the
 it can check the team's health, help update subfloor, and create skills tailored
 to your repository.
 
-A **forkable shell substrate for a single code repository.** You install it into
+### The technical details
+Subfloor is a **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
 whatever coding harness you point at it — **Claude Code, OpenCode, Codex,
