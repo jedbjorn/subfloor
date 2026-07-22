@@ -43,6 +43,7 @@ Run from the repo root, like every engine command:
     ./sc mem task add "<title>" --feature <id> --doc <id> --seq <n> [--desc "…"]
     ./sc mem task start <task_id>    ./sc mem task done <task_id>
     ./sc mem task cancel <task_id>   [--notes "…"]   # work moved/rescoped — never built
+    ./sc mem task edit <task_id>     [--title "…"] [--desc "…"]   # revise title/description
     ./sc mem oriented                # mark first-run complete (bootstrapped=1)
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
@@ -495,6 +496,17 @@ def cmd_task(args) -> int:
             payload["resolution_notes"] = args.notes
         _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", payload)
         return _finish_api(f"mem: task #{args.task_id} → cancelled")
+    if args.task_cmd == "edit":
+        payload = {}
+        if args.title is not None:
+            payload["title"] = args.title
+        if args.desc is not None:
+            payload["description"] = args.desc
+        if not payload:
+            die("nothing to edit — pass at least one of --title / --desc")
+        _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", payload)
+        edited = " + ".join(payload)  # 'title', 'description', or both
+        return _finish_api(f"mem: task #{args.task_id} edited ({edited})")
     status = "in_progress" if args.task_cmd == "start" else "done"
     _api("PATCH", f"/_sc/mem/tasks/{args.task_id}", {"status": status})
     return _finish_api(f"mem: task #{args.task_id} → {status}")
@@ -702,7 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     pss.add_argument("status", choices=["active", "inactive", "paused"])
     sp.set_defaults(fn=cmd_project)
 
-    sp = sub.add_parser("task", help="spec_tasks: add / start / done / cancel")
+    sp = sub.add_parser("task", help="spec_tasks: add / start / done / cancel / edit")
     tsub = sp.add_subparsers(dest="task_cmd", required=True)
     ta = tsub.add_parser("add")
     ta.add_argument("title")
@@ -718,6 +730,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="terminal close without building — split/re-scope moved the work")
     tcl.add_argument("task_id", type=int)
     tcl.add_argument("--notes", help="why + where the work went (e.g. 'moved to F117 as task #431')")
+    te = tsub.add_parser("edit", help="revise a task's title and/or description")
+    te.add_argument("task_id", type=int)
+    te.add_argument("--title")
+    te.add_argument("--desc")
     sp.set_defaults(fn=cmd_task)
 
     sub.add_parser("oriented", help="mark this shell oriented (bootstrapped=1)") \

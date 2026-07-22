@@ -414,6 +414,33 @@ class ApiMemTest(unittest.TestCase):
         self.assertIn("cancelled", buf.getvalue())
         self.assertIn("moved to F999", buf.getvalue())
 
+    # ── task edit: revise title/description in place (SC-010) ────────────────
+    def test_task_edit_title_and_desc(self):
+        self.run_mem("roadmap", "add", "feat edit")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat edit'")[0]
+        body = self.tmp / "se.md"
+        body.write_text("# spec\n")
+        self.run_mem("doc", "add", "spec edit", "--body-file", str(body),
+                     "--feature", str(fid))
+        did = self.q("SELECT document_id FROM documents WHERE title='spec edit'")[0]
+        self.run_mem("task", "add", "vague title", "--feature", str(fid),
+                     "--doc", str(did), "--seq", "1")
+        tid = self.q("SELECT task_id FROM spec_tasks WHERE title='vague title'")[0]
+        self.run_mem("task", "edit", str(tid), "--title", "precise title",
+                     "--desc", "the QA contract, spelled out")
+        row = self.q("SELECT title, description, status FROM spec_tasks WHERE task_id=?", tid)
+        self.assertEqual(row["title"], "precise title")
+        self.assertEqual(row["description"], "the QA contract, spelled out")
+        self.assertEqual(row["status"], "pending")  # edit is not a status change
+        # editing one field leaves the other untouched
+        self.run_mem("task", "edit", str(tid), "--desc", "revised contract")
+        row = self.q("SELECT title, description FROM spec_tasks WHERE task_id=?", tid)
+        self.assertEqual(row["title"], "precise title")
+        self.assertEqual(row["description"], "revised contract")
+        # nothing-to-edit is a client-side refusal, not a silent no-op
+        with self.assertRaises(SystemExit):
+            self.run_mem("task", "edit", str(tid))
+
     def test_task_bogus_status_is_400_not_500(self):
         self.run_mem("roadmap", "add", "feat vs")
         fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat vs'")[0]
