@@ -116,15 +116,45 @@ class SchemaTest(unittest.TestCase):
         body = self.con.execute(
             "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
         self.assertIn("two routine routing questions to the FnB", body)
-        self.assertIn("Billing gate — Plan billing only by default.", body)
-        self.assertIn("env -u CODEX_API_KEY codex login status", body)
-        self.assertIn("env -u ANTHROPIC_API_KEY claude auth status --json", body)
-        self.assertIn("env -u CODEX_API_KEY ./sc run", body)
-        self.assertIn("env -u ANTHROPIC_API_KEY ./sc run", body)
-        self.assertIn("Usage Credits disabled", body)
-        self.assertIn("Auto top-up off and flexible-credit balance\n0", body)
-        self.assertIn("Choosing a harness/model is not permission", body)
-        self.assertIn("No standing invariant or recorded exception -> do not launch", body)
+        self.assertIn("Plan billing by default; observe, never mutate auth", body)
+        self.assertIn('if [ -n "${CODEX_API_KEY+x}" ]', body)
+        self.assertIn('key=s.get("apiKeySource")', body)
+        self.assertIn("billing=api source=CODEX_API_KEY", body)
+        self.assertIn("Billing approval required: provider=<openai|anthropic>", body)
+        self.assertIn("Default scope = one launch", body)
+        self.assertIn("billing-exception: provider=<openai|anthropic>", body)
+        self.assertIn("current environment unchanged", body)
+        self.assertIn("No matching, unexpired approval -> do not launch", body)
+        self.assertIn("Do not claim Extra Usage was\nvalidated", body)
+        self.assertNotIn("env -u", body)
+        self.assertNotIn("flexible-credit balance", body)
+
+    def test_billing_approval_reseed_replaces_scrub_and_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.executescript(SCHEMA.read_text())
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            con.executescript(migration.read_text())
+            if migration.name == "0078_reseed_sprint_plan_billing.sql":
+                break
+
+        before = con.execute(
+            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
+        self.assertIn("env -u CODEX_API_KEY", before)
+        self.assertIn("env -u ANTHROPIC_API_KEY", before)
+
+        reseed = (MIGRATIONS / "0079_reseed_sprint_billing_approval.sql").read_text()
+        con.executescript(reseed)
+        once = con.execute(
+            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
+        con.executescript(reseed)
+        twice = con.execute(
+            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
+
+        self.assertIn("observe, never mutate auth", once)
+        self.assertIn("Default scope = one launch", once)
+        self.assertNotIn("env -u", once)
+        self.assertEqual(twice, once)
 
 
 # ── daemon core: diff_events (pure) ──────────────────────────────────────────
