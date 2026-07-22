@@ -175,40 +175,92 @@ def cmd_inbox(args) -> int:
     _require_api()
     deadline = time.monotonic() + args.timeout if args.timeout else None
     failures = 0
-    while True:
+    channel = None
+    if os.environ.get("SC_SESSION_ACTIVE_CHANNEL") == "claude-inbox":
         try:
-            r = _api_soft("GET", "/_sc/mem/messages")
-            failures = 0
-            unread = [m for m in r.get("messages", []) if not m.get("read_at")]
-            if unread:
-                print(f"watch: {len(unread)} unread message(s) — inbox watcher fired:")
-                for m in unread[:10]:
-                    kind = m.get("kind") or "shell"
-                    first = (m.get("body") or "").splitlines()[0][:120]
-                    print(f"  [#{m['message_id']}] {kind} · {first}")
-                print("  → `sc mem message check`, act, mark-read, then re-arm the watcher.")
-                return 0
-        except _ApiDown as e:
-            failures += 1
-            if failures >= 10:
-                print(f"watch: inbox watcher giving up — API unreachable ({e})", file=sys.stderr)
-                return 3
-        if deadline and time.monotonic() >= deadline:
-            print("watch: inbox watcher timed out with no unread messages — re-arm to keep watching.")
-            return 2
-        time.sleep(args.interval)
+            binding_id = int(os.environ["SC_SESSION_BINDING_ID"])
+        except (KeyError, ValueError):
+            die("Claude inbox channel requires SC_SESSION_BINDING_ID")
+        channel = _api(
+            "POST",
+            "/_sc/session-control/channel",
+            {"binding_id": binding_id, "action": "register", "pid": os.getpid()},
+        )
+
+    try:
+        while True:
+            try:
+                if channel:
+                    _api_soft(
+                        "POST",
+                        "/_sc/session-control/channel",
+                        {
+                            "binding_id": channel["binding_id"],
+                            "action": "heartbeat",
+                            "pid": channel["pid"],
+                            "start_ticks": channel["start_ticks"],
+                        },
+                    )
+                r = _api_soft("GET", "/_sc/mem/messages")
+                failures = 0
+                unread = [m for m in r.get("messages", []) if not m.get("read_at")]
+                if unread:
+                    print(f"watch: {len(unread)} unread message(s) — inbox watcher fired:")
+                    for m in unread[:10]:
+                        kind = m.get("kind") or "shell"
+                        first = (m.get("body") or "").splitlines()[0][:120]
+                        print(f"  [#{m['message_id']}] {kind} · {first}")
+                    print("  → `sc mem message check`, act, mark-read, then re-arm the watcher.")
+                    return 0
+            except _ApiDown as e:
+                failures += 1
+                if failures >= 10:
+                    print(
+                        f"watch: inbox watcher giving up — API unreachable ({e})",
+                        file=sys.stderr,
+                    )
+                    return 3
+            if deadline and time.monotonic() >= deadline:
+                print(
+                    "watch: inbox watcher timed out with no unread messages — "
+                    "re-arm to keep watching."
+                )
+                return 2
+            time.sleep(args.interval)
+    finally:
+        if channel:
+            try:
+                _api_soft(
+                    "POST",
+                    "/_sc/session-control/channel",
+                    {
+                        "binding_id": channel["binding_id"],
+                        "action": "clear",
+                        "pid": channel["pid"],
+                        "start_ticks": channel["start_ticks"],
+                    },
+                )
+            except _ApiDown:
+                pass
 
 
 class _ApiDown(Exception):
     pass
 
 
-def _api_soft(method: str, path: str) -> dict:
+def _api_soft(
+    method: str, path: str, payload: "dict | None" = None
+) -> dict:
     """Like _api but raises _ApiDown instead of exiting — the inbox watcher
     rides out server restarts (e.g. an `./sc launch` bounce) instead of dying."""
     url = SC_API_BASE.rstrip("/") + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Authorization": f"Bearer {SC_API_TOKEN}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        url, method=method, headers={"Authorization": f"Bearer {SC_API_TOKEN}"})
+        url, data=data, method=method, headers=headers
+    )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
