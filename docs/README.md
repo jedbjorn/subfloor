@@ -424,12 +424,12 @@ shells of a flavor are interchangeable workers, and reviewers stay a
 *different lineage* from the code they gate — the doctrine above, chosen per
 sprint instead of per boot.
 
-The planner itself is not interviewed — it is already booted. **Strong
-recommendation, not a gate: run the planner on Claude.** The planner is the
-low-volume, high-leverage reasoning seat, the one long-lived context in the
-loop, and the only role the inbox watcher (`./sc watch inbox`, claude-only)
-fully serves. Any harness *works* in the planner seat — wake latency and
-ergonomics degrade, correctness doesn't.
+The planner itself is not interviewed — it is already booted. Before kickoff,
+bind that planner's archive and native conversation with `./sc session manage`.
+Managed delivery is provider-neutral: it uses the harness's validated active
+transport while idle and resumes the same native conversation when dormant. A
+Claude planner may keep `./sc watch inbox` as an optional provider-local active
+channel; that watcher is not the cross-provider correctness model.
 
 ## Shells & worktrees
 
@@ -501,7 +501,7 @@ graph TD
   P --> R[Sprint review]:::class3
   R -->|Major / Medium findings| B
   R -->|review-clean| M[Dev merges its own PR]:::class2
-  M -->|pr_event wakes planner → boots downstream dev| B
+  M -->|pr_event delivered to managed planner → boots downstream dev| B
   M --> C[all units merged]:::class1
   C --> Q[Conformance pass — spec vs main]:::class3
   Q -->|Major finding → fix unit| B
@@ -535,16 +535,19 @@ graph TD
   declared review-clean (every Major/Medium fixed), **only** while the doc says
   `ACTIVE` and isn't frozen. Anything outside those four conditions is the
   default gate, unchanged — and the authority dies when the sprint closes.
-- **Events wake shells — nobody polls on a schedule.** A sprint is mostly
+- **The managed planner receives events; workers are booted explicitly.** A
+  sprint is mostly
   waiting for someone else's PR, and idle waiting used to cost a full-context
   harness turn per poll, per shell. Now every instruction and result is a
   typed `shell_messages` row: the planner sends `task` rows and boots workers
   headless; a dev opens its PR and registers a watch for the planner; the
   fork's ONE GitHub watcher daemon turns CI conclusions, reviews, and merges
-  into `pr_event` rows; the planner's zero-token inbox watcher wakes it the
-  moment any row lands. Waking is not knowing: on wake a shell re-reads the
-  board and its inbox — the event only says "look". The pieces and their
-  commands are *Under the hood — the event loop*, below.
+  into `pr_event` rows; the session dispatcher delivers unread rows through
+  the planner's managed binding. A row addressed to an ordinary worker does
+  not start a model turn — the planner boots that worker with `./sc run`.
+  Delivery is not knowing: the planner still re-reads the board and inbox; the
+  event only says "look". The pieces and their commands are *Under the hood —
+  the event loop*, below.
 - **Models are declared per sprint.** Headless boots never pass the launch
   picker, so the model seam moves to the declaration: the planner asks the
   operator exactly two questions — which harness/model for **devs**, which
@@ -613,7 +616,8 @@ design is [`specs_sc/sprint-eventing.md`](../specs_sc/sprint-eventing.md).
   supervised by `./sc launch` / `./sc down` like the brokers — covers every
   live watch with one batched GraphQL poll and turns transitions (checks
   concluded, review submitted, merged, closed) into one-line `pr_event`
-  rows: the message is the wake-up, not the payload. On merge/close a watch
+  rows: the message is the transition signal, not the payload. On merge/close
+  a watch
   retires itself (a merge whose checks are still pending keeps its watch until
   they conclude); `./sc watch list` shows what's live. Each cycle the daemon
   also beats a heartbeat row, so `list` / `pr` can say whether anybody is
@@ -633,30 +637,33 @@ design is [`specs_sc/sprint-eventing.md`](../specs_sc/sprint-eventing.md).
   exit — so no worker context accretes across the sprint, while memory,
   archives, and messages accrete in the DB exactly as in an interactive
   session.
-- **A zero-token wake for the planner.** `./sc watch inbox` blocks until a
-  message row lands, then exits — armed as a background task, its exit
-  wakes the live planner session the moment anything arrives, at zero token
-  cost while idle. Claude-harness only; on other harnesses the planner
-  keeps the task-boundary inbox check, so correctness is identical and only
-  wake latency degrades.
+- **One managed planner binding.** `./sc session manage <planner> --sprint
+  <doc>` binds the planner's archive and native conversation to the sprint.
+  The dispatcher delivers unread rows through the provider's validated active
+  transport or resumes the same dormant conversation; busy turns keep new
+  rows queued. A Claude planner may keep `./sc watch inbox` as an optional
+  provider-local active channel, but the managed binding is the
+  cross-provider control plane.
 - **Session-surviving jobs.** `./sc job start [--label <slug>] [--timeout <s>]
   -- <cmd>` runs long local work — a suite, a bench, a build — as a detached,
   supervised one-shot that **outlives the session that started it** (a harness
   background task is session-scoped and dies with a headless boot, silently).
-  Completion lands as a `result` row in the starting shell's own inbox — the
-  same wake path PR events ride — and `--timeout` group-kills a wedged run
-  into a bounded failure *with* a wake-up, never a silent hole. `list` /
-  `status` / `tail` / `kill` complete the set; `./sc job wait <id>` is the
-  bounded foreground slice (≤ 550 s; exit 2 = still running — drain your inbox
-  between slices). Full doc: [`docs_sc/job-runner.md`](../docs_sc/job-runner.md).
+  Completion lands as a durable `result` row in the starting shell's own
+  inbox, but that row does not boot an ordinary worker. `--timeout`
+  group-kills a wedged run into a bounded failure with a durable result, never
+  a silent hole. `list` / `status` / `tail` / `kill` complete the set;
+  `./sc job wait <id>` is the bounded foreground slice (≤ 550 s; exit 2 =
+  still running — drain your inbox between slices). Full doc:
+  [`docs_sc/job-runner.md`](../docs_sc/job-runner.md).
 
 ```linear
-Planner sends task row :::class1 -> sc run dev (headless) :::class2 -> Dev builds, opens PR + watch :::class2 -> CI concludes :::class3 -> Daemon writes pr_event :::class3 -> Watcher wakes planner :::class1 -> Planner boots next unit :::class1
+Planner sends task row :::class1 -> sc run dev (headless) :::class2 -> Dev builds, opens PR + watch :::class2 -> CI concludes :::class3 -> Daemon writes pr_event :::class3 -> Dispatcher delivers planner turn :::class1 -> Planner boots next unit :::class1
 ```
 
 The bar the feature shipped against: a unit goes task → build → PR → green →
 review → merge with **zero scheduled polling by any shell** — the planner is
-woken by rows, workers are booted per task, and the full history replays
+delivered unread rows through its managed binding, workers are booted per task,
+and the full history replays
 from `shell_messages`.
 
 ## Update a fork
@@ -788,9 +795,9 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc enter-<shortname>   # attach + boot one shell directly, skip the shell picker
 ./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
 ./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
-./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
-./sc job start -- <cmd>  # run a long local command detached + supervised — survives the session,
-                         #   completion lands in your inbox (wait/list/status/tail/kill complete the set)
+./sc watch inbox         # optional Claude planner active channel; session manage is the control plane
+./sc job start -- <cmd>  # run a long local command detached + supervised — survives the session;
+                         #   completion is durable but does not boot an ordinary worker
 ./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·
                          #   flag · roadmap · doc · narrative) — identity is the shell's token
 sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` for the repo-map dr_*
