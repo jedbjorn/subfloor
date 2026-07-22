@@ -15,9 +15,45 @@ purpose: Forkable shell substrate for a repo
 
 **[Quick start](docs/quick-start.md) · [Full documentation](docs/README.md)**
 
+## Overview
+
+### What is subfloor?
+
+In everyday terms, **subfloor is an AI development system — a whole AI
+development team in a box.** Add it to an existing project from the command
+line, install it, launch it, and start working with a Shell (subfloor's name for
+an AI agent). Launching also prints the address of the local Review GUI: a
+friendly home base where you can see your team, roadmap, specs and docs, open
+flags, repo map, worktrees, and token use.
+
 ![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
-## Overview
+A good first run starts with the **Cartographer Shell**. It maps your repository
+and adds short descriptions so every other Shell can get oriented without
+re-reading the whole project. Next, start a **Planner Shell** and work through
+your first feature and its spec. Specs and docs make the handoff smoother, so
+for anything complex, send the spec through a fresh reviewer or QA session
+before development begins.
+
+When the spec is ready, ask the planner to message a **Dev Shell**. subfloor has
+native messaging between Shells: boot the dev, tell it to check its inbox, and
+watch it implement the spec and open a pull request. Send complex work through
+review; simple work can go straight to your merge approval. Booting each Shell
+manually is a good way to learn the system, and you can always ask the Shell
+you're with what should happen next — every role knows the workflow.
+
+Once that feels familiar, try a **sprint**: subfloor's built-in workflow for
+larger efforts across models and providers. A Planner Shell oversees the work
+from start to finish, handing units between developers and reviewers. Outside a
+sprint, Shells never merge without your approval. During a declared sprint,
+they receive narrow permission to merge reviewed, passing work; this runs most
+smoothly when GitHub does not require a human to merge into `main`. If it does,
+the planner will tell you when your approval is needed.
+
+If you are ever unsure what is happening, open the Review GUI or boot the
+**Admin Shell**. Admin works from `main` and looks after the system as a whole:
+it can check the team's health, help update subfloor, and create skills tailored
+to your repository.
 
 A **forkable shell substrate for a single code repository.** You install it into
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
