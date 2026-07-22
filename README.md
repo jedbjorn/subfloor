@@ -32,7 +32,9 @@ flags, repo map, worktrees, and token use.
 
 A good first run starts with the **Cartographer Shell**. It maps your repository
 and adds short descriptions so every other Shell can get oriented without
-re-reading the whole project. Next, start a **Planner Shell** and work through
+re-reading the whole project. 
+
+Next, start a **Planner Shell** and work through
 your first feature and its spec. Specs and docs make the handoff smoother, so
 for anything complex, send the spec through a fresh reviewer or QA session
 before development begins.
