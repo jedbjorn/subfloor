@@ -63,3 +63,33 @@ Strong: the `CloseSessionMatrixTest` walks every lifecycle state legally before 
 ## Recommendation
 
 **1 Major + 1 Medium — block.** Findings to DEV5 directly (scoped sprint handoff), one-line copy to PLN1. Re-review on the fix push; Lows 1–2 to the sprint report.
+
+---
+
+# Re-review — fix push @3d0449d (2026-07-23)
+
+**Verdict: REVIEW-CLEAN — both blockers verified closed.** 0 Major / 0 Medium / 2 Low (unchanged, to sprint report).
+
+## SC-064 (Major) — CLOSED, fix verified against the actual interleavings
+
+- `spawn()` now registers the `Generation` in `self.generations` BEFORE the tmux work (interface_runtime.py), so the cancel path's `abandon()` pops and tears the in-flight spawn down — the DB-NULL-identity misjudgment is gone from the outcome space. The try/except pops the registration on any failure, guarded by `is gen` identity so a quick re-create's newer generation is never popped.
+- Two `_abort_if_torn_down` checkpoints (after pane identity is known; after `_pipe_pane`, before the sentinel boot file is touched) kill the just-created pane by exact identity and raise `SpawnAborted` — the harness never boots on an ended row. `_pipe_pane`'s marker wait returns early on `terminated`, so an abandoned spawn can't wedge on the writer attach. The second-check → `open(sentinel)` gap is safe: no await between them (cooperative asyncio), and the window is already dead in the abandon-won case.
+- `Generation.teardown` guards `if self.pane_id:` — no empty `-t` target to tmux. `abandon()` = pop + `teardown(kill_window=True)`, idempotent via the `terminated` flag; double-abandon (cancel path + create backstop) is a no-op.
+- `_create_session` backstop (interface_routes.py): post-spawn occupancy re-check — `ended`/`unreconciled` → `abandon` + `con.commit` + **409 `session_cancelled`**, never a 201, pane identity never persisted onto the terminal row. Covers the pre-registration cancel window the runtime check can't see. `SpawnAborted` itself maps to the same 409.
+- Uncertainty discipline kept: the except path deliberately does NOT kill the window on ambiguous tmux failure — that stays for the unreconciled path to judge. Only proven-abandoned spawns kill, by exact identity. Matches req 2's "uncertain → unreconciled, never silently ended".
+- Consumers of `generations` (`enqueue_input`, wake writer, attach) all guard `gen is None or gen.terminated`; a mid-spawn pane-less generation degrades to the same `PreSendError` the pre-fix `None` produced.
+- Tests: the API test drives the real interleaving on two threads (cancel lands while spawn is blocked pre-registration) and asserts the whole end state — 409, row `ended/ended/cancelled_before_spawn` with NULL identity, shell immediately re-creatable. The real-tmux test kills the pane by exact identity post-abandon and asserts `SpawnAborted`. Both would be red pre-fix.
+
+## SC-065 (Medium) — CLOSED
+
+- Guard is now `occupancy == "ended" and lifecycle == "ended"` — a legacy partial row (occupancy ended, lifecycle nonterminal) converges: occupancy transition skipped (same-state), lifecycle walked to `ended`, generation ended, leases revoked. Original `end_reason`/`ended_at` kept (`recorded_reason = prior_reason`) — the terminal record is not falsified. Fully-terminal repeat close stays a true no-op.
+- Test constructs the exact legacy shape (occupancy ended directly, lease held, generation open) and asserts convergence + original record + second-close no-op. Red pre-fix, green post.
+
+## Verification run (this review)
+
+Temp worktree @3d0449d: both hermetic regression tests green via `python -m unittest`; the real-tmux one skips in this sandbox (no tmux/node sidecar) but is green in CI. Full touched files — `test_interface_api` + `test_interface_crash_window` + `test_interface_runtime`: **113 passed, 5 env-skipped, 0 failed**.
+
+## Lows (unchanged, to sprint report)
+
+1. `BrokerError("…not found")` → 409 `state_conflict` masquerade (narrow race only).
+2. Cancel start requires the runtime available (503 otherwise); reconcile is the road out.
