@@ -14,7 +14,11 @@ tests/test_interface_runtime.py):
 - hook callback: generation-token auth, exact pid identity proof, reserved →
   occupied promotion, replay rejection;
 - writer leases, stream tickets, clean certification, explicit end — and
-  New chat available again after durable closure.
+  New chat available again after durable closure;
+- lifecycle convergence (spec #30): session_end hook runs the one closure
+  helper, cancel start on a reservation (#519), hook/terminate races end
+  in one terminal record (#532), repeated ends are idempotent successes,
+  and route/state/server errors stay distinct (#523).
 
 Run:
     python3 tests/test_interface_api.py
@@ -350,6 +354,7 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "shell_occupied")
         self.assertEqual(body["error"]["details"]["session_id"], 1)
+        self.assertEqual(body["error"]["details"]["occupancy"], "reserved")
 
     def test_unknown_fields_rejected(self):
         status, _, body = self.create_session(shell_id=1, bogus=True)
@@ -378,7 +383,9 @@ class InterfaceApiTest(unittest.TestCase):
 
     def test_new_chat_existing_worktree_not_reprovisioned(self):
         root = Path(self.tmp.name)
-        (root / ".sc-worktrees" / "s1").mkdir(parents=True)
+        wt = root / ".sc-worktrees" / "s1"
+        wt.mkdir(parents=True)
+        (wt / ".git").touch()  # a real git worktree carries a .git file
         with mock.patch.object(run_mod, "REPO_ROOT", root):
             status, _, body = self.create_session()
         self.assertEqual(status, 201, body)
@@ -979,6 +986,388 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["verified"])
         self.assertEqual(body["occupancy"], "occupied")
+
+    # -- lifecycle convergence (sprint 31 unit 1, spec #30 / #519 #523 #532) --
+
+    def test_session_end_hook_converges_full_closure(self):
+        """#532: the provider's session_end hook runs the ONE closure helper —
+        occupancy, lifecycle, generation, and leases converge atomically; the
+        occupied/ended divergence no route could close is gone."""
+        sid = self.occupy()
+        self.acquire_lease(sid)
+        tok = "Authorization: Bearer " + self.hook_token(sid)
+        status, _, body = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 3,
+             "event": "session_end", "pid": 4321})
+        self.assertEqual(status, 200, body)
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended", "provider_session_end"))
+        gen = con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0]
+        self.assertIsNotNone(gen)
+        leases = con.execute(
+            "SELECT COUNT(*) FROM interface_writer_leases "
+            "WHERE session_id=? AND revoked_at IS NULL", (sid,)).fetchone()[0]
+        self.assertEqual(leases, 0)
+        con.close()
+        # New chat immediately — no service restart, no reconcile (#532's
+        # workaround is gone).
+        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
+        self.assertEqual(body["shells"][0]["availability"], "available")
+        status, _, body = self.create_session(key="k-after-end")
+        self.assertEqual(status, 201, body)
+        # A duplicate session_end acknowledges without reopening …
+        status, _, body = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 4,
+             "event": "session_end", "pid": 4321})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["already_ended"])
+        # …but any other event on the ended generation is still rejected.
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 5,
+             "event": "turn_stop", "pid": 4321})
+        self.assertEqual(status, 403)
+
+    def test_terminate_on_ended_lifecycle_converges(self):
+        """The #532 legacy state (occupied + lifecycle ended): termination
+        completes durable closure idempotently — success, never a transition
+        back to stopping, never a false no_such_route."""
+        sid = self.occupy()
+        self.acquire_lease(sid)
+        con = sqlite3.connect(self.db_path)
+        routes.interface_state.transition(con, "lifecycle", sid, "stopping")
+        routes.interface_state.transition(con, "lifecycle", sid, "ended")
+        con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now') "
+            "WHERE shell_id=1 AND generation=1")
+        con.commit()
+        con.close()
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-leg"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(body["terminated"])
+        self.assertTrue(body["already_ended"])
+        self.assertEqual(self.runtime.terminated, [],
+                         "nothing live to signal — closure only")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended"))
+        leases = con.execute(
+            "SELECT COUNT(*) FROM interface_writer_leases "
+            "WHERE session_id=? AND revoked_at IS NULL", (sid,)).fetchone()[0]
+        self.assertEqual(leases, 0)
+        con.close()
+
+    def test_terminate_race_session_end_hook_wins(self):
+        """The exact #532 interleaving: the harness exits DURING the graceful
+        window — its session_end hook lands while the termination request is
+        in flight. One clean terminal record, success response, no 404."""
+        sid = self.occupy()
+        tok = "Authorization: Bearer " + self.hook_token(sid)
+        test = self
+
+        async def race_terminate(session_id, force=False):
+            status, _, b = test.call(
+                "POST", "/api/interface/hook-callbacks", (tok,),
+                {"shell_id": 1, "generation": 1, "hook_seq": 3,
+                 "event": "session_end", "pid": 4321})
+            assert status == 200, b
+            return {"terminated": False, "reason": "graceful_timeout",
+                    "pid": 4321, "generation": 1}
+
+        self.runtime.terminate = race_terminate
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-race"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(body["terminated"])
+        self.assertTrue(body["already_ended"])
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess[:2], ("ended", "ended"))
+        con.close()
+        # New chat immediately — the race leaves a converged terminal record.
+        status, _, body = self.create_session(key="k-after-race")
+        self.assertEqual(status, 201, body)
+
+    def test_repeated_end_chat_fresh_key_semantic_success(self):
+        """Spec Lifecycle Contract: a repeated request races the completed
+        closure — the same idempotency key replays the original response; a
+        FRESH key against the ended session returns the same semantic
+        success without a second signal."""
+        sid = self.occupy()
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-repeat"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202)
+        # Same key: exact replay of the stored response.
+        status, _, replay = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-repeat"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202)
+        self.assertEqual(replay, body)
+        # Fresh key: semantic success, no second signal to the runtime.
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-repeat-2"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(body["terminated"])
+        self.assertTrue(body["already_ended"])
+        self.assertEqual(len(self.runtime.terminated), 1)
+
+    # -- cancel start (#519) ----------------------------------------------------
+
+    def test_cancel_start_without_identity(self):
+        """#519: End chat on a reservation that never established pane or
+        harness identity cancels it — cancelled_before_spawn, no signal, the
+        shell available again."""
+        status, _, body = self.create_session()
+        assert status == 201
+        sid = body["session_id"]
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "UPDATE interface_sessions SET tmux_pane_id=NULL, pane_pid=NULL, "
+            "pane_start_ticks=NULL WHERE session_id=?", (sid,))
+        con.commit()
+        con.close()
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: cx1"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(body["terminated"])
+        self.assertEqual(body["end_reason"], "cancelled_before_spawn")
+        self.assertEqual(self.runtime.terminated, [],
+                         "no identity ever established — nothing to signal")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended", "cancelled_before_spawn"))
+        gen = con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0]
+        self.assertIsNotNone(gen)
+        con.close()
+        # The reservation no longer blocks New chat (#519's actual complaint).
+        status, _, body = self.create_session(key="k-after-cancel")
+        self.assertEqual(status, 201, body)
+
+    def test_cancel_start_verified_identity_runs_stop_path(self):
+        """Cancel start with a verified live pane identity signals the exact
+        generation and converges through normal closure."""
+        status, _, body = self.create_session()
+        assert status == 201
+        sid = body["session_id"]
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: cx2"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(body["terminated"])
+        self.assertEqual(self.runtime.terminated, [(sid, False)],
+                         "verified identity — the exact pane is signalled")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended", "operator_end"))
+        con.close()
+
+    def test_cancel_start_unverifiable_identity_parks_unreconciled(self):
+        """Spawn outcome uncertain: cancel start never silently ends — the
+        session becomes unreconciled and requires absence proof."""
+        async def no_verify(session_id):
+            return False
+        self.runtime.verify_identity = no_verify
+        status, _, body = self.create_session()
+        assert status == 201
+        sid = body["session_id"]
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: cx3"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "identity_unverified")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, error_detail FROM "
+            "interface_sessions WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess[:2], ("unreconciled", "lost"))
+        self.assertIn("cancel start", sess[2])
+        con.close()
+        # The road out: prove absence, then reconcile-close.
+        status, _, body = self.call(
+            "POST", "/api/interface/reconciliations",
+            (OP, "Idempotency-Key: cx4"),
+            {"session_id": sid, "action": "close"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["closed"])
+
+    def test_terminate_unreconciled_points_at_reconcile(self):
+        """An unreconciled session still refuses termination — but with a
+        truthful code and the supported next action, not a bare 'not
+        occupied'."""
+        sid = self._unreconciled()
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-unrec"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "not_occupied")
+        self.assertIn("reconcile", body["error"]["message"])
+
+    def test_terminate_not_running_proves_absence_and_closes(self):
+        """The runtime holding no live generation is absence, not a graceful
+        timeout: prove it and converge — never a phantom
+        graceful_timed_out_at."""
+        sid = self.occupy()
+        self.runtime.terminate_result = {"terminated": False,
+                                         "reason": "not_running"}
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-nr"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertTrue(body["terminated"])
+        self.assertEqual(body["reason"], "already_absent")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, graceful_timed_out_at FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess[0], "ended")
+        self.assertIsNone(sess[1], "absence is not a graceful timeout")
+        con.close()
+
+    def test_terminate_not_running_without_absence_fails_closed(self):
+        sid = self.occupy()
+        self.runtime.terminate_result = {"terminated": False,
+                                         "reason": "not_running"}
+        self.runtime.absence_proved = False
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x-nr2"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["reason"], "not_running")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("unreconciled", "lost"))
+        con.close()
+
+    # -- API error mapping (#523, spec req 4) ------------------------------------
+
+    def test_bad_path_id_is_422_never_no_such_route(self):
+        status, _, body = self.call("GET", "/api/interface/sessions/abc",
+                                    (OP,))
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "invalid_path_id")
+
+    def test_unknown_route_still_404(self):
+        status, _, body = self.call("GET", "/api/interface/bogus", (OP,))
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+
+    def test_escaped_state_conflict_is_409_never_no_such_route(self):
+        """#523: an illegal transition raised inside a handler was rewritten
+        to a false 404 no_such_route by the broad `except ValueError`. State
+        conflicts now map to 409 with a stable code."""
+        sid = self._unreconciled()
+        with mock.patch.object(
+                routes.interface_state, "transition",
+                side_effect=routes.interface_state.InterfaceTransitionError(
+                    "illegal transition: ended -> stopping")):
+            status, _, body = self.call(
+                "POST", "/api/interface/reconciliations",
+                (OP, "Idempotency-Key: em1"),
+                {"session_id": sid, "action": "verify"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "state_conflict")
+        self.assertIn("ended -> stopping", body["error"]["message"])
+
+    def test_unexpected_failure_is_sanitized_500_with_correlation(self):
+        """Unexpected handler failures: a sanitized 500 whose correlation id
+        matches a server-side record — internals never cross the wire."""
+        self.create_session()
+        with mock.patch.object(
+                routes.interface_broker, "current_writer",
+                side_effect=RuntimeError("db on fire")):
+            status, _, body = self.call("GET", "/api/interface/sessions/1",
+                                        (OP,))
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "internal")
+        self.assertNotIn("db on fire", json.dumps(body),
+                         "internals never leak into the response")
+        self.assertTrue(body["error"]["details"]["correlation"])
+
+    # -- worktree path validation + launcher exception curation (#526 lows) -----
+
+    def test_worktree_path_not_directory_refused(self):
+        """A stray FILE at the worktree path is a distinct, actionable
+        refusal — provisioning would no-op on it and the pane would die."""
+        root = Path(self.tmp.name)
+        wt = root / ".sc-worktrees" / "s1"
+        wt.parent.mkdir(parents=True)
+        wt.touch()
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "worktree_not_directory")
+        self.assertEqual(body["error"]["details"]["reason"], "non_directory")
+        self.ensure_wt.assert_not_called()
+
+    def test_worktree_plain_directory_unusable_refused(self):
+        """A bare directory without git backing is unusable, not
+        'existing' — provisioning assumes an existing dir is intact."""
+        root = Path(self.tmp.name)
+        (root / ".sc-worktrees" / "s1").mkdir(parents=True)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "worktree_unusable")
+        self.assertEqual(body["error"]["details"]["reason"], "not_a_worktree")
+        self.ensure_wt.assert_not_called()
+
+    def test_provision_oserror_curated(self):
+        """Expected launcher failures (git binary missing, mkdir refused)
+        are curated into the actionable 500, never a raw 500."""
+        self.ensure_wt.side_effect = FileNotFoundError(
+            "No such file or directory: 'git'")
+        root = Path(self.tmp.name)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "worktree_provision_failed")
+        self.assertIn("git", body["error"]["message"])
+
+    def test_provision_launch_error_curated(self):
+        self.ensure_wt.side_effect = run_mod.LaunchError(
+            "shell is not launchable")
+        root = Path(self.tmp.name)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "worktree_provision_failed")
+        self.assertIn("LaunchError", body["error"]["message"])
 
 
 if __name__ == "__main__":

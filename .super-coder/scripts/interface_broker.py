@@ -298,6 +298,83 @@ def reconcile_input(con, session_id: int, outcome: str) -> None:
                     "forwarded_seq": new_forwarded})
 
 
+def close_session(con, session_id: int, end_reason: str) -> dict:
+    """THE one closure helper (spec #30 Lifecycle Contract) — every close
+    producer (operator terminate, cancel start, reconcile-close, spawn
+    failure, provider session_end) converges through here instead of
+    composing lifecycle/occupancy moves independently.
+
+    One transaction boundary (the caller's connection): records end
+    reason/time, terminalizes occupancy AND lifecycle (walking through
+    `stopping` where no direct edge exists — a hook that won the race can
+    never strand occupied/ended, and nothing ever moves terminal →
+    nonterminal), ends the matching generation, revokes active leases,
+    and resolves or parks session-scoped wake state by the existing
+    ambiguity rules (a pending human frame parks delivery_unknown; a
+    batch with a proven stop reconciles from read state; a batch with no
+    stop evidence parks — no live harness will re-drive it). Queued wake
+    work is deliberately left queued for a future generation.
+
+    Idempotent: an already-ended session returns its original terminal
+    result without state churn."""
+    row = con.execute(
+        "SELECT shell_id, generation, occupancy, lifecycle, end_reason "
+        "FROM interface_sessions WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise BrokerError(f"interface session {session_id} not found")
+    shell_id, generation, occupancy, lifecycle, prior_reason = row
+    if occupancy == "ended":
+        return {"session_id": session_id, "already_ended": True,
+                "end_reason": prior_reason}
+
+    interface_state.transition(
+        con, "occupancy", session_id, "ended",
+        extra_sets={"ended_at": _now(con), "end_reason": end_reason})
+    if lifecycle != "ended":
+        if lifecycle in ("idle", "busy", "approval", "user_input"):
+            # No direct edge to ended — converge through stopping (the
+            # only nonterminal staging state every live state can reach).
+            interface_state.transition(con, "lifecycle", session_id,
+                                       "stopping")
+        interface_state.transition(con, "lifecycle", session_id, "ended")
+    con.execute(
+        "UPDATE interface_generations SET ended_at=datetime('now') "
+        "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
+        (shell_id, generation))
+    con.execute(
+        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
+        "revoke_reason='session_end' "
+        "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
+
+    # Session-scoped wake state: the generation is provably over, so a
+    # pending human frame can never be acked and a live batch can never
+    # see its stop hook. Resolve from durable evidence or park — the same
+    # rules startup reconciliation applies (decision #22).
+    istate = con.execute(
+        "SELECT pending_seq, delivery FROM interface_input_state "
+        "WHERE session_id=?", (session_id,)).fetchone()
+    if istate is not None and istate[0] is not None \
+            and istate[1] != "delivery_unknown":
+        park_delivery_unknown(con, session_id)
+    batches = con.execute(
+        "SELECT batch_id, binding_id, state, stop_hook_seq "
+        "FROM planner_wake_batches "
+        "WHERE shell_id=? AND generation=? AND state IN ('submitting','running')",
+        (shell_id, generation)).fetchall()
+    for batch_id, binding_id, _state, stop_seq in batches:
+        if stop_seq is not None:
+            _complete_batch(con, batch_id, stop_seq)
+        else:
+            interface_state.transition(con, "wake_batch", batch_id,
+                                       "delivery_unknown")
+            _alert(con, severity="critical",
+                   reason="wake_batch_delivery_unknown", binding_id=binding_id)
+    return {"session_id": session_id, "already_ended": False,
+            "end_reason": end_reason}
+
+
 def record_hook(con, shell_id: int, generation: int, hook_seq: int,
                 event: str, source: str = "provider") -> dict:
     """Record one authenticated harness hook with its durable sequence.
@@ -325,6 +402,12 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
     if gen is None:
         raise BrokerError(f"unknown generation {shell_id}/{generation}")
     if gen[1] is not None:
+        if event == "session_end":
+            # A provider hook may ACKNOWLEDGE an already-ended generation
+            # (its own end, or a close that won the race) without reopening
+            # it — a clean 200, never a rejection loop the emitter retries.
+            return {"hook_seq": hook_seq, "event": event,
+                    "acknowledged": True, "already_ended": True}
         raise BrokerError(f"generation {shell_id}/{generation} has ended")
     if hook_seq <= gen[0]:
         raise BrokerError(
@@ -416,15 +499,12 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
         if _turn_finished(con, sess, shell_id, generation, hook_seq):
             result["wake_batch_complete"] = True
     elif event == "session_end":
-        interface_state.transition(con, "lifecycle", sess[0], "ended")
-        # The chat is provably over: end the generation too. Without this the
-        # one-live-generation index keeps the shell occupied forever — and a
-        # snapshot/rebuild cycle would resurrect a "live" generation that
-        # bricks the shell's next New chat.
-        con.execute(
-            "UPDATE interface_generations SET ended_at=datetime('now') "
-            "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
-            (shell_id, generation))
+        # The chat is provably over: converge FULL durable closure through
+        # the one helper — occupancy AND lifecycle terminal, generation
+        # ended, leases revoked, wake state resolved/parked. Ending only
+        # the lifecycle here stranded occupied/ended sessions that no
+        # route could converge (#532).
+        close_session(con, sess[0], "provider_session_end")
     elif event == "approval_wait":
         # Optional (kimi PermissionRequest): busy → approval + alert. A
         # harness without this event simply stays busy — safe (spec).
