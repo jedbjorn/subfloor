@@ -114,3 +114,40 @@ hardening — planner rules whether they block this merge.
   prove no-clobber with a fork group fixture, prove both TOCTOU orderings,
   prove the gate never reads a pre-commit snapshot). 43 new/updated
   hermetic tests; CI 6/6 green.
+
+## Addendum (second pass, same session — deep trace of axes 3/5)
+
+- M3 (flag #51, Medium): NOT all hook-callback rejections are audited,
+  contra spec #20 Harness Hooks ("wrong tokens, stale generations,
+  replayed sequences, illegal transitions, and PID mismatch are rejected
+  and audited"). Audited: bad token/stale generation (403, `_log`),
+  unknown event (422, `_log`), PID mismatch (403, `_log`), illegal
+  transition (409, `_log`). NOT audited: replayed/stale hook_seq and all
+  other `BrokerError` 409s (the route returns `_err(409)` with no `_log`),
+  unknown source / unknown fields / missing fields (422), no-session
+  (404), session_start-without-pid (422). Replayed sequences are the
+  spec-named category that matters most here — and the missing audit is
+  exactly the diagnostic #50's out-of-order losses would need in
+  production. One `_log` per rejection path fixes it.
+- L1 broadened: the unguarded-`install()` crash class is wider than
+  claude write errors. `_codex_merge` crashes the launch on valid-JSON
+  non-dict `.codex/hooks.json` (`[]` → `cfg.setdefault` AttributeError)
+  or a non-dict `hooks` value (`hooks.get` AttributeError), and its
+  mkdir/`os.replace` OSErrors are likewise uncaught; `interface_exec`
+  calls `install()` outside any try/except, so any of these kills the
+  launch before exec — same contract violation, more realistic trigger
+  (user/fork-owned hooks.json shapes). Same fix covers all branches:
+  wrap the `install()` call in `interface_exec.main`, fail open.
+- Correction to the #50 worst-case trace (cosmetic, conclusion stands):
+  `interface_state.check` makes a same-state move an always-legal no-op,
+  so an early turn_stop landing while lifecycle is idle returns 200
+  (no-op), not "idle→idle illegal → 409". The lost event is still the
+  earlier prompt_submit (rejected stale once the later seq commits);
+  the stranded state is then batch stuck `submitting` holding the input
+  lock (wake fence unanswered) — recovered only by startup reconcile or
+  operator resolve_batch, same wedge class as flag #49's lost submission.
+- Verified clean on re-trace: emitter content discipline (stdin never
+  read; `</dev/null`; exact contract body asserted in test), record_hook
+  duplicate-seq concurrency resolves benignly (same-state no-op
+  idempotency + rollback-on-error), `_alert` dedupe via partial unique
+  index + INSERT OR IGNORE (re-alerts after resolution, as designed).
