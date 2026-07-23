@@ -25,6 +25,17 @@ DB="$ENGINE/shell_db.db"
 MAPDB="$ROOT/.sc-state/map.db"
 S="$ENGINE/scripts"
 
+# Python for the Interface verbs: the attach client needs `websockets` —
+# baked into the sandbox image's own python (Dockerfile) and pinned in
+# requirements.txt for the ./sc deps .venv. Take the first interpreter that
+# has it; else fail with the fix, like _sc_devtool.
+ifpy() {
+  if "$PY" -c 'import websockets' >/dev/null 2>&1; then printf '%s\n' "$PY"; return 0; fi
+  if [ -x "$here/.venv/bin/python" ] && "$here/.venv/bin/python" -c 'import websockets' >/dev/null 2>&1; then printf '%s\n' "$here/.venv/bin/python"; return 0; fi
+  echo "✗ sc interface: no python with websockets — run ./sc deps (or ./sc build to refresh the sandbox image)" >&2
+  return 1
+}
+
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
@@ -57,7 +68,7 @@ SC_PG_SHM="${SC_PG_SHM:-1g}"
 dcheck() {
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc serve + ./sc boot" >&2
+    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc serve + ./sc interface enter" >&2
     exit 1
   fi
 }
@@ -948,6 +959,10 @@ case "$cmd" in
   # Interface pane entrypoint (internal; spec #20) — consumes the single-use
   # launch token the API wrote, then becomes the shell's harness TUI.
   interface-exec)  exec "$PY" "$S/interface_exec.py" "$@" ;;
+  # Interface CLI parity (spec #20 seq 6) — status/start/view/attach/
+  # take-control/stop/reconcile, and the in-container half of `sc enter`.
+  # API-backed only; the attach client needs websockets (ifpy).
+  interface)    IFPY="$(ifpy)" && exec "$IFPY" "$S/interface_cli.py" "$@" ;;
   # Headless boot (sprint eventing): same render-then-exec path as boot, minus
   # the picker and the TTY. In-container primitive like boot — the planner
   # calls it to stand up an ephemeral worker; also the no-docker host path.
@@ -1066,8 +1081,11 @@ case "$cmd" in
     # no host watch-daemon is started here anymore.
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
-  enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
-  enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
+  # Interactive entry goes through the Interface API (spec #20): the in-container
+  # target resolves occupancy, starts a New chat (picker + reservation) for an
+  # available shell, or reattaches the occupied generation. Never a raw boot.
+  enter)        exec docker exec -it "$CNAME" ./sc interface enter "$@" ;;
+  enter-*)      exec docker exec -it "$CNAME" ./sc interface enter "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
@@ -1155,10 +1173,15 @@ super-coder — forkable shell substrate
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
   ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
-  ./sc enter               attach an interactive session: auth + pick shell + pick harness + boot
-  ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
+  ./sc enter               enter a shell through the Interface API: pick a shell, then
+                             New chat (harness picker) if available, else reattach the live session
+  ./sc enter-<shortname>   enter that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
+  ./sc interface <verb>    Interface CLI parity (spec #20), API-backed (never direct DB/tmux):
+                             status [shell] [--json] · start <shell> [--harness H] [--model M] [--effort E]
+                             view <shell> (read-only) · attach <shell> (writer) · take-control <shell>
+                             stop <shell> [--force] · reconcile <shell> [--close] — mutations take --json
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
                              opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
                              default prompt · --harness <h> · -m <model> (else flavor_defaults);
@@ -1170,7 +1193,8 @@ super-coder — forkable shell substrate
 
   Primitives (run inside the container; also the no-docker host escape hatch):
   ./sc serve               run the review layer (api + static UI) in the foreground
-  ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
+  ./sc boot [shortname]    raw interactive launch — REFUSES without the Interface reservation
+                             capability (spec #20); use ./sc enter / ./sc interface instead
   ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
                              (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette)
   ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure

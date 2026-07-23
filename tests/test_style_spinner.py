@@ -302,7 +302,12 @@ class BootPhaseLabelTest(unittest.TestCase):
             self.assertTrue(enabled)
             yield _LabelRecorder(labels, label)
 
-        env = {"SC_NO_AUTOPRUNE": "1"} if no_prune else {}
+        # SC_RAW_BOOT: main()'s interactive entry refuses without the Interface
+        # reservation capability (spec #20); these unit tests drive the raw
+        # boot pipeline itself, so they hold the tooling escape hatch.
+        env = {"SC_RAW_BOOT": "1"}
+        if no_prune:
+            env["SC_NO_AUTOPRUNE"] = "1"
         stdout = _Stdout(tty=False)
         stdin = _Stdout(tty=False)
         sync = mock.Mock(return_value="in sync with origin/main")
