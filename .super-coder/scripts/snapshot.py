@@ -81,10 +81,12 @@ PER_INSTANCE_TABLES = [
     # chat is live, and rebuild/update refuse while any live state exists, so
     # content.sql only ever carries closed/terminal rows. Volatile columns
     # (tmux socket, PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
-    # Fully volatile tables (interface_writer_leases, interface_input_state,
-    # pr_poll_runs) are NOT in this list — a rebuild rederives them empty.
+    # Fully volatile tables (interface_writer_leases, pr_poll_runs) are NOT in
+    # this list — a rebuild rederives them empty. interface_input_state keeps
+    # only terminal delivery-unknown metadata (never terminal bytes).
     "interface_generations",
     "interface_sessions",
+    "interface_input_state",
     "interface_idempotency_keys",
     "sprint_planner_bindings",
     "planner_wake_batches",
@@ -122,7 +124,13 @@ def _serialized_binding(binding_ref: str) -> str:
         "JOIN interface_generations bg "
         "ON bg.shell_id=b.shell_id AND bg.generation=b.generation "
         f"WHERE b.binding_id={binding_ref} "
-        "AND b.released_at IS NOT NULL "
+        "AND (b.released_at IS NOT NULL "
+        "OR EXISTS (SELECT 1 FROM interface_input_state i "
+        "WHERE i.session_id=b.session_id "
+        "AND i.delivery='delivery_unknown') "
+        "OR EXISTS (SELECT 1 FROM planner_wake_batches p "
+        "WHERE p.binding_id=b.binding_id "
+        "AND p.state='delivery_unknown')) "
         "AND s.occupancy='ended' AND s.lifecycle='ended' "
         "AND s.ended_at IS NOT NULL "
         "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL)"
@@ -142,7 +150,6 @@ def _serialized_batch(batch_ref: str) -> str:
         "ON wg.shell_id=wb.shell_id AND wg.generation=wb.generation "
         f"WHERE wb.batch_id={batch_ref} "
         "AND wb.state IN ('complete','delivery_unknown') "
-        "AND b.released_at IS NOT NULL "
         "AND s.occupancy='ended' AND s.lifecycle='ended' "
         "AND s.ended_at IS NOT NULL "
         "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL "
@@ -158,6 +165,9 @@ SNAPSHOT_ROW_FILTERS = {
         "WHERE g.shell_id=interface_sessions.shell_id "
         "AND g.generation=interface_sessions.generation "
         "AND g.ended_at IS NOT NULL)",
+    "interface_input_state":
+        "WHERE delivery='delivery_unknown' "
+        "AND " + _serialized_session("interface_input_state.session_id"),
     "sprint_planner_bindings":
         "WHERE " + _serialized_binding(
             "sprint_planner_bindings.binding_id"),

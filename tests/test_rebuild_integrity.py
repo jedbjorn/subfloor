@@ -32,7 +32,7 @@ def digest(path: Path) -> str:
 
 
 class RebuildIntegrityTest(unittest.TestCase):
-    def test_cleanup_migration_removes_orphans_and_terminal_volatile_state(self):
+    def test_cleanup_migration_parks_terminal_ambiguity_and_removes_orphans(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             db = Path(raw_tmp) / "shell_db.db"
             apply_engine_schema(db)
@@ -67,9 +67,14 @@ class RebuildIntegrityTest(unittest.TestCase):
 
             con.executescript(
                 (MIGRATIONS / "0083_interface_integrity_cleanup.sql").read_text())
-            self.assertIsNone(con.execute(
-                "SELECT 1 FROM interface_input_state WHERE session_id=1"
-            ).fetchone())
+            self.assertEqual(con.execute(
+                "SELECT composer, delivery, pending_seq "
+                "FROM interface_input_state WHERE session_id=1"
+            ).fetchone(), ("unknown", "delivery_unknown", 7))
+            self.assertEqual(con.execute(
+                "SELECT reason FROM planner_alerts WHERE session_id=1 "
+                "AND resolved_at IS NULL"
+            ).fetchone(), ("crash_window_delivery_unknown",))
             revoked_at, reason = con.execute(
                 "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
                 "WHERE session_id=1").fetchone()

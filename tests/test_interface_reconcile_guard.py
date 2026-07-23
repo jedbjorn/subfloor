@@ -230,7 +230,7 @@ class LiveRefusalGuardTest(unittest.TestCase):
         reasons = interface_reconcile.live_refusal_reasons(self.db)
         self.assertTrue(any("ambiguity" in r for r in reasons))
 
-    def test_terminal_session_stale_input_does_not_block(self):
+    def test_terminal_session_park_survives_startup_without_blocking(self):
         sid = self._occupied_session()
         self.con.execute(
             "UPDATE interface_sessions SET occupancy='ended', lifecycle='ended', "
@@ -245,12 +245,18 @@ class LiveRefusalGuardTest(unittest.TestCase):
         self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
 
         counts = interface_reconcile.startup_reconcile(self.con)
-        self.assertEqual(counts["terminal_inputs_removed"], 1)
-        self.assertIsNone(self.con.execute(
-            "SELECT 1 FROM interface_input_state WHERE session_id=?",
-            (sid,)).fetchone())
+        self.assertEqual(counts["terminal_inputs_removed"], 0)
+        self.assertEqual(counts["terminal_input_parks"], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT composer, delivery, pending_seq "
+            "FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone(), ("unknown", "delivery_unknown", 9))
+        self.assertEqual(self.con.execute(
+            "SELECT reason FROM planner_alerts WHERE session_id=? "
+            "AND resolved_at IS NULL", (sid,)).fetchone(),
+            ("crash_window_delivery_unknown",))
 
-    def test_shared_close_removes_volatile_children(self):
+    def test_shared_close_revokes_writer_and_preserves_ambiguity(self):
         sid = self._occupied_session()
         self.con.execute(
             "INSERT INTO interface_input_state (session_id, shell_id, generation, "
@@ -262,9 +268,10 @@ class LiveRefusalGuardTest(unittest.TestCase):
         interface_broker.close_session(self.con, sid, "operator_end")
         self.con.commit()
 
-        self.assertIsNone(self.con.execute(
-            "SELECT 1 FROM interface_input_state WHERE session_id=?",
-            (sid,)).fetchone())
+        self.assertEqual(self.con.execute(
+            "SELECT composer, delivery, pending_seq "
+            "FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone(), ("unknown", "delivery_unknown", 4))
         revoked_at, reason = self.con.execute(
             "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
             "WHERE session_id=?", (sid,)).fetchone()
@@ -272,18 +279,16 @@ class LiveRefusalGuardTest(unittest.TestCase):
         self.assertEqual(reason, "session_end")
         self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
 
-        # A repeated close also curates stale legacy volatile state without
-        # reopening or restamping the terminal session.
-        self.con.execute(
-            "INSERT INTO interface_input_state (session_id, shell_id, generation, "
-            "composer, pending_seq) VALUES (?,1,1,'unknown',8)", (sid,))
+        # A repeated close preserves the same evidence without reopening or
+        # restamping the terminal session.
         result = interface_broker.close_session(
             self.con, sid, "different_retry_reason")
         self.assertTrue(result["already_ended"])
         self.assertEqual(result["end_reason"], "operator_end")
-        self.assertIsNone(self.con.execute(
-            "SELECT 1 FROM interface_input_state WHERE session_id=?",
-            (sid,)).fetchone())
+        self.assertEqual(self.con.execute(
+            "SELECT delivery, pending_seq FROM interface_input_state "
+            "WHERE session_id=?", (sid,)).fetchone(),
+            ("delivery_unknown", 4))
 
     def test_fully_drained_passes(self):
         sid = self._occupied_session()

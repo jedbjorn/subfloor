@@ -1,8 +1,10 @@
 -- 0083 — terminal Interface cleanup + orphan alert repair (#529, #533).
 --
 -- Older closure paths could leave generation-volatile input state attached to
--- a fully ended session. It can no longer be delivered or reconciled, so drop
--- it and revoke any lingering writer lease. Older snapshots could also load
+-- a fully ended session. Drop ordinary state, but preserve metadata-only
+-- pending/delivery-unknown evidence as a parked observation (decision #16);
+-- terminal audit must not block update, but it must not be silently erased.
+-- Revoke any lingering writer lease. Older snapshots could also load
 -- planner_alerts with FK enforcement disabled while omitting one of their
 -- parents; delete those alerts before a reused integer ID can reattach them to
 -- a different session/binding/message/watch generation.
@@ -16,7 +18,31 @@ WHERE session_id IN (
     WHERE occupancy='ended'
       AND lifecycle='ended'
       AND ended_at IS NOT NULL
-);
+)
+  AND pending_seq IS NULL
+  AND delivery <> 'delivery_unknown';
+
+UPDATE interface_input_state
+SET composer='unknown',
+    delivery='delivery_unknown',
+    updated_at=datetime('now')
+WHERE session_id IN (
+    SELECT session_id
+    FROM interface_sessions
+    WHERE occupancy='ended'
+      AND lifecycle='ended'
+      AND ended_at IS NOT NULL
+)
+  AND (pending_seq IS NOT NULL OR delivery='delivery_unknown');
+
+INSERT OR IGNORE INTO planner_alerts
+    (session_id, severity, reason, dedupe_key)
+SELECT session_id,
+       'critical',
+       'crash_window_delivery_unknown',
+       CAST(session_id AS TEXT) || '|-|-|crash_window_delivery_unknown'
+FROM interface_input_state
+WHERE delivery='delivery_unknown';
 
 UPDATE interface_writer_leases
 SET revoked_at=COALESCE(revoked_at, datetime('now')),

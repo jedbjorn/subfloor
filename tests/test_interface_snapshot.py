@@ -5,15 +5,14 @@ The snapshot contract: it may run while a chat is live because it omits all
 volatile state, and rebuild/update refuse while live state exists — so
 content.sql carries only durable audit. These tests pin:
 
-- volatile tables (interface_writer_leases, interface_input_state,
-  pr_poll_runs) are NOT in PER_INSTANCE_TABLES;
+- fully volatile tables (interface_writer_leases, pr_poll_runs) are NOT in
+  PER_INSTANCE_TABLES; terminal delivery-unknown input metadata is preserved;
 - volatile columns (tmux socket, PIDs/start ticks, hook token hash) never
   appear in a dump even on preserved rows;
-- row filters keep live rows out: non-ended sessions, armed bindings,
+- row filters keep live rows out: non-ended sessions, their bindings,
   nonterminal batches/items, and no-transition observations are excluded
-  while their terminal counterparts are preserved;
-- durable guard tables (action receipts, idempotency keys, alerts) dump
-  whole.
+  while terminal audit and parked ambiguity are preserved;
+- alerts are serialized only when every referenced parent is preserved.
 
 Run:
     python3 tests/test_interface_snapshot.py
@@ -31,6 +30,8 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ENGINE / "api"))
+import interface_routes  # noqa: E402
 import snapshot  # noqa: E402
 
 SECRET_SOCKET = "/run/sc/SECRET-tmux-socket-0700"
@@ -49,9 +50,9 @@ def build_engine_db(path: Path) -> None:
             "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
             "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
             "VALUES (?,?,?,'test','sp',1,0,1,1)", (sid, f"S{sid}", f"s{sid}"))
-    con.execute(
-        "INSERT INTO documents (document_id, kind, title) "
-        "VALUES (1,'doc','SPRINT: test')")
+    con.executemany(
+        "INSERT INTO documents (document_id, kind, title) VALUES (?,?,?)",
+        [(1, "doc", "SPRINT: live"), (2, "doc", "SPRINT: ended")])
     con.commit()
     con.close()
 
@@ -82,23 +83,41 @@ class InterfaceSnapshotTest(unittest.TestCase):
             " tmux_socket, pane_pid) "
             "VALUES (2,2,2,'ended','ended',datetime('now'),'operator_end',"
             " ?, 999)", (SECRET_SOCKET,))
-        # Bindings: one armed, one released.
+        # Input state: only the terminal delivery-unknown record is durable.
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, "
+            "generation, composer, delivery, pending_seq) "
+            "VALUES (1,1,1,'unknown','delivery_unknown',4)")
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, "
+            "generation, composer, delivery, pending_seq) "
+            "VALUES (2,2,2,'unknown','delivery_unknown',9)")
+        # Bindings: one on a live parent, one still armed on a terminal
+        # parent so its parked audit and recovery action survive rebuild.
         self.con.execute(
             "INSERT INTO sprint_planner_bindings (binding_id, sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation) "
             "VALUES (1,1,1,1,1,1)")
         self.con.execute(
             "INSERT INTO sprint_planner_bindings (binding_id, sprint_doc_id,"
+            " planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (2,2,2,2,2,2)")
+        self.con.execute(
+            "INSERT INTO sprint_planner_bindings (binding_id, sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation,"
             " released_at, release_reason) "
-            "VALUES (2,1,2,2,2,2,datetime('now'),'sprint_closed')")
-        # Batches: complete (audit) + queued (live).
+            "VALUES (4,2,2,2,2,2,datetime('now'),'sprint_closed')")
+        # Batches: complete + delivery-unknown audit, plus queued live state.
         self.con.execute(
             "INSERT INTO planner_wake_batches (batch_id, binding_id,"
             " shell_id, generation, state) VALUES (1,2,2,2,'complete')")
         self.con.execute(
             "INSERT INTO planner_wake_batches (batch_id, binding_id,"
             " shell_id, generation, state) VALUES (2,1,1,1,'queued')")
+        self.con.execute(
+            "INSERT INTO planner_wake_batches (batch_id, binding_id,"
+            " shell_id, generation, state) "
+            "VALUES (3,2,2,2,'delivery_unknown')")
         # Items: done (audit) + queued (live).
         self.con.execute(
             "INSERT INTO shell_messages (message_id, from_shell_id,"
@@ -143,11 +162,19 @@ class InterfaceSnapshotTest(unittest.TestCase):
             "INSERT INTO planner_alerts (session_id, severity, reason, dedupe_key) "
             "VALUES (2,'warning','ended-session','2|-|-|-|ended')")
         self.con.execute(
+            "INSERT INTO planner_alerts (session_id, severity, reason, dedupe_key) "
+            "VALUES (2,'critical','crash_window_delivery_unknown',"
+            "'2|-|-|crash_window_delivery_unknown')")
+        self.con.execute(
             "INSERT INTO planner_alerts (binding_id, severity, reason, dedupe_key) "
             "VALUES (1,'warning','live-binding','-|1|-|-|live')")
         self.con.execute(
             "INSERT INTO planner_alerts (binding_id, severity, reason, dedupe_key) "
             "VALUES (2,'warning','ended-binding','-|2|-|-|ended')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (binding_id, severity, reason, dedupe_key) "
+            "VALUES (2,'critical','wake_batch_delivery_unknown',"
+            "'-|2|-|wake_batch_delivery_unknown')")
         self.con.execute(
             "INSERT INTO planner_alerts (session_id, binding_id, severity, "
             "reason, dedupe_key) "
@@ -167,10 +194,10 @@ class InterfaceSnapshotTest(unittest.TestCase):
         return "\n".join(snapshot.dump_table(self.con, table))
 
     def test_volatile_tables_not_snapshotted(self):
-        for table in ("interface_writer_leases", "interface_input_state",
-                      "pr_poll_runs"):
+        for table in ("interface_writer_leases", "pr_poll_runs"):
             self.assertNotIn(table, snapshot.PER_INSTANCE_TABLES,
                              f"{table} must never reach content.sql")
+        self.assertIn("interface_input_state", snapshot.PER_INSTANCE_TABLES)
 
     def test_session_rows_filtered_and_redacted(self):
         out = self._dump("interface_sessions")
@@ -197,16 +224,26 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.assertNotIn("VALUES (1, 1,", out, "live generation leaked")
         self.assertIn("VALUES (2, 2,", out, "ended generation audit dropped")
 
-    def test_bindings_keep_released_only(self):
+    def test_bindings_keep_released_or_parked_terminal_state(self):
         out = self._dump("sprint_planner_bindings")
-        self.assertIn("'sprint_closed'", out)
-        # binding 1 (armed) must not appear; binding 2 (released) must.
+        # Live-parent binding 1 is excluded. Terminal binding 2 survives while
+        # unreleased because it owns a park; released binding 4 remains audit.
         self.assertNotIn("VALUES (1,", out)
         self.assertIn("VALUES (2,", out)
+        self.assertIn("VALUES (4,", out)
+        self.assertIn("'sprint_closed'", out)
+
+    def test_input_state_keeps_terminal_ambiguity_only(self):
+        out = self._dump("interface_input_state")
+        self.assertNotIn("VALUES (1,", out, "live input state leaked")
+        self.assertIn("VALUES (2,", out, "terminal ambiguity evidence dropped")
+        self.assertIn("'delivery_unknown'", out)
+        self.assertIn(", 9,", out)
 
     def test_wake_batches_keep_terminal_only(self):
         out = self._dump("planner_wake_batches")
         self.assertIn("'complete'", out)
+        self.assertIn("'delivery_unknown'", out)
         self.assertNotIn("'queued'", out)
 
     def test_wake_items_keep_terminal_only(self):
@@ -260,9 +297,42 @@ class InterfaceSnapshotTest(unittest.TestCase):
         try:
             rebuilt.executescript("\n".join(lines))
             violations = rebuilt.execute("PRAGMA foreign_key_check").fetchall()
+            input_park = rebuilt.execute(
+                "SELECT composer, delivery, pending_seq "
+                "FROM interface_input_state WHERE session_id=2").fetchone()
+            binding = rebuilt.execute(
+                "SELECT released_at FROM sprint_planner_bindings "
+                "WHERE binding_id=2").fetchone()
+            wake_park = rebuilt.execute(
+                "SELECT state FROM planner_wake_batches "
+                "WHERE batch_id=3").fetchone()
+            alerts = set(rebuilt.execute(
+                "SELECT reason FROM planner_alerts "
+                "WHERE session_id=2 OR binding_id=2").fetchall())
+            binding_row = rebuilt.execute(
+                "SELECT binding_id, sprint_doc_id, planner_shell_id, "
+                "session_id, generation, armed_at, released_at, release_reason "
+                "FROM sprint_planner_bindings WHERE binding_id=2").fetchone()
+            projected = interface_routes._project_binding(
+                rebuilt, binding_row)
         finally:
             rebuilt.close()
         self.assertEqual(violations, [])
+        self.assertEqual(input_park, ("unknown", "delivery_unknown", 9))
+        self.assertEqual(binding, (None,))
+        self.assertEqual(wake_park, ("delivery_unknown",))
+        self.assertIn(("crash_window_delivery_unknown",), alerts)
+        self.assertIn(("wake_batch_delivery_unknown",), alerts)
+        self.assertEqual(projected["wake_state"], "parked")
+        self.assertEqual(projected["park"], {
+            "batch_id": 3,
+            "input_park": True,
+            "reason": "wake_batch_delivery_unknown",
+        })
+        self.assertEqual(projected["retry"], {
+            "applicable": True,
+            "needs_outcome": True,
+        })
 
 
 if __name__ == "__main__":

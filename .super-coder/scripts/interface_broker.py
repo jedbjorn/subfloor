@@ -299,13 +299,29 @@ def reconcile_input(con, session_id: int, outcome: str) -> None:
 
 
 def _close_volatile_children(con, session_id: int) -> None:
-    """Terminalize/remove generation-volatile state in the caller's txn."""
+    """Terminalize/remove generation-volatile state in the caller's txn.
+
+    A delivery-unknown input row is no longer live, but it remains the
+    metadata-only ambiguity record required by decision #16.  Preserve that
+    park and its operator alert; remove only input state with no pending or
+    ambiguous delivery evidence.
+    """
     con.execute(
         "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
         "revoke_reason='session_end' "
         "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
-    con.execute(
-        "DELETE FROM interface_input_state WHERE session_id=?", (session_id,))
+    input_state = con.execute(
+        "SELECT pending_seq, delivery FROM interface_input_state "
+        "WHERE session_id=?", (session_id,)).fetchone()
+    if input_state is None:
+        return
+    pending_seq, delivery = input_state
+    if pending_seq is None and delivery != "delivery_unknown":
+        con.execute(
+            "DELETE FROM interface_input_state WHERE session_id=?",
+            (session_id,))
+        return
+    park_delivery_unknown(con, session_id)
 
 
 def close_session(con, session_id: int, end_reason: str) -> dict:
@@ -319,8 +335,9 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     `stopping` where no direct edge exists — a hook that won the race can
     never strand occupied/ended, and nothing ever moves terminal →
     nonterminal), ends the matching generation, revokes active leases,
-    removes volatile input state, and resolves or parks durable session-scoped
-    wake state by the existing ambiguity rules (a batch with a proven stop
+    removes ordinary volatile input state, preserves a metadata-only
+    delivery-unknown park, and resolves or parks durable session-scoped wake
+    state by the existing ambiguity rules (a batch with a proven stop
     reconciles from read state; a batch with no stop evidence parks — no live
     harness will re-drive it). Queued wake work is deliberately left queued
     for a future generation.
@@ -366,10 +383,10 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
         "UPDATE interface_generations SET ended_at=datetime('now') "
         "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
         (shell_id, generation))
-    # Input/composer state is generation-volatile. Once process absence and
-    # durable closure are proved there is nothing left to deliver or inspect,
-    # so remove it in this same transaction. Keeping an unknown/pending row
-    # made a safely closed session permanently block update (#529).
+    # Ordinary input/composer state is generation-volatile.  A pending or
+    # delivery-unknown row is different: it is the decision #16 ambiguity
+    # record, so park it durably while the live guard ignores its terminal
+    # parent.  Everything else is removed in this same transaction (#529).
     _close_volatile_children(con, session_id)
 
     # Session-scoped wake state: the generation is provably over, so a live

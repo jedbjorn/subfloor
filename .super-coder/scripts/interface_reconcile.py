@@ -57,19 +57,31 @@ def startup_reconcile(con) -> dict:
               "batches_delivery_unknown": 0, "batches_proven_running": 0,
               "batches_completed": 0, "leases_revoked": 0,
               "terminal_inputs_removed": 0,
+              "terminal_input_parks": 0,
               "terminal_leases_revoked": 0}
 
     active_session = interface_state.active_session_sql("s")
 
-    # A fully closed session has no actor left to accept or acknowledge input.
-    # Clean legacy volatile children before examining live crash windows so old
-    # composer/delivery/pending rows cannot re-park ended sessions (#529).
+    # A fully closed session has no actor left to accept new input.  Remove
+    # ordinary volatile state, but preserve metadata-only delivery ambiguity:
+    # decision #16 requires the pending sequence and operator action to survive
+    # closure without continuing to block update (#529).
     cur = con.execute(
         "DELETE FROM interface_input_state WHERE session_id IN ("
         "SELECT s.session_id FROM interface_sessions s "
-        f"WHERE NOT ({active_session}))"
+        f"WHERE NOT ({active_session})) "
+        "AND pending_seq IS NULL AND delivery <> 'delivery_unknown'"
     )
     counts["terminal_inputs_removed"] = cur.rowcount
+    terminal_parks = con.execute(
+        "SELECT i.session_id FROM interface_input_state i "
+        "JOIN interface_sessions s ON s.session_id=i.session_id "
+        f"WHERE NOT ({active_session}) "
+        "AND (i.pending_seq IS NOT NULL OR i.delivery='delivery_unknown')"
+    ).fetchall()
+    for (session_id,) in terminal_parks:
+        interface_broker.park_delivery_unknown(con, session_id)
+        counts["terminal_input_parks"] += 1
     cur = con.execute(
         "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
         "revoke_reason='session_end' WHERE revoked_at IS NULL "

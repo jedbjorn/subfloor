@@ -651,10 +651,9 @@ class CloseSessionMatrixTest(unittest.TestCase):
         self.assertTrue(out["already_ended"])
         self.assertEqual(out["end_reason"], "spawn_failed")
 
-    def test_close_removes_terminal_input_state(self):
-        """Once absence-proved closure ends the generation, pending input is
-        volatile terminal state: remove it instead of leaving an ambiguity
-        that no live TUI can ever reconcile (#529)."""
+    def test_close_parks_pending_human_input_without_blocking_update(self):
+        """Closure neutralizes the live blocker but keeps decision #16's
+        metadata-only ambiguity evidence and named operator alert."""
         sid = self._make("occupied", "idle")
         interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
         self.con.execute(
@@ -664,9 +663,9 @@ class CloseSessionMatrixTest(unittest.TestCase):
         interface_broker.close_session(self.con, sid, "operator_end")
         self.con.commit()
         ist = self.con.execute(
-            "SELECT 1 FROM "
+            "SELECT composer, delivery, pending_seq FROM "
             "interface_input_state WHERE session_id=?", (sid,)).fetchone()
-        self.assertIsNone(ist)
+        self.assertEqual(ist, ("unknown", "delivery_unknown", 1))
         alert = self.con.execute(
             "SELECT resolved_at FROM planner_alerts WHERE session_id=? AND "
             "reason='crash_window_delivery_unknown'",
