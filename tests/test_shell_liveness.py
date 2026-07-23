@@ -10,9 +10,13 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
@@ -118,6 +122,52 @@ class SessionStateTest(unittest.TestCase):
             "dev2", {"supported": False, "processes": self.SNAP["processes"]}))
 
 
+class AdminPresenceTest(unittest.TestCase):
+    """Cleanup requires positive evidence that the current Admin owns root."""
+
+    def test_missing_self_identity_is_indeterminate_and_unsafe(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(shell_liveness, "PROC", Path(td)), \
+                mock.patch.object(shell_liveness, "harness_binaries",
+                                  return_value={"codex"}), \
+                mock.patch.object(shell_liveness, "_shell_labels", return_value={}):
+            snap = shell_liveness.compute()
+
+        self.assertIsNone(snap["self_pid"])
+        self.assertEqual("indeterminate", snap["admin_presence"])
+        self.assertFalse(snap["safe_to_clean_all"])
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            shell_liveness._print_text(snap)
+        self.assertIn("admin_presence=indeterminate", output.getvalue())
+        self.assertIn("cleanup remains unsafe", output.getvalue())
+
+    def test_matched_root_self_is_positive_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            proc = Path(td)
+            process = proc / "123"
+            process.mkdir()
+            (process / "comm").write_text("codex\n")
+            (process / "cwd").symlink_to(shell_liveness.REPO_ROOT)
+
+            with mock.patch.object(shell_liveness, "PROC", proc), \
+                    mock.patch.object(shell_liveness, "harness_binaries",
+                                      return_value={"codex"}), \
+                    mock.patch.object(shell_liveness, "_shell_labels",
+                                      return_value={}), \
+                    mock.patch.object(shell_liveness, "_self_harness_pid",
+                                      return_value=123), \
+                    mock.patch.object(shell_liveness, "_tty_nr", return_value=0), \
+                    mock.patch.object(shell_liveness, "_ppid", return_value=2), \
+                    mock.patch.object(shell_liveness, "_tty_fd", return_value=None):
+                snap = shell_liveness.compute()
+
+        self.assertEqual("present", snap["admin_presence"])
+        self.assertEqual([123], snap["admin_root_pids"])
+        self.assertTrue(snap["safe_to_clean_all"])
+
+
 class ComputeSmokeTest(unittest.TestCase):
     """compute() against the real /proc: shape only, no liveness assumptions."""
 
@@ -125,6 +175,9 @@ class ComputeSmokeTest(unittest.TestCase):
         snap = shell_liveness.compute()
         if not snap.get("supported"):
             self.skipTest("non-Linux: /proc unavailable")
+        self.assertIn(snap["admin_presence"], ("present", "indeterminate"))
+        if snap["admin_presence"] == "indeterminate":
+            self.assertFalse(snap["safe_to_clean_all"])
         self.assertIn("orphaned_pids", snap)
         self.assertIsInstance(snap["orphaned_pids"], list)
         for p in snap["processes"]:
