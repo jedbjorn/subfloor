@@ -912,6 +912,43 @@ class InterfaceApiTest(unittest.TestCase):
         status, _, body = self.create_session(key="k-again")
         self.assertEqual(status, 201, body)
 
+    def test_ended_occupancy_with_live_lifecycle_needs_reconciliation(self):
+        session_id = self.occupy()
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "UPDATE interface_sessions SET occupancy='ended', "
+            "ended_at=datetime('now') WHERE session_id=?",
+            (session_id,))
+        con.commit()
+        con.close()
+
+        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
+        self.assertEqual(status, 200)
+        shell = body["shells"][0]
+        self.assertEqual(shell["session_id"], session_id)
+        self.assertEqual(shell["availability"], "unreconciled")
+
+    def test_terminal_state_without_ended_at_needs_reconciliation(self):
+        session_id = self.occupy()
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "UPDATE interface_sessions SET lifecycle='stopping' "
+            "WHERE session_id=?", (session_id,))
+        con.execute(
+            "UPDATE interface_sessions SET lifecycle='ended' "
+            "WHERE session_id=?", (session_id,))
+        con.execute(
+            "UPDATE interface_sessions SET occupancy='ended' "
+            "WHERE session_id=?", (session_id,))
+        con.commit()
+        con.close()
+
+        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
+        self.assertEqual(status, 200)
+        shell = body["shells"][0]
+        self.assertEqual(shell["session_id"], session_id)
+        self.assertEqual(shell["availability"], "unreconciled")
+
     def test_terminate_graceful_timeout_then_force(self):
         sid = self.occupy()
         self.runtime.terminate_result = {"terminated": False,

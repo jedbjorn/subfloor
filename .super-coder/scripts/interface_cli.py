@@ -279,8 +279,8 @@ def cmd_start(args) -> int:
             f"({resp.get('error', 'spawn failed')}) — investigate, then "
             f"`sc interface reconcile {short}`")
     print(f"→ session {resp['session_id']} reserved for {short} "
-          f"(generation {resp.get('generation')}, starting) — attach with "
-          f"`sc interface attach {short}`")
+          f"(generation {resp.get('generation')}, starting) — wait for it "
+          f"to become occupied, or cancel with `sc interface stop {short}`")
     return 0
 
 
@@ -823,7 +823,7 @@ def cmd_enter(args) -> int:
         return _attach(session_id, "writer", lease)
     if avail == "starting":
         die(f"{short} is starting (a reservation is booting) — retry in a "
-            f"moment, or watch with `sc interface view {short}`")
+            f"moment, or cancel with `sc interface stop {short}`")
     die(f"{short} is {avail} — New chat is blocked. "
         f"`sc interface status {short}` shows the session; "
         f"`sc interface reconcile {short}` revalidates it.")

@@ -18,6 +18,26 @@ Delivery sections. Two deliberate readings of the spec's edge lists:
 """
 from __future__ import annotations
 
+
+# One definition of whether a durable Interface session can still act or needs
+# reconciliation. A row is closed only when all three terminal markers agree;
+# every partial/legacy combination remains active and therefore fail-closed.
+def active_session_sql(alias: str = "interface_sessions") -> str:
+    return (
+        f"NOT ({alias}.occupancy='ended' "
+        f"AND {alias}.lifecycle='ended' "
+        f"AND {alias}.ended_at IS NOT NULL)"
+    )
+
+
+def session_is_active(occupancy: str, lifecycle: str, ended_at) -> bool:
+    return not (
+        occupancy == "ended"
+        and lifecycle == "ended"
+        and ended_at is not None
+    )
+
+
 # ── Edge maps (mirror the 0078 triggers exactly) ─────────────────────────────
 
 OCCUPANCY_EDGES = {

@@ -405,6 +405,7 @@ function dmModelPicker(harness, cat, row, save) {
       list.append(card);
     });
     results.append(list);
+    list.children[highlighted]?.scrollIntoView({ block: "nearest" });
     results.hidden = false;
   };
 

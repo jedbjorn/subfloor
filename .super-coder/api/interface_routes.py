@@ -340,9 +340,11 @@ def _availability(con, shell_id: int, snap) -> dict:
     projected for compact display; New-chat authority never changes here. A
     shell with no live session is available ONLY after the liveness scan
     clears it — a legacy/unmanaged harness makes it unreconciled."""
+    active_session = interface_state.active_session_sql("s")
     row = con.execute(
-        "SELECT session_id, generation, occupancy, lifecycle, harness "
-        "FROM interface_sessions WHERE shell_id=? AND occupancy <> 'ended'",
+        "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, s.harness "
+        "FROM interface_sessions s WHERE s.shell_id=? "
+        f"AND {active_session} ORDER BY s.session_id DESC LIMIT 1",
         (shell_id,)).fetchone()
     if row is not None:
         session_id, generation, occupancy, lifecycle, harness = row
