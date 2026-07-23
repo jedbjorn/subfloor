@@ -18,6 +18,14 @@ act as another shell (identity isn't a spoofable argument; it's the secret
 token). The one place a *recipient* is named is `message send <to>` — that
 addresses someone else's inbox; the sender is always the token.
 
+Host Admin discovery (spec doc #30 req 11): a host Admin seat booted outside
+run.py has neither var. When BOTH are absent, `sc mem` may adopt the unique
+owner-only runtime credential the supervised API provisions per Admin shell
+(`.super-coder/run/mem/<shortname>.json`, mode 0600) — `SC_MEM_AS=<shortname>`
+selects one when several exist; ambiguity, an insecure artifact, and a stale
+(rotated) token all refuse with the supported action. Discovery still calls
+the API; it is never a direct-DB path.
+
 Run from the repo root, like every engine command:
 
     ./sc mem which                                 # confirm API reachability + who your token resolves to
@@ -65,6 +73,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import sys
 import time
 import urllib.error
@@ -77,9 +86,71 @@ from pathlib import Path
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
 SC_API_BASE  = os.environ.get("SC_API_BASE", "")
 
+# Runtime credential discovery (spec doc #30 req 11, issue #516): a host Admin
+# seat booted outside run.py has neither var. The supervised API provisions one
+# owner-only artifact per Admin shell at every boot (scripts/mem_credentials.py)
+# under .super-coder/run/mem/; when BOTH vars are absent we may discover the
+# unique Admin artifact. We still call the API and only the API — the artifact
+# carries the same bearer token run.py would have injected, never a DB path.
+_CRED_DIR = Path(os.environ.get("SC_MEM_CRED_DIR") or
+                 (Path(__file__).resolve().parents[1] / "run" / "mem"))
+_DISCOVERED_FROM: "Path | None" = None  # artifact the token came from, if any
+
 
 def die(msg: str) -> "NoReturn":  # noqa: F821
     sys.exit(f"mem: {msg}")
+
+
+def _load_runtime_credential(path: Path) -> None:
+    """Trust-boundary check, then adopt the artifact's bearer token + base.
+
+    Accepted only under the existing local trust boundary: a regular file,
+    owned by this user, with no group/world permission bits (the service
+    writes 0600 under a 0700 dir). Anything weaker is refused, not used."""
+    global SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM
+    try:
+        st = path.stat()
+    except OSError as exc:
+        die(f"runtime credential {path} is unreadable ({exc}) — restart the "
+            "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        die(f"runtime credential {path} is not an owner-only regular file "
+            f"(mode {oct(stat.S_IMODE(st.st_mode))}) — the supervised service "
+            "re-provisions it with mode 0600 at boot: `./sc restart` / `make dos-r`.")
+    try:
+        data = json.loads(path.read_text())
+        token, base = data["token"], data["api_base"]
+    except (OSError, ValueError, KeyError):
+        die(f"runtime credential {path} is malformed — the supervised service "
+            "re-provisions it at boot: `./sc restart` / `make dos-r`.")
+    SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM = token, base, path
+
+
+def _discover_runtime_credential() -> bool:
+    """Adopt the unique Admin runtime credential when no env wiring exists.
+
+    Selection: SC_MEM_AS=<shortname> picks one artifact explicitly; without
+    it exactly one artifact must exist — multiple Admin identities are
+    ambiguous and refused, never guessed."""
+    try:
+        artifacts = sorted(p for p in _CRED_DIR.glob("*.json"))
+    except OSError:
+        return False
+    want = os.environ.get("SC_MEM_AS", "")
+    if want:
+        artifacts = [p for p in artifacts if p.stem.lower() == want.lower()]
+        if not artifacts:
+            die(f"no runtime credential for Admin shell '{want}' in {_CRED_DIR} — "
+                "the supervised service provisions one per Admin shell at boot "
+                "(`./sc restart` / `make dos-r`).")
+    if not artifacts:
+        return False
+    if len(artifacts) > 1:
+        die(f"multiple Admin runtime credentials in {_CRED_DIR} "
+            f"({', '.join(p.stem for p in artifacts)}) — identity is ambiguous; "
+            "re-run with SC_MEM_AS=<shortname> to choose one explicitly.")
+    _load_runtime_credential(artifacts[0])
+    return True
 
 
 def _require_api() -> None:
@@ -88,11 +159,15 @@ def _require_api() -> None:
     shell think a write was API-backed when it wasn't)."""
     if SC_API_TOKEN and SC_API_BASE:
         return
+    if not SC_API_TOKEN and not SC_API_BASE and _discover_runtime_credential():
+        return
     missing = [n for n, v in (("SC_API_BASE", SC_API_BASE), ("SC_API_TOKEN", SC_API_TOKEN)) if not v]
     die(f"the engine API is required but {' + '.join(missing)} "
         f"{'is' if len(missing) == 1 else 'are'} unset — this shell isn't API-wired. "
         f"Boot via `./sc enter` (run.py injects them) with the server up (`./sc launch`). "
-        f"`./sc mem` does not fall back to direct DB.")
+        f"On a host Admin seat, the supervised service provisions a runtime "
+        f"credential at {_CRED_DIR}/<shortname>.json that `sc mem` discovers "
+        f"automatically. `./sc mem` does not fall back to direct DB.")
 
 
 _RETRIES = 3          # extra attempts beyond the first
@@ -144,6 +219,11 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                     pause = _RETRY_PAUSE
                 time.sleep(pause)
                 continue
+            if e.code == 401 and _DISCOVERED_FROM is not None:
+                die(f"the runtime credential {_DISCOVERED_FROM} is stale — the API "
+                    "refused it (the key was rotated after the artifact was written). "
+                    "The supervised service refreshes the artifact at boot: "
+                    "`./sc restart` / `make dos-r`, then retry.")
             try:
                 msg = json.loads(e.read()).get("error", e.reason)
             except Exception:
@@ -172,7 +252,10 @@ def cmd_which(args) -> int:
     me = _api("GET", "/_sc/mem/whoami")
     print(f"engine API : {SC_API_BASE}")
     print(f"shell      : {me.get('display_name')} ({me.get('shortname')}) #{me.get('shell_id')}")
-    print("identity   : resolved from your bearer token (SC_API_TOKEN), server-side")
+    if _DISCOVERED_FROM is not None:
+        print(f"credential : discovered from runtime artifact {_DISCOVERED_FROM}")
+    else:
+        print("identity   : resolved from your bearer token (SC_API_TOKEN), server-side")
     return 0
 
 

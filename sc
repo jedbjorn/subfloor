@@ -25,15 +25,17 @@ DB="$ENGINE/shell_db.db"
 MAPDB="$ROOT/.sc-state/map.db"
 S="$ENGINE/scripts"
 
-# Python for the Interface verbs: the attach client needs `websockets` —
-# baked into the sandbox image's own python (Dockerfile) and pinned in
-# requirements.txt for the ./sc deps .venv. Take the first interpreter that
-# has it; else fail with the fix, like _sc_devtool.
+# Python for the Interface verbs: PREFER an interpreter with `websockets`
+# (baked into the sandbox image's own python and pinned in requirements.txt
+# for the ./sc deps .venv) because attach/view/take-control stream over it.
+# Never a hard gate here (spec #30 req 12, #518): HTTP-only verbs
+# (status/start/stop/reconcile) are stdlib-only and run on any python3 —
+# the stream dependency is checked lazily, inside the verbs that stream,
+# where interface_cli refuses with the exact dependency action.
 ifpy() {
   if "$PY" -c 'import websockets' >/dev/null 2>&1; then printf '%s\n' "$PY"; return 0; fi
   if [ -x "$here/.venv/bin/python" ] && "$here/.venv/bin/python" -c 'import websockets' >/dev/null 2>&1; then printf '%s\n' "$here/.venv/bin/python"; return 0; fi
-  echo "✗ sc interface: no python with websockets — run ./sc deps (or ./sc build to refresh the sandbox image)" >&2
-  return 1
+  printf '%s\n' "$PY"
 }
 
 port() { "$PY" "$S/ports.py" port; }
@@ -962,8 +964,9 @@ case "$cmd" in
   interface-exec)  exec "$PY" "$S/interface_exec.py" "$@" ;;
   # Interface CLI parity (spec #20 seq 6) — status/start/view/attach/
   # take-control/stop/reconcile, and the in-container half of `sc enter`.
-  # API-backed only; the attach client needs websockets (ifpy).
-  interface)    IFPY="$(ifpy)" && exec "$IFPY" "$S/interface_cli.py" "$@" ;;
+  # API-backed only. ifpy prefers a websockets-capable interpreter for the
+  # stream verbs but never blocks the stdlib-only HTTP verbs (spec #30).
+  interface)    exec "$(ifpy)" "$S/interface_cli.py" "$@" ;;
   # Headless boot (sprint eventing): same render-then-exec path as boot, minus
   # the picker and the TTY. In-container primitive like boot — the planner
   # calls it to stand up an ephemeral worker; also the no-docker host path.

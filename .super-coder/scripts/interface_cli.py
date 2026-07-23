@@ -357,9 +357,17 @@ def _read_stdin() -> bytes:
 
 
 def _ws_connect(ws_url: str):
-    """The WS seam — tests patch this, never a socket. Lazy import: the CLI
-    verbs (and their test env) never need the websockets package."""
-    from websockets.sync.client import connect
+    """The WS seam — tests patch this, never a socket. Lazy import: HTTP-only
+    verbs (status/start/stop/reconcile) run on a stdlib python (spec #30 req
+    12, #518); only attach/view/take-control reach here, and a missing
+    package refuses with the exact dependency action."""
+    try:
+        from websockets.sync.client import connect
+    except ImportError:
+        die("this command streams the terminal over websockets, but no "
+            "importable `websockets` package was found — run ./sc deps (or "
+            "./sc build to refresh the sandbox image). The HTTP-only verbs "
+            "(status/start/stop/reconcile) work without it.", EXIT_API_DOWN)
     return connect(ws_url, subprotocols=[SUBPROTOCOL])
 
 
