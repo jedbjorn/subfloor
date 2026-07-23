@@ -75,6 +75,11 @@ class InterfaceUnavailable(RuntimeError):
     """tmux/node stack missing or too old — review UI keeps working."""
 
 
+class SpawnAborted(RuntimeError):
+    """The generation was abandoned (cancel start) while its spawn was
+    still in flight — the spawn must not complete (SC-064)."""
+
+
 class _Rejected(Exception):
     """Pre-broker rejection carrying a stable wire reason string."""
 
@@ -405,10 +410,13 @@ class Generation:
             for client in list(self.clients):
                 client.send_control({"type": "error", "code": "terminated"})
                 client.close(1000, "generation terminated")
-            try:
-                await self.runtime.tmux("kill-window", "-t", self.pane_id)
-            except Exception:
-                pass
+            if self.pane_id:
+                # A generation abandoned mid-spawn can have no pane yet —
+                # never hand tmux an empty target (SC-064).
+                try:
+                    await self.runtime.tmux("kill-window", "-t", self.pane_id)
+                except Exception:
+                    pass
         self.runtime.shadow.dispose(self.sid)
         if self._pump_fd >= 0:
             try:
@@ -738,6 +746,10 @@ class InterfaceRuntime:
             f"&& exec cat >&9")
         deadline = time.monotonic() + TMUX_SYNC_TIMEOUT_S
         while not os.path.exists(marker):
+            if gen.terminated:
+                # Abandoned mid-spawn (SC-064) — the writer will never
+                # attach; let spawn's abort check raise SpawnAborted.
+                return
             if time.monotonic() > deadline:
                 raise RuntimeError(
                     f"pipe-pane writer never attached for {fifo}")
@@ -754,76 +766,112 @@ class InterfaceRuntime:
             asyncio.create_task(gen._input_consumer()),
         ]
 
+    async def _abort_if_torn_down(self, gen: Generation) -> None:
+        """Cancel-during-spawn convergence (SC-064): abandon() popped and
+        tore down this generation while its spawn was in flight. Kill the
+        just-created pane by its exact identity — provably ours, created
+        seconds ago — and refuse to complete the spawn: a completed spawn
+        on an already-ended row is a live harness nobody can close."""
+        if not gen.terminated:
+            return
+        if gen.pane_id:
+            try:
+                await self.tmux("kill-window", "-t", gen.pane_id)
+            except Exception:  # noqa: BLE001,S110 — already dead is the goal
+                pass
+        raise SpawnAborted(
+            f"session {gen.session_id} abandoned during spawn")
+
     async def spawn(self, *, session_id: int, shell_id: int, generation: int,
                     worktree: str, sc_path: str, token_path: str,
                     rows: int, cols: int,
                     command: list[str] | None = None) -> dict:
         """Create the tmux window + FIFO pump + shadow for one generation.
         `command` overrides the exec line — tests only. Returns the pane
-        identity the caller persists to interface_sessions."""
+        identity the caller persists to interface_sessions.
+
+        The generation is registered BEFORE the tmux work so a cancel
+        start landing mid-spawn (SC-064) can see and tear it down through
+        abandon(); the abort checks then stop the spawn before the harness
+        ever boots and SpawnAborted tells the caller the session was
+        cancelled — never a completed spawn on an ended row."""
         self._require_available()
         gen = Generation(self, session_id, shell_id, generation, rows, cols)
-        fifo = self._fifo_path(session_id)
-        sentinel = self._sentinel_path(session_id)
-        for stale in (fifo, sentinel):
-            if os.path.exists(stale):
-                os.unlink(stale)
-        os.mkfifo(fifo)
-        self._open_fifo(gen)
+        self.generations[session_id] = gen
+        try:
+            fifo = self._fifo_path(session_id)
+            sentinel = self._sentinel_path(session_id)
+            for stale in (fifo, sentinel):
+                if os.path.exists(stale):
+                    os.unlink(stale)
+            os.mkfifo(fifo)
+            self._open_fifo(gen)
 
-        if command is not None:
-            exec_line = shlex.join(command)
-        else:
-            exec_line = (f"{shlex.quote(sc_path)} interface-exec "
-                         f"{shlex.quote(token_path)}")
-        shell_line = (
-            f"cd {shlex.quote(worktree)} && "
-            f"while [ ! -f {shlex.quote(sentinel)} ]; do sleep 0.02; done; "
-            f"exec {exec_line}")
-        window = gen.sid
-        if not self._tmux_session_started:
-            await self.tmux("new-session", "-d", "-s", TMUX_SESSION,
-                            "-n", window, "-x", str(cols), "-y", str(rows),
-                            shell_line)
-            self._tmux_session_started = True
-        else:
-            try:
-                await self.tmux("new-window", "-d", "-t", f"{TMUX_SESSION}:",
-                                "-n", window, shell_line)
-            except RuntimeError as exc:
-                if "no server running" not in str(exc):
-                    raise
-                # last kill-window took the session (and server) down with it
-                self._tmux_session_started = False
+            if command is not None:
+                exec_line = shlex.join(command)
+            else:
+                exec_line = (f"{shlex.quote(sc_path)} interface-exec "
+                             f"{shlex.quote(token_path)}")
+            shell_line = (
+                f"cd {shlex.quote(worktree)} && "
+                f"while [ ! -f {shlex.quote(sentinel)} ]; do sleep 0.02; done; "
+                f"exec {exec_line}")
+            window = gen.sid
+            if not self._tmux_session_started:
                 await self.tmux("new-session", "-d", "-s", TMUX_SESSION,
-                                "-n", window, "-x", str(cols), "-y",
-                                str(rows), shell_line)
+                                "-n", window, "-x", str(cols), "-y", str(rows),
+                                shell_line)
                 self._tmux_session_started = True
             else:
-                await self.tmux("resize-window", "-t",
-                                f"{TMUX_SESSION}:{window}",
-                                "-x", str(cols), "-y", str(rows))
-        out = await self.tmux("display-message", "-p", "-t",
-                              f"{TMUX_SESSION}:{window}",
-                              "#{pane_id} #{pane_pid}")
-        pane_id, pane_pid = out.decode().split()
-        gen.pane_id, gen.pane_pid = pane_id, int(pane_pid)
-        gen.pane_start_ticks = await asyncio.to_thread(
-            _read_start_ticks, gen.pane_pid)
+                try:
+                    await self.tmux("new-window", "-d", "-t", f"{TMUX_SESSION}:",
+                                    "-n", window, shell_line)
+                except RuntimeError as exc:
+                    if "no server running" not in str(exc):
+                        raise
+                    # last kill-window took the session (and server) down with it
+                    self._tmux_session_started = False
+                    await self.tmux("new-session", "-d", "-s", TMUX_SESSION,
+                                    "-n", window, "-x", str(cols), "-y",
+                                    str(rows), shell_line)
+                    self._tmux_session_started = True
+                else:
+                    await self.tmux("resize-window", "-t",
+                                    f"{TMUX_SESSION}:{window}",
+                                    "-x", str(cols), "-y", str(rows))
+            out = await self.tmux("display-message", "-p", "-t",
+                                  f"{TMUX_SESSION}:{window}",
+                                  "#{pane_id} #{pane_pid}")
+            pane_id, pane_pid = out.decode().split()
+            gen.pane_id, gen.pane_pid = pane_id, int(pane_pid)
+            gen.pane_start_ticks = await asyncio.to_thread(
+                _read_start_ticks, gen.pane_pid)
+            await self._abort_if_torn_down(gen)
 
-        self.shadow.create(gen.sid, rows, cols)
-        await self._pipe_pane(gen)
-        # boot the harness only now: zero lost boot bytes
-        open(sentinel, "w").close()
+            self.shadow.create(gen.sid, rows, cols)
+            await self._pipe_pane(gen)
+            # boot the harness only when the spawn was not cancelled: zero
+            # lost boot bytes, and never a live harness on an ended row.
+            await self._abort_if_torn_down(gen)
+            open(sentinel, "w").close()
 
-        self.generations[session_id] = gen
-        self._start_consumers(gen)
-        _log(gen.sid, f"session spawned: shell={shell_id} gen={generation} "
-                      f"pane={pane_id} pid={pane_pid} {cols}x{rows}")
-        return {"pane_id": pane_id, "pane_pid": gen.pane_pid,
-                "pane_start_ticks": gen.pane_start_ticks,
-                "tmux_socket": self.sock, "tmux_session": TMUX_SESSION,
-                "tmux_window": window}
+            self._start_consumers(gen)
+            _log(gen.sid, f"session spawned: shell={shell_id} gen={generation} "
+                          f"pane={pane_id} pid={pane_pid} {cols}x{rows}")
+            return {"pane_id": pane_id, "pane_pid": gen.pane_pid,
+                    "pane_start_ticks": gen.pane_start_ticks,
+                    "tmux_socket": self.sock, "tmux_session": TMUX_SESSION,
+                    "tmux_window": window}
+        except Exception:
+            # A failed spawn leaves NO generation registered (the pre-SC-064
+            # shape): a later terminate/abandon must not mistake a
+            # half-spawned entry for a live one. The window itself is NOT
+            # killed here — an ambiguous tmux outcome stays for the
+            # unreconciled path to judge (only a proven-abandoned spawn
+            # kills, in _abort_if_torn_down, by exact identity).
+            if self.generations.get(session_id) is gen:
+                self.generations.pop(session_id, None)
+            raise
 
     def get_generation(self, session_id: int) -> Generation | None:
         return self.generations.get(session_id)

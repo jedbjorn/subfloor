@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -40,6 +41,7 @@ MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import interface_broker  # noqa: E402
 import interface_reconcile  # noqa: E402
+import interface_state  # noqa: E402
 
 
 class Crash(Exception):
@@ -495,6 +497,273 @@ class CrashWindowTest(unittest.TestCase):
         # Hooks for the ended generation are rejected from here on.
         with self.assertRaises(interface_broker.BrokerError):
             interface_broker.record_hook(self.con, 1, 1, 4, "prompt_submit")
+
+
+class CloseSessionMatrixTest(unittest.TestCase):
+    """close_session — THE one closure helper (spec #30 Lifecycle Contract,
+    sprint 31 unit 1). From EVERY legal (occupancy, lifecycle) pair it
+    produces one ended session, one ended generation, and revoked leases in
+    one transaction; a repeated close returns the original terminal result
+    without state churn. Session-scoped wake state resolves or parks by the
+    existing ambiguity rules."""
+
+    # Legal walks from the INSERTed (reserved, starting) row to each state.
+    OCCUPANCY_WALKS: ClassVar[dict] = {
+        "reserved": [],
+        "occupied": ["occupied"],
+        "unreconciled": ["unreconciled"],
+    }
+    LIFECYCLE_WALKS: ClassVar[dict] = {
+        "starting": [],
+        "idle": ["idle"],
+        "busy": ["idle", "busy"],
+        "approval": ["idle", "busy", "approval"],
+        "user_input": ["idle", "busy", "user_input"],
+        "stopping": ["idle", "stopping"],
+        "lost": ["lost"],
+        "error": ["error"],
+    }
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "shell_db.db"
+        build_engine_db(self.db)
+        self.con = sqlite3.connect(self.db)
+        self.gen = 0
+
+    def tearDown(self):
+        self.con.close()
+        for p in self.tmp.glob("*"):
+            p.unlink()
+        self.tmp.rmdir()
+
+    def _make(self, occupancy, lifecycle):
+        """One shell-1 session walked legally to (occupancy, lifecycle)."""
+        self.gen += 1
+        self.con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (1,?)", (self.gen,))
+        sid = self.con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle, harness, cli_version) VALUES (1,?,'reserved',"
+            "'starting','kimi','kimi-code 0.27.0')",
+            (self.gen,)).lastrowid
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id,"
+            " generation, composer) VALUES (?,1,?,'clean')", (sid, self.gen))
+        for occ in self.OCCUPANCY_WALKS[occupancy]:
+            interface_state.transition(self.con, "occupancy", sid, occ)
+        for lif in self.LIFECYCLE_WALKS[lifecycle]:
+            interface_state.transition(self.con, "lifecycle", sid, lif)
+        self.con.commit()
+        return sid
+
+    def _assert_converged(self, sid, reason):
+        sess = self.con.execute(
+            "SELECT occupancy, lifecycle, end_reason, ended_at FROM "
+            "interface_sessions WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess[0], "ended")
+        self.assertEqual(sess[1], "ended")
+        self.assertEqual(sess[2], reason)
+        self.assertIsNotNone(sess[3])
+        gen = self.con.execute(
+            "SELECT g.ended_at FROM interface_generations g "
+            "JOIN interface_sessions s ON s.shell_id=g.shell_id "
+            "AND s.generation=g.generation WHERE s.session_id=?",
+            (sid,)).fetchone()[0]
+        self.assertIsNotNone(gen)
+
+    def test_closure_matrix(self):
+        cases = ([("occupied", lif) for lif in self.LIFECYCLE_WALKS]
+                 + [("reserved", "starting"),
+                    ("unreconciled", "starting"),
+                    ("unreconciled", "lost"),
+                    ("unreconciled", "error")])
+        for occupancy, lifecycle in cases:
+            with self.subTest(occupancy=occupancy, lifecycle=lifecycle):
+                sid = self._make(occupancy, lifecycle)
+                out = interface_broker.close_session(self.con, sid,
+                                                     "operator_end")
+                self.assertFalse(out["already_ended"])
+                self.con.commit()
+                self._assert_converged(sid, "operator_end")
+
+    def test_close_revokes_leases_and_is_idempotent(self):
+        sid = self._make("occupied", "idle")
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
+        self.con.commit()
+        interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+        lease = self.con.execute(
+            "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertIsNotNone(lease[0])
+        self.assertEqual(lease[1], "session_end")
+        # A repeated close returns the original terminal result — no churn.
+        first = self.con.execute(
+            "SELECT ended_at, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        out = interface_broker.close_session(self.con, sid, "operator_close")
+        self.assertTrue(out["already_ended"])
+        self.assertEqual(out["end_reason"], "operator_end")
+        self.con.commit()
+        second = self.con.execute(
+            "SELECT ended_at, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(first, second)
+
+    def test_close_converges_legacy_partial_row(self):
+        """SC-065: a pre-convergence closure (the old spawn-failure path)
+        ended occupancy but left lifecycle nonterminal, the generation open,
+        and leases held. The one closure helper must CONVERGE that row —
+        never silently no-op on occupancy=='ended' alone — while keeping
+        the original terminal record (reason/time) intact."""
+        sid = self._make("occupied", "idle")
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
+        # The legacy shape: occupancy ended directly, children untouched.
+        interface_state.transition(
+            self.con, "occupancy", sid, "ended",
+            extra_sets={"ended_at": "2026-07-20 00:00:00",
+                        "end_reason": "spawn_failed"})
+        self.con.commit()
+        out = interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+        self.assertFalse(out["already_ended"],
+                         "a partially closed row converges — never a no-op")
+        self.assertEqual(out["end_reason"], "spawn_failed",
+                         "the original terminal record is kept, not re-stamped")
+        sess = self.con.execute(
+            "SELECT occupancy, lifecycle, ended_at, end_reason FROM "
+            "interface_sessions WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended", "2026-07-20 00:00:00",
+                                "spawn_failed"),
+                         "lifecycle must not stay nonterminal forever")
+        gen = self.con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0]
+        self.assertIsNotNone(gen, "the open generation ends too")
+        lease = self.con.execute(
+            "SELECT revoked_at FROM interface_writer_leases "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertIsNotNone(lease[0], "held leases are revoked")
+        # Fully terminal now: a repeated close is a true no-op.
+        out = interface_broker.close_session(self.con, sid, "operator_end")
+        self.assertTrue(out["already_ended"])
+        self.assertEqual(out["end_reason"], "spawn_failed")
+
+    def test_close_parks_pending_human_input(self):
+        """A pending unacknowledged frame can never be acked once the
+        generation is over — the close parks it by the crash-window rule
+        (evidence kept, alert raised), never drops it."""
+        sid = self._make("occupied", "idle")
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
+        self.con.execute(
+            "UPDATE interface_input_state SET pending_seq=1, "
+            "pending_reserved_at=datetime('now') WHERE session_id=?", (sid,))
+        self.con.commit()
+        interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+        ist = self.con.execute(
+            "SELECT composer, delivery, pending_seq FROM "
+            "interface_input_state WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(ist[0], "unknown")
+        self.assertEqual(ist[1], "delivery_unknown")
+        self.assertEqual(ist[2], 1, "evidence must survive the close")
+        alert = self.con.execute(
+            "SELECT 1 FROM planner_alerts WHERE session_id=? AND "
+            "reason='crash_window_delivery_unknown' AND resolved_at IS NULL",
+            (sid,)).fetchone()
+        self.assertIsNotNone(alert)
+
+    def _binding_with_message(self, sid):
+        """A binding on sid's generation (its own sprint doc — one ACTIVE
+        binding per doc and per planner shell) + one queued wake item.
+        Returns binding_id."""
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now'),"
+            " release_reason='superseded test case' WHERE released_at IS NULL")
+        self.con.execute(
+            "INSERT INTO documents (kind, title, body) VALUES "
+            "('doc','SPRINT: t','# SPRINT: t\nstatus: ACTIVE')")
+        doc = self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.con.execute(
+            "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
+            " planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (?,1,?,1,?)", (doc, sid, self.gen))
+        bid = self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'wake','task',?)", (doc,))
+        mid = self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.con.execute(
+            "INSERT INTO planner_wake_items (binding_id, message_id) "
+            "VALUES (?,?)", (bid, mid))
+        self.con.commit()
+        return bid
+
+    def test_close_parks_unevidenced_batch_completes_proven_one(self):
+        """Session-scoped wake batches at close: no live harness will
+        re-drive them, so an unevidenced submitting batch parks (alert) —
+        never a blind resubmit — while a batch with a proven stop hook
+        reconciles from durable read state. A merely QUEUED batch survives:
+        its work belongs to a future generation."""
+        # Case 1: queued batch on the closing generation → untouched.
+        sid = self._make("occupied", "idle")
+        bid = self._binding_with_message(sid)
+        batch_q = interface_broker.form_batch(self.con, bid)
+        self.con.commit()
+        interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+                (batch_q,)).fetchone()[0], "queued",
+            "queued work survives the close for a future generation")
+
+        # Case 2: submitted with NO durable submit evidence → parked
+        # (alert), never left awaiting a stop hook that can never arrive.
+        sid = self._make("occupied", "idle")
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
+        bid = self._binding_with_message(sid)
+        batch_s = interface_broker.form_batch(self.con, bid)
+        rec1 = Recorder("ok")
+        out = interface_broker.submit_wake_batch(
+            self.con, batch_s, writer=rec1, now_iso="2030-01-01 00:00:10")
+        self.assertTrue(out["submitted"])
+        self.con.commit()
+        interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+        state = self.con.execute(
+            "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+            (batch_s,)).fetchone()[0]
+        self.assertEqual(state, "delivery_unknown")
+        alert = self.con.execute(
+            "SELECT 1 FROM planner_alerts WHERE binding_id=? AND "
+            "reason='wake_batch_delivery_unknown' AND resolved_at IS NULL",
+            (bid,)).fetchone()
+        self.assertIsNotNone(alert)
+
+        # Case 3: running with a proven stop stamp → complete, items
+        # reconciled from durable read state (unread → requeued).
+        sid2 = self._make("occupied", "idle")
+        interface_broker.acquire_writer(self.con, sid2, "tab-1", "tok-1")
+        bid2 = self._binding_with_message(sid2)
+        batch2 = interface_broker.form_batch(self.con, bid2)
+        rec = Recorder("ok")
+        out = interface_broker.submit_wake_batch(
+            self.con, batch2, writer=rec, now_iso="2030-01-01 00:00:10")
+        self.assertTrue(out["submitted"])
+        interface_broker.record_hook(self.con, 1, self.gen, 1, "prompt_submit")
+        self.con.execute(
+            "UPDATE planner_wake_batches SET stop_hook_seq=9 WHERE batch_id=?",
+            (batch2,))
+        self.con.commit()
+        interface_broker.close_session(self.con, sid2, "operator_end")
+        self.con.commit()
+        state = self.con.execute(
+            "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+            (batch2,)).fetchone()[0]
+        self.assertEqual(state, "complete")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ import secrets
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -299,29 +300,62 @@ def _worktree_for(shortname: str, flavor: "str | None" = None) -> str:
 
 
 def _provision_worktree(worktree: str, shortname: str):
-    """Create the shell's git worktree on demand, exactly like the CLI boot
-    (run.ensure_worktree). A shell that was never CLI-booted has no
-    .sc-worktrees/<shortname> yet; the tmux pane's `cd` and the exec both
-    assume it exists, so it must be provisioned BEFORE the reservation is
-    written — never left to fail as a raw 'not a directory'. Returns an
-    error tuple for produce() on failure, None on success/no-op."""
-    path = Path(worktree)
-    if path.is_dir():
-        return None
+    """Validate, then create the shell's git worktree on demand, exactly
+    like the CLI boot (run.ensure_worktree). A shell that was never
+    CLI-booted has no .sc-worktrees/<shortname> yet; the tmux pane's `cd`
+    and the exec both assume it exists, so it must be provisioned BEFORE
+    the reservation is written — never left to fail as a raw 'not a
+    directory'. Path validation distinguishes the three failure shapes:
+    missing (provision it), existing-but-not-a-directory (refuse — a stray
+    file blocks the path), and existing-but-unusable (a bare directory
+    without git backing, or not writable — refuse, provisioning assumes an
+    existing dir is intact and would no-op). Returns an error tuple for
+    produce() on failure, None on success/no-op."""
     import run as run_mod
+    path = Path(worktree)
     if path == run_mod.REPO_ROOT:
         return None  # admin flavor boots at the repo root — nothing to add
+
+    def _err_tuple(code: str, message: str, reason: str):
+        return 500, {"error": {
+            "code": code, "message": message,
+            "details": {"worktree": worktree, "shortname": shortname,
+                        "reason": reason}}}
+
+    if path.exists() and not path.is_dir():
+        return _err_tuple(
+            "worktree_not_directory",
+            f"{worktree} exists but is not a directory — remove the stray "
+            f"file, then retry New chat", "non_directory")
+    if path.is_dir():
+        if not (path / ".git").exists():
+            return _err_tuple(
+                "worktree_unusable",
+                f"{worktree} is a plain directory, not a git worktree — "
+                f"remove it or provision it by hand (`./sc enter "
+                f"{shortname}`), then retry New chat", "not_a_worktree")
+        if not os.access(path, os.W_OK | os.X_OK):
+            return _err_tuple(
+                "worktree_unusable",
+                f"{worktree} is not writable by this service — fix its "
+                f"ownership/permissions, then retry New chat",
+                "not_writable")
+        return None
     try:
         run_mod.ensure_worktree(path, shortname)
     except SystemExit as e:  # ensure_worktree exits with the git stderr
         detail = str(e).removeprefix("FATAL: ").strip()
-        return 500, {"error": {
-            "code": "worktree_provision_failed",
-            "message": f"could not provision the shell worktree: {detail} — "
-                       f"fix the repo (`git worktree list`) or create it by "
-                       f"hand (`./sc enter {shortname}`), then retry New chat",
-            "details": {"worktree": worktree, "shortname": shortname}}}
-    return None
+    except (OSError, run_mod.LaunchError) as e:
+        # The expected launcher failures (git binary missing, mkdir
+        # refused, launch-gate refusal) — curated, never a raw 500.
+        detail = f"{type(e).__name__}: {e}"
+    else:
+        return None
+    return _err_tuple(
+        "worktree_provision_failed",
+        f"could not provision the shell worktree: {detail} — fix the repo "
+        f"(`git worktree list`) or create it by hand (`./sc enter "
+        f"{shortname}`), then retry New chat", "provision_failed")
 
 
 def _create_session(actor, headers, body):
@@ -430,30 +464,65 @@ def _create_session(actor, headers, body):
                     token_path=str(token_path), rows=rows, cols=cols))
             except Exception as exc:  # noqa: BLE001 — see below
                 # Definite pre-spawn failure (runtime down, bad worktree)
-                # closes the reservation; an AMBIGUOUS tmux outcome leaves it
-                # unreconciled (spec #20 Interface Workflow 4) — never a
-                # second process, never an auto-kill.
-                from interface_runtime import InterfaceUnavailable
+                # closes the reservation through the one closure helper —
+                # occupancy AND lifecycle terminalize together; an
+                # AMBIGUOUS tmux outcome leaves it unreconciled (spec #20
+                # Interface Workflow 4) — never a second process, never an
+                # auto-kill.
+                from interface_runtime import InterfaceUnavailable, SpawnAborted
+                if isinstance(exc, SpawnAborted):
+                    # Cancel start won the race mid-spawn (SC-064): the
+                    # cancel path already closed this row and the runtime
+                    # killed the pane by exact identity. Never persist the
+                    # pane identity onto the ended row, never a 201.
+                    con.commit()
+                    return 409, {"error": {
+                        "code": "session_cancelled",
+                        "message": "the session was cancelled while its "
+                                   "harness was still spawning — the "
+                                   "partial spawn was torn down",
+                        "details": {"session_id": session_id,
+                                    "occupancy": "ended"}}}
                 definite = isinstance(exc, (InterfaceUnavailable,
                                             FileNotFoundError, ValueError))
-                interface_state.transition(
-                    con, "occupancy", session_id,
-                    "ended" if definite else "unreconciled",
-                    extra_sets={"error_detail": f"spawn failed: {exc}"[:400],
-                                **({"ended_at": _now(con),
-                                    "end_reason": "spawn_failed"}
-                                   if definite else {})})
                 if definite:
+                    interface_broker.close_session(con, session_id,
+                                                   "spawn_failed")
                     con.execute(
-                        "UPDATE interface_generations SET "
-                        "ended_at=datetime('now') "
-                        "WHERE shell_id=? AND generation=?",
-                        (shell_id, gen_no))
+                        "UPDATE interface_sessions SET error_detail=? "
+                        "WHERE session_id=?",
+                        (f"spawn failed: {exc}"[:400], session_id))
+                else:
+                    interface_state.transition(
+                        con, "occupancy", session_id, "unreconciled",
+                        extra_sets={"error_detail":
+                                    f"spawn failed: {exc}"[:400]})
                 con.commit()
                 code = 503 if definite else 202
                 return code, {"session_id": session_id, "shell_id": shell_id,
                               "occupancy": "ended" if definite else "unreconciled",
                               "error": str(exc)[:200]}
+            # Cancel-during-spawn convergence (SC-064), the backstop for
+            # every interleaving the runtime's abort check can't see (a
+            # cancel that landed before the generation was registered, or
+            # one that parked the row unreconciled): the row was concluded
+            # while we spawned — tear the just-created pane down by its
+            # exact identity instead of persisting that identity onto a
+            # concluded row. A live harness on an ended generation is the
+            # unclosable #519 wound; an occupied row (the entrypoint hook
+            # already promoted it) is the healthy fast-boot path.
+            occ = con.execute(
+                "SELECT occupancy FROM interface_sessions WHERE session_id=?",
+                (session_id,)).fetchone()[0]
+            if occ in ("ended", "unreconciled"):
+                _runtime.call(_runtime.abandon(session_id))
+                con.commit()
+                return 409, {"error": {
+                    "code": "session_cancelled",
+                    "message": "the session was concluded by a concurrent "
+                               "cancel while its harness was spawning — "
+                               "the pane was torn down by exact identity",
+                    "details": {"session_id": session_id, "occupancy": occ}}}
             con.execute(
                 "UPDATE interface_sessions SET tmux_socket=?, tmux_session=?, "
                 "tmux_window=?, tmux_pane_id=?, pane_pid=?, pane_start_ticks=? "
@@ -479,14 +548,17 @@ def _create_session(actor, headers, body):
         if isinstance(exc, sqlite3.IntegrityError):
             # Lost the reservation race — the partial unique index fired;
             # return the existing owner (spec: a concurrent start returns the
-            # existing owner, never a second process).
+            # existing owner, never a second process). owner can momentarily
+            # be None if the winner committed only its generation row so far
+            # (the generations index fired first) — the retry reveals it.
             owner = con.execute(
-                "SELECT session_id FROM interface_sessions "
+                "SELECT session_id, occupancy FROM interface_sessions "
                 "WHERE shell_id=? AND occupancy <> 'ended'",
                 (shell_id,)).fetchone()
             return _err(409, "shell_occupied",
                         "a concurrent start owns this shell",
-                        {"session_id": owner[0] if owner else None})
+                        {"session_id": owner[0] if owner else None,
+                         "occupancy": owner[1] if owner else None})
         raise
     finally:
         con.close()
@@ -698,10 +770,13 @@ def _terminate(actor, headers, body):
         if sess is None:
             return _err(404, "no_such_session",
                         f"interface session {session_id} not found")
-        if sess[2] != "occupied":
+        if sess[2] == "unreconciled":
             return _err(409, "not_occupied",
-                        f"session {session_id} is {sess[2]}, not occupied")
-        if force and sess[4] is None:
+                        f"session {session_id} is unreconciled — termination "
+                        "needs a verified identity; reconcile and close "
+                        "after proved absence instead")
+        if force and sess[4] is None and sess[2] != "ended" \
+                and sess[3] != "ended":
             # Spec Workflow 9: force only AFTER graceful termination fails
             # and shows the PID/generation it will end. The UI sequences it;
             # the API (authority surface for the seq-6 CLI) enforces it.
@@ -710,58 +785,117 @@ def _terminate(actor, headers, body):
                         "termination timed out for this session")
 
         def produce():
-            interface_state.transition(con, "lifecycle", session_id, "stopping")
-            con.commit()
-            result = _runtime.call(_runtime.terminate(session_id, force=force))
-            if not result.get("terminated"):
-                if result.get("reason") == "identity_mismatch":
-                    # Fail closed (spec: never kill an uncertain process) —
-                    # the session is now uncertain, not endable.
-                    interface_state.transition(con, "occupancy", session_id,
-                                               "unreconciled")
+            # Re-read inside produce: the gate above ran before the
+            # idempotency store, and a hook/close may have raced in since.
+            cur = con.execute(
+                "SELECT occupancy, lifecycle, tmux_pane_id, pane_pid "
+                "FROM interface_sessions WHERE session_id=?",
+                (session_id,)).fetchone()
+            occ, lif, pane_id, pane_pid = cur
+            if occ == "ended" or lif == "ended":
+                # Terminal already (a repeated request, or a session_end
+                # hook that won the race): complete durable closure
+                # idempotently — never transition back to stopping (#532).
+                interface_broker.close_session(con, session_id, "operator_end")
+                con.commit()
+                return 202, {"terminated": True, "already_ended": True}
+            if occ == "reserved":
+                # Cancel start (spec Lifecycle Contract / #519).
+                if pane_id is None and pane_pid is None:
+                    # No pane or harness identity was ever established:
+                    # nothing live to signal — cancel the reservation.
+                    interface_broker.close_session(
+                        con, session_id, "cancelled_before_spawn")
+                    con.commit()
+                    _runtime.call(_runtime.abandon(session_id))
+                    return 202, {"terminated": True,
+                                 "end_reason": "cancelled_before_spawn"}
+                if not _runtime.call(_runtime.verify_identity(session_id)):
+                    # Spawn outcome uncertain — never silently ended: park
+                    # as unreconciled and require absence proof.
+                    interface_state.transition(
+                        con, "occupancy", session_id, "unreconciled",
+                        extra_sets={"error_detail":
+                                    "cancel start: pane identity "
+                                    "unverifiable"})
                     interface_state.transition(con, "lifecycle", session_id,
                                                "lost")
                     con.commit()
-                    return 409, {"terminated": False,
-                                 "reason": "identity_mismatch"}
-                # graceful timeout: stays stopping, and the timeout is
-                # recorded durably — it is what unlocks the force follow-up.
-                interface_state.transition(
-                    con, "lifecycle", session_id, "stopping",
-                    extra_sets={"graceful_timed_out_at": _now(con)})
+                    return 409, {"error": {
+                        "code": "identity_unverified",
+                        "message": "the reserved pane's identity cannot be "
+                                   "verified — the session is unreconciled; "
+                                   "prove absence and close it via "
+                                   "reconciliation",
+                        "details": {"session_id": session_id}}}
+                # Verified identity live — the normal stop path below runs.
+            try:
+                interface_state.transition(con, "lifecycle", session_id,
+                                           "stopping")
                 con.commit()
-                return 200, {"terminated": False,
-                             "reason": result.get("reason", "graceful_timeout"),
-                             "pid": result.get("pid"),
-                             "generation": result.get("generation")}
-            _end_session(con, session_id,
-                         "operator_force" if force else "operator_end")
-            con.commit()
-            return 202, {"terminated": True}
+                result = _runtime.call(_runtime.terminate(session_id,
+                                                          force=force))
+                if not result.get("terminated"):
+                    reason = result.get("reason")
+                    if reason == "identity_mismatch":
+                        # Fail closed (spec: never kill an uncertain
+                        # process) — the session is uncertain, not endable.
+                        interface_state.transition(con, "occupancy",
+                                                   session_id, "unreconciled")
+                        interface_state.transition(con, "lifecycle",
+                                                   session_id, "lost")
+                        con.commit()
+                        return 409, {"terminated": False,
+                                     "reason": "identity_mismatch"}
+                    if reason == "not_running":
+                        # The runtime holds no live generation — absence,
+                        # not a timeout. Prove it and converge rather than
+                        # recording a phantom graceful timeout.
+                        if _runtime.call(_runtime.prove_absence(session_id)):
+                            interface_broker.close_session(
+                                con, session_id, "operator_end")
+                            con.commit()
+                            _runtime.call(_runtime.abandon(session_id))
+                            return 202, {"terminated": True,
+                                         "reason": "already_absent"}
+                        interface_state.transition(con, "occupancy",
+                                                   session_id, "unreconciled")
+                        interface_state.transition(con, "lifecycle",
+                                                   session_id, "lost")
+                        con.commit()
+                        return 409, {"terminated": False,
+                                     "reason": "not_running"}
+                    # graceful timeout: stays stopping, and the timeout is
+                    # recorded durably — it is what unlocks the force
+                    # follow-up.
+                    interface_state.transition(
+                        con, "lifecycle", session_id, "stopping",
+                        extra_sets={"graceful_timed_out_at": _now(con)})
+                    con.commit()
+                    return 200, {"terminated": False,
+                                 "reason": result.get("reason",
+                                                      "graceful_timeout"),
+                                 "pid": result.get("pid"),
+                                 "generation": result.get("generation")}
+                interface_broker.close_session(
+                    con, session_id,
+                    "operator_force" if force else "operator_end")
+                con.commit()
+                return 202, {"terminated": True}
+            except interface_state.InterfaceTransitionError:
+                # A session_end hook (or a concurrent close) terminalized
+                # mid-flight — the race the old code lost as a false
+                # no_such_route (#532). Roll back the partial attempt and
+                # converge closure; the semantic result is still success.
+                con.rollback()
+                interface_broker.close_session(con, session_id, "operator_end")
+                con.commit()
+                _runtime.call(_runtime.abandon(session_id))
+                return 202, {"terminated": True, "already_ended": True}
 
         return _idempotent(con, actor, "terminate", headers, body, produce)
     finally:
         con.close()
-
-
-def _end_session(con, session_id: int, end_reason: str) -> None:
-    """Durable closure: occupancy → ended (availability derives), generation
-    ended, leases revoked. The shell offers New chat only after this."""
-    row = con.execute(
-        "SELECT shell_id, generation FROM interface_sessions "
-        "WHERE session_id=?", (session_id,)).fetchone()
-    interface_state.transition(
-        con, "occupancy", session_id, "ended",
-        extra_sets={"ended_at": _now(con), "end_reason": end_reason})
-    interface_state.transition(con, "lifecycle", session_id, "ended")
-    con.execute(
-        "UPDATE interface_generations SET ended_at=datetime('now') "
-        "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
-        (row[0], row[1]))
-    con.execute(
-        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
-        "revoke_reason='session_end' "
-        "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
 
 
 def _reconcile(actor, headers, body):
@@ -807,7 +941,8 @@ def _reconcile(actor, headers, body):
                                    "reconcile or investigate first",
                         "details": {}}}
                 _runtime.call(_runtime.abandon(session_id))
-                _end_session(con, session_id, "operator_close")
+                interface_broker.close_session(con, session_id,
+                                               "operator_close")
                 con.commit()
                 return 200, {"session_id": session_id, "closed": True,
                              "occupancy": "ended",
@@ -1410,10 +1545,23 @@ def _hook_callback(headers, body):
             "SELECT hook_token_hash, ended_at FROM interface_generations "
             "WHERE shell_id=? AND generation=?", (shell_id, generation)
         ).fetchone()
-        if gen is None or gen[1] is not None or \
+        if gen is None or \
                 hashlib.sha256(token.encode()).hexdigest() != gen[0]:
             _log(f"hook auth rejected shell={shell_id} gen={generation} "
                  f"event={event}")
+            return _err(403, "hook_auth",
+                        "unknown generation or bad hook token")
+        if gen[1] is not None:
+            # The generation has ended. Every event is rejected EXCEPT a
+            # session_end acknowledgement: a provider hook (its own end, or
+            # one that lost the race to an operator close) gets a clean 200
+            # — acknowledged, never reopened, never a rejection loop (#532).
+            if event == "session_end":
+                return _json(200, {"hook_seq": hook_seq, "event": event,
+                                   "acknowledged": True,
+                                   "already_ended": True})
+            _log(f"hook rejected (ended generation) shell={shell_id} "
+                 f"gen={generation} event={event}")
             return _err(403, "hook_auth",
                         "unknown generation or bad hook token")
         sess = con.execute(
@@ -1534,6 +1682,19 @@ def _browser_session(headers, body):
 
 # ------------------------------------------------------------------ dispatch
 
+class _BadPathId(ValueError):
+    """A route-shaped path whose identifier segment is not an int."""
+
+
+def _path_id(path: str, segment: int = -1) -> int:
+    """Parse one path segment as a route identifier; a bad segment is a
+    422 parsing error, never a 404 no_such_route (spec #30 req 4)."""
+    try:
+        return int(path.split("/")[segment])
+    except (ValueError, IndexError):
+        raise _BadPathId(f"invalid path identifier: {path!r}")
+
+
 def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     from urllib.parse import parse_qs, urlparse
     headers = _parse_headers(headers_raw)
@@ -1583,14 +1744,13 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
         if p == "/api/interface/sessions" and method == "POST":
             return _create_session(actor, headers, data)
         if p.startswith("/api/interface/sessions/") and method == "GET":
-            return _get_session(int(p.rsplit("/", 1)[1]))
+            return _get_session(_path_id(p))
         if p == "/api/interface/stream-tickets" and method == "POST":
             return _mint_ticket(actor, headers, data)
         if p == "/api/interface/writer-leases" and method == "POST":
             return _acquire_lease(actor, headers, data)
         if p.startswith("/api/interface/writer-leases/") and method == "DELETE":
-            return _release_lease(actor, headers, data,
-                                  int(p.rsplit("/", 1)[1]))
+            return _release_lease(actor, headers, data, _path_id(p))
         if p == "/api/interface/clean-certifications" and method == "POST":
             return _certify_clean(actor, headers, data)
         if p == "/api/interface/termination-requests" and method == "POST":
@@ -1605,17 +1765,32 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _sprint_alerts(actor, query)
         if p.startswith("/api/interface/sprint-bindings/") \
                 and p.endswith("/retry") and method == "POST":
-            return _retry_binding(actor, headers, data,
-                                  int(p.split("/")[4]))
+            return _retry_binding(actor, headers, data, _path_id(p, -2))
         if p.startswith("/api/interface/sprint-bindings/") \
                 and method == "DELETE":
-            return _release_binding(actor, headers, data,
-                                    int(p.rsplit("/", 1)[1]))
+            return _release_binding(actor, headers, data, _path_id(p))
         if p == "/api/planner-action-receipts" and method == "POST":
             return _begin_receipt(actor, headers, data)
         if p.startswith("/api/planner-action-receipts/") and method == "PATCH":
-            return _update_receipt(actor, headers, data,
-                                   int(p.rsplit("/", 1)[1]))
+            return _update_receipt(actor, headers, data, _path_id(p))
         return _err(404, "no_such_route", f"no route: {method} {p}")
-    except ValueError:
-        return _err(404, "no_such_route", f"no route: {method} {p}")
+    except _BadPathId as exc:
+        # Route PARSING error — a legal route shape with a bad identifier.
+        return _err(422, "invalid_path_id", str(exc))
+    except (interface_state.InterfaceTransitionError,
+            interface_broker.BrokerError) as exc:
+        # A legal route whose durable state refused the transition. NEVER
+        # no_such_route (#523): the old broad `except ValueError` rewrote
+        # these internal state conflicts to a false 404.
+        _log(f"state conflict {method} {p}: {exc}")
+        return _err(409, "state_conflict", str(exc))
+    except Exception as exc:  # noqa: BLE001 — the last-resort boundary
+        # Unexpected handler failure: sanitized 500 with a server-side
+        # correlation record; internals never cross the wire.
+        correlation = secrets.token_hex(8)
+        _log(f"handler failure {method} {p} correlation={correlation}: "
+             f"{exc!r}\n{traceback.format_exc()}")
+        return _err(500, "internal",
+                    "unexpected server failure — quote correlation "
+                    f"{correlation} when reporting",
+                    {"correlation": correlation})
