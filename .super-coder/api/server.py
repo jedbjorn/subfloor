@@ -65,6 +65,7 @@ import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
 import interface_wake  # noqa: E402  (transactional wake ingress + coordinator)
 import interface_broker  # noqa: E402  (sprint close → binding release, seq 10)
+import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 sys.path.insert(0, str(ENGINE / "api"))
 try:
     import interface_routes  # noqa: E402  (Interface HTTP API, spec #20)
@@ -2704,6 +2705,13 @@ def main(argv):
     # auth path resolves against; a `make launch/restart` thus self-heals keys
     # (no separate `./sc update` step). New shells are still keyed at creation.
     backfill_shell_api_keys.backfill(str(DB_PATH))
+    # Runtime Admin credentials (spec #30 req 11, #516): one owner-only
+    # artifact per Admin shell, so a host Admin seat without injected
+    # SC_API_BASE/SC_API_TOKEN can still reach this API through `sc mem`
+    # discovery. Rewritten on every boot, right after the key backfill — an
+    # api_key rotation is picked up here. Lives under the gitignored,
+    # never-snapshotted .super-coder/run/.
+    mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
     # Interface startup reconciliation (spec #20): idempotent, once per boot —
     # parks any crash-window pending input as delivery_unknown (never
     # replays), recovers wake batches from durable hook-sequence evidence,

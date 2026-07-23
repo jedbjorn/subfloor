@@ -623,5 +623,46 @@ class RawLaunchRefusalTest(unittest.TestCase):
             self._main(["run.py", "--first"], {"RENDER_ONLY": "1"})
 
 
+# ── spec #30 req 12 / #518: lazy websockets ─────────────────────────────────
+# The real seam, captured at import time before any test patches it — the
+# stream-refusal test puts it back so the verb reaches the actual import.
+_REAL_RUN_STREAM = ic.run_stream
+
+# A host python without the package: any websockets import raises ImportError.
+WS_BLOCKED = {"websockets": None, "websockets.sync": None,
+              "websockets.sync.client": None}
+
+
+class LazyWebsocketsTest(InterfaceCliTest):
+    """Host python without `websockets` (spec #30 req 12, issue #518): the
+    stream dependency is checked lazily, inside the verbs that stream —
+    HTTP-only verbs (status/stop/reconcile) run on a stdlib python, and a
+    stream verb refuses with the exact dependency action instead of the old
+    dispatch-time `no python with websockets` gate."""
+
+    def test_http_verbs_pass_without_the_package(self):
+        self.http.add("POST", "/api/interface/termination-requests",
+                      {"terminated": True})
+        self.http.add("POST", "/api/interface/reconciliations",
+                      {"session_id": 9, "verified": True,
+                       "occupancy": "unreconciled", "actions": []})
+        with mock.patch.dict(sys.modules, WS_BLOCKED):
+            rc, _, _ = self.run_cli(["status"])
+            self.assertEqual(rc, 0)
+            rc, _, _ = self.run_cli(["stop", "s2", "--json"])
+            self.assertEqual(rc, 0)
+            rc, _, _ = self.run_cli(["reconcile", "s3", "--json"])
+            self.assertEqual(rc, 0)
+
+    def test_stream_verb_refuses_with_the_dependency_action(self):
+        with mock.patch.dict(sys.modules, WS_BLOCKED), \
+                mock.patch.object(ic, "run_stream", _REAL_RUN_STREAM):
+            rc, _, err = self.run_cli(["view", "s2"])
+        self.assertEqual(rc, ic.EXIT_API_DOWN)
+        self.assertIn("websockets", err)
+        self.assertIn("./sc deps", err)
+        self.assertIn("status/start/stop/reconcile", err)
+
+
 if __name__ == "__main__":
     unittest.main()
