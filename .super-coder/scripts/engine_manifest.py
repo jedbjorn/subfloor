@@ -70,6 +70,7 @@ ENGINE_PATHS = [
     ".super-coder/ui",
     ".super-coder/assets/skills",
     ".super-coder/hooks",
+    ".super-coder/shadow",
 ]
 
 # Never hashed: bytecode + caches that churn without a source edit.
