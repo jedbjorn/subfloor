@@ -93,7 +93,8 @@ class CrashWindowTest(unittest.TestCase):
             "VALUES (1,1)")
         self.sid = self.con.execute(
             "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
-            " lifecycle) VALUES (1,1,'occupied','idle')").lastrowid
+            " lifecycle, harness, cli_version) VALUES (1,1,'occupied','idle',"
+            "'kimi','kimi-code 0.27.0')").lastrowid
         self.con.execute(
             "INSERT INTO interface_input_state (session_id, shell_id,"
             " generation, composer) VALUES (?,1,1,'clean')", (self.sid,))

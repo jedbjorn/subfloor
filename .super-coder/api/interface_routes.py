@@ -50,6 +50,7 @@ import db_driver  # noqa: E402
 import interface_broker  # noqa: E402
 import interface_hooks  # noqa: E402
 import interface_state  # noqa: E402
+import interface_wake  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
 
@@ -120,10 +121,12 @@ def _parse_headers(headers_raw: str):
 # ------------------------------------------------------------------ authority
 
 class _Actor:
-    def __init__(self, kind: str, scope: str, csrf_ok: bool):
-        self.kind = kind          # "operator" | "browser"
+    def __init__(self, kind: str, scope: str, csrf_ok: bool,
+                 shell_id: "int | None" = None):
+        self.kind = kind          # "operator" | "browser" | "shell"
         self.scope = scope        # idempotency actor_scope
         self.csrf_ok = csrf_ok    # mutation authority for browser actors
+        self.shell_id = shell_id  # set for kind="shell" (the planner's token)
 
 
 def _host_ok(headers) -> bool:
@@ -160,6 +163,21 @@ def _resolve_actor(headers) -> "_Actor | None":
         token = authz[7:].strip()
         if token and token == _operator_token():
             return _Actor("operator", "operator", True)
+        # A shell's own API token (the planner driving `sc sprint action` /
+        # arming its own binding). Deliberately read-only elsewhere: shell
+        # actors may call ONLY the sprint-binding and action-receipt routes
+        # (enforced in handle()) — never session/writer/stop authority.
+        if token:
+            con = _db()
+            try:
+                row = con.execute(
+                    "SELECT shell_id FROM shells WHERE api_key=? "
+                    "AND COALESCE(is_deleted,0)=0", (token,)).fetchone()
+            finally:
+                con.close()
+            if row is not None:
+                return _Actor("shell", f"shell:{row[0]}", True,
+                              shell_id=row[0])
         return None
     cookie = headers.get("Cookie") or ""
     for part in cookie.split(";"):
@@ -471,7 +489,7 @@ def _get_session(session_id: int):
             "last_human_input_at": istate[3] if istate else None,
             "writer": {"held": writer is not None,
                        "client_id": writer[1] if writer else None},
-            "wake_state": "disarmed",
+            "wake_state": _wake_state(con, session_id=session_id),
             "clients": (runtime_state or {}).get("attached_clients", 0),
             "alerts": _alert_count(con, session_id),
         })
@@ -491,7 +509,8 @@ def _list_shells():
             proj = _availability(con, shell_id, snap)
             out.append({"shell_id": shell_id, "shortname": shortname,
                         "display_name": display_name,
-                        "wake_state": "disarmed", **proj})
+                        "wake_state": _wake_state(
+                            con, planner_shell_id=shell_id), **proj})
         return _json(200, {"shells": out})
     finally:
         con.close()
@@ -616,6 +635,8 @@ def _certify_clean(actor, headers, body):
             except interface_broker.BrokerError as exc:
                 return 409, {"error": {"code": "certify_refused",
                                        "message": str(exc), "details": {}}}
+            # A fresh clean certification may unblock queued wake work.
+            interface_wake.notify_session(session_id)
             return 201, {"session_id": session_id, "composer": "clean"}
         return _idempotent(con, actor, "certify_clean", headers, body, produce)
     finally:
@@ -779,6 +800,244 @@ def _reconcile(actor, headers, body):
 
 # ------------------------------------------------------------------ hooks
 
+# ------------------------------------------------------------------ sprint wake
+
+def _wake_state(con, *, session_id=None, planner_shell_id=None) -> str:
+    """The occupancy model's wake dimension, derived (never stored):
+    disarmed without an unreleased binding; parked while a batch is
+    delivery_unknown; the live batch's state while one submits/runs;
+    queued with pending work; else armed."""
+    if session_id is not None:
+        binding = con.execute(
+            "SELECT binding_id FROM sprint_planner_bindings "
+            "WHERE session_id=? AND released_at IS NULL",
+            (session_id,)).fetchone()
+    else:
+        binding = con.execute(
+            "SELECT binding_id FROM sprint_planner_bindings "
+            "WHERE planner_shell_id=? AND released_at IS NULL",
+            (planner_shell_id,)).fetchone()
+    if binding is None:
+        return "disarmed"
+    batch = con.execute(
+        "SELECT state FROM planner_wake_batches WHERE binding_id=? "
+        "AND state IN ('queued','submitting','running','delivery_unknown') "
+        "ORDER BY batch_id DESC LIMIT 1", (binding[0],)).fetchone()
+    if batch is not None:
+        if batch[0] == "delivery_unknown":
+            return "parked"
+        if batch[0] in ("submitting", "running"):
+            return batch[0]
+        return "queued"
+    queued = con.execute(
+        "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
+        "AND state='queued' LIMIT 1", (binding[0],)).fetchone()
+    return "queued" if queued is not None else "armed"
+
+
+def _err_obj(code: str, message: str) -> dict:
+    return {"error": {"code": code, "message": message, "details": {}}}
+
+
+def _arm_binding(actor, headers, body):
+    """POST /api/interface/sprint-bindings — arm one ACTIVE sprint document
+    to one planner generation (spec #20 API Resources / Sprint Scope). A
+    shell actor may arm only ITSELF; the operator may arm any planner.
+    Fail-closed refusals: doc missing/frozen/not ACTIVE, no occupied
+    planner session, a mandatory-hook gap (an unverifiable wake must never
+    arm), or a second ACTIVE binding (the partial unique indexes backstop).
+    """
+    doc_id = body.get("sprint_doc_id")
+    planner = body.get("planner_shell_id")
+    if not isinstance(doc_id, int) or not isinstance(planner, int):
+        return _err(422, "validation",
+                    "sprint_doc_id, planner_shell_id (int) required")
+    if actor.kind == "shell" and actor.shell_id != planner:
+        return _err(403, "not_the_planner",
+                    "a shell may arm only its own binding")
+    con = _db()
+    try:
+        def produce():
+            doc = con.execute(
+                "SELECT frozen FROM documents WHERE document_id=?",
+                (doc_id,)).fetchone()
+            if doc is None or doc[0] or not interface_broker._sprint_active(
+                    con, doc_id):
+                return 409, _err_obj(
+                    "sprint_not_active",
+                    "sprint document is missing, frozen, or not ACTIVE")
+            sess = con.execute(
+                "SELECT session_id, shell_id, generation, harness, "
+                "cli_version FROM interface_sessions "
+                "WHERE shell_id=? AND occupancy='occupied'",
+                (planner,)).fetchone()
+            if sess is None:
+                return 409, _err_obj(
+                    "no_live_session",
+                    "planner has no occupied Interface session to bind")
+            cap = interface_hooks.capability(sess[3], sess[4])
+            if not cap["mandatory_ok"]:
+                return 409, _err_obj(
+                    "hooks_unsupported",
+                    f"harness {sess[3]!r} lacks mandatory lifecycle hooks "
+                    f"({', '.join(cap['missing_mandatory']) or 'version'}) — "
+                    "sprint wake cannot arm")
+            try:
+                cur = con.execute(
+                    "INSERT INTO sprint_planner_bindings "
+                    "(sprint_doc_id, planner_shell_id, session_id, shell_id,"
+                    " generation) VALUES (?,?,?,?,?)",
+                    (doc_id, planner, sess[0], sess[1], sess[2]))
+            except db_driver.IntegrityError:
+                return 409, _err_obj(
+                    "already_armed",
+                    "planner or sprint already has an ACTIVE binding")
+            con.commit()
+            _log(f"sprint binding {cur.lastrowid} armed: doc={doc_id} "
+                 f"planner={planner} session={sess[0]} gen={sess[2]}")
+            return 201, {"binding_id": cur.lastrowid,
+                         "sprint_doc_id": doc_id,
+                         "planner_shell_id": planner,
+                         "session_id": sess[0], "generation": sess[2],
+                         "wake_state": "armed"}
+        resp = _idempotent(con, actor, "sprint_binding_arm", headers, body,
+                           produce)
+        if resp[0] == 201:
+            interface_wake.notify_binding(
+                json.loads(resp[2])["binding_id"])
+        return resp
+    finally:
+        con.close()
+
+
+def _release_binding(actor, headers, body, binding_id: int):
+    """DELETE /api/interface/sprint-bindings/{id} — release the binding and
+    cancel its queued wake work with an audit reason (spec Sprint Scope:
+    messages stay UNREAD; a live submitting/running batch is left for hook
+    reconciliation — its fenced evidence still resolves it)."""
+    con = _db()
+    try:
+        def produce():
+            row = con.execute(
+                "SELECT planner_shell_id, released_at "
+                "FROM sprint_planner_bindings WHERE binding_id=?",
+                (binding_id,)).fetchone()
+            if row is None:
+                return 404, _err_obj("no_such_binding",
+                                     f"binding {binding_id} not found")
+            if actor.kind == "shell" and actor.shell_id != row[0]:
+                return 403, _err_obj(
+                    "not_the_planner",
+                    "a shell may release only its own binding")
+            if row[1] is not None:
+                return 200, {"binding_id": binding_id, "released": True,
+                             "already_released": True}
+            reason = (body.get("reason") or "operator release").strip()
+            con.execute(
+                "UPDATE sprint_planner_bindings "
+                "SET released_at=datetime('now'), release_reason=? "
+                "WHERE binding_id=?", (reason, binding_id))
+            cancelled = 0
+            batches = con.execute(
+                "SELECT batch_id FROM planner_wake_batches "
+                "WHERE binding_id=? AND state='queued'",
+                (binding_id,)).fetchall()
+            for (batch_id_,) in batches:
+                batched = con.execute(
+                    "SELECT COUNT(*) FROM planner_wake_items "
+                    "WHERE batch_id=? AND state='batched'",
+                    (batch_id_,)).fetchone()[0]
+                interface_broker._cancel_batch(con, batch_id_)
+                cancelled += batched
+            items = con.execute(
+                "SELECT item_id FROM planner_wake_items "
+                "WHERE binding_id=? AND state='queued'",
+                (binding_id,)).fetchall()
+            for (item_id,) in items:
+                interface_state.transition(
+                    con, "wake_item", item_id, "cancelled",
+                    extra_sets={"error": f"binding released: {reason}"})
+                cancelled += 1
+            con.commit()
+            _log(f"sprint binding {binding_id} released ({reason}); "
+                 f"{cancelled} queued wake item(s) cancelled")
+            return 200, {"binding_id": binding_id, "released": True,
+                         "cancelled_items": cancelled,
+                         "wake_state": "disarmed"}
+        return _idempotent(con, actor, "sprint_binding_release", headers,
+                           body, produce)
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------- action receipts
+
+def _begin_receipt(actor, headers, body):
+    """POST /api/planner-action-receipts — record action INTENT before a
+    planner side effect (spec Event Ingress). The idempotency key derives
+    from message + operation + target; an existing key returns the original
+    receipt — a completed one suppresses the duplicate action outright."""
+    message_id = body.get("message_id")
+    operation = (body.get("operation") or "").strip()
+    target = (body.get("target") or "").strip()
+    if not operation or not target:
+        return _err(422, "validation", "operation and target required")
+    if message_id is not None and not isinstance(message_id, int):
+        return _err(422, "validation", "message_id must be an int")
+    idem_key = f"action|{message_id or '-'}|{operation}|{target}"
+    con = _db()
+    try:
+        def produce():
+            existing = con.execute(
+                "SELECT receipt_id, state FROM planner_action_receipts "
+                "WHERE idem_key=?", (idem_key,)).fetchone()
+            if existing is not None:
+                return 200, {"receipt_id": existing[0], "state": existing[1],
+                             "duplicate": True,
+                             "suppressed": existing[1] == "complete"}
+            cur = con.execute(
+                "INSERT INTO planner_action_receipts "
+                "(message_id, operation, target, idem_key) VALUES (?,?,?,?)",
+                (message_id, operation, target, idem_key))
+            con.commit()
+            return 201, {"receipt_id": cur.lastrowid, "state": "intent",
+                         "idem_key": idem_key}
+        return _idempotent(con, actor, "planner_action_begin", headers, body,
+                           produce)
+    finally:
+        con.close()
+
+
+def _update_receipt(actor, headers, body, receipt_id: int):
+    """PATCH /api/planner-action-receipts/{id} — record the observed result:
+    complete | unknown (parks the message's wake item for reconciliation on
+    the next batch completion) | reconciled (operator-resolved unknown)."""
+    new_state = body.get("state")
+    if new_state not in ("complete", "unknown", "reconciled"):
+        return _err(422, "validation",
+                    "state must be complete | unknown | reconciled")
+    detail = (body.get("result_detail") or "").strip() or None
+    con = _db()
+    try:
+        def produce():
+            extra = {"result_detail": detail}
+            if new_state == "complete":
+                extra["completed_at"] = _now(con)
+            elif new_state == "reconciled":
+                extra["reconciled_at"] = _now(con)
+            try:
+                interface_state.transition(
+                    con, "receipt", receipt_id, new_state, extra_sets=extra)
+            except interface_state.InterfaceTransitionError as exc:
+                return 409, _err_obj("receipt_transition", str(exc))
+            con.commit()
+            return 200, {"receipt_id": receipt_id, "state": new_state}
+        return _idempotent(con, actor, "planner_action_update", headers, body,
+                           produce)
+    finally:
+        con.close()
+
+
 def _hook_callback(headers, body):
     """Generation-scoped hook authority: the token calls ONLY this route, for
     its one generation. session_start additionally promotes the reservation
@@ -798,18 +1057,24 @@ def _hook_callback(headers, body):
     if not token or not isinstance(shell_id, int) \
             or not isinstance(generation, int) \
             or not isinstance(hook_seq, int) or not event:
+        _log(f"hook rejected (422 missing/invalid fields): "
+             f"shell={shell_id} gen={generation} event={event!r}")
         return _err(422, "validation",
                     "bearer token + shell_id, generation, hook_seq, event")
     unknown = set(body) - {"shell_id", "generation", "hook_seq", "event",
                            "source", "pid", "start_ticks", "archive_id",
                            "cli_version"}
     if unknown:
+        _log(f"hook rejected (422 unknown fields {sorted(unknown)}): "
+             f"shell={shell_id} gen={generation} event={event!r}")
         return _err(422, "validation", f"unknown fields: {sorted(unknown)}")
     if event not in interface_hooks.EVENTS:
         _log(f"hook event rejected shell={shell_id} gen={generation} "
              f"event={event!r}")
         return _err(422, "validation", f"unknown hook event {event!r}")
     if source not in interface_hooks.SOURCES:
+        _log(f"hook rejected (422 unknown source {source!r}): "
+             f"shell={shell_id} gen={generation} event={event}")
         return _err(422, "validation", f"unknown hook source {source!r}")
     con = _db()
     try:
@@ -828,6 +1093,8 @@ def _hook_callback(headers, body):
             "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
             (shell_id, generation)).fetchone()
         if sess is None:
+            _log(f"hook rejected (404 no live session): shell={shell_id} "
+                 f"gen={generation} event={event}")
             return _err(404, "no_such_session", "no live session for generation")
         session_id, occupancy, pane_pid = sess
         try:
@@ -837,6 +1104,8 @@ def _hook_callback(headers, body):
             # passes $PPID. session_start MUST carry it (entrypoint and
             # emitter both do); any mismatch fails closed, on any event.
             if body.get("pid") is None and event == "session_start":
+                _log(f"hook rejected (422 session_start without pid): "
+                     f"session={session_id} source={source}")
                 return _err(422, "validation",
                             "session_start requires pid identity")
             if body.get("pid") is not None and body.get("pid") != pane_pid:
@@ -858,8 +1127,17 @@ def _hook_callback(headers, body):
             result = interface_broker.record_hook(
                 con, shell_id, generation, hook_seq, event, source=source)
             con.commit()
+            # A lifecycle event may make queued wake work submittable
+            # (turn_stop → idle, provider session_start → ready+quiet
+            # baseline). Signal after commit; a no-op when nothing is queued.
+            interface_wake.notify_session(session_id)
             return _json(200, result)
         except interface_broker.BrokerError as exc:
+            # Flag #51 (decision #31): EVERY rejection is audited — a silent
+            # rejection hides exactly the losses #50's ordering needs to
+            # diagnose in production (stale/replayed hook_seq among them).
+            _log(f"hook rejected (409 {event} shell={shell_id} "
+                 f"gen={generation} seq={hook_seq}): {exc}")
             return _err(409, "hook_rejected", str(exc))
         except interface_state.InterfaceTransitionError as exc:
             _log(f"hook illegal transition session={session_id} "
@@ -951,6 +1229,14 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     if actor is None:
         return _err(401, "unauthorized",
                     "operator bearer or browser session required")
+    # Shell actors (the planner's own API token) reach ONLY the sprint-wake
+    # surfaces — bindings + action receipts — never session/writer/stop.
+    if actor.kind == "shell" and not (
+            p.startswith("/api/interface/sprint-bindings")
+            or p.startswith("/api/planner-action-receipts")):
+        return _err(403, "shell_scope",
+                    "a shell token may call only sprint-binding and "
+                    "action-receipt routes")
     if method in ("POST", "DELETE", "PATCH", "PUT"):
         if not actor.csrf_ok:
             return _err(403, "csrf", "browser mutations need the session's "
@@ -979,6 +1265,17 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _terminate(actor, headers, data)
         if p == "/api/interface/reconciliations" and method == "POST":
             return _reconcile(actor, headers, data)
+        if p == "/api/interface/sprint-bindings" and method == "POST":
+            return _arm_binding(actor, headers, data)
+        if p.startswith("/api/interface/sprint-bindings/") \
+                and method == "DELETE":
+            return _release_binding(actor, headers, data,
+                                    int(p.rsplit("/", 1)[1]))
+        if p == "/api/planner-action-receipts" and method == "POST":
+            return _begin_receipt(actor, headers, data)
+        if p.startswith("/api/planner-action-receipts/") and method == "PATCH":
+            return _update_receipt(actor, headers, data,
+                                   int(p.rsplit("/", 1)[1]))
         return _err(404, "no_such_route", f"no route: {method} {p}")
     except ValueError:
         return _err(404, "no_such_route", f"no route: {method} {p}")

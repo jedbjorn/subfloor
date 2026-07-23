@@ -17,7 +17,9 @@ the launch env the pane entrypoint injected (SC_INTERFACE_*), never from
 config files or argv.
 
 hook_seq is allocated from a per-generation counter file under the engine
-run dir (flock-serialized — concurrent hooks can't double-issue). The
+run dir. The flock is held through the POST (flag #50, decisions #28/#31):
+allocation order IS commit order, so a concurrent hook can never commit
+first and strand the earlier event as a stale-sequence rejection. The
 entrypoint's pre-exec session_start is always seq 1, so the counter starts
 at 1 and the first harness-side hook issues 2. A crash between allocation
 and POST leaves a gap; the receiver rejects only <= last, so gaps are
@@ -72,17 +74,48 @@ def next_hook_seq(run_dir: Path, shell_id: int, generation: int) -> int:
     path = run_dir / f"hook-seq-{shell_id}-{generation}.seq"
     with open(path, "a+") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.seek(0)
-        raw = fh.read().strip()
-        last = int(raw) if raw else 1  # 1 = the entrypoint's session_start
-        nxt = last + 1
-        fh.seek(0)
-        fh.truncate()
-        fh.write(f"{nxt}\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+        nxt = _alloc_seq(fh)
         fcntl.flock(fh, fcntl.LOCK_UN)
     return nxt
+
+
+def _alloc_seq(fh) -> int:
+    """Allocate + persist the next sequence on an already-flocked counter
+    file. The counter is written BEFORE the POST: a crash leaves a gap
+    (safe — the receiver rejects only <= last), never a duplicate."""
+    fh.seek(0)
+    raw = fh.read().strip()
+    last = int(raw) if raw else 1  # 1 = the entrypoint's session_start
+    nxt = last + 1
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"{nxt}\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+    return nxt
+
+
+def emit_locked(run_dir: Path, shell_id: int, generation: int, body: dict,
+                api_base: str, token: str) -> bool:
+    """Allocate the hook sequence AND post the callback while holding the
+    counter flock through the POST (flag #50, decisions #28/#31 — HARD
+    seq-8 requirement): the flock serializes COMMIT, not just allocation.
+    Without it two concurrent hooks allocated in order could POST out of
+    order; the later seq would commit first and the earlier hook would be
+    rejected as stale — a dropped prompt_submit strands its wake batch
+    'submitting' with RESTART-ONLY recovery. Holding the lock through the
+    POST makes allocation order == commit order, so that state is
+    unreachable. The POST is short-timeout and the harness is local; the
+    worst-case wait for a concurrent hook is bounded by POST_TIMEOUT_S."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / f"hook-seq-{shell_id}-{generation}.seq"
+    with open(path, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            body["hook_seq"] = _alloc_seq(fh)
+            return post_callback(api_base, token, body)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def post_callback(api_base: str, token: str, body: dict,
@@ -138,12 +171,14 @@ def main(argv: "list[str] | None" = None) -> int:
             raise EmitError("SC_INTERFACE_HOOK_TOKEN / SC_INTERFACE_SHELL_ID "
                             "/ SC_INTERFACE_GENERATION / SC_API_BASE unset — "
                             "not an Interface-managed session")
-        seq = next_hook_seq(_run_dir(), int(shell_id), int(generation))
         body = {"shell_id": int(shell_id), "generation": int(generation),
-                "hook_seq": seq, "event": args.event, "source": "provider"}
+                "event": args.event, "source": "provider"}
         if args.pid is not None:
             body["pid"] = args.pid
-        post_callback(api_base, token, body)
+        # Seq allocation AND the POST ride one flock (flag #50) — commit
+        # order can no longer invert allocation order.
+        emit_locked(_run_dir(), int(shell_id), int(generation), body,
+                    api_base, token)
     except EmitError as e:
         print(f"interface-hook: {e}", file=sys.stderr)
     except Exception as e:  # noqa: BLE001 — never break the harness

@@ -296,12 +296,13 @@ def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
         (watch_id, severity, reason, dedupe))
 
 
-def _emit_event(con, watch, event: dict, head_sha: str) -> bool:
+def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     """One semantic transition → idempotent pr_event + same-transaction wake
     item. Dedupe keyed (watch, transition, head SHA, state) via the message's
     dedupe_key partial unique index: a repeated key is a no-op, so a replayed
-    poll or a baseline race can never double-wake the planner. Returns True
-    when the event was newly emitted."""
+    poll or a baseline race can never double-wake the planner. Returns the
+    new message_id when the event was emitted (None on dedupe) so the caller
+    can signal the wake coordinator after commit."""
     dedupe_key = f"pr-event|{watch['watch_id']}|{event['key']}|{head_sha}"
     try:
         cur = con.execute(
@@ -311,7 +312,7 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> bool:
             (watch["shell_id"], watch["shell_id"], event["body"],
              watch["sprint_doc_id"], dedupe_key))
     except sqlite3.IntegrityError:
-        return False  # the dedupe index — already emitted
+        return None  # the dedupe index — already emitted
     message_id = cur.lastrowid
     binding = con.execute(
         "SELECT binding_id FROM sprint_planner_bindings "
@@ -321,7 +322,7 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> bool:
         con.execute(
             "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
             "VALUES (?, ?)", (binding[0], message_id))
-    return True
+    return message_id
 
 
 def poll_cycle(con, fetch=None, source: str = "scheduler",
@@ -336,6 +337,7 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
     now = now if now is not None else time.monotonic()
     summary = {"watches": 0, "repos": 0, "skipped_backoff": 0,
                "events": 0, "errors": 0, "retired": 0}
+    emitted_ids: list[int] = []
     watches = armed_watches(con)
     summary["watches"] = len(watches)
     if not watches:
@@ -397,8 +399,10 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                     (w["watch_id"], run_id, cur.get("sha"), json.dumps(cur),
                      ",".join(e["key"] for e in events) or None, blind))
             for e in events:
-                if _emit_event(con, w, e, cur.get("sha") or ""):
+                mid = _emit_event(con, w, e, cur.get("sha") or "")
+                if mid is not None:
                     summary["events"] += 1
+                    emitted_ids.append(mid)
             con.execute(
                 "UPDATE watched_prs SET last_seen=?" +
                 (", closed_at=datetime('now')" if terminal else "") +
@@ -407,6 +411,11 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
             if terminal:
                 summary["retired"] += 1
         con.commit()
+    # Events are durable — signal the wake coordinator (thread-safe; a no-op
+    # when the Interface stack is down, durable work drains at next startup).
+    import interface_wake
+    for mid in emitted_ids:
+        interface_wake.notify_message(mid)
     return summary
 
 

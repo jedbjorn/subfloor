@@ -45,6 +45,7 @@ from pathlib import Path
 
 import db_driver
 import interface_broker
+import interface_wake
 
 ENGINE = Path(__file__).resolve().parents[1]
 SHADOW_DIR = ENGINE / "shadow"
@@ -59,6 +60,8 @@ LEASE_LIVENESS_TIMEOUT = 40.0         # dead-lease sweep bound (WS PING_TIMEOUT)
 TICKET_TTL_S = 60
 GRACEFUL_TERMINATE_S = 10.0
 SHADOW_REQUEST_TIMEOUT_S = 10.0   # a sidecar that can't answer is dead
+TMUX_SYNC_TIMEOUT_S = 10.0   # a wedged-but-alive tmux must never hang the
+                             # broker worker thread (SC-013)
 
 TMUX_SESSION = "sc-interface"
 
@@ -437,6 +440,7 @@ class InterfaceRuntime:
         self.available = False
         self.unavailable_reason = "start() not called"
         self.on_unexpected_exit = None  # sync callable(session_id), set by routes
+        self.wake_coordinator = None    # interface_wake.WakeCoordinator (start())
         self._tmux_session_started = False
         self._reaper: asyncio.Task | None = None
         self._tickets: dict[str, dict] = {}
@@ -506,9 +510,74 @@ class InterfaceRuntime:
             except Exception as exc:  # noqa: BLE001 — keep booting
                 _log("boot", f"lost-transition for s{session_id} failed: "
                              f"{exc!r}")
+        # Wake coordinator (sprint 25 seq 8): the event-driven drain of
+        # queued sprint wake work through the broker-owned input path —
+        # never a direct tmux send. Signals arrive from message ingress,
+        # hook callbacks, certifications, and binding arms; startup_pass is
+        # the ONE reconciliation scan (spec Event Ingress: no interval model
+        # scan, no steady wake timer).
+        self.wake_coordinator = interface_wake.WakeCoordinator(
+            self.db_path, writer_factory=self.wake_writer,
+            unmanaged_probe=self.unmanaged_writable_client)
+        self.wake_coordinator.start(self.loop)
+        interface_wake.bind(self.wake_coordinator)
+        self.wake_coordinator.startup_pass()
+
+    # -- wake submission (sprint 25 seq 8 — the API-owned input path) -----------
+
+    def wake_writer(self, session_id: int):
+        """The broker-owned writer for one wake submission: preflight the
+        pane (a failure PROVES no byte moved → PreSendError — the definite
+        pre-send failure that rides the bounded 1s/5s/30s retries), then one
+        indivisible send-keys of the fixed prompt + Enter. This is the ONLY
+        path a wake reaches tmux; the crash-window parking in the broker is
+        unbypassable from here."""
+        payload = interface_broker.WAKE_PROMPT.encode() + b"\r"
+
+        def writer(n: int) -> None:
+            assert n == len(payload)
+            gen = self.generations.get(session_id)
+            if gen is None or gen.terminated:
+                raise interface_broker.PreSendError(
+                    f"session {session_id} generation not live in runtime")
+            try:
+                subprocess.run(
+                    ["tmux", "-S", self.sock, "display-message", "-p",
+                     "-t", gen.pane_id, "#{pane_id}"],
+                    capture_output=True, check=True,
+                    timeout=TMUX_SYNC_TIMEOUT_S)
+            except Exception as exc:
+                raise interface_broker.PreSendError(
+                    f"wake preflight failed for {gen.pane_id}: "
+                    f"{exc!r}") from exc
+            self._send_keys_sync(gen.pane_id, payload)
+
+        return writer
+
+    def unmanaged_writable_client(self, session_id: int) -> bool:
+        """Decision #15 probe: any READ-WRITE tmux client attached to our
+        private server is unmanaged — the broker never attaches a client,
+        and a read-only diagnostic client (spec Tmux Runtime) is tolerated.
+        tmux itself being unreachable — or wedged and never answering — is
+        NOT reported here (the wake writer's preflight owns that failure, as
+        definite pre-send); the timeout keeps a wedged server from hanging
+        the drain thread (SC-013)."""
+        if session_id not in self.generations:
+            return False
+        try:
+            out = subprocess.run(
+                ["tmux", "-S", self.sock, "list-clients",
+                 "-F", "#{client_readonly}"],
+                capture_output=True, check=True, text=True,
+                timeout=TMUX_SYNC_TIMEOUT_S).stdout
+        except Exception:  # noqa: BLE001
+            return False
+        return any(line.strip() == "0" for line in out.splitlines())
 
     async def stop(self) -> None:
         """Release runtime resources; panes stay alive for reattach."""
+        interface_wake.bind(None)
+        self.wake_coordinator = None
         if self._reaper:
             self._reaper.cancel()
         for gen in list(self.generations.values()):
@@ -585,13 +654,17 @@ class InterfaceRuntime:
     def _send_keys_sync(self, pane_id: str, payload: bytes) -> None:
         """The injected broker writer: chunked send-keys -H, ≤512 bytes per
         invocation, called exactly once per accepted frame (as many tmux
-        calls as chunks). Runs in the broker worker thread."""
+        calls as chunks). Runs in the broker worker thread. Every call is
+        timeout-bounded: a wedged server raises (TimeoutExpired — ambiguous,
+        the caller parks delivery_unknown) instead of hanging the thread
+        (SC-013)."""
         for off in range(0, len(payload), SENDKEYS_CHUNK):
             chunk = payload[off:off + SENDKEYS_CHUNK]
             subprocess.run(
                 ["tmux", "-S", self.sock, "send-keys", "-t", pane_id, "-H",
                  *[f"{b:02x}" for b in chunk]],
-                capture_output=True, check=True)
+                capture_output=True, check=True,
+                timeout=TMUX_SYNC_TIMEOUT_S)
 
     async def send_keys(self, pane_id: str, payload: bytes) -> None:
         for off in range(0, len(payload), SENDKEYS_CHUNK):
