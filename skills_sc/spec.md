@@ -60,12 +60,6 @@ Surface all three before any planning or code:
   slice.
 - No stated done-condition in the spec -> that is the first unclear item.
 
-### Anticipated User Activity
-The spec's `## Anticipated User Activity` section is governing intent: its
-roles, reach, and tenancy invariants shape the plan — access and tenancy
-checks are planned tasks, not afterthoughts. Older specs predate the section;
-absence there is not a blocker.
-
 ### Unclear items
 Anything you cannot act on without guessing:
 - Ambiguous between two interpretations
@@ -125,7 +119,7 @@ Always this shape:
 |---|---|---|
 | 0 | Preparation | Always first — read code paths, verify DB state, confirm entry points |
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
-| N+1 | Verification | Always last — run tests, smoke-test against done-condition, check the build against the spec's Anticipated User Activity section, snapshot + render |
+| N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
 
 Add one task per seq with `sc mem task add` — each write is live in the
 shared DB immediately:
@@ -134,7 +128,7 @@ shared DB immediately:
 sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
 sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
 sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, check the build against the spec's Anticipated User Activity section, snapshot + render"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
 ```
 
 Then set `current_state` — nothing done yet, next = Preparation:
@@ -245,9 +239,6 @@ Mid-build, the work grows past the spec's stated what/why:
   marked done.
 - **Verification is not optional.** It is the last task; skipping it makes
   "done" meaningless.
-- **Anticipated User Activity is intent.** Verification checks the build
-  against the spec's section — a capability beyond its stated roles, or data
-  crossing a tenancy line it states, is a finding, not a nuance.
 - **Spec too large for one session** -> scope a slice at Preparation: cover
   steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can't
   be verified before the session ends.

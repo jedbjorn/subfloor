@@ -91,49 +91,6 @@ sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-p
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
-## Specs carry "Anticipated User Activity"
-
-Every spec (`kind='spec'`) ships an `## Anticipated User Activity` section —
-the feature's posture statement: who is expected to touch it, where it can be
-reached, whose data it holds, and what it does not intend to allow. Soft
-vocabulary, hard invariants — the nouns stay gentle, every statement stays
-checkable from code ("a Valid User only ever sees rows tied to their own
-account"), because review + Verification test the build against this section.
-
-Shape (H3s under the section H2):
-
-| H3 | holds |
-|---|---|
-| `### Vocabulary` | the cast — roles from the shared roster below + any feature-specific ones, each defined in one line |
-| `### Expected Activity` | per role: what they do, what they see, what they can change |
-| `### Reach` | where the feature meets the world — pages, endpoints, jobs, files it adds or alters, and which roles can arrive at each |
-| `### Data Tenancy` | whose data the feature touches; what stays within one account; what, if anything, is deliberately shared |
-| `### Beyond Intention` | activity the feature does not intend to accommodate — anything observed here in review is a finding, not a nuance |
-
-Shared roster (always available; same meaning in every spec):
-
-| role | means |
-|---|---|
-| **Valid Privileged User** | signed-in user with an operator/admin role, acting within what that role allows |
-| **Valid User** | signed-in user acting inside their own account and their own data |
-| **Visitor** | expected traffic that has not signed in (public/shared surfaces) |
-| **Future Potential User** | a role anticipated later, not built now — the design must not wall it out |
-| **System** | the product acting on a schedule or trigger — daemons, jobs, watchers |
-| **Shell** | an AI agent shell acting through its granted tools — its activity is messages, memory writes, file edits |
-| **Unexpected Participant** | anyone acting outside the roles above — where the spec says what must never be reachable |
-
-Language — soft by design. Specs never use: threat model, attack or attack
-surface, adversary, exploit, abuse case, vulnerability, breach, privilege
-escalation, exfiltration, malicious. Say it in roster words instead: threat
-model -> anticipated activity · attacker -> Unexpected Participant · abuse
-case -> Beyond Intention · access matrix -> Expected Activity · attack
-surface -> Reach · isolation -> tenancy. Describe behavior and boundaries,
-never hostility.
-
-Internal-only feature -> the section still ships, one line ("All activity is
-by Valid Privileged Users; no tenancy boundary"). Whole section ≤ ~40 lines —
-it frames the build, it does not enumerate it.
-
 ## Revise before freeze
 
 Unfrozen -> edit in place: no new row, no seq bump. Pass any of `--title` /
