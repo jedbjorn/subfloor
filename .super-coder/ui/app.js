@@ -2131,9 +2131,15 @@ async function ifBootstrap() {
   for (let attempt = 0; attempt < 2; attempt++) {
     const headers = { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() };
     if (ifOpToken) headers["Authorization"] = "Bearer " + ifOpToken;
-    const r = await fetch("/api/interface/browser-sessions", {
-      method: "POST", credentials: "same-origin", headers, body: "{}",
-    });
+    let r;
+    try {
+      r = await fetch("/api/interface/browser-sessions", {
+        method: "POST", credentials: "same-origin", headers, body: "{}",
+      });
+    } catch (e) {
+      ifOpToken = null;   // network failure — never keep a half-used capability
+      throw e;
+    }
     const data = await r.json().catch(() => ({}));
     if (r.ok) { ifCsrf = data.csrf; ifOpToken = null; return; }
     if (r.status === 401 && attempt === 0) {
@@ -2141,13 +2147,14 @@ async function ifBootstrap() {
         "Interface operator capability required — paste the contents of\n" +
         ".super-coder/run/interface/operator.token (mode 0600, operator-only):",
         "");
-      if (!t) throw ifError(r, data);
+      if (!t) { ifOpToken = null; throw ifError(r, data); }
       ifOpToken = t.trim();
       continue;
     }
-    if (r.status === 401) {   // the pasted capability was rejected
-      ifOpToken = null;
-    }
+    // EVERY other non-ok exit (rejected 401 retry, 403, 409, 422, 5xx,
+    // malformed body) drops the capability uniformly — it never survives a
+    // failed exchange, no matter which branch failed.
+    ifOpToken = null;
     throw ifError(r, data);
   }
 }
@@ -2207,18 +2214,33 @@ async function renderInterface(root) {
   }
   const rail = el("div", { className: "if-rail" });
   const pane = el("div", { className: "if-pane" });
-  root.append(el("div", { className: "if-wrap" }, rail, pane));
+  // Mobile shell picker (CSS-hidden on desktop): same selection, same hash.
+  const picker = el("select", { className: "if-picker", title: "shell" });
+  picker.append(el("option", { value: "" }, "select a shell…"));
+  root.append(el("div", { className: "if-wrap" }, picker, rail, pane));
   for (const s of shells) {
+    // Projection happens SERVER-side (_availability): reserved+starting →
+    // starting, occupied+(idle|busy|approval|user_input) → occupied,
+    // unreconciled+(lost|error) → lost|error. The rail renders it verbatim;
+    // New-chat authority below stays keyed on availability === "available".
     const row = el("button", { type: "button",
       className: "if-row" + (s.shortname === ifSelected ? " active" : "") });
-    row.append(
-      el("div", { className: "if-row-head" },
-        el("b", {}, s.display_name || s.shortname),
-        el("span", { className: "pill if-badge " + (IF_BADGE[s.availability] || "") }, s.availability)),
+    const head = el("div", { className: "if-row-head" },
+      el("b", {}, s.display_name || s.shortname),
+      el("span", { className: "pill if-badge " + (IF_BADGE[s.availability] || "") }, s.availability));
+    if (s.alerts > 0)
+      head.append(el("span", { className: "pill if-badge bad",
+        title: s.alerts + " unread alert(s)" }, "⚠ " + s.alerts));
+    row.append(head,
       el("div", { className: "if-row-sub" }, s.shortname + (s.harness ? " · " + s.harness : "")));
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
+    const opt = el("option", { value: s.shortname },
+      `${s.display_name || s.shortname} · ${s.shortname} · ${s.availability}`);
+    if (s.shortname === ifSelected) opt.selected = true;
+    picker.append(opt);
   }
+  picker.onchange = () => { if (picker.value) location.hash = "interface/" + picker.value; };
   if (!shells.length) rail.append(el("div", { className: "muted" }, "No shells."));
   const sel = shells.find((s) => s.shortname === ifSelected);
   if (!sel) {
@@ -2229,68 +2251,190 @@ async function renderInterface(root) {
   if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
   if (sel.availability === "lost" || sel.availability === "error" || sel.availability === "unreconciled") {
     ifDetach();
-    const card = el("div", { className: "card" },
-      el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
-        el("span", { className: "pill if-badge bad" }, sel.availability), "."));
-    if (!sel.session_id) {
-      card.append(el("div", { className: "muted" },
-        "New chat is blocked — this shell runs a legacy or unmanaged harness."));
-    } else {
-      // Spec Interface Layout: a lost/error pane offers reconcile (verify the
-      // process still lives) and close (after absence is proved); a closed
-      // session frees the shell for a fresh generation.
-      const msg = el("div", { className: "muted" },
-        "New chat is blocked until this generation is reconciled or closed.");
-      const recon = el("button", { className: "act", type: "button", textContent: "Reconcile" });
-      const close = el("button", { className: "act", type: "button", textContent: "Close session" });
-      const note = el("div", { className: "if-note" });
-      recon.onclick = async () => {
-        recon.disabled = true; note.textContent = "";
-        try {
-          const r = await apiIf("/interface/reconciliations", "POST",
-            { session_id: sel.session_id, action: "verify" });
-          if (r.verified) return renderInterface(root);
-          note.textContent = "identity could not be verified — close it if the process is gone.";
-        } catch (e) { note.textContent = (e.code ? e.code + ": " : "") + e.message; }
-        recon.disabled = false;
-      };
-      close.onclick = async () => {
-        if (!confirm(`Close session #${sel.session_id}? Allowed only after the process is proved absent. This frees ${sel.display_name || sel.shortname} for a new chat.`)) return;
-        close.disabled = true; note.textContent = "";
-        try {
-          await apiIf("/interface/reconciliations", "POST",
-            { session_id: sel.session_id, action: "close" });
-          return renderInterface(root);
-        } catch (e) {
-          note.textContent = (e.code ? e.code + ": " : "") + e.message;
-          close.disabled = false;
-        }
-      };
-      card.append(msg, el("div", {}, recon, " ", close), note);
-    }
-    pane.append(card);
-    return;
+    return ifRecoveryPane(pane, sel, root);
   }
   return ifSessionPane(pane, sel);   // occupied | starting
 }
 
+// Lost/error/unreconciled pane (spec Interface Layout): diagnostics and
+// queued-work counts come straight from GET /sessions/<id> — occupancy,
+// lifecycle, error_detail, the input pipeline (composer/delivery/forwarded
+// seq), wake and alerts. The API exposes no explicit allowed-actions field,
+// so the action gates mirror the route's own 409 preconditions exactly:
+// verify any time the session isn't ended (this pane never shows ended),
+// close ONLY while occupancy is unreconciled (occupied refuses with
+// not_unreconciled; absence is re-proved server-side on every close). A
+// closed session derives available → New chat IS the fresh-generation action.
+async function ifRecoveryPane(pane, sel, root) {
+  const card = el("div", { className: "card" },
+    el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
+      el("span", { className: "pill if-badge bad" }, sel.availability), "."));
+  pane.append(card);
+  if (!sel.session_id) {
+    card.append(el("div", { className: "muted" },
+      "New chat is blocked — this shell runs a legacy or unmanaged harness. " +
+      "Prove the process absent (or adopt a managed generation) to free it."));
+    return;
+  }
+  let sess;
+  try { sess = await apiIf("/interface/sessions/" + sel.session_id); }
+  catch (e) {
+    card.append(el("div", { className: "muted" },
+      "session state unavailable (" + e.message + ") — reselect the shell to retry. " +
+      "Recovery actions stay hidden while the exact state is unknown."));
+    return;
+  }
+  const diag = el("div", { className: "if-diag" });
+  const drow = (k, v) => diag.append(el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v ?? "—"))));
+  drow("session", "#" + sess.session_id + " · gen " + (sess.generation ?? "—"));
+  drow("occupancy", sess.occupancy);
+  drow("lifecycle", sess.lifecycle);
+  drow("harness", sess.harness || "—");
+  drow("composer", sess.composer);
+  drow("delivery", sess.delivery);
+  drow("forwarded seq", sess.forwarded_seq);
+  drow("wake", sess.wake_state);
+  drow("alerts", sess.alerts ?? 0);
+  card.append(diag);
+  if (sess.error_detail)
+    card.append(el("div", { className: "if-note" }, "diagnostics: " + sess.error_detail));
+  card.append(el("div", { className: "muted" },
+    "New chat is blocked until this generation is reconciled or closed."));
+
+  const note = el("div", { className: "if-note" });
+  const acts = el("div", {});
+  const recon = el("button", { className: "act", type: "button", textContent: "Reconcile",
+    title: "re-verify tmux/process identity — a verified unreconciled session returns to occupied" });
+  recon.onclick = async () => {
+    recon.disabled = true; note.textContent = "";
+    try {
+      const r = await apiIf("/interface/reconciliations", "POST",
+        { session_id: sess.session_id, action: "verify" });
+      if (r.verified) return renderInterface(root);
+      note.textContent = (r.actions || [])[0] ||
+        "identity could not be verified — close it if the process is gone.";
+    } catch (e) { note.textContent = (e.code ? e.code + ": " : "") + e.message; }
+    recon.disabled = false;
+  };
+  acts.append(recon);
+  if (sess.occupancy === "unreconciled") {
+    const close = el("button", { className: "act", type: "button", textContent: "Close session",
+      title: "only after absence is proved (re-checked server-side) — frees the shell for a fresh generation" });
+    close.onclick = async () => {
+      if (!confirm(`Close session #${sess.session_id}? Allowed only after the process is proved absent. This frees ${sel.display_name || sel.shortname} for a new chat.`)) return;
+      close.disabled = true; note.textContent = "";
+      try {
+        await apiIf("/interface/reconciliations", "POST",
+          { session_id: sess.session_id, action: "close" });
+        return renderInterface(root);
+      } catch (e) {
+        note.textContent = (e.code ? e.code + ": " : "") + e.message;
+        close.disabled = false;
+      }
+    };
+    acts.append(" ", close);
+  }
+  card.append(acts, note);
+}
+
+// Available pane: one primary New chat command (spec Interface Layout — no
+// second New-chat control exists for occupied or unreconciled shells). The
+// action opens the normal harness/model/effort choices sourced from the live
+// catalogue (GET /api/models v3, family-first) using the Default Models
+// picker conventions (dmModelPicker). POST /sessions rejects unknown fields
+// and accepts only shell_id/harness/model/effort/rows/cols — there is no
+// permission-mode field on the API, so none is offered here.
 function ifAvailablePane(pane, sel, root) {
   ifDetach();
-  const btn = el("button", { className: "act primary", type: "button", textContent: "New chat" });
-  const msg = el("div", { className: "muted" });
-  btn.onclick = async () => {
-    btn.disabled = true; msg.textContent = "";
+  const card = el("div", { className: "card if-newchat" },
+    el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is available."));
+  const open = el("button", { className: "act primary", type: "button", textContent: "New chat" });
+  open.onclick = () => { open.remove(); ifNewChatForm(card, sel, root); };
+  card.append(open);
+  pane.append(card);
+}
+
+async function ifNewChatForm(card, sel, root) {
+  const msg = el("div", { className: "muted" }, "loading model catalogue…");
+  card.append(msg);
+  let cat = null;
+  try { cat = await api("/models"); } catch { /* typed ids still store as-is */ }
+  if (!card.isConnected) return;   // user navigated away mid-fetch
+  msg.textContent = cat ? "" :
+    "catalogue unreachable — typed ids are stored as-is (advisory).";
+
+  const harnesses = Object.keys((cat && cat.harnesses) || {}).sort();
+  const choice = { harness: harnesses[0] || null, model: "", effort: "" };
+
+  const effortSel = el("select", { className: "if-effort", title: "effort" });
+  const effortRow = el("div", { className: "dm-row", hidden: true },
+    el("span", { className: "dm-harness" }, "effort"), effortSel);
+  effortSel.onchange = () => { choice.effort = effortSel.value; };
+  const paintEffort = () => {
+    const entry = (((cat || {}).harnesses || {})[choice.harness] || { models: [] })
+      .models.find((m) => m.id === choice.model);
+    const efforts = (entry && entry.supported_efforts) || [];
+    choice.effort = "";
+    effortSel.replaceChildren(el("option", { value: "" }, "effort: harness default"));
+    for (const ef of efforts) {
+      const o = el("option", { value: ef }, "effort: " + ef);
+      if (ef === entry.default_effort) { o.selected = true; choice.effort = ef; }
+      effortSel.append(o);
+    }
+    effortRow.hidden = !efforts.length;   // effort is unknown for typed/uncatalogued models
+  };
+
+  // dmModelPicker reads row.model for the current label and calls save(value)
+  // on a pick — `choice` plays the row; save also refreshes the effort list.
+  const pickerZone = el("div");
+  const buildPicker = () => {
+    const picker = dmModelPicker(choice.harness, cat || { harnesses: {} }, choice,
+      async (value) => { choice.model = value || ""; paintEffort(); });
+    pickerZone.replaceChildren(
+      el("div", { className: "dm-row" },
+        el("span", { className: "dm-harness" }, "model"), picker.current, picker.input),
+      picker.results);
+  };
+
+  let harnessCtl;
+  if (harnesses.length) {
+    harnessCtl = el("select", { title: "harness" });
+    for (const h of harnesses) harnessCtl.append(el("option", { value: h }, h));
+    harnessCtl.onchange = () => {
+      choice.harness = harnessCtl.value; choice.model = "";
+      buildPicker(); paintEffort();
+    };
+  } else {
+    harnessCtl = el("input", { type: "text", className: "dm-search",
+      placeholder: "harness (e.g. claude)" });
+    harnessCtl.oninput = () => { choice.harness = harnessCtl.value.trim() || null; };
+  }
+  buildPicker();   // effort select stays hidden until a catalogued model is picked
+
+  const start = el("button", { className: "act primary", type: "button", textContent: "Start chat" });
+  start.onclick = async () => {
+    start.disabled = true; msg.textContent = "";
+    const body = { shell_id: sel.shell_id };
+    if (choice.harness) body.harness = choice.harness;
+    if (choice.model) body.model = choice.model;
+    if (choice.effort) body.effort = choice.effort;
     try {
-      // 201 → the shell flips to occupied; re-render lands on the session pane.
-      await apiIf("/interface/sessions", "POST", { shell_id: sel.shell_id });
+      // 201 → the shell flips to reserved/starting; re-render lands on the
+      // session pane. A 202 (ambiguous spawn) re-renders onto the recovery
+      // pane, which shows the server's error_detail.
+      await apiIf("/interface/sessions", "POST", body);
       await renderInterface(root);
     } catch (e) {   // 409 shell_occupied / unmanaged_harness — show the server's message
       msg.textContent = (e.code ? e.code + ": " : "") + e.message;
-      btn.disabled = false;
+      start.disabled = false;
     }
   };
-  pane.append(el("div", { className: "card if-newchat" },
-    el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is available."), btn, msg));
+  card.append(
+    el("div", { className: "dm-row" },
+      el("span", { className: "dm-harness" }, "harness"), harnessCtl),
+    pickerZone,
+    effortRow,
+    start);
 }
 
 // Occupied/starting pane: header state line + terminal. Attaches writer-first
@@ -2318,10 +2462,14 @@ async function ifSessionPane(pane, sel) {
 
   const st = {
     harness: sess.harness || sel.harness || "—",
+    model: sess.model_route || "harness default",
     lifecycle: sess.lifecycle || "—",
     composer: sess.composer || "unknown",
     writer: sess.writer && sess.writer.held ? "held" : "none",
     clients: sess.clients ?? 0,
+    wake: sess.wake_state || "disarmed",
+    archive: sess.archive_id ?? null,
+    since: sess.occupied_at || sess.created_at || null,
     note: "",
   };
   const headEl = el("div", { className: "if-head" });
@@ -2371,19 +2519,45 @@ function ifReleaseLease(a) {
   a.leaseId = null;
 }
 
+// Session age from a UTC timestamp — SQLite datetime('now') shape
+// ("YYYY-MM-DD HH:MM:SS") or ISO-8601; both parse as UTC here.
+function ifAge(ts) {
+  if (!ts) return "—";
+  const s0 = String(ts);
+  const t = new Date(s0.includes("T") ? s0 : s0.replace(" ", "T") + "Z");
+  if (isNaN(t)) return "—";
+  const s = Math.max(0, (Date.now() - t.getTime()) / 1000);
+  if (s < 90) return Math.floor(s) + "s";
+  if (s < 5400) return Math.floor(s / 60) + "m";
+  if (s < 129600) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+
 function ifPaintHeader(a, sel, pane) {
   const st = a.st;
+  const stat = (k, v) => el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v)));
+  // Spec Interface Layout header: harness/model, archive/session age, writer
+  // or read-only state, draft (composer) state, sprint wake state, then the
+  // exact recovery actions. idle/busy/approval/user_input stay lifecycle
+  // details HERE — they never replace occupancy in the rail.
   const head = [
-    el("span", { className: "if-stat" }, "harness ", el("b", {}, String(st.harness))),
-    el("span", { className: "if-stat" }, "session ", el("b", {}, "#" + a.sessionId)),
-    el("span", { className: "if-stat" }, "lifecycle ", el("b", {}, String(st.lifecycle))),
-    el("span", { className: "if-stat" }, "composer ", el("b", {}, String(st.composer))),
-    el("span", { className: "if-stat" }, "writer ", el("b", {}, st.writer)),
-    el("span", { className: "if-stat" }, "clients ", el("b", {}, String(st.clients))),
+    stat("harness", st.harness),
+    stat("model", st.model),
+    stat("session", "#" + a.sessionId + (st.archive != null ? " · arc #" + st.archive : "")),
+    stat("age", ifAge(st.since)),
+    stat("lifecycle", st.lifecycle),
+    stat("composer", st.composer),
+    stat("writer", st.writer === "active" ? "you" : st.writer === "held" ? "read-only" : st.writer),
+    stat("clients", st.clients),
+    stat("wake", st.wake),
   ];
   if (st.writer === "held" || st.writer === "revoked") {
-    const take = el("button", { className: "act", type: "button", textContent: "Take-over" });
-    take.onclick = () => ifTakeover(a);
+    const take = el("button", { className: "act", type: "button", textContent: "Take-over",
+      title: "explicitly take the writer lease — the current writer turns read-only" });
+    take.onclick = () => {
+      if (confirm("Take control of this session? The current writer (another tab or CLI) becomes read-only."))
+        ifTakeover(a);
+    };
     head.push(take);
   }
   if (st.composer === "dirty" || st.composer === "unknown") {
@@ -2399,29 +2573,45 @@ function ifPaintHeader(a, sel, pane) {
     };
     head.push(cert);
   }
-  const end = el("button", { className: "act", type: "button", textContent: "End chat" });
-  end.onclick = () => ifEndChat(a, sel, pane);
+  const end = el("button", { className: "act", type: "button", textContent: "End chat",
+    title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout" });
+  end.onclick = () => ifEndChat(a, sel, pane, end);
   head.push(end);
   if (st.note) head.push(el("span", { className: "if-note" }, st.note));
   a.headEl.replaceChildren(...head);
 }
 
-async function ifEndChat(a, sel, pane) {
+// End chat (spec Workflow 9): explicit + confirmed, graceful first. Force is
+// a SEPARATE action that exists only after the graceful request timed out —
+// the API enforces the same gate (force_requires_graceful_timeout) and the
+// prompt names the exact PID/generation from its response. The shell returns
+// to available only when the API says terminated; identity_mismatch fails
+// closed into unreconciled/lost, so we re-render onto the recovery pane.
+async function ifEndChat(a, sel, pane, btn) {
   if (!confirm(`End chat with ${sel.display_name || sel.shortname}? This terminates session #${a.sessionId}.`)) return;
+  if (btn) btn.disabled = true;
+  const root = pane.closest(".view");
   let r;
   try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: false }); }
   catch (e) {
     if (e.status === 409 && e.body && e.body.reason) r = e.body;
     else { a.st.note = "end chat failed: " + e.message; a.paint(); return; }
   }
+  if (!r.terminated && r.reason === "identity_mismatch") {
+    if (root) return renderInterface(root);
+    return;
+  }
   if (!r.terminated && r.reason === "graceful_timeout") {
-    if (!confirm(`Graceful stop timed out. Force-kill PID ${r.pid} (generation ${r.generation})?`)) return;
+    if (!confirm(`Graceful stop timed out. Force-kill PID ${r.pid} (generation ${r.generation})?`)) {
+      a.st.note = "graceful stop timed out — End chat again to retry, or confirm the force kill.";
+      a.paint();
+      return;
+    }
     try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: true }); }
     catch (e) { a.st.note = "force kill failed: " + e.message; a.paint(); return; }
   }
   if (r.terminated) {
     ifDetach();
-    const root = pane.closest(".view");
     if (root) renderInterface(root);
   } else { a.st.note = "not terminated: " + (r.reason || "?"); a.paint(); }
 }
@@ -2531,23 +2721,39 @@ function ifSendResize(a, rows, cols) {
   a.ws.send(frame);
 }
 
+// This client's writer lease is gone (taken over elsewhere): flip read-only
+// IMMEDIATELY with a clear notice (spec Workflow 6).
+function ifRevoked(a) {
+  a.role = "viewer"; a.leaseId = null; a.leaseToken = null;
+  a.awaiting = false; a.halted = false; a.outBuf = "";
+  a.st.writer = "held";
+  a.st.note = "control was taken by another client — you are now read-only (Take-over to reclaim)";
+}
+
 function ifControl(a, m) {
   switch (m.type) {
     case "input_ack":   // may carry replayed:true — either way the frame landed
       if (m.seq === a.inflight) { a.awaiting = false; a.lastAck = m.seq; ifFlush(a); }
       break;
-    case "input_reject":   // seqs are session-scoped; stop until the next attach
+    case "input_reject":
       a.awaiting = false;
-      a.halted = true;
-      a.st.note = `input rejected (seq ${m.seq}): ${m.reason || "?"} — reattach to resume`;
+      // writer_revoked = a takeover revoked our lease; the runtime learns of
+      // it at the next keystroke and rejects the frame. Same flip as a
+      // writer-state revoke — not a halt.
+      if (m.reason === "writer_revoked" && a.role === "writer") {
+        ifRevoked(a);
+      } else {   // seqs are session-scoped; stop until the next attach
+        a.halted = true;
+        a.st.note = `input rejected (seq ${m.seq}): ${m.reason || "?"} — reattach to resume`;
+      }
       a.paint();
       break;
     case "writer":
-      a.st.writer = m.state;
-      if (m.state === "revoked" && a.role === "writer") {
-        a.role = "viewer"; a.leaseId = null; a.leaseToken = null; a.halted = false;
-        a.st.note = "writer lease revoked — now read-only";
-      }
+      // Server states (interface_runtime.writer_control): active | held |
+      // none — there is no "revoked" frame. A non-active state while we still
+      // believe we hold the lease IS the revocation signal.
+      if (a.role === "writer" && m.state !== "active") ifRevoked(a);
+      else a.st.writer = m.state;
       a.paint();
       break;
     case "lifecycle":
