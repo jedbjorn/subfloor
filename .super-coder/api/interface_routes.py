@@ -819,13 +819,18 @@ def _wake_state(con, *, session_id=None, planner_shell_id=None) -> str:
             (planner_shell_id,)).fetchone()
     if binding is None:
         return "disarmed"
+    # A parked batch shadows every newer live one — a parked batch is not
+    # 'live' per idx_pwb_live, so the drain forms a NEW batch while one
+    # parks, and a newest-first pick would hide the park behind it.
+    if con.execute(
+            "SELECT 1 FROM planner_wake_batches WHERE binding_id=? "
+            "AND state='delivery_unknown' LIMIT 1", (binding[0],)).fetchone():
+        return "parked"
     batch = con.execute(
         "SELECT state FROM planner_wake_batches WHERE binding_id=? "
-        "AND state IN ('queued','submitting','running','delivery_unknown') "
+        "AND state IN ('queued','submitting','running') "
         "ORDER BY batch_id DESC LIMIT 1", (binding[0],)).fetchone()
     if batch is not None:
-        if batch[0] == "delivery_unknown":
-            return "parked"
         if batch[0] in ("submitting", "running"):
             return batch[0]
         return "queued"
@@ -949,12 +954,6 @@ def _release_binding(actor, headers, body, binding_id: int):
 
 # ---------------------------------------------------------- wake ops (seq 10)
 
-# Alert reasons a successful retry resolves (dedupe-while-open re-arms them
-# if the condition recurs).
-RETRY_CLEARS = ("wake_batch_delivery_unknown",
-                "wake_presend_retries_exhausted",
-                "crash_window_delivery_unknown")
-
 
 def _qint(query: dict, name: str) -> "int | None":
     raw = query.get(name, [None])[0]
@@ -982,7 +981,7 @@ def _project_binding(con, row) -> dict:
     current = con.execute(
         "SELECT batch_id, state, created_at, submitted_at "
         "FROM planner_wake_batches WHERE binding_id=? "
-        "AND state IN ('queued','submitting','running','delivery_unknown') "
+        "AND state IN ('queued','submitting','running') "
         "ORDER BY batch_id DESC LIMIT 1", (binding_id,)).fetchone()
     last = con.execute(
         "SELECT batch_id, state, completed_at FROM planner_wake_batches "
@@ -1035,7 +1034,14 @@ def _project_binding(con, row) -> dict:
         "SELECT delivery FROM interface_input_state WHERE session_id=?",
         (session_id,)).fetchone()
     input_park = input_park is not None and input_park[0] == "delivery_unknown"
-    parked = current is not None and current[1] == "delivery_unknown"
+    # The park surfaces regardless of any NEWER live batch — a parked batch
+    # is not 'live' per idx_pwb_live, so one can coexist with the batch the
+    # drain formed after the park.
+    parked_row = con.execute(
+        "SELECT batch_id FROM planner_wake_batches WHERE binding_id=? "
+        "AND state='delivery_unknown' ORDER BY batch_id DESC LIMIT 1",
+        (binding_id,)).fetchone()
+    parked = parked_row is not None
     if parked or input_park:
         reason = con.execute(
             "SELECT reason FROM planner_alerts "
@@ -1043,7 +1049,7 @@ def _project_binding(con, row) -> dict:
             "ORDER BY alert_id DESC LIMIT 1",
             (binding_id, session_id)).fetchone()
         out["park"] = {
-            "batch_id": current[0] if parked else None,
+            "batch_id": parked_row[0] if parked else None,
             "input_park": input_park,
             "reason": reason[0] if reason else None,
         }
@@ -1173,6 +1179,7 @@ def _retry_binding(actor, headers, body, binding_id: int):
                     "binding_released",
                     f"binding {binding_id} is released — arm a fresh binding")
             actions = []
+            input_reconciled = False
             inp = con.execute(
                 "SELECT delivery FROM interface_input_state "
                 "WHERE session_id=?", (session_id,)).fetchone()
@@ -1184,32 +1191,59 @@ def _retry_binding(actor, headers, body, binding_id: int):
                         "the session's input is parked delivery_unknown — "
                         "retry needs outcome=delivered|not_delivered")
                 interface_broker.reconcile_input(con, session_id, outcome)
+                input_reconciled = True
                 actions.append(f"input park reconciled ({outcome})")
-            batch = con.execute(
-                "SELECT batch_id, state FROM planner_wake_batches "
-                "WHERE binding_id=? AND state IN ('queued','delivery_unknown')"
-                " ORDER BY batch_id DESC LIMIT 1", (binding_id,)).fetchone()
-            if batch is not None and batch[1] == "delivery_unknown":
-                interface_broker.resolve_batch(con, batch[0])
+            # A parked batch is never the NEWEST batch for long — the drain
+            # forms a new live batch once one parks (the common case: the
+            # sprint keeps producing messages before the operator retries).
+            # A newest-first pick would grab that newer batch, take the
+            # re-signal branch, and strand the parked one's items 'batched'
+            # forever (resolve_batch is the only requeue path). Resolve EVERY
+            # parked batch: each closes as audit and its items requeue for a
+            # NEW batch through the coordinator.
+            parked = con.execute(
+                "SELECT batch_id FROM planner_wake_batches "
+                "WHERE binding_id=? AND state='delivery_unknown' "
+                "ORDER BY batch_id", (binding_id,)).fetchall()
+            for (parked_id,) in parked:
+                interface_broker.resolve_batch(con, parked_id)
                 actions.append(
-                    f"parked batch {batch[0]} resolved as audit — its items "
-                    "requeue for a NEW batch")
-            elif batch is not None or con.execute(
+                    f"parked batch {parked_id} resolved as audit — its "
+                    "items requeue for a NEW batch")
+            resignalled = False
+            if con.execute(
+                    "SELECT 1 FROM planner_wake_batches WHERE binding_id=? "
+                    "AND state='queued' LIMIT 1", (binding_id,)).fetchone() \
+                    or con.execute(
                     "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
                     "AND state='queued' LIMIT 1", (binding_id,)).fetchone():
                 actions.append(
                     "wake work re-signalled — the coordinator re-gates "
                     "from live state")
+                resignalled = True
             elif not actions:
                 return 409, _err_obj(
                     "nothing_to_retry",
                     "no input park, parked batch, or queued wake work on "
                     "this binding")
-            con.execute(
-                "UPDATE planner_alerts SET resolved_at=datetime('now') "
-                "WHERE resolved_at IS NULL AND reason IN (?,?,?) "
-                "AND (binding_id=? OR session_id=?)",
-                (*RETRY_CLEARS, binding_id, session_id))
+            # Clear ONLY the alerts this retry actually remedied — a blanket
+            # clear would resolve a parked batch's alert while its items sat
+            # stranded, making the park invisible to the operator
+            # (dedupe-while-open re-arms any alert whose condition recurs).
+            clears = []
+            if parked:
+                clears.append("wake_batch_delivery_unknown")
+            if input_reconciled:
+                clears.append("crash_window_delivery_unknown")
+            if resignalled:
+                clears.append("wake_presend_retries_exhausted")
+            if clears:
+                con.execute(
+                    "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                    "WHERE resolved_at IS NULL "
+                    f"AND reason IN ({','.join('?' * len(clears))}) "
+                    "AND (binding_id=? OR session_id=?)",
+                    (*clears, binding_id, session_id))
             con.commit()
             _log(f"sprint binding {binding_id} retry: {'; '.join(actions)}")
             return 200, {

@@ -13,12 +13,16 @@ Covers, without tmux or a live harness:
 - RETRY (POST .../sprint-bindings/{id}/retry): the operator recovery path —
   a parked input needs the explicit outcome verdict; a parked
   (delivery_unknown) batch is NEVER resubmitted (it closes as audit, its
-  items requeue for a NEW batch); a pre-send-stalled queue re-signals; the
-  alerts the retry addresses resolve (dedupe-while-open re-arms them);
-  the coordinator is signalled to re-gate. Idempotent replay.
+  items requeue for a NEW batch) and is resolved even when a NEWER live
+  batch has formed since the park (nothing strands 'batched'; the park
+  stays visible in status while it lasts); a pre-send-stalled queue
+  re-signals; only the alerts the retry actually remedied resolve
+  (dedupe-while-open re-arms them); the coordinator is signalled to
+  re-gate. Idempotent replay.
 - CLOSE INTEGRATION: closing (status: CLOSED) or freezing the sprint doc
-  through the mem API releases its bindings and cancels queued wake work —
-  no orphan armed binding, no stranded queued batch; messages stay unread.
+  through the mem API releases its bindings and cancels queued wake work
+  ATOMICALLY with the doc edit — no orphan armed binding, no stranded
+  queued batch, no half-landed close; messages stay unread.
 
 Run:
     python3 tests/test_interface_sprint_ops.py
@@ -31,6 +35,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -374,6 +379,74 @@ class SprintOpsRoutesTest(unittest.TestCase):
             "SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL"))
         self.assertIn(binding_id, self.coordinator.bindings)
 
+    def test_retry_resolves_parked_batch_behind_newer_live_batch(self):
+        """SC-015: parked batch1 + newer live batch2 — the COMMON case, the
+        sprint keeps producing messages between the park and the operator's
+        retry (a delivery_unknown batch is not 'live' per idx_pwb_live, so
+        the drain forms a new one). Retry must resolve the PARKED batch and
+        requeue its items — never strand them 'batched' behind the newer
+        batch — and clear only the alerts it actually remedied."""
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        mid1 = self.queue_message()
+        batch1 = self.park_batch(binding_id, mid1)
+        mid2 = self.queue_message()
+        con = sqlite3.connect(self.db_path)
+        batch2 = interface_broker.form_batch(con, binding_id)  # stays queued
+        interface_broker._alert(con, severity="warning",
+                                reason="wake_item_quarantined",
+                                binding_id=binding_id)
+        con.commit()
+        con.close()
+        self.assertNotEqual(batch1, batch2)
+        # The park is never INVISIBLE: status reads parked (not the newer
+        # batch's state) and names the parked batch, its alert open — even
+        # with a newer live batch present.
+        status, body = self.call("GET", "/api/interface/sprint-bindings",
+                                 (OP,))
+        b = body["bindings"][0]
+        self.assertEqual(b["wake_state"], "parked")
+        self.assertEqual(b["park"]["batch_id"], batch1)
+        self.assertEqual(b["current_batch"]["batch_id"], batch2)
+        self.assertTrue(b["retry"]["applicable"])
+        self.assertIsNotNone(self.q(
+            "SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL "
+            "AND reason='wake_batch_delivery_unknown'"))
+        # Retry (the input park needs the operator's verdict).
+        status, body = self.call(
+            "POST", f"/api/interface/sprint-bindings/{binding_id}/retry",
+            (OP, "Idempotency-Key: k-retry-2batch"),
+            {"outcome": "not_delivered"})
+        self.assertEqual(status, 200, body)
+        self.assertIn(f"parked batch {batch1} resolved",
+                      "; ".join(body["actions"]))
+        # The PARKED batch resolved as audit; its item requeued, unbatched —
+        # a stranded 'batched' item is impossible after retry.
+        self.assertEqual(self.q("SELECT state FROM planner_wake_batches "
+                                "WHERE batch_id=?", (batch1,))[0], "complete")
+        self.assertEqual(self.q("SELECT state, batch_id FROM "
+                                "planner_wake_items WHERE message_id=?",
+                                (mid1,)), ("queued", None))
+        self.assertIsNone(self.q(
+            "SELECT 1 FROM planner_wake_items WHERE batch_id=? "
+            "AND state IN ('batched','submitting','running')", (batch1,)))
+        # The newer live batch is untouched — its item stays batched to it.
+        self.assertEqual(self.q("SELECT state FROM planner_wake_batches "
+                                "WHERE batch_id=?", (batch2,))[0], "queued")
+        self.assertEqual(self.q("SELECT state, batch_id FROM "
+                                "planner_wake_items WHERE message_id=?",
+                                (mid2,)), ("batched", batch2))
+        # The remedied alerts (batch park, input park) resolved; the
+        # UNRELATED open alert was not swept up by the retry.
+        self.assertIsNone(self.q(
+            "SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL "
+            "AND reason IN ('wake_batch_delivery_unknown',"
+            "'crash_window_delivery_unknown')"))
+        self.assertIsNotNone(self.q(
+            "SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL "
+            "AND reason='wake_item_quarantined'"))
+        self.assertIn(binding_id, self.coordinator.bindings)
+
     def test_retry_nothing_to_retry(self):
         _, body = self.arm()
         binding_id = body["binding_id"]
@@ -523,6 +596,41 @@ class SprintCloseTest(unittest.TestCase):
         self.assertIsNone(self.q(
             "SELECT 1 FROM planner_alerts WHERE binding_id=? "
             "AND resolved_at IS NULL", (binding,)))
+
+    def test_closed_close_is_atomic_under_fault(self):
+        """SC-016: a fault between the column patch and the wake close
+        leaves NO partial state — the status: CLOSED edit and the binding
+        release + queue cancel land in ONE transaction, edge-identical to
+        the freeze path."""
+        binding, mid = self.arm_sprint(104)
+        with mock.patch.object(server, "_close_sprint_wake",
+                               side_effect=RuntimeError("injected fault")):
+            try:
+                self.patch("/_sc/mem/docs/104",
+                           {"body": "# SPRINT: close\nstatus: CLOSED"})
+                self.fail("the injected fault should surface as a 500")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 500)
+        # NEITHER side landed: doc still ACTIVE, binding still armed, wake
+        # item still queued, alert still open.
+        self.assertIn("status: ACTIVE", self.q(
+            "SELECT body FROM documents WHERE document_id=104")[0])
+        self.assertIsNone(self.q(
+            "SELECT released_at FROM sprint_planner_bindings "
+            "WHERE binding_id=?", (binding,))[0])
+        self.assertEqual(self.q("SELECT state FROM planner_wake_items "
+                                "WHERE message_id=?", (mid,))[0], "queued")
+        self.assertIsNotNone(self.q(
+            "SELECT 1 FROM planner_alerts WHERE binding_id=? "
+            "AND resolved_at IS NULL", (binding,)))
+        # Stand down: release the still-armed binding so the other close
+        # tests can arm the same planner (one live binding per planner).
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now'),"
+            " release_reason='test teardown' WHERE binding_id=?", (binding,))
+        con.commit()
+        con.close()
 
     def test_freeze_releases_binding_and_cancels_queue(self):
         binding, mid = self.arm_sprint(102)

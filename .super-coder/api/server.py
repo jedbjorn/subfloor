@@ -633,7 +633,7 @@ def get_analytics_filters(con) -> dict:
 
 # ── Mutations ─────────────────────────────────────────────────────────────────
 
-def patch_columns(con, table, pk_col, pk, body, allowed):
+def patch_columns(con, table, pk_col, pk, body, allowed, commit=True):
     # Column names come exclusively from `allowed` (caller-supplied hardcoded set).
     # Values are kept in a separate list so taint from body never reaches the
     # SQL string — only the parameterised bindings.
@@ -646,7 +646,8 @@ def patch_columns(con, table, pk_col, pk, body, allowed):
                       tuple(vals) + (pk,))
     if cur.rowcount == 0:
         return False, "not found"
-    con.commit()
+    if commit:
+        con.commit()
     return True, None
 
 
@@ -727,7 +728,7 @@ def patch_shell(con, shell_id, body):
                          SHELL_EDITABLE)
 
 
-def patch_document(con, doc_id, body):
+def patch_document(con, doc_id, body, commit=True):
     r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
                     (doc_id,)).fetchone()
     if r is None:
@@ -738,7 +739,7 @@ def patch_document(con, doc_id, body):
     # be made publishable — `doc edit --render-path` advertised the option
     # and silently dropped it, and `doc add` always INSERTs a new row.
     return patch_columns(con, "documents", "document_id", doc_id, body,
-                          {"body", "title", "render_path"})
+                         {"body", "title", "render_path"}, commit=commit)
 
 
 def _sprint_doc_status(con, doc_id) -> "str | None":
@@ -2041,16 +2042,19 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT 1 FROM documents WHERE document_id=?",
                         (did,)).fetchone():
                     return self._send(404, {"error": "no such document"})
-                ok, err = patch_document(con, did, body)
+                # Sprint close integration (seq 10): the planner closes the
+                # board by setting status: CLOSED — the doc edit and the wake
+                # close (binding release + queue cancel) land in ONE
+                # transaction, edge-identical to the freeze path above: a
+                # crash mid-close leaves neither a CLOSED doc with an armed
+                # binding nor a released binding under an ACTIVE doc.
+                ok, err = patch_document(con, did, body, commit=False)
                 if not ok:
                     return self._send(400, {"ok": ok, "error": err})
-                # Sprint close integration (seq 10): the planner closes the
-                # board by setting status: CLOSED — release its wake
-                # bindings + cancel queued wake work in the same breath.
                 released = 0
                 if _sprint_doc_status(con, did) == "CLOSED":
                     released = _close_sprint_wake(con, did)
-                    con.commit()
+                con.commit()
                 return self._send(200, {"ok": ok,
                                         "released_bindings": released,
                                         "serialize": serialize_doc_write()})
