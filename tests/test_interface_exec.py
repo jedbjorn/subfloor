@@ -193,12 +193,21 @@ class InterfaceExecTest(unittest.TestCase):
         self.assertEqual(self.plan_calls, [])
         self.assertEqual(self._archive_count(), 0)
 
-    def test_bad_worktree_refuses(self):
+    # ── 1b: a missing worktree self-heals (flag #61) ─────────────────────
+    def test_missing_worktree_self_heals_via_prepare_launch(self):
+        """A token whose worktree was never provisioned (a shell never
+        CLI-booted) must NOT refuse with a bare 'not a directory':
+        prepare_launch — the CLI boot's own resolver — re-resolves and
+        provisions the shell's cwd, and the harness execs from plan.cwd."""
         path = self._write_token(worktree=str(self.tmp / "ghost"))
-        code, _ = self._run(path)
-        self.assertEqual(code, 2)
-        self.assertEqual(self.plan_calls, [])
-        self.assertEqual(self._archive_count(), 0)
+        code, err = self._run(path)
+        self.assertEqual(code, 0)
+        self.assertNotIn("not a directory", err)
+        self.assertEqual(len(self.plan_calls), 1,
+                         "prepare_launch (the shared resolver) must run")
+        self.assertEqual(len(self.exec_calls), 1)
+        self.assertEqual(os.getcwd(), str(self.worktree),
+                         "the final cwd is prepare_launch's plan.cwd")
 
     # ── 2: single use ───────────────────────────────────────────────────
     def test_token_consumed_on_read(self):

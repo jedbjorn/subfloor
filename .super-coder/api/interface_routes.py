@@ -290,8 +290,38 @@ def _shortname(con, shell_id: int) -> str:
 
 # ------------------------------------------------------------------ sessions
 
-def _worktree_for(shortname: str) -> str:
-    return str(REPO_ROOT / ".sc-worktrees" / shortname.lower())
+def _worktree_for(shortname: str, flavor: "str | None" = None) -> str:
+    """A shell's exec cwd, resolved through the CLI boot's own rule
+    (run.shell_work_dir): admin at the repo root, every other flavor at
+    .sc-worktrees/<shortname>. Lazy import — run.py is the CLI module."""
+    import run as run_mod
+    return str(run_mod.shell_work_dir(shortname, flavor))
+
+
+def _provision_worktree(worktree: str, shortname: str):
+    """Create the shell's git worktree on demand, exactly like the CLI boot
+    (run.ensure_worktree). A shell that was never CLI-booted has no
+    .sc-worktrees/<shortname> yet; the tmux pane's `cd` and the exec both
+    assume it exists, so it must be provisioned BEFORE the reservation is
+    written — never left to fail as a raw 'not a directory'. Returns an
+    error tuple for produce() on failure, None on success/no-op."""
+    path = Path(worktree)
+    if path.is_dir():
+        return None
+    import run as run_mod
+    if path == run_mod.REPO_ROOT:
+        return None  # admin flavor boots at the repo root — nothing to add
+    try:
+        run_mod.ensure_worktree(path, shortname)
+    except SystemExit as e:  # ensure_worktree exits with the git stderr
+        detail = str(e).removeprefix("FATAL: ").strip()
+        return 500, {"error": {
+            "code": "worktree_provision_failed",
+            "message": f"could not provision the shell worktree: {detail} — "
+                       f"fix the repo (`git worktree list`) or create it by "
+                       f"hand (`./sc enter {shortname}`), then retry New chat",
+            "details": {"worktree": worktree, "shortname": shortname}}}
+    return None
 
 
 def _create_session(actor, headers, body):
@@ -314,12 +344,13 @@ def _create_session(actor, headers, body):
     con = _db()
     try:
         shell = con.execute(
-            "SELECT shell_id, shortname FROM shells "
+            "SELECT shell_id, shortname, flavor FROM shells "
             "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
             (shell_id,)).fetchone()
         if shell is None:
             return _err(404, "no_such_shell", f"shell {shell_id} not found")
         shortname = shell[1]
+        flavor = shell[2]
 
         def produce():
             # These checks live INSIDE produce: the idempotency store is
@@ -348,6 +379,14 @@ def _create_session(actor, headers, body):
                                "chat is blocked as unreconciled until "
                                "absence is proved",
                     "details": {"shortname": shortname}}}
+            # Resolve + provision the shell's exec cwd through the CLI
+            # boot's own rule BEFORE any row or token exists: a shell never
+            # CLI-booted (e.g. a planner woken only through the Interface)
+            # has no worktree yet — create it here, like `./sc enter`.
+            worktree = _worktree_for(shortname, flavor)
+            provision_err = _provision_worktree(worktree, shortname)
+            if provision_err is not None:
+                return provision_err
             gen_no = con.execute(
                 "SELECT COALESCE(MAX(generation),0)+1 FROM "
                 "interface_generations WHERE shell_id=?",
@@ -366,7 +405,7 @@ def _create_session(actor, headers, body):
                 "VALUES (?,?,?,?,?, 'reserved', 'starting', "
                 "        datetime('now', ?))",
                 (shell_id, gen_no, harness, body.get("model"),
-                 _worktree_for(shortname), f"+{RESERVATION_TTL_S} seconds"))
+                 worktree, f"+{RESERVATION_TTL_S} seconds"))
             session_id = cur.lastrowid
             con.execute(
                 "INSERT INTO interface_input_state "
@@ -379,14 +418,14 @@ def _create_session(actor, headers, body):
                 "session_id": session_id, "shell_id": shell_id,
                 "generation": gen_no, "hook_token": hook_token,
                 "api_port": ports_mod.resolve().get("port", 8800),
-                "worktree": _worktree_for(shortname),
+                "worktree": worktree,
                 "harness": harness, "model": body.get("model"),
                 "effort": body.get("effort")}))
             os.chmod(token_path, 0o600)
             try:
                 identity = _runtime.call(_runtime.spawn(
                     session_id=session_id, shell_id=shell_id,
-                    generation=gen_no, worktree=_worktree_for(shortname),
+                    generation=gen_no, worktree=worktree,
                     sc_path=str(REPO_ROOT / "sc"),
                     token_path=str(token_path), rows=rows, cols=cols))
             except Exception as exc:  # noqa: BLE001 — see below

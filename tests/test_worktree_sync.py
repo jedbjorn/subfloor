@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for the launcher's worktree drift check (run.sync_worktree).
+"""Tests for the launcher's worktree handling: the drift check
+(run.sync_worktree), the shared boot-cwd resolver (run.shell_work_dir),
+and on-demand worktree provisioning (run.ensure_worktree, flag #61).
 
 Stdlib `unittest`, no pytest — matching the engine's no-dependency style.
 Each test builds a throwaway origin + clone + shell worktree with real git in
@@ -17,11 +19,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from run import sync_worktree  # noqa: E402
+import run as run_mod  # noqa: E402
+from run import ensure_worktree, shell_work_dir, sync_worktree  # noqa: E402
 
 GIT_ENV = {
     **os.environ,
@@ -132,6 +136,53 @@ class WorktreeSyncTest(unittest.TestCase):
         note = sync_worktree(self.wt, "DEV1")
         self.assertIn("in sync", note)
         self.assertIn("unmerged local commit", note)
+
+
+class ShellWorkDirTest(unittest.TestCase):
+    """The shared boot-cwd resolver (flag #61): admin boots at the repo
+    root; every other flavor — dev, planner, reviewer — boots in its own
+    .sc-worktrees/<shortname> worktree."""
+
+    def test_role_resolution(self) -> None:
+        root = Path("/repo")
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            for flavor in ("dev", "planner", "reviewer", None):
+                with self.subTest(flavor=flavor):
+                    self.assertEqual(
+                        shell_work_dir("PLN1", flavor),
+                        root / ".sc-worktrees" / "pln1")
+            self.assertEqual(shell_work_dir("ADMIN", "admin"), root)
+            self.assertEqual(shell_work_dir("", "dev"), root)
+
+
+class EnsureWorktreeTest(unittest.TestCase):
+    """ensure_worktree is the provisioning the Interface reserve path now
+    shares with the CLI boot (flag #61): it must create a missing shell
+    worktree on branch shell/<shortname>, idempotently."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "fork"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        (self.repo / "f.txt").write_text("v1\n")
+        git(self.repo, "add", "f.txt")
+        git(self.repo, "commit", "-qm", "c1")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_provisions_missing_worktree(self) -> None:
+        wt = self.repo / ".sc-worktrees" / "pln1"
+        with mock.patch.object(run_mod, "REPO_ROOT", self.repo):
+            ensure_worktree(wt, "PLN1")
+            self.assertTrue(wt.is_dir())
+            self.assertIn("shell/pln1",
+                          git(self.repo, "branch", "--list", "shell/pln1"))
+            self.assertIn(str(wt), git(self.repo, "worktree", "list"))
+            ensure_worktree(wt, "PLN1")  # second call is a no-op
+        self.assertEqual(git(wt, "symbolic-ref", "--short", "HEAD"),
+                         "shell/pln1")
 
 
 if __name__ == "__main__":

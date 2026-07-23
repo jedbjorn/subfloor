@@ -10,7 +10,13 @@ points a private tmux pane's shell line at this script. This process then:
        unreadable, unparsable, or missing fields refuses (exit 2) BEFORE
        any archive row exists: no capability, no launch, no session.
     2. deletes the token (single use — a second invocation refuses).
-    3. chdirs into the token's worktree.
+    3. chdirs into the token's worktree when it exists. A missing one is
+       NOT fatal: prepare_launch below resolves the shell's cwd through the
+       CLI boot's own rule (admin → repo root, every other flavor →
+       .sc-worktrees/<shortname>, provisioning the git worktree on demand),
+       and the process chdirs to plan.cwd before exec. (The API already
+       provisions at reserve time; this is the self-heal for a worktree
+       lost between reserve and exec.)
     4. prepares the launch through run.py's `prepare_launch` — the NORMAL
        harness/model/effort/permission/worktree/render/boot/archive path
        (exit 3 on refusal), then merges the harness's authenticated
@@ -159,11 +165,12 @@ def main(argv: "list[str] | None" = None) -> int:
         pass
 
     worktree = Path(token["worktree"])
-    if not worktree.is_dir():
-        print(f"interface-exec: worktree {worktree} is not a directory",
-              file=sys.stderr)
-        return 2
-    os.chdir(worktree)
+    if worktree.is_dir():
+        os.chdir(worktree)
+    # A missing token worktree is not a hard failure: prepare_launch (the
+    # CLI boot's own resolver) provisions the shell's worktree on demand
+    # and hands back the authoritative plan.cwd, which we chdir to before
+    # exec. Never refuse with a bare "not a directory".
 
     try:
         plan = run_mod.prepare_launch(
