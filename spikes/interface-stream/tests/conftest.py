@@ -16,7 +16,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import Api, WSClient, tmux  # noqa: E402
-from server import Server  # noqa: E402
+
+# The engine API (.super-coder/api/server.py) is also imported as plain
+# `server` by the tests/ suite in the same pytest process. Importing the
+# spike's server under that top-level name poisons sys.modules for every
+# later `import server` (sprint 25 seq 11: with the Interface stack baked,
+# this conftest loads and 65 engine tests errored on
+# `module 'server' has no attribute 'Handler'`). Load it namespaced.
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "spike_server",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "server.py"))
+_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+Server = _mod.Server
 
 
 @pytest.fixture(scope="session")
