@@ -27,10 +27,19 @@ import interface_state
 MAX_INPUT_BYTES = 64 * 1024  # one human frame, per the pinned spike protocol
 WAKE_PROMPT = "Check your inbox and act on unread sprint events."
 DEFAULT_QUIET_S = 3.0  # debounce, never proof of an empty composer
+MAX_COMPLETED_WAKES = 3  # unread after 3 completed wake turns → quarantined
 
 
 class BrokerError(ValueError):
     """A refused broker operation (stale generation, bad sequence, gate)."""
+
+
+class PreSendError(Exception):
+    """A DEFINITE pre-send failure: the writer proved no byte reached tmux
+    (its preflight failed before any send-keys call). Distinct from an
+    ambiguous write failure (which parks delivery_unknown): a PreSendError
+    returns the batch to queued and rides the coordinator's bounded pre-send
+    retry schedule (1s/5s/30s, spec #20 Retry Policy) instead of parking."""
 
 
 def _begin_immediate(con) -> bool:
@@ -64,14 +73,14 @@ def _session(con, session_id: int):
 
 
 def _alert(con, *, severity: str, reason: str, session_id=None,
-           binding_id=None) -> None:
+           binding_id=None, message_id=None) -> None:
     """Raise an alert, deduplicated while open (partial unique index)."""
-    dedupe = f"{session_id or '-'}|{binding_id or '-'}|{reason}"
+    dedupe = f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}|{reason}"
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
-        "(session_id, binding_id, severity, reason, dedupe_key) "
-        "VALUES (?,?,?,?,?)",
-        (session_id, binding_id, severity, reason, dedupe))
+        "(session_id, binding_id, message_id, severity, reason, dedupe_key) "
+        "VALUES (?,?,?,?,?,?)",
+        (session_id, binding_id, message_id, severity, reason, dedupe))
 
 
 def park_delivery_unknown(con, session_id: int, *,
@@ -342,6 +351,15 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
             # composer as it is — dirty/unknown still need submit/certify.
             if sess[1] == "starting":
                 interface_state.transition(con, "lifecycle", sess[0], "idle")
+            # REAL provider readiness (flag #49, decisions #28/#31): stamp
+            # the quiet baseline NOW — never at the pre-exec occupied_at —
+            # so a >3s harness boot cannot let a queued wake submit into an
+            # unpainted TUI. The wake gate measures quiet from max(human
+            # input, provider_ready_at, ...), so this stamp resets the
+            # debounce to the moment the provider actually proved alive.
+            con.execute(
+                "UPDATE interface_sessions SET provider_ready_at=datetime('now') "
+                "WHERE session_id=?", (sess[0],))
             istate = con.execute(
                 "SELECT composer, pending_seq, forwarded_seq "
                 "FROM interface_input_state WHERE session_id=?",
@@ -485,29 +503,79 @@ def _hook_capability_alerts(con, session_id: int) -> None:
 
 def _complete_batch(con, batch_id: int, stop_hook_seq: int) -> None:
     """Reconcile a running batch's items from durable message read state
-    (spec #20 Wake Delivery): read → done; unread → back to queued with
-    completed_wakes+1. Infrastructure never marks messages read."""
+    (spec #20 Wake Delivery): read → done; unread with a durable ambiguous
+    action (an action receipt still intent/unknown) → reconcile; unread
+    without ambiguity → back to queued with completed_wakes+1 — except the
+    third completed wake, which QUARANTINES the item and alerts (newer work
+    is never blocked). A queued item whose message was read during the turn
+    completes without a wake of its own ("new message handled in the turn:
+    complete it"). Infrastructure never marks messages read."""
     interface_state.transition(
         con, "wake_batch", batch_id, "complete",
         extra_sets={"stop_hook_seq": stop_hook_seq, "completed_at": _now(con)})
+    binding_id = con.execute(
+        "SELECT binding_id FROM planner_wake_batches WHERE batch_id=?",
+        (batch_id,)).fetchone()[0]
     items = con.execute(
         "SELECT item_id, message_id FROM planner_wake_items "
         "WHERE batch_id=? AND state IN ('batched','submitting','running')",
         (batch_id,)).fetchall()
     for item_id, message_id in items:
-        read = con.execute(
-            "SELECT read_at FROM shell_messages WHERE message_id=?",
-            (message_id,)).fetchone()[0]
-        if read is not None:
-            interface_state.transition(
-                con, "wake_item", item_id, "done",
-                extra_sets={"done_at": _now(con)})
-        else:
-            con.execute(
-                "UPDATE planner_wake_items SET completed_wakes="
-                "completed_wakes + 1, batch_id=NULL WHERE item_id=?",
-                (item_id,))
-            interface_state.transition(con, "wake_item", item_id, "queued")
+        _reconcile_item(con, item_id, message_id, binding_id)
+    # Messages that arrived DURING the turn and were read in it complete
+    # without riding a batch (spec: "new message handled in the turn:
+    # complete it; otherwise leave it queued").
+    strays = con.execute(
+        "SELECT i.item_id, i.message_id FROM planner_wake_items i "
+        "JOIN shell_messages m ON m.message_id=i.message_id "
+        "WHERE i.binding_id=? AND i.state='queued' AND m.read_at IS NOT NULL",
+        (binding_id,)).fetchall()
+    for item_id, _ in strays:
+        interface_state.transition(
+            con, "wake_item", item_id, "done",
+            extra_sets={"done_at": _now(con)})
+
+
+def _reconcile_item(con, item_id: int, message_id: int,
+                    binding_id: int) -> None:
+    """One batched item's stop-hook reconciliation (see _complete_batch)."""
+    read = con.execute(
+        "SELECT read_at FROM shell_messages WHERE message_id=?",
+        (message_id,)).fetchone()[0]
+    if read is not None:
+        interface_state.transition(
+            con, "wake_item", item_id, "done",
+            extra_sets={"done_at": _now(con)})
+        return
+    ambiguous = con.execute(
+        "SELECT receipt_id, state FROM planner_action_receipts "
+        "WHERE message_id=? AND state IN ('intent','unknown')",
+        (message_id,)).fetchone()
+    if ambiguous is not None:
+        # A durable ambiguous action: the planner started a side effect whose
+        # result was never observed. Park for operator reconciliation —
+        # NEVER requeue blind (spec Wake Delivery; decision #12).
+        interface_state.transition(
+            con, "wake_item", item_id, "reconcile",
+            extra_sets={"ambiguity":
+                        f"action receipt {ambiguous[0]} is {ambiguous[1]}"})
+        _alert(con, severity="warning", reason="wake_item_reconcile",
+               binding_id=binding_id, message_id=message_id)
+        return
+    wakes = con.execute(
+        "SELECT completed_wakes FROM planner_wake_items WHERE item_id=?",
+        (item_id,)).fetchone()[0] + 1
+    con.execute(
+        "UPDATE planner_wake_items SET completed_wakes=?, batch_id=NULL "
+        "WHERE item_id=?", (wakes, item_id))
+    if wakes >= MAX_COMPLETED_WAKES:
+        # Three completed wakes left it unread: quarantine + alert; newer
+        # work continues past it (spec Wake Delivery; decision #12).
+        interface_state.transition(con, "wake_item", item_id, "quarantined")
+        _alert(con, severity="warning", reason="wake_item_quarantined",
+               binding_id=binding_id, message_id=message_id)
+    else:
+        interface_state.transition(con, "wake_item", item_id, "queued")
 
 
 def form_batch(con, binding_id: int) -> int:
@@ -527,7 +595,8 @@ def form_batch(con, binding_id: int) -> int:
     batch_id = cur.lastrowid
     items = con.execute(
         "SELECT item_id FROM planner_wake_items "
-        "WHERE binding_id=? AND state='queued' ORDER BY item_id",
+        "WHERE binding_id=? AND state='queued' AND batch_id IS NULL "
+        "ORDER BY item_id",
         (binding_id,)).fetchall()
     for (item_id,) in items:
         interface_state.transition(
@@ -594,26 +663,37 @@ def _cancel_batch(con, batch_id: int) -> None:
 
 
 def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
-                      quiet_s: float = DEFAULT_QUIET_S) -> dict:
+                      quiet_s: float = DEFAULT_QUIET_S,
+                      unmanaged_writable=None) -> dict:
     """Gate + submit one coalesced fixed-prompt batch under the input lock.
 
     Revalidates everything the spec requires before a byte moves: the binding
     still armed and its sprint still ACTIVE (a close between form_batch and
     submit CANCELS the batch), occupied session, idle lifecycle, clean
     composer, quiet >= quiet_s since the last accepted human input AND since
-    the last service restart (a fresh full debounce is owed after every
-    restart — a NULL last_human_input_at never skips the check), no pending
-    human frame. quiet_s must be > 0 (the spec forbids a zero debounce).
-    Transient gate failures (busy/dirty/quiet) cancel the attempt WITHOUT a
-    state change — the batch stays queued awaiting a later event.
+    REAL provider readiness (flag #49: the provider session_start stamp, NOT
+    the pre-exec occupied_at — a >3s claude/codex boot must not submit into
+    an unpainted TUI) AND since the last service restart (a fresh full
+    debounce is owed after every restart), no pending human frame, mandatory
+    lifecycle hooks actually supported by the session's harness, and NO
+    unmanaged writable tmux client (decision #15: one is an immediate
+    composer-unknown + disarm + alert, recoverable only by removal plus
+    explicit clean certification). quiet_s must be > 0 (the spec forbids a
+    zero debounce). Transient gate failures (busy/dirty/quiet) cancel the
+    attempt WITHOUT a state change — the batch stays queued awaiting a
+    later event; the quiet failure carries retry_after so the coordinator
+    can re-attempt at the exact debounce deadline (event-reset, never a
+    poll).
 
     From the 'submitting' commit until the fenced submit hook, the batch
     holds the input lock: accept_human_input refuses new frames, so no human
     input can interleave inside the fixed submission. The submission is one
     indivisible writer call; its fence is forwarded_seq+1 (the broker
-    sequence the submit hook must answer). A writer failure without process
-    death parks the batch as delivery_unknown — the prompt may have landed —
-    which also releases the lock.
+    sequence the submit hook must answer). A writer raising PreSendError
+    PROVES no byte moved: the batch returns to queued (a legal edge) for the
+    coordinator's bounded pre-send retries (1s/5s/30s) — it never parks.
+    Any OTHER writer failure is ambiguous (the prompt may have landed): the
+    batch parks as delivery_unknown, which also releases the lock.
 
     The gate reads + the 'submitting' commit are serialized under BEGIN
     IMMEDIATE (REV2 seq-4 L5 TOCTOU): two concurrent submitters on separate
@@ -657,7 +737,8 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
                     "reason": "sprint doc is not ACTIVE"}
 
         sess = con.execute(
-            "SELECT session_id, occupancy, lifecycle, occupied_at, created_at "
+            "SELECT session_id, occupancy, lifecycle, occupied_at, "
+            "created_at, provider_ready_at, harness, cli_version "
             "FROM interface_sessions "
             "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
             (shell_id, generation)).fetchone()
@@ -666,10 +747,10 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             "FROM interface_input_state WHERE session_id=?",
             (sess[0],)).fetchone()
 
-        def gate_fail(reason):
+        def gate_fail(reason, **extra):
             if began:
                 con.rollback()
-            return {"submitted": False, "reason": reason}
+            return {"submitted": False, "reason": reason, **extra}
 
         if sess[1] != "occupied" or sess[2] != "idle":
             return gate_fail(
@@ -678,11 +759,33 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             return gate_fail(f"composer is {istate[0]}")
         if istate[1] is not None:
             return gate_fail("a human frame is pending")
-        # Quiet baseline: the last human input if any, else the session's
-        # start — floored at the last service restart (startup_reconcile
-        # revokes every lease with reason 'service_restart'; that stamp is
-        # the restart time).
-        baseline = istate[3] or sess[3] or sess[4]
+        cap = interface_hooks.capability(sess[6], sess[7])
+        if not cap["mandatory_ok"]:
+            return gate_fail(
+                f"harness {sess[6]!r} lacks mandatory lifecycle hooks "
+                f"(missing: {', '.join(cap['missing_mandatory']) or 'version'})"
+                " — wake cannot submit")
+        if unmanaged_writable is not None and unmanaged_writable():
+            # Decision #15: an unmanaged writable client bypasses the ordered
+            # input boundary — detection sets composer unknown (which disarms
+            # wake: the gate requires clean), alerts, and requires removal +
+            # explicit clean certification before rearming.
+            interface_state.transition(con, "composer", sess[0], "unknown")
+            _alert(con, severity="critical",
+                   reason="unmanaged_writable_client", session_id=sess[0])
+            con.commit()
+            began = False
+            return {"submitted": False, "disarmed": True,
+                    "reason": "unmanaged writable tmux client — composer "
+                              "unknown, wake disarmed until removal + "
+                              "clean certification"}
+        # Quiet baseline (#49): the most recent of — last accepted human
+        # input, REAL provider readiness (the provider session_start stamp,
+        # never the pre-exec occupied_at), session start, and the last
+        # service restart (startup_reconcile revokes every lease with reason
+        # 'service_restart'; that stamp is the restart time).
+        baseline = max(t for t in (istate[3], sess[3], sess[4], sess[5])
+                       if t is not None)
         restart_at = con.execute(
             "SELECT MAX(revoked_at) FROM interface_writer_leases "
             "WHERE session_id=? AND revoke_reason='service_restart'",
@@ -693,7 +796,8 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             "SELECT julianday(?) - julianday(?)", (now_iso, baseline)
         ).fetchone()[0] * 86400.0
         if quiet < quiet_s:
-            return gate_fail(f"quiet {quiet:.2f}s < {quiet_s}s")
+            return gate_fail(f"quiet {quiet:.2f}s < {quiet_s}s",
+                             retry_after=quiet_s - quiet)
 
         fence = istate[2] + 1
         interface_state.transition(
@@ -701,7 +805,7 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             extra_sets={"input_seq_fence": fence})
         con.execute(
             "UPDATE planner_wake_items SET state='submitting' "
-            "WHERE batch_id=? AND state='batched'",
+            "WHERE batch_id=? AND state IN ('batched','queued')",
             (batch_id,))
         con.commit()
         began = False
@@ -712,6 +816,17 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
 
     try:
         writer(len(WAKE_PROMPT) + 1)  # the fixed prompt + Enter, indivisible
+    except PreSendError:
+        # DEFINITE pre-send failure (the writer's preflight proved no byte
+        # moved): the batch returns to queued — a legal edge — and the
+        # coordinator's bounded retry schedule (1s/5s/30s) decides the next
+        # attempt. NEVER parked: nothing is ambiguous.
+        interface_state.transition(con, "wake_batch", batch_id, "queued")
+        con.execute(
+            "UPDATE planner_wake_items SET state='queued' "
+            "WHERE batch_id=? AND state='submitting'", (batch_id,))
+        con.commit()
+        raise
     except Exception:
         # The prompt may or may not have landed and no submit hook can be
         # trusted to disambiguate — park exactly like the restart path (never

@@ -63,6 +63,7 @@ import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
+import interface_wake  # noqa: E402  (transactional wake ingress + coordinator)
 sys.path.insert(0, str(ENGINE / "api"))
 try:
     import interface_routes  # noqa: E402  (Interface HTTP API, spec #20)
@@ -1812,9 +1813,18 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, {"message_id": r[0], "duplicate": True})
                 try:
                     cur = con.execute(
-                        "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind, dedupe_key) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (sid, int(to_sid), msg, kind, dk))
+                        "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind, sprint_doc_id, dedupe_key) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (sid, int(to_sid), msg, kind,
+                         body.get("sprint_doc_id"), dk))
+                    message_id = cur.lastrowid
+                    # Transactional wake ingress (spec #20 Event Ingress, seq
+                    # 8): the wake item rides the SAME transaction as the
+                    # message — unique (binding_id, message_id) dedupes; a
+                    # rollback drops both, so no accepted event is ever lost
+                    # or double-woken. Ineligible traffic (shell kind,
+                    # unscoped, no ACTIVE binding) creates nothing.
+                    interface_wake.maybe_create_wake_item(con, message_id)
                     con.commit()
                 except db_driver.IntegrityError:
                     r = con.execute(
@@ -1823,7 +1833,11 @@ class Handler(BaseHTTPRequestHandler):
                     if r is None:
                         raise
                     return self._send(200, {"message_id": r[0], "duplicate": True})
-                return self._send(201, {"message_id": cur.lastrowid})
+                # The event is durable — signal the wake coordinator (a no-op
+                # when the Interface stack or coordinator is down; the next
+                # startup pass drains durable queued work regardless).
+                interface_wake.notify_message(message_id)
+                return self._send(201, {"message_id": message_id})
 
             if path == "/_sc/mem/projects":
                 shortname = (body.get("shortname") or "").strip()
@@ -2593,7 +2607,8 @@ def dispatch_http(method: str, path: str, headers_raw: str,
     (status, [(header, value)], body bytes). Interface API paths go to the
     interface module; everything else runs through the shimmed Handler."""
     parsed = urlparse(path)
-    if parsed.path.startswith("/api/interface/"):
+    if parsed.path.startswith("/api/interface/") or \
+            parsed.path.startswith("/api/planner-action-receipts"):
         if interface_routes is None:
             return (503, [("Content-Type", "application/json")],
                     json.dumps({"error": {

@@ -399,6 +399,7 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
             for e in events:
                 if _emit_event(con, w, e, cur.get("sha") or ""):
                     summary["events"] += 1
+                    emitted.append((w["sprint_doc_id"], e, cur.get("sha") or ""))
             con.execute(
                 "UPDATE watched_prs SET last_seen=?" +
                 (", closed_at=datetime('now')" if terminal else "") +
