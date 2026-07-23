@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".super-coder" / "s
 import install  # noqa: E402
 
 MAP_DB = "/.sc-state/map.db"
+DB_BACKUPS = "/.sc-state/db_backups/"
 
 
 class EnsureGitignoreTest(unittest.TestCase):
@@ -36,6 +37,7 @@ class EnsureGitignoreTest(unittest.TestCase):
         self.assertIn(install._GITIGNORE_MARKER, text)
         for pat in install._required_ignores():
             self.assertIn(pat, text)
+        self.assertIn(DB_BACKUPS, text)
 
     def test_idempotent(self):
         install.ensure_gitignore(self.root)
@@ -53,6 +55,7 @@ class EnsureGitignoreTest(unittest.TestCase):
         self.assertTrue(changed)
         text = self.gi.read_text()
         self.assertIn(MAP_DB, text)
+        self.assertIn(DB_BACKUPS, text)
         # existing lines are not duplicated
         self.assertEqual(text.count("/.super-coder/"), 1)
         # and a second run is a no-op

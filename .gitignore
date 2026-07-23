@@ -50,10 +50,14 @@
 /.sc-state/map.db
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm
+/.sc-state/db_backups/
 
 # Python / tooling
 __pycache__/
 *.pyc
 .venv/
+# Source-repo shadow uses a symlink to the image's shared node toolchain; the
+# directory-only rule below does not match a symlink.
+/.super-coder/shadow/node_modules
 node_modules/
 .svelte-kit/
