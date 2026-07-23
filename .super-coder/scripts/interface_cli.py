@@ -37,8 +37,10 @@ from collections import deque
 import os
 import select
 import signal
+import shutil
 import sys
 import termios
+import textwrap
 import threading
 import time
 import tty
@@ -716,57 +718,148 @@ def cmd_recover(args) -> int:
 
 # ------------------------------------------------------------------ enter
 
-def _flavor_harness(shell: dict) -> str | None:
-    """The shell's flavor default harness, read from the engine DB exactly as
-    the boot path does (launch routing data — never interface state, which
-    comes from the API only). Best-effort: any failure degrades to the
-    instance default."""
-    try:
-        con = run_mod.db_driver.connect(str(run_mod.DB_PATH))
-        try:
-            row = con.execute("SELECT flavor FROM shells WHERE shell_id=?",
-                              (shell["shell_id"],)).fetchone()
-            fdef = run_mod.flavor_defaults(con).get(row["flavor"] if row
-                                                    else None)
-        finally:
-            con.close()
-    except Exception:
-        return None
-    return fdef["default_harness"] if fdef else None
-
-
 def _pick_harness(shell: dict, args) -> str | None:
     """The normal boot picker (run.py's own): an explicit --harness / HARNESS
     wins silently; else the harnesses on PATH, defaulting to this shell's
-    flavor default → instance.json → 'claude'. Model/effort resolve through
-    the reservation (prepare_launch's flavor_defaults), like the GUI's New
-    chat; explicit --model/--effort flags override."""
+    API-projected flavor default → instance.json → 'claude'. Model/effort
+    resolve through the reservation (prepare_launch's flavor_defaults), like
+    the GUI's New chat; explicit --model/--effort flags override."""
     if args.harness:
         return args.harness
     if os.environ.get("HARNESS"):
         return os.environ["HARNESS"]
-    default = (_flavor_harness(shell) or run_mod._configured_harness()
+    default = (shell.get("default_harness") or run_mod._configured_harness()
                or "claude")
     picked = run_mod.pick_harness(run_mod.detect_harnesses(), default,
                                   first=False)
     return picked or default
 
 
+def _fit(value, width: int) -> str:
+    """Fit one plain-text picker cell without letting long names break rows."""
+    text = str(value or "")
+    if len(text) <= width:
+        return text
+    return text[:max(0, width - 1)] + "…"
+
+
+def _picker_status(shell: dict) -> str:
+    availability = (shell.get("availability") or "unknown").replace("_", " ")
+    paint = {
+        "available": style.green,
+        "occupied": style.amber,
+        "starting": style.yellow,
+        "lost": style.red,
+        "error": style.red,
+        "unreconciled": style.red,
+        "unknown": style.dim,
+    }.get(availability, style.dim)
+    return paint(availability)
+
+
+def _picker_default(shell: dict) -> str:
+    harness = shell.get("default_harness")
+    if not harness:
+        return ""
+    model = shell.get("default_model")
+    return harness + (f" · {str(model).split('/')[-1]}" if model else "")
+
+
+def _grouped_shells(shells: list[dict]) -> list[dict]:
+    """Stable flavor groups without changing the API rail's canonical order."""
+    return sorted(
+        shells,
+        key=lambda shell: (
+            shell.get("flavor") is None,
+            (shell.get("flavor") or "").lower(),
+            shell.get("shell_id") or 0,
+        ),
+    )
+
+
+def _render_shell_picker(shells: list[dict]) -> list[dict]:
+    """Render the grouped launcher table, with a compact narrow-terminal form."""
+    ordered = _grouped_shells(shells)
+    columns = shutil.get_terminal_size((100, 24)).columns
+    full = columns >= 78
+    print(style.bold("\nShells"))
+    if full:
+        default_width = max(12, min(30, columns - 61))
+        print(style.dim(
+            f"{'#':>3}  {'Name':<18}{'Shortname':<13}{'State':<15}"
+            f"{'Default (harness · model)':<{default_width}}"
+        ))
+    current = object()
+    for number, shell in enumerate(ordered, 1):
+        flavor = shell.get("flavor")
+        if flavor != current:
+            current = flavor
+            print(f"\n{style.accent(flavor or '(bespoke)')}")
+        shortname = shell.get("shortname") or "?"
+        status = _picker_status(shell)
+        default = _picker_default(shell)
+        if full:
+            display = f"{_fit(shell.get('display_name'), 17):<18}"
+            state_width = len(str(shell.get("availability") or "unknown"))
+            print(
+                f"{style.dim(f'{number:>3}')}  "
+                f"{style.bold(display)}"
+                f"{_fit(shortname, 12):<13}"
+                f"{status}{' ' * max(1, 15 - state_width)}"
+                f"{style.dim(_fit(default, default_width))}"
+            )
+            continue
+        if columns >= 32:
+            short_width = min(14, max(6, columns - 22))
+            print(
+                f"{number:>3}  "
+                f"{_fit(shortname, short_width):<{short_width + 1}} "
+                f"{_picker_status(shell)}"
+            )
+        else:
+            print(f"{number:>3} {_fit(shortname, max(1, columns - 4))}")
+            print(f"     {_picker_status(shell)}")
+        detail = " · ".join(
+            str(part) for part in (shell.get("display_name"), default) if part
+        )
+        if detail:
+            for line in textwrap.wrap(
+                    detail, width=max(1, columns - 5),
+                    break_long_words=True, break_on_hyphens=False):
+                print(style.dim(f"     {line}"))
+    return ordered
+
+
 def _pick_shell(shells: list[dict], requested: str | None) -> dict:
     """The `sc enter` shell picker, API-backed: the rail's own data (the
     operator bearer is the auth — no username round-trip)."""
     if requested:
-        return _find_shell(requested)
+        chosen = next(
+            (shell for shell in shells
+             if (shell.get("shortname") or "").lower() == requested.lower()),
+            None,
+        )
+        if chosen is None:
+            avail = ", ".join(
+                shell.get("shortname") or "?" for shell in shells
+            ) or "none"
+            die(f"no shell '{requested}'. Available: {avail}", EXIT_USAGE)
+        return chosen
     if not shells:
         die("no shells")
     if not sys.stdin.isatty():
         return shells[0]
-    for n, s in enumerate(shells, 1):
-        print(f"{style.dim(f'{n:>3}')}  {_status_line(s)}")
+    ordered = _render_shell_picker(shells)
     while True:
-        choice = input("\nPick (#): ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(shells):
-            return shells[int(choice) - 1]
+        try:
+            choice = input("\nPick (#, q to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            die("selection cancelled")
+        if choice.lower() in ("q", "quit"):
+            die("selection cancelled")
+        if choice.isdigit() and 1 <= int(choice) <= len(ordered):
+            return ordered[int(choice) - 1]
         print("  invalid choice")
 
 

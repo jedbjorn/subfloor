@@ -1376,7 +1376,10 @@ super-coder — forkable shell substrate
   ./sc interface <verb>    Interface CLI parity (spec #20), API-backed (never direct DB/tmux):
                              status [shell] [--json] · start <shell> [--harness H] [--model M] [--effort E]
                              view <shell> (read-only) · attach <shell> (writer) · take-control <shell>
-                             stop <shell> [--force] · reconcile <shell> [--close] — mutations take --json
+                             stop <shell> [--force] · reconcile <shell> [--close]
+                             recover <shell> [--force] [--discard-worktree] [--yes] — mutations take --json
+  make dos-help            supported operator aliases for lifecycle, Interface, models,
+                             sprint/watch/job, maintenance, browser token, and generic ./sc forwarding
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
                              opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
                              default prompt · --harness <h> · -m <model> (else flavor_defaults);
