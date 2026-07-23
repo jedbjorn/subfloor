@@ -268,7 +268,7 @@ class InterfaceCliTest(unittest.TestCase):
 
     def test_attach_held_lease_refuses_without_takeover(self):
         self.http.add("POST", "/api/interface/writer-leases",
-                      http_error(409, "lease_refused", "session 7 writer "
+                      http_error(409, "writer_held", "session 7 writer "
                                  "held by web-1 — explicit takeover required"))
         rc, _, err = self.run_cli(["attach", "s2"])
         self.assertEqual(rc, 1)
@@ -388,7 +388,7 @@ class InterfaceCliTest(unittest.TestCase):
 
     def test_enter_occupied_lease_held_falls_back_readonly(self):
         self.http.add("POST", "/api/interface/writer-leases",
-                      http_error(409, "lease_refused", "writer held by web-1"))
+                      http_error(409, "writer_held", "writer held by web-1"))
         rc, _, err = self.run_cli(["enter", "s2"])
         self.assertEqual(rc, 0)
         self.assertIn("READ-ONLY", err)

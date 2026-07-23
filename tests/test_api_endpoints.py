@@ -245,6 +245,14 @@ class FlavorDefaultsTest(unittest.TestCase):
             "SELECT model, is_default FROM flavor_defaults "
             "WHERE flavor=? AND harness=?", (flavor, harness)).fetchone()
 
+    def _route(self, harness, selector, *, availability="available", stale=0):
+        self.con.execute(
+            "INSERT INTO model_routes "
+            "(harness, selector, source, availability, last_seen_at, stale) "
+            "VALUES (?, ?, 'test', ?, datetime('now'), ?)",
+            (harness, selector, availability, stale))
+        self.con.commit()
+
     def test_matrix_includes_template_flavors_and_harnesses(self) -> None:
         got = server.get_flavor_defaults(self.con)
         self.assertIn("planner", got["flavors"])
@@ -253,6 +261,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.assertIn(h, got["harnesses"])
 
     def test_set_model(self) -> None:
+        self._route("claude", "opus")
         ok, err = server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
         self.assertTrue(ok, err)
@@ -272,6 +281,7 @@ class FlavorDefaultsTest(unittest.TestCase):
     def test_upsert_missing_cell(self) -> None:
         # 'vibe' has no seeded row for planner — a write must create it
         self.assertIsNone(self._row("planner", "vibe"))
+        self._route("vibe", "devstral-latest")
         ok, err = server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "vibe",
                        "model": "devstral-latest", "is_default": True})
@@ -281,11 +291,45 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertEqual(row["is_default"], 1)
 
     def test_empty_model_clears_to_null(self) -> None:
+        self._route("claude", "opus")
         server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
         server.set_flavor_default(
-            self.con, {"flavor": "planner", "harness": "claude", "model": ""})
+            self.con, {"flavor": "planner", "harness": "claude", "model": None})
         self.assertIsNone(self._row("planner", "claude")["model"])
+
+    def test_empty_string_is_not_harness_default(self) -> None:
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude", "model": ""})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+
+    def test_invalid_model_does_not_create_missing_cell(self) -> None:
+        self.assertIsNone(self._row("planner", "vibe"))
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "vibe",
+                       "model": "not-local"})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertIsNone(self._row("planner", "vibe"))
+
+    def test_model_requires_exact_available_route_for_harness(self) -> None:
+        self._route("codex", "gpt-5.6-sol")
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude",
+                       "model": "gpt-5.6-sol"})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertNotEqual(self._row("planner", "claude")["model"],
+                            "gpt-5.6-sol")
+
+    def test_stale_route_is_not_settable(self) -> None:
+        self._route("claude", "opus-next", stale=1)
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude",
+                       "model": "opus-next"})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
 
     def test_unknown_names_and_empty_writes_are_loud(self) -> None:
         self.assertFalse(server.set_flavor_default(

@@ -19,13 +19,11 @@ Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
 dirty the tree and trip the publish guard) with a TTL; a failed refresh serves
 the stale cache and says so.
 
-Payload (v3) is family-first, matching the picker: per harness, `families`
-([{family, latest, release_date, n}], newest-first — "pick opus / sonnet /
-fable / deepseek and track its latest") plus the flat `models` list for
-sub-version search. For claude, a family with a CLI alias (opus / sonnet /
-haiku / fable) resolves `latest` to the alias — an alias floats to the newest
-model in its family, so the stored value never goes stale. Entries also carry
-their route source, local availability, CLI version, and effort support.
+Payload v3 exposes the flat `models` list consumed by the shared searchable
+picker. Legacy `families` metadata remains for API compatibility but is not a
+selection surface: the harness is the only picker prefilter, and family-null
+local routes are ordinary results. Entries carry their route source, local
+availability, CLI version, and effort support.
 """
 from __future__ import annotations
 
@@ -131,8 +129,9 @@ def _from_models_dev(fetch) -> dict[str, list[dict]]:
 
 
 def _families(harness: str, entries: list[dict]) -> list[dict]:
-    """Group a harness's models by models.dev family, newest family first.
-    A family chip means "track this line's latest": `latest` is the newest
+    """Retained v3 compatibility metadata, not a picker selection surface.
+
+    `latest` is the newest
     release in the family — except claude families with a CLI alias
     (opus/sonnet/haiku), where it is the alias itself, which self-tracks
     upstream so the stored value never goes stale. Entries from sources

@@ -67,6 +67,7 @@ main { padding: 1.2rem; }
    cards — past the max-width instead of truncating. Clamp the track to 0. */
 .view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
+#view-interface { max-width: calc(230px + 1rem + 1300px); }
 
 /* ── Tight card rhythm (Skills / Roadmap / Docs / Flags) ────────────────────
    Stacked card panels on these tabs sit a small 5px apart. Section headers
@@ -328,8 +329,7 @@ a { color: var(--accent); }
    Fork-global config: the shell-scoped subbar is inert here. One card per
    flavor (docs-style separation); one .dm-row per (flavor, harness): star
    radio (default harness) · harness label · current value · search bar.
-   Search results render INLINE as chips below the row — collapsed while the
-   search is empty; family chips first (pick = track that line's latest). */
+   The focus-opened exact-route list renders inline below the row. */
 .subbar-inert { opacity: .4; pointer-events: none; }
 .dm-card + .dm-card { margin-top: 5px; }
 .dm-meta { padding: .1rem .2rem .4rem; font-size: 11px; color: var(--dim); }
@@ -347,6 +347,7 @@ a { color: var(--accent); }
   white-space: nowrap;
 }
 .dm-current.dm-unset { color: var(--dim); font-style: italic; }
+.dm-current.dm-stale { color: var(--warn); }
 .dm-search {
   background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
   border-radius: var(--r); padding: .35rem .6rem; width: 100%;
@@ -361,19 +362,7 @@ a { color: var(--accent); }
   flex-basis: 100%; font-size: 10px; text-transform: uppercase;
   letter-spacing: .12em; color: var(--dim); padding-top: .25rem;
 }
-.dm-famrow { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: .35rem; }
-.dm-chip {
-  display: inline-flex; align-items: baseline; gap: .45rem; cursor: pointer;
-  background: var(--panel2); border: 1px solid var(--line-soft); color: inherit;
-  border-radius: 99px; padding: .22rem .7rem; max-width: 100%;
-  font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
-}
-.dm-chip:hover { border-color: var(--accent); }
-.dm-chip b { font-weight: 600; }
-.dm-chip-sub { font-size: 10px; color: var(--dim); }
-.dm-chip.dm-fam { border-color: rgba(255,255,255,.25); background: rgba(255,255,255,.05); }
-.dm-chip.dm-active { border-color: var(--accent); background: rgba(255,255,255,.10); color: #fff; }
-/* stacked model cards — one per row, scroll past ~12 */
+/* stacked model routes — one per row in the fixed scroll window */
 .dm-cardlist {
   flex-basis: 100%; display: flex; flex-direction: column; gap: 4px;
   max-height: 17rem; overflow-y: auto; padding-right: .2rem;
@@ -386,10 +375,9 @@ a { color: var(--accent); }
   font: 12px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
 }
 .dm-mcard:hover { border-color: var(--accent); }
+.dm-mcard.dm-highlight { border-color: var(--accent); background: rgba(255,255,255,.07); }
 .dm-mcard b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dm-mcard-sub { font-size: 10px; color: var(--dim); white-space: nowrap; }
-.dm-mcard.dm-alias { border-color: rgba(255,255,255,.30); background: rgba(255,255,255,.05); }
-.dm-mcard.dm-raw { border-style: dashed; }
 .dm-note { padding: .5rem .2rem; font-size: 11px; color: var(--dim); }
 .acc { border-top: 1px solid var(--line-soft); }
 .acc > summary {
@@ -709,7 +697,10 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-badge.warn { color: var(--warn); border-color: var(--warn); }
 .if-badge.accent { color: var(--accent); border-color: var(--accent); }
 .if-badge.bad { color: #d45a5a; border-color: #d45a5a; }
-.if-pane { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .5rem; }
+.if-pane {
+  flex: 1 1 auto; min-width: 0; width: 100%; max-width: 1300px;
+  display: flex; flex-direction: column; gap: .5rem;
+}
 .if-head {
   display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
@@ -721,7 +712,9 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-note { color: var(--warn); font-size: .8rem; flex-basis: 100%; }
 .if-term {
   background: #000; border: 1px solid var(--line); border-radius: var(--r);
-  padding: 6px; height: 60vh; min-height: 260px; overflow: hidden;
+  padding: 6px; width: 100%; max-width: 1300px;
+  height: clamp(260px, calc(100dvh - 140px), 850px);
+  max-height: 850px; min-height: 260px; overflow: hidden;
 }
 .if-term .xterm { height: 100%; }
 .if-newchat .act { margin-top: .8rem; }
@@ -731,6 +724,19 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-newchat select { background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--r); color: var(--ink); font: inherit; padding: .3rem .5rem; }
 .if-diag { display: flex; flex-wrap: wrap; gap: .4rem 1.2rem; margin: .5rem 0; }
+.if-alert, .if-capability {
+  flex-basis: 100%; border-left: 2px solid var(--warn); padding: .35rem .65rem;
+  color: var(--ink); font-size: .8rem;
+}
+.if-alert.critical { border-left-color: #d45a5a; }
+.if-alert.critical > b { color: #d45a5a; }
+.if-alert.warning > b { color: var(--warn); }
+.if-capability { border-left-color: var(--accent); }
+.if-capability > b { color: var(--accent); }
+.if-history {
+  width: 100%; max-height: 12rem; overflow-y: auto; margin-top: .5rem;
+  color: var(--dim); font: 11px/1.55 ui-monospace, monospace;
+}
 /* Mobile: the rail collapses into a shell picker above the terminal; the
    terminal keeps a stable minimum height and the header stays above it. */
 .if-picker { display: none; }
@@ -741,5 +747,5 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
     border: 1px solid var(--line); border-radius: var(--r); color: var(--ink);
     font: inherit; padding: .45rem .6rem; }
   .if-pane { width: 100%; }
-  .if-term { height: 55vh; min-height: 240px; }
+  .if-term { height: clamp(240px, 55dvh, 850px); min-height: 240px; }
 }

@@ -397,6 +397,8 @@ class InterfaceApiTest(unittest.TestCase):
         the Interface must resolve it there and provision nothing."""
         con = sqlite3.connect(self.db_path)
         con.execute("UPDATE shells SET flavor='admin' WHERE shell_id=1")
+        con.execute("UPDATE flavor_defaults SET model=NULL "
+                    "WHERE flavor='admin' AND harness='claude'")
         con.commit()
         con.close()
         root = Path(self.tmp.name)
@@ -646,10 +648,19 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(lifecycle(), "idle")
         con = sqlite3.connect(self.db_path)
         alert = con.execute(
-            "SELECT 1 FROM planner_alerts WHERE session_id=? AND "
+            "SELECT resolved_at FROM planner_alerts WHERE session_id=? AND "
             "reason='turn_failure'", (sid,)).fetchone()
         con.close()
         self.assertIsNotNone(alert)
+        self.assertIsNone(alert[0])
+        hook(7, "prompt_submit")
+        hook(8, "turn_stop")
+        con = sqlite3.connect(self.db_path)
+        resolved = con.execute(
+            "SELECT resolved_at FROM planner_alerts WHERE session_id=? AND "
+            "reason='turn_failure'", (sid,)).fetchone()[0]
+        con.close()
+        self.assertIsNotNone(resolved)
 
     def test_hook_capability_alerts_at_readiness(self):
         # claude (no approval-result/user-input events) → degraded info
@@ -677,6 +688,11 @@ class InterfaceApiTest(unittest.TestCase):
         con.close()
         self.assertIsNotNone(alert)
         self.assertEqual(alert[0], "info")
+        status, _, detail = self.call(
+            "GET", f"/api/interface/sessions/{sid}", (OP,))
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["alerts"], 0,
+                         "capability information is outside warning counts")
 
     def test_hook_mandatory_gap_alerts_not_armable(self):
         # An unknown harness (no adapter) can chat, but provider readiness
@@ -754,8 +770,10 @@ class InterfaceApiTest(unittest.TestCase):
         token = body["lease_token"]
         # Held lease refuses a second writer; takeover succeeds and reseeds
         # from the SESSION's forwarded sequence (still 1 here).
-        status, _, _ = self.acquire_lease(sid, client_id="web-2", key="k-l2")
+        status, _, held = self.acquire_lease(
+            sid, client_id="web-2", key="k-l2")
         self.assertEqual(status, 409)
+        self.assertEqual(held["error"]["code"], "writer_held")
         status, _, body = self.acquire_lease(sid, client_id="web-2",
                                              takeover=True)
         self.assertEqual(status, 201)
@@ -781,6 +799,64 @@ class InterfaceApiTest(unittest.TestCase):
             (OP, "Idempotency-Key: t3"),
             {"session_id": sid, "role": "viewer", "client_id": "web-3"})
         self.assertEqual(status, 201)
+
+    def test_missing_identity_never_attaches_cached_terminal(self):
+        sid = self.occupy()
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "UPDATE interface_sessions SET tmux_pane_id=NULL, pane_pid=NULL, "
+            "pane_start_ticks=NULL WHERE session_id=?", (sid,))
+        con.commit()
+        con.close()
+        status, _, body = self.call(
+            "GET", "/api/interface/shells", (OP,))
+        shell = next(s for s in body["shells"] if s["shell_id"] == 1)
+        self.assertEqual(shell["availability"], "unreconciled")
+        self.assertFalse(shell["attachable"])
+        self.assertFalse(shell["identity_verified"])
+        status, _, body = self.acquire_lease(sid)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "identity_unverified")
+        status, _, body = self.call(
+            "POST", "/api/interface/stream-tickets",
+            (OP, "Idempotency-Key: no-cache-view"),
+            {"session_id": sid, "role": "viewer", "client_id": "web-view"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "identity_unverified")
+
+    def test_incompatible_lifecycle_refuses_writer_and_viewer(self):
+        sid = self.occupy()
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE interface_sessions SET lifecycle='lost' "
+                    "WHERE session_id=?", (sid,))
+        con.commit()
+        con.close()
+        status, _, lease = self.acquire_lease(sid)
+        self.assertEqual(status, 409)
+        self.assertEqual(lease["error"]["code"], "not_attachable")
+        status, _, ticket = self.call(
+            "POST", "/api/interface/stream-tickets",
+            (OP, "Idempotency-Key: lost-view"),
+            {"session_id": sid, "role": "viewer", "client_id": "web-view"})
+        self.assertEqual(status, 409)
+        self.assertEqual(ticket["error"]["code"], "not_attachable")
+
+    def test_stale_stored_default_blocks_before_reservation(self):
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE shells SET flavor='admin' WHERE shell_id=1")
+        con.execute(
+            "UPDATE flavor_defaults SET model='missing-route' "
+            "WHERE flavor='admin' AND harness='claude'")
+        con.commit()
+        con.close()
+        status, _, body = self.create_session(harness="claude")
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "invalid_model_route")
+        self.assertIn("Harness default", body["error"]["details"]["action"])
+        con = sqlite3.connect(self.db_path)
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM interface_sessions").fetchone()[0], 0)
+        con.close()
 
     def test_certify_clean(self):
         sid = self.occupy()
