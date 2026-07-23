@@ -24,14 +24,16 @@ supervised-runtime remediation; it never falls back).
                                                    reattach an occupied one
 
 The attach client speaks sc-term.v1 (api/interface_ws.py) — the same session
-stream and writer lease as the browser, ported from the proven spike
-(spikes/interface-stream/cli_client.py). A refresh/reconnect reattaches the
-same generation; it never provider-resumes.
+stream and writer lease as the browser, with the full client-side protocol
+semantics (ack-gated input, read-only flip on lease loss, quiet control
+frames). A refresh/reconnect reattaches the same generation; it never
+provider-resumes.
 """
 from __future__ import annotations
 
 import argparse
 import json
+from collections import deque
 import os
 import select
 import signal
@@ -343,22 +345,83 @@ def cmd_take_control(args) -> int:
     return _attach_writer(shell, _session_of(shell), takeover=True)
 
 
+def _stdin_ready(timeout: float) -> bool:
+    """One stdin poll — the sender's input seam (tests patch this)."""
+    r, _, _ = select.select([sys.stdin.buffer], [], [], timeout)
+    return bool(r)
+
+
+def _read_stdin() -> bytes:
+    """One stdin read — ≤64 KiB, so it always fits MAX_INPUT_PAYLOAD."""
+    return os.read(0, 65536)
+
+
 def run_stream(ws_url: str, role: str, start_seq: int,
                lease: dict | None = None) -> int:
-    """The sc-term.v1 terminal loop (spike port): stdin raw, stdin bytes →
-    0x01|seq:u64be|payload as writer, 0x03 resize on start + SIGWINCH,
-    0x00/0x04 payloads → stdout, JSON control frames dimmed to stderr, 20s
-    writer heartbeat, clean exit on close/terminated. The writer lease is
-    released on the way out (a closing client releases only ITS lease —
-    tmux and the harness continue)."""
+    """The sc-term.v1 terminal loop, production client semantics (spec #20
+    Input Broker): stdin raw; keystrokes are sent ACK-GATED — at most one
+    unacknowledged input frame in flight, later keystrokes buffered locally
+    and drained one frame per input_ack (the same one-unacked rule as the
+    browser, which also bounds what a stalled broker can queue server-side).
+    A writer_revoked/stale_generation reject or a non-active writer control
+    flips the client READ-ONLY with a loud notice — input stops, output
+    continues (the browser's flip for a lost lease). Routine control frames
+    (input_ack, heartbeat acks, unchanged state) are never echoed: raw-mode
+    stderr carries errors and state transitions only, so the attached TUI
+    isn't garbled. 0x00/0x04 payloads → stdout, 0x03 resize on start +
+    SIGWINCH, 20s writer heartbeat (halted on read-only), clean exit on
+    close/terminated. The writer lease is released on the way out (a
+    closing client releases only ITS lease — tmux and the harness
+    continue)."""
     from websockets.sync.client import connect
 
     ws = connect(ws_url, subprotocols=[SUBPROTOCOL])
     old_attrs = termios.tcgetattr(0) if os.isatty(0) else None
     if old_attrs:
         tty.setraw(0)
-    state = {"seq": start_seq, "winch": True, "dead": False}
+    lock = threading.Lock()
+    state: dict = {"seq": start_seq, "winch": True, "dead": False,
+                   "readonly": role != "writer", "inflight": None,
+                   "outbuf": deque(), "writer_state": None, "lifecycle": None}
     signal.signal(signal.SIGWINCH, lambda *_: state.__setitem__("winch", True))
+
+    def notice(text: str) -> None:
+        # Raw-mode-safe: \r\n keeps the line from staircasing the TUI.
+        print(f"\r\n\x1b[1m[sc interface] {text}\x1b[0m\r\n",
+              file=sys.stderr, flush=True)
+
+    def pump() -> None:
+        """Send the next buffered input frame iff nothing is unacknowledged
+        (the one-unacked-frame rule, client side)."""
+        with lock:
+            if (state["dead"] or state["readonly"]
+                    or state["inflight"] is not None or not state["outbuf"]):
+                return
+            data = state["outbuf"].popleft()
+            seq = state["seq"]
+            state["seq"] += 1
+            state["inflight"] = seq
+        ws.send(b"\x01" + seq.to_bytes(8, "big") + data)
+
+    def acked(seq) -> None:
+        """An ack or a non-terminal reject: the inflight frame is settled —
+        release it and drain the local buffer."""
+        with lock:
+            if state["inflight"] == seq:
+                state["inflight"] = None
+        pump()
+
+    def go_readonly(text: str) -> None:
+        """Terminal input loss: flip read-only exactly once (loud), drop
+        pending input, keep streaming output like the browser."""
+        with lock:
+            if state["readonly"]:
+                return
+            state["readonly"] = True
+            state["outbuf"].clear()
+            state["inflight"] = None
+        notice(f"{text} — READ-ONLY from here; `sc interface take-control` "
+               "regains the writer role")
 
     def sender() -> None:
         try:
@@ -368,22 +431,25 @@ def run_stream(ws_url: str, role: str, start_seq: int,
                     rows, cols = _winsize()
                     ws.send(b"\x03" + rows.to_bytes(2, "big")
                             + cols.to_bytes(2, "big"))
-                r, _, _ = select.select([sys.stdin.buffer], [], [], 0.2)
-                if not r:
+                if not _stdin_ready(0.2):
                     continue
-                data = os.read(0, 65536)
+                data = _read_stdin()
                 if not data:
                     state["dead"] = True
                     return
-                if role == "writer":
-                    ws.send(b"\x01" + state["seq"].to_bytes(8, "big") + data)
-                    state["seq"] += 1
+                with lock:
+                    if not state["readonly"]:
+                        state["outbuf"].append(data)
+                pump()
         except Exception:
             state["dead"] = True
 
     def heartbeater() -> None:
         while not state["dead"]:
             time.sleep(HEARTBEAT_S)
+            with lock:
+                if state["readonly"] or state["dead"]:
+                    return  # no lease left to keep alive
             try:
                 ws.send(json.dumps({"type": "heartbeat"}))
             except Exception:
@@ -402,11 +468,42 @@ def run_stream(ws_url: str, role: str, start_seq: int,
                 if message[:1] in (b"\x00", b"\x04"):
                     out.write(message[1:])
                     out.flush()
-            else:
-                msg = json.loads(message)
-                if msg.get("type") == "error" and msg.get("code") == "terminated":
+                continue
+            msg = json.loads(message)
+            mtype = msg.get("type")
+            if mtype == "input_ack":
+                acked(msg.get("seq"))              # routine: silent
+            elif mtype == "input_reject":
+                reason = msg.get("reason", "?")
+                if reason in ("writer_revoked", "stale_generation"):
+                    go_readonly(f"writer lease lost ({reason})")
+                else:
+                    notice(f"input seq {msg.get('seq')} rejected: {reason}")
+                    acked(msg.get("seq"))
+            elif mtype == "writer":
+                new = msg.get("state")
+                with lock:
+                    prev = state["writer_state"]
+                    state["writer_state"] = new
+                if role == "writer" and new != "active":
+                    go_readonly(f"writer lease lost (state: {new})")
+                elif new != prev:
+                    notice(f"writer {new}")
+            elif mtype == "lifecycle":
+                cur = (msg.get("lifecycle"), msg.get("composer"))
+                with lock:
+                    changed = cur != state["lifecycle"]
+                    state["lifecycle"] = cur
+                if changed:
+                    notice(f"lifecycle {cur[0]}"
+                           + (f" · composer {cur[1]}" if cur[1] else ""))
+            elif mtype == "resync":
+                notice(f"resync ({msg.get('reason', '?')})")
+            elif mtype == "error":
+                if msg.get("code") == "terminated":
                     break
-                print(f"\x1b[2m[{message}]\x1b[0m", file=sys.stderr)
+                notice(f"error: {msg.get('code', '?')}")
+            # heartbeat acks: routine, silent
     except Exception as exc:
         print(f"connection closed: {exc!r}", file=sys.stderr)
     finally:

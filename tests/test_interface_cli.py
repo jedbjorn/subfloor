@@ -8,6 +8,10 @@ operator bearer, method, path, and body are all asserted on the REAL api()
 wrapper), and the WS loop (`run_stream`) is a mock — the verbs are tested
 up to the point a socket would open.
 
+The real `run_stream` is covered separately (RunStreamTest) against a
+scripted FakeWS peer + a scripted stdin: ack-gating (one unacknowledged
+input frame), the read-only flip on lease loss, and quiet control frames.
+
 Also covers the run.py raw-launch refusal (spec #20 Tmux Runtime): the
 public interactive entry refuses before an archive exists; the escape
 hatch, headless (`sc run`), and RENDER_ONLY paths pass the gate.
@@ -21,8 +25,11 @@ import contextlib
 import email.message
 import io
 import json
+import queue
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -397,6 +404,191 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertIn("reconcile", err)
         self.assertEqual(self.http.find("POST", "/api/interface/sessions"), [])
         self.stream.assert_not_called()
+
+
+class FakeWS:
+    """A scripted sc-term.v1 peer for the REAL run_stream: outbound frames
+    are recorded in `sent`; inbound frames are fed by the test through a
+    queue so the receive loop blocks exactly like a socket would."""
+
+    _END = object()
+
+    def __init__(self):
+        self.sent = []
+        self._q = queue.Queue()
+
+    def send(self, data):
+        self.sent.append(data)
+
+    def feed(self, frame):
+        self._q.put(frame)
+
+    def end(self):
+        self._q.put(self._END)
+
+    def __iter__(self):
+        while True:
+            item = self._q.get()
+            if item is self._END:
+                return
+            yield item
+
+    def input_frames(self):
+        return [f for f in self.sent if f[:1] == b"\x01"]
+
+
+class StdinScript:
+    """A scripted stdin for run_stream's input seams: the test feeds reads;
+    `ready` blocks (like select) until one is pending."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._reads = []
+
+    def feed(self, data: bytes):
+        with self._cv:
+            self._reads.append(data)
+            self._cv.notify_all()
+
+    def ready(self, timeout: float) -> bool:
+        with self._cv:
+            if not self._reads:
+                self._cv.wait(timeout)
+            return bool(self._reads)
+
+    def read(self) -> bytes:
+        with self._cv:
+            return self._reads.pop(0)
+
+
+def wait_for(cond, timeout=5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+class RunStreamTest(unittest.TestCase):
+    """The real run_stream against FakeWS + StdinScript: client-side broker
+    protocol semantics (spec #20 Input Broker — review r1 M1)."""
+
+    def run_stream(self, ws, stdin, role="writer", start_seq=5):
+        """Drives run_stream on a thread; returns (thread, stderr StringIO).
+        The caller feeds frames/keystrokes, then `ws.end()` and joins."""
+        err = io.StringIO()
+        patches = [
+            mock.patch.object(ic, "_stdin_ready", stdin.ready),
+            mock.patch.object(ic, "_read_stdin", stdin.read),
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            # run_stream installs its SIGWINCH handler unconditionally; off
+            # the main thread that raises — the handler is untestable noise.
+            mock.patch.object(ic.signal, "signal"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        redir = contextlib.redirect_stderr(err)
+        redir.__enter__()
+        self.addCleanup(redir.__exit__, None, None, None)
+        t = threading.Thread(target=ic.run_stream,
+                             args=("ws://x", role, start_seq), daemon=True)
+        t.start()
+        self.addCleanup(t.join, 10)
+        return t, err
+
+    @staticmethod
+    def _seq(frame):
+        return int.from_bytes(frame[1:9], "big")
+
+    def test_input_is_ack_gated_one_unacked_frame(self):
+        ws, stdin = FakeWS(), StdinScript()
+        t, _ = self.run_stream(ws, stdin)
+        # Resize goes out immediately (0x03); keystrokes wait on the gate.
+        self.assertTrue(wait_for(lambda: any(f[:1] == b"\x03"
+                                             for f in ws.sent)))
+        stdin.feed(b"a")
+        self.assertTrue(wait_for(lambda: len(ws.input_frames()) == 1))
+        self.assertEqual(self._seq(ws.input_frames()[0]), 5)
+        # A second keystroke with no ack must NOT hit the wire.
+        stdin.feed(b"b")
+        time.sleep(0.3)
+        self.assertEqual(len(ws.input_frames()), 1,
+                         "one unacknowledged frame — b must buffer locally")
+        # The ack releases exactly the next buffered frame.
+        ws.feed(json.dumps({"type": "input_ack", "seq": 5}))
+        self.assertTrue(wait_for(lambda: len(ws.input_frames()) == 2))
+        self.assertEqual(self._seq(ws.input_frames()[1]), 6)
+        self.assertEqual(ws.input_frames()[1][9:], b"b")
+        # A non-terminal reject also settles the inflight frame (loudly) —
+        # the buffer keeps draining without an ack.
+        ws.feed(json.dumps({"type": "input_reject", "seq": 6,
+                            "reason": "delivery_unknown"}))
+        stdin.feed(b"c")
+        self.assertTrue(wait_for(lambda: len(ws.input_frames()) == 3))
+        self.assertEqual(ws.input_frames()[2][9:], b"c")
+        ws.end()
+        t.join(10)
+        self.assertFalse(t.is_alive())
+
+    def test_writer_revoked_reject_flips_readonly(self):
+        ws, stdin = FakeWS(), StdinScript()
+        t, err = self.run_stream(ws, stdin)
+        stdin.feed(b"a")
+        self.assertTrue(wait_for(lambda: len(ws.input_frames()) == 1))
+        ws.feed(json.dumps({"type": "input_reject", "seq": 5,
+                            "reason": "writer_revoked"}))
+        self.assertTrue(wait_for(lambda: "READ-ONLY" in err.getvalue()))
+        self.assertIn("take-control", err.getvalue())
+        # The displaced writer types into the void no longer: input stops.
+        stdin.feed(b"b")
+        time.sleep(0.3)
+        self.assertEqual(len(ws.input_frames()), 1,
+                         "a revoked writer must stop sending input")
+        ws.end()
+        t.join(10)
+        self.assertFalse(t.is_alive())
+
+    def test_writer_control_non_active_flips_readonly(self):
+        ws, stdin = FakeWS(), StdinScript()
+        t, err = self.run_stream(ws, stdin)
+        ws.feed(json.dumps({"type": "writer", "state": "active"}))
+        self.assertTrue(wait_for(lambda: "writer active" in err.getvalue()))
+        # A takeover broadcast ("held" while we believe we're writer) is the
+        # same signal as a revoke: read-only flip, input halted.
+        ws.feed(json.dumps({"type": "writer", "state": "held"}))
+        self.assertTrue(wait_for(lambda: "READ-ONLY" in err.getvalue()))
+        stdin.feed(b"x")
+        time.sleep(0.3)
+        self.assertEqual(ws.input_frames(), [])
+        ws.end()
+        t.join(10)
+        self.assertFalse(t.is_alive())
+
+    def test_routine_control_frames_are_silent(self):
+        ws, stdin = FakeWS(), StdinScript()
+        t, err = self.run_stream(ws, stdin, role="viewer")
+        ws.feed(json.dumps({"type": "writer", "state": "held"}))
+        ws.feed(json.dumps({"type": "writer", "state": "held"}))   # unchanged
+        ws.feed(json.dumps({"type": "lifecycle", "lifecycle": "running",
+                            "composer": "idle"}))
+        ws.feed(json.dumps({"type": "lifecycle", "lifecycle": "running",
+                            "composer": "idle"}))                    # unchanged
+        ws.feed(json.dumps({"type": "heartbeat"}))                   # hb ack
+        ws.feed(json.dumps({"type": "input_ack", "seq": 1}))
+        ws.feed(json.dumps({"type": "error", "code": "boom"}))
+        ws.feed(json.dumps({"type": "error", "code": "terminated"}))
+        t.join(10)
+        self.assertFalse(t.is_alive(), "terminated ends the stream")
+        text = err.getvalue()
+        self.assertEqual(text.count("writer held"), 1)
+        self.assertEqual(text.count("lifecycle running"), 1)
+        self.assertEqual(text.count("error: boom"), 1)
+        self.assertNotIn("heartbeat", text)
+        self.assertNotIn("input_ack", text)
+        self.assertNotIn("\x1b[2m", text, "no dimmed per-frame echo in raw "
+                                          "mode — transitions/errors only")
 
 
 class RawLaunchRefusalTest(unittest.TestCase):
