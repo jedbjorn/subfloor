@@ -25,7 +25,7 @@
 #   make dos-help                list + describe the commands
 #
 #   LONG-ONLY: dos-build dos-logs dos-serve dos-health dos-ports dos-verify dos-map
-#              dos-render dos-snapshot dos-deps dos-install dos-rollback
+#              dos-render dos-snapshot dos-deps dos-install dos-rollback dos-token
 #              dos-update-harnesses dos-feat/dos-feature dos-eject
 #              passthrough: make dos ARGS=health
 #
@@ -33,7 +33,7 @@ SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
-        dos-update-harnesses dos-feat dos-feature dos-eject dos
+        dos-update-harnesses dos-feat dos-feature dos-eject dos-token dos
 
 # Hot commands — long form, with a one-letter alias delegating to it.
 dos-enter:            ; $(SC) $(if $(s),enter-$(s),enter)
@@ -62,6 +62,9 @@ dos-snapshot:         ; $(SC) snapshot
 dos-deps:             ; $(SC) deps
 dos-install:          ; $(SC) install
 dos-rollback:         ; $(SC) rollback
+# Browser sign-in operator token — prints ONLY the owner-only runtime
+# credential to stdout (never rotates, never logs); exact alias of ./sc token.
+dos-token:            ; $(SC) token
 dos-update-harnesses: ; $(SC) update-harnesses
 # Opt-in features: make dos-feat (list) · make dos-feat ARGS="enable pg"
 dos-feature:          ; $(SC) feature $(ARGS)
@@ -115,6 +118,7 @@ dos-help:
 	@echo "  │ dos-deps             │ install python (.venv) + node deps into the bind-mount   │"
 	@echo "  │ dos-install          │ first-launch bootstrap for a fork                        │"
 	@echo "  │ dos-rollback         │ undo a bad update — restore DB + engine together         │"
+	@echo "  │ dos-token            │ print the browser sign-in operator token (stdout only)     │"
 	@echo "  │ dos-update-harnesses │ update claude + opencode + codex + vibe to latest        │"
 	@echo "  │ dos-feat ARGS=<x>    │ opt-in features — list / enable pg·windows·tailnet       │"
 	@echo "  │ dos-eject            │ ONE-WAY: own the engine — stop tracking upstream         │"

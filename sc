@@ -998,6 +998,7 @@ case "$cmd" in
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
+  token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
   # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
   # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
@@ -1318,6 +1319,11 @@ super-coder — forkable shell substrate
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
+  ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
+                             credential from the owner-only artifact .super-coder/run/mem/<shortname>.json, mode 0600)
+                             — stdout carries ONLY the token, for paste into the browser sign-in prompt. Never
+                             rotates; a missing/unreadable/insecure artifact refuses on stderr with the service
+                             action (`./sc restart` / `make dos-r`). Alias: make dos-token
   ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
                              intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
   ./sc sprint status       wake status per binding: armed/released, sprint ACTIVE/frozen, batch state,

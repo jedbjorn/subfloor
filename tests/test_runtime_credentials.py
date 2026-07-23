@@ -27,6 +27,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -45,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mem  # noqa: E402
 import mem_credentials  # noqa: E402
 import server  # noqa: E402
+import operator_token as sc_token  # noqa: E402
 from test_mem import TOKEN, PEER_TOKEN, build_engine_db  # noqa: E402
 
 
@@ -251,6 +253,124 @@ class DiscoveryTest(unittest.TestCase):
             self.run_which()
         self.assertIn("isn't API-wired", str(cm.exception))
         self.assertIn("runtime", str(cm.exception))  # …and names the new path
+
+
+class TokenCommandTest(unittest.TestCase):
+    """`./sc token` (spec doc #30 req 23) — artifact-only read of the Admin
+    runtime credential: stdout carries ONLY the token; missing/unreadable/
+    insecure artifacts refuse on stderr with the service action; help labels
+    the value without printing it. No API needed — the artifact is the
+    contract, so these tests run without a server."""
+
+    def setUp(self):
+        self.cred_dir = Path(tempfile.mkdtemp())
+        self._saved = (mem.SC_API_TOKEN, mem.SC_API_BASE,
+                       mem._CRED_DIR, mem._DISCOVERED_FROM, mem._PROG)
+        mem.SC_API_TOKEN = ""
+        mem.SC_API_BASE = ""
+        mem._CRED_DIR = self.cred_dir
+        mem._DISCOVERED_FROM = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (mem.SC_API_TOKEN, mem.SC_API_BASE,
+         mem._CRED_DIR, mem._DISCOVERED_FROM, mem._PROG) = self._saved
+
+    def write_artifact(self, shortname, token, mode=0o600):
+        p = self.cred_dir / f"{shortname}.json"
+        p.write_text(json.dumps({
+            "shell_id": 1, "shortname": shortname,
+            "api_base": "http://127.0.0.1:8800",
+            "token": token,
+        }))
+        p.chmod(mode)
+        return p
+
+    def run_token(self, argv=()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = sc_token.main(list(argv))
+        return rc, out.getvalue()
+
+    def test_prints_exactly_the_token(self):
+        self.write_artifact("TC", TOKEN)
+        rc, out = self.run_token()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, TOKEN + "\n")   # stdout purity — nothing else
+
+    def test_sc_mem_as_selects_among_admins(self):
+        self.write_artifact("TC", TOKEN)
+        self.write_artifact("PEER", PEER_TOKEN)
+        with mock.patch.dict(os.environ, {"SC_MEM_AS": "peer"}):
+            rc, out = self.run_token()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, PEER_TOKEN + "\n")
+
+    def test_ambiguity_refuses_without_printing(self):
+        self.write_artifact("TC", TOKEN)
+        self.write_artifact("PEER", PEER_TOKEN)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_token()
+        self.assertIn("ambiguous", str(cm.exception))
+        self.assertIn("SC_MEM_AS", str(cm.exception))
+        self.assertNotIn(TOKEN, str(cm.exception))
+        self.assertNotIn(PEER_TOKEN, str(cm.exception))
+
+    def test_missing_artifact_names_the_service_action(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_token()
+        msg = str(cm.exception)
+        self.assertIn("sc token:", msg)            # refusal names this command
+        self.assertIn("./sc restart", msg)
+        self.assertIn("make dos-r", msg)
+
+    def test_insecure_artifact_is_refused(self):
+        self.write_artifact("TC", TOKEN, mode=0o644)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_token()
+        self.assertIn("owner-only", str(cm.exception))
+        self.assertNotIn(TOKEN, str(cm.exception))  # refusal never leaks the value
+
+    def test_malformed_artifact_is_refused(self):
+        p = self.cred_dir / "TC.json"
+        p.write_text("not json")
+        p.chmod(0o600)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_token()
+        self.assertIn("malformed", str(cm.exception))
+
+    def test_env_wiring_never_substitutes_for_the_artifact(self):
+        # An injected SC_API_TOKEN must not bypass the artifact contract:
+        # insecure artifact still refuses even when env is fully wired.
+        self.write_artifact("TC", TOKEN, mode=0o644)
+        mem.SC_API_TOKEN = "env-token"
+        mem.SC_API_BASE = "http://127.0.0.1:8800"
+        with self.assertRaises(SystemExit) as cm:
+            self.run_token()
+        self.assertIn("owner-only", str(cm.exception))
+
+    def test_help_labels_without_printing(self):
+        self.write_artifact("TC", TOKEN)
+        rc, out = self.run_token(["--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("operator capability", out)
+        self.assertIn("./sc token", out)
+        self.assertNotIn(TOKEN, out)
+
+    def test_script_end_to_end(self):
+        """Real interpreter, real artifact: stdout is the token and only the
+        token. (The `token)` line in ./sc is the same one-line exec pattern as
+        every other verb; a bash-dispatcher subprocess test would resolve the
+        engine at the MAIN worktree root and break in linked dev worktrees.)"""
+        self.write_artifact("TC", TOKEN)
+        env = dict(os.environ, SC_MEM_CRED_DIR=str(self.cred_dir))
+        env.pop("SC_MEM_AS", None)
+        proc = subprocess.run(
+            [sys.executable,
+             str(ENGINE / "scripts" / "operator_token.py")],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, TOKEN + "\n")
 
 
 if __name__ == "__main__":

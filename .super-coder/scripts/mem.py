@@ -97,8 +97,13 @@ _CRED_DIR = Path(os.environ.get("SC_MEM_CRED_DIR") or
 _DISCOVERED_FROM: "Path | None" = None  # artifact the token came from, if any
 
 
+# Refusal prefix — `sc token` overrides this so its refusals name the right
+# command (scripts/token.py reuses the discovery below).
+_PROG = "mem"
+
+
 def die(msg: str) -> "NoReturn":  # noqa: F821
-    sys.exit(f"mem: {msg}")
+    sys.exit(f"{_PROG}: {msg}")
 
 
 def _load_runtime_credential(path: Path) -> None:
