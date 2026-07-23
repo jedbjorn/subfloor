@@ -5,6 +5,11 @@ edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Interface chats and interactive planner wake
 roadmap_status: in_progress
 frozen: false
+---
+
+#20 spec seq 2 · feature 14 — Interface-backed planner wake
+
+---
 title: Interface-backed planner wake
 tags: [sprints, interface, tmux, polling, claude, codex, kimi]
 date: 2026-07-22
@@ -103,6 +108,9 @@ resume, second harness, or headless planner is created.
 15. Interface reads and mutations have explicit operator authority. Browser
     mutation requires same-origin session plus anti-forgery proof; CLI uses the
     instance operator capability; hooks use only generation-scoped capability.
+    The trust boundary is web-origin / network / credential-exposure, not other local
+    processes; loopback same-origin is trusted (see Security And Privacy trust
+    boundary, decision #30, supersedes #26).
 
 ## Product Boundary
 
@@ -218,9 +226,17 @@ errors use `{ "error": { "code", "message", "details" } }`. Unknown payload
 fields are rejected. Timestamps are ISO-8601 UTC and resource IDs are opaque.
 
 `./sc launch` provisions a mode-0600 instance operator capability for the
-server and CLI. A same-origin UI bootstrap exchanges it for an HttpOnly,
-SameSite=Strict browser session and a rotating anti-forgery token; hostile sites
-cannot read that token. Every Interface mutation requires both browser session
+server and CLI. **Target bootstrap (decision #30):** a same-origin UI bootstrap on
+the loopback interface mints an HttpOnly, SameSite=Strict browser session and a
+rotating anti-forgery token automatically behind Host/Origin/SameSite/CSRF/CSP
+controls — the browser never presents or holds the operator capability, which stays a
+CLI/server credential and is never pasted into JavaScript; sites from other origins
+cannot read that token. **Sprint-25 interim:** the shipped seq-5 impl instead exchanges the
+mode-0600 operator capability at bootstrap (decision #26); that impl STANDS for this
+sprint and is not to be ripped out — PLN2 authors the post-sprint follow-up that
+relaxes bootstrap to the automatic same-origin target. Remaining-sprint reviewers must
+NOT flag the absence of automatic bootstrap as a defect, nor require the operator-cap
+exchange to be removed. Every Interface mutation requires both browser session
 and token, or the CLI operator bearer. Stream setup also validates the exact
 Origin and consumes a single-use ticket bound to session, generation, client,
 role, and expiry. Hook tokens can call only the callback route for their one
@@ -593,6 +609,19 @@ watch intervals are the only steady timer and never invoke a model directly.
 
 ## Security And Privacy
 
+**Trust boundary (authoritative — FnB clarification, decision #30, supersedes #26).**
+Subfloor is a single-machine personal tool. Expected deployment is one user, occasionally
+two or three trusted family members, all sharing a machine they trust. Other local
+processes and same-user shells are treated as trusted, not as untrusted parties. The
+boundary the design guards is **untrusted web origins, accidental network exposure, and
+accidental credential exposure** — not other local software or separate untrusting user
+accounts on the same host. Same-origin traffic on the loopback interface is trusted once
+Host/Origin/SameSite/CSRF/CSP checks pass; the design does not try to prevent a same-user
+process from acting as the operator. The operator capability may back CLI and server
+control, but is never pasted into or held by browser JavaScript — a JS-reachable operator
+token is itself the kind of credential exposure this boundary guards against. **Reviewers
+judge every remaining sprint unit against this boundary.**
+
 - The service remains localhost-only under the existing host/container network
   boundary. Remote access uses the owner's established secure transport.
 - Session streams and writer leases use random generation-scoped tokens. Token
@@ -648,7 +677,7 @@ watch intervals are the only steady timer and never invoke a model directly.
    action-receipt begin/complete/unknown/reconcile, sprint-close integration,
    structured messaging/watch registration, and provider-neutral skill guidance
    only after executable support is green.
-9. **Conformance and real sprints.** Run adversarial input/session/provider
+9. **Conformance and real sprints.** Run stress and edge-case input/session/provider
    matrices, then one real task/CI/review/merge sprint on each supported harness
    before freezing.
 
@@ -756,3 +785,4 @@ or terminal-input replays, scheduled model polls, provider resumes, second
 planner processes, public webhook dependencies, or event bodies injected into
 the terminal. A broker-crash window for unacknowledged human input is surfaced
 as `delivery_unknown`, never falsely reported as delivered or safe to retry.
+
