@@ -2117,17 +2117,38 @@ function ifError(r, data) {
   err.body = data;
   return err;
 }
-// Bootstrap the operator browser session: sets the HttpOnly SameSite=Strict
-// cookie and returns the CSRF token we then send as X-CSRF on every call.
+// Bootstrap the operator browser session: EXCHANGES the operator capability
+// (the mode-0600 token at .super-coder/run/interface/operator.token) for the
+// HttpOnly SameSite=Strict cookie + the CSRF token we then send as X-CSRF on
+// every call. The operator pastes the capability once per tab; it lives in
+// sessionStorage only (survives refresh, dies with the tab).
+let ifOpToken = null;
+try { ifOpToken = sessionStorage.getItem("sc-if-op") || null; } catch { /* storage blocked */ }
 async function ifBootstrap() {
-  const r = await fetch("/api/interface/browser-sessions", {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
-    body: "{}",
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw ifError(r, data);
-  ifCsrf = data.csrf;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const headers = { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() };
+    if (ifOpToken) headers["Authorization"] = "Bearer " + ifOpToken;
+    const r = await fetch("/api/interface/browser-sessions", {
+      method: "POST", credentials: "same-origin", headers, body: "{}",
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) { ifCsrf = data.csrf; return; }
+    if (r.status === 401 && attempt === 0) {
+      const t = prompt(
+        "Interface operator capability required — paste the contents of\n" +
+        ".super-coder/run/interface/operator.token (mode 0600, operator-only):",
+        ifOpToken || "");
+      if (!t) throw ifError(r, data);
+      ifOpToken = t.trim();
+      try { sessionStorage.setItem("sc-if-op", ifOpToken); } catch { /* storage blocked */ }
+      continue;
+    }
+    if (r.status === 401) {   // the stored/pasted capability was rejected
+      ifOpToken = null;
+      try { sessionStorage.removeItem("sc-if-op"); } catch { /* storage blocked */ }
+    }
+    throw ifError(r, data);
+  }
 }
 // api() twin for /api/interface/* — same-origin credentials + X-CSRF, fresh
 // Idempotency-Key per ATTEMPT on POST/DELETE (an intentional retry reuses the
@@ -2207,11 +2228,46 @@ async function renderInterface(root) {
   if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
   if (sel.availability === "lost" || sel.availability === "error" || sel.availability === "unreconciled") {
     ifDetach();
-    pane.append(el("div", { className: "card" },
+    const card = el("div", { className: "card" },
       el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
-        el("span", { className: "pill if-badge bad" }, sel.availability), "."),
-      el("div", { className: "muted" },
-        "New chat is blocked — this shell runs a legacy or unmanaged harness.")));
+        el("span", { className: "pill if-badge bad" }, sel.availability), "."));
+    if (!sel.session_id) {
+      card.append(el("div", { className: "muted" },
+        "New chat is blocked — this shell runs a legacy or unmanaged harness."));
+    } else {
+      // Spec Interface Layout: a lost/error pane offers reconcile (verify the
+      // process still lives) and close (after absence is proved); a closed
+      // session frees the shell for a fresh generation.
+      const msg = el("div", { className: "muted" },
+        "New chat is blocked until this generation is reconciled or closed.");
+      const recon = el("button", { className: "act", type: "button", textContent: "Reconcile" });
+      const close = el("button", { className: "act", type: "button", textContent: "Close session" });
+      const note = el("div", { className: "if-note" });
+      recon.onclick = async () => {
+        recon.disabled = true; note.textContent = "";
+        try {
+          const r = await apiIf("/interface/reconciliations", "POST",
+            { session_id: sel.session_id, action: "verify" });
+          if (r.verified) return renderInterface(root);
+          note.textContent = "identity could not be verified — close it if the process is gone.";
+        } catch (e) { note.textContent = (e.code ? e.code + ": " : "") + e.message; }
+        recon.disabled = false;
+      };
+      close.onclick = async () => {
+        if (!confirm(`Close session #${sel.session_id}? Allowed only after the process is proved absent. This frees ${sel.display_name || sel.shortname} for a new chat.`)) return;
+        close.disabled = true; note.textContent = "";
+        try {
+          await apiIf("/interface/reconciliations", "POST",
+            { session_id: sel.session_id, action: "close" });
+          return renderInterface(root);
+        } catch (e) {
+          note.textContent = (e.code ? e.code + ": " : "") + e.message;
+          close.disabled = false;
+        }
+      };
+      card.append(msg, el("div", {}, recon, " ", close), note);
+    }
+    pane.append(card);
     return;
   }
   return ifSessionPane(pane, sel);   // occupied | starting

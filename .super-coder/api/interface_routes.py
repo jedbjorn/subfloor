@@ -12,9 +12,11 @@ Authority (spec #20 API Resources / Security):
   operator.token`, mode 0600, provisioned at server boot) or a browser
   session cookie; mutations additionally need the session's anti-forgery
   token (X-CSRF).
-- browser bootstrap (POST /browser-sessions) requires same-origin fetch
-  proof (Origin == Host, or Sec-Fetch-Site: same-origin) — a hostile site
-  cannot mint a session, and the cookie is HttpOnly + SameSite=Strict.
+- browser bootstrap (POST /browser-sessions) EXCHANGES the operator
+  capability (bearer) for the cookie, and additionally requires same-origin
+  fetch proof (Origin == Host, or Sec-Fetch-Site: same-origin) — a hostile
+  site cannot mint a session, and a local process without the mode-0600
+  token cannot either. The cookie is HttpOnly + SameSite=Strict.
 - hook callbacks authenticate with the generation-scoped hook token only;
   it can call NOTHING else.
 - every Interface route rejects a Host outside 127.0.0.1/localhost (DNS
@@ -629,8 +631,8 @@ def _terminate(actor, headers, body):
     con = _db()
     try:
         sess = con.execute(
-            "SELECT shell_id, generation, occupancy, lifecycle "
-            "FROM interface_sessions WHERE session_id=?",
+            "SELECT shell_id, generation, occupancy, lifecycle, "
+            "graceful_timed_out_at FROM interface_sessions WHERE session_id=?",
             (session_id,)).fetchone()
         if sess is None:
             return _err(404, "no_such_session",
@@ -638,6 +640,13 @@ def _terminate(actor, headers, body):
         if sess[2] != "occupied":
             return _err(409, "not_occupied",
                         f"session {session_id} is {sess[2]}, not occupied")
+        if force and sess[4] is None:
+            # Spec Workflow 9: force only AFTER graceful termination fails
+            # and shows the PID/generation it will end. The UI sequences it;
+            # the API (authority surface for the seq-6 CLI) enforces it.
+            return _err(409, "force_requires_graceful_timeout",
+                        "force is available only after a graceful "
+                        "termination timed out for this session")
 
         def produce():
             interface_state.transition(con, "lifecycle", session_id, "stopping")
@@ -654,9 +663,11 @@ def _terminate(actor, headers, body):
                     con.commit()
                     return 409, {"terminated": False,
                                  "reason": "identity_mismatch"}
-                # graceful timeout: stays stopping; force becomes available.
-                interface_state.transition(con, "lifecycle", session_id,
-                                           "stopping")
+                # graceful timeout: stays stopping, and the timeout is
+                # recorded durably — it is what unlocks the force follow-up.
+                interface_state.transition(
+                    con, "lifecycle", session_id, "stopping",
+                    extra_sets={"graceful_timed_out_at": _now(con)})
                 con.commit()
                 return 200, {"terminated": False,
                              "reason": result.get("reason", "graceful_timeout"),
@@ -694,8 +705,10 @@ def _end_session(con, session_id: int, end_reason: str) -> None:
 
 def _reconcile(actor, headers, body):
     session_id = body.get("session_id")
-    if not isinstance(session_id, int):
-        return _err(422, "validation", "session_id (int) required")
+    action = body.get("action", "verify")
+    if not isinstance(session_id, int) or action not in ("verify", "close"):
+        return _err(422, "validation",
+                    "session_id (int) required; action is verify|close")
     if _runtime is None or not _runtime.available:
         return _err(503, "interface_unavailable", "Interface runtime unavailable")
     con = _db()
@@ -710,6 +723,37 @@ def _reconcile(actor, headers, body):
         if sess[2] == "ended":
             return _err(409, "session_ended",
                         f"session {session_id} has ended")
+
+        if action == "close":
+            # The road OUT of unreconciled (spec Occupancy Model: "the
+            # operator closes or replaces it"; Interface Layout: lost/error
+            # panes offer close/fresh-generation). Close is allowed only
+            # after absence is PROVED — anything uncertain refuses.
+            if sess[2] != "unreconciled":
+                return _err(409, "not_unreconciled",
+                            f"session {session_id} is {sess[2]} — close "
+                            "applies to unreconciled sessions only "
+                            "(occupied sessions end via termination)")
+
+            def produce_close():
+                absent = _runtime.call(_runtime.prove_absence(session_id))
+                if not absent:
+                    con.commit()
+                    return 409, {"error": {
+                        "code": "absence_not_proved",
+                        "message": "the pane or its exact-identity process "
+                                   "is still present — close refused, "
+                                   "reconcile or investigate first",
+                        "details": {}}}
+                _runtime.call(_runtime.abandon(session_id))
+                _end_session(con, session_id, "operator_close")
+                con.commit()
+                return 200, {"session_id": session_id, "closed": True,
+                             "occupancy": "ended",
+                             "actions": ["absence proved — session closed; "
+                                         "the shell offers New chat again"]}
+            return _idempotent(con, actor, "close_session", headers, body,
+                               produce_close)
 
         def produce():
             verified = _runtime.call(_runtime.verify_identity(session_id))
@@ -831,9 +875,20 @@ def _on_unexpected_exit(session_id: int) -> None:
 # ------------------------------------------------------------------ bootstrap
 
 def _browser_session(headers, body):
+    """Bootstrap = an EXCHANGE (spec #20 API Resources, decision on flag
+    #43): the caller presents the mode-0600 operator capability and gets an
+    HttpOnly SameSite=Strict browser session back. Same-origin proof alone
+    mints NOTHING — without the capability any local process could
+    self-mint operator-equivalent authority."""
     if not _same_origin_proof(headers):
         return _err(403, "not_same_origin",
                     "browser sessions mint only from the same-origin UI")
+    authz = headers.get("Authorization") or ""
+    token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
+    if not token or token != _operator_token():
+        return _err(401, "operator_capability_required",
+                    "browser bootstrap exchanges the operator capability "
+                    "(Authorization: Bearer <operator token>)")
     if not (headers.get("Idempotency-Key") or ""):
         return _err(422, "idempotency_key_required",
                     "Idempotency-Key header is required for Interface mutations")

@@ -69,6 +69,8 @@ class FakeRuntime:
         self.on_unexpected_exit = None
         self.spawned = []
         self.terminated = []
+        self.abandoned = []
+        self.absence_proved = True
         self.terminate_result = {"terminated": True}
 
     def call(self, coro):
@@ -88,6 +90,12 @@ class FakeRuntime:
 
     async def verify_identity(self, session_id):
         return True
+
+    async def prove_absence(self, session_id):
+        return self.absence_proved
+
+    async def abandon(self, session_id):
+        self.abandoned.append(session_id)
 
     def mint_ticket(self, **kw):
         return {"ticket": f"tk-{kw['role']}-{kw['session_id']}",
@@ -197,7 +205,8 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(body["shells"][0]["availability"], "available")
 
     def test_browser_bootstrap_same_origin_fence(self):
-        # Cross-site Origin cannot mint a session.
+        # Cross-site Origin cannot mint a session (rejected before the
+        # capability is even consulted).
         status, _, _ = self.call(
             "POST", "/api/interface/browser-sessions",
             ("Origin: http://evil.example.com", "Idempotency-Key: b1"), {})
@@ -205,22 +214,38 @@ class InterfaceApiTest(unittest.TestCase):
         # Missing idempotency key → 422.
         status, _, _ = self.call(
             "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800",), {})
+            ("Origin: http://127.0.0.1:8800", OP), {})
         self.assertEqual(status, 422)
-        # Same-origin proof mints cookie + anti-forgery token.
+        # Same-origin proof + the operator capability mints cookie +
+        # anti-forgery token.
         status, headers, body = self.call(
             "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", "Idempotency-Key: b2"), {})
+            ("Origin: http://127.0.0.1:8800", OP, "Idempotency-Key: b2"), {})
         self.assertEqual(status, 201)
         self.assertIn("csrf", body)
         cookie = headers["Set-Cookie"]
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
 
+    def test_browser_bootstrap_requires_operator_capability(self):
+        # Same-origin alone mints NOTHING (flag #43): a local process without
+        # the mode-0600 operator token cannot self-mint browser authority.
+        status, _, body = self.call(
+            "POST", "/api/interface/browser-sessions",
+            ("Origin: http://127.0.0.1:8800", "Idempotency-Key: b5"), {})
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "operator_capability_required")
+        # A wrong token is refused the same way.
+        status, _, _ = self.call(
+            "POST", "/api/interface/browser-sessions",
+            ("Origin: http://127.0.0.1:8800", "Authorization: Bearer wrong",
+             "Idempotency-Key: b6"), {})
+        self.assertEqual(status, 401)
+
     def _browser(self):
         status, headers, body = self.call(
             "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", "Idempotency-Key: b3"), {})
+            ("Origin: http://127.0.0.1:8800", OP, "Idempotency-Key: b3"), {})
         assert status == 201
         cookie = headers["Set-Cookie"].split(";")[0]
         return cookie, body["csrf"]
@@ -507,6 +532,13 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertFalse(body["terminated"])
         self.assertEqual(body["reason"], "graceful_timeout")
         self.assertEqual(body["pid"], 4321)
+        # The timeout is recorded durably — it is what unlocks force.
+        con = sqlite3.connect(self.db_path)
+        stamped = con.execute(
+            "SELECT graceful_timed_out_at FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()[0]
+        con.close()
+        self.assertIsNotNone(stamped)
         # Force is the separate, explicit follow-up.
         self.runtime.terminate_result = {"terminated": True}
         status, _, body = self.call(
@@ -521,8 +553,31 @@ class InterfaceApiTest(unittest.TestCase):
         con.close()
         self.assertEqual(reason, "operator_force")
 
+    def test_force_requires_prior_graceful_timeout(self):
+        # Spec Workflow 9 (flag #42): force first-touch is refused — the API,
+        # not just the UI, gates force on a prior graceful timeout.
+        sid = self.occupy()
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x5"),
+            {"session_id": sid, "force": True})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"],
+                         "force_requires_graceful_timeout")
+        self.assertEqual(self.runtime.terminated, [],
+                         "no signal may be sent on a refused force")
+
     def test_terminate_identity_mismatch_fails_closed(self):
         sid = self.occupy()
+        # Earn the force gate first: graceful attempt times out.
+        self.runtime.terminate_result = {"terminated": False,
+                                         "reason": "graceful_timeout"}
+        status, _, _ = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: x6"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 200)
+        # Now the force follow-up hits an identity mismatch → fail closed.
         self.runtime.terminate_result = {"terminated": False,
                                          "reason": "identity_mismatch"}
         status, _, body = self.call(
@@ -536,7 +591,10 @@ class InterfaceApiTest(unittest.TestCase):
         con.close()
         self.assertEqual(occ, "unreconciled")
 
-    def test_unexpected_exit_marks_lost(self):
+    def test_unexpected_exit_transition_marks_lost(self):
+        # The DB transition itself (unit). The LIVE trigger — real pane death
+        # → pump EOF → this callback — is proven end-to-end in
+        # tests/test_interface_runtime.py::test_pane_death_drives_real_lost_transition.
         sid = self.occupy()
         routes._on_unexpected_exit(sid)
         con = sqlite3.connect(self.db_path)
@@ -547,6 +605,72 @@ class InterfaceApiTest(unittest.TestCase):
         con.close()
         status, _, body = self.call("GET", "/api/interface/shells", (OP,))
         self.assertEqual(body["shells"][0]["availability"], "lost")
+
+    # -- close: the road out of unreconciled (flag #41) -------------------------------
+
+    def _unreconciled(self, shell_id=1):
+        sid = self.occupy(shell_id)
+        routes._on_unexpected_exit(sid)   # occupied → unreconciled/lost
+        return sid
+
+    def test_close_unreconciled_after_proved_absence(self):
+        sid = self._unreconciled()
+        status, _, body = self.call(
+            "POST", "/api/interface/reconciliations",
+            (OP, "Idempotency-Key: cl1"),
+            {"session_id": sid, "action": "close"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["closed"])
+        self.assertEqual(self.runtime.abandoned, [sid])
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, end_reason FROM interface_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended", "operator_close"))
+        gen = con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0]
+        self.assertIsNotNone(gen)
+        con.close()
+        # The road THROUGH: the shell offers New chat again (fresh generation).
+        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
+        self.assertEqual(body["shells"][0]["availability"], "available")
+        status, _, body = self.create_session(key="k-after-close")
+        self.assertEqual(status, 201, body)
+
+    def test_close_refused_without_proved_absence(self):
+        sid = self._unreconciled()
+        self.runtime.absence_proved = False
+        status, _, body = self.call(
+            "POST", "/api/interface/reconciliations",
+            (OP, "Idempotency-Key: cl2"),
+            {"session_id": sid, "action": "close"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "absence_not_proved")
+        con = sqlite3.connect(self.db_path)
+        occ = con.execute("SELECT occupancy FROM interface_sessions "
+                          "WHERE session_id=?", (sid,)).fetchone()[0]
+        con.close()
+        self.assertEqual(occ, "unreconciled", "a refused close changes nothing")
+
+    def test_close_refused_on_occupied(self):
+        sid = self.occupy()
+        status, _, body = self.call(
+            "POST", "/api/interface/reconciliations",
+            (OP, "Idempotency-Key: cl3"),
+            {"session_id": sid, "action": "close"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "not_unreconciled")
+
+    def test_reconcile_verify_still_default(self):
+        sid = self._unreconciled()
+        status, _, body = self.call(
+            "POST", "/api/interface/reconciliations",
+            (OP, "Idempotency-Key: cl4"),
+            {"session_id": sid})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["verified"])
+        self.assertEqual(body["occupancy"], "occupied")
 
 
 if __name__ == "__main__":

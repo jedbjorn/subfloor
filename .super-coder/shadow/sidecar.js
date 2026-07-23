@@ -35,6 +35,9 @@ rl.on('line', (line) => {
   try { msg = JSON.parse(line); } catch { return; }
   const { id, op, gen } = msg;
   switch (op) {
+    case 'ping':   // liveness probe — answered before any gen state is touched
+      if (id) reply({ id, ok: true });
+      break;
     case 'create':
       run(gen, async () => {
         const old = gens.get(gen);

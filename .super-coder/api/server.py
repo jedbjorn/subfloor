@@ -2610,10 +2610,12 @@ def main(argv):
         runtime = None
         if interface_ws is not None:
             runtime = interface_ws.build_runtime(db_path=str(DB_PATH))
-            await runtime.start()
-            ws_handler = runtime.handle_ws
+            # Bind BEFORE start(): start() reattaches survivors and walks lost
+            # sessions through the routes callback, so it must be set first.
             interface_routes.bind_runtime(runtime)
             interface_routes.ensure_operator_capability()
+            await runtime.start()
+            ws_handler = runtime.handle_ws
         else:
             print(f"server: Interface unavailable ({_INTERFACE_IMPORT_ERROR}) "
                   "— review UI only", file=sys.stderr)

@@ -2,12 +2,15 @@
 """Interface runtime tests (spec #20, sprint 25 seq 5 vertical slice).
 
 Unit tests run hermetic WITHOUT tmux/node: availability gating, ticket
-mint/consume discipline, reject-reason mapping. Integration tests are gated
-on tmux being installed (they also need node + @xterm/headless for the
-shadow sidecar, provided by the image); they drive a real private tmux
-server against a stub command and prove the durable input path end to end:
-ordered human input → byte-exact echo, duplicate replay, seq-gap rejection,
-reconnect redraw, reattach-after-restart, graceful terminate.
+mint/consume discipline, reject-reason mapping, PID-reuse identity, the
+reattach-lost callback wiring. The sidecar tests need node only (a dead or
+silent sidecar must fail fast, never hang — sprint 25 flag #45).
+Integration tests are gated on tmux + node + the @xterm/headless module
+(tmux+node alone is NOT sufficient — the sidecar dies on require without
+it); they drive a real private tmux server against a stub command and prove
+the durable input path end to end: ordered human input → byte-exact echo,
+duplicate replay, seq-gap rejection, reconnect redraw, reattach-after-
+restart, graceful terminate, and real pane death → lost/unreconciled.
 
 Run:
     python3 tests/test_interface_runtime.py
@@ -15,7 +18,9 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -35,6 +40,21 @@ import interface_runtime  # noqa: E402
 from test_interface_crash_window import build_engine_db  # noqa: E402
 
 HAS_TMUX = shutil.which("tmux") is not None
+HAS_NODE = shutil.which("node") is not None
+
+
+def _shadow_module_present() -> bool:
+    """@xterm/headless must resolve for the sidecar — tmux+node alone is NOT
+    enough (CI runners carry both but not the module, and a sidecar that
+    dies on require used to hang the whole suite: sprint 25 flag #45)."""
+    for base in (interface_runtime.SHADOW_NODE_PATH,
+                 str(interface_runtime.SHADOW_DIR / "node_modules")):
+        if (Path(base) / "@xterm" / "headless").is_dir():
+            return True
+    return False
+
+
+HAS_SHADOW_STACK = HAS_TMUX and HAS_NODE and _shadow_module_present()
 
 
 class FakeClient:
@@ -141,6 +161,110 @@ class AvailabilityTest(unittest.TestCase):
         with mock.patch("builtins.open", mock.mock_open(read_data=stat_text)):
             self.assertEqual(interface_runtime._read_start_ticks(123), 999888)
 
+    def test_pid_alive_requires_exact_ticks(self):
+        # PID reuse: a live pid with DIFFERENT start ticks is not our process.
+        stat_text = ("123 (x) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 "
+                     "999888 20\n")
+        with mock.patch("builtins.open", mock.mock_open(read_data=stat_text)):
+            self.assertTrue(interface_runtime._pid_alive(123, 999888))
+            self.assertFalse(interface_runtime._pid_alive(123, 111))
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertFalse(interface_runtime._pid_alive(123, 999888))
+
+    def test_start_walks_lost_reattach_through_callback(self):
+        # An occupied session whose pane identity cannot verify is lost on
+        # reattach; start() must hand it to the on_unexpected_exit callback
+        # (the routes layer's occupied → lost/unreconciled transition), not
+        # just log it (sprint 25 flag #40).
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (1,1)")
+        sid = con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle, tmux_pane_id, pane_pid, pane_start_ticks) VALUES "
+            "(1,1,'occupied','idle','%999',424242,1)").lastrowid
+        con.commit()
+        con.close()
+        rt = self._runtime()
+        called = []
+        rt.on_unexpected_exit = called.append
+        with mock.patch.object(rt, "_check_available", return_value=None), \
+                mock.patch.object(rt.shadow, "start", new=mock.AsyncMock()):
+            async def flow():
+                await rt.start()
+                self.assertTrue(rt.available)
+                self.assertEqual(called, [sid],
+                                 "a lost reattach must fire the callback")
+                await rt.stop()
+            asyncio.run(flow())
+
+
+# ------------------------------------------------------------------ shadow sidecar
+
+@unittest.skipUnless(HAS_NODE, "node not installed")
+class ShadowSidecarTest(unittest.TestCase):
+    """Sidecar liveness (sprint 25 flag #45): a sidecar that dies on require
+    or wedges mid-session must fail requests fast — never hang a caller on a
+    future nothing resolves."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _script(self, text: str) -> str:
+        p = self.tmp / "stub.js"
+        p.write_text(text)
+        return str(p)
+
+    def test_silent_sidecar_times_out(self):
+        # Answers nothing — requests must raise after the timeout, not hang.
+        script = self._script(
+            "require('readline').createInterface"
+            "({input: process.stdin}).on('line', () => {});\n")
+
+        async def flow():
+            sidecar = interface_runtime.ShadowSidecar(script)
+            with mock.patch.object(interface_runtime,
+                                   "SHADOW_REQUEST_TIMEOUT_S", 0.5):
+                t0 = time.monotonic()
+                with self.assertRaises(RuntimeError):
+                    await sidecar.start()   # the boot probe times out
+                self.assertLess(time.monotonic() - t0, 5)
+            await sidecar.stop()
+        asyncio.run(flow())
+
+    def test_dead_sidecar_fails_probe_fast(self):
+        # Dies instantly (what a missing @xterm/headless require does).
+        script = self._script("process.exit(1)\n")
+
+        async def flow():
+            sidecar = interface_runtime.ShadowSidecar(script)
+            with mock.patch.object(interface_runtime,
+                                   "SHADOW_REQUEST_TIMEOUT_S", 5):
+                t0 = time.monotonic()
+                with self.assertRaises(RuntimeError):
+                    await sidecar.start()
+                self.assertLess(time.monotonic() - t0, 5)
+            await sidecar.stop()
+        asyncio.run(flow())
+
+    def test_dead_sidecar_marks_runtime_unavailable(self):
+        tmp_db = self.tmp / "shell_db.db"
+        build_engine_db(tmp_db)
+        script = self._script("process.exit(1)\n")
+        rt = interface_runtime.InterfaceRuntime(
+            str(tmp_db), run_dir=str(self.tmp / "run"), shadow_script=script)
+
+        async def flow():
+            with mock.patch.object(rt, "_check_available", return_value=None):
+                await rt.start()
+            self.assertFalse(rt.available)
+            self.assertIn("sidecar", rt.unavailable_reason)
+        asyncio.run(flow())
+
 
 class TicketTest(unittest.TestCase):
     def setUp(self):
@@ -220,7 +344,8 @@ class RejectReasonTest(unittest.TestCase):
 
 # ------------------------------------------------------------- integration (tmux)
 
-@unittest.skipUnless(HAS_TMUX, "tmux not installed")
+@unittest.skipUnless(HAS_SHADOW_STACK,
+                     "needs tmux + node + @xterm/headless (shadow sidecar)")
 class TmuxIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -406,6 +531,38 @@ class TmuxIntegrationTest(unittest.TestCase):
         self.assertEqual(result["reason"], "identity_mismatch")
         gen = self.rt.get_generation(self.sid)
         self.assertIsNotNone(gen, "generation must survive a refused kill")
+        await self.rt.stop()
+
+    def test_pane_death_drives_real_lost_transition(self):
+        asyncio.run(self._flow_pane_death())
+
+    async def _flow_pane_death(self):
+        """The REAL trigger (sprint 25 flag #40): kill the pane's process and
+        watch the whole chain fire — tmux's pipe writer exits → pump FIFO EOF
+        → _on_pump_exit → the routes callback → DB occupied →
+        lost/unreconciled. No callback invoked directly."""
+        info = await self._spawn_stub()
+        sys.path.insert(0, str(ENGINE / "api"))
+        import interface_routes as routes
+        with mock.patch.object(routes, "DB_PATH", self.db):
+            routes.bind_runtime(self.rt)   # as the server does, pre-start
+            os.kill(info["pane_pid"], signal.SIGKILL)
+
+            def lost():
+                con = sqlite3.connect(self.db)
+                row = con.execute(
+                    "SELECT occupancy, lifecycle FROM interface_sessions "
+                    "WHERE session_id=?", (self.sid,)).fetchone()
+                con.close()
+                return row == ("unreconciled", "lost")
+            await wait_for(lost, what="pane death → lost/unreconciled")
+            con = sqlite3.connect(self.db)
+            alert = con.execute(
+                "SELECT reason FROM planner_alerts WHERE session_id=?",
+                (self.sid,)).fetchone()
+            con.close()
+            self.assertIsNotNone(alert)
+            self.assertEqual(alert[0], "session_lost")
         await self.rt.stop()
 
 

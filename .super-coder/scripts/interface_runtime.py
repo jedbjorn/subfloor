@@ -53,6 +53,7 @@ TMUX_MIN_VERSION = (3, 4)
 LEASE_HEARTBEAT_TIMEOUT = 60.0        # 3 missed 20s heartbeats
 TICKET_TTL_S = 60
 GRACEFUL_TERMINATE_S = 10.0
+SHADOW_REQUEST_TIMEOUT_S = 10.0   # a sidecar that can't answer is dead
 
 TMUX_SESSION = "sc-interface"
 
@@ -99,6 +100,15 @@ def _read_start_ticks(pid: int) -> int:
         text = fh.read()
     rest = text[text.rindex(")") + 2:]
     return int(rest.split()[19])  # field 22 (starttime), zero-based 19 after comm
+
+
+def _pid_alive(pid: int, start_ticks: int) -> bool:
+    """True only if /proc/<pid> exists AND its start ticks match — a recycled
+    PID occupied by a different process is NOT our process."""
+    try:
+        return _read_start_ticks(pid) == start_ticks
+    except Exception:
+        return False
 
 
 def _tmux_version() -> tuple[int, int] | None:
@@ -153,6 +163,11 @@ class ShadowSidecar:
             env=env,
         )
         asyncio.create_task(self._reader())
+        # Liveness proof before the runtime declares itself available: a
+        # sidecar that dies on require (e.g. @xterm/headless missing) never
+        # answers, and every later request would wedge on a future nothing
+        # resolves. Fail fast here instead.
+        await self._request({"op": "ping"})
 
     async def _reader(self) -> None:
         assert self._proc and self._proc.stdout
@@ -181,7 +196,14 @@ class ShadowSidecar:
         fut = asyncio.get_running_loop().create_future()
         self._pending[op["id"]] = fut
         self._write(op)
-        return await fut
+        try:
+            return await asyncio.wait_for(fut, SHADOW_REQUEST_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            self._pending.pop(op["id"], None)
+            raise RuntimeError(
+                f"shadow sidecar request {op['op']!r} timed out after "
+                f"{SHADOW_REQUEST_TIMEOUT_S}s — sidecar dead or wedged"
+            ) from None
 
     def create(self, gen: str, rows: int, cols: int) -> None:
         self._write({"op": "create", "gen": gen, "rows": rows, "cols": cols})
@@ -239,7 +261,6 @@ class Generation:
         self.pane_start_ticks = 0
         self.dbg_pump_bytes = 0
         self.dbg_fanout_bytes = 0
-        self._fifo_keep_fd = -1
         self._pump_fd = -1
         self._pump_thread: threading.Thread | None = None
         self._tasks: list[asyncio.Task] = []
@@ -375,13 +396,12 @@ class Generation:
             except Exception:
                 pass
         self.runtime.shadow.dispose(self.sid)
-        for fd in (self._fifo_keep_fd, self._pump_fd):
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            self._fifo_keep_fd = self._pump_fd = -1
+        if self._pump_fd >= 0:
+            try:
+                os.close(self._pump_fd)
+            except OSError:
+                pass
+            self._pump_fd = -1
 
 
 # ---------------------------------------------------------------- runtime
@@ -449,17 +469,38 @@ class InterfaceRuntime:
             self.unavailable_reason = reason
             _log("boot", f"UNAVAILABLE: {reason} — review UI only")
             return
+        try:
+            await self.shadow.start()
+        except Exception as exc:  # noqa: BLE001 — any boot failure = unavailable
+            self.available = False
+            self.unavailable_reason = f"shadow sidecar did not answer: {exc}"
+            _log("boot", f"UNAVAILABLE: {self.unavailable_reason} — "
+                         "review UI only")
+            return
         self.available = True
         self.unavailable_reason = ""
-        await self.shadow.start()
         self._reaper = asyncio.create_task(self._heartbeat_reaper())
         # Reattach generations that survived a service restart (the tmux
-        # server and FIFOs are ours, stable under run_dir).
+        # server and FIFOs are ours, stable under run_dir). Lost sessions get
+        # the SAME DB transition as a live-detected pane death (occupied →
+        # lost/unreconciled) via the routes layer's callback — the rail must
+        # never show a dead harness as occupied.
         sessions = await asyncio.to_thread(self._occupied_sessions)
         result = await self.reattach_all(sessions)
         if result["reattached"] or result["lost"]:
             _log("boot", f"reattach: {len(result['reattached'])} ok, "
                          f"lost {result['lost']}")
+        callback = self.on_unexpected_exit
+        for session_id in result["lost"]:
+            if callback is None:
+                _log("boot", f"s{session_id} lost on reattach but no "
+                             "on_unexpected_exit callback is bound")
+                continue
+            try:
+                await asyncio.to_thread(callback, session_id)
+            except Exception as exc:  # noqa: BLE001 — keep booting
+                _log("boot", f"lost-transition for s{session_id} failed: "
+                             f"{exc!r}")
 
     async def stop(self) -> None:
         """Release runtime resources; panes stay alive for reattach."""
@@ -565,12 +606,16 @@ class InterfaceRuntime:
         return os.path.join(self.run_dir, f"ready-s{session_id}")
 
     def _open_fifo(self, gen: Generation) -> None:
-        """Pre-open RDWR|NONBLOCK so tmux's `cat > fifo` writer never blocks,
-        then the blocking pump reader."""
-        gen._fifo_keep_fd = os.open(  # noqa: SLF001
+        """Open the blocking pump reader. A FIFO O_RDONLY open blocks until a
+        writer exists, so pre-open RDWR|NONBLOCK as the stand-in writer —
+        then CLOSE it immediately. A held write end would make the pump's
+        read never return EOF when the pane dies and tmux's `cat` writer
+        exits, and that EOF is the pump's pane-death signal."""
+        keep_fd = os.open(
             self._fifo_path(gen.session_id), os.O_RDWR | os.O_NONBLOCK)
         gen._pump_fd = os.open(  # noqa: SLF001
             self._fifo_path(gen.session_id), os.O_RDONLY)
+        os.close(keep_fd)
 
     def _start_consumers(self, gen: Generation) -> None:
         gen._pump_thread = threading.Thread(  # noqa: SLF001
@@ -686,7 +731,9 @@ class InterfaceRuntime:
     async def reattach_all(self, sessions: list[dict]) -> dict:
         """Rebind occupied sessions that survived a service restart. On ANY
         identity mismatch the DB row is left alone and the session reported
-        lost (the caller marks it unreconciled+lost)."""
+        lost; start() walks the lost list through the routes layer's
+        on_unexpected_exit callback so it lands the same occupied →
+        lost/unreconciled transition as a live-detected pane death."""
         self._require_available()
         reattached: list[int] = []
         lost: list[int] = []
@@ -750,14 +797,25 @@ class InterfaceRuntime:
 
         gen.terminating = True
         os.kill(pane_pid, signal.SIGTERM)
-        dead = await self._wait_gone(pane_id, pane_pid, GRACEFUL_TERMINATE_S)
+        dead = await self._wait_gone(pane_id, pane_pid, pane_ticks,
+                                     GRACEFUL_TERMINATE_S)
         if not dead and not force:
             gen.terminating = False
             return {"terminated": False, "reason": "graceful_timeout",
                     "pid": pane_pid, "generation": generation}
         if not dead:
+            # Re-verify before SIGKILL: the grace window is long enough for
+            # PID reuse, and the rule is never kill an uncertain process.
+            verified = await asyncio.to_thread(
+                self._verify_identity, pane_id, pane_pid, pane_ticks)
+            if not verified:
+                gen.terminating = False
+                _log(gen.sid, "force: identity changed during grace window — "
+                              "refusing SIGKILL")
+                return {"terminated": False, "reason": "identity_mismatch"}
             os.kill(pane_pid, signal.SIGKILL)
-            await self._wait_gone(pane_id, pane_pid, GRACEFUL_TERMINATE_S)
+            await self._wait_gone(pane_id, pane_pid, pane_ticks,
+                                  GRACEFUL_TERMINATE_S)
         await gen.teardown(kill_window=True)
         self.generations.pop(session_id, None)
         _log(gen.sid, f"terminated (force={force})")
@@ -776,6 +834,31 @@ class InterfaceRuntime:
         return await asyncio.to_thread(
             self._verify_identity, pane_id, pane_pid, pane_ticks)
 
+    async def prove_absence(self, session_id: int) -> bool:
+        """Absence proof for the operator close path (spec Occupancy Model:
+        the operator closes an unreconciled session only after absence is
+        proved). False if the pane still exists in our tmux server OR a
+        process with the recorded exact identity still sits at the pid —
+        anything uncertain refuses the close."""
+        self._require_available()
+        row = await asyncio.to_thread(self._session_identity, session_id)
+        if row is None:
+            return True  # no recorded identity — nothing live to disprove
+        pane_id, pane_pid, pane_ticks, _generation = row
+        if await self._pane_exists(pane_id):
+            return False
+        if await asyncio.to_thread(_pid_alive, pane_pid, pane_ticks):
+            return False  # the process lives on outside our tmux server
+        return True
+
+    async def abandon(self, session_id: int) -> None:
+        """Drop a generation's runtime resources WITHOUT signaling anything
+        (operator close after proved absence). The tmux window is already
+        gone — kill-window is best-effort cleanup of any remnant."""
+        gen = self.generations.pop(session_id, None)
+        if gen is not None:
+            await gen.teardown(kill_window=True)
+
     def _session_identity(self, session_id: int):
         con = db_driver.connect(self.db_path)
         try:
@@ -789,10 +872,15 @@ class InterfaceRuntime:
         finally:
             con.close()
 
-    async def _wait_gone(self, pane_id: str, pid: int, timeout: float) -> bool:
+    async def _wait_gone(self, pane_id: str, pid: int, start_ticks: int,
+                         timeout: float) -> bool:
+        """Gone = the pane is gone from our tmux server AND no process with
+        our exact identity sits at the pid. A recycled PID (ticks differ)
+        counts as gone — it is not our process."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            pid_gone = not os.path.exists(f"/proc/{pid}")
+            pid_gone = not await asyncio.to_thread(
+                _pid_alive, pid, start_ticks)
             pane_gone = not await self._pane_exists(pane_id)
             if pid_gone and pane_gone:
                 return True
@@ -808,7 +896,13 @@ class InterfaceRuntime:
         if gen.terminating or gen.session_id not in self.generations:
             return
         if await self._pane_exists(gen.pane_id):
-            return  # FIFO hiccup, pane alive — nothing to prove
+            # The pane outlived its pipe writer (someone killed tmux's `cat`):
+            # output no longer flows. Not a death transition — but never
+            # silent.
+            _log(gen.sid, "pump EOF with a live pane — pipe writer lost")
+            await asyncio.to_thread(self._alert, gen.session_id,
+                                    "interface_pump_lost", "critical")
+            return
         _log(gen.sid, "pane died unexpectedly")
         callback = self.on_unexpected_exit
         if callback is not None:
