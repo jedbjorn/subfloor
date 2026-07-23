@@ -2120,10 +2120,13 @@ function ifError(r, data) {
 // Bootstrap the operator browser session: EXCHANGES the operator capability
 // (the mode-0600 token at .super-coder/run/interface/operator.token) for the
 // HttpOnly SameSite=Strict cookie + the CSRF token we then send as X-CSRF on
-// every call. The operator pastes the capability once per tab; it lives in
-// sessionStorage only (survives refresh, dies with the tab).
+// every call. The capability is used ONCE for the exchange, then discarded —
+// never persisted (no sessionStorage) and cleared from JS memory the moment
+// the session mints, so no long-lived credential sits where XSS can reach it.
+// A later 401 (session gone: refresh, server restart) re-prompts the operator.
 let ifOpToken = null;
-try { ifOpToken = sessionStorage.getItem("sc-if-op") || null; } catch { /* storage blocked */ }
+// Drop any capability an older build persisted before the one-shot model.
+try { sessionStorage.removeItem("sc-if-op"); } catch { /* storage blocked */ }
 async function ifBootstrap() {
   for (let attempt = 0; attempt < 2; attempt++) {
     const headers = { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() };
@@ -2132,20 +2135,18 @@ async function ifBootstrap() {
       method: "POST", credentials: "same-origin", headers, body: "{}",
     });
     const data = await r.json().catch(() => ({}));
-    if (r.ok) { ifCsrf = data.csrf; return; }
+    if (r.ok) { ifCsrf = data.csrf; ifOpToken = null; return; }
     if (r.status === 401 && attempt === 0) {
       const t = prompt(
         "Interface operator capability required — paste the contents of\n" +
         ".super-coder/run/interface/operator.token (mode 0600, operator-only):",
-        ifOpToken || "");
+        "");
       if (!t) throw ifError(r, data);
       ifOpToken = t.trim();
-      try { sessionStorage.setItem("sc-if-op", ifOpToken); } catch { /* storage blocked */ }
       continue;
     }
-    if (r.status === 401) {   // the stored/pasted capability was rejected
+    if (r.status === 401) {   // the pasted capability was rejected
       ifOpToken = null;
-      try { sessionStorage.removeItem("sc-if-op"); } catch { /* storage blocked */ }
     }
     throw ifError(r, data);
   }
