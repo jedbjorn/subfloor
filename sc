@@ -1142,6 +1142,13 @@ super-coder — forkable shell substrate
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
                              intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
+  ./sc sprint status       wake status per binding: armed/released, sprint ACTIVE/frozen, batch state,
+                             last outcome, park/quarantine reason (--sprint <doc-id>, --all incl. released)
+  ./sc sprint alerts       open wake alerts — session-loss, retries-exhausted, quarantine, unmanaged-writer
+                             (--all includes resolved); the only window into wake failures
+  ./sc sprint retry        operator recovery for a parked/stalled batch: --binding <id> [--outcome
+                             delivered|not_delivered] — the park is NEVER resubmitted; items requeue as a
+                             NEW batch that re-gates before a byte moves
   ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner;
                              --sprint <doc-id> arms it to an ACTIVE sprint); an immediate GitHub baseline
                              is taken at registration, then the engine service poller turns transitions

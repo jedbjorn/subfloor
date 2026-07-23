@@ -1,6 +1,6 @@
 ---
 name: sprint_orchestration
-description: Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.
+description: Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Wake ops are provider-neutral: arm the binding before the first wake, monitor `sc sprint status`/`alerts`, retry parks as NEW gated batches (never resubmit), close releases bindings and cancels queued wake work. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.
 category: craft
 common: false
 ---
@@ -266,6 +266,55 @@ receipt: overrule by `task` row while the unit is still un-merged, or
 stay silent and the call stands. Either way log the call + outcome the
 moment it arrives — the sprint report lists every one, and calls
 reconstructed at close-out from old messages are calls lost.
+
+## Wake operations (Interface-backed planner wake)
+
+Provider-neutral operator workflow for the wake machinery — identical on
+every harness (claude / codex / kimi); there are no provider-specific
+steps. The operator surfaces are `sc sprint status` / `alerts` / `retry`
+and the Interface tab's Sprint wake panel; both read the same API
+projection. None of it is scheduled polling — they are on-demand reads of
+durable state, and the events still wake you.
+
+- **Arm before the sprint's first wake.** Once your Interface chat is
+  live, arm the binding: `POST /api/interface/sprint-bindings` with
+  `sprint_doc_id` + `planner_shell_id` (a shell may arm only itself; the
+  operator may arm any planner). Arming is fail-closed: a frozen or
+  non-ACTIVE doc, a mandatory-hook gap, or a second ACTIVE binding is
+  refused. PR watches registered with `--sprint <doc-id>` ride the
+  binding — an unarmed binding means `pr_event` rows arrive but nothing
+  wakes you.
+- **Monitor wake status.** `./sc sprint status` shows binding
+  armed/released, the sprint doc ACTIVE/frozen, the derived wake state
+  (armed/queued/submitting/running/parked), the current batch, the last
+  wake outcome, and the park/quarantine reason. The Interface tab's
+  Sprint wake panel on your session shows the same projection.
+- **Read the alerts.** `./sc sprint alerts` (+ the Interface alert
+  panel) is the ONLY window into wake failures — session-loss,
+  delivery_unknown parks, pre-send retries exhausted, quarantine,
+  unmanaged-writer. Alerts are deduplicated while open; an open critical
+  alert means the loop is NOT healthy no matter how quiet the inbox
+  looks. Investigate the alert before concluding a stall is a shell's
+  fault.
+- **Retry a park — never resubmit it.** A parked (`delivery_unknown`)
+  batch is never sent again: the parking invariant is law.
+  `./sc sprint retry --binding <id>` closes the park as audit, returns
+  its items to queued, and the coordinator forms a NEW batch that
+  re-gates everything (idle, clean composer, quiet, hooks healthy,
+  sprint ACTIVE) before a byte moves. When the input frame itself is
+  parked, retry needs your verdict on what reached the pane:
+  `--outcome delivered|not_delivered`. The Interface panel offers the
+  same action (Retry wake / Retry — input landed / Retry — input lost).
+- **Quarantine is yours to drain by hand.** An item that survives three
+  completed wake turns quarantines and alerts without blocking newer
+  work — read that message yourself and act on it; the wake machinery
+  deliberately leaves it alone.
+- **Close cleanly.** Setting `status: CLOSED` on the board (and the
+  freeze after it) releases the binding and cancels queued wake work in
+  the same transaction — no orphan armed binding, no stranded queued
+  batch survives the close. Messages stay unread; the Interface chat is
+  untouched. Verify with `./sc sprint status --all`: every binding of
+  the sprint shows released.
 
 ## Step 4: Unblock
 

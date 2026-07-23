@@ -933,31 +933,8 @@ def _release_binding(actor, headers, body, binding_id: int):
                 return 200, {"binding_id": binding_id, "released": True,
                              "already_released": True}
             reason = (body.get("reason") or "operator release").strip()
-            con.execute(
-                "UPDATE sprint_planner_bindings "
-                "SET released_at=datetime('now'), release_reason=? "
-                "WHERE binding_id=?", (reason, binding_id))
-            cancelled = 0
-            batches = con.execute(
-                "SELECT batch_id FROM planner_wake_batches "
-                "WHERE binding_id=? AND state='queued'",
-                (binding_id,)).fetchall()
-            for (batch_id_,) in batches:
-                batched = con.execute(
-                    "SELECT COUNT(*) FROM planner_wake_items "
-                    "WHERE batch_id=? AND state='batched'",
-                    (batch_id_,)).fetchone()[0]
-                interface_broker._cancel_batch(con, batch_id_)
-                cancelled += batched
-            items = con.execute(
-                "SELECT item_id FROM planner_wake_items "
-                "WHERE binding_id=? AND state='queued'",
-                (binding_id,)).fetchall()
-            for (item_id,) in items:
-                interface_state.transition(
-                    con, "wake_item", item_id, "cancelled",
-                    extra_sets={"error": f"binding released: {reason}"})
-                cancelled += 1
+            cancelled = interface_broker.release_binding(
+                con, binding_id, reason)
             con.commit()
             _log(f"sprint binding {binding_id} released ({reason}); "
                  f"{cancelled} queued wake item(s) cancelled")
@@ -966,6 +943,284 @@ def _release_binding(actor, headers, body, binding_id: int):
                          "wake_state": "disarmed"}
         return _idempotent(con, actor, "sprint_binding_release", headers,
                            body, produce)
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------- wake ops (seq 10)
+
+# Alert reasons a successful retry resolves (dedupe-while-open re-arms them
+# if the condition recurs).
+RETRY_CLEARS = ("wake_batch_delivery_unknown",
+                "wake_presend_retries_exhausted",
+                "crash_window_delivery_unknown")
+
+
+def _qint(query: dict, name: str) -> "int | None":
+    raw = query.get(name, [None])[0]
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _project_binding(con, row) -> dict:
+    """The wake-status projection for one binding (spec #20 Wake Delivery /
+    Data Model, sprint 25 seq 10): binding + sprint doc + derived wake_state
+    + the current batch and last outcome + park/quarantine detail. Pure
+    READ — no writer, no side effect."""
+    (binding_id, doc_id, planner, session_id, generation, armed_at,
+     released_at, release_reason) = row
+    doc = con.execute(
+        "SELECT title, frozen FROM documents WHERE document_id=?",
+        (doc_id,)).fetchone()
+    items = dict(con.execute(
+        "SELECT state, COUNT(*) FROM planner_wake_items WHERE binding_id=? "
+        "GROUP BY state", (binding_id,)).fetchall())
+    current = con.execute(
+        "SELECT batch_id, state, created_at, submitted_at "
+        "FROM planner_wake_batches WHERE binding_id=? "
+        "AND state IN ('queued','submitting','running','delivery_unknown') "
+        "ORDER BY batch_id DESC LIMIT 1", (binding_id,)).fetchone()
+    last = con.execute(
+        "SELECT batch_id, state, completed_at FROM planner_wake_batches "
+        "WHERE binding_id=? AND state IN ('complete','delivery_unknown') "
+        "ORDER BY batch_id DESC LIMIT 1", (binding_id,)).fetchone()
+    out = {
+        "binding_id": binding_id,
+        "sprint_doc_id": doc_id,
+        "planner_shell_id": planner,
+        "session_id": session_id,
+        "generation": generation,
+        "armed_at": armed_at,
+        "released_at": released_at,
+        "release_reason": release_reason,
+        "sprint": {
+            "document_id": doc_id,
+            "title": doc[0] if doc else None,
+            "frozen": bool(doc[1]) if doc else None,
+            "active": interface_broker._sprint_active(con, doc_id),
+        },
+        "wake_state": ("disarmed" if released_at is not None else
+                       _wake_state(con, planner_shell_id=planner)),
+        "items": items,
+        "current_batch": None,
+        "last_batch": None,
+        "park": None,
+        "quarantined": [],
+        "retry": {"applicable": False, "needs_outcome": False},
+    }
+    if current is not None:
+        out["current_batch"] = {
+            "batch_id": current[0], "state": current[1],
+            "created_at": current[2], "submitted_at": current[3]}
+    if last is not None:
+        outcomes = dict(con.execute(
+            "SELECT state, COUNT(*) FROM planner_wake_items "
+            "WHERE batch_id=? GROUP BY state", (last[0],)).fetchall())
+        out["last_batch"] = {"batch_id": last[0], "state": last[1],
+                             "completed_at": last[2], "items": outcomes}
+    quarantined = con.execute(
+        "SELECT item_id, message_id, error, completed_wakes "
+        "FROM planner_wake_items WHERE binding_id=? AND state='quarantined' "
+        "ORDER BY item_id", (binding_id,)).fetchall()
+    out["quarantined"] = [
+        {"item_id": q[0], "message_id": q[1], "error": q[2],
+         "completed_wakes": q[3]} for q in quarantined]
+    if released_at is not None:
+        return out
+    input_park = con.execute(
+        "SELECT delivery FROM interface_input_state WHERE session_id=?",
+        (session_id,)).fetchone()
+    input_park = input_park is not None and input_park[0] == "delivery_unknown"
+    parked = current is not None and current[1] == "delivery_unknown"
+    if parked or input_park:
+        reason = con.execute(
+            "SELECT reason FROM planner_alerts "
+            "WHERE resolved_at IS NULL AND (binding_id=? OR session_id=?) "
+            "ORDER BY alert_id DESC LIMIT 1",
+            (binding_id, session_id)).fetchone()
+        out["park"] = {
+            "batch_id": current[0] if parked else None,
+            "input_park": input_park,
+            "reason": reason[0] if reason else None,
+        }
+    stalled = con.execute(
+        "SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL "
+        "AND reason='wake_presend_retries_exhausted' "
+        "AND (binding_id=? OR session_id=?) LIMIT 1",
+        (binding_id, session_id)).fetchone()
+    out["retry"] = {
+        "applicable": bool(parked or input_park or stalled),
+        "needs_outcome": input_park,
+    }
+    return out
+
+
+def _binding_status(actor, query: dict):
+    """GET /api/interface/sprint-bindings — the operator/planner wake-status
+    surface (sprint 25 seq 10): a read-only projection of wake_state, the
+    current batch, park/quarantine detail, and the last wake outcome per
+    binding. A shell actor sees only its own planner bindings."""
+    planner = _qint(query, "planner_shell_id")
+    session_id = _qint(query, "session_id")
+    doc_id = _qint(query, "sprint_doc_id")
+    include_released = query.get("include_released", ["0"])[0] in (
+        "1", "true", "yes")
+    if actor.kind == "shell":
+        planner = actor.shell_id
+    sql = ("SELECT binding_id, sprint_doc_id, planner_shell_id, session_id,"
+           " generation, armed_at, released_at, release_reason"
+           " FROM sprint_planner_bindings")
+    conds, params = [], []
+    if planner is not None:
+        conds.append("planner_shell_id=?")
+        params.append(planner)
+    if session_id is not None:
+        conds.append("session_id=?")
+        params.append(session_id)
+    if doc_id is not None:
+        conds.append("sprint_doc_id=?")
+        params.append(doc_id)
+    if not include_released:
+        conds.append("released_at IS NULL")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY released_at IS NOT NULL, binding_id DESC LIMIT 20"
+    con = _db()
+    try:
+        rows = con.execute(sql, params).fetchall()
+        return _json(200, {"bindings":
+                           [_project_binding(con, r) for r in rows]})
+    finally:
+        con.close()
+
+
+def _sprint_alerts(actor, query: dict):
+    """GET /api/interface/sprint-alerts — the operator's window into wake
+    failures (spec Data Model planner_alerts; deduplicated while open).
+    Default lists OPEN alerts; include_resolved=1 adds the audit history.
+    A shell actor sees only alerts tied to its own sessions or bindings."""
+    session_id = _qint(query, "session_id")
+    binding_id = _qint(query, "binding_id")
+    planner = _qint(query, "planner_shell_id")
+    include_resolved = query.get("include_resolved", ["0"])[0] in (
+        "1", "true", "yes")
+    sql = ("SELECT alert_id, session_id, binding_id, message_id, watch_id,"
+           " severity, reason, opened_at, resolved_at FROM planner_alerts")
+    conds, params = [], []
+    if actor.kind == "shell":
+        conds.append(
+            "(session_id IN (SELECT session_id FROM interface_sessions "
+            "WHERE shell_id=?) OR binding_id IN (SELECT binding_id FROM "
+            "sprint_planner_bindings WHERE planner_shell_id=?))")
+        params += [actor.shell_id, actor.shell_id]
+    elif planner is not None:
+        conds.append(
+            "(session_id IN (SELECT session_id FROM interface_sessions "
+            "WHERE shell_id=?) OR binding_id IN (SELECT binding_id FROM "
+            "sprint_planner_bindings WHERE planner_shell_id=?))")
+        params += [planner, planner]
+    if session_id is not None:
+        conds.append("session_id=?")
+        params.append(session_id)
+    if binding_id is not None:
+        conds.append("binding_id=?")
+        params.append(binding_id)
+    if not include_resolved:
+        conds.append("resolved_at IS NULL")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY resolved_at IS NOT NULL, alert_id DESC LIMIT 100"
+    con = _db()
+    try:
+        cols = ("alert_id", "session_id", "binding_id", "message_id",
+                "watch_id", "severity", "reason", "opened_at", "resolved_at")
+        alerts = [dict(zip(cols, r)) for r in con.execute(sql, params)]
+        return _json(200, {"alerts": alerts})
+    finally:
+        con.close()
+
+
+def _retry_binding(actor, headers, body, binding_id: int):
+    """POST /api/interface/sprint-bindings/{id}/retry — the operator recovery
+    path for parked/stalled wake work (spec Retry Policy, decision #22;
+    sprint 25 seq 10). The parking invariant is law: a parked
+    (delivery_unknown) batch is NEVER resubmitted — resolve_batch closes it
+    as audit and returns its items to queued, an input park clears only on
+    the operator's explicit delivered/not_delivered verdict, and the
+    coordinator then forms a NEW batch and re-gates everything before a
+    byte moves through the broker-owned writer."""
+    con = _db()
+    try:
+        def produce():
+            row = con.execute(
+                "SELECT planner_shell_id, session_id, released_at "
+                "FROM sprint_planner_bindings WHERE binding_id=?",
+                (binding_id,)).fetchone()
+            if row is None:
+                return 404, _err_obj("no_such_binding",
+                                     f"binding {binding_id} not found")
+            planner, session_id, released = row
+            if actor.kind == "shell" and actor.shell_id != planner:
+                return 403, _err_obj(
+                    "not_the_planner",
+                    "a shell may retry only its own binding")
+            if released is not None:
+                return 409, _err_obj(
+                    "binding_released",
+                    f"binding {binding_id} is released — arm a fresh binding")
+            actions = []
+            inp = con.execute(
+                "SELECT delivery FROM interface_input_state "
+                "WHERE session_id=?", (session_id,)).fetchone()
+            if inp is not None and inp[0] == "delivery_unknown":
+                outcome = (body.get("outcome") or "").strip()
+                if outcome not in ("delivered", "not_delivered"):
+                    return 422, _err_obj(
+                        "outcome_required",
+                        "the session's input is parked delivery_unknown — "
+                        "retry needs outcome=delivered|not_delivered")
+                interface_broker.reconcile_input(con, session_id, outcome)
+                actions.append(f"input park reconciled ({outcome})")
+            batch = con.execute(
+                "SELECT batch_id, state FROM planner_wake_batches "
+                "WHERE binding_id=? AND state IN ('queued','delivery_unknown')"
+                " ORDER BY batch_id DESC LIMIT 1", (binding_id,)).fetchone()
+            if batch is not None and batch[1] == "delivery_unknown":
+                interface_broker.resolve_batch(con, batch[0])
+                actions.append(
+                    f"parked batch {batch[0]} resolved as audit — its items "
+                    "requeue for a NEW batch")
+            elif batch is not None or con.execute(
+                    "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
+                    "AND state='queued' LIMIT 1", (binding_id,)).fetchone():
+                actions.append(
+                    "wake work re-signalled — the coordinator re-gates "
+                    "from live state")
+            elif not actions:
+                return 409, _err_obj(
+                    "nothing_to_retry",
+                    "no input park, parked batch, or queued wake work on "
+                    "this binding")
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE resolved_at IS NULL AND reason IN (?,?,?) "
+                "AND (binding_id=? OR session_id=?)",
+                (*RETRY_CLEARS, binding_id, session_id))
+            con.commit()
+            _log(f"sprint binding {binding_id} retry: {'; '.join(actions)}")
+            return 200, {
+                "binding_id": binding_id, "retried": True,
+                "actions": actions,
+                "wake_state": _wake_state(con, planner_shell_id=planner)}
+        resp = _idempotent(con, actor, "sprint_binding_retry", headers,
+                           body, produce)
+        if resp[0] == 200:
+            interface_wake.notify_binding(binding_id)
+        return resp
     finally:
         con.close()
 
@@ -1207,11 +1462,13 @@ def _browser_session(headers, body):
 # ------------------------------------------------------------------ dispatch
 
 def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
-    from urllib.parse import urlparse
+    from urllib.parse import parse_qs, urlparse
     headers = _parse_headers(headers_raw)
     if not _host_ok(headers):
         return _err(403, "bad_host", "Interface API serves 127.0.0.1/localhost only")
-    p = urlparse(path).path
+    u = urlparse(path)
+    p = u.path
+    query = parse_qs(u.query)
     try:
         data = json.loads(body) if body else {}
     except ValueError:
@@ -1230,13 +1487,15 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
         return _err(401, "unauthorized",
                     "operator bearer or browser session required")
     # Shell actors (the planner's own API token) reach ONLY the sprint-wake
-    # surfaces — bindings + action receipts — never session/writer/stop.
+    # surfaces — bindings + wake ops + action receipts — never
+    # session/writer/stop.
     if actor.kind == "shell" and not (
             p.startswith("/api/interface/sprint-bindings")
+            or p.startswith("/api/interface/sprint-alerts")
             or p.startswith("/api/planner-action-receipts")):
         return _err(403, "shell_scope",
-                    "a shell token may call only sprint-binding and "
-                    "action-receipt routes")
+                    "a shell token may call only sprint-binding, "
+                    "sprint-alert, and action-receipt routes")
     if method in ("POST", "DELETE", "PATCH", "PUT"):
         if not actor.csrf_ok:
             return _err(403, "csrf", "browser mutations need the session's "
@@ -1267,6 +1526,14 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _reconcile(actor, headers, data)
         if p == "/api/interface/sprint-bindings" and method == "POST":
             return _arm_binding(actor, headers, data)
+        if p == "/api/interface/sprint-bindings" and method == "GET":
+            return _binding_status(actor, query)
+        if p == "/api/interface/sprint-alerts" and method == "GET":
+            return _sprint_alerts(actor, query)
+        if p.startswith("/api/interface/sprint-bindings/") \
+                and p.endswith("/retry") and method == "POST":
+            return _retry_binding(actor, headers, data,
+                                  int(p.split("/")[4]))
         if p.startswith("/api/interface/sprint-bindings/") \
                 and method == "DELETE":
             return _release_binding(actor, headers, data,

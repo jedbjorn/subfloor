@@ -2335,6 +2335,115 @@ async function ifRecoveryPane(pane, sel, root) {
     acts.append(" ", close);
   }
   card.append(acts, note);
+  ifSprintPanel(pane, sel);
+}
+
+// Sprint wake panel (sprint 25 seq 10): the operator-facing projection of
+// the shell's planner binding — sprint doc ACTIVE/frozen, wake state, current
+// batch, last outcome, park/quarantine reason — plus the open wake alerts
+// (the only window into wake failures) and the retry action for parked or
+// stalled work. Retry NEVER resubmits a parked batch: the server resolves it
+// as audit and requeues a NEW gated batch; a parked input needs the
+// operator's explicit delivered/not_delivered verdict. Read-only projections
+// come from GET /interface/sprint-bindings + /interface/sprint-alerts; the
+// action gates mirror the server's own preconditions (retry.applicable /
+// retry.needs_outcome). Nothing renders for a shell with no sprint history.
+async function ifSprintPanel(pane, sel) {
+  let bindings = [], alerts = [];
+  try {
+    const [b, a] = await Promise.all([
+      apiIf("/interface/sprint-bindings?planner_shell_id=" + sel.shell_id +
+            "&include_released=1"),
+      apiIf("/interface/sprint-alerts?planner_shell_id=" + sel.shell_id),
+    ]);
+    bindings = b.bindings || [];
+    alerts = a.alerts || [];
+  } catch { return; }   // surface down — never break the pane over the panel
+  if (!pane.isConnected || (!bindings.length && !alerts.length)) return;
+  const card = el("div", { className: "card" });
+  card.append(el("div", {}, el("b", {}, "Sprint wake")));
+  const note = el("div", { className: "if-note" });
+
+  if (bindings.length) {
+    const b = bindings[0];   // unreleased first, then most recent
+    const doc = b.sprint || {};
+    const diag = el("div", { className: "if-diag" });
+    const drow = (k, v) => diag.append(el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v ?? "—"))));
+    drow("sprint", "#" + b.sprint_doc_id + " " + (doc.title || "?") +
+      " · " + (doc.active ? "ACTIVE" : "not-ACTIVE") + (doc.frozen ? " · frozen" : ""));
+    drow("binding", "#" + b.binding_id + " " +
+      (b.released_at ? "released (" + (b.release_reason || "—") + ")" : "armed"));
+    drow("wake", b.wake_state);
+    if (b.current_batch)
+      drow("batch", "#" + b.current_batch.batch_id + " " + b.current_batch.state);
+    if (b.last_batch)
+      drow("last outcome", "#" + b.last_batch.batch_id + " " + b.last_batch.state +
+        " · " + ifCounts(b.last_batch.items));
+    drow("items", ifCounts(b.items));
+    if (b.quarantined && b.quarantined.length)
+      drow("quarantined", b.quarantined.length +
+        " item(s) — " + (b.quarantined[0].error || "wake limit"));
+    card.append(diag);
+    if (b.park)
+      card.append(el("div", { className: "if-note" },
+        "PARKED: " + (b.park.reason || "delivery_unknown") +
+        (b.park.input_park ? " — the input frame's delivery is unknown; retry needs your verdict" : "")));
+    const retry = b.retry || {};
+    if (retry.applicable && !b.released_at) {
+      const acts = el("div", {});
+      const refresh = () => { card.remove(); ifSprintPanel(pane, sel); };
+      const doRetry = async (outcome, btn) => {
+        btn.disabled = true; note.textContent = "";
+        try {
+          const r = await apiIf("/interface/sprint-bindings/" + b.binding_id + "/retry",
+            "POST", outcome ? { outcome } : {});
+          note.textContent = "retried — wake now " + r.wake_state +
+            " (" + (r.actions || []).join("; ") + ")";
+          setTimeout(refresh, 800);
+        } catch (e) {
+          note.textContent = (e.code ? e.code + ": " : "") + e.message;
+          btn.disabled = false;
+        }
+      };
+      if (retry.needs_outcome) {
+        const landed = el("button", { className: "act", type: "button", textContent: "Retry — input landed",
+          title: "the parked frame reached the planner — fold it in and requeue the batch as NEW" });
+        landed.onclick = () => {
+          if (confirm("Confirm the parked input reached the planner's pane. The parked batch closes as audit and its items requeue as a NEW gated batch."))
+            doRetry("delivered", landed);
+        };
+        const lost = el("button", { className: "act", type: "button", textContent: "Retry — input lost",
+          title: "the parked frame never landed — drop it and requeue the batch as NEW" });
+        lost.onclick = () => {
+          if (confirm("Confirm the parked input NEVER reached the planner. The parked batch closes as audit and its items requeue as a NEW gated batch."))
+            doRetry("not_delivered", lost);
+        };
+        acts.append(landed, " ", lost);
+      } else {
+        const retryBtn = el("button", { className: "act", type: "button", textContent: "Retry wake",
+          title: "requeue parked/stalled wake work as a NEW gated batch — the parked batch is never resubmitted" });
+        retryBtn.onclick = () => {
+          if (confirm("Retry this binding's wake work? The parked batch closes as audit and its items requeue as a NEW gated batch."))
+            doRetry(null, retryBtn);
+        };
+        acts.append(retryBtn);
+      }
+      card.append(acts);
+    }
+  }
+  if (alerts.length) {
+    const list = el("div", { className: "if-diag" });
+    for (const a of alerts)
+      list.append(el("div", { className: "if-note" },
+        "⚠ " + a.severity + " · " + a.reason + " · opened " + ifAge(a.opened_at) + " ago"));
+    card.append(list);
+  }
+  card.append(note);
+  pane.append(card);
+}
+function ifCounts(counts) {
+  const parts = Object.entries(counts || {}).map(([k, v]) => k + ":" + v);
+  return parts.length ? parts.join(", ") : "—";
 }
 
 // Available pane: one primary New chat command (spec Interface Layout — no
@@ -2453,6 +2562,7 @@ async function ifSessionPane(pane, sel) {
   if (ifAttach && ifAttach.sessionId === sessionId &&
       ifAttach.ws && ifAttach.ws.readyState <= WebSocket.OPEN) {
     pane.append(ifAttach.headEl, ifAttach.termEl);
+    ifSprintPanel(pane, sel);
     return;
   }
   ifDetach();
@@ -2481,6 +2591,7 @@ async function ifSessionPane(pane, sel) {
   a.paint = () => ifPaintHeader(a, sel, pane);
   ifAttach = a;
   pane.append(headEl, termEl);
+  ifSprintPanel(pane, sel);
   a.paint();
 
   try {

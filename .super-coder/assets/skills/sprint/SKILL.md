@@ -1,6 +1,6 @@
 ---
 name: sprint
-description: Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.
+description: Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Wake ops (status, alerts, retry) are provider-neutral reads/recovery on the planner's binding — a parked batch is never resubmitted, only requeued as a NEW gated batch. Load when a sprint task message names you a participant.
 category: craft
 common: false
 ---
@@ -303,6 +303,21 @@ between two units — are yours to catch.
 5. **Stand down** when the planner confirms receipt (a re-run on fix
    units arrives as a fresh scoped `task` row).
 
+## Wake ops (participant view)
+
+The planner's wake machinery has operator surfaces you can read too —
+provider-neutral, identical on every harness: `./sc sprint status`
+(binding armed/released, sprint ACTIVE/frozen, batch state, park and
+quarantine reasons) and `./sc sprint alerts` (the only window into wake
+failures — session-loss, retries exhausted, quarantine,
+unmanaged-writer; deduplicated while open). When the loop looks stalled,
+check both before reporting a stall: an open critical alert already
+names it. Recovery is the planner's/operator's action —
+`./sc sprint retry --binding <id>` requeues a parked batch as a NEW
+gated batch and NEVER resubmits the park — so a parked or quarantined
+wake goes to the planner as a `result` row, never a hand-rolled
+resubmission of your own.
+
 ## Stance
 
 - No scheduled polling, ever: `task` rows and headless boots wake you;
@@ -313,6 +328,9 @@ between two units — are yours to catch.
   CI-vs-CI on one runner.
 - Register the watch in the same step that opens the PR — an unwatched PR
   is a silent link, and silent links revert the sprint to polling.
+- A parked wake is never resubmitted — retry requeues it as a NEW gated
+  batch; parks and quarantines are reported to the planner, never
+  worked around.
 - Report state transitions (`building → pr-open → in-review → fixing →
   merged`) as `result` rows, one line each — not progress prose. The
   unit report at merge is the one sanctioned multi-line row.

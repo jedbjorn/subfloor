@@ -633,6 +633,68 @@ def resolve_batch(con, batch_id: int) -> None:
     con.commit()
 
 
+def release_binding(con, binding_id: int, reason: str) -> "int | None":
+    """Release one binding and cancel its queued wake work with an audit
+    reason (spec Sprint Scope): messages stay UNREAD; a live submitting/
+    running batch is left for hook reconciliation — its fenced evidence
+    still resolves it. Returns the cancelled-item count, or None when the
+    binding does not exist. An already-released binding is a no-op (0).
+    The caller owns the transaction (commit)."""
+    row = con.execute(
+        "SELECT released_at FROM sprint_planner_bindings WHERE binding_id=?",
+        (binding_id,)).fetchone()
+    if row is None:
+        return None
+    if row[0] is not None:
+        return 0
+    con.execute(
+        "UPDATE sprint_planner_bindings "
+        "SET released_at=datetime('now'), release_reason=? "
+        "WHERE binding_id=?", (reason, binding_id))
+    cancelled = 0
+    batches = con.execute(
+        "SELECT batch_id FROM planner_wake_batches "
+        "WHERE binding_id=? AND state='queued'", (binding_id,)).fetchall()
+    for (batch_id_,) in batches:
+        batched = con.execute(
+            "SELECT COUNT(*) FROM planner_wake_items "
+            "WHERE batch_id=? AND state='batched'",
+            (batch_id_,)).fetchone()[0]
+        _cancel_batch(con, batch_id_)
+        cancelled += batched
+    items = con.execute(
+        "SELECT item_id FROM planner_wake_items "
+        "WHERE binding_id=? AND state='queued'", (binding_id,)).fetchall()
+    for (item_id,) in items:
+        interface_state.transition(
+            con, "wake_item", item_id, "cancelled",
+            extra_sets={"error": f"binding released: {reason}"})
+        cancelled += 1
+    return cancelled
+
+
+def release_bindings_for_sprint(con, sprint_doc_id: int,
+                                reason: str) -> "list[int]":
+    """Sprint close (spec Sprint Scope): release every unreleased binding of
+    the sprint and cancel its queued wake work, and resolve the bindings'
+    open alerts — a released binding's wake failures are no longer
+    actionable. Returns the released binding ids. The caller owns the
+    transaction; used by the operator close path (doc status: CLOSED /
+    freeze) so no orphan armed binding or stranded queued batch survives a
+    sprint close."""
+    rows = con.execute(
+        "SELECT binding_id FROM sprint_planner_bindings "
+        "WHERE sprint_doc_id=? AND released_at IS NULL",
+        (sprint_doc_id,)).fetchall()
+    ids = [r[0] for r in rows]
+    for binding_id in ids:
+        release_binding(con, binding_id, reason)
+        con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE binding_id=? AND resolved_at IS NULL", (binding_id,))
+    return ids
+
+
 def _sprint_active(con, sprint_doc_id: int) -> bool:
     """The sprint doc's body contract carries a `status: ACTIVE|CLOSED` line
     (the planner is its only writer); a wake may submit only while ACTIVE."""

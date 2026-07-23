@@ -64,6 +64,7 @@ import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
 import interface_wake  # noqa: E402  (transactional wake ingress + coordinator)
+import interface_broker  # noqa: E402  (sprint close → binding release, seq 10)
 sys.path.insert(0, str(ENGINE / "api"))
 try:
     import interface_routes  # noqa: E402  (Interface HTTP API, spec #20)
@@ -738,6 +739,35 @@ def patch_document(con, doc_id, body):
     # and silently dropped it, and `doc add` always INSERTs a new row.
     return patch_columns(con, "documents", "document_id", doc_id, body,
                           {"body", "title", "render_path"})
+
+
+def _sprint_doc_status(con, doc_id) -> "str | None":
+    """The sprint board's `status:` line (the planner is its only writer)."""
+    r = con.execute("SELECT body FROM documents WHERE document_id=?",
+                    (doc_id,)).fetchone()
+    if r is None or r[0] is None:
+        return None
+    for line in r[0].splitlines():
+        if line.startswith("status:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _close_sprint_wake(con, doc_id) -> int:
+    """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10):
+    closing (status: CLOSED) or freezing a sprint doc releases its wake
+    bindings and cancels their queued wake work in the SAME transaction —
+    no orphan armed binding or stranded queued batch survives the close
+    (the frozen-CANCEL in the submit gate is the in-flight backstop, not
+    the cleanup). Messages stay unread; the Interface chat is untouched.
+    Returns the number of bindings released."""
+    if con.execute(
+            "SELECT 1 FROM sprint_planner_bindings "
+            "WHERE sprint_doc_id=? AND released_at IS NULL LIMIT 1",
+            (doc_id,)).fetchone() is None:
+        return 0
+    return len(interface_broker.release_bindings_for_sprint(
+        con, doc_id, "sprint closed"))
 
 
 def create_flag(con, body):
@@ -1996,8 +2026,12 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute(
                     "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
                     (did,))
+                # Sprint close integration (seq 10): freezing the board
+                # releases its wake bindings + cancels queued wake work.
+                released = _close_sprint_wake(con, did)
                 con.commit()
                 return self._send(200, {"ok": True,
+                                        "released_bindings": released,
                                         "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/docs/{id}
@@ -2010,7 +2044,15 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = patch_document(con, did, body)
                 if not ok:
                     return self._send(400, {"ok": ok, "error": err})
+                # Sprint close integration (seq 10): the planner closes the
+                # board by setting status: CLOSED — release its wake
+                # bindings + cancel queued wake work in the same breath.
+                released = 0
+                if _sprint_doc_status(con, did) == "CLOSED":
+                    released = _close_sprint_wake(con, did)
+                    con.commit()
                 return self._send(200, {"ok": ok,
+                                        "released_bindings": released,
                                         "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/messages/{id}/read
