@@ -2293,15 +2293,179 @@ async function ifStartingPane(pane, sel, root) {
   card.append(cancel, note);
 }
 
+// Recovery evidence is descriptive only. The browser may display it, but the
+// server's legal_actions list is the sole authority for Recover / Force
+// recover. Keeping request construction in one helper also makes discard an
+// explicit escalation rather than an accidental option on ordinary recovery.
+function ifRecoveryContext(sel, preview) {
+  const evidence = preview.evidence || {};
+  const shell = evidence.shell || {};
+  const session = evidence.session || {};
+  const process = evidence.process || {};
+  const git = evidence.git;
+  const shellName = shell.shortname || sel.shortname || String(sel.shell_id);
+  const sessionName = session.session_id == null
+    ? "no Interface session"
+    : `session #${session.session_id} · generation ${session.generation ?? "—"} · ` +
+      `${session.occupancy ?? "—"}/${session.lifecycle ?? "—"}`;
+  const processName = process.pane_pid == null || process.pane_start_ticks == null
+    ? "no recorded process identity"
+    : `PID ${process.pane_pid} · start ticks ${process.pane_start_ticks} · ` +
+      `PGID ${process.pgid ?? "—"} · pane ${process.pane_id ?? "—"}`;
+  let worktreeName = "unknown";
+  if (git) {
+    const tracked = Number.isInteger(git.dirty_tracked) ? git.dirty_tracked : null;
+    const untracked = Number.isInteger(git.untracked) ? git.untracked : null;
+    const clean = tracked === 0 && untracked === 0;
+    worktreeName = tracked == null || untracked == null
+      ? "unknown"
+      : clean
+        ? `clean · ${git.worktree || "worktree path unavailable"}`
+        : `not clean · ${tracked} tracked · ${untracked} untracked · ` +
+          `${git.worktree || "worktree path unavailable"}`;
+    if (Number.isInteger(git.unpushed_commits))
+      worktreeName += ` · ${git.unpushed_commits} unpushed commit(s)`;
+  }
+  return { shellName, sessionName, processName, worktreeName };
+}
+
+function ifRecoveryBody(preview, mode, discard, confirmShortname) {
+  const legal = Array.isArray(preview.legal_actions)
+    ? preview.legal_actions : [];
+  if (!legal.includes(mode)) return null;
+  const body = {
+    observation_id: preview.observation_id,
+    mode,
+    preserve_worktree: !discard,
+  };
+  if (mode === "force") body.confirm_force = true;
+  if (discard) {
+    body.discard_worktree = true;
+    body.confirm_shortname = confirmShortname;
+  }
+  return body;
+}
+
+function ifRecoveryControls(host, sel, root) {
+  const note = el("div", { className: "if-note" });
+  const previewBtn = el("button", { className: "act", type: "button",
+    textContent: "Preview recovery",
+    title: "inspect server-classified recovery evidence; preview never changes state" });
+  host.append(previewBtn, note);
+
+  const load = async (notice = "") => {
+    previewBtn.disabled = true;
+    note.textContent = notice || "Loading recovery evidence…";
+    let preview;
+    try {
+      preview = await apiIf(
+        "/interface/shells/" + sel.shell_id + "/recovery");
+    } catch (e) {
+      note.textContent = (e.code ? e.code + ": " : "") + e.message;
+      previewBtn.disabled = false;
+      return;
+    }
+    const context = ifRecoveryContext(sel, preview);
+    const legal = Array.isArray(preview.legal_actions)
+      ? preview.legal_actions : [];
+    const body = el("div", { className: "if-recovery-preview" },
+      el("div", { className: "if-diag" },
+        el("span", { className: "if-stat" }, "shell ",
+          el("b", {}, context.shellName)),
+        el("span", { className: "if-stat" }, "classification ",
+          el("b", {}, preview.classification || "—")),
+        el("span", { className: "if-stat" }, "session ",
+          el("b", {}, context.sessionName)),
+        el("span", { className: "if-stat" }, "process ",
+          el("b", {}, context.processName)),
+        el("span", { className: "if-stat" }, "worktree ",
+          el("b", {}, context.worktreeName))),
+      el("div", { className: "muted" },
+        `Observation ${preview.observation_id} · expires in ` +
+        `${preview.expires_in_s ?? "—"}s.`));
+    if (notice) body.append(el("div", { className: "if-note" }, notice));
+
+    const actions = el("div", { className: "if-recovery-actions" });
+    if (!legal.includes("recover") && !legal.includes("force")) {
+      actions.append(el("div", { className: "muted" },
+        "The server lists no legal recovery action for this observation."));
+      host.replaceChildren(previewBtn, body, actions, note);
+      previewBtn.disabled = false;
+      return;
+    }
+
+    const discard = el("input", { type: "checkbox" });
+    const discardLabel = el("label", { className: "muted" }, discard,
+      " Discard worktree changes (separate escalation; unpushed commits are refused)");
+    const execute = async (mode, button) => {
+      const label = mode === "force" ? "Force recover" : "Recover";
+      const preserve = !discard.checked;
+      if (!confirm(
+        `${label} ${context.shellName}? ${context.sessionName}; ` +
+        `${context.processName}; worktree ${context.worktreeName}. ` +
+        (preserve
+          ? "All worktree files will be preserved."
+          : "Worktree discard still requires a separate typed confirmation.")))
+        return;
+
+      let typed = null;
+      if (!preserve) {
+        typed = prompt(
+          `Discard tracked and untracked changes only in ${context.shellName}'s ` +
+          `exact worktree? Unpushed commits are never removed.\n` +
+          `Type ${context.shellName} to confirm:`, "");
+        if (typed !== context.shellName) {
+          note.textContent =
+            `Discard cancelled — confirmation must exactly match ${context.shellName}.`;
+          return;
+        }
+      }
+      const request = ifRecoveryBody(preview, mode, !preserve, typed);
+      if (!request) {
+        note.textContent =
+          `${label} is no longer listed as legal; preview again.`;
+        return;
+      }
+      button.disabled = true;
+      discard.disabled = true;
+      note.textContent = `${label} in progress…`;
+      try {
+        await apiIf("/interface/shells/" + sel.shell_id + "/recovery",
+          "POST", request);
+        return renderInterface(root);
+      } catch (e) {
+        if (e.status === 409 && e.code === "recovery_observation_stale") {
+          return load(
+            "Recovery state changed. Review this fresh preview before acting.");
+        }
+        note.textContent = (e.code ? e.code + ": " : "") + e.message;
+        button.disabled = false;
+        discard.disabled = false;
+      }
+    };
+    if (legal.includes("recover")) {
+      const recover = el("button", { className: "act primary", type: "button",
+        textContent: "Recover" });
+      recover.onclick = () => execute("recover", recover);
+      actions.append(recover);
+    }
+    if (legal.includes("force")) {
+      const force = el("button", { className: "act bad", type: "button",
+        textContent: "Force recover" });
+      force.onclick = () => execute("force", force);
+      actions.append(force);
+    }
+    actions.append(discardLabel);
+    host.replaceChildren(previewBtn, body, actions, note);
+    previewBtn.disabled = false;
+  };
+  previewBtn.onclick = () => load();
+}
+
 // Lost/error/unreconciled pane (spec Interface Layout): diagnostics and
-// queued-work counts come straight from GET /sessions/<id> — occupancy,
-// lifecycle, error_detail, the input pipeline (composer/delivery/forwarded
-// seq), wake and alerts. The API exposes no explicit allowed-actions field,
-// so the action gates mirror the route's own 409 preconditions exactly:
-// verify any time the session isn't ended (this pane never shows ended),
-// close ONLY while occupancy is unreconciled (occupied refuses with
-// not_unreconciled; absence is re-proved server-side on every close). A
-// closed session derives available → New chat IS the fresh-generation action.
+// queued-work counts come straight from GET /sessions/<id>. Reconcile remains
+// the exact-identity repair path; closure and process recovery are offered only
+// after the API returns a fresh recovery observation with a legal action.
 async function ifRecoveryPane(pane, sel, root) {
   const card = el("div", { className: "card" },
     el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
@@ -2354,24 +2518,10 @@ async function ifRecoveryPane(pane, sel, root) {
     recon.disabled = false;
   };
   acts.append(recon);
-  if (sess.occupancy === "unreconciled") {
-    const close = el("button", { className: "act", type: "button", textContent: "Close session",
-      title: "only after absence is proved (re-checked server-side) — frees the shell for a fresh generation" });
-    close.onclick = async () => {
-      if (!confirm(`Close session #${sess.session_id}? Allowed only after the process is proved absent. This frees ${sel.display_name || sel.shortname} for a new chat.`)) return;
-      close.disabled = true; note.textContent = "";
-      try {
-        await apiIf("/interface/reconciliations", "POST",
-          { session_id: sess.session_id, action: "close" });
-        return renderInterface(root);
-      } catch (e) {
-        note.textContent = (e.code ? e.code + ": " : "") + e.message;
-        close.disabled = false;
-      }
-    };
-    acts.append(" ", close);
-  }
   card.append(acts, note);
+  const recovery = el("div", { className: "if-recovery" });
+  card.append(recovery);
+  ifRecoveryControls(recovery, sel, root);
   ifSprintPanel(pane, sel);
 }
 
