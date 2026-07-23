@@ -356,6 +356,13 @@ def _read_stdin() -> bytes:
     return os.read(0, 65536)
 
 
+def _ws_connect(ws_url: str):
+    """The WS seam — tests patch this, never a socket. Lazy import: the CLI
+    verbs (and their test env) never need the websockets package."""
+    from websockets.sync.client import connect
+    return connect(ws_url, subprotocols=[SUBPROTOCOL])
+
+
 def run_stream(ws_url: str, role: str, start_seq: int,
                lease: dict | None = None) -> int:
     """The sc-term.v1 terminal loop, production client semantics (spec #20
@@ -373,9 +380,7 @@ def run_stream(ws_url: str, role: str, start_seq: int,
     close/terminated. The writer lease is released on the way out (a
     closing client releases only ITS lease — tmux and the harness
     continue)."""
-    from websockets.sync.client import connect
-
-    ws = connect(ws_url, subprotocols=[SUBPROTOCOL])
+    ws = _ws_connect(ws_url)
     old_attrs = termios.tcgetattr(0) if os.isatty(0) else None
     if old_attrs:
         tty.setraw(0)

@@ -481,7 +481,7 @@ class RunStreamTest(unittest.TestCase):
         patches = [
             mock.patch.object(ic, "_stdin_ready", stdin.ready),
             mock.patch.object(ic, "_read_stdin", stdin.read),
-            mock.patch("websockets.sync.client.connect", return_value=ws),
+            mock.patch.object(ic, "_ws_connect", return_value=ws),
             # run_stream installs its SIGWINCH handler unconditionally; off
             # the main thread that raises — the handler is untestable noise.
             mock.patch.object(ic.signal, "signal"),
