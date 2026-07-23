@@ -329,6 +329,9 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
         raise BrokerError(f"interface session {session_id} not found")
     shell_id, generation, occupancy, lifecycle, prior_reason = row
     if occupancy == "ended" and lifecycle == "ended":
+        con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE session_id=? AND resolved_at IS NULL", (session_id,))
         return {"session_id": session_id, "already_ended": True,
                 "end_reason": prior_reason}
 
@@ -380,6 +383,12 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
                                        "delivery_unknown")
             _alert(con, severity="critical",
                    reason="wake_batch_delivery_unknown", binding_id=binding_id)
+    # Every alert tied directly to this session is generation-scoped. Once the
+    # generation is durably closed it is no longer current, including an input
+    # ambiguity raised while converging closure; keep the row as resolved audit.
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE session_id=? AND resolved_at IS NULL", (session_id,))
     return {"session_id": session_id, "already_ended": False,
             "end_reason": recorded_reason}
 
@@ -507,6 +516,12 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
     elif event == "turn_stop":
         if _turn_finished(con, sess, shell_id, generation, hook_seq):
             result["wake_batch_complete"] = True
+        # A provider turn_stop is the later successful turn evidence. Interrupt
+        # and failure also finish a turn, but must not clear an earlier failure.
+        con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE session_id=? AND reason='turn_failure' "
+            "AND resolved_at IS NULL", (sess[0],))
     elif event == "session_end":
         # The chat is provably over: converge FULL durable closure through
         # the one helper — occupancy AND lifecycle terminal, generation

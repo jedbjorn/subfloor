@@ -57,7 +57,13 @@ async function api(path, method = "GET", body) {
   // publish/scripts report failure as {ok:false, output:<step trace>} with no
   // `error` key — the trace names the refusing guard and the remedy, so it is
   // the message, not statusText.
-  if (!r.ok) throw new Error(data.error || data.output || r.statusText);
+  if (!r.ok) {
+    const err = data.error;
+    const message = typeof err === "object" && err
+      ? [err.code, err.message].filter(Boolean).join(": ")
+      : (err || data.output || r.statusText);
+    throw new Error(message);
+  }
   return data;
 }
 
@@ -315,64 +321,56 @@ async function renderShells(root) {
 // resolves at boot). Fork-global config — the selected shell's flavor leads,
 // but the matrix is the same from any shell.
 //
-// The model picker is family-first: family chips are FILTERS — click one to
-// narrow the list to that line (opus / sonnet / fable, deepseek / glm, …),
-// then select a model from its stacked cards. Where a family has a
-// self-tracking CLI alias (opus/sonnet/haiku) an "alias — tracks latest" card
-// is pinned on top of that family's list; elsewhere the newest release
-// already leads. The panel opens on focus (family chips first), the card
-// list appears once a family is active or a query is typed, "all" + Enter
-// browses everything, Enter stores any typed id as-is, Escape / outside
-// click / a pick collapses. Catalog: /api/models v2 — advisory, never a
-// constraint. Payload v3 adds local route authority + effort capability: a
-// public suggestion remains typeable, but only a locally available model with
-// verified high effort is sprint-runnable through `sc models resolve`.
-const DM_MODEL_CAP = 60;   // rendered cards per view — "all" on opencode is huge
+// One shared harness-first picker for Default Models and Interface New chat.
+// Focus opens Harness default + every exact locally available route for that
+// harness. Search only filters that list; it is never itself a selectable
+// value. Arrow keys move the highlight, Enter chooses it, and Escape/outside
+// click closes without changing the current selection.
 
 function dmModelPicker(harness, cat, row, save) {
-  const data = cat.harnesses?.[harness] || { families: [], models: [] };
+  const data = cat.harnesses?.[harness] || { models: [] };
   const currentRoute = (data.models || []).find((m) => m.id === row.model);
-  const current = el("span", { className: "dm-current" + (row.model ? "" : " dm-unset"),
-                               textContent: row.model || "harness default",
-                               title: currentRoute
-                                 ? `${currentRoute.availability || "advisory"} · ${currentRoute.source || "unknown source"}`
-                                 : (row.model ? "not present in the latest catalogue" : "") });
+  const currentAvailable = !row.model || (
+    currentRoute && currentRoute.availability === "available" && !cat.stale);
+  const current = el("span", {
+    className: "dm-current" + (row.model ? "" : " dm-unset") +
+      (currentAvailable ? "" : " dm-stale"),
+    textContent: row.model
+      ? row.model + (currentAvailable ? "" : " (stale)")
+      : "Harness default",
+    title: currentAvailable
+      ? (currentRoute
+        ? `${currentRoute.availability} · ${currentRoute.source || "unknown source"}`
+        : "")
+      : "This stored route is unavailable. Choose an available model or Harness default before launch.",
+  });
   const input = el("input", { className: "dm-search",
-                              placeholder: "search · click a family to filter · “all” ⏎" });
+                              placeholder: "Search models for " + harness,
+                              role: "combobox", ariaExpanded: "false" });
   const results = el("div", { className: "dm-results", hidden: true });
-  let open = false, activeFam = null, allMode = false;
+  let open = false, highlighted = 0, choices = [];
 
-  // model family labels are raw ("claude-opus"); family chips are stripped
-  const famOf = (m) => harness === "claude"
-    ? (m.family || "").replace(/^claude-/, "") : (m.family || "");
-
-  const close = () => { open = false; activeFam = null; allMode = false; input.value = ""; paint(); };
+  const close = () => {
+    open = false; highlighted = 0; input.value = "";
+    input.ariaExpanded = "false"; paint();
+  };
   const pick = async (value) => {
-    await save(value);
-    current.textContent = value || "harness default";
+    try {
+      await save(value);
+    } catch (e) {
+      current.title = e.message;
+      return;
+    }
+    row.model = value || null;
+    current.textContent = value || "Harness default";
     current.classList.toggle("dm-unset", !value);
+    current.classList.remove("dm-stale");
     close();
-  };
-
-  const famChip = (f) => {
-    const c = el("button", { className: "dm-chip dm-fam" + (activeFam === f.family ? " dm-active" : ""),
-                             type: "button",
-                             title: `filter to the ${f.family} line (${f.n} model${f.n > 1 ? "s" : ""})` });
-    c.append(el("b", {}, f.family), el("span", { className: "dm-chip-sub" }, String(f.n)));
-    c.onclick = () => { activeFam = activeFam === f.family ? null : f.family; allMode = false; paint(); };
-    return c;
-  };
-  const mcard = (id, sub, cls) => {
-    const c = el("button", { className: "dm-mcard" + (cls ? " " + cls : ""), type: "button", title: id });
-    c.append(el("b", {}, id), el("span", { className: "dm-mcard-sub" }, sub || ""));
-    c.onclick = () => pick(id);
-    return c;
   };
   const routeSub = (m) => {
     const efforts = m.supported_efforts || [];
-    const route = m.availability === "available"
-      ? (efforts.includes("high") ? "local · high-effort route" : "local · no verified high effort")
-      : (m.availability || "advisory");
+    const route = efforts.includes("high")
+      ? "local · high-effort route" : "local route";
     return [route, m.source, m.release_date].filter(Boolean).join(" · ");
   };
 
@@ -380,61 +378,54 @@ function dmModelPicker(harness, cat, row, save) {
     results.textContent = "";
     if (!open) { results.hidden = true; return; }
     const q = input.value.trim().toLowerCase();
-    const hit = (s) => !q || (s || "").toLowerCase().includes(q);
-
-    // family filter row — always visible while open; the query narrows it too
-    const fams = (data.families || []).filter((f) => hit(f.family) || f.family === activeFam);
-    if (fams.length) {
-      results.append(el("div", { className: "dm-sect" }, "families — click to filter"));
-      const frow = el("div", { className: "dm-famrow" });
-      for (const f of fams) frow.append(famChip(f));
-      results.append(frow);
-    }
-
-    // stacked model cards — once a family is active, a query is typed, or all-mode
-    let models = null;
-    if (activeFam) {
-      models = (data.models || []).filter(
-        (m) => famOf(m) === activeFam && (hit(m.id) || hit(m.name)));
-    } else if (allMode) {
-      models = data.models || [];
-    } else if (q) {
-      models = (data.models || []).filter(
-        (m) => hit(m.id) || hit(m.name) || hit(m.family));
-    }
-    if (models) {
-      const label = activeFam ? `${activeFam} models` : "models";
-      results.append(el("div", { className: "dm-sect" },
-        `${label} (${models.length})`
-        + (models.length > DM_MODEL_CAP ? ` — first ${DM_MODEL_CAP}, type to narrow` : "")));
-      const list = el("div", { className: "dm-cardlist" });
-      // aliased family → pin the self-tracking card on top of its list
-      const famMeta = activeFam && (data.families || []).find((f) => f.family === activeFam);
-      if (famMeta && !models.some((m) => m.id === famMeta.latest) && hit(famMeta.latest))
-        list.append(mcard(famMeta.latest, "alias — tracks this family's latest", "dm-alias"));
-      for (const m of models.slice(0, DM_MODEL_CAP))
-        list.append(mcard(m.id, routeSub(m)));
-      if (q && !allMode)
-        list.append(mcard(input.value.trim(), "use as typed", "dm-raw"));
-      results.append(list);
-      if (!models.length && !q)
-        results.append(el("div", { className: "dm-sect" }, "no models in this family"));
-    } else {
-      results.append(el("div", { className: "dm-sect" },
-        "click a family to filter · type to search · “all” ⏎ for everything"));
-    }
+    const hit = (m) => !q || [m.id, m.name, m.family]
+      .some((s) => (s || "").toLowerCase().includes(q));
+    const models = cat.stale ? [] : (data.models || []).filter(
+      (m) => m.availability === "available" && hit(m));
+    choices = [
+      ...(!q || "harness default".includes(q)
+        ? [{ value: null, label: "Harness default", sub: "clear the model override" }]
+        : []),
+      ...models.map((m) => ({ value: m.id, label: m.id, sub: routeSub(m) })),
+    ];
+    highlighted = Math.max(0, Math.min(highlighted, choices.length - 1));
+    results.append(el("div", { className: "dm-sect" },
+      `${models.length} available model${models.length === 1 ? "" : "s"} for ${harness}`));
+    const list = el("div", { className: "dm-cardlist", role: "listbox" });
+    choices.forEach((choice, i) => {
+      const card = el("button", {
+        className: "dm-mcard" + (i === highlighted ? " dm-highlight" : ""),
+        type: "button", role: "option", ariaSelected: String(i === highlighted),
+        title: choice.value || "Harness default",
+      });
+      card.append(el("b", {}, choice.label),
+        el("span", { className: "dm-mcard-sub" }, choice.sub));
+      card.onmouseenter = () => { highlighted = i; paint(); };
+      card.onclick = () => pick(choice.value);
+      list.append(card);
+    });
+    results.append(list);
+    list.children[highlighted]?.scrollIntoView({ block: "nearest" });
     results.hidden = false;
   };
 
-  input.onfocus = () => { if (!open) { open = true; paint(); } };
-  input.oninput = () => { allMode = false; paint(); };
+  input.onfocus = () => {
+    if (!open) { open = true; highlighted = 0; input.ariaExpanded = "true"; paint(); }
+  };
+  input.oninput = () => { highlighted = 0; paint(); };
   input.onkeydown = (e) => {
     if (e.key === "Escape") { close(); input.blur(); return; }
-    if (e.key !== "Enter") return;
-    const q = input.value.trim();
-    if (!q) return;
-    if (q.toLowerCase() === "all") { allMode = true; activeFam = null; input.value = ""; paint(); }
-    else pick(q);
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const delta = e.key === "ArrowDown" ? 1 : -1;
+      highlighted = Math.max(0, Math.min(highlighted + delta, choices.length - 1));
+      paint();
+      return;
+    }
+    if (e.key === "Enter" && choices[highlighted]) {
+      e.preventDefault();
+      pick(choices[highlighted].value);
+    }
   };
   // outside click collapses; chips/cards live inside `results`, so picks land
   // first. Self-unregisters once this render generation is detached.
@@ -452,7 +443,7 @@ async function renderDefaultModels(root, s) {
   try { fd = await api("/flavor-defaults"); }
   catch (e) { root.append(el("div", { className: "vpanel" }, "flavor-defaults error: " + e.message)); return; }
   let cat = { harnesses: {}, sources: [], fetched_at: null, stale: true };
-  try { cat = await api("/models"); } catch { /* pickers still store typed ids */ }
+  try { cat = await api("/models"); } catch { /* picker shows Harness default only */ }
 
   const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
   const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh models" });
@@ -494,7 +485,7 @@ async function renderDefaultModels(root, s) {
         try {
           await api("/flavor-defaults", "POST", { flavor, harness: h, model: value });
           toast(`${flavor} · ${h} → ${value || "(harness default)"}`);
-        } catch (e) { toast("error: " + e.message); }
+        } catch (e) { toast("error: " + e.message); throw e; }
       });
       panel.append(el("div", { className: "dm-row" },
         star, el("span", { className: "dm-harness" }, h),
@@ -504,7 +495,7 @@ async function renderDefaultModels(root, s) {
     root.append(panel);
   }
   root.append(el("div", { className: "dm-note" },
-    "★ = default harness at launch. Local + high-effort = sprint-runnable. Advisory entries remain free-text suggestions. Family chip = track that line's latest."));
+    "★ = default harness at launch. Model overrides must be exact locally available routes; Harness default clears the override."));
 }
 
 // Harness — the shell's surfaces as grouped accordions: Operational
@@ -2199,6 +2190,8 @@ window.addEventListener("pagehide", ifDetach);
 
 const IF_BADGE = { available: "ok", starting: "warn", occupied: "accent",
   lost: "bad", error: "bad", unreconciled: "bad" };
+const IF_ATTACHABLE_LIFECYCLES = new Set(
+  ["starting", "idle", "busy", "approval", "user_input"]);
 
 async function renderInterface(root) {
   root.replaceChildren();
@@ -2253,7 +2246,51 @@ async function renderInterface(root) {
     ifDetach();
     return ifRecoveryPane(pane, sel, root);
   }
-  return ifSessionPane(pane, sel);   // occupied | starting
+  if (sel.availability === "starting") return ifStartingPane(pane, sel, root);
+  return ifSessionPane(pane, sel);   // verified occupied generation only
+}
+
+// A reservation is not a terminal. It exposes only Cancel start; cached output,
+// writer controls, certification, takeover, and process-only End chat stay
+// hidden until the API projects an attachable occupied generation.
+async function ifStartingPane(pane, sel, root) {
+  ifDetach();
+  const card = el("div", { className: "card" },
+    el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is starting."));
+  pane.append(card);
+  if (!sel.session_id) {
+    card.append(el("div", { className: "muted" },
+      "The reservation has no session id yet. Reselect the shell to refresh."));
+    return;
+  }
+  let sess;
+  try { sess = await apiIf("/interface/sessions/" + sel.session_id); }
+  catch (e) {
+    card.append(el("div", { className: "muted" },
+      "Reservation state unavailable (" + e.message + ")."));
+    return;
+  }
+  card.append(el("div", { className: "if-diag" },
+    el("span", { className: "if-stat" }, "session ", el("b", {}, "#" + sess.session_id)),
+    el("span", { className: "if-stat" }, "generation ", el("b", {}, String(sess.generation))),
+    el("span", { className: "if-stat" }, "state ",
+      el("b", {}, sess.occupancy + "/" + sess.lifecycle))));
+  const note = el("div", { className: "if-note" });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel start",
+    title: "cancel the reservation; a verified live pane follows the normal exact-identity stop path" });
+  cancel.onclick = async () => {
+    if (!confirm(`Cancel start for session #${sess.session_id}?`)) return;
+    cancel.disabled = true; note.textContent = "";
+    try {
+      await apiIf("/interface/termination-requests", "POST",
+        { session_id: sess.session_id, force: false });
+      return renderInterface(root);
+    } catch (e) {
+      note.textContent = (e.code ? e.code + ": " : "") + e.message;
+      cancel.disabled = false;
+    }
+  };
+  card.append(cancel, note);
 }
 
 // Lost/error/unreconciled pane (spec Interface Layout): diagnostics and
@@ -2350,18 +2387,23 @@ async function ifRecoveryPane(pane, sel, root) {
 // retry.needs_outcome). Nothing renders for a shell with no sprint history.
 async function ifSprintPanel(pane, sel) {
   let bindings = [], alerts = [];
+  const alertScope = sel.session_id
+    ? "session_id=" + encodeURIComponent(sel.session_id) +
+      "&generation=" + encodeURIComponent(sel.generation)
+    : "planner_shell_id=" + encodeURIComponent(sel.shell_id) +
+      (sel.generation != null ? "&generation=" + encodeURIComponent(sel.generation) : "");
   try {
     const [b, a] = await Promise.all([
       apiIf("/interface/sprint-bindings?planner_shell_id=" + sel.shell_id +
             "&include_released=1"),
-      apiIf("/interface/sprint-alerts?planner_shell_id=" + sel.shell_id),
+      apiIf("/interface/sprint-alerts?" + alertScope),
     ]);
     bindings = b.bindings || [];
     alerts = a.alerts || [];
   } catch { return; }   // surface down — never break the pane over the panel
-  if (!pane.isConnected || (!bindings.length && !alerts.length)) return;
+  if (!pane.isConnected || (!sel.session_id && !bindings.length && !alerts.length)) return;
   const card = el("div", { className: "card" });
-  card.append(el("div", {}, el("b", {}, "Sprint wake")));
+  card.append(el("div", {}, el("b", {}, "Generation alerts / Sprint wake")));
   const note = el("div", { className: "if-note" });
 
   if (bindings.length) {
@@ -2433,11 +2475,63 @@ async function ifSprintPanel(pane, sel) {
   }
   if (alerts.length) {
     const list = el("div", { className: "if-diag" });
-    for (const a of alerts)
-      list.append(el("div", { className: "if-note" },
-        "⚠ " + a.severity + " · " + a.reason + " · opened " + ifAge(a.opened_at) + " ago"));
+    for (const a of alerts) {
+      const capability = a.category === "capability";
+      const item = el("div", {
+        className: capability ? "if-capability" : "if-alert " + a.severity,
+      },
+        el("b", {}, capability ? "Capability information" : a.severity),
+        el("span", {},
+          ` · session #${a.session_id ?? "—"} · generation ${a.generation ?? "—"}`),
+        el("div", {}, a.meaning),
+        el("div", { className: "muted" }, "Next: " + a.next_action),
+        el("div", { className: "muted" }, "Opened " + ifAge(a.opened_at) + " ago"));
+      if (a.dismissible) {
+        const ack = el("button", { className: "act", type: "button",
+          textContent: "Acknowledge" });
+        ack.onclick = async () => {
+          ack.disabled = true;
+          try {
+            await apiIf("/interface/sprint-alerts/" + a.alert_id + "/acknowledge",
+              "POST", {});
+            card.remove();
+            ifSprintPanel(pane, sel);
+          } catch (e) {
+            note.textContent = (e.code ? e.code + ": " : "") + e.message;
+            ack.disabled = false;
+          }
+        };
+        item.append(ack);
+      }
+      list.append(item);
+    }
     card.append(list);
   }
+  const history = el("button", { className: "act", type: "button",
+    textContent: "Alert history" });
+  history.onclick = async () => {
+    history.disabled = true;
+    try {
+      const data = await apiIf("/interface/sprint-alerts?" + alertScope +
+        "&include_resolved=1");
+      const rows = el("div", { className: "if-history" });
+      for (const a of data.alerts || []) {
+        const state = a.resolved_at ? "resolved " + a.resolved_at
+          : a.acknowledged_at ? "acknowledged " + a.acknowledged_at +
+            " by " + a.acknowledged_by : "open";
+        rows.append(el("div", {},
+          `#${a.alert_id} · ${a.reason} · session #${a.session_id ?? "—"} · ` +
+          `generation ${a.generation ?? "—"} · ${state}`));
+      }
+      if (!rows.childElementCount)
+        rows.append(el("div", { className: "muted" }, "No alert history for this generation."));
+      history.replaceWith(rows);
+    } catch (e) {
+      note.textContent = (e.code ? e.code + ": " : "") + e.message;
+      history.disabled = false;
+    }
+  };
+  card.append(history);
   card.append(note);
   pane.append(card);
 }
@@ -2449,7 +2543,7 @@ function ifCounts(counts) {
 // Available pane: one primary New chat command (spec Interface Layout — no
 // second New-chat control exists for occupied or unreconciled shells). The
 // action opens the normal harness/model/effort choices sourced from the live
-// catalogue (GET /api/models v3, family-first) using the Default Models
+// catalogue (GET /api/models v3, harness-prefiltered flat routes) using the Default Models
 // picker conventions (dmModelPicker). POST /sessions rejects unknown fields
 // and accepts only shell_id/harness/model/effort/rows/cols — there is no
 // permission-mode field on the API, so none is offered here.
@@ -2467,12 +2561,14 @@ async function ifNewChatForm(card, sel, root) {
   const msg = el("div", { className: "muted" }, "loading model catalogue…");
   card.append(msg);
   let cat = null;
-  try { cat = await api("/models"); } catch { /* typed ids still store as-is */ }
+  try { cat = await api("/models"); } catch { /* Harness default remains usable */ }
   if (!card.isConnected) return;   // user navigated away mid-fetch
   msg.textContent = cat ? "" :
-    "catalogue unreachable — typed ids are stored as-is (advisory).";
+    "catalogue unreachable — only Harness default is available; refresh models before choosing an override.";
 
   const harnesses = Object.keys((cat && cat.harnesses) || {}).sort();
+  if (!harnesses.length)
+    harnesses.push("claude", "codex", "kimi", "opencode", "vibe");
   const choice = { harness: harnesses[0] || null, model: "", effort: "" };
 
   const effortSel = el("select", { className: "if-effort", title: "effort" });
@@ -2505,19 +2601,12 @@ async function ifNewChatForm(card, sel, root) {
       picker.results);
   };
 
-  let harnessCtl;
-  if (harnesses.length) {
-    harnessCtl = el("select", { title: "harness" });
-    for (const h of harnesses) harnessCtl.append(el("option", { value: h }, h));
-    harnessCtl.onchange = () => {
-      choice.harness = harnessCtl.value; choice.model = "";
-      buildPicker(); paintEffort();
-    };
-  } else {
-    harnessCtl = el("input", { type: "text", className: "dm-search",
-      placeholder: "harness (e.g. claude)" });
-    harnessCtl.oninput = () => { choice.harness = harnessCtl.value.trim() || null; };
-  }
+  const harnessCtl = el("select", { title: "harness" });
+  for (const h of harnesses) harnessCtl.append(el("option", { value: h }, h));
+  harnessCtl.onchange = () => {
+    choice.harness = harnessCtl.value; choice.model = "";
+    buildPicker(); paintEffort();
+  };
   buildPicker();   // effort select stays hidden until a catalogued model is picked
 
   const start = el("button", { className: "act primary", type: "button", textContent: "Start chat" });
@@ -2569,6 +2658,11 @@ async function ifSessionPane(pane, sel) {
   let sess;
   try { sess = await apiIf("/interface/sessions/" + sessionId); }
   catch (e) { pane.append(el("div", { className: "card" }, "error: " + e.message)); return; }
+  if (!sess.attachable || !sess.identity_verified) {
+    ifDetach();
+    return ifRecoveryPane(pane, { ...sel, availability: "unreconciled" },
+      pane.closest(".view"));
+  }
 
   const st = {
     harness: sess.harness || sel.harness || "—",
@@ -2606,7 +2700,7 @@ async function ifSessionPane(pane, sel) {
       a.seq = lease.next_input_seq ?? 1;
       a.st.writer = "active";
     } catch (e) {
-      if (e.status !== 409) throw e;
+      if (e.status !== 409 || e.code !== "writer_held") throw e;
       a.st.writer = "held";   // read-only attach; Take-over button in the header
     }
     a.paint();
@@ -2646,6 +2740,7 @@ function ifAge(ts) {
 
 function ifPaintHeader(a, sel, pane) {
   const st = a.st;
+  const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(st.lifecycle);
   const stat = (k, v) => el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v)));
   // Spec Interface Layout header: harness/model, archive/session age, writer
   // or read-only state, draft (composer) state, sprint wake state, then the
@@ -2662,7 +2757,7 @@ function ifPaintHeader(a, sel, pane) {
     stat("clients", st.clients),
     stat("wake", st.wake),
   ];
-  if (st.writer === "held" || st.writer === "revoked") {
+  if (controlsActive && (st.writer === "held" || st.writer === "revoked")) {
     const take = el("button", { className: "act", type: "button", textContent: "Take-over",
       title: "explicitly take the writer lease — the current writer turns read-only" });
     take.onclick = () => {
@@ -2671,7 +2766,7 @@ function ifPaintHeader(a, sel, pane) {
     };
     head.push(take);
   }
-  if (st.composer === "dirty" || st.composer === "unknown") {
+  if (controlsActive && (st.composer === "dirty" || st.composer === "unknown")) {
     const cert = el("button", { className: "act", type: "button", textContent: "certify clean" });
     cert.onclick = async () => {
       cert.disabled = true;
@@ -2684,10 +2779,12 @@ function ifPaintHeader(a, sel, pane) {
     };
     head.push(cert);
   }
-  const end = el("button", { className: "act", type: "button", textContent: "End chat",
-    title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout" });
-  end.onclick = () => ifEndChat(a, sel, pane, end);
-  head.push(end);
+  if (controlsActive) {
+    const end = el("button", { className: "act", type: "button", textContent: "End chat",
+      title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout" });
+    end.onclick = () => ifEndChat(a, sel, pane, end);
+    head.push(end);
+  }
   if (st.note) head.push(el("span", { className: "if-note" }, st.note));
   a.headEl.replaceChildren(...head);
 }
@@ -2801,6 +2898,10 @@ function ifOpenStream(a, ticket) {
   };
   a.resizeObs = new ResizeObserver(fit);
   a.resizeObs.observe(a.termEl);
+  ws.onopen = () => {
+    fit();
+    ifSendResize(a, term.rows, term.cols);
+  };
   fit();
 }
 

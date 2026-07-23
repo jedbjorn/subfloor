@@ -297,12 +297,21 @@ def get_flavor_defaults(con) -> dict:
     return {"flavors": flavors, "harnesses": known_harnesses()}
 
 
+def model_route_available(con, harness: str, selector: str) -> bool:
+    """True only for an exact route proved available by the local catalogue."""
+    row = con.execute(
+        "SELECT 1 FROM model_routes WHERE harness=? AND selector=? "
+        "AND availability='available' AND stale=0",
+        (harness, selector)).fetchone()
+    return row is not None
+
+
 def set_flavor_default(con, body) -> tuple[bool, str | None]:
     """One write to the launch-defaults matrix: set a (flavor, harness) cell's
     model, and/or star the harness as the flavor's default. Starring is
     transactional across the flavor's rows — exactly one is_default=1 after.
     Upserts the row so template flavors / harnesses without a seeded row are
-    settable; an empty model clears the cell back to NULL (harness default)."""
+    settable; a null model clears the cell back to Harness default."""
     flavor = (body.get("flavor") or "").strip()
     harness = (body.get("harness") or "").strip()
     if not flavor or not harness:
@@ -315,12 +324,26 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
         return False, f"unknown flavor '{flavor}'"
     if "model" not in body and not body.get("is_default"):
         return False, "nothing to set — pass model and/or is_default"
+    model = None
+    if "model" in body:
+        raw_model = body.get("model")
+        if raw_model is not None and (
+                not isinstance(raw_model, str) or not raw_model.strip()):
+            return False, (
+                "invalid_model_route: model must be null for Harness default "
+                "or an exact non-empty available route")
+        model = raw_model.strip() if isinstance(raw_model, str) else None
+        if model is not None and not model_route_available(
+                con, harness, model):
+            return False, (
+                f"invalid_model_route: {model!r} is not an exact currently "
+                f"available route for {harness}; choose an available "
+                "model or Harness default")
     con.execute(
         "INSERT INTO flavor_defaults (flavor, harness, model, is_default) "
         "VALUES (?, ?, NULL, 0) ON CONFLICT(flavor, harness) DO NOTHING",
         (flavor, harness))
     if "model" in body:
-        model = (body.get("model") or "").strip() or None
         con.execute("UPDATE flavor_defaults SET model=? "
                     "WHERE flavor=? AND harness=?", (model, flavor, harness))
     if body.get("is_default"):
@@ -2403,8 +2426,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, {"shell_id": sid, "shortname": sn})
             if path == "/api/flavor-defaults":
                 ok, err = set_flavor_default(con, self._body())
-                return self._send(200 if ok else 400,
-                                  {"ok": ok} if ok else {"error": err})
+                if ok:
+                    return self._send(200, {"ok": True})
+                if err and err.startswith("invalid_model_route:"):
+                    return self._send(422, {"error": {
+                        "code": "invalid_model_route",
+                        "message": err.split(":", 1)[1].strip()}})
+                return self._send(400, {"error": err})
             if path == "/api/analytics/sweep":
                 # GUI Analytics tab load — incremental, so steady-state is
                 # cheap; sweep opens its own connection.

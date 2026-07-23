@@ -279,8 +279,8 @@ def cmd_start(args) -> int:
             f"({resp.get('error', 'spawn failed')}) — investigate, then "
             f"`sc interface reconcile {short}`")
     print(f"→ session {resp['session_id']} reserved for {short} "
-          f"(generation {resp.get('generation')}, starting) — attach with "
-          f"`sc interface attach {short}`")
+          f"(generation {resp.get('generation')}, starting) — wait for it "
+          f"to become occupied, or cancel with `sc interface stop {short}`")
     return 0
 
 
@@ -320,7 +320,7 @@ def _attach_writer(shell: dict, session_id: int, takeover: bool) -> int:
     try:
         lease = _acquire_lease(session_id, takeover)
     except ApiError as exc:
-        if exc.status == 409 and not takeover:
+        if exc.status == 409 and exc.code == "writer_held" and not takeover:
             die(f"writer lease held{_writer_holder(session_id)} "
                 f"({exc.message}) — not taking over silently; use "
                 f"`sc interface take-control {short}` for an explicit "
@@ -776,8 +776,12 @@ def _wait_occupied(session_id: int, timeout: float = OCCUPIED_WAIT_S) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         detail = _session_detail(session_id)
-        if detail.get("occupancy") == "occupied":
+        if detail.get("attachable"):
             return detail
+        if detail.get("occupancy") == "occupied":
+            die(f"session {session_id} is occupied but not attachable "
+                f"({detail.get('state_reason') or 'identity unverified'}) — "
+                "`sc interface reconcile <shell>` revalidates it")
         if detail.get("occupancy") in ("unreconciled", "ended"):
             die(f"session {session_id} failed to start "
                 f"({detail.get('error_detail') or 'no detail'}) — "
@@ -809,7 +813,7 @@ def cmd_enter(args) -> int:
         try:
             lease = _acquire_lease(session_id, takeover=False)
         except ApiError as exc:
-            if exc.status != 409:
+            if exc.status != 409 or exc.code != "writer_held":
                 _print_api_error(exc)
                 raise SystemExit(EXIT_REFUSED) from exc
             print(f"→ writer lease held{_writer_holder(session_id)} — "
@@ -819,7 +823,7 @@ def cmd_enter(args) -> int:
         return _attach(session_id, "writer", lease)
     if avail == "starting":
         die(f"{short} is starting (a reservation is booting) — retry in a "
-            f"moment, or watch with `sc interface view {short}`")
+            f"moment, or cancel with `sc interface stop {short}`")
     die(f"{short} is {avail} — New chat is blocked. "
         f"`sc interface status {short}` shows the session; "
         f"`sc interface reconcile {short}` revalidates it.")

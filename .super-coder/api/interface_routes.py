@@ -65,6 +65,10 @@ _runtime = None          # bound by bind_runtime()
 _browser_sessions: dict = {}
 _browser_lock = threading.Lock()
 
+_ATTACHABLE_LIFECYCLES = {
+    "starting", "idle", "busy", "approval", "user_input",
+}
+
 
 # ------------------------------------------------------------------ plumbing
 
@@ -247,7 +251,88 @@ def _idempotent(con, actor: _Actor, operation: str, headers, body_obj,
 def _alert_count(con, session_id) -> int:
     return con.execute(
         "SELECT COUNT(*) FROM planner_alerts "
-        "WHERE session_id=? AND resolved_at IS NULL", (session_id,)).fetchone()[0]
+        "WHERE session_id=? AND resolved_at IS NULL "
+        "AND acknowledged_at IS NULL AND severity <> 'info'",
+        (session_id,)).fetchone()[0]
+
+
+def _client_state(con, session_id: int) -> dict:
+    """Fail closed unless the state pair and exact live identity agree."""
+    row = con.execute(
+        "SELECT occupancy, lifecycle, tmux_pane_id, pane_pid, "
+        "pane_start_ticks FROM interface_sessions WHERE session_id=?",
+        (session_id,)).fetchone()
+    if row is None:
+        return {"exists": False, "attachable": False,
+                "identity_verified": False, "legal_actions": []}
+    occupancy, lifecycle, pane_id, pane_pid, start_ticks = row
+    compatible = (
+        occupancy == "occupied" and lifecycle in _ATTACHABLE_LIFECYCLES
+    )
+    identity_present = (
+        pane_id is not None and pane_pid is not None and start_ticks is not None
+    )
+    verified = False
+    if compatible and identity_present and _runtime is not None \
+            and _runtime.available:
+        try:
+            verified = bool(_runtime.call(_runtime.verify_identity(session_id)))
+        except Exception:  # an unverifiable identity is never attach authority
+            verified = False
+    attachable = compatible and verified
+    if attachable:
+        actions = ["view", "acquire_writer", "takeover", "certify", "terminate"]
+        reason = None
+    elif occupancy == "reserved" and lifecycle == "starting":
+        actions = ["cancel_start"]
+        reason = "generation is reserved and still starting"
+    elif occupancy == "ended" and lifecycle == "ended":
+        actions = []
+        reason = "generation has ended"
+    else:
+        actions = ["reconcile"]
+        reason = (
+            "pane identity is missing or could not be verified"
+            if compatible else
+            f"state pair {occupancy}/{lifecycle} is not attachable"
+        )
+    return {
+        "exists": True,
+        "occupancy": occupancy,
+        "lifecycle": lifecycle,
+        "state_compatible": compatible,
+        "identity_present": identity_present,
+        "identity_verified": verified,
+        "attachable": attachable,
+        "state_reason": reason,
+        "legal_actions": actions,
+    }
+
+
+def _client_state_error(state: dict) -> tuple[int, dict]:
+    if state.get("state_compatible") and not state.get("identity_verified"):
+        return 409, _err_obj(
+            "identity_unverified",
+            "the pane identity is missing or no longer verifies — cached "
+            "terminal output is read-only history; reconcile this generation")
+    return 409, _err_obj(
+        "not_attachable",
+        f"session state {state.get('occupancy')}/{state.get('lifecycle')} "
+        "cannot attach or accept terminal controls — reconcile the generation")
+
+
+def _exact_identity_verified(con, session_id: int) -> bool:
+    identity = con.execute(
+        "SELECT tmux_pane_id, pane_pid, pane_start_ticks "
+        "FROM interface_sessions WHERE session_id=?", (session_id,)).fetchone()
+    if identity is None or any(v is None for v in identity):
+        return False
+    if _runtime is None or not _runtime.available:
+        return False
+    try:
+        return bool(_runtime.call(_runtime.verify_identity(session_id)))
+    except Exception:
+        return False
 
 
 def _availability(con, shell_id: int, snap) -> dict:
@@ -255,26 +340,30 @@ def _availability(con, shell_id: int, snap) -> dict:
     projected for compact display; New-chat authority never changes here. A
     shell with no live session is available ONLY after the liveness scan
     clears it — a legacy/unmanaged harness makes it unreconciled."""
+    active_session = interface_state.active_session_sql("s")
     row = con.execute(
-        "SELECT session_id, occupancy, lifecycle, harness "
-        "FROM interface_sessions WHERE shell_id=? AND occupancy <> 'ended'",
+        "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, s.harness "
+        "FROM interface_sessions s WHERE s.shell_id=? "
+        f"AND {active_session} ORDER BY s.session_id DESC LIMIT 1",
         (shell_id,)).fetchone()
     if row is not None:
-        session_id, occupancy, lifecycle, harness = row
+        session_id, generation, occupancy, lifecycle, harness = row
+        client = _client_state(con, session_id)
         if occupancy == "reserved":
             availability = "starting"
-        elif occupancy == "occupied":
+        elif client["attachable"]:
             availability = "occupied"
-        else:  # unreconciled
+        else:
             availability = {"lost": "lost", "error": "error"}.get(
                 lifecycle, "unreconciled")
         composer = con.execute(
             "SELECT composer FROM interface_input_state WHERE session_id=?",
             (session_id,)).fetchone()
         return {"availability": availability, "session_id": session_id,
+                "generation": generation,
                 "lifecycle": lifecycle, "harness": harness,
                 "composer": composer[0] if composer else None,
-                "alerts": _alert_count(con, session_id)}
+                "alerts": _alert_count(con, session_id), **client}
     state = shell_liveness.session_state(_shortname(con, shell_id), snap)
     if state is not None:
         return {"availability": "unreconciled", "session_id": None,
@@ -298,6 +387,31 @@ def _worktree_for(shortname: str, flavor: "str | None" = None) -> str:
     .sc-worktrees/<shortname>. Lazy import — run.py is the CLI module."""
     import run as run_mod
     return str(run_mod.shell_work_dir(shortname, flavor))
+
+
+def _resolved_launch_route(con, flavor: str | None, requested_harness,
+                           requested_model) -> tuple[str, "str | None"]:
+    """Resolve the effective harness/model before reserving a generation."""
+    import run as run_mod
+    defaults = run_mod.flavor_defaults(con).get(flavor)
+    harness = (
+        requested_harness
+        or (defaults["default_harness"] if defaults else None)
+        or run_mod._configured_harness()
+        or "claude"
+    )
+    model = requested_model or (
+        defaults["models"].get(harness) if defaults else None
+    )
+    return harness, model
+
+
+def _model_route_available(con, harness: str, model: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM model_routes WHERE harness=? AND selector=? "
+        "AND availability='available' AND stale=0",
+        (harness, model)).fetchone()
+    return row is not None
 
 
 def _provision_worktree(worktree: str, shortname: str):
@@ -376,6 +490,7 @@ def _create_session(actor, headers, body):
     if unknown:
         return _err(422, "validation", f"unknown fields: {sorted(unknown)}")
 
+    active_session = interface_state.active_session_sql()
     con = _db()
     try:
         shell = con.execute(
@@ -393,7 +508,7 @@ def _create_session(actor, headers, body):
             # instead of tripping the occupied check on its own session.
             existing = con.execute(
                 "SELECT session_id, occupancy FROM interface_sessions "
-                "WHERE shell_id=? AND occupancy <> 'ended'",
+                f"WHERE shell_id=? AND {active_session}",
                 (shell_id,)).fetchone()
             if existing is not None:
                 return 409, {"error": {
@@ -414,8 +529,23 @@ def _create_session(actor, headers, body):
                                "chat is blocked as unreconciled until "
                                "absence is proved",
                     "details": {"shortname": shortname}}}
-            # Resolve + provision the shell's exec cwd through the CLI
-            # boot's own rule BEFORE any row or token exists: a shell never
+            harness, model = _resolved_launch_route(
+                con, flavor, body.get("harness"), body.get("model"))
+            if model and not _model_route_available(con, harness, model):
+                return 422, {"error": {
+                    "code": "invalid_model_route",
+                    "message": f"stored or requested model route {model!r} is "
+                               f"not currently available for {harness}; choose "
+                               "an available model or clear the Default Models "
+                               "override to Harness default",
+                    "details": {
+                        "harness": harness, "model": model,
+                        "action": "choose an available model for this harness "
+                                  "or clear its Default Models override to "
+                                  "Harness default"}}}
+            # Provision the shell's exec cwd through the CLI boot's own rule
+            # only after the model preflight passes and BEFORE any row/token
+            # exists: a shell never
             # CLI-booted (e.g. a planner woken only through the Interface)
             # has no worktree yet — create it here, like `./sc enter`.
             worktree = _worktree_for(shortname, flavor)
@@ -427,7 +557,6 @@ def _create_session(actor, headers, body):
                 "interface_generations WHERE shell_id=?",
                 (shell_id,)).fetchone()[0]
             hook_token = secrets.token_hex(24)
-            harness = body.get("harness")
             con.execute(
                 "INSERT INTO interface_generations "
                 "(shell_id, generation, hook_token_hash) VALUES (?,?,?)",
@@ -439,7 +568,7 @@ def _create_session(actor, headers, body):
                 " occupancy, lifecycle, reservation_expires_at) "
                 "VALUES (?,?,?,?,?, 'reserved', 'starting', "
                 "        datetime('now', ?))",
-                (shell_id, gen_no, harness, body.get("model"),
+                (shell_id, gen_no, harness, model,
                  worktree, f"+{RESERVATION_TTL_S} seconds"))
             session_id = cur.lastrowid
             con.execute(
@@ -454,7 +583,7 @@ def _create_session(actor, headers, body):
                 "generation": gen_no, "hook_token": hook_token,
                 "api_port": ports_mod.resolve().get("port", 8800),
                 "worktree": worktree,
-                "harness": harness, "model": body.get("model"),
+                "harness": harness, "model": model,
                 "effort": body.get("effort")}))
             os.chmod(token_path, 0o600)
             try:
@@ -535,7 +664,8 @@ def _create_session(actor, headers, body):
             con.commit()
             return 201, {"session_id": session_id, "shell_id": shell_id,
                          "generation": gen_no, "occupancy": "reserved",
-                         "lifecycle": "starting", "harness": harness}
+                         "lifecycle": "starting", "harness": harness,
+                         "model": model}
 
         result = _idempotent(con, actor, "create_session", headers, body,
                              produce)
@@ -554,7 +684,7 @@ def _create_session(actor, headers, body):
             # (the generations index fired first) — the retry reveals it.
             owner = con.execute(
                 "SELECT session_id, occupancy FROM interface_sessions "
-                "WHERE shell_id=? AND occupancy <> 'ended'",
+                f"WHERE shell_id=? AND {active_session}",
                 (shell_id,)).fetchone()
             return _err(409, "shell_occupied",
                         "a concurrent start owns this shell",
@@ -588,6 +718,7 @@ def _get_session(session_id: int):
         writer = interface_broker.current_writer(con, session_id)
         runtime_state = (_runtime.runtime_state(session_id)
                          if _runtime is not None else None)
+        client_state = _client_state(con, session_id)
         return _json(200, {
             "session_id": row[0], "shell_id": row[1], "generation": row[2],
             "archive_id": row[3], "harness": row[4], "model_route": row[5],
@@ -604,6 +735,7 @@ def _get_session(session_id: int):
             "wake_state": _wake_state(con, session_id=session_id),
             "clients": (runtime_state or {}).get("attached_clients", 0),
             "alerts": _alert_count(con, session_id),
+            **client_state,
         })
     finally:
         con.close()
@@ -640,14 +772,25 @@ def _acquire_lease(actor, headers, body):
     con = _db()
     try:
         def produce():
+            state = _client_state(con, session_id)
+            if not state["attachable"]:
+                return _client_state_error(state)
+            held = interface_broker.current_writer(con, session_id)
+            if held is not None and not takeover:
+                return 409, _err_obj(
+                    "writer_held",
+                    f"session {session_id} writer held by {held[1]} — explicit "
+                    "takeover required",
+                    {"client_id": held[1]})
             token = secrets.token_hex(24)
             try:
                 lease_id = interface_broker.acquire_writer(
                     con, session_id, str(client_id), token, takeover=takeover)
                 con.commit()
             except interface_broker.BrokerError as exc:
-                return 409, {"error": {"code": "lease_refused",
-                                       "message": str(exc), "details": {}}}
+                code = "writer_held" if "writer held by" in str(exc) \
+                    else "lease_refused"
+                return 409, _err_obj(code, str(exc))
             seq = con.execute(
                 "SELECT next_input_seq FROM interface_writer_leases "
                 "WHERE lease_id=?", (lease_id,)).fetchone()[0]
@@ -693,10 +836,8 @@ def _mint_ticket(actor, headers, body):
                     "session_id, role (viewer|writer), client_id required")
     con = _db()
     try:
-        sess = con.execute(
-            "SELECT occupancy FROM interface_sessions WHERE session_id=?",
-            (session_id,)).fetchone()
-        if sess is None:
+        state = _client_state(con, session_id)
+        if not state["exists"]:
             return _err(404, "no_such_session",
                         f"interface session {session_id} not found")
         lease_id = None
@@ -714,6 +855,8 @@ def _mint_ticket(actor, headers, body):
             lease_id, lease_token = lease[0], token
 
         def produce():
+            if not state["attachable"]:
+                return _client_state_error(state)
             ticket = _runtime.mint_ticket(
                 session_id=session_id, role=role, client_id=str(client_id),
                 lease_id=lease_id, lease_token=lease_token)
@@ -735,6 +878,13 @@ def _certify_clean(actor, headers, body):
                     "session_id, client_id, client_seq (int) required")
     con = _db()
     try:
+        state = _client_state(con, session_id)
+        if not state["exists"]:
+            return _err(404, "no_such_session",
+                        f"interface session {session_id} not found")
+        if not state["attachable"]:
+            status, obj = _client_state_error(state)
+            return _json(status, obj)
         lease = interface_broker.current_writer(con, session_id)
         if lease is None or lease[1] != str(client_id):
             return _err(409, "not_the_writer",
@@ -800,6 +950,16 @@ def _terminate(actor, headers, body):
                 interface_broker.close_session(con, session_id, "operator_end")
                 con.commit()
                 return 202, {"terminated": True, "already_ended": True}
+            if occ == "occupied":
+                state = _client_state(con, session_id)
+                if lif == "stopping":
+                    if not _exact_identity_verified(con, session_id):
+                        return 409, _err_obj(
+                            "identity_unverified",
+                            "the stopping pane identity no longer verifies — "
+                            "force termination is refused; reconcile it")
+                elif not state["attachable"]:
+                    return _client_state_error(state)
             if occ == "reserved":
                 # Cancel start (spec Lifecycle Contract / #519).
                 if pane_id is None and pane_pid is None:
@@ -1071,8 +1231,9 @@ def _wake_state(con, *, session_id=None, planner_shell_id=None) -> str:
     return "queued" if queued is not None else "armed"
 
 
-def _err_obj(code: str, message: str) -> dict:
-    return {"error": {"code": code, "message": message, "details": {}}}
+def _err_obj(code: str, message: str, details=None) -> dict:
+    return {"error": {"code": code, "message": message,
+                      "details": details or {}}}
 
 
 def _arm_binding(actor, headers, body):
@@ -1335,6 +1496,111 @@ def _binding_status(actor, query: dict):
         con.close()
 
 
+_ALERT_COPY = {
+    "hooks_degraded": (
+        "Optional provider hooks are unavailable; ordinary chat still works, "
+        "but some wait-state detail may be less precise.",
+        "Continue ordinary chat. Upgrade the harness only if richer lifecycle "
+        "detail is needed.",
+        "capability",
+    ),
+    "wake_not_armable": (
+        "This harness generation cannot prove every lifecycle event required "
+        "for automatic sprint wake.",
+        "Choose a supported harness/model generation before arming sprint wake.",
+        "warning",
+    ),
+    "turn_failure": (
+        "One provider turn failed in this generation.",
+        "Retry the turn. A later successful turn resolves this warning "
+        "automatically.",
+        "warning",
+    ),
+    "reservation_expired": (
+        "The generation did not finish starting before its reservation expired.",
+        "Reconcile the generation; after absence is proved, close it and start "
+        "a new chat.",
+        "warning",
+    ),
+    "approval_wait": (
+        "The provider is waiting for an approval.",
+        "Answer the approval in the terminal.",
+        "warning",
+    ),
+    "user_input_wait": (
+        "The provider is waiting for operator input.",
+        "Answer the prompt in the terminal.",
+        "warning",
+    ),
+    "session_lost": (
+        "The managed pane exited without a completed session end.",
+        "Reconcile the generation and close it after process absence is proved.",
+        "warning",
+    ),
+    "crash_window_delivery_unknown": (
+        "A human input frame may or may not have reached the pane before the "
+        "broker stopped.",
+        "Reconcile input delivery explicitly; never replay it blindly.",
+        "warning",
+    ),
+    "wake_batch_delivery_unknown": (
+        "A sprint wake submission may or may not have reached the planner.",
+        "Use Retry with the observed delivered/not-delivered outcome.",
+        "warning",
+    ),
+    "wake_presend_retries_exhausted": (
+        "Sprint wake could not reach the pane before any bytes were sent.",
+        "Restore the pane/runtime, then retry the wake.",
+        "warning",
+    ),
+    "wake_item_reconcile": (
+        "A sprint action has an uncertain durable outcome.",
+        "Reconcile the named action receipt before retrying.",
+        "warning",
+    ),
+    "wake_item_quarantined": (
+        "Unread sprint work remained after the maximum automatic wake turns.",
+        "Inspect the unread message and act on it manually.",
+        "warning",
+    ),
+    "wake_session_ended": (
+        "The planner generation ended while wake work was still pending.",
+        "Start a fresh planner generation and re-arm the active sprint.",
+        "warning",
+    ),
+    "unmanaged_writable_client": (
+        "A writable tmux client exists outside the Interface input broker.",
+        "Detach the unmanaged client before retrying automatic wake.",
+        "warning",
+    ),
+}
+
+
+def _alert_projection(row) -> dict:
+    cols = (
+        "alert_id", "session_id", "binding_id", "message_id", "watch_id",
+        "severity", "reason", "opened_at", "resolved_at", "acknowledged_at",
+        "acknowledged_by", "shell_id", "generation",
+    )
+    alert = dict(zip(cols, row))
+    meaning, action, category = _ALERT_COPY.get(
+        alert["reason"],
+        (alert["reason"].replace("_", " ").capitalize() + ".",
+         "Inspect the generation diagnostics and use the supported recovery "
+         "action shown there.",
+         "warning" if alert["severity"] != "info" else "capability"),
+    )
+    alert.update({
+        "meaning": meaning,
+        "next_action": action,
+        "category": category,
+        "dismissible": category != "capability"
+                       and alert["resolved_at"] is None
+                       and alert["acknowledged_at"] is None,
+    })
+    return alert
+
+
 def _sprint_alerts(actor, query: dict):
     """GET /api/interface/sprint-alerts — the operator's window into wake
     failures (spec Data Model planner_alerts; deduplicated while open).
@@ -1343,40 +1609,108 @@ def _sprint_alerts(actor, query: dict):
     session_id = _qint(query, "session_id")
     binding_id = _qint(query, "binding_id")
     planner = _qint(query, "planner_shell_id")
+    generation = _qint(query, "generation")
     include_resolved = query.get("include_resolved", ["0"])[0] in (
         "1", "true", "yes")
-    sql = ("SELECT alert_id, session_id, binding_id, message_id, watch_id,"
-           " severity, reason, opened_at, resolved_at FROM planner_alerts")
+    sql = (
+        "SELECT a.alert_id, a.session_id, a.binding_id, a.message_id, "
+        "a.watch_id, a.severity, a.reason, a.opened_at, a.resolved_at, "
+        "a.acknowledged_at, a.acknowledged_by, "
+        "COALESCE(s.shell_id, b.shell_id), "
+        "COALESCE(s.generation, b.generation) "
+        "FROM planner_alerts a "
+        "LEFT JOIN interface_sessions s ON s.session_id=a.session_id "
+        "LEFT JOIN sprint_planner_bindings b ON b.binding_id=a.binding_id"
+    )
     conds, params = [], []
     if actor.kind == "shell":
         conds.append(
-            "(session_id IN (SELECT session_id FROM interface_sessions "
-            "WHERE shell_id=?) OR binding_id IN (SELECT binding_id FROM "
+            "(a.session_id IN (SELECT session_id FROM interface_sessions "
+            "WHERE shell_id=?) OR a.binding_id IN (SELECT binding_id FROM "
             "sprint_planner_bindings WHERE planner_shell_id=?))")
         params += [actor.shell_id, actor.shell_id]
+        planner = actor.shell_id
     elif planner is not None:
         conds.append(
-            "(session_id IN (SELECT session_id FROM interface_sessions "
-            "WHERE shell_id=?) OR binding_id IN (SELECT binding_id FROM "
+            "(a.session_id IN (SELECT session_id FROM interface_sessions "
+            "WHERE shell_id=?) OR a.binding_id IN (SELECT binding_id FROM "
             "sprint_planner_bindings WHERE planner_shell_id=?))")
         params += [planner, planner]
     if session_id is not None:
-        conds.append("session_id=?")
+        conds.append("a.session_id=?")
         params.append(session_id)
     if binding_id is not None:
-        conds.append("binding_id=?")
+        conds.append("a.binding_id=?")
         params.append(binding_id)
+    if generation is None and planner is not None and session_id is None \
+            and binding_id is None:
+        current = None
+        con = _db()
+        try:
+            current = con.execute(
+                "SELECT generation FROM interface_sessions "
+                "WHERE shell_id=? AND occupancy <> 'ended' "
+                "ORDER BY generation DESC LIMIT 1", (planner,)).fetchone()
+        finally:
+            con.close()
+        if current is None:
+            conds.append("1=0")
+        else:
+            generation = current[0]
+    if generation is not None:
+        conds.append("COALESCE(s.generation, b.generation)=?")
+        params.append(generation)
     if not include_resolved:
-        conds.append("resolved_at IS NULL")
+        conds.append("a.resolved_at IS NULL AND a.acknowledged_at IS NULL")
     if conds:
         sql += " WHERE " + " AND ".join(conds)
-    sql += " ORDER BY resolved_at IS NOT NULL, alert_id DESC LIMIT 100"
+    sql += " ORDER BY a.resolved_at IS NOT NULL, a.alert_id DESC LIMIT 100"
     con = _db()
     try:
-        cols = ("alert_id", "session_id", "binding_id", "message_id",
-                "watch_id", "severity", "reason", "opened_at", "resolved_at")
-        alerts = [dict(zip(cols, r)) for r in con.execute(sql, params)]
+        alerts = [_alert_projection(r) for r in con.execute(sql, params)]
         return _json(200, {"alerts": alerts})
+    finally:
+        con.close()
+
+
+def _acknowledge_alert(actor, headers, body, alert_id: int):
+    if body:
+        return _err(422, "validation", "alert acknowledgement takes no body")
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT a.alert_id, a.severity, a.resolved_at, a.acknowledged_at, "
+            "a.acknowledged_by, s.shell_id, b.planner_shell_id "
+            "FROM planner_alerts a "
+            "LEFT JOIN interface_sessions s ON s.session_id=a.session_id "
+            "LEFT JOIN sprint_planner_bindings b ON b.binding_id=a.binding_id "
+            "WHERE a.alert_id=?", (alert_id,)).fetchone()
+        if row is None:
+            return _err(404, "no_such_alert", f"alert {alert_id} not found")
+        if actor.kind == "shell" and actor.shell_id not in (row[5], row[6]):
+            return _err(403, "shell_scope",
+                        "a shell may acknowledge only its own generation alerts")
+        if row[2] is not None:
+            return _err(409, "alert_resolved",
+                        "the alert is already resolved and remains in history")
+        if row[1] == "info":
+            return _err(409, "capability_information",
+                        "capability information is not a dismissible warning")
+
+        def produce():
+            con.execute(
+                "UPDATE planner_alerts SET acknowledged_at=datetime('now'), "
+                "acknowledged_by=? WHERE alert_id=? AND acknowledged_at IS NULL",
+                (actor.scope, alert_id))
+            con.commit()
+            ack = con.execute(
+                "SELECT acknowledged_at, acknowledged_by FROM planner_alerts "
+                "WHERE alert_id=?", (alert_id,)).fetchone()
+            return 200, {"alert_id": alert_id, "acknowledged_at": ack[0],
+                         "acknowledged_by": ack[1]}
+
+        return _idempotent(
+            con, actor, "acknowledge_alert", headers, body, produce)
     finally:
         con.close()
 
@@ -1829,6 +2163,10 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _binding_status(actor, query)
         if p == "/api/interface/sprint-alerts" and method == "GET":
             return _sprint_alerts(actor, query)
+        if p.startswith("/api/interface/sprint-alerts/") \
+                and p.endswith("/acknowledge") and method == "POST":
+            return _acknowledge_alert(
+                actor, headers, data, _path_id(p, -2))
         if p.startswith("/api/interface/sprint-bindings/") \
                 and p.endswith("/retry") and method == "POST":
             return _retry_binding(actor, headers, data, _path_id(p, -2))

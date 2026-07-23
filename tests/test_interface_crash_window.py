@@ -670,10 +670,12 @@ class CloseSessionMatrixTest(unittest.TestCase):
         self.assertEqual(ist[1], "delivery_unknown")
         self.assertEqual(ist[2], 1, "evidence must survive the close")
         alert = self.con.execute(
-            "SELECT 1 FROM planner_alerts WHERE session_id=? AND "
-            "reason='crash_window_delivery_unknown' AND resolved_at IS NULL",
+            "SELECT resolved_at FROM planner_alerts WHERE session_id=? AND "
+            "reason='crash_window_delivery_unknown'",
             (sid,)).fetchone()
         self.assertIsNotNone(alert)
+        self.assertIsNotNone(
+            alert[0], "ended-generation alerts remain as resolved audit")
 
     def _binding_with_message(self, sid):
         """A binding on sid's generation (its own sprint doc — one ACTIVE

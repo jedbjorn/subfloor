@@ -317,6 +317,59 @@ class SprintOpsRoutesTest(unittest.TestCase):
                                  (SHELL2,))
         self.assertEqual(body["alerts"], [])
 
+    def test_alert_acknowledgement_dismisses_current_but_keeps_audit(self):
+        con = sqlite3.connect(self.db_path)
+        interface_broker._alert(
+            con, severity="warning", reason="turn_failure",
+            session_id=self.sid)
+        alert_id = con.execute(
+            "SELECT alert_id FROM planner_alerts WHERE session_id=?",
+            (self.sid,)).fetchone()[0]
+        con.commit()
+        con.close()
+        status, body = self.call(
+            "POST",
+            f"/api/interface/sprint-alerts/{alert_id}/acknowledge",
+            (OP, "Idempotency-Key: ack-1"), {})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["alert_id"], alert_id)
+        self.assertIsNotNone(body["acknowledged_at"])
+        status, body = self.call(
+            "GET", f"/api/interface/sprint-alerts?session_id={self.sid}",
+            (OP,))
+        self.assertEqual(body["alerts"], [])
+        status, body = self.call(
+            "GET", f"/api/interface/sprint-alerts?session_id={self.sid}"
+                   "&include_resolved=1", (OP,))
+        self.assertEqual(len(body["alerts"]), 1)
+        self.assertIsNotNone(body["alerts"][0]["acknowledged_at"])
+        self.assertIsNone(body["alerts"][0]["resolved_at"])
+        self.assertIn("meaning", body["alerts"][0])
+        self.assertIn("next_action", body["alerts"][0])
+
+    def test_planner_alert_query_defaults_to_current_generation(self):
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "INSERT INTO interface_generations "
+            "(shell_id, generation, ended_at) VALUES (1,2,datetime('now'))")
+        old_sid = con.execute(
+            "INSERT INTO interface_sessions "
+            "(shell_id, generation, occupancy, lifecycle, ended_at) "
+            "VALUES (1,2,'ended','ended',datetime('now'))").lastrowid
+        interface_broker._alert(
+            con, severity="warning", reason="turn_failure",
+            session_id=old_sid)
+        interface_broker._alert(
+            con, severity="warning", reason="turn_failure",
+            session_id=self.sid)
+        con.commit()
+        con.close()
+        status, body = self.call(
+            "GET", "/api/interface/sprint-alerts?planner_shell_id=1", (OP,))
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [a["session_id"] for a in body["alerts"]], [self.sid])
+
     # -- retry ---------------------------------------------------------------------
 
     def test_retry_parked_batch_never_resubmits_park(self):

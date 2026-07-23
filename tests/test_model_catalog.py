@@ -3,7 +3,7 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → `opencode models` CLI →
-cache → static floor. Payload v2 is family-first: per harness `families`
+cache → static floor. Payload v3 retains family metadata for compatibility:
 (newest-first; claude families with a CLI alias resolve `latest` to the
 alias) plus the flat `models` list for sub-version search. These tests pin
 that contract: harness→provider mapping and opencode prefixing, family
@@ -294,7 +294,7 @@ class CatalogCacheTest(NoCLI):
         floor_fams = {f["family"]: f["latest"]
                       for f in got["harnesses"]["claude"]["families"]}
         self.assertEqual(floor_fams.get("opus"), "opus",
-                         "floor still offers alias family chips")
+                         "floor retains alias family compatibility metadata")
         self.assertEqual(floor_fams.get("fable"), "fable",
                          "fable ships in the floor with its self-tracking alias")
 

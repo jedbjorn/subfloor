@@ -226,6 +226,17 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertIn("cols", call["body"])
         self.assertEqual(json.loads(out)["session_id"], 11)
 
+    def test_start_names_wait_or_legal_cancel_action(self):
+        self.http.add("POST", "/api/interface/sessions",
+                      {"session_id": 11, "shell_id": 1, "generation": 1,
+                       "occupancy": "reserved", "lifecycle": "starting",
+                       "harness": "claude"})
+        rc, out, _ = self.run_cli(["start", "s1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("wait for it to become occupied", out)
+        self.assertIn("stop S1", out)
+        self.assertNotIn("interface attach", out)
+
     def test_start_occupied_race_reports_existing_session(self):
         self.http.add("POST", "/api/interface/sessions",
                       http_error(409, "shell_occupied", "a live generation "
@@ -268,7 +279,7 @@ class InterfaceCliTest(unittest.TestCase):
 
     def test_attach_held_lease_refuses_without_takeover(self):
         self.http.add("POST", "/api/interface/writer-leases",
-                      http_error(409, "lease_refused", "session 7 writer "
+                      http_error(409, "writer_held", "session 7 writer "
                                  "held by web-1 — explicit takeover required"))
         rc, _, err = self.run_cli(["attach", "s2"])
         self.assertEqual(rc, 1)
@@ -388,7 +399,7 @@ class InterfaceCliTest(unittest.TestCase):
 
     def test_enter_occupied_lease_held_falls_back_readonly(self):
         self.http.add("POST", "/api/interface/writer-leases",
-                      http_error(409, "lease_refused", "writer held by web-1"))
+                      http_error(409, "writer_held", "writer held by web-1"))
         rc, _, err = self.run_cli(["enter", "s2"])
         self.assertEqual(rc, 0)
         self.assertIn("READ-ONLY", err)
@@ -398,6 +409,19 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertEqual(self.stream.call_args[0][1], "viewer")
 
     def test_enter_starting_or_lost_refuses(self):
+        starting = json.loads(json.dumps(SHELLS))
+        starting["shells"][2].update(
+            availability="starting", lifecycle="starting")
+        self.http.add("GET", "/api/interface/shells", starting)
+        rc, _, err = self.run_cli(["enter", "s3"])
+        self.assertEqual(rc, 1)
+        self.assertIn("stop S3", err)
+        self.assertNotIn("interface view", err)
+        self.assertEqual(self.http.find("POST", "/api/interface/stream-tickets"),
+                         [])
+        self.stream.assert_not_called()
+
+        self.http.add("GET", "/api/interface/shells", SHELLS)
         rc, _, err = self.run_cli(["enter", "s3"])
         self.assertEqual(rc, 1)
         self.assertIn("lost", err)
