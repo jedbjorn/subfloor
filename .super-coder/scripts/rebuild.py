@@ -24,21 +24,19 @@ DB_PATH = ENGINE / "shell_db.db"
 SCHEMA_SQLITE = ENGINE / "schema.sql"
 SNAPSHOT       = REPO_ROOT / ".sc-state" / "content.sql"
 SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
-# PER-FORK backup dir, keyed by the host repo's dir name. This was a fixed
-# "super-coder" for every fork, which pooled all forks' pre-update dumps in one
-# dir — and rollback restores the MOST RECENT dump, so a multi-fork update
-# sweep could roll one fork back onto ANOTHER FORK'S DB. In the source repo the
-# name IS super-coder, so its path is unchanged. Old pooled dumps stay where
-# they are: they cannot be attributed to a fork after the fact.
-BACKUP_DIR = Path.home() / "db_backups" / REPO_ROOT.name
-
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_backup as db_backup_mod  # noqa: E402
 import db_driver    # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import map_repo     # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
 import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
+
+# Compatibility/readability constant: the historical preferred location.
+# Writes resolve dynamically through backup_dir() so a restricted host seat can
+# fall through to SC_DB_BACKUP_DIR or the repo-local gitignored destination.
+BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
 
 
 def snapshot_path() -> Path:
@@ -119,8 +117,13 @@ def restore_keys(keys: dict) -> int:
 KEEP_BACKUPS = 5
 
 
-def prune_backups(prefix: str) -> None:
-    backups = sorted(BACKUP_DIR.glob(f"{prefix}.*.db"))
+def backup_dir() -> Path:
+    return db_backup_mod.select_backup_dir(REPO_ROOT)
+
+
+def prune_backups(prefix: str, directory: Path | None = None) -> None:
+    target = directory or backup_dir()
+    backups = sorted(target.glob(f"{prefix}.*.db"))
     for old in backups[:-KEEP_BACKUPS]:
         old.unlink(missing_ok=True)
 
@@ -143,11 +146,11 @@ def backup_db(dst: Path, src: Path = DB_PATH) -> None:
 def backup_existing() -> None:
     if not DB_PATH.exists():
         return
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    target = backup_dir()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = BACKUP_DIR / f"shell_db.prerebuild.{ts}.db"
+    dst = target / f"shell_db.prerebuild.{ts}.db"
     backup_db(dst)
-    prune_backups("shell_db.prerebuild")
+    prune_backups("shell_db.prerebuild", target)
     print(f"rebuild: backed up existing DB -> {dst}")
 
 

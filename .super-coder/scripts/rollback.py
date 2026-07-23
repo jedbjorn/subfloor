@@ -36,19 +36,21 @@ ENGINE_REF = STATE_DIR / "engine.ref"
 ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import db_backup as db_backup_mod  # noqa: E402
 import engine_manifest  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, backup_db, prune_backups, KEEP_BACKUPS)
 import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
 
-# One source of truth with rebuild.py — the PER-FORK dir. A restore point must
-# come from THIS fork's backups: a private copy of the path is exactly how the
-# pooled-dir hazard happened (rollback restoring another fork's dump).
+# Compatibility alias for callers that inspect the preferred location. Runtime
+# reads/writes use rebuild_mod.backup_dir() so restricted seats share the same
+# fallback selection as rebuild and restart.
 BACKUP_DIR = rebuild_mod.BACKUP_DIR
 
 
 def latest_db_restore_point() -> Path | None:
-    backups = sorted(BACKUP_DIR.glob("shell_db.prerebuild.*.db"))
-    return backups[-1] if backups else None
+    return db_backup_mod.latest_backup(
+        REPO_ROOT, "shell_db.prerebuild.*.db"
+    )
 
 
 def backup_current_db() -> None:
@@ -56,11 +58,11 @@ def backup_current_db() -> None:
     never mistaken for a pre-update restore point on a later rollback."""
     if not DB_PATH.exists():
         return
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    target = rebuild_mod.backup_dir()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = BACKUP_DIR / f"shell_db.prerollback.{ts}.db"
+    dst = target / f"shell_db.prerollback.{ts}.db"
     rebuild_mod.backup_db(dst)
-    rebuild_mod.prune_backups("shell_db.prerollback")
+    rebuild_mod.prune_backups("shell_db.prerollback", target)
     print(f"→ backed up current DB -> {dst}")
 
 
@@ -99,7 +101,7 @@ def main() -> int:
     src = latest_db_restore_point()
     if src is None:
         sys.exit("rollback: no shell_db.prerebuild.*.db restore point found in "
-                 f"{BACKUP_DIR} — nothing to roll back to.")
+                 f"{rebuild_mod.backup_dir()} — nothing to roll back to.")
     prev_sha = ENGINE_REF_PREV.read_text().strip() if ENGINE_REF_PREV.exists() else ""
 
     print("→ rolling back the last update (DB + engine pair-restore)")

@@ -38,9 +38,9 @@ SC := ./sc
 # Hot commands — long form, with a one-letter alias delegating to it.
 dos-enter:            ; $(SC) $(if $(s),enter-$(s),enter)
 dos-e: dos-enter
-dos-launch:           ; $(SC) launch
+dos-launch:           ; $(SC) launch $(ARGS)
 dos-l: dos-launch
-dos-restart:          ; $(SC) restart
+dos-restart:          ; $(SC) restart $(ARGS)
 dos-r: dos-restart
 dos-down:             ; $(SC) down
 dos-d: dos-down

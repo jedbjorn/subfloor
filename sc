@@ -116,6 +116,15 @@ dbuild() {
     "$here"
 }
 
+dimage_preflight() {
+  if docker image inspect "$IMG" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "✗ --no-build: sandbox image '$IMG:latest' is missing; nothing was stopped." >&2
+  echo "  Run ./sc build, then retry with --no-build." >&2
+  return 1
+}
+
 # ── dev kit (deps + test) — in-container primitives, like serve/boot ──────────
 # A shell runs these from INSIDE the sandbox, where pip/npm act directly on the
 # bind-mounted repo: the .venv / node_modules they create live in the mount and so
@@ -825,29 +834,139 @@ sc_persist() {
 }
 
 
-# WAL-safe DB backup via sqlite3's online-backup API — a plain file copy of a
-# live WAL database misses un-checkpointed pages (they live in the -wal
-# sidecar). Same dir + naming + keep-5 pruning as rebuild.py/rollback.py.
+# Resolve + write-probe the destination before a restart changes any runtime
+# state. db_backup.py is also used by rebuild/rollback, keeping one deterministic
+# override → home → repo-local fallback contract across every engine backup.
+sc_db_backup_preflight() {
+  "$PY" "$S/db_backup.py" select "$ROOT"
+}
 sc_db_backup() {
-  "$PY" - "$DB" "$(basename "$ROOT")" "${1:-manual}" <<'EOF'
-import sqlite3, sys, time
-from pathlib import Path
-db, repo, prefix = sys.argv[1:4]
-if not Path(db).exists():
-    print("→ no DB yet — nothing to back up"); raise SystemExit(0)
-bdir = Path.home() / "db_backups" / repo
-bdir.mkdir(parents=True, exist_ok=True)
-dst = bdir / f"shell_db.{prefix}.{time.strftime('%Y%m%d_%H%M%S')}.db"
-src = sqlite3.connect(db); out = sqlite3.connect(dst)
-try:
-    with out:
-        src.backup(out)
-finally:
-    out.close(); src.close()
-for old in sorted(bdir.glob(f"shell_db.{prefix}.*.db"))[:-5]:
-    old.unlink()
-print(f"→ DB backed up -> {dst}")
-EOF
+  prefix="${1:-manual}"
+  destination="${2:-}"
+  if [ -n "$destination" ]; then
+    "$PY" "$S/db_backup.py" backup "$DB" "$ROOT" "$prefix" "$destination"
+  else
+    "$PY" "$S/db_backup.py" backup "$DB" "$ROOT" "$prefix"
+  fi
+}
+
+sc_systemd_unit_loaded() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ "$(systemctl --user show "$1" -p LoadState --value 2>/dev/null)" = "loaded" ]
+}
+
+sc_wait_until() {
+  check="$1"
+  attempts=0
+  while [ "$attempts" -lt 20 ]; do
+    "$check" && return 0
+    attempts=$((attempts + 1))
+    sleep 0.25
+  done
+  return 1
+}
+
+sc_sandbox_alive() {
+  docker inspect --format '{{.State.Running}}' "$CNAME" 2>/dev/null | grep -q true \
+    && curl -fsS "http://127.0.0.1:$(port)/api/health" >/dev/null 2>&1
+}
+
+sc_pg_healthy() {
+  sc_pg_alive && docker exec "$PGNAME" pg_isready -U sc -d sc >/dev/null 2>&1
+}
+
+sc_vm_broker_configured() { "$PY" "$S/vm.py" configured; }
+sc_ts_broker_configured() { "$PY" "$S/ts.py" configured; }
+sc_pm2_broker_configured() { "$PY" "$S/pm2.py" configured; }
+sc_db_broker_configured() { "$PY" "$S/dbq.py" configured; }
+
+# Restart one configured broker through its actual supervisor. launch has
+# already recreated pidfile-managed brokers; systemd-managed brokers remain
+# alive across down by design, so restart them explicitly to load current code.
+sc_restart_broker() {
+  label="$1"
+  configured="$2"
+  alive="$3"
+  up="$4"
+  down="$5"
+  pidfile="$6"
+  unit="$7"
+  if ! "$configured"; then
+    echo "  $label: skipped (unconfigured)"
+    return 0
+  fi
+  supervisor="pidfile"
+  if sc_systemd_unit_loaded "$unit"; then
+    supervisor="systemd"
+    # A loaded-but-previously-inactive unit may have let launch create a
+    # pidfile process. Remove that exact process before handing ownership back
+    # to systemd; an already-active systemd process is deliberately left alone
+    # by the broker's down helper and then restarted by its supervisor.
+    "$down" >/dev/null 2>&1 || true
+    if ! systemctl --user restart "$unit"; then
+      echo "  $label: failed (systemd restart)"
+      SC_RESTART_FAILED=1
+      return 0
+    fi
+  elif ! "$up"; then
+    echo "  $label: failed (start)"
+    SC_RESTART_FAILED=1
+    return 0
+  elif [ ! -f "$pidfile" ]; then
+    echo "  $label: failed (live broker has no recognized supervisor)"
+    SC_RESTART_FAILED=1
+    return 0
+  fi
+  if sc_wait_until "$alive"; then
+    echo "  $label: restarted ($supervisor)"
+  else
+    echo "  $label: failed (unhealthy after $supervisor restart)"
+    SC_RESTART_FAILED=1
+  fi
+}
+
+sc_restart_health_summary() {
+  launch_rc="$1"
+  SC_RESTART_FAILED=0
+  echo "→ restart health"
+  if [ "$launch_rc" -eq 0 ] && sc_wait_until sc_sandbox_alive; then
+    echo "  sandbox: restarted"
+  else
+    echo "  sandbox: failed (launch or health)"
+    SC_RESTART_FAILED=1
+  fi
+  sc_restart_broker "vm-broker" \
+    sc_vm_broker_configured sc_vm_broker_alive sc_vm_broker_up \
+    sc_vm_broker_down "$VM_BROKER_PID" "$VM_BROKER_UNIT"
+  sc_restart_broker "ts-broker" \
+    sc_ts_broker_configured sc_ts_broker_alive sc_ts_broker_up \
+    sc_ts_broker_down "$TS_BROKER_PID" "$TS_BROKER_UNIT"
+  sc_restart_broker "pm2-broker" \
+    sc_pm2_broker_configured sc_pm2_broker_alive sc_pm2_broker_up \
+    sc_pm2_broker_down "$PM2_BROKER_PID" "$PM2_BROKER_UNIT"
+  sc_restart_broker "db-broker" \
+    sc_db_broker_configured sc_db_broker_alive sc_db_broker_up \
+    sc_db_broker_down "$DB_BROKER_PID" "$DB_BROKER_UNIT"
+  if sc_pg_configured; then
+    if sc_wait_until sc_pg_healthy; then
+      echo "  postgres: restarted"
+    else
+      echo "  postgres: failed (unhealthy after restart)"
+      SC_RESTART_FAILED=1
+    fi
+  else
+    echo "  postgres: skipped (unconfigured)"
+  fi
+  if sc_watch_daemon_unit_active; then
+    systemctl --user stop "$WATCH_DAEMON_UNIT" >/dev/null 2>&1 || true
+  fi
+  if sc_watch_daemon_alive || sc_watch_daemon_unit_active; then
+    echo "  legacy-watch-daemon: failed (retired service still running)"
+    SC_RESTART_FAILED=1
+  else
+    echo "  legacy-watch-daemon: skipped (retired; confirmed stopped)"
+  fi
+  [ "$SC_RESTART_FAILED" -eq 0 ]
 }
 
 
@@ -977,12 +1096,26 @@ case "$cmd" in
   typecheck)    sc_typecheck "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
+    no_build=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --no-build) no_build=1 ;;
+        -h|--help)
+          echo "usage: ./sc launch [--no-build]"
+          echo "  --no-build  reuse the existing $IMG:latest image; refuse if absent"
+          exit 0 ;;
+        *)
+          echo "sc launch: unknown argument '$1' (usage: ./sc launch [--no-build])" >&2
+          exit 2 ;;
+      esac
+      shift
+    done
     dcheck
+    if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
     dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dp="$(devport)"
-    dbuild
     dnet
     # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
     # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
@@ -1081,6 +1214,9 @@ case "$cmd" in
     sc_ts_broker_up || true
     # Same for the pm2 broker — self-skips when no `pm2` block is linked.
     sc_pm2_broker_up || true
+    # Same for the read-only DB broker — it was previously omitted from the
+    # sandbox lifecycle, so a restart could leave configured diagnostics down.
+    sc_db_broker_up || true
     # PR polling rides the engine service itself (spec #20, decision #19) —
     # no host watch-daemon is started here anymore.
     # Start the PG sidecar when configured — self-skips otherwise.
@@ -1094,6 +1230,7 @@ case "$cmd" in
                 sc_vm_broker_down
                 sc_ts_broker_down
                 sc_pm2_broker_down
+                sc_db_broker_down
                 sc_watch_daemon_down
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
@@ -1102,20 +1239,43 @@ case "$cmd" in
   # dos-e), so: typed confirmation (only YES / Yes / yes proceed — anything
   # else, including a closed stdin, aborts) + a WAL-safe DB backup BEFORE
   # anything is torn down. --yes/-y skips the prompt for scripted callers.
+  # --no-build validates the existing image before down; the default path
+  # likewise completes its build before down, so a known preflight failure
+  # cannot strand a healthy fork offline.
   restart)
-    case "${1:-}" in
-      -y|--yes) shift ;;
-      *)
-        echo "restart recreates the sandbox — live sessions inside it are killed."
-        printf "ARE YOU SURE YOU WANT TO RESTART? (YES/no): "
-        ans=""; read -r ans || true
-        case "$ans" in
-          YES|Yes|yes) ;;
-          *) echo "→ restart aborted (nothing touched)"; exit 1 ;;
-        esac ;;
-    esac
-    sc_db_backup prerestart
-    "$0" down; exec "$0" launch "$@" ;;
+    assume_yes=""
+    no_build=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -y|--yes) assume_yes=1 ;;
+        --no-build) no_build=1 ;;
+        -h|--help)
+          echo "usage: ./sc restart [-y|--yes] [--no-build]"
+          echo "  --no-build  reuse the existing $IMG:latest image; preflight before down"
+          exit 0 ;;
+        *)
+          echo "sc restart: unknown argument '$1' (usage: ./sc restart [-y|--yes] [--no-build])" >&2
+          exit 2 ;;
+      esac
+      shift
+    done
+    if [ -z "$assume_yes" ]; then
+      echo "restart recreates the sandbox — live sessions inside it are killed."
+      printf "ARE YOU SURE YOU WANT TO RESTART? (YES/no): "
+      ans=""; read -r ans || true
+      case "$ans" in
+        YES|Yes|yes) ;;
+        *) echo "→ restart aborted (nothing touched)"; exit 1 ;;
+      esac
+    fi
+    dcheck
+    if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
+    backup_dir="$(sc_db_backup_preflight)"
+    sc_db_backup prerestart "$backup_dir"
+    "$0" down
+    launch_rc=0
+    "$0" launch --no-build || launch_rc=$?
+    sc_restart_health_summary "$launch_rc" ;;
   build)        dcheck; dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
@@ -1186,6 +1346,7 @@ super-coder — forkable shell substrate
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
   ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
+                             --no-build reuses the existing image and refuses before runtime changes when absent
   ./sc enter               enter a shell through the Interface API: pick a shell, then
                              New chat (harness picker) if available, else reattach the live session
   ./sc enter-<shortname>   enter that shell directly (skip the shell picker)
@@ -1200,7 +1361,8 @@ super-coder — forkable shell substrate
                              default prompt · --harness <h> · -m <model> (else flavor_defaults);
                              --effort defaults to high; refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
-  ./sc restart             confirm (YES) + DB backup, then down + launch — recreate fresh (--yes skips the prompt)
+  ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services
+                             --yes skips the prompt · --no-build preflights/reuses the existing image
   ./sc build               (re)build the sandbox image
   ./sc logs                tail the sandbox server logs
 
