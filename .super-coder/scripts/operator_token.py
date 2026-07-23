@@ -46,6 +46,10 @@ def main(argv: "list[str] | None" = None) -> int:
         mem.die(f"no Admin runtime credential in {mem._CRED_DIR} — the "
                 "supervised service provisions one per Admin shell at boot "
                 "(`./sc restart` / `make dos-r`).")
+    # codeql[py/clear-text-logging-sensitive-data] — printing the operator
+    # token to stdout IS this command's spec'd function (doc #30 req 23):
+    # stdout is the paste channel for the browser sign-in prompt, never a
+    # log; nothing else is written anywhere.
     print(mem.SC_API_TOKEN)
     return 0
 
