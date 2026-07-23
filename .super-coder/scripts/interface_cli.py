@@ -582,6 +582,132 @@ def cmd_reconcile(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ recover
+
+def _confirm(prompt: str, yes: bool) -> None:
+    """A scoped interactive confirmation; --yes pre-answers it. Never
+    prompt on a non-terminal — refuse instead (the eject.py convention)."""
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        die("confirmation required on a terminal — re-run with --yes to "
+            "pre-confirm", EXIT_REFUSED)
+    if input(f"{prompt} [y/N] ").strip().lower() not in ("y", "yes"):
+        die("aborted by operator", EXIT_REFUSED)
+
+
+def _print_recovery_preview(preview: dict) -> None:
+    ev = preview["evidence"]
+    print(f"→ classification: {preview['classification']} "
+          f"(legal actions: {', '.join(preview['legal_actions']) or 'none'})")
+    sess = ev.get("session")
+    if sess:
+        print(f"  session {sess['session_id']} gen {sess['generation']}: "
+              f"{sess['occupancy']}/{sess['lifecycle']} "
+              f"({sess.get('harness') or '?'})")
+    proc = ev.get("process") or {}
+    if proc.get("pane_pid"):
+        print(f"  process: pid {proc['pane_pid']} "
+              f"ticks {proc['pane_start_ticks']} "
+              f"pgid {proc.get('pgid')} — {proc['pid_state']}"
+              + ("" if proc.get("pane_present") is None else
+                 f", pane {'present' if proc['pane_present'] else 'gone'}"))
+    archive = ev.get("archive")
+    if archive:
+        print(f"  archive {archive['archive_id']}: "
+              f"{'open' if archive['ended_at'] is None else 'closed'}"
+              + (" (active)" if archive.get("active") else ""))
+    if ev.get("sprint_binding"):
+        print(f"  sprint binding {ev['sprint_binding']['binding_id']} armed")
+    print(f"  unread messages: {ev['unread_messages']} (left unread)")
+    git = ev.get("git")
+    if git:
+        print(f"  worktree {git['worktree']}: branch {git['branch']}, "
+              f"{git['dirty_tracked']} dirty tracked, {git['untracked']} "
+              f"untracked, {git['unpushed_commits']} unpushed commit(s)")
+
+
+def cmd_recover(args) -> int:
+    shell = _find_shell(args.shell)
+    shell_id = shell["shell_id"]
+    shortname = shell.get("shortname")
+    try:
+        preview = api("GET", f"/api/interface/shells/{shell_id}/recovery")
+    except ApiError as exc:
+        _print_api_error(exc)
+        raise SystemExit(EXIT_REFUSED) from exc
+
+    classification = preview["classification"]
+    legal = preview["legal_actions"]
+    if not args.json:
+        _print_recovery_preview(preview)
+
+    mode = "force" if args.force else "recover"
+    if mode not in legal:
+        if args.json:
+            _print_json({"preview": preview, "result": None})
+        if classification == "available":
+            print(f"→ {shortname} is available — nothing to recover")
+            return 0
+        print(f"→ {classification.replace('_', ' ')} — no automatic action; "
+              "investigate the evidence above", file=sys.stderr)
+        return EXIT_REFUSED
+
+    body = {"observation_id": preview["observation_id"], "mode": mode,
+            "preserve_worktree": not args.discard_worktree}
+    if mode == "force":
+        proc = preview["evidence"]["process"]
+        _confirm(
+            f"Force recover {shortname}: SIGTERM the exact process group of "
+            f"pid {proc.get('pane_pid')} (ticks "
+            f"{proc.get('pane_start_ticks')}, pgid {proc.get('pgid')}), "
+            "SIGKILL after the bounded grace if it persists?",
+            args.yes)
+        body["confirm_force"] = True
+    if args.discard_worktree:
+        if not args.yes:
+            _confirm(
+                f"Discard ALL tracked and untracked file changes in "
+                f"{shortname}'s worktree (unpushed commits refuse)?",
+                False)
+        body["discard_worktree"] = True
+        body["confirm_shortname"] = shortname
+    try:
+        result = api("POST", f"/api/interface/shells/{shell_id}/recovery",
+                     body)
+    except ApiError as exc:
+        _print_api_error(exc)
+        if exc.code == "recovery_observation_stale":
+            print("  state changed since the preview — re-run to preview "
+                  "again", file=sys.stderr)
+        raise SystemExit(EXIT_REFUSED) from exc
+    if args.json:
+        _print_json({"preview": preview, "result": result})
+        return 0
+    sig = result.get("signaled")
+    if sig and sig.get("signaled"):
+        print(f"→ signaled pid {sig['pid']} (pgid {sig.get('pgid')}"
+              f"{', escalated to SIGKILL' if sig.get('escalated') else ''})")
+    closed = result.get("closed") or {}
+    if closed.get("session"):
+        print(f"→ session {closed['session']['session_id']} ended "
+              f"({closed['session']['end_reason']})")
+    if closed.get("archive"):
+        print(f"→ archive {closed['archive']['archive_id']} closed")
+    if closed.get("binding"):
+        print(f"→ sprint binding {closed['binding']['binding_id']} released")
+    for parked in closed.get("parked", []):
+        print(f"→ parked ambiguous binding {parked['binding_id']}: "
+              f"{parked['next_action']}")
+    wt = result.get("worktree") or {}
+    if wt.get("discarded"):
+        print(f"→ worktree {wt['worktree']} changes discarded")
+    else:
+        print("→ worktree preserved")
+    print(f"→ {shortname} is {result.get('availability')}")
+    return 0
+
+
 # ------------------------------------------------------------------ enter
 
 def _flavor_harness(shell: dict) -> str | None:
@@ -739,6 +865,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="end an unreconciled session after proved absence")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(fn=cmd_reconcile)
+
+    sp = sub.add_parser("recover", help="preview + execute shell recovery")
+    sp.add_argument("shell")
+    sp.add_argument("--force", action="store_true",
+                    help="terminate a verified-live exact process identity")
+    sp.add_argument("--discard-worktree", action="store_true",
+                    help="also discard tracked/untracked worktree changes "
+                         "(refuses unpushed commits; never implied)")
+    sp.add_argument("--yes", action="store_true",
+                    help="pre-answer the scoped confirmations")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_recover)
 
     sp = sub.add_parser("enter", help="the `sc enter` flow (in-container)")
     sp.add_argument("shell", nargs="?")

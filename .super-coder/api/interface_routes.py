@@ -50,6 +50,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 import db_driver  # noqa: E402
 import interface_broker  # noqa: E402
 import interface_hooks  # noqa: E402
+import interface_recovery  # noqa: E402
 import interface_state  # noqa: E402
 import interface_wake  # noqa: E402
 import ports as ports_mod  # noqa: E402
@@ -972,6 +973,62 @@ def _reconcile(actor, headers, body):
         con.close()
 
 
+# ------------------------------------------------------------------ recovery
+
+def _recovery_worktree(con, shell_id: int) -> "str | None":
+    """The shell's conventional worktree (advisory git facts / discard
+    target). None when it doesn't exist — never invented."""
+    row = con.execute("SELECT shortname, flavor FROM shells WHERE shell_id=?",
+                      (shell_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        path = _worktree_for(row[0], row[1])
+    except Exception:
+        return None
+    return path if os.path.isdir(path) else None
+
+
+def _get_recovery(shell_id: int):
+    """Preview (spec #30 Shell Recovery): the server derives ONE
+    classification + the legal actions and stores them as a fingerprinted
+    observation; the client renders, never infers."""
+    con = _db()
+    try:
+        payload = interface_recovery.preview(
+            con, shell_id, _recovery_worktree(con, shell_id))
+        return _json(200, payload)
+    except interface_recovery.RecoveryError as exc:
+        return _err(exc.status, exc.code, exc.message, exc.details)
+    finally:
+        con.close()
+
+
+def _post_recovery(actor, headers, body, shell_id: int):
+    """Execute against a fresh observation. Idempotency-Key discipline as
+    every Interface mutation; a stale observation or changed durable state
+    refuses with 409 recovery_observation_stale."""
+    con = _db()
+    try:
+        def produce():
+            try:
+                payload = interface_recovery.execute(
+                    con, shell_id, body,
+                    _recovery_worktree(con, shell_id),
+                    abandon=(lambda sid: _runtime.call(_runtime.abandon(sid)))
+                    if _runtime is not None and _runtime.available else None)
+            except interface_recovery.RecoveryError as exc:
+                con.commit()
+                return exc.status, {"error": {"code": exc.code,
+                                              "message": exc.message,
+                                              "details": exc.details}}
+            return 200, payload
+        return _idempotent(con, actor, "shell_recovery", headers, body,
+                           produce)
+    finally:
+        con.close()
+
+
 # ------------------------------------------------------------------ hooks
 
 # ------------------------------------------------------------------ sprint wake
@@ -1703,6 +1760,10 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     u = urlparse(path)
     p = u.path
     query = parse_qs(u.query)
+    # The spec's canonical recovery prefix (spec #30 Shell Recovery) —
+    # identical authority and handlers as /api/interface/*.
+    if p.startswith("/_sc/interface/"):
+        p = "/api/interface/" + p[len("/_sc/interface/"):]
     try:
         data = json.loads(body) if body else {}
     except ValueError:
@@ -1741,6 +1802,11 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     try:
         if p == "/api/interface/shells" and method == "GET":
             return _list_shells()
+        if p.startswith("/api/interface/shells/") and p.endswith("/recovery"):
+            if method == "GET":
+                return _get_recovery(_path_id(p, -2))
+            if method == "POST":
+                return _post_recovery(actor, headers, data, _path_id(p, -2))
         if p == "/api/interface/sessions" and method == "POST":
             return _create_session(actor, headers, data)
         if p.startswith("/api/interface/sessions/") and method == "GET":
