@@ -2655,6 +2655,7 @@ def dispatch_http(method: str, path: str, headers_raw: str,
     interface module; everything else runs through the shimmed Handler."""
     parsed = urlparse(path)
     if parsed.path.startswith("/api/interface/") or \
+            parsed.path.startswith("/_sc/interface/") or \
             parsed.path.startswith("/api/planner-action-receipts"):
         if interface_routes is None:
             return (503, [("Content-Type", "application/json")],
