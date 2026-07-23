@@ -48,6 +48,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 import db_driver  # noqa: E402
 import interface_broker  # noqa: E402
+import interface_hooks  # noqa: E402
 import interface_state  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
@@ -781,16 +782,35 @@ def _reconcile(actor, headers, body):
 def _hook_callback(headers, body):
     """Generation-scoped hook authority: the token calls ONLY this route, for
     its one generation. session_start additionally promotes the reservation
-    (reserved → occupied) after exact identity proof."""
+    (reserved → occupied) after exact identity proof.
+
+    Contract (spec #20 Harness Hooks, seq 7): callbacks carry ONLY event,
+    session, generation, sequence, PID identity, and token — no content.
+    Wrong tokens, stale generations, replayed sequences, unknown events,
+    illegal transitions, and PID mismatches are rejected and audited.
+    `source` distinguishes the entrypoint's pre-exec identity claim from a
+    provider-native hook; only the provider's session_start is readiness."""
     authz = headers.get("Authorization") or ""
     token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
     shell_id, generation = body.get("shell_id"), body.get("generation")
     hook_seq, event = body.get("hook_seq"), body.get("event")
+    source = body.get("source", "provider")
     if not token or not isinstance(shell_id, int) \
             or not isinstance(generation, int) \
             or not isinstance(hook_seq, int) or not event:
         return _err(422, "validation",
                     "bearer token + shell_id, generation, hook_seq, event")
+    unknown = set(body) - {"shell_id", "generation", "hook_seq", "event",
+                           "source", "pid", "start_ticks", "archive_id",
+                           "cli_version"}
+    if unknown:
+        return _err(422, "validation", f"unknown fields: {sorted(unknown)}")
+    if event not in interface_hooks.EVENTS:
+        _log(f"hook event rejected shell={shell_id} gen={generation} "
+             f"event={event!r}")
+        return _err(422, "validation", f"unknown hook event {event!r}")
+    if source not in interface_hooks.SOURCES:
+        return _err(422, "validation", f"unknown hook source {source!r}")
     con = _db()
     try:
         gen = con.execute(
@@ -811,17 +831,22 @@ def _hook_callback(headers, body):
             return _err(404, "no_such_session", "no live session for generation")
         session_id, occupancy, pane_pid = sess
         try:
+            # Exact identity (spec: PID presence is never authority): a
+            # callback reporting a pid must report the pane's pid — the
+            # exec chain makes harness pid == pane pid, and the emitter
+            # passes $PPID. session_start MUST carry it (entrypoint and
+            # emitter both do); any mismatch fails closed, on any event.
+            if body.get("pid") is None and event == "session_start":
+                return _err(422, "validation",
+                            "session_start requires pid identity")
+            if body.get("pid") is not None and body.get("pid") != pane_pid:
+                _log(f"hook identity mismatch session={session_id} "
+                     f"event={event} pid={body.get('pid')} "
+                     f"pane_pid={pane_pid}")
+                return _err(403, "identity_mismatch",
+                            "reported pid is not the pane's pid")
             if event == "session_start":
-                # Exact identity (spec: PID presence is never authority): the
-                # entrypoint's pid must be the pane's pid — exec-chained all
-                # the way down. Any mismatch fails closed.
-                if body.get("pid") != pane_pid:
-                    _log(f"session_start identity mismatch session="
-                         f"{session_id} pid={body.get('pid')} "
-                         f"pane_pid={pane_pid}")
-                    return _err(403, "identity_mismatch",
-                                "reported pid is not the pane's pid")
-                if occupancy == "reserved":
+                if source == "entrypoint" and occupancy == "reserved":
                     interface_state.transition(
                         con, "occupancy", session_id, "occupied",
                         extra_sets={"occupied_at": _now(con),
@@ -830,15 +855,16 @@ def _hook_callback(headers, body):
                                     "harness_start_ticks":
                                         body.get("start_ticks"),
                                     "cli_version": body.get("cli_version")})
-                result = interface_broker.record_hook(
-                    con, shell_id, generation, hook_seq, event)
-            else:
-                result = interface_broker.record_hook(
-                    con, shell_id, generation, hook_seq, event)
+            result = interface_broker.record_hook(
+                con, shell_id, generation, hook_seq, event, source=source)
             con.commit()
             return _json(200, result)
         except interface_broker.BrokerError as exc:
             return _err(409, "hook_rejected", str(exc))
+        except interface_state.InterfaceTransitionError as exc:
+            _log(f"hook illegal transition session={session_id} "
+                 f"event={event}: {exc}")
+            return _err(409, "hook_rejected", f"illegal transition: {exc}")
     finally:
         con.close()
 

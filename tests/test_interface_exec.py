@@ -227,11 +227,42 @@ class InterfaceExecTest(unittest.TestCase):
         self.assertEqual(body["archive_id"], 4242,
                          "the archive id comes from prepare_launch")
         self.assertEqual(body["pid"], os.getpid())
+        self.assertEqual(body["source"], "entrypoint",
+                         "the pre-exec claim is identity, not readiness")
         self.assertIsInstance(body["start_ticks"], int)
         self.assertEqual(body["cli_version"], "test-cli 1.0")
         self.assertEqual(self.exec_calls[0][0], ["/bin/true"])
         self.assertEqual(self.plan_calls[0]["shell_id"], 1)
         self.assertEqual(self.plan_calls[0]["harness"], "claude")
+
+    def test_hook_credentials_reach_the_exec_env_only(self):
+        """The emitter's per-generation credentials travel in the launch
+        env (SC_INTERFACE_*) — never in argv, never on stderr; and the
+        harness's hook config is installed for the session (mocked here at
+        the capability-gated version in _fake_prepare: 'test-cli 1.0' is
+        below claude's floor, so install must refuse and add no argv)."""
+        code, err = self._run(self._write_token())
+        self.assertEqual(code, 0)
+        argv, env = self.exec_calls[0]
+        self.assertEqual(env["SC_INTERFACE_HOOK_TOKEN"], HOOK_TOKEN)
+        self.assertEqual(env["SC_INTERFACE_SHELL_ID"], "1")
+        self.assertEqual(env["SC_INTERFACE_GENERATION"], "3")
+        self.assertNotIn(HOOK_TOKEN, " ".join(argv))
+        self.assertNotIn(HOOK_TOKEN, err)
+        self.assertEqual(argv, ["/bin/true"],
+                         "unversioned harness → no hook config, chat "
+                         "still launches (ordinary chat unaffected)")
+
+    def test_hook_install_argv_is_appended(self):
+        with mock.patch.object(interface_exec.interface_hooks, "install",
+                               return_value={"installed": True,
+                                             "argv": ["--settings", "/x.json"],
+                                             "capability": {}}) as inst:
+            code, _ = self._run(self._write_token())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.exec_calls[0][0],
+                         ["/bin/true", "--settings", "/x.json"])
+        self.assertEqual(inst.call_args[0][0], "claude")
 
     # ── 4: fail closed ──────────────────────────────────────────────────
     def test_rejected_hook_never_execs(self):

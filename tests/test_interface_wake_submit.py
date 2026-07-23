@@ -274,5 +274,148 @@ class WakeSubmitGateTest(unittest.TestCase):
         self.assertEqual(writes, [10])
 
 
+class SubmitGateToctouTest(unittest.TestCase):
+    """REV2 seq-4 L5: the submit gate's check-then-commit must be
+    serialized. Two connections racing the gate can no longer both pass on
+    the same pre-commit snapshot — the write lock is taken BEFORE the gate
+    reads (BEGIN IMMEDIATE), so the loser re-reads and refuses."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "shell_db.db"
+        build_engine_db(self.db)
+        self.con = sqlite3.connect(self.db, timeout=5)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA busy_timeout=5000")
+
+    def tearDown(self):
+        self.con.close()
+        for p in self.tmp.glob("*"):
+            p.unlink()
+        self.tmp.rmdir()
+
+    def _arm(self):
+        con = self.con
+        con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (1,1)")
+        sid = con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle) VALUES (1,1,'occupied','idle')").lastrowid
+        con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id,"
+            " generation, composer) VALUES (?,1,1,'clean')", (sid,))
+        bid = con.execute(
+            "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
+            " planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (1,1,?,1,1)", (sid,)).lastrowid
+        mid = con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'wake','task',1)").lastrowid
+        con.execute(
+            "INSERT INTO planner_wake_items (binding_id, message_id) "
+            "VALUES (?,?)", (bid, mid))
+        con.commit()
+        batch = interface_broker.form_batch(con, bid)
+        con.commit()
+        return sid, bid, batch
+
+    def _other_con(self, busy_timeout=200):
+        con = sqlite3.connect(self.db, timeout=1)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute(f"PRAGMA busy_timeout={busy_timeout}")
+        return con
+
+    def test_second_submitter_refuses_after_first_commits(self):
+        _, _, batch = self._arm()
+        writes = []
+        out = interface_broker.submit_wake_batch(
+            self.con, batch, writer=lambda n: writes.append(n),
+            now_iso="2030-01-01 00:00:10")
+        self.assertTrue(out["submitted"])
+        other = self._other_con()
+        try:
+            with self.assertRaises(interface_broker.BrokerError) as ctx:
+                interface_broker.submit_wake_batch(
+                    other, batch, writer=lambda n: None,
+                    now_iso="2030-01-01 00:00:10")
+            self.assertIn("not queued", str(ctx.exception))
+        finally:
+            other.close()
+        self.assertEqual(len(writes), 1, "exactly one submission ever fires")
+
+    def test_gate_reads_cannot_observe_a_pre_commit_snapshot(self):
+        """A connection holding the write lock blocks a racing gate at
+        BEGIN IMMEDIATE — it never reads the gate on stale state."""
+        _, _, batch = self._arm()
+        holder = self._other_con()
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            racer = sqlite3.connect(self.db, timeout=1)
+            racer.execute("PRAGMA busy_timeout=200")
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    interface_broker.submit_wake_batch(
+                        racer, batch, writer=lambda n: None,
+                        now_iso="2030-01-01 00:00:10")
+                # The racer never touched the batch.
+                state = self.con.execute(
+                    "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+                    (batch,)).fetchone()[0]
+                self.assertEqual(state, "queued")
+            finally:
+                racer.close()
+        finally:
+            holder.rollback()
+            holder.close()
+        # With the lock released the same submit succeeds — the refusal was
+        # the serialization, not a gate failure.
+        out = interface_broker.submit_wake_batch(
+            self.con, batch, writer=lambda n: None,
+            now_iso="2030-01-01 00:00:10")
+        self.assertTrue(out["submitted"])
+
+    def test_human_frame_committed_first_cancels_the_gate(self):
+        """The race that mattered: a human frame reserving its sequence
+        BEFORE the submitting commit makes the gate see pending input —
+        the wake attempt cancels, no byte is sent."""
+        sid, _, batch = self._arm()
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok")
+        self.con.commit()
+        ack = interface_broker.accept_human_input(
+            self.con, sid, 1, 5, writer=lambda n: None)
+        self.assertEqual(ack, {"ack": 1, "duplicate": False})
+        out = interface_broker.submit_wake_batch(
+            self.con, batch, writer=lambda n: None,
+            now_iso="2030-01-01 00:00:10")
+        self.assertFalse(out["submitted"])
+        self.assertEqual(self._batch_state(batch), "queued")
+
+    def _batch_state(self, batch):
+        return self.con.execute(
+            "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+            (batch,)).fetchone()[0]
+
+    def test_submitting_commit_first_refuses_the_frame(self):
+        """The other ordering: once 'submitting' is committed, the input
+        lock refuses the human frame — no interleave inside the prompt."""
+        sid, _, batch = self._arm()
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok")
+        self.con.commit()
+        out = interface_broker.submit_wake_batch(
+            self.con, batch, writer=lambda n: None,
+            now_iso="2030-01-01 00:00:10")
+        self.assertTrue(out["submitted"])
+        with self.assertRaises(interface_broker.BrokerError) as ctx:
+            interface_broker.accept_human_input(
+                self.con, sid, 1, 5, writer=lambda n: None)
+        self.assertIn("input lock", str(ctx.exception))
+        # The refused frame left no residue: no pending reservation.
+        row = self.con.execute(
+            "SELECT pending_seq, composer FROM interface_input_state "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(row, (None, "clean"))
+
+
 if __name__ == "__main__":
     unittest.main()
