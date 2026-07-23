@@ -668,8 +668,13 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     """Gate + submit one coalesced fixed-prompt batch under the input lock.
 
     Revalidates everything the spec requires before a byte moves: the binding
-    still armed and its sprint still ACTIVE (a close between form_batch and
-    submit CANCELS the batch), occupied session, idle lifecycle, clean
+    still armed and its sprint still ACTIVE AND unfrozen (a close or freeze
+    between form_batch and submit CANCELS the batch — freeze is how sprint
+    authority is revoked, so a post-freeze wake is exactly what must not
+    fire), a live occupied session (an ended session gate-fails with an
+    ALERT and the batch stays queued for a future generation — End chat
+    deliberately does not release the sprint binding, so this gate must
+    never crash on it), idle lifecycle, clean
     composer, quiet >= quiet_s since the last accepted human input AND since
     REAL provider readiness (flag #49: the provider session_start stamp, NOT
     the pre-exec occupied_at — a >3s claude/codex boot must not submit into
@@ -684,6 +689,10 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     later event; the quiet failure carries retry_after so the coordinator
     can re-attempt at the exact debounce deadline (event-reset, never a
     poll).
+
+    The unmanaged-client probe runs BEFORE the write txn (SC-013): it
+    shells out to tmux, and a wedged-but-alive server must never hang the
+    drain thread while this gate holds the SQLite write lock.
 
     From the 'submitting' commit until the fenced submit hook, the batch
     holds the input lock: accept_human_input refuses new frames, so no human
@@ -705,6 +714,10 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     """
     if quiet_s <= 0:
         raise BrokerError("quiet_s must be > 0 — a zero debounce is forbidden")
+    # Decision #15 probe runs BEFORE the write txn (SC-013): it shells out
+    # to tmux, and a wedged-but-alive server must never hang the drain
+    # thread while this gate holds the SQLite write lock.
+    unmanaged = unmanaged_writable is not None and unmanaged_writable()
     began = _begin_immediate(con)
     try:
         batch = con.execute(
@@ -729,12 +742,16 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             began = False
             return {"submitted": False, "cancelled": True,
                     "reason": "binding released — sprint no longer armed"}
-        if not _sprint_active(con, binding[0]):
+        frozen = con.execute(
+            "SELECT frozen FROM documents WHERE document_id=?",
+            (binding[0],)).fetchone()
+        if (frozen is None or frozen[0]
+                or not _sprint_active(con, binding[0])):
             _cancel_batch(con, batch_id)
             con.commit()
             began = False
             return {"submitted": False, "cancelled": True,
-                    "reason": "sprint doc is not ACTIVE"}
+                    "reason": "sprint doc is frozen or not ACTIVE"}
 
         sess = con.execute(
             "SELECT session_id, occupancy, lifecycle, occupied_at, "
@@ -742,6 +759,21 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             "FROM interface_sessions "
             "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
             (shell_id, generation)).fetchone()
+        if sess is None:
+            # End chat (_end_session) deliberately does NOT release the
+            # binding or cancel queued wake work — chat and sprint
+            # lifecycles are separate — so an armed binding can outlive its
+            # session. The batch STAYS queued for a future generation; spec
+            # Retry Policy requires harness/session loss to queue AND alert
+            # (SC-011: a silent crash stall is the failure class this
+            # feature exists to prevent).
+            if began:
+                con.rollback()
+                began = False
+            _alert(con, severity="critical", reason="wake_session_ended",
+                   binding_id=binding_id)
+            con.commit()
+            return {"submitted": False, "reason": "session ended"}
         istate = con.execute(
             "SELECT composer, pending_seq, forwarded_seq, last_human_input_at "
             "FROM interface_input_state WHERE session_id=?",
@@ -765,11 +797,13 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
                 f"harness {sess[6]!r} lacks mandatory lifecycle hooks "
                 f"(missing: {', '.join(cap['missing_mandatory']) or 'version'})"
                 " — wake cannot submit")
-        if unmanaged_writable is not None and unmanaged_writable():
+        if unmanaged:
             # Decision #15: an unmanaged writable client bypasses the ordered
             # input boundary — detection sets composer unknown (which disarms
             # wake: the gate requires clean), alerts, and requires removal +
-            # explicit clean certification before rearming.
+            # explicit clean certification before rearming. The probe itself
+            # ran before the write txn (SC-013); only its verdict is applied
+            # here.
             interface_state.transition(con, "composer", sess[0], "unknown")
             _alert(con, severity="critical",
                    reason="unmanaged_writable_client", session_id=sess[0])

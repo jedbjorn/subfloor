@@ -100,6 +100,66 @@ async def wait_for(pred, timeout=10.0, what="condition"):
     raise AssertionError(f"timed out waiting for {what}")
 
 
+class WedgedTmuxTimeoutTest(unittest.TestCase):
+    """SC-013 (sprint 25 seq 8): every wake-path SYNC tmux call — the
+    unmanaged-client probe, the writer preflight, _send_keys_sync — is
+    timeout-bounded. A wedged-but-alive tmux (socket accepts, never
+    answers) must raise / fail closed fast, never hang the broker drain
+    thread (a hang strands the batch and, worse, used to stall it while
+    the gate held the SQLite write lock). Hermetic: a stub `tmux` that
+    sleeps forever, first on PATH, with the timeout constant patched
+    down for speed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "shell_db.db"
+        build_engine_db(self.db)
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        stub = bindir / "tmux"
+        stub.write_text("#!/bin/sh\nexec sleep 3600\n")
+        stub.chmod(0o755)
+        self.rt = interface_runtime.InterfaceRuntime(
+            str(self.db), run_dir=str(self.tmp / "run"))
+        self.rt.sock = str(self.tmp / "tmux.sock")
+        gen = mock.Mock()
+        gen.terminated = False
+        gen.pane_id = "%1"
+        self.rt.generations = {1: gen}
+        self._env = mock.patch.dict(
+            os.environ,
+            {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"})
+        self._env.start()
+        self._tmo = mock.patch.object(
+            interface_runtime, "TMUX_SYNC_TIMEOUT_S", 0.5)
+        self._tmo.start()
+
+    def tearDown(self):
+        self._tmo.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_probe_timeout_fails_closed_never_hangs(self):
+        start = time.monotonic()
+        # Unreachable/wedged tmux is NOT 'unmanaged' — the writer preflight
+        # owns that failure as definite pre-send (decision #32) — but the
+        # call must RETURN, not hang.
+        self.assertFalse(self.rt.unmanaged_writable_client(1))
+        self.assertLess(time.monotonic() - start, 5)
+
+    def test_wake_preflight_timeout_is_definite_pre_send(self):
+        writer = self.rt.wake_writer(1)
+        with self.assertRaises(interface_broker.PreSendError):
+            writer(len(interface_broker.WAKE_PROMPT) + 1)
+
+    def test_send_keys_timeout_raises_never_hangs(self):
+        # send-keys hangs AFTER bytes may have moved: TimeoutExpired must
+        # propagate (ambiguous → the broker parks delivery_unknown + alerts),
+        # never hang the worker thread.
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.rt._send_keys_sync("%1", b"x")
+
+
 # ------------------------------------------------------------------ unit (no tmux)
 
 class AvailabilityTest(unittest.TestCase):

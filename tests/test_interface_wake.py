@@ -375,6 +375,72 @@ class WakeGateHardeningTest(WakeFixture):
         with self.assertRaises(interface_broker.BrokerError):
             self.submit(batch_id, lambda n: None)
 
+    def test_ended_session_gate_fails_alerts_never_crashes(self):
+        # SC-011: End chat does NOT release the binding or cancel queued
+        # wake work — armed binding + queued batch + ended session must
+        # gate_fail WITH an alert (spec Retry Policy: session loss queues
+        # AND alerts), never die on a None dereference.
+        batch_id = self._armed_batch()
+        self.con.execute(
+            "UPDATE interface_sessions SET occupancy='ended' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        writes = []
+        out = self.submit(batch_id, writes.append)
+        self.assertFalse(out["submitted"])
+        self.assertIn("session ended", out["reason"])
+        self.assertEqual(writes, [], "no byte may move")
+        self.assertEqual(self.batch_state(batch_id), "queued",
+                         "the batch waits for a future generation")
+        alert = self.con.execute(
+            "SELECT severity FROM planner_alerts "
+            "WHERE reason='wake_session_ended' AND resolved_at IS NULL"
+        ).fetchone()
+        self.assertIsNotNone(alert, "session loss must alert, not stall")
+        self.assertEqual(alert[0], "critical")
+        # Idempotent: every drain / startup_pass re-attempt gate-fails
+        # cleanly — no re-crash, and the open alert dedupes (no spam).
+        out2 = self.submit(batch_id, writes.append)
+        self.assertFalse(out2["submitted"])
+        self.assertEqual(self.batch_state(batch_id), "queued")
+        count = self.con.execute(
+            "SELECT COUNT(*) FROM planner_alerts "
+            "WHERE reason='wake_session_ended' AND resolved_at IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_frozen_active_sprint_blocks_submit(self):
+        # SC-012: spec Sprint Scope — a wake is eligible only while the doc
+        # is unfrozen AND ACTIVE. Freeze between form and submit revokes
+        # sprint authority exactly like a close: the batch cancels, no byte.
+        batch_id = self._armed_batch()
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        writes = []
+        out = self.submit(batch_id, writes.append)
+        self.assertFalse(out["submitted"])
+        self.assertTrue(out["cancelled"])
+        self.assertEqual(writes, [], "a post-freeze wake must never fire")
+        self.assertEqual(self.batch_state(batch_id), "complete")
+        self.assertEqual(self.item_states()[0][2], "cancelled")
+
+    def test_probe_runs_outside_the_write_transaction(self):
+        # SC-013: the unmanaged-client probe shells out to tmux; run inside
+        # BEGIN IMMEDIATE, a wedged server would hang the drain thread WHILE
+        # HOLDING the SQLite write lock — an engine-wide write stall.
+        batch_id = self._armed_batch()
+        seen = {}
+
+        def probe():
+            seen["in_txn"] = self.con.in_transaction
+            return False
+
+        writes = []
+        out = self.submit(batch_id, writes.append, probe=probe)
+        self.assertTrue(out["submitted"], out)
+        self.assertFalse(seen["in_txn"],
+                         "the probe must not run inside the write txn")
+
 
 # ── Stop-hook reconciliation: ambiguity, quarantine, read-during-turn ─────────
 

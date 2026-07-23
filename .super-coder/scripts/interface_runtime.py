@@ -60,6 +60,8 @@ LEASE_LIVENESS_TIMEOUT = 40.0         # dead-lease sweep bound (WS PING_TIMEOUT)
 TICKET_TTL_S = 60
 GRACEFUL_TERMINATE_S = 10.0
 SHADOW_REQUEST_TIMEOUT_S = 10.0   # a sidecar that can't answer is dead
+TMUX_SYNC_TIMEOUT_S = 10.0   # a wedged-but-alive tmux must never hang the
+                             # broker worker thread (SC-013)
 
 TMUX_SESSION = "sc-interface"
 
@@ -542,7 +544,8 @@ class InterfaceRuntime:
                 subprocess.run(
                     ["tmux", "-S", self.sock, "display-message", "-p",
                      "-t", gen.pane_id, "#{pane_id}"],
-                    capture_output=True, check=True)
+                    capture_output=True, check=True,
+                    timeout=TMUX_SYNC_TIMEOUT_S)
             except Exception as exc:
                 raise interface_broker.PreSendError(
                     f"wake preflight failed for {gen.pane_id}: "
@@ -555,15 +558,18 @@ class InterfaceRuntime:
         """Decision #15 probe: any READ-WRITE tmux client attached to our
         private server is unmanaged — the broker never attaches a client,
         and a read-only diagnostic client (spec Tmux Runtime) is tolerated.
-        tmux itself being unreachable is NOT reported here (the wake
-        writer's preflight owns that failure, as definite pre-send)."""
+        tmux itself being unreachable — or wedged and never answering — is
+        NOT reported here (the wake writer's preflight owns that failure, as
+        definite pre-send); the timeout keeps a wedged server from hanging
+        the drain thread (SC-013)."""
         if session_id not in self.generations:
             return False
         try:
             out = subprocess.run(
                 ["tmux", "-S", self.sock, "list-clients",
                  "-F", "#{client_readonly}"],
-                capture_output=True, check=True, text=True).stdout
+                capture_output=True, check=True, text=True,
+                timeout=TMUX_SYNC_TIMEOUT_S).stdout
         except Exception:  # noqa: BLE001
             return False
         return any(line.strip() == "0" for line in out.splitlines())
@@ -648,13 +654,17 @@ class InterfaceRuntime:
     def _send_keys_sync(self, pane_id: str, payload: bytes) -> None:
         """The injected broker writer: chunked send-keys -H, ≤512 bytes per
         invocation, called exactly once per accepted frame (as many tmux
-        calls as chunks). Runs in the broker worker thread."""
+        calls as chunks). Runs in the broker worker thread. Every call is
+        timeout-bounded: a wedged server raises (TimeoutExpired — ambiguous,
+        the caller parks delivery_unknown) instead of hanging the thread
+        (SC-013)."""
         for off in range(0, len(payload), SENDKEYS_CHUNK):
             chunk = payload[off:off + SENDKEYS_CHUNK]
             subprocess.run(
                 ["tmux", "-S", self.sock, "send-keys", "-t", pane_id, "-H",
                  *[f"{b:02x}" for b in chunk]],
-                capture_output=True, check=True)
+                capture_output=True, check=True,
+                timeout=TMUX_SYNC_TIMEOUT_S)
 
     async def send_keys(self, pane_id: str, payload: bytes) -> None:
         for off in range(0, len(payload), SENDKEYS_CHUNK):
