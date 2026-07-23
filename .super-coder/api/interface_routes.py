@@ -469,7 +469,20 @@ def _create_session(actor, headers, body):
                 # AMBIGUOUS tmux outcome leaves it unreconciled (spec #20
                 # Interface Workflow 4) — never a second process, never an
                 # auto-kill.
-                from interface_runtime import InterfaceUnavailable
+                from interface_runtime import InterfaceUnavailable, SpawnAborted
+                if isinstance(exc, SpawnAborted):
+                    # Cancel start won the race mid-spawn (SC-064): the
+                    # cancel path already closed this row and the runtime
+                    # killed the pane by exact identity. Never persist the
+                    # pane identity onto the ended row, never a 201.
+                    con.commit()
+                    return 409, {"error": {
+                        "code": "session_cancelled",
+                        "message": "the session was cancelled while its "
+                                   "harness was still spawning — the "
+                                   "partial spawn was torn down",
+                        "details": {"session_id": session_id,
+                                    "occupancy": "ended"}}}
                 definite = isinstance(exc, (InterfaceUnavailable,
                                             FileNotFoundError, ValueError))
                 if definite:
@@ -489,6 +502,27 @@ def _create_session(actor, headers, body):
                 return code, {"session_id": session_id, "shell_id": shell_id,
                               "occupancy": "ended" if definite else "unreconciled",
                               "error": str(exc)[:200]}
+            # Cancel-during-spawn convergence (SC-064), the backstop for
+            # every interleaving the runtime's abort check can't see (a
+            # cancel that landed before the generation was registered, or
+            # one that parked the row unreconciled): the row was concluded
+            # while we spawned — tear the just-created pane down by its
+            # exact identity instead of persisting that identity onto a
+            # concluded row. A live harness on an ended generation is the
+            # unclosable #519 wound; an occupied row (the entrypoint hook
+            # already promoted it) is the healthy fast-boot path.
+            occ = con.execute(
+                "SELECT occupancy FROM interface_sessions WHERE session_id=?",
+                (session_id,)).fetchone()[0]
+            if occ in ("ended", "unreconciled"):
+                _runtime.call(_runtime.abandon(session_id))
+                con.commit()
+                return 409, {"error": {
+                    "code": "session_cancelled",
+                    "message": "the session was concluded by a concurrent "
+                               "cancel while its harness was spawning — "
+                               "the pane was torn down by exact identity",
+                    "details": {"session_id": session_id, "occupancy": occ}}}
             con.execute(
                 "UPDATE interface_sessions SET tmux_socket=?, tmux_session=?, "
                 "tmux_window=?, tmux_pane_id=?, pane_pid=?, pane_start_ticks=? "

@@ -31,6 +31,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1220,6 +1221,64 @@ class InterfaceApiTest(unittest.TestCase):
             {"session_id": sid, "action": "close"})
         self.assertEqual(status, 200, body)
         self.assertTrue(body["closed"])
+
+    def test_cancel_during_inflight_spawn_tears_down_pane(self):
+        """SC-064: a cancel start landing while the runtime spawn is still
+        in flight (reservation committed, pane identity never persisted)
+        must not conclude as a live harness on an ended row — the #519
+        wound with no API path out. The create call converges instead: no
+        201, the pane torn down by exact identity, and the row stays the
+        cancel's terminal record with NULL identity."""
+        started = threading.Event()
+        release = threading.Event()
+        real_spawn = self.runtime.spawn
+
+        async def slow_spawn(**kw):
+            started.set()
+            release.wait(10)
+            return await real_spawn(**kw)
+
+        self.runtime.spawn = slow_spawn
+        outcome = {}
+
+        def create():
+            outcome["result"] = self.create_session()
+
+        t = threading.Thread(target=create)
+        t.start()
+        self.assertTrue(started.wait(10), "spawn in flight")
+        con = sqlite3.connect(self.db_path)
+        sid = con.execute(
+            "SELECT session_id FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0]
+        con.close()
+        # The SC-064 window: reserved/starting, pane identity still NULL.
+        status, _, body = self.call(
+            "POST", "/api/interface/termination-requests",
+            (OP, "Idempotency-Key: cx-race"),
+            {"session_id": sid, "force": False})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(body["end_reason"], "cancelled_before_spawn")
+        release.set()
+        t.join(10)
+        status, _, body = outcome["result"]
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "session_cancelled",
+                         "never a 201 + live harness on an ended row")
+        self.assertIn(sid, self.runtime.abandoned,
+                      "the just-spawned pane is torn down by exact identity")
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle, end_reason, tmux_pane_id, pane_pid "
+            "FROM interface_sessions WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess[:3], ("ended", "ended",
+                                    "cancelled_before_spawn"))
+        self.assertEqual(sess[3:], (None, None),
+                         "no pane identity persisted onto the ended row")
+        con.close()
+        # The shell is immediately available — no unmanaged-harness wound.
+        status, _, body = self.create_session(key="k-after-race-cancel")
+        self.assertEqual(status, 201, body)
 
     def test_terminate_unreconciled_points_at_reconcile(self):
         """An unreconciled session still refuses termination — but with a

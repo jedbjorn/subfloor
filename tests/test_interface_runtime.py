@@ -828,6 +828,54 @@ class TmuxIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(gen, "generation must survive a refused kill")
         await self.rt.stop()
 
+    def test_abandon_during_spawn_aborts_and_kills_pane(self):
+        asyncio.run(self._flow_abandon_during_spawn())
+
+    async def _flow_abandon_during_spawn(self):
+        """SC-064: cancel start lands mid-spawn (the pane created, the
+        spawn not yet complete). abandon() — the cancel path's teardown —
+        must see the in-flight generation, spawn must refuse to complete
+        (SpawnAborted) before the harness boots, and the just-created pane
+        must be killed by exact identity — never left live on a cancelled
+        session."""
+        await self.rt.start()
+        self.assertTrue(self.rt.available, self.rt.unavailable_reason)
+        piped = asyncio.Event()
+        release = asyncio.Event()
+        orig_pipe = self.rt._pipe_pane
+
+        async def held_pipe(gen):
+            piped.set()
+            await release.wait()
+
+        self.rt._pipe_pane = held_pipe
+        try:
+            spawn_task = asyncio.create_task(self.rt.spawn(
+                session_id=self.sid, shell_id=1, generation=1,
+                worktree=str(self.tmp), sc_path="/bin/sc",
+                token_path="/tmp/tok", rows=24, cols=80,
+                command=["/bin/sh", "-c",
+                         "stty raw -echo; printf READY; cat"]))
+            await asyncio.wait_for(piped.wait(), 10)
+            gen = self.rt.generations.get(self.sid)
+            self.assertIsNotNone(
+                gen, "an in-flight spawn is visible to the cancel path")
+            pane_id = gen.pane_id
+            self.assertTrue(pane_id.startswith("%"))
+            # The cancel start's teardown, mid-spawn.
+            await self.rt.abandon(self.sid)
+            self.assertNotIn(self.sid, self.rt.generations)
+            release.set()
+            with self.assertRaises(interface_runtime.SpawnAborted):
+                await asyncio.wait_for(spawn_task, 10)
+            self.assertFalse(
+                await self.rt._pane_exists(pane_id),
+                "the just-created pane is killed — never live on an "
+                "ended session")
+        finally:
+            self.rt._pipe_pane = orig_pipe
+        await self.rt.stop()
+
     def test_pane_death_drives_real_lost_transition(self):
         asyncio.run(self._flow_pane_death())
 

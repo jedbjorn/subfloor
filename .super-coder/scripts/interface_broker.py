@@ -315,8 +315,11 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     stop evidence parks — no live harness will re-drive it). Queued wake
     work is deliberately left queued for a future generation.
 
-    Idempotent: an already-ended session returns its original terminal
-    result without state churn."""
+    Idempotent: a FULLY terminal session (occupancy AND lifecycle ended)
+    returns its original terminal result without state churn. A partially
+    closed legacy row — a pre-convergence closure that ended occupancy but
+    left lifecycle nonterminal — is converged, never silently no-op'ed
+    (SC-065); its original end reason/time are kept."""
     row = con.execute(
         "SELECT shell_id, generation, occupancy, lifecycle, end_reason "
         "FROM interface_sessions WHERE session_id=?",
@@ -325,13 +328,19 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     if row is None:
         raise BrokerError(f"interface session {session_id} not found")
     shell_id, generation, occupancy, lifecycle, prior_reason = row
-    if occupancy == "ended":
+    if occupancy == "ended" and lifecycle == "ended":
         return {"session_id": session_id, "already_ended": True,
                 "end_reason": prior_reason}
 
-    interface_state.transition(
-        con, "occupancy", session_id, "ended",
-        extra_sets={"ended_at": _now(con), "end_reason": end_reason})
+    if occupancy != "ended":
+        interface_state.transition(
+            con, "occupancy", session_id, "ended",
+            extra_sets={"ended_at": _now(con), "end_reason": end_reason})
+        recorded_reason = end_reason
+    else:
+        # Legacy partial row: occupancy already ended — re-stamping the
+        # reason/time would falsify the original terminal record.
+        recorded_reason = prior_reason
     if lifecycle != "ended":
         if lifecycle in ("idle", "busy", "approval", "user_input"):
             # No direct edge to ended — converge through stopping (the
@@ -372,7 +381,7 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
             _alert(con, severity="critical",
                    reason="wake_batch_delivery_unknown", binding_id=binding_id)
     return {"session_id": session_id, "already_ended": False,
-            "end_reason": end_reason}
+            "end_reason": recorded_reason}
 
 
 def record_hook(con, shell_id: int, generation: int, hook_seq: int,

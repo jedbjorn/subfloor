@@ -612,6 +612,45 @@ class CloseSessionMatrixTest(unittest.TestCase):
             "WHERE session_id=?", (sid,)).fetchone()
         self.assertEqual(first, second)
 
+    def test_close_converges_legacy_partial_row(self):
+        """SC-065: a pre-convergence closure (the old spawn-failure path)
+        ended occupancy but left lifecycle nonterminal, the generation open,
+        and leases held. The one closure helper must CONVERGE that row —
+        never silently no-op on occupancy=='ended' alone — while keeping
+        the original terminal record (reason/time) intact."""
+        sid = self._make("occupied", "idle")
+        interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
+        # The legacy shape: occupancy ended directly, children untouched.
+        interface_state.transition(
+            self.con, "occupancy", sid, "ended",
+            extra_sets={"ended_at": "2026-07-20 00:00:00",
+                        "end_reason": "spawn_failed"})
+        self.con.commit()
+        out = interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+        self.assertFalse(out["already_ended"],
+                         "a partially closed row converges — never a no-op")
+        self.assertEqual(out["end_reason"], "spawn_failed",
+                         "the original terminal record is kept, not re-stamped")
+        sess = self.con.execute(
+            "SELECT occupancy, lifecycle, ended_at, end_reason FROM "
+            "interface_sessions WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(sess, ("ended", "ended", "2026-07-20 00:00:00",
+                                "spawn_failed"),
+                         "lifecycle must not stay nonterminal forever")
+        gen = self.con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0]
+        self.assertIsNotNone(gen, "the open generation ends too")
+        lease = self.con.execute(
+            "SELECT revoked_at FROM interface_writer_leases "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertIsNotNone(lease[0], "held leases are revoked")
+        # Fully terminal now: a repeated close is a true no-op.
+        out = interface_broker.close_session(self.con, sid, "operator_end")
+        self.assertTrue(out["already_ended"])
+        self.assertEqual(out["end_reason"], "spawn_failed")
+
     def test_close_parks_pending_human_input(self):
         """A pending unacknowledged frame can never be acked once the
         generation is over — the close parks it by the crash-window rule
