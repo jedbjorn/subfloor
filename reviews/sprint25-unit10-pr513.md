@@ -150,3 +150,76 @@ SC-015, flagged once, there).
 
 Fix SC-015 (Major) and SC-016 (Medium), push, re-review. Lows ride the sprint
 report.
+
+---
+
+# Re-review (r2): PR #513 @66f537a — 2026-07-23
+
+CI: 6/6 green, 801 passed at head 66f537a. Fix commit touches only
+`interface_routes.py`, `server.py`, `test_interface_sprint_ops.py` — the
+r1-verified surfaces (3-artifact skill chain, migration 0082, dedupe partial
+unique, actor scoping) are byte-untouched and carry over.
+
+Verdict: **REVIEW-CLEAN. Both findings verified fixed; flags #57/#58 closed.**
+
+## SC-015 (was Major) — VERIFIED FIXED
+
+- `_retry_binding` now selects **every** `delivery_unknown` batch of the
+  binding (`ORDER BY batch_id`, no DESC-LIMIT-1) and resolves each via
+  `resolve_batch` — the parked batch closes as audit, its items return to
+  `queued`/`batch_id=NULL` for a NEW batch through the coordinator. The
+  newest-first pick and the re-signal-over-park branch are gone.
+- Alert clears are now **conditional on what the retry actually remedied**:
+  parked → `wake_batch_delivery_unknown`, input verdict →
+  `crash_window_delivery_unknown`, re-signal → `wake_presend_retries_exhausted`.
+  The blanket RETRY_CLEARS UPDATE is deleted. An unrelated open alert
+  survives the retry (proven by test).
+- `_wake_state` checks `delivery_unknown` FIRST — a park shadows any newer
+  live batch; `_project_binding` surfaces `park.batch_id` from its own
+  parked-batch query while `current_batch` still shows the newer live one.
+  DESC-LIMIT-1 hiding is gone from both surfaces.
+- **Red-test proof (run, not assumed):** the new
+  `test_retry_resolves_parked_batch_behind_newer_live_batch` and
+  `test_closed_close_is_atomic_under_fault` were executed against the OLD
+  code (88f055c): both fail — the old projection reads `queued` over the
+  hidden park, and the old close path lands CLOSED with the binding still
+  armed. Genuine red, not test-the-test.
+- Single-batch parking invariant (r1-cleared) still holds — all 16 tests in
+  `test_interface_sprint_ops.py` pass at the new head.
+
+## SC-016 (was Medium) — VERIFIED FIXED
+
+- `patch_columns`/`patch_document` take `commit=False`; the
+  `PATCH /docs/{id}` route now runs doc patch + `_close_sprint_wake` + ONE
+  `con.commit()` — structurally identical to the freeze path (same helper,
+  same commit shape). Default `commit=True` preserves all other callers.
+- Fault-injection test proves atomicity: `_close_sprint_wake` raising → 500,
+  doc still ACTIVE, binding still armed, item still queued, alert still
+  open. Neither side lands. Verified red against the old two-transaction
+  code.
+
+## Regression one-pass — HOLD
+
+- Input-park verdict gate: 422 `outcome_required` still precedes
+  `reconcile_input` and fires only when the session's input is parked. ✓
+- Actor scoping: 403 `not_the_planner`, 409 `binding_released`, and the
+  status/alerts scoping are untouched by the fix diff. ✓
+- Alert re-arm via `idx_planner_alerts_open` partial unique: untouched. ✓
+- 3-artifact skill chain: not in the fix diff; r1 byte-compare stands. ✓
+- L1–L4: not reopened by the fix.
+
+## New Low (report-only)
+
+- L5: the conditional clears introduce a narrow replay gap on top of L1 —
+  `resolve_batch` still commits internally, so a crash between that commit
+  and the clears commit leaves the batch resolved with its
+  `wake_batch_delivery_unknown` alert open; a retry replay then finds no
+  parked batch and the conditional clear never touches the stale alert
+  (the old blanket clear would have healed it on replay). Requires a crash
+  mid-retry; operator-visible stale alert, no wake loss. Fix with L1
+  (caller-owns-transaction) if ever addressed.
+
+## Recommendation
+
+Merge-ready. DEV3 merges under scoped authority and delivers the seq-10
+unit report. Flags #57 (SC-015) and #58 (SC-016) closed by REV2.
