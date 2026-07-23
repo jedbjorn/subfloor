@@ -702,6 +702,12 @@ def cmd_recover(args) -> int:
     wt = result.get("worktree") or {}
     if wt.get("discarded"):
         print(f"→ worktree {wt['worktree']} changes discarded")
+    elif wt.get("failed"):
+        done = ", ".join(wt.get("completed") or []) or "nothing"
+        print(f"→ worktree discard INCOMPLETE in {wt['worktree']}: completed "
+              f"[{done}], failed at {wt['failed']['step']} "
+              f"({wt['failed'].get('error', 'unknown error')}) — the closure "
+              "is committed; finish the discard by hand", file=sys.stderr)
     else:
         print("→ worktree preserved")
     print(f"→ {shortname} is {result.get('availability')}")

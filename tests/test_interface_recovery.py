@@ -17,13 +17,20 @@ module is stdlib-only by design — HTTP-only recovery):
   confirm_force or against non-verified-live classifications;
 - exact process-group signaling against REAL child processes: SIGTERM
   kills, SIGKILL only after the grace with the same identity, identity loss
-  performs no signal and closes nothing;
+  performs no signal and closes nothing, and closure follows ONLY on
+  /proc-proven absence — an unreadable grace or a SIGKILL survivor refuses
+  with a named next action;
+- pane presence: tmux list-panes membership proves BOTH ways — a dead pane
+  is provably gone (classification can reach pane-gone), only an
+  unanswering server is unknown;
 - atomic closure: session+generation+leases, archive close with the
   active_archive_id guard, alert resolution, generation-bound binding
   release, ambiguous binding parked with a named next action, unread
   messages left unread;
 - worktree: preserved by default; discard requires the typed shortname,
-  refuses unpushed commits (fail closed), never deletes the worktree;
+  refuses unpushed commits (fail closed), never deletes the worktree, and a
+  mid-discard git failure after the committed closure is reported
+  step-by-step — never a 500 that hides what completed;
 - CLI parity: ./sc interface recover drives GET preview → POST execute with
   the spec's flags (--force/--discard-worktree/--yes/--json).
 
@@ -294,6 +301,44 @@ class ClassificationTest(RecoveryCase):
         self.assertEqual(obj["classification"], "available")
 
 
+# ------------------------------------------------------------------ pane presence
+
+class PanePresentTest(unittest.TestCase):
+    """_pane_present against a mocked tmux: list-panes membership proves
+    BOTH ways — a dead pane is provably gone, only an unanswering server is
+    unknown (regression: the old targeted display-message probe mapped a
+    dead pane's nonzero exit to unknown, leaving pane-gone unreachable)."""
+
+    def run_tmux(self, returncode=0, stdout="", stderr=""):
+        return mock.patch.object(
+            recovery.subprocess, "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=returncode, stdout=stdout,
+                stderr=stderr))
+
+    def test_pane_listed_is_present(self):
+        with self.run_tmux(stdout="%1\n%2\n") as run:
+            self.assertIs(recovery._pane_present("/s.sock", "%2"), True)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:4], ["tmux", "-S", "/s.sock", "list-panes"])
+
+    def test_pane_missing_from_listing_is_proven_gone(self):
+        with self.run_tmux(stdout="%1\n%3\n"):
+            self.assertIs(recovery._pane_present("/s.sock", "%2"), False)
+
+    def test_unreachable_server_is_unknown(self):
+        with self.run_tmux(returncode=1, stderr="no server running"):
+            self.assertIsNone(recovery._pane_present("/s.sock", "%1"))
+
+    def test_tmux_failure_is_unknown(self):
+        with mock.patch.object(recovery.subprocess, "run",
+                               side_effect=OSError("no tmux binary")):
+            self.assertIsNone(recovery._pane_present("/s.sock", "%1"))
+
+    def test_no_socket_is_unknown(self):
+        self.assertIsNone(recovery._pane_present(None, "%1"))
+
+
 # ------------------------------------------------------------------ signaling
 
 class ProcessGroupSignalTest(unittest.TestCase):
@@ -322,6 +367,7 @@ class ProcessGroupSignalTest(unittest.TestCase):
         proc, ticks = self.child()
         result = recovery.terminate_process_group(proc.pid, ticks, grace_s=2)
         self.assertTrue(result["signaled"])
+        self.assertTrue(result["dead"])
         self.assertFalse(result["escalated"])
         self.assertEqual(result["pgid"], proc.pid)
         proc.wait(timeout=5)
@@ -331,9 +377,33 @@ class ProcessGroupSignalTest(unittest.TestCase):
         proc, ticks = self.child(ignore_sigterm=True)
         result = recovery.terminate_process_group(proc.pid, ticks, grace_s=0.3)
         self.assertTrue(result["signaled"])
+        self.assertTrue(result["dead"])
         self.assertTrue(result["escalated"])
         proc.wait(timeout=5)
         self.assertEqual(recovery._proc_state(proc.pid, ticks), "dead")
+
+    def test_unreadable_during_grace_is_not_absence(self):
+        proc, ticks = self.child()
+        states = mock.Mock(side_effect=["alive"] + ["unreadable"] * 50)
+        with mock.patch.object(recovery, "_proc_state", states):
+            result = recovery.terminate_process_group(proc.pid, ticks,
+                                                      grace_s=0.3)
+        self.assertTrue(result["signaled"])  # SIGTERM really sent
+        self.assertFalse(result["dead"])
+        self.assertFalse(result["escalated"])
+        self.assertEqual(result["reason"], "absence_unproven")
+
+    def test_sigkill_survivor_is_not_absence(self):
+        # D-state analog: the process never leaves /proc even after SIGKILL.
+        proc, ticks = self.child(ignore_sigterm=True)
+        with mock.patch.object(recovery, "_proc_state",
+                               return_value="alive"):
+            result = recovery.terminate_process_group(proc.pid, ticks,
+                                                      grace_s=0.3)
+        self.assertTrue(result["signaled"])
+        self.assertTrue(result["escalated"])
+        self.assertFalse(result["dead"])
+        self.assertEqual(result["reason"], "absence_unproven")
 
     def test_no_signal_on_identity_mismatch(self):
         proc, ticks = self.child()
@@ -553,6 +623,35 @@ class ExecuteTest(RecoveryCase):
             (sid,)).fetchone()[0], "occupied")
         con.close()
 
+    def test_closure_refused_when_absence_unproven(self):
+        # A signal was sent but /proc never proved the process gone (an
+        # unkillable D-state survivor): closure is refused with a named
+        # next action and NO durable state is touched.
+        proc, ticks = self.child()
+        sid = self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
+        with mock.patch.object(recovery, "_pane_present", return_value=False):
+            obj = self.preview(1)
+            self.assertEqual(obj["classification"], "exact_idle_orphan")
+            with mock.patch.object(
+                    recovery, "terminate_process_group",
+                    return_value={"signaled": True, "dead": False,
+                                  "escalated": True, "pid": proc.pid,
+                                  "pgid": proc.pid,
+                                  "reason": "absence_unproven",
+                                  "detail": "survives SIGKILL"}):
+                status, err = self.call(
+                    "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
+                    {"observation_id": obj["observation_id"],
+                     "mode": "recover"})
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_absence_unproven")
+        self.assertIn("preview again", err["error"]["message"])
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE session_id=?",
+            (sid,)).fetchone()[0], "occupied")
+        con.close()
+
     def test_idempotent_replay_no_second_side_effect(self):
         proc, ticks = self.child()
         self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
@@ -723,6 +822,64 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
         self.assertFalse((Path(wt) / "untracked.txt").exists())
         self.assertTrue(Path(wt).is_dir())  # worktree itself never deleted
+
+    def test_discard_git_failure_reports_exactly_what_completed(self):
+        # clean fails AFTER reset succeeded and the closure committed: the
+        # response stays 200 and names the completed/failed steps — never a
+        # bare 500 that hides a partial discard.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        real_run = recovery.subprocess.run
+
+        def flaky_clean(*args, **kwargs):
+            if "clean" in args[0]:
+                return subprocess.CompletedProcess(
+                    args=args[0], returncode=1, stdout="",
+                    stderr="fatal: clean boom")
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(recovery.subprocess, "run",
+                               side_effect=flaky_clean):
+            status, result = self.post(obj, preserve_worktree=False,
+                                       discard_worktree=True,
+                                       confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        wt_result = result["worktree"]
+        self.assertFalse(wt_result["discarded"])
+        self.assertEqual(wt_result["completed"], ["reset"])
+        self.assertEqual(wt_result["failed"]["step"], "clean")
+        self.assertIn("clean boom", wt_result["failed"]["error"])
+        # reset ran (tracked restored), clean did not (untracked survives),
+        # and the durable closure still committed.
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
+
+    def test_discard_git_timeout_reported_not_raised(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        real_run = recovery.subprocess.run
+
+        def timeout_reset(*args, **kwargs):
+            if "reset" in args[0]:
+                raise subprocess.TimeoutExpired(cmd=args[0], timeout=60)
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(recovery.subprocess, "run",
+                               side_effect=timeout_reset):
+            status, result = self.post(obj, preserve_worktree=False,
+                                       discard_worktree=True,
+                                       confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        self.assertFalse(result["worktree"]["discarded"])
+        self.assertEqual(result["worktree"]["completed"], [])
+        self.assertEqual(result["worktree"]["failed"]["step"], "reset")
 
 
 # ------------------------------------------------------------------ CLI parity

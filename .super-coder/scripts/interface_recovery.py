@@ -96,25 +96,35 @@ def _proc_state(pid: int, start_ticks: int) -> str:
 
 
 def _pane_present(sock: str | None, pane_id: str) -> bool | None:
-    """Is the exact pane in the session's own tmux server? None when tmux
-    can't answer (binary missing, socket unreachable) — unknown is not
-    gone."""
+    """Is the exact pane in the session's own tmux server? Membership is
+    answered by list-panes, so a server that answers proves BOTH ways:
+    False = the pane is gone (reachable classification), True = it lives.
+    None ONLY when tmux can't answer (binary missing, socket unreachable,
+    garbled output) — unknown is not gone."""
     if not sock:
         return None
     try:
         out = subprocess.run(
-            ["tmux", "-S", sock, "display-message", "-p", "-t", pane_id,
-             "#{pane_id} #{pane_pid}"],
+            ["tmux", "-S", sock, "list-panes", "-a", "-F", "#{pane_id}"],
             capture_output=True, text=True, timeout=10, check=False)
     except Exception:  # noqa: BLE001 — any tmux failure means "unknown"
         return None
     if out.returncode != 0:
         return None  # server unreachable — unknown, NOT proof of absence
-    try:
-        got_pane, _got_pid = out.stdout.split()
-    except ValueError:
-        return None
-    return got_pane == pane_id
+    return any(line.strip() == pane_id for line in out.stdout.splitlines())
+
+
+def _wait_dead(pid: int, start_ticks: int, grace_s: float) -> str:
+    """Poll exact-identity liveness for up to grace_s. Returns 'dead' the
+    moment /proc proves absence; otherwise the last observed state at the
+    deadline ('alive' or 'unreadable') — NEITHER is proof of absence, so
+    neither may satisfy closure."""
+    deadline = time.monotonic() + grace_s
+    state = _proc_state(pid, start_ticks)
+    while state != "dead" and time.monotonic() < deadline:
+        time.sleep(0.1)
+        state = _proc_state(pid, start_ticks)
+    return state
 
 
 def terminate_process_group(pid: int, start_ticks: int,
@@ -122,42 +132,52 @@ def terminate_process_group(pid: int, start_ticks: int,
     """SIGTERM the exact verified process group, bounded grace, SIGKILL only
     while the same PID/start ticks still identify the process. Identity
     mismatch or unreadable state performs NO signal and reports
-    indeterminate — the caller maps that to a refusal, never a closure."""
+    indeterminate — the caller maps that to a refusal, never a closure.
+    `dead` is True ONLY on /proc-proven absence: a signal is not proof of
+    death, and 'unreadable' or a SIGKILL survivor (D-state) leaves the
+    caller to refuse closure with a named next action."""
     state = _proc_state(pid, start_ticks)
     if state != "alive":
-        return {"signaled": False, "reason": "indeterminate",
+        return {"signaled": False, "dead": False, "reason": "indeterminate",
                 "detail": f"process state {state} at signal time"}
     try:
         pgid = os.getpgid(pid)
     except OSError:
-        return {"signaled": False, "reason": "indeterminate",
+        return {"signaled": False, "dead": False, "reason": "indeterminate",
                 "detail": "process group unreadable at signal time"}
     os.killpg(pgid, signal.SIGTERM)
-    deadline = time.monotonic() + grace_s
-    while time.monotonic() < deadline:
-        if _proc_state(pid, start_ticks) != "alive":
-            return {"signaled": True, "escalated": False, "pid": pid,
-                    "pgid": pgid}
-        time.sleep(0.1)
-    # Grace expired. Re-verify the EXACT identity before SIGKILL — the window
-    # is long enough for exit + PID reuse, and the rule is never signal an
-    # uncertain process.
-    if _proc_state(pid, start_ticks) != "alive":
-        return {"signaled": True, "escalated": False, "pid": pid,
-                "pgid": pgid,
+    state = _wait_dead(pid, start_ticks, grace_s)
+    if state == "dead":
+        return {"signaled": True, "dead": True, "escalated": False,
+                "pid": pid, "pgid": pgid}
+    if state == "unreadable":
+        return {"signaled": True, "dead": False, "escalated": False,
+                "pid": pid, "pgid": pgid, "reason": "absence_unproven",
+                "detail": "SIGTERM sent but /proc turned unreadable during "
+                          "the grace — absence not proven"}
+    # Grace expired with the process alive. Re-verify the EXACT identity
+    # before SIGKILL — the window is long enough for exit + PID reuse, and
+    # the rule is never signal an uncertain process.
+    state = _proc_state(pid, start_ticks)
+    if state != "alive":
+        return {"signaled": True, "dead": state == "dead",
+                "escalated": False, "pid": pid, "pgid": pgid,
                 "note": "identity changed during grace — no SIGKILL sent"}
     try:
         pgid = os.getpgid(pid)
     except OSError:
-        return {"signaled": True, "escalated": False, "pid": pid,
+        return {"signaled": True, "dead": False, "escalated": False,
+                "pid": pid, "pgid": pgid,
                 "note": "process exited during grace — no SIGKILL sent"}
     os.killpg(pgid, signal.SIGKILL)
-    deadline = time.monotonic() + grace_s
-    while time.monotonic() < deadline:
-        if _proc_state(pid, start_ticks) != "alive":
-            break
-        time.sleep(0.1)
-    return {"signaled": True, "escalated": True, "pid": pid, "pgid": pgid}
+    state = _wait_dead(pid, start_ticks, grace_s)
+    if state == "dead":
+        return {"signaled": True, "dead": True, "escalated": True,
+                "pid": pid, "pgid": pgid}
+    return {"signaled": True, "dead": False, "escalated": True,
+            "pid": pid, "pgid": pgid, "reason": "absence_unproven",
+            "detail": f"process state {state} after SIGKILL — absence not "
+                      "proven (an unkillable D-state process survives)"}
 
 
 # ------------------------------------------------------------------ git facts
@@ -210,12 +230,28 @@ def _unpushed_count(worktree: str) -> int:
 
 def _discard_worktree_files(worktree: str) -> dict:
     """Remove tracked + untracked file changes in the exact worktree. Never
-    deletes the worktree, its branch, or ignored files."""
-    subprocess.run(["git", "-C", worktree, "reset", "--hard", "HEAD"],
-                   capture_output=True, text=True, timeout=60, check=True)
-    subprocess.run(["git", "-C", worktree, "clean", "-fd"],
-                   capture_output=True, text=True, timeout=60, check=True)
-    return {"worktree": worktree, "discarded": True}
+    deletes the worktree, its branch, or ignored files. Runs AFTER the
+    durable closure is committed, so a git failure here must never escape
+    as a 500 that hides what happened: each step's outcome is recorded and
+    a failure returns exactly what completed and where it stopped."""
+    result: dict = {"worktree": worktree, "discarded": False,
+                    "completed": [], "failed": None}
+    for step, args in (("reset", ["reset", "--hard", "HEAD"]),
+                       ("clean", ["clean", "-fd"])):
+        try:
+            out = subprocess.run(["git", "-C", worktree, *args],
+                                 capture_output=True, text=True, timeout=60,
+                                 check=False)
+        except Exception as exc:  # noqa: BLE001 — timeout etc: report it
+            result["failed"] = {"step": step, "error": str(exc)[:200]}
+            return result
+        if out.returncode != 0:
+            result["failed"] = {"step": step,
+                                "error": out.stderr.strip()[-200:]}
+            return result
+        result["completed"].append(step)
+    result["discarded"] = True
+    return result
 
 
 # ------------------------------------------------------------------ evidence
@@ -614,6 +650,16 @@ def execute(con, shell_id: int, body: dict,
                 "the exact process identity no longer verifies — no signal "
                 "sent, no state closed; preview again",
                 {"detail": signal_result.get("detail")})
+        if not signal_result.get("dead"):
+            raise RecoveryError(
+                409, "recovery_absence_unproven",
+                "a signal was sent but /proc never proved the process gone "
+                "— durable closure refused (closure only on proven "
+                "absence). Next action: preview again; if the process "
+                "persists, inspect /proc/"
+                f"{proc['pane_pid']} and resolve it at the OS level first",
+                {"pid": proc["pane_pid"],
+                 "detail": signal_result.get("detail")})
 
     # -- atomic durable closure on proven absence ---------------------------
     end_reason = "operator_recovery_force" if mode == "force" \
