@@ -3,6 +3,9 @@
 .super-coder/shell_db.db
 .super-coder/shell_db.db-wal
 .super-coder/shell_db.db-shm
+.super-coder/shell_db.db.rebuild
+.super-coder/shell_db.db.rebuild-wal
+.super-coder/shell_db.db.rebuild-shm
 
 # Boot artifact — rebuilt at launch from the DB. The harness dictates the name;
 # we dual-write both. Ignored everywhere. opencode.json is emitted from the

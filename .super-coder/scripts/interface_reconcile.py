@@ -55,11 +55,34 @@ def startup_reconcile(con) -> dict:
 
     counts = {"reservations_unreconciled": 0, "parks": 0,
               "batches_delivery_unknown": 0, "batches_proven_running": 0,
-              "batches_completed": 0, "leases_revoked": 0}
+              "batches_completed": 0, "leases_revoked": 0,
+              "terminal_inputs_removed": 0,
+              "terminal_leases_revoked": 0}
+
+    active_session = interface_state.active_session_sql("s")
+
+    # A fully closed session has no actor left to accept or acknowledge input.
+    # Clean legacy volatile children before examining live crash windows so old
+    # composer/delivery/pending rows cannot re-park ended sessions (#529).
+    cur = con.execute(
+        "DELETE FROM interface_input_state WHERE session_id IN ("
+        "SELECT s.session_id FROM interface_sessions s "
+        f"WHERE NOT ({active_session}))"
+    )
+    counts["terminal_inputs_removed"] = cur.rowcount
+    cur = con.execute(
+        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
+        "revoke_reason='session_end' WHERE revoked_at IS NULL "
+        "AND session_id IN (SELECT s.session_id FROM interface_sessions s "
+        f"WHERE NOT ({active_session}))"
+    )
+    counts["terminal_leases_revoked"] = cur.rowcount
 
     # 1. Crash-window parking — pending human frame at restart.
     parked = con.execute(
-        "SELECT session_id FROM interface_input_state WHERE pending_seq IS NOT NULL"
+        "SELECT i.session_id FROM interface_input_state i "
+        "JOIN interface_sessions s ON s.session_id=i.session_id "
+        f"WHERE i.pending_seq IS NOT NULL AND {active_session}"
     ).fetchall()
     for (session_id,) in parked:
         interface_broker.park_delivery_unknown(con, session_id)
@@ -110,7 +133,9 @@ def startup_reconcile(con) -> dict:
     #    Composer/dirty state is preserved (spec: dirty survives disconnect).
     cur = con.execute(
         "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
-        "revoke_reason='service_restart' WHERE revoked_at IS NULL")
+        "revoke_reason='service_restart' WHERE revoked_at IS NULL "
+        "AND session_id IN (SELECT s.session_id FROM interface_sessions s "
+        f"WHERE {active_session})")
     counts["leases_revoked"] = cur.rowcount
 
     con.commit()
@@ -137,31 +162,42 @@ def live_refusal_reasons(db_path) -> list[str]:
                 f"generation {shell_id}/{generation} is live — end it first "
                 "(a rebuilt live generation bricks that shell's next New "
                 "chat)")
+        active_session = interface_state.active_session_sql("s")
         rows = con.execute(
-            "SELECT session_id, shell_id, occupancy FROM interface_sessions "
-            "WHERE occupancy <> 'ended'").fetchall()
+            "SELECT s.session_id, s.shell_id, s.occupancy "
+            "FROM interface_sessions s "
+            f"WHERE {active_session}").fetchall()
         for session_id, shell_id, occupancy in rows:
             reasons.append(
                 f"interface session {session_id} (shell {shell_id}) is "
                 f"{occupancy} — end/reconcile it first")
         rows = con.execute(
-            "SELECT binding_id, sprint_doc_id FROM sprint_planner_bindings "
-            "WHERE released_at IS NULL").fetchall()
+            "SELECT b.binding_id, b.sprint_doc_id "
+            "FROM sprint_planner_bindings b "
+            "LEFT JOIN interface_sessions s ON s.session_id=b.session_id "
+            "WHERE b.released_at IS NULL "
+            f"AND (s.session_id IS NULL OR {active_session})").fetchall()
         for binding_id, doc_id in rows:
             reasons.append(
                 f"sprint binding {binding_id} (doc {doc_id}) is armed — "
                 "release it first")
         rows = con.execute(
-            "SELECT batch_id, state FROM planner_wake_batches "
-            "WHERE state <> 'complete'").fetchall()
+            "SELECT wb.batch_id, wb.state FROM planner_wake_batches wb "
+            "LEFT JOIN sprint_planner_bindings b ON b.binding_id=wb.binding_id "
+            "LEFT JOIN interface_sessions s ON s.session_id=b.session_id "
+            "WHERE wb.state <> 'complete' "
+            f"AND (b.binding_id IS NULL OR s.session_id IS NULL "
+            f"OR {active_session})").fetchall()
         for batch_id, state in rows:
             reasons.append(
                 f"wake batch {batch_id} is {state} — drain or reconcile it "
                 "first")
         rows = con.execute(
-            "SELECT session_id FROM interface_input_state "
-            "WHERE composer='unknown' OR delivery='delivery_unknown' "
-            "OR pending_seq IS NOT NULL").fetchall()
+            "SELECT i.session_id FROM interface_input_state i "
+            "LEFT JOIN interface_sessions s ON s.session_id=i.session_id "
+            "WHERE (i.composer='unknown' OR i.delivery='delivery_unknown' "
+            "OR i.pending_seq IS NOT NULL) "
+            f"AND (s.session_id IS NULL OR {active_session})").fetchall()
         for (session_id,) in rows:
             reasons.append(
                 f"session {session_id} has input ambiguity — inspect the live "

@@ -298,6 +298,16 @@ def reconcile_input(con, session_id: int, outcome: str) -> None:
                     "forwarded_seq": new_forwarded})
 
 
+def _close_volatile_children(con, session_id: int) -> None:
+    """Terminalize/remove generation-volatile state in the caller's txn."""
+    con.execute(
+        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
+        "revoke_reason='session_end' "
+        "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
+    con.execute(
+        "DELETE FROM interface_input_state WHERE session_id=?", (session_id,))
+
+
 def close_session(con, session_id: int, end_reason: str) -> dict:
     """THE one closure helper (spec #30 Lifecycle Contract) — every close
     producer (operator terminate, cancel start, reconcile-close, spawn
@@ -309,11 +319,11 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     `stopping` where no direct edge exists — a hook that won the race can
     never strand occupied/ended, and nothing ever moves terminal →
     nonterminal), ends the matching generation, revokes active leases,
-    and resolves or parks session-scoped wake state by the existing
-    ambiguity rules (a pending human frame parks delivery_unknown; a
-    batch with a proven stop reconciles from read state; a batch with no
-    stop evidence parks — no live harness will re-drive it). Queued wake
-    work is deliberately left queued for a future generation.
+    removes volatile input state, and resolves or parks durable session-scoped
+    wake state by the existing ambiguity rules (a batch with a proven stop
+    reconciles from read state; a batch with no stop evidence parks — no live
+    harness will re-drive it). Queued wake work is deliberately left queued
+    for a future generation.
 
     Idempotent: a FULLY terminal session (occupancy AND lifecycle ended)
     returns its original terminal result without state churn. A partially
@@ -321,14 +331,15 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     left lifecycle nonterminal — is converged, never silently no-op'ed
     (SC-065); its original end reason/time are kept."""
     row = con.execute(
-        "SELECT shell_id, generation, occupancy, lifecycle, end_reason "
+        "SELECT shell_id, generation, occupancy, lifecycle, ended_at, end_reason "
         "FROM interface_sessions WHERE session_id=?",
         (session_id,),
     ).fetchone()
     if row is None:
         raise BrokerError(f"interface session {session_id} not found")
-    shell_id, generation, occupancy, lifecycle, prior_reason = row
-    if occupancy == "ended" and lifecycle == "ended":
+    shell_id, generation, occupancy, lifecycle, ended_at, prior_reason = row
+    if not interface_state.session_is_active(occupancy, lifecycle, ended_at):
+        _close_volatile_children(con, session_id)
         con.execute(
             "UPDATE planner_alerts SET resolved_at=datetime('now') "
             "WHERE session_id=? AND resolved_at IS NULL", (session_id,))
@@ -355,21 +366,15 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
         "UPDATE interface_generations SET ended_at=datetime('now') "
         "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
         (shell_id, generation))
-    con.execute(
-        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
-        "revoke_reason='session_end' "
-        "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
+    # Input/composer state is generation-volatile. Once process absence and
+    # durable closure are proved there is nothing left to deliver or inspect,
+    # so remove it in this same transaction. Keeping an unknown/pending row
+    # made a safely closed session permanently block update (#529).
+    _close_volatile_children(con, session_id)
 
-    # Session-scoped wake state: the generation is provably over, so a
-    # pending human frame can never be acked and a live batch can never
-    # see its stop hook. Resolve from durable evidence or park — the same
-    # rules startup reconciliation applies (decision #22).
-    istate = con.execute(
-        "SELECT pending_seq, delivery FROM interface_input_state "
-        "WHERE session_id=?", (session_id,)).fetchone()
-    if istate is not None and istate[0] is not None \
-            and istate[1] != "delivery_unknown":
-        park_delivery_unknown(con, session_id)
+    # Session-scoped wake state: the generation is provably over, so a live
+    # batch can never see its stop hook. Resolve from durable evidence or park
+    # the durable batch audit; queued work remains for a future generation.
     batches = con.execute(
         "SELECT batch_id, binding_id, state, stop_hook_seq "
         "FROM planner_wake_batches "

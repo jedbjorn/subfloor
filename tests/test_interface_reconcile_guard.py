@@ -25,6 +25,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import interface_reconcile  # noqa: E402
+import interface_broker  # noqa: E402
 import rebuild  # noqa: E402
 import update  # noqa: E402
 
@@ -213,7 +214,8 @@ class LiveRefusalGuardTest(unittest.TestCase):
         self.con.execute(
             "UPDATE sprint_planner_bindings SET released_at=datetime('now')")
         self.con.execute(
-            "UPDATE interface_sessions SET occupancy='ended'")
+            "UPDATE interface_sessions SET occupancy='ended', lifecycle='ended', "
+            "ended_at=datetime('now')")
         self.con.execute(
             "UPDATE interface_generations SET ended_at=datetime('now')")
         self.con.commit()
@@ -227,6 +229,61 @@ class LiveRefusalGuardTest(unittest.TestCase):
         self.con.commit()
         reasons = interface_reconcile.live_refusal_reasons(self.db)
         self.assertTrue(any("ambiguity" in r for r in reasons))
+
+    def test_terminal_session_stale_input_does_not_block(self):
+        sid = self._occupied_session()
+        self.con.execute(
+            "UPDATE interface_sessions SET occupancy='ended', lifecycle='ended', "
+            "ended_at=datetime('now') WHERE session_id=?", (sid,))
+        self.con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now')")
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, generation, "
+            "composer, delivery, pending_seq) "
+            "VALUES (?,1,1,'unknown','delivery_unknown',9)", (sid,))
+        self.con.commit()
+        self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
+
+        counts = interface_reconcile.startup_reconcile(self.con)
+        self.assertEqual(counts["terminal_inputs_removed"], 1)
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone())
+
+    def test_shared_close_removes_volatile_children(self):
+        sid = self._occupied_session()
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, generation, "
+            "composer, pending_seq) VALUES (?,1,1,'unknown',4)", (sid,))
+        self.con.execute(
+            "INSERT INTO interface_writer_leases (session_id, shell_id, "
+            "generation, client_id, token_hash) VALUES (?,1,1,'client','hash')",
+            (sid,))
+        interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone())
+        revoked_at, reason = self.con.execute(
+            "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertIsNotNone(revoked_at)
+        self.assertEqual(reason, "session_end")
+        self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
+
+        # A repeated close also curates stale legacy volatile state without
+        # reopening or restamping the terminal session.
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, generation, "
+            "composer, pending_seq) VALUES (?,1,1,'unknown',8)", (sid,))
+        result = interface_broker.close_session(
+            self.con, sid, "different_retry_reason")
+        self.assertTrue(result["already_ended"])
+        self.assertEqual(result["end_reason"], "operator_end")
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone())
 
     def test_fully_drained_passes(self):
         sid = self._occupied_session()

@@ -68,7 +68,7 @@ class InterfaceSnapshotTest(unittest.TestCase):
             " hook_token_hash) VALUES (1,1,?)", (SECRET_HOOK_HASH,))
         self.con.execute(
             "INSERT INTO interface_generations (shell_id, generation,"
-            " ended_at) VALUES (1,2,datetime('now'))")
+            " ended_at) VALUES (2,2,datetime('now'))")
         # Sessions: one live with volatile identity, one ended audit row.
         self.con.execute(
             "INSERT INTO interface_sessions (session_id, shell_id,"
@@ -80,13 +80,13 @@ class InterfaceSnapshotTest(unittest.TestCase):
             "INSERT INTO interface_sessions (session_id, shell_id,"
             " generation, occupancy, lifecycle, ended_at, end_reason,"
             " tmux_socket, pane_pid) "
-            "VALUES (2,1,2,'ended','ended',datetime('now'),'operator_end',"
+            "VALUES (2,2,2,'ended','ended',datetime('now'),'operator_end',"
             " ?, 999)", (SECRET_SOCKET,))
         # Bindings: one armed, one released.
         self.con.execute(
             "INSERT INTO sprint_planner_bindings (binding_id, sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation) "
-            "VALUES (1,1,2,1,2,1)")
+            "VALUES (1,1,1,1,1,1)")
         self.con.execute(
             "INSERT INTO sprint_planner_bindings (binding_id, sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation,"
@@ -98,7 +98,7 @@ class InterfaceSnapshotTest(unittest.TestCase):
             " shell_id, generation, state) VALUES (1,2,2,2,'complete')")
         self.con.execute(
             "INSERT INTO planner_wake_batches (batch_id, binding_id,"
-            " shell_id, generation, state) VALUES (2,1,2,1,'queued')")
+            " shell_id, generation, state) VALUES (2,1,1,1,'queued')")
         # Items: done (audit) + queued (live).
         self.con.execute(
             "INSERT INTO shell_messages (message_id, from_shell_id,"
@@ -136,6 +136,25 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.con.execute(
             "INSERT INTO planner_alerts (severity, reason, dedupe_key) "
             "VALUES ('critical','crash','-|-|crash')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (session_id, severity, reason, dedupe_key) "
+            "VALUES (1,'warning','live-session','1|-|-|-|live')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (session_id, severity, reason, dedupe_key) "
+            "VALUES (2,'warning','ended-session','2|-|-|-|ended')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (binding_id, severity, reason, dedupe_key) "
+            "VALUES (1,'warning','live-binding','-|1|-|-|live')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (binding_id, severity, reason, dedupe_key) "
+            "VALUES (2,'warning','ended-binding','-|2|-|-|ended')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (session_id, binding_id, severity, "
+            "reason, dedupe_key) "
+            "VALUES (2,1,'warning','mixed-live-parent','2|1|-|-|mixed')")
+        self.con.execute(
+            "INSERT INTO planner_alerts (session_id, severity, reason, dedupe_key) "
+            "VALUES (999,'warning','orphan-session','999|-|-|-|orphan')")
         self.con.commit()
 
     def tearDown(self):
@@ -176,7 +195,7 @@ class InterfaceSnapshotTest(unittest.TestCase):
         # New chat (flag #36). Ended generations are durable audit.
         out = self._dump("interface_generations")
         self.assertNotIn("VALUES (1, 1,", out, "live generation leaked")
-        self.assertIn("VALUES (1, 2,", out, "ended generation audit dropped")
+        self.assertIn("VALUES (2, 2,", out, "ended generation audit dropped")
 
     def test_bindings_keep_released_only(self):
         out = self._dump("sprint_planner_bindings")
@@ -201,10 +220,19 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.assertIn("VALUES (2,", out, "blind-window observation dropped")
         self.assertNotIn("VALUES (3,", out, "no-transition observation kept")
 
-    def test_durable_guard_tables_dump_whole(self):
+    def test_durable_guard_tables_preserve_closed_projection(self):
         self.assertIn("'k1'", self._dump("planner_action_receipts"))
         self.assertIn("'operator'", self._dump("interface_idempotency_keys"))
         self.assertIn("'crash'", self._dump("planner_alerts"))
+
+    def test_alerts_require_every_referenced_parent_in_projection(self):
+        out = self._dump("planner_alerts")
+        self.assertIn("'ended-session'", out)
+        self.assertIn("'ended-binding'", out)
+        self.assertNotIn("'live-session'", out)
+        self.assertNotIn("'live-binding'", out)
+        self.assertNotIn("'mixed-live-parent'", out)
+        self.assertNotIn("'orphan-session'", out)
 
     def test_row_filters_reference_live_columns(self):
         # Drift guard: each filter must parse and execute against the live
@@ -218,6 +246,23 @@ class InterfaceSnapshotTest(unittest.TestCase):
             except sqlite3.OperationalError as e:
                 self.fail(f"{table}: row filter broken against schema "
                           f"({filt!r}): {e}")
+
+    def test_complete_snapshot_projection_is_foreign_key_closed(self):
+        target = self.tmp / "rebuilt.db"
+        build_engine_db(target)
+        lines = ["PRAGMA foreign_keys=OFF;", "BEGIN;"]
+        for table in snapshot.PER_INSTANCE_TABLES:
+            if snapshot.table_exists(self.con, table):
+                lines.extend(snapshot.dump_table(self.con, table))
+        lines.extend(["COMMIT;", "PRAGMA foreign_keys=ON;"])
+
+        rebuilt = sqlite3.connect(target)
+        try:
+            rebuilt.executescript("\n".join(lines))
+            violations = rebuilt.execute("PRAGMA foreign_key_check").fetchall()
+        finally:
+            rebuilt.close()
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

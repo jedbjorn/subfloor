@@ -651,10 +651,10 @@ class CloseSessionMatrixTest(unittest.TestCase):
         self.assertTrue(out["already_ended"])
         self.assertEqual(out["end_reason"], "spawn_failed")
 
-    def test_close_parks_pending_human_input(self):
-        """A pending unacknowledged frame can never be acked once the
-        generation is over — the close parks it by the crash-window rule
-        (evidence kept, alert raised), never drops it."""
+    def test_close_removes_terminal_input_state(self):
+        """Once absence-proved closure ends the generation, pending input is
+        volatile terminal state: remove it instead of leaving an ambiguity
+        that no live TUI can ever reconcile (#529)."""
         sid = self._make("occupied", "idle")
         interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
         self.con.execute(
@@ -664,11 +664,9 @@ class CloseSessionMatrixTest(unittest.TestCase):
         interface_broker.close_session(self.con, sid, "operator_end")
         self.con.commit()
         ist = self.con.execute(
-            "SELECT composer, delivery, pending_seq FROM "
+            "SELECT 1 FROM "
             "interface_input_state WHERE session_id=?", (sid,)).fetchone()
-        self.assertEqual(ist[0], "unknown")
-        self.assertEqual(ist[1], "delivery_unknown")
-        self.assertEqual(ist[2], 1, "evidence must survive the close")
+        self.assertIsNone(ist)
         alert = self.con.execute(
             "SELECT resolved_at FROM planner_alerts WHERE session_id=? AND "
             "reason='crash_window_delivery_unknown'",

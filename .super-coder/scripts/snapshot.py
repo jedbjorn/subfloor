@@ -102,15 +102,93 @@ PER_INSTANCE_TABLES = [
 # quarantined wake audit, and transition/blind-window observations — and may
 # run while a chat is live). The dump still DELETEs the whole table on load;
 # rows outside the filter simply never existed as far as the rebuild knows.
+def _serialized_session(session_ref: str) -> str:
+    return (
+        "EXISTS (SELECT 1 FROM interface_sessions s "
+        "JOIN interface_generations g "
+        "ON g.shell_id=s.shell_id AND g.generation=s.generation "
+        f"WHERE s.session_id={session_ref} "
+        "AND s.occupancy='ended' AND s.lifecycle='ended' "
+        "AND s.ended_at IS NOT NULL AND g.ended_at IS NOT NULL)"
+    )
+
+
+def _serialized_binding(binding_ref: str) -> str:
+    return (
+        "EXISTS (SELECT 1 FROM sprint_planner_bindings b "
+        "JOIN interface_sessions s ON s.session_id=b.session_id "
+        "JOIN interface_generations sg "
+        "ON sg.shell_id=s.shell_id AND sg.generation=s.generation "
+        "JOIN interface_generations bg "
+        "ON bg.shell_id=b.shell_id AND bg.generation=b.generation "
+        f"WHERE b.binding_id={binding_ref} "
+        "AND b.released_at IS NOT NULL "
+        "AND s.occupancy='ended' AND s.lifecycle='ended' "
+        "AND s.ended_at IS NOT NULL "
+        "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL)"
+    )
+
+
+def _serialized_batch(batch_ref: str) -> str:
+    return (
+        "EXISTS (SELECT 1 FROM planner_wake_batches wb "
+        "JOIN sprint_planner_bindings b ON b.binding_id=wb.binding_id "
+        "JOIN interface_sessions s ON s.session_id=b.session_id "
+        "JOIN interface_generations sg "
+        "ON sg.shell_id=s.shell_id AND sg.generation=s.generation "
+        "JOIN interface_generations bg "
+        "ON bg.shell_id=b.shell_id AND bg.generation=b.generation "
+        "JOIN interface_generations wg "
+        "ON wg.shell_id=wb.shell_id AND wg.generation=wb.generation "
+        f"WHERE wb.batch_id={batch_ref} "
+        "AND wb.state IN ('complete','delivery_unknown') "
+        "AND b.released_at IS NOT NULL "
+        "AND s.occupancy='ended' AND s.lifecycle='ended' "
+        "AND s.ended_at IS NOT NULL "
+        "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL "
+        "AND wg.ended_at IS NOT NULL)"
+    )
+
+
 SNAPSHOT_ROW_FILTERS = {
     "interface_generations": "WHERE ended_at IS NOT NULL",
-    "interface_sessions": "WHERE occupancy = 'ended'",
-    "sprint_planner_bindings": "WHERE released_at IS NOT NULL",
-    "planner_wake_batches": "WHERE state IN ('complete','delivery_unknown')",
+    "interface_sessions":
+        "WHERE occupancy='ended' AND lifecycle='ended' AND ended_at IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM interface_generations g "
+        "WHERE g.shell_id=interface_sessions.shell_id "
+        "AND g.generation=interface_sessions.generation "
+        "AND g.ended_at IS NOT NULL)",
+    "sprint_planner_bindings":
+        "WHERE " + _serialized_binding(
+            "sprint_planner_bindings.binding_id"),
+    "planner_wake_batches":
+        "WHERE " + _serialized_batch("planner_wake_batches.batch_id"),
     "planner_wake_items":
-        "WHERE state IN ('done','reconcile','quarantined','cancelled')",
+        "WHERE state IN ('done','reconcile','quarantined','cancelled') "
+        "AND " + _serialized_binding("planner_wake_items.binding_id") + " "
+        "AND EXISTS (SELECT 1 FROM shell_messages m "
+        "WHERE m.message_id=planner_wake_items.message_id) "
+        "AND (batch_id IS NULL OR "
+        + _serialized_batch("planner_wake_items.batch_id") + ")",
     "pr_poll_observations":
-        "WHERE transition IS NOT NULL OR blind_window <> 0",
+        "WHERE (transition IS NOT NULL OR blind_window <> 0) "
+        "AND EXISTS (SELECT 1 FROM watched_prs w "
+        "WHERE w.watch_id=pr_poll_observations.watch_id)",
+    # Alerts are durable only when every referenced parent is in this same
+    # projection. This drops session-scoped alerts for excluded live sessions
+    # and all legacy orphans, preventing integer-ID reuse from reattaching old
+    # generation state (#533).
+    "planner_alerts":
+        "WHERE (session_id IS NULL OR "
+        + _serialized_session("planner_alerts.session_id") + ") "
+        "AND (binding_id IS NULL OR "
+        + _serialized_binding("planner_alerts.binding_id") + ") "
+        "AND (message_id IS NULL OR EXISTS ("
+        "SELECT 1 FROM shell_messages m "
+        "WHERE m.message_id=planner_alerts.message_id)) "
+        "AND (watch_id IS NULL OR EXISTS ("
+        "SELECT 1 FROM watched_prs w "
+        "WHERE w.watch_id=planner_alerts.watch_id))",
 }
 
 
@@ -183,7 +261,6 @@ def dump_local_skills(con) -> list[str]:
         delete_line = "DELETE FROM skills;"
 
     cols = [r[1] for r in con.execute("PRAGMA table_info(skills)")]
-    collist = ", ".join(cols)
     mutable_cols = [c for c in cols if c != "skill_id"]
     insert_cols = ", ".join(mutable_cols)
     update_cols = [c for c in mutable_cols if c != "name"]
