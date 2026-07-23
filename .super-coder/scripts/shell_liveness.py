@@ -21,11 +21,11 @@ under THIS repo is a live shell session:
                                   root, not a worktree)
   • cwd under .sc-worktrees/<n> → the shell whose shortname.lower() == <n>
 
-The admin runs this (directly or as a child of its own harness), so its OWN
-session always appears — identified by `is_self` (PPID walk from our pid up to a
-harness ancestor) and by the repo-root cwd. The admin being active is EXPECTED;
-the gate is about OTHER shells. `active_other_shells == []` ⇒ the admin is the
-only live shell ⇒ every worktree is dormant ⇒ safe to clean all.
+The admin runs this (directly or as a child of its own harness), and its OWN
+session is positively identified only when the PPID walk finds a harness
+ancestor whose cwd is the repo root. Host launchers may hide that ancestor; in
+that case admin presence is indeterminate and cleanup fails closed. When Admin
+is positively present, the gate is about OTHER shells.
 
 Permissions: /proc/<pid>/cwd is readable only for same-user processes. A harness
 owned by another OS user is counted but unreadable → `indeterminate`. When
@@ -204,7 +204,6 @@ def compute() -> dict:
 
     bins = harness_binaries()
     root = REPO_ROOT.resolve()
-    wt_base = (REPO_ROOT / ".sc-worktrees").resolve()
     labels = _shell_labels()
 
     # First pass: every harness process and its raw pid/comm (cwd resolved next).
@@ -261,11 +260,14 @@ def compute() -> dict:
     active_other = sorted(worktree_sessions)
     indeterminate = len(indeterminate_pids)
     orphaned_pids = [p["pid"] for p in processes if p["orphaned"]]
+    admin_present = self_pid is not None and self_pid in admin_root_pids
+    admin_presence = "present" if admin_present else "indeterminate"
     return {
         "supported": True,
         "repo": {"name": REPO_ROOT.name, "root": str(REPO_ROOT)},
         "harness_binaries": sorted(bins),
         "self_pid": self_pid,
+        "admin_presence": admin_presence,
         "processes": processes,
         "worktree_sessions": worktree_sessions,
         "active_other_shells": active_other,
@@ -273,8 +275,9 @@ def compute() -> dict:
         "indeterminate": indeterminate,
         "indeterminate_pids": indeterminate_pids,
         "orphaned_pids": orphaned_pids,
-        # The gate: only the admin is live AND nothing is unreadable.
-        "safe_to_clean_all": not active_other and indeterminate == 0,
+        # The gate: Admin is positively present, no other shell is live, and
+        # every harness cwd was readable.
+        "safe_to_clean_all": admin_present and not active_other and indeterminate == 0,
     }
 
 
@@ -313,7 +316,8 @@ def _print_text(d: dict) -> None:
         print(f"{d['repo']['name']}: liveness unsupported — {d.get('note','')}")
         return
     print(f"{d['repo']['name']}   harnesses={','.join(d['harness_binaries'])}"
-          f"   self_pid={d['self_pid']}")
+          f"   self_pid={d['self_pid']}"
+          f"   admin_presence={d['admin_presence']}")
     print("\nLIVE HARNESS SESSIONS")
     if not d["processes"]:
         print("  (none — no harness cwd'd inside this repo)")
@@ -345,6 +349,9 @@ def _print_text(d: dict) -> None:
               f"  → surface those worktrees; do NOT act on them.")
         if not d["indeterminate"]:
             print("  All other worktrees are dormant → safe to clean.")
+    elif d["admin_presence"] != "present":
+        print("  Admin presence is indeterminate — current harness identity "
+              "was not positively matched to the repo root; cleanup remains unsafe.")
     elif d["indeterminate"]:
         print("  No live other shells seen, but indeterminate>0 → surface, "
               "do not assume safe.")

@@ -25,7 +25,6 @@ import json
 import re
 import sqlite3
 import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -42,7 +41,8 @@ CONFIG_PATH_LEGACY = ENGINE / "map.config.json"
 
 # Built-in defaults. A fork's map.config.json EXTENDS the skip sets and may add
 # role_overrides — it never shrinks these (so the engine dirs below stay hidden).
-SKIP_DIRS = {".git", "node_modules", ".super-coder", ".sc-state", ".venv", "venv",
+SKIP_DIRS = {".git", ".sc-worktrees", "node_modules", ".super-coder", ".sc-state",
+             ".venv", "venv",
              "__pycache__", ".svelte-kit", "dist", "build", ".next", "target",
              "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache",
              # super-coder's own render output — mirrors the DB, not host source.
