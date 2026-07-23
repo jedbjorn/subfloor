@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 
+import interface_hooks
 import interface_state
 
 MAX_INPUT_BYTES = 64 * 1024  # one human frame, per the pinned spike protocol
@@ -30,6 +31,21 @@ DEFAULT_QUIET_S = 3.0  # debounce, never proof of an empty composer
 
 class BrokerError(ValueError):
     """A refused broker operation (stale generation, bad sequence, gate)."""
+
+
+def _begin_immediate(con) -> bool:
+    """Serialize a check-then-act gate (REV2 seq-4 L5 TOCTOU): take the DB
+    write lock BEFORE the gate reads so a concurrent gate on another
+    connection cannot pass on the same pre-commit snapshot. WAL +
+    busy_timeout make the contender wait, then re-read post-commit state.
+    Returns True when THIS call opened the transaction — the caller must
+    then release it (commit or rollback) on every exit path; False when the
+    connection was already in a transaction (serialization is then the
+    caller's own)."""
+    if con.in_transaction:
+        return False
+    con.execute("BEGIN IMMEDIATE")
+    return True
 
 
 def _now(con) -> str:
@@ -136,53 +152,71 @@ def accept_human_input(con, session_id: int, client_seq: int,
     a writer() failure WITHOUT process death takes the same park immediately
     (delivery unknown, writer revoked, alert) since the bytes may have
     landed.
+
+    The gate reads + the phase-1 commit are serialized under BEGIN IMMEDIATE
+    (REV2 seq-4 L5): a wake submission committing its input lock on another
+    connection cannot slip between this frame's lock check and its
+    reservation — whichever commits first wins; the loser re-reads and
+    refuses (lock held) or re-gates (frame pending).
     """
-    if payload_len > MAX_INPUT_BYTES:
-        raise BrokerError(f"payload {payload_len} > {MAX_INPUT_BYTES} bytes")
-    sess = _session(con, session_id)
-    if sess[3] != "occupied":
-        raise BrokerError(f"session {session_id} is {sess[3]}, not occupied")
-    lease = current_writer(con, session_id)
-    if lease is None:
-        raise BrokerError(f"session {session_id} has no writer")
-    istate = con.execute(
-        "SELECT composer, delivery, pending_seq, forwarded_seq "
-        "FROM interface_input_state WHERE session_id=?",
-        (session_id,),
-    ).fetchone()
-    if istate is None:
-        raise BrokerError(f"session {session_id} has no input state row")
-    _, _, pending_seq, forwarded_seq = istate
+    began = _begin_immediate(con)
+    try:
+        if payload_len > MAX_INPUT_BYTES:
+            raise BrokerError(
+                f"payload {payload_len} > {MAX_INPUT_BYTES} bytes")
+        sess = _session(con, session_id)
+        if sess[3] != "occupied":
+            raise BrokerError(
+                f"session {session_id} is {sess[3]}, not occupied")
+        lease = current_writer(con, session_id)
+        if lease is None:
+            raise BrokerError(f"session {session_id} has no writer")
+        istate = con.execute(
+            "SELECT composer, delivery, pending_seq, forwarded_seq "
+            "FROM interface_input_state WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if istate is None:
+            raise BrokerError(f"session {session_id} has no input state row")
+        _, _, pending_seq, forwarded_seq = istate
 
-    if client_seq <= forwarded_seq:
-        # Known-forwarded duplicate: replay the ack, never the bytes.
-        return {"ack": client_seq, "duplicate": True}
-    # The input lock: while a wake batch is submitting, its fixed prompt is
-    # the indivisible input — a human frame is ordered AFTER it (spec #20
-    # Retry Policy), never interleaved inside the submission.
-    locked = con.execute(
-        "SELECT 1 FROM planner_wake_batches "
-        "WHERE shell_id=? AND generation=? AND state='submitting'",
-        (sess[1], sess[2])).fetchone()
-    if locked is not None:
-        raise BrokerError(
-            "a wake submission holds the input lock — this frame is ordered "
-            "after it; retry once the wake is acknowledged")
-    if pending_seq is not None:
-        # One unacknowledged frame per writer — the client buffers locally.
-        raise BrokerError(f"sequence {pending_seq} is pending — wait for its ack")
-    if client_seq != lease[2]:
-        raise BrokerError(
-            f"sequence gap: expected {lease[2]}, got {client_seq} — rejected, "
-            "no bytes forwarded")
+        if client_seq <= forwarded_seq:
+            # Known-forwarded duplicate: replay the ack, never the bytes.
+            if began:
+                con.rollback()
+            return {"ack": client_seq, "duplicate": True}
+        # The input lock: while a wake batch is submitting, its fixed prompt is
+        # the indivisible input — a human frame is ordered AFTER it (spec #20
+        # Retry Policy), never interleaved inside the submission.
+        locked = con.execute(
+            "SELECT 1 FROM planner_wake_batches "
+            "WHERE shell_id=? AND generation=? AND state='submitting'",
+            (sess[1], sess[2])).fetchone()
+        if locked is not None:
+            raise BrokerError(
+                "a wake submission holds the input lock — this frame is "
+                "ordered after it; retry once the wake is acknowledged")
+        if pending_seq is not None:
+            # One unacknowledged frame per writer — the client buffers locally.
+            raise BrokerError(
+                f"sequence {pending_seq} is pending — wait for its ack")
+        if client_seq != lease[2]:
+            raise BrokerError(
+                f"sequence gap: expected {lease[2]}, got {client_seq} — "
+                "rejected, no bytes forwarded")
 
-    # Phase 1 (commit): reserve the sequence, dirty the composer FIRST.
-    interface_state.transition(
-        con, "composer", session_id, "dirty",
-        extra_sets={"pending_seq": client_seq,
-                    "pending_reserved_at": _now(con),
-                    "last_human_input_at": _now(con)})
-    con.commit()
+        # Phase 1 (commit): reserve the sequence, dirty the composer FIRST.
+        interface_state.transition(
+            con, "composer", session_id, "dirty",
+            extra_sets={"pending_seq": client_seq,
+                        "pending_reserved_at": _now(con),
+                        "last_human_input_at": _now(con)})
+        con.commit()
+        began = False
+    except Exception:
+        if began:
+            con.rollback()
+        raise
 
     # Phase 2: forward the exact bytes once. A crash here is the window.
     try:
@@ -256,14 +290,24 @@ def reconcile_input(con, session_id: int, outcome: str) -> None:
 
 
 def record_hook(con, shell_id: int, generation: int, hook_seq: int,
-                event: str) -> dict:
+                event: str, source: str = "provider") -> dict:
     """Record one authenticated harness hook with its durable sequence.
 
-    Rejects replays (hook_seq <= last_hook_seq) and stale generations. The
-    sequence is the crash-window evidence: a batch's submit/stop hook seqs
-    are stamped here, and startup reconciliation trusts only these durable
-    stamps — never the broker's memory of what it sent.
+    Rejects replays (hook_seq <= last_hook_seq), stale generations, and
+    unknown events. The sequence is the crash-window evidence: a batch's
+    submit/stop hook seqs are stamped here, and startup reconciliation
+    trusts only these durable stamps — never the broker's memory of what
+    it sent.
+
+    `source` distinguishes the entrypoint's pre-exec identity claim
+    (reserved → occupied promotion; NOT readiness) from a provider-native
+    hook delivered by the emitter — only the provider's session_start is
+    real start-readiness (sprint 25 seq 7).
     """
+    if event not in interface_hooks.EVENTS:
+        raise BrokerError(f"unknown hook event {event!r} — rejected")
+    if source not in interface_hooks.SOURCES:
+        raise BrokerError(f"unknown hook source {source!r} — rejected")
     gen = con.execute(
         "SELECT last_hook_seq, ended_at FROM interface_generations "
         "WHERE shell_id=? AND generation=?",
@@ -289,9 +333,24 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
     result = {"hook_seq": hook_seq, "event": event}
 
     if event == "session_start":
-        # Ready prompt proven, zero accepted human sequence → idle + clean.
-        interface_state.transition(con, "lifecycle", sess[0], "idle")
-        interface_state.transition(con, "composer", sess[0], "clean")
+        if source == "provider":
+            # Real provider readiness (seq 7): the harness's own start hook,
+            # not the entrypoint's identity claim. starting → idle; composer
+            # unknown → clean ONLY while zero human input has been accepted
+            # (spec: clean requires the ready callback AND no accepted human
+            # sequence). Readiness arriving after human input leaves the
+            # composer as it is — dirty/unknown still need submit/certify.
+            if sess[1] == "starting":
+                interface_state.transition(con, "lifecycle", sess[0], "idle")
+            istate = con.execute(
+                "SELECT composer, pending_seq, forwarded_seq "
+                "FROM interface_input_state WHERE session_id=?",
+                (sess[0],)).fetchone()
+            if istate is not None and istate[1] is None and istate[2] == 0:
+                interface_state.transition(con, "composer", sess[0], "clean")
+            _hook_capability_alerts(con, sess[0])
+        # source='entrypoint': identity/promotion only (the route owns the
+        # reserved → occupied move); readiness waits for the provider hook.
     elif event == "prompt_submit":
         # Fenced submit callback. A prompt_submit hook clears dirty -> clean
         # and promotes a submitting wake batch ONLY when it provably answers
@@ -336,14 +395,8 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
                 result["wake_batch_running"] = batch[0]
         interface_state.transition(con, "lifecycle", sess[0], "busy")
     elif event == "turn_stop":
-        interface_state.transition(con, "lifecycle", sess[0], "idle")
-        batch = con.execute(
-            "SELECT batch_id FROM planner_wake_batches "
-            "WHERE shell_id=? AND generation=? AND state='running'",
-            (shell_id, generation)).fetchone()
-        if batch is not None:
-            _complete_batch(con, batch[0], hook_seq)
-            result["wake_batch_complete"] = batch[0]
+        if _turn_finished(con, sess, shell_id, generation, hook_seq):
+            result["wake_batch_complete"] = True
     elif event == "session_end":
         interface_state.transition(con, "lifecycle", sess[0], "ended")
         # The chat is provably over: end the generation too. Without this the
@@ -354,11 +407,80 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
             "UPDATE interface_generations SET ended_at=datetime('now') "
             "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
             (shell_id, generation))
-    # approval_wait / approval_result / user_input_wait / interrupt map to
-    # plain lifecycle moves — added with the adapters (task #83); the
-    # mandatory four above are the wake-critical contract.
+    elif event == "approval_wait":
+        # Optional (kimi PermissionRequest): busy → approval + alert. A
+        # harness without this event simply stays busy — safe (spec).
+        if sess[1] == "busy":
+            interface_state.transition(con, "lifecycle", sess[0], "approval")
+            _alert(con, severity="warning", reason="approval_wait",
+                   session_id=sess[0])
+    elif event == "approval_result":
+        if sess[1] == "approval":
+            interface_state.transition(con, "lifecycle", sess[0], "busy")
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE session_id=? AND reason='approval_wait' "
+                "AND resolved_at IS NULL", (sess[0],))
+    elif event == "user_input_wait":
+        if sess[1] == "busy":
+            interface_state.transition(
+                con, "lifecycle", sess[0], "user_input")
+            _alert(con, severity="warning", reason="user_input_wait",
+                   session_id=sess[0])
+    elif event in ("interrupt", "failure"):
+        # The turn is over (user cancel / provider error). kimi's Stop does
+        # not fire on interrupt and claude's Stop does not fire on API
+        # error, so these events ARE that harness's turn-stop: preserve
+        # every queue, record the explicit terminal state, and reconcile a
+        # running batch exactly like turn_stop (spec Harness Hooks).
+        if _turn_finished(con, sess, shell_id, generation, hook_seq):
+            result["wake_batch_complete"] = True
+        if event == "failure":
+            _alert(con, severity="warning", reason="turn_failure",
+                   session_id=sess[0])
+        result["turn_terminal"] = event
     con.commit()
     return result
+
+
+def _turn_finished(con, sess, shell_id: int, generation: int,
+                   stop_hook_seq: int) -> bool:
+    """turn_stop / interrupt / failure: the model turn ended. Lifecycle
+    walks back to idle (through busy from approval/user_input — Stop may
+    arrive while a wait state is up), and a running wake batch reconciles
+    from durable read state. Returns True when a batch was completed."""
+    if sess[1] in ("approval", "user_input"):
+        interface_state.transition(con, "lifecycle", sess[0], "busy")
+        interface_state.transition(con, "lifecycle", sess[0], "idle")
+    else:
+        interface_state.transition(con, "lifecycle", sess[0], "idle")
+    batch = con.execute(
+        "SELECT batch_id FROM planner_wake_batches "
+        "WHERE shell_id=? AND generation=? AND state='running'",
+        (shell_id, generation)).fetchone()
+    if batch is not None:
+        _complete_batch(con, batch[0], stop_hook_seq)
+        return True
+    return False
+
+
+def _hook_capability_alerts(con, session_id: int) -> None:
+    """Spec Harness Hooks: a harness lacking distinct approval/user-input
+    hooks stays busy during those waits (safe) and Interface REPORTS the
+    degradation; a mandatory-hook gap blocks sprint-wake arming — never
+    the ordinary chat. Evaluated once per generation at provider
+    readiness; alerts dedupe while open."""
+    row = con.execute(
+        "SELECT harness, cli_version FROM interface_sessions "
+        "WHERE session_id=?", (session_id,)).fetchone()
+    cap = interface_hooks.capability(row[0] if row else None,
+                                     row[1] if row else None)
+    if not cap["mandatory_ok"]:
+        _alert(con, severity="warning", reason="wake_not_armable",
+               session_id=session_id)
+    elif cap["degraded"]:
+        _alert(con, severity="info", reason="hooks_degraded",
+               session_id=session_id)
 
 
 def _complete_batch(con, batch_id: int, stop_hook_seq: int) -> None:
@@ -492,78 +614,101 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     sequence the submit hook must answer). A writer failure without process
     death parks the batch as delivery_unknown — the prompt may have landed —
     which also releases the lock.
+
+    The gate reads + the 'submitting' commit are serialized under BEGIN
+    IMMEDIATE (REV2 seq-4 L5 TOCTOU): two concurrent submitters on separate
+    connections can no longer both pass the gate on the same pre-commit
+    snapshot — the second blocks on the write lock, then re-reads state
+    'submitting' and refuses; a human frame racing the gate either commits
+    its pending reservation first (this gate then sees it and cancels the
+    attempt) or loses to the 'submitting' commit and is refused by the lock.
     """
     if quiet_s <= 0:
         raise BrokerError("quiet_s must be > 0 — a zero debounce is forbidden")
-    batch = con.execute(
-        "SELECT binding_id, shell_id, generation, state "
-        "FROM planner_wake_batches WHERE batch_id=?",
-        (batch_id,)).fetchone()
-    if batch is None:
-        raise BrokerError(f"wake batch {batch_id} not found")
-    if batch[3] != "queued":
-        raise BrokerError(f"wake batch {batch_id} is {batch[3]}, not queued")
-    binding_id, shell_id, generation, _ = batch
+    began = _begin_immediate(con)
+    try:
+        batch = con.execute(
+            "SELECT binding_id, shell_id, generation, state "
+            "FROM planner_wake_batches WHERE batch_id=?",
+            (batch_id,)).fetchone()
+        if batch is None:
+            raise BrokerError(f"wake batch {batch_id} not found")
+        if batch[3] != "queued":
+            raise BrokerError(
+                f"wake batch {batch_id} is {batch[3]}, not queued")
+        binding_id, shell_id, generation, _ = batch
 
-    # Revalidate the arming at SUBMIT time: a sprint close or binding release
-    # since form_batch cancels the batch outright (no byte, no retry).
-    binding = con.execute(
-        "SELECT sprint_doc_id, released_at FROM sprint_planner_bindings "
-        "WHERE binding_id=?", (binding_id,)).fetchone()
-    if binding is None or binding[1] is not None:
-        _cancel_batch(con, batch_id)
+        # Revalidate the arming at SUBMIT time: a sprint close or binding
+        # release since form_batch cancels the batch outright (no byte).
+        binding = con.execute(
+            "SELECT sprint_doc_id, released_at FROM sprint_planner_bindings "
+            "WHERE binding_id=?", (binding_id,)).fetchone()
+        if binding is None or binding[1] is not None:
+            _cancel_batch(con, batch_id)
+            con.commit()
+            began = False
+            return {"submitted": False, "cancelled": True,
+                    "reason": "binding released — sprint no longer armed"}
+        if not _sprint_active(con, binding[0]):
+            _cancel_batch(con, batch_id)
+            con.commit()
+            began = False
+            return {"submitted": False, "cancelled": True,
+                    "reason": "sprint doc is not ACTIVE"}
+
+        sess = con.execute(
+            "SELECT session_id, occupancy, lifecycle, occupied_at, created_at "
+            "FROM interface_sessions "
+            "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
+            (shell_id, generation)).fetchone()
+        istate = con.execute(
+            "SELECT composer, pending_seq, forwarded_seq, last_human_input_at "
+            "FROM interface_input_state WHERE session_id=?",
+            (sess[0],)).fetchone()
+
+        def gate_fail(reason):
+            if began:
+                con.rollback()
+            return {"submitted": False, "reason": reason}
+
+        if sess[1] != "occupied" or sess[2] != "idle":
+            return gate_fail(
+                f"session not occupied+idle ({sess[1]}/{sess[2]})")
+        if istate[0] != "clean":
+            return gate_fail(f"composer is {istate[0]}")
+        if istate[1] is not None:
+            return gate_fail("a human frame is pending")
+        # Quiet baseline: the last human input if any, else the session's
+        # start — floored at the last service restart (startup_reconcile
+        # revokes every lease with reason 'service_restart'; that stamp is
+        # the restart time).
+        baseline = istate[3] or sess[3] or sess[4]
+        restart_at = con.execute(
+            "SELECT MAX(revoked_at) FROM interface_writer_leases "
+            "WHERE session_id=? AND revoke_reason='service_restart'",
+            (sess[0],)).fetchone()[0]
+        if restart_at is not None and restart_at > baseline:
+            baseline = restart_at
+        quiet = con.execute(
+            "SELECT julianday(?) - julianday(?)", (now_iso, baseline)
+        ).fetchone()[0] * 86400.0
+        if quiet < quiet_s:
+            return gate_fail(f"quiet {quiet:.2f}s < {quiet_s}s")
+
+        fence = istate[2] + 1
+        interface_state.transition(
+            con, "wake_batch", batch_id, "submitting",
+            extra_sets={"input_seq_fence": fence})
+        con.execute(
+            "UPDATE planner_wake_items SET state='submitting' "
+            "WHERE batch_id=? AND state='batched'",
+            (batch_id,))
         con.commit()
-        return {"submitted": False, "cancelled": True,
-                "reason": "binding released — sprint no longer armed"}
-    if not _sprint_active(con, binding[0]):
-        _cancel_batch(con, batch_id)
-        con.commit()
-        return {"submitted": False, "cancelled": True,
-                "reason": "sprint doc is not ACTIVE"}
-
-    sess = con.execute(
-        "SELECT session_id, occupancy, lifecycle, occupied_at, created_at "
-        "FROM interface_sessions "
-        "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
-        (shell_id, generation)).fetchone()
-    istate = con.execute(
-        "SELECT composer, pending_seq, forwarded_seq, last_human_input_at "
-        "FROM interface_input_state WHERE session_id=?",
-        (sess[0],)).fetchone()
-
-    if sess[1] != "occupied" or sess[2] != "idle":
-        return {"submitted": False,
-                "reason": f"session not occupied+idle ({sess[1]}/{sess[2]})"}
-    if istate[0] != "clean":
-        return {"submitted": False, "reason": f"composer is {istate[0]}"}
-    if istate[1] is not None:
-        return {"submitted": False, "reason": "a human frame is pending"}
-    # Quiet baseline: the last human input if any, else the session's start —
-    # floored at the last service restart (startup_reconcile revokes every
-    # lease with reason 'service_restart'; that stamp is the restart time).
-    baseline = istate[3] or sess[3] or sess[4]
-    restart_at = con.execute(
-        "SELECT MAX(revoked_at) FROM interface_writer_leases "
-        "WHERE session_id=? AND revoke_reason='service_restart'",
-        (sess[0],)).fetchone()[0]
-    if restart_at is not None and restart_at > baseline:
-        baseline = restart_at
-    quiet = con.execute(
-        "SELECT julianday(?) - julianday(?)", (now_iso, baseline)
-    ).fetchone()[0] * 86400.0
-    if quiet < quiet_s:
-        return {"submitted": False,
-                "reason": f"quiet {quiet:.2f}s < {quiet_s}s"}
-
-    fence = istate[2] + 1
-    interface_state.transition(
-        con, "wake_batch", batch_id, "submitting",
-        extra_sets={"input_seq_fence": fence})
-    con.execute(
-        "UPDATE planner_wake_items SET state='submitting' "
-        "WHERE batch_id=? AND state='batched'",
-        (batch_id,))
-    con.commit()
+        began = False
+    except Exception:
+        if began:
+            con.rollback()
+        raise
 
     try:
         writer(len(WAKE_PROMPT) + 1)  # the fixed prompt + Enter, indivisible

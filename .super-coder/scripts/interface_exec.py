@@ -13,12 +13,17 @@ points a private tmux pane's shell line at this script. This process then:
     3. chdirs into the token's worktree.
     4. prepares the launch through run.py's `prepare_launch` — the NORMAL
        harness/model/effort/permission/worktree/render/boot/archive path
-       (exit 3 on refusal).
-    5. confirms identity to the API with a session_start hook callback,
-       which promotes the reservation reserved→occupied (exit 4 when the
-       API is unreachable or rejects — fail closed: never start an
+       (exit 3 on refusal), then merges the harness's authenticated
+       lifecycle hook config (interface_hooks — never replacing fork/user
+       hooks) and injects the emitter's per-generation credentials into
+       the launch env;
+    5. confirms identity to the API with an entrypoint session_start hook
+       callback, which promotes the reservation reserved→occupied (exit 4
+       when the API is unreachable or rejects — fail closed: never start an
        unmanaged harness; an unpromoted reservation expires into
-       unreconciled for the operator).
+       unreconciled for the operator). This is IDENTITY only: lifecycle
+       idle + composer clean wait for the harness's own provider
+       session_start hook (seq 7 hardening);
     6. execvpe's the harness TUI — this process BECOMES the harness,
        keeping the pane PID (the pane shell line exec's all the way down).
 
@@ -39,8 +44,10 @@ import urllib.request
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
+RUN_DIR = ENGINE / "run" / "interface"  # gitignored runtime home
 sys.path.insert(0, str(ENGINE / "scripts"))
 import run as run_mod  # noqa: E402
+import interface_hooks  # noqa: E402
 
 # Fields the reservation capability must carry (harness/model/effort are
 # optional route hints — prepare_launch resolves their defaults).
@@ -172,11 +179,27 @@ def main(argv: "list[str] | None" = None) -> int:
               f"({type(e).__name__}: {e})", file=sys.stderr)
         return 3
 
+    # Lifecycle hooks (sprint 25 seq 7): merge this harness's authenticated
+    # hook config WITHOUT replacing fork/user hooks, and hand the emitter
+    # its per-generation credentials through the launch env — the token
+    # never touches a config file, argv, or stderr. A harness whose hooks
+    # can't install still launches (ordinary chat unaffected); without the
+    # provider session_start the session simply never becomes wake-armable.
+    hook_install = interface_hooks.install(
+        plan.harness, Path(plan.cwd), run_dir=RUN_DIR,
+        session_id=int(token["session_id"]), cli_version=plan.cli_version)
+    argv = list(plan.argv) + hook_install["argv"]
+    env = dict(plan.env)
+    env["SC_INTERFACE_HOOK_TOKEN"] = token["hook_token"]
+    env["SC_INTERFACE_SHELL_ID"] = str(token["shell_id"])
+    env["SC_INTERFACE_GENERATION"] = str(token["generation"])
+
     body = {
         "shell_id": int(token["shell_id"]),
         "generation": int(token["generation"]),
         "hook_seq": 1,
         "event": "session_start",
+        "source": "entrypoint",
         "archive_id": plan.archive_id,
         "pid": os.getpid(),
         "start_ticks": _start_ticks(),
@@ -193,7 +216,7 @@ def main(argv: "list[str] | None" = None) -> int:
         return 4
 
     os.chdir(plan.cwd)
-    _exec(plan.argv, plan.env)
+    _exec(argv, env)
     return 0  # unreachable: _exec replaces the process
 
 

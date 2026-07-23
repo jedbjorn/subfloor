@@ -157,17 +157,25 @@ class InterfaceApiTest(unittest.TestCase):
                          {"shell_id": shell_id, **extra})
 
     def occupy(self, shell_id=1):
-        """Drive a session to occupied+idle+clean via the hook callback."""
+        """Drive a session to occupied+idle+clean: the entrypoint's
+        session_start (identity, promotes reserved→occupied) then the
+        provider's session_start (real readiness → idle+clean)."""
         status, _, body = self.create_session(shell_id)
         assert status == 201, body
         sid = body["session_id"]
-        status, _, _ = self.call(
+        status, _, b = self.call(
             "POST", "/api/interface/hook-callbacks",
             ("Authorization: Bearer " + self.hook_token(sid),),
             {"shell_id": shell_id, "generation": 1, "hook_seq": 1,
-             "event": "session_start", "archive_id": 10, "pid": 4321,
-             "start_ticks": 999})
-        assert status == 200, (sid, status)
+             "event": "session_start", "source": "entrypoint",
+             "archive_id": 10, "pid": 4321, "start_ticks": 999})
+        assert status == 200, (sid, status, b)
+        status, _, b = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(sid),),
+            {"shell_id": shell_id, "generation": 1, "hook_seq": 2,
+             "event": "session_start", "source": "provider", "pid": 4321})
+        assert status == 200, (sid, status, b)
         return sid
 
     def hook_token(self, session_id):
@@ -402,18 +410,38 @@ class InterfaceApiTest(unittest.TestCase):
 
     def test_hook_session_start_promotes(self):
         self.create_session()
+        # Phase 1 — the entrypoint's identity claim: promotes reserved →
+        # occupied, but is NOT readiness: lifecycle stays 'starting' and
+        # the composer stays 'unknown' (seq 7 hardening).
         status, _, _ = self.call(
             "POST", "/api/interface/hook-callbacks",
             ("Authorization: Bearer " + self.hook_token(1),),
             {"shell_id": 1, "generation": 1, "hook_seq": 1,
-             "event": "session_start", "archive_id": 10, "pid": 4321,
-             "start_ticks": 999})
+             "event": "session_start", "source": "entrypoint",
+             "archive_id": 10, "pid": 4321, "start_ticks": 999})
         self.assertEqual(status, 200)
         con = sqlite3.connect(self.db_path)
         sess = con.execute(
             "SELECT occupancy, lifecycle, archive_id FROM interface_sessions "
             "WHERE session_id=1").fetchone()
-        self.assertEqual(sess, ("occupied", "idle", 10))
+        self.assertEqual(sess, ("occupied", "starting", 10))
+        composer = con.execute(
+            "SELECT composer FROM interface_input_state WHERE session_id=1"
+        ).fetchone()[0]
+        self.assertEqual(composer, "unknown")
+        con.close()
+        # Phase 2 — the provider's own session_start: real readiness.
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(1),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 2,
+             "event": "session_start", "source": "provider", "pid": 4321})
+        self.assertEqual(status, 200)
+        con = sqlite3.connect(self.db_path)
+        sess = con.execute(
+            "SELECT occupancy, lifecycle FROM interface_sessions "
+            "WHERE session_id=1").fetchone()
+        self.assertEqual(sess, ("occupied", "idle"))
         composer = con.execute(
             "SELECT composer FROM interface_input_state WHERE session_id=1"
         ).fetchone()[0]
@@ -424,9 +452,216 @@ class InterfaceApiTest(unittest.TestCase):
             "POST", "/api/interface/hook-callbacks",
             ("Authorization: Bearer " + self.hook_token(1),),
             {"shell_id": 1, "generation": 1, "hook_seq": 1,
-             "event": "session_start", "archive_id": 10, "pid": 4321,
-             "start_ticks": 999})
+             "event": "session_start", "source": "entrypoint",
+             "archive_id": 10, "pid": 4321, "start_ticks": 999})
         self.assertEqual(status, 409)
+
+    def test_hook_contract_validation(self):
+        self.create_session()
+        tok = "Authorization: Bearer " + self.hook_token(1)
+        # Unknown event → 422, audited (nothing recorded).
+        status, _, body = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,
+             "event": "screenshot", "pid": 4321})
+        self.assertEqual(status, 422)
+        # Unknown source → 422.
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,
+             "event": "session_start", "source": "moon", "pid": 4321})
+        self.assertEqual(status, 422)
+        # Unknown payload fields → 422 (spec: unknown fields are rejected).
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,
+             "event": "turn_stop", "prompt": "never content"})
+        self.assertEqual(status, 422)
+        # session_start without pid identity → 422.
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,
+             "event": "session_start", "source": "entrypoint"})
+        self.assertEqual(status, 422)
+
+    def test_hook_pid_fence_on_every_event(self):
+        sid = self.occupy()
+        # A pid on ANY event must be the pane's pid (exec-chain identity).
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(sid),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 3,
+             "event": "turn_stop", "pid": 9999})
+        self.assertEqual(status, 403)
+
+    def test_hook_approval_and_user_input_lifecycle(self):
+        sid = self.occupy()
+        tok = "Authorization: Bearer " + self.hook_token(sid)
+
+        def hook(seq, event):
+            status, _, body = self.call(
+                "POST", "/api/interface/hook-callbacks", (tok,),
+                {"shell_id": 1, "generation": 1, "hook_seq": seq,
+                 "event": event, "pid": 4321})
+            assert status == 200, (event, status, body)
+
+        def lifecycle():
+            con = sqlite3.connect(self.db_path)
+            row = con.execute("SELECT lifecycle FROM interface_sessions "
+                              "WHERE session_id=?", (sid,)).fetchone()[0]
+            con.close()
+            return row
+
+        hook(3, "prompt_submit")
+        self.assertEqual(lifecycle(), "busy")
+        hook(4, "approval_wait")
+        self.assertEqual(lifecycle(), "approval")
+        # The wait raised an alert; the result resolves it.
+        con = sqlite3.connect(self.db_path)
+        alert = con.execute(
+            "SELECT 1 FROM planner_alerts WHERE session_id=? AND "
+            "reason='approval_wait' AND resolved_at IS NULL",
+            (sid,)).fetchone()
+        con.close()
+        self.assertIsNotNone(alert)
+        hook(5, "approval_result")
+        self.assertEqual(lifecycle(), "busy")
+        con = sqlite3.connect(self.db_path)
+        alert = con.execute(
+            "SELECT 1 FROM planner_alerts WHERE session_id=? AND "
+            "reason='approval_wait' AND resolved_at IS NULL",
+            (sid,)).fetchone()
+        con.close()
+        self.assertIsNone(alert)
+        hook(6, "user_input_wait")
+        self.assertEqual(lifecycle(), "user_input")
+        # turn_stop from a wait state walks back through busy to idle.
+        hook(7, "turn_stop")
+        self.assertEqual(lifecycle(), "idle")
+
+    def test_hook_interrupt_and_failure_end_the_turn(self):
+        sid = self.occupy()
+        tok = "Authorization: Bearer " + self.hook_token(sid)
+
+        def hook(seq, event):
+            status, _, body = self.call(
+                "POST", "/api/interface/hook-callbacks", (tok,),
+                {"shell_id": 1, "generation": 1, "hook_seq": seq,
+                 "event": event, "pid": 4321})
+            assert status == 200, (event, status, body)
+
+        def lifecycle():
+            con = sqlite3.connect(self.db_path)
+            row = con.execute("SELECT lifecycle FROM interface_sessions "
+                              "WHERE session_id=?", (sid,)).fetchone()[0]
+            con.close()
+            return row
+
+        hook(3, "prompt_submit")
+        hook(4, "interrupt")  # kimi Interrupt: Stop never fires on cancel
+        self.assertEqual(lifecycle(), "idle")
+        hook(5, "prompt_submit")
+        hook(6, "failure")  # claude StopFailure: Stop never fires on error
+        self.assertEqual(lifecycle(), "idle")
+        con = sqlite3.connect(self.db_path)
+        alert = con.execute(
+            "SELECT 1 FROM planner_alerts WHERE session_id=? AND "
+            "reason='turn_failure'", (sid,)).fetchone()
+        con.close()
+        self.assertIsNotNone(alert)
+
+    def test_hook_capability_alerts_at_readiness(self):
+        # claude (no approval-result/user-input events) → degraded info
+        # alert; the chat itself is unaffected.
+        status, _, body = self.create_session(1, harness="claude")
+        assert status == 201, body
+        sid = body["session_id"]
+        tok = "Authorization: Bearer " + self.hook_token(sid)
+        status, _, b = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,
+             "event": "session_start", "source": "entrypoint",
+             "archive_id": 10, "pid": 4321, "start_ticks": 999,
+             "cli_version": "2.1.217 (Claude Code)"})
+        assert status == 200, b
+        status, _, b = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 2,
+             "event": "session_start", "source": "provider", "pid": 4321})
+        assert status == 200, b
+        con = sqlite3.connect(self.db_path)
+        alert = con.execute(
+            "SELECT severity FROM planner_alerts WHERE session_id=? AND "
+            "reason='hooks_degraded'", (sid,)).fetchone()
+        con.close()
+        self.assertIsNotNone(alert)
+        self.assertEqual(alert[0], "info")
+
+    def test_hook_mandatory_gap_alerts_not_armable(self):
+        # An unknown harness (no adapter) can chat, but provider readiness
+        # flags the mandatory-hook gap: wake can never arm on it.
+        status, _, body = self.create_session(1, harness="ed")
+        assert status == 201, body
+        sid = body["session_id"]
+        tok = "Authorization: Bearer " + self.hook_token(sid)
+        self.call("POST", "/api/interface/hook-callbacks", (tok,),
+                  {"shell_id": 1, "generation": 1, "hook_seq": 1,
+                   "event": "session_start", "source": "entrypoint",
+                   "archive_id": 10, "pid": 4321, "start_ticks": 999})
+        status, _, b = self.call(
+            "POST", "/api/interface/hook-callbacks", (tok,),
+            {"shell_id": 1, "generation": 1, "hook_seq": 2,
+             "event": "session_start", "source": "provider", "pid": 4321})
+        assert status == 200, b
+        con = sqlite3.connect(self.db_path)
+        alert = con.execute(
+            "SELECT severity FROM planner_alerts WHERE session_id=? AND "
+            "reason='wake_not_armable'", (sid,)).fetchone()
+        con.close()
+        self.assertIsNotNone(alert)
+        self.assertEqual(alert[0], "warning")
+
+    def test_provider_readiness_never_cleans_after_human_input(self):
+        sid = self.occupy()
+        # A human frame is accepted (composer dirty), THEN a second provider
+        # session_start arrives (e.g. a resume): it must NOT manufacture
+        # clean — only submit/certify can.
+        status, _, body = self.acquire_lease(sid)
+        assert status == 201, body
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE interface_input_state SET composer='dirty', "
+                    "forwarded_seq=1 WHERE session_id=?", (sid,))
+        con.commit()
+        con.close()
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(sid),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 3,
+             "event": "session_start", "source": "provider", "pid": 4321})
+        self.assertEqual(status, 200)
+        con = sqlite3.connect(self.db_path)
+        composer = con.execute(
+            "SELECT composer FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone()[0]
+        con.close()
+        self.assertEqual(composer, "dirty")
+
+    def test_hook_illegal_transition_rejected(self):
+        self.create_session()
+        # prompt_submit from lifecycle 'starting' is an illegal edge
+        # (starting → busy) — rejected + audited, no state churn.
+        status, _, body = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(1),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,
+             "event": "prompt_submit", "pid": 4321})
+        self.assertEqual(status, 409)
+        con = sqlite3.connect(self.db_path)
+        lifecycle = con.execute(
+            "SELECT lifecycle FROM interface_sessions WHERE session_id=1"
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(lifecycle, "starting")
 
     # -- leases + tickets + certification ---------------------------------------------------------------
 
