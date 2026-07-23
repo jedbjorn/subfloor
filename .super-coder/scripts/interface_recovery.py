@@ -505,8 +505,17 @@ def _close_durable_state(con, shell_id: int, evidence: dict,
                      "binding": None, "parked": []}
     sess = evidence["session"]
     if evidence["live_session"] and sess:
+        alerts_before = con.execute(
+            "SELECT COUNT(*) FROM planner_alerts "
+            "WHERE session_id=? AND resolved_at IS NULL",
+            (sess["session_id"],)).fetchone()[0]
         result = interface_broker.close_session(con, sess["session_id"],
                                                 end_reason)
+        alerts_after = con.execute(
+            "SELECT COUNT(*) FROM planner_alerts "
+            "WHERE session_id=? AND resolved_at IS NULL",
+            (sess["session_id"],)).fetchone()[0]
+        changed["alerts_resolved"] += alerts_before - alerts_after
         changed["session"] = {"session_id": sess["session_id"],
                               "end_reason": result["end_reason"],
                               "already_ended": result["already_ended"]}
