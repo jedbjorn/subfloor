@@ -10,8 +10,8 @@ content.sql carries only durable audit. These tests pin:
 - volatile columns (tmux socket, PIDs/start ticks, hook token hash) never
   appear in a dump even on preserved rows;
 - row filters keep live rows out: non-ended sessions, their bindings,
-  nonterminal batches/items, and no-transition observations are excluded
-  while terminal audit and parked ambiguity are preserved;
+  ordinary nonterminal batches/items, and no-transition observations are
+  excluded while terminal audit and parked recovery items are preserved;
 - alerts are serialized only when every referenced parent is preserved.
 
 Run:
@@ -19,11 +19,13 @@ Run:
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -118,7 +120,7 @@ class InterfaceSnapshotTest(unittest.TestCase):
             "INSERT INTO planner_wake_batches (batch_id, binding_id,"
             " shell_id, generation, state) "
             "VALUES (3,2,2,2,'delivery_unknown')")
-        # Items: done (audit) + queued (live).
+        # Items: done audit + parked in-flight recovery state + queued live.
         self.con.execute(
             "INSERT INTO shell_messages (message_id, from_shell_id,"
             " to_shell_id, body) VALUES (1,1,2,'a')")
@@ -126,11 +128,17 @@ class InterfaceSnapshotTest(unittest.TestCase):
             "INSERT INTO shell_messages (message_id, from_shell_id,"
             " to_shell_id, body) VALUES (2,1,2,'b')")
         self.con.execute(
+            "INSERT INTO shell_messages (message_id, from_shell_id,"
+            " to_shell_id, body) VALUES (3,1,2,'parked-unread')")
+        self.con.execute(
             "INSERT INTO planner_wake_items (item_id, binding_id, message_id,"
             " batch_id, state) VALUES (1,2,1,1,'done')")
         self.con.execute(
             "INSERT INTO planner_wake_items (item_id, binding_id, message_id,"
             " state) VALUES (2,1,2,'queued')")
+        self.con.execute(
+            "INSERT INTO planner_wake_items (item_id, binding_id, message_id,"
+            " batch_id, state) VALUES (3,2,3,3,'submitting')")
         # Observations: transition + blind-window (audit), plain (noise).
         self.con.execute(
             "INSERT INTO watched_prs (watch_id, repo, pr_number, shell_id) "
@@ -246,9 +254,10 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.assertIn("'delivery_unknown'", out)
         self.assertNotIn("'queued'", out)
 
-    def test_wake_items_keep_terminal_only(self):
+    def test_wake_items_keep_terminal_and_parked_recovery_state(self):
         out = self._dump("planner_wake_items")
         self.assertIn("'done'", out)
+        self.assertIn("'submitting'", out)
         self.assertNotIn("'queued'", out)
 
     def test_observations_keep_transitions_and_blind_windows(self):
@@ -284,7 +293,7 @@ class InterfaceSnapshotTest(unittest.TestCase):
                 self.fail(f"{table}: row filter broken against schema "
                           f"({filt!r}): {e}")
 
-    def test_complete_snapshot_projection_is_foreign_key_closed(self):
+    def test_projection_is_fk_closed_and_parked_retry_survives_rebuild(self):
         target = self.tmp / "rebuilt.db"
         build_engine_db(target)
         lines = ["PRAGMA foreign_keys=OFF;", "BEGIN;"]
@@ -306,6 +315,11 @@ class InterfaceSnapshotTest(unittest.TestCase):
             wake_park = rebuilt.execute(
                 "SELECT state FROM planner_wake_batches "
                 "WHERE batch_id=3").fetchone()
+            parked_item = rebuilt.execute(
+                "SELECT i.state, i.batch_id, m.read_at "
+                "FROM planner_wake_items i "
+                "JOIN shell_messages m ON m.message_id=i.message_id "
+                "WHERE i.item_id=3").fetchone()
             alerts = set(rebuilt.execute(
                 "SELECT reason FROM planner_alerts "
                 "WHERE session_id=2 OR binding_id=2").fetchall())
@@ -315,12 +329,16 @@ class InterfaceSnapshotTest(unittest.TestCase):
                 "FROM sprint_planner_bindings WHERE binding_id=2").fetchone()
             projected = interface_routes._project_binding(
                 rebuilt, binding_row)
+            rebuilt.execute(
+                "UPDATE shells SET api_key='shelltok2' WHERE shell_id=2")
+            rebuilt.commit()
         finally:
             rebuilt.close()
         self.assertEqual(violations, [])
         self.assertEqual(input_park, ("unknown", "delivery_unknown", 9))
         self.assertEqual(binding, (None,))
         self.assertEqual(wake_park, ("delivery_unknown",))
+        self.assertEqual(parked_item, ("submitting", 3, None))
         self.assertIn(("crash_window_delivery_unknown",), alerts)
         self.assertIn(("wake_batch_delivery_unknown",), alerts)
         self.assertEqual(projected["wake_state"], "parked")
@@ -333,6 +351,29 @@ class InterfaceSnapshotTest(unittest.TestCase):
             "applicable": True,
             "needs_outcome": True,
         })
+        headers = (
+            "Host: 127.0.0.1:8800\r\n"
+            "Authorization: Bearer shelltok2\r\n"
+            "Idempotency-Key: snapshot-rebuild-retry"
+        )
+        with mock.patch.object(interface_routes, "DB_PATH", target):
+            status, _, body = interface_routes.handle(
+                "POST", "/api/interface/sprint-bindings/2/retry", headers,
+                json.dumps({"outcome": "not_delivered"}).encode())
+        self.assertEqual(status, 200, body)
+        retry = json.loads(body)
+        self.assertIn("parked batch 3 resolved", "; ".join(retry["actions"]))
+
+        rebuilt = sqlite3.connect(target)
+        try:
+            requeued = rebuilt.execute(
+                "SELECT i.state, i.batch_id, m.read_at "
+                "FROM planner_wake_items i "
+                "JOIN shell_messages m ON m.message_id=i.message_id "
+                "WHERE i.item_id=3").fetchone()
+        finally:
+            rebuilt.close()
+        self.assertEqual(requeued, ("queued", None, None))
 
 
 if __name__ == "__main__":

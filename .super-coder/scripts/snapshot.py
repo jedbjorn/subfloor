@@ -137,7 +137,10 @@ def _serialized_binding(binding_ref: str) -> str:
     )
 
 
-def _serialized_batch(batch_ref: str) -> str:
+def _serialized_batch(
+        batch_ref: str,
+        states: tuple[str, ...] = ("complete", "delivery_unknown")) -> str:
+    state_list = ",".join(f"'{state}'" for state in states)
     return (
         "EXISTS (SELECT 1 FROM planner_wake_batches wb "
         "JOIN sprint_planner_bindings b ON b.binding_id=wb.binding_id "
@@ -149,7 +152,7 @@ def _serialized_batch(batch_ref: str) -> str:
         "JOIN interface_generations wg "
         "ON wg.shell_id=wb.shell_id AND wg.generation=wb.generation "
         f"WHERE wb.batch_id={batch_ref} "
-        "AND wb.state IN ('complete','delivery_unknown') "
+        f"AND wb.state IN ({state_list}) "
         "AND s.occupancy='ended' AND s.lifecycle='ended' "
         "AND s.ended_at IS NOT NULL "
         "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL "
@@ -173,8 +176,15 @@ SNAPSHOT_ROW_FILTERS = {
             "sprint_planner_bindings.binding_id"),
     "planner_wake_batches":
         "WHERE " + _serialized_batch("planner_wake_batches.batch_id"),
+    # In-flight items are normally volatile. The exception is an item owned
+    # by a serialized delivery_unknown batch: resolve_batch() needs that row
+    # after rebuild to requeue the still-unread message on explicit retry.
     "planner_wake_items":
-        "WHERE state IN ('done','reconcile','quarantined','cancelled') "
+        "WHERE (state IN ('done','reconcile','quarantined','cancelled') "
+        "OR (state IN ('batched','submitting','running') "
+        "AND batch_id IS NOT NULL AND "
+        + _serialized_batch(
+            "planner_wake_items.batch_id", ("delivery_unknown",)) + ")) "
         "AND " + _serialized_binding("planner_wake_items.binding_id") + " "
         "AND EXISTS (SELECT 1 FROM shell_messages m "
         "WHERE m.message_id=planner_wake_items.message_id) "

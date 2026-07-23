@@ -330,9 +330,10 @@ CREATE TABLE daemon_heartbeats (
 -- per shell, exact-identity sessions, writer leases, metadata-only input
 -- state, idempotency keys, sprint planner bindings, wake items/batches,
 -- action receipts, PR poll audit, and alerts. Volatile runtime tables
--- (interface_writer_leases, interface_input_state, pr_poll_runs) are
--- deliberately NOT in snapshot.py's PER_INSTANCE_TABLES; volatile columns
--- (tmux socket, PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
+-- (interface_writer_leases, pr_poll_runs) are deliberately NOT in
+-- snapshot.py's PER_INSTANCE_TABLES. interface_input_state preserves only
+-- terminal delivery-unknown metadata; volatile columns (tmux socket,
+-- PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
 -- See migrations/0078_interface_sessions.sql (convergent — carries an
 -- existing fork) and scripts/interface_state.py (app-level edge maps — keep
 -- in sync with the transition triggers below).
