@@ -595,10 +595,10 @@ END;
 CREATE TRIGGER trg_pwi_state
 BEFORE UPDATE OF state ON planner_wake_items
 WHEN NEW.state <> OLD.state AND NOT (
-    (OLD.state = 'queued'      AND NEW.state IN ('batched','quarantined','cancelled')) OR
+    (OLD.state = 'queued'      AND NEW.state IN ('batched','done','quarantined','cancelled')) OR
     (OLD.state = 'batched'     AND NEW.state IN ('queued','submitting','cancelled')) OR
     (OLD.state = 'submitting'  AND NEW.state IN ('queued','running','cancelled')) OR
-    (OLD.state = 'running'     AND NEW.state IN ('done','reconcile','queued','cancelled')) OR
+    (OLD.state = 'running'     AND NEW.state IN ('done','reconcile','queued','quarantined','cancelled')) OR
     (OLD.state = 'reconcile'   AND NEW.state IN ('queued','done','cancelled')) OR
     (OLD.state = 'quarantined' AND NEW.state IN ('queued','cancelled'))
 )

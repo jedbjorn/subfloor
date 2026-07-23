@@ -50,7 +50,7 @@ Run from the repo root, like every engine command:
     ./sc mem doc freeze <document_id>
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
-    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
+    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--sprint DOC_ID]
     ./sc mem message sent                              # outbound view — verify delivery
     ./sc mem message mark-read <message_id>            # (pr_event rows are daemon-emitted)
 
@@ -629,6 +629,7 @@ def cmd_message(args) -> int:
         # timeout — the failure mode that used to duplicate messages fleet-wide.
         r = _api("POST", "/_sc/mem/messages",
                  {"to": args.to, "body": args.body, "kind": args.kind,
+                  "sprint_doc_id": args.sprint,
                   "dedupe_key": uuid.uuid4().hex},
                  idempotent=True)
         tag = f" ({args.kind})" if args.kind != "shell" else ""
@@ -809,6 +810,9 @@ def build_parser() -> argparse.ArgumentParser:
     # forging PR transitions would poison the wake loop's ground truth.
     ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
                     help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
+    ms.add_argument("--sprint", type=int, default=None, metavar="DOC_ID",
+                    help="scope a task/result event to an ACTIVE sprint doc — "
+                         "wake-eligible when the recipient is the bound planner")
     mm = msub.add_parser("mark-read")
     mm.add_argument("message_id", type=int)
     sp.set_defaults(fn=cmd_message)

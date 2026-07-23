@@ -51,10 +51,13 @@ DELIVERY_EDGES = {
 }
 
 WAKE_ITEM_EDGES = {
-    "queued": {"batched", "quarantined", "cancelled"},
+    # queued -> done: a message handled (read) during another batch's turn
+    # completes without riding a batch of its own (spec #20 Wake Delivery:
+    # "new message handled in the turn: complete it").
+    "queued": {"batched", "done", "quarantined", "cancelled"},
     "batched": {"queued", "submitting", "cancelled"},
     "submitting": {"queued", "running", "cancelled"},
-    "running": {"done", "reconcile", "queued", "cancelled"},
+    "running": {"done", "reconcile", "queued", "quarantined", "cancelled"},
     "reconcile": {"queued", "done", "cancelled"},
     "quarantined": {"queued", "cancelled"},
     "done": set(),

@@ -803,9 +803,15 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         interface_state.transition(
             con, "wake_batch", batch_id, "submitting",
             extra_sets={"input_seq_fence": fence})
+        # Items ride legal edges only: a first attempt's items are 'batched',
+        # a bounded-retry re-attempt's were returned to 'queued' with the
+        # batch — walk those through 'batched' before 'submitting'.
+        con.execute(
+            "UPDATE planner_wake_items SET state='batched' "
+            "WHERE batch_id=? AND state='queued'", (batch_id,))
         con.execute(
             "UPDATE planner_wake_items SET state='submitting' "
-            "WHERE batch_id=? AND state IN ('batched','queued')",
+            "WHERE batch_id=? AND state='batched'",
             (batch_id,))
         con.commit()
         began = False

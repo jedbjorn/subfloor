@@ -28,7 +28,6 @@ import threading
 import db_driver
 import interface_broker
 import interface_hooks
-import interface_state
 
 ELIGIBLE_KINDS = ("task", "result", "pr_event")
 RETRY_DELAYS_S = (1.0, 5.0, 30.0)  # bounded pre-send retries (spec table)
@@ -184,9 +183,14 @@ class WakeCoordinator:
     def _schedule_retry(self, binding_id: int, delay: float) -> None:
         """One re-attempt at the exact debounce deadline / retry delay.
         Event-reset semantics: a fresh event may drain first; the timer is
-        deduped per binding and the re-drain re-gates from live state."""
+        deduped per binding and the re-drain re-gates from live state.
+        call_later is loop-thread-only, so hop through call_soon_threadsafe
+        (the drain runs in a worker thread)."""
         if self.loop is None:
             return
+        self.loop.call_soon_threadsafe(self._arm_timer, binding_id, delay)
+
+    def _arm_timer(self, binding_id: int, delay: float) -> None:
         with self._lock:
             old = self._timers.pop(binding_id, None)
             if old is not None:

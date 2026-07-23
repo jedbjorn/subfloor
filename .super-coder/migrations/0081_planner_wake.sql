@@ -10,3 +10,26 @@
 -- then falls back to occupied_at/created_at exactly as before.
 
 ALTER TABLE interface_sessions ADD COLUMN provider_ready_at TEXT;
+
+-- queued -> done wake-item edge (spec #20 Wake Delivery: a message handled
+-- — read — during another batch's turn "completes it" without riding a
+-- batch of its own), and running -> quarantined (the third completed wake
+-- turn quarantines an unread item at stop-hook reconciliation). The trigger
+-- is the DB backstop; DROP + recreate with the widened edge set
+-- (interface_state.WAKE_ITEM_EDGES mirrors it;
+-- tests/test_interface_transitions.py walks both layers for drift).
+
+DROP TRIGGER trg_pwi_state;
+CREATE TRIGGER trg_pwi_state
+BEFORE UPDATE OF state ON planner_wake_items
+WHEN NEW.state <> OLD.state AND NOT (
+    (OLD.state = 'queued'      AND NEW.state IN ('batched','done','quarantined','cancelled')) OR
+    (OLD.state = 'batched'     AND NEW.state IN ('queued','submitting','cancelled')) OR
+    (OLD.state = 'submitting'  AND NEW.state IN ('queued','running','cancelled')) OR
+    (OLD.state = 'running'     AND NEW.state IN ('done','reconcile','queued','quarantined','cancelled')) OR
+    (OLD.state = 'reconcile'   AND NEW.state IN ('queued','done','cancelled')) OR
+    (OLD.state = 'quarantined' AND NEW.state IN ('queued','cancelled'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal wake item transition');
+END;

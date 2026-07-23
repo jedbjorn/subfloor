@@ -865,6 +865,7 @@ case "$cmd" in
   migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
   snapshot)     exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
+  sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
   # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
   # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
   watch)             exec "$PY" "$S/watch.py" "$@" ;;
@@ -1139,6 +1140,8 @@ super-coder — forkable shell substrate
   ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
+  ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
+                             intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
   ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner;
                              --sprint <doc-id> arms it to an ACTIVE sprint); an immediate GitHub baseline
                              is taken at registration, then the engine service poller turns transitions
