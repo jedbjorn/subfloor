@@ -721,6 +721,10 @@ sc_pg_configured() {
 sc_pg_alive() {
   docker inspect --format '{{.State.Running}}' "$PGNAME" 2>/dev/null | grep -q true
 }
+sc_pg_absent() {
+  names="$(docker ps -a --filter "name=^/${PGNAME}$" --format '{{.Names}}')" || return 1
+  [ -z "$names" ]
+}
 sc_pg_up() {
   if ! sc_pg_configured; then
     echo "→ pg: no \`pg\` key in instance.json — skipping (run: ./sc pg-init)"; return 0
@@ -739,9 +743,17 @@ sc_pg_up() {
   echo "→ pg 17 up ($PGNAME on $SC_NET) · DATABASE_URL=postgresql://sc:sc@$PGNAME:5432/sc"
 }
 sc_pg_down() {
-  if docker inspect "$PGNAME" >/dev/null 2>&1; then
-    docker rm -f "$PGNAME" >/dev/null 2>&1 && echo "→ pg stopped (volume $PGVOL retained)" || true
+  remove_rc=0
+  docker rm -f "$PGNAME" >/dev/null 2>&1 || remove_rc=$?
+  if sc_pg_absent; then
+    if [ "$remove_rc" -eq 0 ]; then
+      echo "→ pg stopped (volume $PGVOL retained)"
+    fi
+    return 0
   fi
+  echo "✗ postgres teardown could not verify removal of '$PGNAME'." >&2
+  echo "  Fix Docker access, run ./sc pg-down, then retry ./sc restart." >&2
+  return 1
 }
 sc_pg_init() {
   f="$ENGINE/instance.json"
@@ -1272,7 +1284,10 @@ case "$cmd" in
     if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
     backup_dir="$(sc_db_backup_preflight)"
     sc_db_backup prerestart "$backup_dir"
-    "$0" down
+    if ! "$0" down; then
+      echo "✗ restart stopped: teardown did not complete; no replacement services were launched." >&2
+      exit 1
+    fi
     launch_rc=0
     "$0" launch --no-build || launch_rc=$?
     sc_restart_health_summary "$launch_rc" ;;

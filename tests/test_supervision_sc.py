@@ -25,10 +25,12 @@ class SupervisionFixture:
         self.fakebin = Path(self._tmp.name) / "bin"
         self.home = Path(self._tmp.name) / "home"
         self.log = Path(self._tmp.name) / "calls.log"
+        self.docker_state = Path(self._tmp.name) / "docker-state"
         self.root.mkdir()
         self.scripts.mkdir(parents=True)
         self.fakebin.mkdir()
         self.home.mkdir()
+        self.docker_state.mkdir()
         shutil.copy2(ROOT / "sc", self.root / "sc")
         shutil.copy2(
             ROOT / ".super-coder" / "scripts" / "db_backup.py",
@@ -59,6 +61,8 @@ class SupervisionFixture:
                 "SC_PYTHON": sys.executable,
                 "SC_TEST_LOG": str(self.log),
                 "SC_TEST_IMAGE": "present",
+                "SC_TEST_DOCKER_STATE": str(self.docker_state),
+                "SC_TEST_PG_NAME": f"sc-pg-{self.root.name}",
                 "NO_COLOR": "1",
             }
         )
@@ -110,6 +114,7 @@ class SupervisionFixture:
             printf 'docker' >> "$SC_TEST_LOG"
             printf ' %s' "$@" >> "$SC_TEST_LOG"
             printf '\\n' >> "$SC_TEST_LOG"
+            state_dir="$SC_TEST_DOCKER_STATE"
             if [ "$1" = info ]; then exit 0; fi
             if [ "$1" = image ] && [ "$2" = inspect ]; then
               [ "$SC_TEST_IMAGE" = present ]
@@ -118,14 +123,59 @@ class SupervisionFixture:
             if [ "$1" = network ] && [ "$2" = inspect ]; then exit 0; fi
             if [ "$1" = network ] && [ "$2" = create ]; then exit 0; fi
             if [ "$1" = build ]; then exit 0; fi
-            if [ "$1" = rm ]; then exit 0; fi
-            if [ "$1" = run ]; then echo fake-container-id; exit 0; fi
-            if [ "$1" = inspect ] && [ "$2" = --format ]; then
-              echo true
+            if [ "$1" = rm ]; then
+              name="$3"
+              if [ "$name" = "$SC_TEST_PG_NAME" ] &&
+                 [ "${SC_TEST_PG_REMOVE_FAIL:-}" = 1 ]; then
+                exit 1
+              fi
+              rm -f "$state_dir/$name.id"
               exit 0
             fi
-            if [ "$1" = inspect ]; then exit 1; fi
-            if [ "$1" = exec ]; then exit 0; fi
+            if [ "$1" = run ]; then
+              shift
+              name=""
+              while [ "$#" -gt 0 ]; do
+                if [ "$1" = --name ]; then
+                  name="$2"
+                  break
+                fi
+                shift
+              done
+              if [ -n "$name" ]; then
+                next_file="$state_dir/next-id"
+                next=0
+                if [ -f "$next_file" ]; then next="$(cat "$next_file")"; fi
+                next=$((next + 1))
+                printf '%s\\n' "$next" > "$next_file"
+                printf 'container-%s\\n' "$next" > "$state_dir/$name.id"
+                echo "container-$next"
+              else
+                echo fake-container-id
+              fi
+              exit 0
+            fi
+            if [ "$1" = inspect ] && [ "$2" = --format ]; then
+              if [ -f "$state_dir/$4.id" ]; then
+                echo true
+                exit 0
+              fi
+              exit 1
+            fi
+            if [ "$1" = inspect ]; then
+              [ -f "$state_dir/$2.id" ]
+              exit
+            fi
+            if [ "$1" = ps ]; then
+              if [ -f "$state_dir/$SC_TEST_PG_NAME.id" ]; then
+                echo "$SC_TEST_PG_NAME"
+              fi
+              exit 0
+            fi
+            if [ "$1" = exec ]; then
+              [ -f "$state_dir/$2.id" ]
+              exit
+            fi
             exit 0
             """,
         )
@@ -192,6 +242,14 @@ class SupervisionFixture:
 
     def calls(self) -> list[str]:
         return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def configure_pg(self) -> None:
+        (self.engine / "instance.json").write_text('{"pg": {}}\n')
+
+    def pg_identity(self) -> str:
+        return (
+            self.docker_state / f"{self.env['SC_TEST_PG_NAME']}.id"
+        ).read_text().strip()
 
 
 class RestrictedLaunchTests(unittest.TestCase):
@@ -297,8 +355,64 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertIn("  vm-broker: failed (systemd restart)", result.stdout)
         self.assertIn("  postgres: skipped (unconfigured)", result.stdout)
 
+    def test_restart_replaces_configured_postgres_identity(self):
+        self.fx.configure_pg()
+        initial = self.fx.run("pg-up")
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        old_identity = self.fx.pg_identity()
+
+        result = self.fx.run("restart", "--yes", "--no-build")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(self.fx.pg_identity(), old_identity)
+        pg_runs = [
+            call
+            for call in self.fx.calls()
+            if f"--name {self.fx.env['SC_TEST_PG_NAME']}" in call
+        ]
+        self.assertEqual(len(pg_runs), 2)
+        self.assertIn("  postgres: restarted", result.stdout)
+
+    def test_restart_refuses_when_configured_postgres_removal_fails(self):
+        self.fx.configure_pg()
+        initial = self.fx.run("pg-up")
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        old_identity = self.fx.pg_identity()
+        self.fx.env["SC_TEST_PG_REMOVE_FAIL"] = "1"
+
+        result = self.fx.run("restart", "--yes", "--no-build")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.fx.pg_identity(), old_identity)
+        self.assertIn("could not verify removal", result.stderr)
+        self.assertIn("run ./sc pg-down, then retry ./sc restart", result.stderr)
+        self.assertIn("no replacement services were launched", result.stderr)
+        self.assertNotIn("postgres: restarted", result.stdout)
+        pg_runs = [
+            call
+            for call in self.fx.calls()
+            if f"--name {self.fx.env['SC_TEST_PG_NAME']}" in call
+        ]
+        self.assertEqual(len(pg_runs), 1)
+        self.assertFalse(
+            any(
+                f"--name sc-{self.fx.root.name}" in call
+                for call in self.fx.calls()
+            )
+        )
+
 
 class MakeDispatchTests(unittest.TestCase):
+    def test_dos_launch_forwards_no_build(self):
+        result = subprocess.run(
+            ["make", "-n", "dos-l", "ARGS=--no-build"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "./sc launch --no-build")
+
     def test_dos_restart_forwards_yes_and_no_build(self):
         result = subprocess.run(
             ["make", "-n", "dos-r", "ARGS=--yes --no-build"],
