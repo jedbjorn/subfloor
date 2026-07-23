@@ -16,6 +16,13 @@ Usage:
     python3 .super-coder/scripts/run.py [shortname] [--first]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
 
+Interface gate (spec #20): the INTERACTIVE path of main() is no longer a public
+entry — interactive chats start through the Interface API (`./sc enter`), which
+holds the reservation capability, so a direct interactive launch refuses before
+creating an archive (SC_RAW_BOOT=1 is the tooling escape hatch). Headless and
+RENDER_ONLY are unaffected. The token-carrying engine path (interface_exec)
+calls prepare_launch below, never main().
+
 Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
 [--effort <level>]`):
 the same render-then-exec path minus the picker and the TTY. The harness runs
@@ -1094,6 +1101,22 @@ def main() -> None:
     if headless and not requested:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
                  '[-m <model>] [--effort <level>]')
+
+    # Interface gate (spec #20 Tmux Runtime): a public INTERACTIVE launch holds
+    # no reservation capability. Interactive chats start through the Interface
+    # API (`./sc enter` / `sc interface start`), which reserves the generation
+    # BEFORE any archive exists; the token-carrying exec path (interface-exec)
+    # goes through prepare_launch, never main(). Refuse before open_db/
+    # open_session could create an unmanaged archive. Headless (`sc run`) and
+    # RENDER_ONLY (verify) are not interactive launches and stay on this path;
+    # SC_RAW_BOOT=1 is the tooling escape hatch (same standing as
+    # SC_NO_AUTOPRUNE — process scanning stays the backstop either way).
+    if not headless and not os.environ.get("RENDER_ONLY") \
+            and not os.environ.get("SC_RAW_BOOT"):
+        sys.exit("interactive launches go through the Interface (spec #20) — "
+                 "use `./sc enter <shell>` (or `./sc interface start <shell>`). "
+                 "The raw launch path is reserved for the engine's reservation "
+                 "capability (interface-exec).")
 
     # Wordmark banner — interactive boots only; headless/verify logs stay clean.
     if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():

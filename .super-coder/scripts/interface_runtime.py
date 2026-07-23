@@ -10,9 +10,13 @@ thread with the tmux send-keys write injected as `writer`; the output path
 (private tmux server on a mode-0700 socket, FIFO pipe-pane pump, 8 MiB
 bounded bridge, shadow sidecar fed before fanout) is ported unchanged.
 
-The runtime owns processes, tmux, and volatile stream state ONLY — every
+The runtime owns processes, tmux, and volatile stream state; every
 occupancy/lifecycle/composer transition stays in the DB and is the routes
-layer's job. On service restart the tmux server and FIFO files survive
+layer's job. The one DB-write exception is writer-lease liveness (seq 6):
+a writer's heartbeats stamp heartbeat_at, and a detached or heartbeat-silent
+writer's lease row is revoked (revoke_reason='liveness'), fenced by lease
+id/token/generation so a stale detach never clobbers a re-acquired lease.
+On service restart the tmux server and FIFO files survive
 (`.super-coder/run/interface/` is stable), so start() reattaches every
 occupied session whose pane identity still verifies exactly.
 
@@ -51,6 +55,7 @@ SENDKEYS_CHUNK = 512                  # proven tmux -H chunk size
 MAX_INPUT_PAYLOAD = 64 * 1024         # wire protocol limit
 TMUX_MIN_VERSION = (3, 4)
 LEASE_HEARTBEAT_TIMEOUT = 60.0        # 3 missed 20s heartbeats
+LEASE_LIVENESS_TIMEOUT = 40.0         # dead-lease sweep bound (WS PING_TIMEOUT)
 TICKET_TTL_S = 60
 GRACEFUL_TERMINATE_S = 10.0
 SHADOW_REQUEST_TIMEOUT_S = 10.0   # a sidecar that can't answer is dead
@@ -1057,6 +1062,12 @@ class InterfaceRuntime:
         gen = self.generations.get(client.session_id)
         if gen is not None:
             gen.detach(client)
+        if client.role == "writer" and client.lease_id is not None:
+            # A detached writer's DB lease dies with it (seq 6 liveness);
+            # the revoke is fenced so a stale detach never clobbers a lease
+            # the client re-acquired. A viewer detaches nothing.
+            generation = gen.generation if gen is not None else None
+            asyncio.create_task(self._revoke_writer_lease(client, generation))
 
     # -- DB state reads (for controls) ---------------------------------------------
 
@@ -1106,7 +1117,7 @@ class InterfaceRuntime:
             msg["stale"] = True
         return msg
 
-    # -- writer heartbeat (WS layer heartbeats; DB revoke is seq 6+) ---------
+    # -- writer lease liveness (seq 6): the DB lease tracks the client -------
 
     def heartbeat(self, client) -> None:
         gen = self.generations.get(client.session_id)
@@ -1114,17 +1125,122 @@ class InterfaceRuntime:
             return
         was_stale = getattr(client, "hb_stale", False)
         client.last_hb = time.monotonic()
+        if client.lease_id is not None:
+            # Durable heartbeat: the dead-lease sweep reads heartbeat_at.
+            asyncio.create_task(self._touch_writer_lease(client))
         if was_stale:
             client.hb_stale = False
             asyncio.create_task(self._broadcast_writer_state(gen))
+
+    def _touch_lease_sync(self, lease_id, lease_token) -> None:
+        token_hash = hashlib.sha256((lease_token or "").encode()).hexdigest()
+        con = db_driver.connect(self.db_path)
+        try:
+            con.execute(
+                "UPDATE interface_writer_leases SET heartbeat_at=datetime('now')"
+                " WHERE lease_id=? AND token_hash=? AND revoked_at IS NULL",
+                (lease_id, token_hash))
+            con.commit()
+        finally:
+            con.close()
+
+    async def _touch_writer_lease(self, client) -> None:
+        try:
+            await asyncio.to_thread(self._touch_lease_sync, client.lease_id,
+                                    client.lease_token)
+        except Exception as exc:  # noqa: BLE001 — a missed touch is retried
+            _log(f"s{client.session_id}", f"lease heartbeat failed: {exc!r}")
+
+    def _revoke_lease_sync(self, lease_id, lease_token, generation) -> bool:
+        """Liveness revoke, fenced by lease id + token (+ generation when
+        known): a late detach of a dead client must never clobber the lease
+        it re-acquired. True iff this call did the revoking."""
+        token_hash = hashlib.sha256((lease_token or "").encode()).hexdigest()
+        sql = ("UPDATE interface_writer_leases SET revoked_at=datetime('now'),"
+               " revoke_reason='liveness' WHERE lease_id=? AND token_hash=?"
+               " AND revoked_at IS NULL")
+        args: list = [lease_id, token_hash]
+        if generation is not None:
+            sql += " AND generation=?"
+            args.append(generation)
+        con = db_driver.connect(self.db_path)
+        try:
+            cur = con.execute(sql, args)
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
+
+    async def _revoke_writer_lease(self, client, generation) -> None:
+        try:
+            revoked = await asyncio.to_thread(
+                self._revoke_lease_sync, client.lease_id, client.lease_token,
+                generation)
+        except Exception as exc:  # noqa: BLE001 — never break the detach path
+            _log(f"s{client.session_id}", f"lease revoke failed: {exc!r}")
+            return
+        if not revoked:
+            return  # already released / taken over / ended — nothing to say
+        _log(f"s{client.session_id}", f"writer lease {client.lease_id} revoked"
+                                     " (liveness: client detached)")
+        gen = self.generations.get(client.session_id)
+        if gen is not None:
+            await self._broadcast_writer_state(gen)
+
+    def _sweep_dead_leases_sync(self, targets) -> list:
+        """Revoke live leases whose durable heartbeat has gone silent past
+        the liveness bound, scoped to the (session, generation) pairs this
+        runtime owns. Returns the [(session_id, lease_id)] it revoked."""
+        con = db_driver.connect(self.db_path)
+        revoked = []
+        try:
+            for session_id, generation in targets:
+                row = con.execute(
+                    "SELECT lease_id FROM interface_writer_leases "
+                    "WHERE session_id=? AND generation=? AND revoked_at IS NULL"
+                    " AND (heartbeat_at IS NULL OR heartbeat_at < "
+                    "datetime('now', ?))",
+                    (session_id, generation,
+                     f"-{int(LEASE_LIVENESS_TIMEOUT)} seconds")).fetchone()
+                if row is None:
+                    continue
+                cur = con.execute(
+                    "UPDATE interface_writer_leases SET "
+                    "revoked_at=datetime('now'), revoke_reason='liveness' "
+                    "WHERE lease_id=? AND revoked_at IS NULL", (row[0],))
+                if cur.rowcount > 0:
+                    revoked.append((session_id, row[0]))
+            con.commit()
+            return revoked
+        finally:
+            con.close()
+
+    async def _sweep_dead_leases(self) -> None:
+        targets = [(gen.session_id, gen.generation)
+                   for gen in list(self.generations.values())]
+        if not targets:
+            return
+        try:
+            revoked = await asyncio.to_thread(self._sweep_dead_leases_sync,
+                                              targets)
+        except Exception as exc:  # noqa: BLE001 — the reaper must not die
+            _log("sweep", f"stale-lease sweep failed: {exc!r}")
+            return
+        for session_id, lease_id in revoked:
+            _log(f"s{session_id}", f"stale writer lease {lease_id} swept "
+                                   "(liveness: heartbeat silent)")
+            gen = self.generations.get(session_id)
+            if gen is not None:
+                await self._broadcast_writer_state(gen)
 
     async def _broadcast_writer_state(self, gen: Generation) -> None:
         for client in list(gen.clients):
             client.send_control(await self.writer_control(gen, client))
 
     async def _heartbeat_reaper(self) -> None:
-        """Mark heartbeat-silent writers stale and broadcast writer state.
-        The DB lease itself persists until takeover/termination/restart."""
+        """Mark heartbeat-silent writers stale, broadcast writer state, and
+        sweep writer leases whose durable heartbeat has gone silent past the
+        liveness bound — a dead writer's lease must not outlive it."""
         try:
             while True:
                 await asyncio.sleep(5)
@@ -1141,6 +1257,7 @@ class InterfaceRuntime:
                             changed = True
                     if changed:
                         await self._broadcast_writer_state(gen)
+                await self._sweep_dead_leases()
         except asyncio.CancelledError:
             pass
 

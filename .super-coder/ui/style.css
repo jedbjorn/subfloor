@@ -726,3 +726,20 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-term .xterm { height: 100%; }
 .if-newchat .act { margin-top: .8rem; }
 .if-newchat .muted { margin-top: .5rem; }
+.if-newchat .dm-row { margin-top: .6rem; grid-template-columns: 100px minmax(10rem, 26rem) 1fr;
+  border-top: none; padding: .4rem 0; }
+.if-newchat select { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r); color: var(--ink); font: inherit; padding: .3rem .5rem; }
+.if-diag { display: flex; flex-wrap: wrap; gap: .4rem 1.2rem; margin: .5rem 0; }
+/* Mobile: the rail collapses into a shell picker above the terminal; the
+   terminal keeps a stable minimum height and the header stays above it. */
+.if-picker { display: none; }
+@media (max-width: 760px) {
+  .if-wrap { flex-direction: column; }
+  .if-rail { display: none; }
+  .if-picker { display: block; width: 100%; background: var(--panel);
+    border: 1px solid var(--line); border-radius: var(--r); color: var(--ink);
+    font: inherit; padding: .45rem .6rem; }
+  .if-pane { width: 100%; }
+  .if-term { height: 55vh; min-height: 240px; }
+}

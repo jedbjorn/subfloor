@@ -3,7 +3,8 @@
 
 Unit tests run hermetic WITHOUT tmux/node: availability gating, ticket
 mint/consume discipline, reject-reason mapping, PID-reuse identity, the
-reattach-lost callback wiring. The sidecar tests need node only (a dead or
+reattach-lost callback wiring, and writer-lease liveness (seq 6: fenced
+detach revoke, dead-lease sweep, durable heartbeat stamps). The sidecar tests need node only (a dead or
 silent sidecar must fail fast, never hang — sprint 25 flag #45).
 Integration tests are gated on tmux + node + the @xterm/headless module
 (tmux+node alone is NOT sufficient — the sidecar dies on require without
@@ -340,6 +341,231 @@ class RejectReasonTest(unittest.TestCase):
             reason = interface_runtime._reject_reason(
                 interface_broker.BrokerError(msg))
             self.assertEqual(reason, expect, f"mapping of {msg!r}")
+
+
+# ------------------------------------------------------------- lease liveness (seq 6)
+
+class LeaseLivenessTest(unittest.TestCase):
+    """Hermetic (no tmux/node): a dead writer's DB lease must not outlive
+    it — detach revokes fenced by lease id/token/generation, the reaper's
+    sweep revokes heartbeat-silent leases, and neither path can clobber a
+    re-acquired lease."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = self.tmp / "shell_db.db"
+        build_engine_db(self.db)
+        self.rt = interface_runtime.InterfaceRuntime(
+            str(self.db), run_dir=str(self.tmp / "run"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _session(self, shell_id=1, generation=1):
+        """One occupied session + input state + a runtime-owned Generation."""
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (?,?)", (shell_id, generation))
+        sid = con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle) VALUES (?,?,'occupied','idle')",
+            (shell_id, generation)).lastrowid
+        con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id,"
+            " generation, composer) VALUES (?,?,?,'clean')",
+            (sid, shell_id, generation))
+        con.commit()
+        con.close()
+        gen = interface_runtime.Generation(self.rt, sid, shell_id, generation,
+                                           24, 80)
+        self.rt.generations[sid] = gen
+        return sid, gen
+
+    def _lease(self, sid, client_id="tab-1", token="tok-1", takeover=False):
+        con = sqlite3.connect(self.db)
+        lease_id = interface_broker.acquire_writer(con, sid, client_id, token,
+                                                   takeover=takeover)
+        con.commit()
+        con.close()
+        return lease_id
+
+    def _lease_row(self, lease_id):
+        con = sqlite3.connect(self.db)
+        row = con.execute(
+            "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
+            "WHERE lease_id=?", (lease_id,)).fetchone()
+        con.close()
+        return row
+
+    def _stale_heartbeat(self, lease_id):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE interface_writer_leases SET "
+            "heartbeat_at=datetime('now','-120 seconds') WHERE lease_id=?",
+            (lease_id,))
+        con.commit()
+        con.close()
+
+    def _heartbeat_fresh(self, lease_id):
+        con = sqlite3.connect(self.db)
+        row = con.execute(
+            "SELECT heartbeat_at > datetime('now','-5 seconds') "
+            "FROM interface_writer_leases WHERE lease_id=?", (lease_id,)
+        ).fetchone()
+        con.close()
+        return row[0] == 1
+
+    def test_writer_detach_revokes_its_lease(self):
+        sid, gen = self._session()
+        lease_id = self._lease(sid)
+        writer = FakeClient(sid, role="writer", client_id="tab-1",
+                            lease_id=lease_id, lease_token="tok-1")
+        viewer = FakeClient(sid, role="viewer", client_id="tab-2")
+        gen.clients.update({writer, viewer})
+
+        async def flow():
+            self.rt.detach(writer)
+            await wait_for(lambda: self._lease_row(lease_id)[0] is not None,
+                           what="liveness revoke")
+        asyncio.run(flow())
+        self.assertEqual(self._lease_row(lease_id)[1], "liveness")
+        # The remaining client is told the writer lease is gone.
+        wstates = viewer.by_type("writer")
+        self.assertTrue(wstates)
+        self.assertEqual(wstates[-1]["state"], "none")
+
+    def test_viewer_detach_revokes_nothing(self):
+        sid, gen = self._session()
+        lease_id = self._lease(sid)
+        viewer = FakeClient(sid, role="viewer", client_id="tab-2")
+        gen.clients.add(viewer)
+
+        async def flow():
+            self.rt.detach(viewer)
+            await asyncio.sleep(0.2)  # any stray revoke task would land
+        asyncio.run(flow())
+        self.assertIsNone(self._lease_row(lease_id)[0])
+
+    def test_late_detach_never_clobbers_reacquired_lease(self):
+        sid, gen = self._session()
+        old_lease = self._lease(sid, token="tok-old")
+        old = FakeClient(sid, role="writer", client_id="tab-1",
+                         lease_id=old_lease, lease_token="tok-old")
+        gen.clients.add(old)
+
+        async def flow():
+            self.rt.detach(old)
+            await wait_for(lambda: self._lease_row(old_lease)[0] is not None,
+                           what="first liveness revoke")
+        asyncio.run(flow())
+
+        # The client re-acquires (new lease id, new token); then the OLD
+        # client object's detach fires again — a late close echo.
+        new_lease = self._lease(sid, token="tok-new")
+        stale = FakeClient(sid, role="writer", client_id="tab-1",
+                           lease_id=old_lease, lease_token="tok-old")
+
+        async def flow2():
+            self.rt.detach(stale)
+            await asyncio.sleep(0.2)
+        asyncio.run(flow2())
+        self.assertIsNone(self._lease_row(new_lease)[0],
+                          "a stale detach must not touch the new lease")
+
+    def test_revoke_fence_requires_token_and_generation(self):
+        sid, _gen = self._session()
+        lease_id = self._lease(sid, token="tok-1")
+        self.assertFalse(self.rt._revoke_lease_sync(lease_id, "wrong", 1))
+        self.assertFalse(self.rt._revoke_lease_sync(lease_id, "tok-1", 2))
+        self.assertIsNone(self._lease_row(lease_id)[0])
+        self.assertTrue(self.rt._revoke_lease_sync(lease_id, "tok-1", 1))
+        self.assertEqual(self._lease_row(lease_id)[1], "liveness")
+        # A double revoke is a no-op (the revoked_at IS NULL fence).
+        self.assertFalse(self.rt._revoke_lease_sync(lease_id, "tok-1", 1))
+
+    def test_sweep_revokes_silent_lease_keeps_fresh_one(self):
+        sid, _gen = self._session()
+        stale_lease = self._lease(sid, client_id="tab-dead", token="tok-d")
+        self._stale_heartbeat(stale_lease)
+
+        async def flow():
+            await self.rt._sweep_dead_leases()
+        asyncio.run(flow())
+        self.assertEqual(self._lease_row(stale_lease)[1], "liveness")
+
+        # A lease with a fresh durable heartbeat survives the sweep.
+        fresh_lease = self._lease(sid, client_id="tab-live", token="tok-l")
+        asyncio.run(flow())
+        self.assertIsNone(self._lease_row(fresh_lease)[0])
+
+    def test_acquire_after_sweep_needs_no_takeover(self):
+        sid, _gen = self._session()
+        dead_lease = self._lease(sid, client_id="tab-dead", token="tok-d")
+        self._stale_heartbeat(dead_lease)
+        # While the dead writer's lease is live, a plain acquire refuses.
+        con = sqlite3.connect(self.db)
+        with self.assertRaises(interface_broker.BrokerError):
+            interface_broker.acquire_writer(con, sid, "tab-2", "tok-2")
+        con.close()
+
+        async def flow():
+            await self.rt._sweep_dead_leases()
+        asyncio.run(flow())
+        # After the sweep the lease is free — no takeover needed.
+        new_lease = self._lease(sid, client_id="tab-2", token="tok-2")
+        self.assertIsNone(self._lease_row(new_lease)[0])
+
+    def test_sweep_scopes_to_owned_generations(self):
+        sid1, _gen1 = self._session(shell_id=1, generation=1)
+        lease1 = self._lease(sid1, client_id="tab-1", token="tok-1")
+        # A second occupied session this runtime does NOT manage.
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (2,1)")
+        sid2 = con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle) VALUES (2,1,'occupied','idle')").lastrowid
+        con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id,"
+            " generation, composer) VALUES (?,2,1,'clean')", (sid2,))
+        con.commit()
+        con.close()
+        lease2 = self._lease(sid2, client_id="tab-x", token="tok-x")
+        self._stale_heartbeat(lease1)
+        self._stale_heartbeat(lease2)
+
+        async def flow():
+            await self.rt._sweep_dead_leases()
+        asyncio.run(flow())
+        self.assertEqual(self._lease_row(lease1)[1], "liveness")
+        self.assertIsNone(self._lease_row(lease2)[0],
+                          "the sweep must not touch foreign generations")
+
+    def test_heartbeat_stamps_lease_fenced_by_token(self):
+        sid, _gen = self._session()
+        lease_id = self._lease(sid, token="tok-1")
+        self._stale_heartbeat(lease_id)
+        writer = FakeClient(sid, role="writer", client_id="tab-1",
+                            lease_id=lease_id, lease_token="tok-1")
+
+        async def flow():
+            self.rt.heartbeat(writer)
+            await wait_for(lambda: self._heartbeat_fresh(lease_id),
+                           what="durable heartbeat stamp")
+        asyncio.run(flow())
+
+        # A writer frame with the wrong token stamps nothing.
+        self._stale_heartbeat(lease_id)
+        impostor = FakeClient(sid, role="writer", client_id="tab-9",
+                              lease_id=lease_id, lease_token="nope")
+
+        async def flow2():
+            self.rt.heartbeat(impostor)
+            await asyncio.sleep(0.3)
+        asyncio.run(flow2())
+        self.assertFalse(self._heartbeat_fresh(lease_id))
 
 
 # ------------------------------------------------------------- integration (tmux)
