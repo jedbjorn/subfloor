@@ -269,6 +269,7 @@ class Generation:
         self.pane_start_ticks = 0
         self.dbg_pump_bytes = 0
         self.dbg_fanout_bytes = 0
+        self._fifo_keep_fd = -1
         self._pump_fd = -1
         self._pump_thread: threading.Thread | None = None
         self._tasks: list[asyncio.Task] = []
@@ -305,10 +306,15 @@ class Generation:
                 return  # loop closed (service shutting down)
 
     def _notify_exit(self, loop) -> None:
+        # run_coroutine_threadsafe, not call_soon_threadsafe: the latter
+        # would CALL the async def and drop the coroutine un-awaited —
+        # the pump's pane-death signal never fired (real-tmux finding,
+        # sprint 25 seq 11).
+        coro = self.runtime._on_pump_exit(self)
         try:
-            loop.call_soon_threadsafe(self.runtime._on_pump_exit, self)
+            asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:
-            pass  # loop closed
+            coro.close()  # loop closed before it could be scheduled
 
     def _on_pump_bytes(self, chunk: bytes) -> None:
         if self.continuity_broken:
@@ -410,6 +416,7 @@ class Generation:
             except OSError:
                 pass
             self._pump_fd = -1
+        self.runtime._close_fifo_keep(self)
 
 
 # ---------------------------------------------------------------- runtime
@@ -673,7 +680,16 @@ class InterfaceRuntime:
                             *[f"{b:02x}" for b in chunk])
 
     async def capture_pane(self, pane_id: str) -> bytes:
-        return await self.tmux("capture-pane", "-epN", "-t", pane_id)
+        """Screen text for a shadow rebuild. tmux 3.5a emits a trailing
+        newline after the last row; replayed as a stream into a same-sized
+        zero-scrollback shadow terminal that extra newline scrolls the top
+        row off the grid (real-tmux finding, sprint 25 seq 11 — a pane whose
+        content sat on row 1 rebuilt as a blank screen). Strip exactly one
+        trailing newline: 24 rows replay into 24 rows with no scroll."""
+        out = await self.tmux("capture-pane", "-epN", "-t", pane_id)
+        if out.endswith(b"\n"):
+            out = out[:-1]
+        return out
 
     # -- spawn -----------------------------------------------------------------
 
@@ -685,15 +701,49 @@ class InterfaceRuntime:
 
     def _open_fifo(self, gen: Generation) -> None:
         """Open the blocking pump reader. A FIFO O_RDONLY open blocks until a
-        writer exists, so pre-open RDWR|NONBLOCK as the stand-in writer —
-        then CLOSE it immediately. A held write end would make the pump's
-        read never return EOF when the pane dies and tmux's `cat` writer
-        exits, and that EOF is the pump's pane-death signal."""
-        keep_fd = os.open(
+        writer exists, so pre-open RDWR|NONBLOCK as the stand-in writer. The
+        stand-in is held until _pipe_pane PROVES tmux's writer attached (the
+        pump thread starts immediately after; a closed stand-in plus a
+        still-starting `cat` reads as an instant false EOF — the pane-death
+        signal — before any byte could flow, real-tmux finding seq 11). A
+        stand-in held FOREVER would be just as wrong: the pump's read must
+        return EOF when the pane dies and tmux's `cat` writer exits, and
+        that EOF is the pump's pane-death signal."""
+        gen._fifo_keep_fd = os.open(  # noqa: SLF001
             self._fifo_path(gen.session_id), os.O_RDWR | os.O_NONBLOCK)
         gen._pump_fd = os.open(  # noqa: SLF001
             self._fifo_path(gen.session_id), os.O_RDONLY)
-        os.close(keep_fd)
+
+    def _close_fifo_keep(self, gen: Generation) -> None:
+        if gen._fifo_keep_fd >= 0:  # noqa: SLF001
+            try:
+                os.close(gen._fifo_keep_fd)  # noqa: SLF001
+            except OSError:
+                pass
+            gen._fifo_keep_fd = -1  # noqa: SLF001
+
+    async def _pipe_pane(self, gen: Generation) -> None:
+        """Attach the pane's output pipe and drop the stand-in writer only
+        once the pipe writer is PROVEN attached: the pipe command holds its
+        own write fd (9) across the marker touch, so the marker means a real
+        writer owns the FIFO. Without this handshake the pump's first read
+        races tmux's fork of `cat` and loses (EOF with zero bytes read)."""
+        fifo = self._fifo_path(gen.session_id)
+        marker = fifo + ".pipeup"
+        if os.path.exists(marker):
+            os.unlink(marker)
+        await self.tmux(
+            "pipe-pane", "-t", gen.pane_id,
+            f"exec 9>{shlex.quote(fifo)} && touch {shlex.quote(marker)} "
+            f"&& exec cat >&9")
+        deadline = time.monotonic() + TMUX_SYNC_TIMEOUT_S
+        while not os.path.exists(marker):
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"pipe-pane writer never attached for {fifo}")
+            await asyncio.sleep(0.02)
+        os.unlink(marker)
+        self._close_fifo_keep(gen)
 
     def _start_consumers(self, gen: Generation) -> None:
         gen._pump_thread = threading.Thread(  # noqa: SLF001
@@ -762,8 +812,7 @@ class InterfaceRuntime:
             _read_start_ticks, gen.pane_pid)
 
         self.shadow.create(gen.sid, rows, cols)
-        await self.tmux("pipe-pane", "-t", pane_id,
-                        f"cat > {shlex.quote(fifo)}")
+        await self._pipe_pane(gen)
         # boot the harness only now: zero lost boot bytes
         open(sentinel, "w").close()
 
@@ -839,10 +888,14 @@ class InterfaceRuntime:
                 # (the old pipe-pane died with its writer).
                 os.mkfifo(fifo)
                 self._open_fifo(gen)
-                await self.tmux("pipe-pane", "-t", pane_id,
-                                f"cat > {shlex.quote(fifo)}")
+                await self._pipe_pane(gen)
             else:
                 self._open_fifo(gen)
+                # No new pipe is issued here: the surviving `cat` is already
+                # the writer (or it died with the old service — then the
+                # pump's instant EOF is exactly the stale-pipe signal the
+                # exit path turns into an alert / lost transition).
+                self._close_fifo_keep(gen)
             # The shadow is volatile: rebuild from the visible pane.
             self.shadow.create(gen.sid, rows, cols)
             capture = await self.capture_pane(pane_id)

@@ -687,8 +687,17 @@ class TmuxIntegrationTest(unittest.TestCase):
             session_id=self.sid, shell_id=1, generation=1,
             worktree=str(self.tmp), sc_path="/bin/sc",
             token_path="/tmp/tok", rows=24, cols=80,
-            command=["/bin/sh", "-c", "stty -echo; cat"])
+            # raw: the spike-proven mode (reader.py setraw). Plain
+            # `stty -echo` leaves canonical mode on — a newline-free frame
+            # never reaches cat, so no echo can ever come back. The READY
+            # marker is the pane's first output: it proves stty already ran,
+            # so no input can land while tty echo is still on (which would
+            # double the echo).
+            command=["/bin/sh", "-c", "stty raw -echo; printf READY; cat"])
         self._persist_identity(info)
+        gen = self.rt.generations[self.sid]
+        await wait_for(lambda: gen.dbg_fanout_bytes >= 5,
+                       what="pane raw-mode READY marker")
         return info
 
     def test_input_echo_redraw_terminate(self):
