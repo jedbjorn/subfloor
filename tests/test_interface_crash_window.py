@@ -721,9 +721,15 @@ class CloseSessionMatrixTest(unittest.TestCase):
 
         # Case 2: submitted with NO durable submit evidence → parked
         # (alert), never left awaiting a stop hook that can never arrive.
+        # Closure also resolves the ended generation's session alerts without
+        # consuming the parked batch's unread item; explicit batch resolution
+        # must still be able to requeue that item after snapshot/rebuild.
         sid = self._make("occupied", "idle")
         interface_broker.acquire_writer(self.con, sid, "tab-1", "tok-1")
         bid = self._binding_with_message(sid)
+        interface_broker._alert(
+            self.con, severity="warning", reason="approval_wait",
+            session_id=sid)
         batch_s = interface_broker.form_batch(self.con, bid)
         rec1 = Recorder("ok")
         out = interface_broker.submit_wake_batch(
@@ -736,11 +742,33 @@ class CloseSessionMatrixTest(unittest.TestCase):
             "SELECT state FROM planner_wake_batches WHERE batch_id=?",
             (batch_s,)).fetchone()[0]
         self.assertEqual(state, "delivery_unknown")
+        session_alert = self.con.execute(
+            "SELECT resolved_at FROM planner_alerts WHERE session_id=? AND "
+            "reason='approval_wait'", (sid,)).fetchone()
+        self.assertIsNotNone(
+            session_alert[0], "ended-generation alerts become resolved audit")
         alert = self.con.execute(
             "SELECT 1 FROM planner_alerts WHERE binding_id=? AND "
             "reason='wake_batch_delivery_unknown' AND resolved_at IS NULL",
             (bid,)).fetchone()
         self.assertIsNotNone(alert)
+        item = self.con.execute(
+            "SELECT i.state, i.batch_id, m.read_at "
+            "FROM planner_wake_items i "
+            "JOIN shell_messages m ON m.message_id=i.message_id "
+            "WHERE i.binding_id=?", (bid,)).fetchone()
+        self.assertEqual(
+            item, ("submitting", batch_s, None),
+            "park keeps the in-flight unread item for durable retry")
+        interface_broker.resolve_batch(self.con, batch_s)
+        item = self.con.execute(
+            "SELECT i.state, i.batch_id, m.read_at "
+            "FROM planner_wake_items i "
+            "JOIN shell_messages m ON m.message_id=i.message_id "
+            "WHERE i.binding_id=?", (bid,)).fetchone()
+        self.assertEqual(
+            item, ("queued", None, None),
+            "explicit resolution requeues without consuming the message")
 
         # Case 3: running with a proven stop stamp → complete, items
         # reconciled from durable read state (unread → requeued).
