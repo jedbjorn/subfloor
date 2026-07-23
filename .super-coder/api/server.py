@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""super-coder review layer — a zero-dependency localhost server.
+"""super-coder review layer — a localhost server.
 
-One stdlib HTTP server serves both the JSON API and the static review UI on a
-single per-fork port (see scripts/ports.py). No FastAPI, no venv, no build step:
-a fork needs only python3 + sqlite3, which the install already requires. Single-
-user, localhost — network controls are the operator's, exactly like superCC's
-API surface.
+One process serves the JSON API, the static review UI, and (sprint 25 seq 5+)
+the Interface WebSocket streams on a single per-fork port (see
+scripts/ports.py + api/transport.py). The review layer stays zero-dependency
+stdlib; the Interface transport pins `websockets` (spec #20: a maintained
+stream stack, never hand-rolled framing). When websockets/tmux are absent the
+review UI still serves and Interface reports unavailable (spec #20 req 13).
+Single-user, localhost — network controls are the operator's, exactly like
+superCC's API surface.
 
 It is a REVIEW layer over the live `shell_db.db`. The law-curated fields (seed,
 L&S) are returned for reading but have **no write endpoint at all** — not a
@@ -19,8 +22,11 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import gzip
+import http.client
+import io
 import json
 import os
 import subprocess
@@ -28,7 +34,7 @@ import sys
 import threading
 import traceback
 from datetime import date, datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -57,6 +63,15 @@ import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
+sys.path.insert(0, str(ENGINE / "api"))
+try:
+    import interface_routes  # noqa: E402  (Interface HTTP API, spec #20)
+    import interface_ws  # noqa: E402  (sc-term.v1 stream protocol)
+    _INTERFACE_IMPORT_ERROR = None
+except ImportError as _exc:  # websockets/tmux stack absent → review UI still serves
+    interface_routes = None
+    interface_ws = None
+    _INTERFACE_IMPORT_ERROR = _exc
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
 import ports as ports_mod  # noqa: E402
@@ -78,7 +93,20 @@ _STATIC = {
     # local copies so the no-build UI renders sanitized GFM without a CDN.
     "/vendor/marked.umd.js": ("vendor/marked.umd.js", "application/javascript; charset=utf-8"),
     "/vendor/purify.min.js": ("vendor/purify.min.js", "application/javascript; charset=utf-8"),
+    # vendored browser terminal (xterm.js 6.0.0, MIT — spec #20: a proven
+    # terminal-emulation library, never hand-rolled emulation).
+    "/vendor/xterm/xterm.js": ("vendor/xterm/xterm.js", "application/javascript; charset=utf-8"),
+    "/vendor/xterm/xterm.css": ("vendor/xterm/xterm.css", "text/css; charset=utf-8"),
 }
+
+# Content-Security-Policy for the app shell (spec #20 Security And Privacy):
+# vendored scripts and same-origin (incl. WebSocket) connections only. Styles
+# keep 'unsafe-inline' — the no-build UI sets style attributes via DOM and the
+# doc renderer emits inline styling; scripts stay strict.
+_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self' ws: wss:; img-src 'self' data:; "
+        "font-src 'self'; object-src 'none'; base-uri 'none'; "
+        "frame-ancestors 'none'")
 
 # md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`
 # param — gzip → base64url (no padding) — which the live md-converter decodes on
@@ -2153,7 +2181,10 @@ class Handler(BaseHTTPRequestHandler):
             f = UI_DIR / fname
             if not f.exists():
                 return self._send(404, "not built", "text/plain")
-            return self._send(200, f.read_text(), ctype)
+            # Restrictive CSP on the app shell (spec #20 Security): vendored
+            # scripts/styles + same-origin connections only, no inline script.
+            headers = {"Content-Security-Policy": _CSP} if fname == "index.html" else None
+            return self._send(200, f.read_text(), ctype, headers=headers)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
         if path == "/_sc/watches":
@@ -2508,6 +2539,94 @@ class Handler(BaseHTTPRequestHandler):
             con.close()
 
 
+# ---------------------------------------------------------------------------
+# asyncio transport integration (sprint 25 seq 5, spec #20)
+#
+# The stdlib ThreadingHTTPServer loop is replaced by api/transport.py's
+# one-port HTTP+WS multiplex. Every existing route below is UNTOUCHED: the
+# shim re-hydrates a Handler instance from a parsed request and captures its
+# response, so the route logic keeps running exactly as written (now on the
+# transport's executor threads instead of ThreadingHTTPServer's threads).
+
+class _ShimHandler(Handler):
+    """A Handler driven without a socket: the transport feeds the parsed
+    request in, response bytes/status are captured instead of written."""
+
+    def __init__(self, method: str, path: str, headers_raw: str, body: bytes):
+        # Deliberately NOT super().__init__ (that would run socket handling).
+        self.command = method
+        self.path = path
+        self.requestline = f"{method} {path} HTTP/1.1"
+        self.request_version = "HTTP/1.1"
+        self.close_connection = True
+        self.rfile = io.BytesIO(body)
+        self.wfile = io.BytesIO()
+        self.headers = http.client.parse_headers(io.BytesIO(headers_raw.encode("latin-1")))
+        self._shim_status = 200
+        self._shim_headers: list = []
+
+    # -- BaseHTTPRequestHandler response plumbing, captured --------------------
+    def log_request(self, code="-", size="-"):  # noqa: D102
+        pass
+
+    def send_response_only(self, code, message=None):  # noqa: D102
+        self._shim_status = code
+
+    def send_header(self, keyword, value):  # noqa: D102
+        self._shim_headers.append((keyword, value))
+
+    def end_headers(self):  # noqa: D102
+        pass
+
+    def send_error(self, code, message=None, explain=None):
+        self._shim_status = code
+        self._shim_headers = [("Content-Type", "application/json")]
+        self.wfile = io.BytesIO()
+        self.wfile.write(json.dumps({"error": message or code}).encode())
+
+    # log_request/log_message already quiet via Handler.log_message.
+
+
+def dispatch_http(method: str, path: str, headers_raw: str,
+                  body: bytes) -> tuple:
+    """The transport's HTTP entry: route one request, return
+    (status, [(header, value)], body bytes). Interface API paths go to the
+    interface module; everything else runs through the shimmed Handler."""
+    parsed = urlparse(path)
+    if parsed.path.startswith("/api/interface/"):
+        if interface_routes is None:
+            return (503, [("Content-Type", "application/json")],
+                    json.dumps({"error": {
+                        "code": "interface_unavailable",
+                        "message": "Interface stack not importable on this "
+                                   f"server ({_INTERFACE_IMPORT_ERROR})",
+                        "details": {}}}).encode())
+        return interface_routes.handle(method, path, headers_raw, body)
+    handler = _ShimHandler(method, path, headers_raw, body)
+    try:
+        route = getattr(handler, f"do_{method}", None)
+        if route is None:
+            handler.send_error(405, "method not allowed")
+        else:
+            route()
+    except Exception as exc:  # noqa: BLE001 — mirrors the old server's per-request isolation
+        traceback.print_exc()
+        handler._shim_status = 500
+        handler._shim_headers = [("Content-Type", "application/json")]
+        handler.wfile = io.BytesIO(str(exc).encode())
+    return (handler._shim_status, handler._shim_headers,
+            handler.wfile.getvalue())
+
+
+async def _ws_unavailable(reader, writer, head_raw: bytes) -> None:
+    writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                 b"Connection: close\r\n\r\n")
+    try:
+        await writer.drain()
+    finally:
+        writer.close()
+
+
 def main(argv):
     port = None
     if "--port" in argv:
@@ -2548,12 +2667,33 @@ def main(argv):
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
     # keeps it loopback-only on the host regardless of the in-container bind.
     bind = os.environ.get("SC_BIND", "127.0.0.1")
-    httpd = ThreadingHTTPServer((bind, port), Handler)
+    import transport  # noqa: E402  (api/ — asyncio one-port multiplex)
+
+    async def _serve():
+        ws_handler = _ws_unavailable
+        runtime = None
+        if interface_ws is not None:
+            runtime = interface_ws.build_runtime(db_path=str(DB_PATH))
+            # Bind BEFORE start(): start() reattaches survivors and walks lost
+            # sessions through the routes callback, so it must be set first.
+            interface_routes.bind_runtime(runtime)
+            interface_routes.ensure_operator_capability()
+            await runtime.start()
+            ws_handler = runtime.handle_ws
+        else:
+            print(f"server: Interface unavailable ({_INTERFACE_IMPORT_ERROR}) "
+                  "— review UI only", file=sys.stderr)
+        try:
+            await transport.serve(bind, port, dispatch_http, ws_handler)
+        finally:
+            if runtime is not None:
+                await runtime.stop()
+
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:
-        httpd.serve_forever()
+        asyncio.run(_serve())
     except KeyboardInterrupt:
-        httpd.shutdown()
+        pass
     return 0
 
 

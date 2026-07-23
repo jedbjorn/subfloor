@@ -2096,8 +2096,478 @@ async function renderAnalytics(root) {
   }
 }
 
+// ── Interface tab (sprint 25 seq 5) ───────────────────────────────────────────
+// One interactive harness TUI per shell, brokered by the engine API inside tmux
+// and streamed over WebSocket (subprotocol sc-term.v1). Left rail of shells by
+// availability; available → New chat, occupied → live xterm attach (ordered,
+// acked input), lost/error/unreconciled → New chat blocked. Selection lives in
+// the hash (#interface/DEV3) so a refresh re-attaches the SAME session — the
+// server reseeds the screen with a 0x04 full-redraw snapshot on every attach.
+let ifCsrf = null;                          // browser-session CSRF token (memory only)
+const ifClientId = "web-" + crypto.randomUUID();  // per-tab client identity
+let ifSelected = null;                      // selected shell shortname (hash segment)
+let ifAttach = null;                        // live attach record, see ifSessionPane
+
+function ifError(r, data) {
+  const e = data && data.error;
+  const err = new Error(
+    typeof e === "object" && e ? (e.message || e.code || r.statusText) : (e || r.statusText));
+  err.status = r.status;
+  err.code = typeof e === "object" && e ? e.code : undefined;
+  err.body = data;
+  return err;
+}
+// Bootstrap the operator browser session: EXCHANGES the operator capability
+// (the mode-0600 token at .super-coder/run/interface/operator.token) for the
+// HttpOnly SameSite=Strict cookie + the CSRF token we then send as X-CSRF on
+// every call. The capability is used ONCE for the exchange, then discarded —
+// never persisted (no sessionStorage) and cleared from JS memory the moment
+// the session mints, so no long-lived credential sits where XSS can reach it.
+// A later 401 (session gone: refresh, server restart) re-prompts the operator.
+let ifOpToken = null;
+// Drop any capability an older build persisted before the one-shot model.
+try { sessionStorage.removeItem("sc-if-op"); } catch { /* storage blocked */ }
+async function ifBootstrap() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const headers = { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() };
+    if (ifOpToken) headers["Authorization"] = "Bearer " + ifOpToken;
+    const r = await fetch("/api/interface/browser-sessions", {
+      method: "POST", credentials: "same-origin", headers, body: "{}",
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) { ifCsrf = data.csrf; ifOpToken = null; return; }
+    if (r.status === 401 && attempt === 0) {
+      const t = prompt(
+        "Interface operator capability required — paste the contents of\n" +
+        ".super-coder/run/interface/operator.token (mode 0600, operator-only):",
+        "");
+      if (!t) throw ifError(r, data);
+      ifOpToken = t.trim();
+      continue;
+    }
+    if (r.status === 401) {   // the pasted capability was rejected
+      ifOpToken = null;
+    }
+    throw ifError(r, data);
+  }
+}
+// api() twin for /api/interface/* — same-origin credentials + X-CSRF, fresh
+// Idempotency-Key per ATTEMPT on POST/DELETE (an intentional retry reuses the
+// caller's key). One silent re-bootstrap + retry on 401/403.
+async function apiIf(path, method = "GET", body, idemKey) {
+  const key = method === "GET" ? undefined : (idemKey || crypto.randomUUID());
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!ifCsrf) await ifBootstrap();
+    const headers = { "X-CSRF": ifCsrf };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (key) headers["Idempotency-Key"] = key;
+    const r = await fetch("/api" + path, {
+      method, credentials: "same-origin", headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if ((r.status === 401 || r.status === 403) && attempt === 0) { ifCsrf = null; continue; }
+    const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
+    if (!r.ok) throw ifError(r, data);
+    return data;
+  }
+}
+
+// Best-effort teardown: close the stream, release the writer lease (keepalive
+// so it also fires on page unload), drop the heartbeat and the terminal.
+function ifDetach() {
+  const a = ifAttach;
+  if (!a) return;
+  ifAttach = null;
+  clearInterval(a.heartbeat);
+  a.resizeObs?.disconnect();
+  try { a.ws?.close(); } catch { /* already closed */ }
+  a.term?.dispose();
+  if (a.leaseId && ifCsrf)
+    fetch("/api/interface/writer-leases/" + a.leaseId, {
+      method: "DELETE", credentials: "same-origin", keepalive: true,
+      headers: { "X-CSRF": ifCsrf, "Idempotency-Key": crypto.randomUUID() },
+    }).catch(() => {});
+}
+window.addEventListener("pagehide", ifDetach);
+
+const IF_BADGE = { available: "ok", starting: "warn", occupied: "accent",
+  lost: "bad", error: "bad", unreconciled: "bad" };
+
+async function renderInterface(root) {
+  root.replaceChildren();
+  let shells;
+  try { ({ shells } = await apiIf("/interface/shells")); }
+  catch (e) {
+    if (e.status === 503 || e.code === "interface_unavailable") {
+      ifDetach();
+      root.append(el("div", { className: "card" }, "Interface unavailable on this server."));
+      return;
+    }
+    throw e;
+  }
+  const rail = el("div", { className: "if-rail" });
+  const pane = el("div", { className: "if-pane" });
+  root.append(el("div", { className: "if-wrap" }, rail, pane));
+  for (const s of shells) {
+    const row = el("button", { type: "button",
+      className: "if-row" + (s.shortname === ifSelected ? " active" : "") });
+    row.append(
+      el("div", { className: "if-row-head" },
+        el("b", {}, s.display_name || s.shortname),
+        el("span", { className: "pill if-badge " + (IF_BADGE[s.availability] || "") }, s.availability)),
+      el("div", { className: "if-row-sub" }, s.shortname + (s.harness ? " · " + s.harness : "")));
+    row.onclick = () => { location.hash = "interface/" + s.shortname; };
+    rail.append(row);
+  }
+  if (!shells.length) rail.append(el("div", { className: "muted" }, "No shells."));
+  const sel = shells.find((s) => s.shortname === ifSelected);
+  if (!sel) {
+    ifDetach();
+    if (shells.length) pane.append(el("div", { className: "card muted" }, "Select a shell on the left."));
+    return;
+  }
+  if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
+  if (sel.availability === "lost" || sel.availability === "error" || sel.availability === "unreconciled") {
+    ifDetach();
+    const card = el("div", { className: "card" },
+      el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
+        el("span", { className: "pill if-badge bad" }, sel.availability), "."));
+    if (!sel.session_id) {
+      card.append(el("div", { className: "muted" },
+        "New chat is blocked — this shell runs a legacy or unmanaged harness."));
+    } else {
+      // Spec Interface Layout: a lost/error pane offers reconcile (verify the
+      // process still lives) and close (after absence is proved); a closed
+      // session frees the shell for a fresh generation.
+      const msg = el("div", { className: "muted" },
+        "New chat is blocked until this generation is reconciled or closed.");
+      const recon = el("button", { className: "act", type: "button", textContent: "Reconcile" });
+      const close = el("button", { className: "act", type: "button", textContent: "Close session" });
+      const note = el("div", { className: "if-note" });
+      recon.onclick = async () => {
+        recon.disabled = true; note.textContent = "";
+        try {
+          const r = await apiIf("/interface/reconciliations", "POST",
+            { session_id: sel.session_id, action: "verify" });
+          if (r.verified) return renderInterface(root);
+          note.textContent = "identity could not be verified — close it if the process is gone.";
+        } catch (e) { note.textContent = (e.code ? e.code + ": " : "") + e.message; }
+        recon.disabled = false;
+      };
+      close.onclick = async () => {
+        if (!confirm(`Close session #${sel.session_id}? Allowed only after the process is proved absent. This frees ${sel.display_name || sel.shortname} for a new chat.`)) return;
+        close.disabled = true; note.textContent = "";
+        try {
+          await apiIf("/interface/reconciliations", "POST",
+            { session_id: sel.session_id, action: "close" });
+          return renderInterface(root);
+        } catch (e) {
+          note.textContent = (e.code ? e.code + ": " : "") + e.message;
+          close.disabled = false;
+        }
+      };
+      card.append(msg, el("div", {}, recon, " ", close), note);
+    }
+    pane.append(card);
+    return;
+  }
+  return ifSessionPane(pane, sel);   // occupied | starting
+}
+
+function ifAvailablePane(pane, sel, root) {
+  ifDetach();
+  const btn = el("button", { className: "act primary", type: "button", textContent: "New chat" });
+  const msg = el("div", { className: "muted" });
+  btn.onclick = async () => {
+    btn.disabled = true; msg.textContent = "";
+    try {
+      // 201 → the shell flips to occupied; re-render lands on the session pane.
+      await apiIf("/interface/sessions", "POST", { shell_id: sel.shell_id });
+      await renderInterface(root);
+    } catch (e) {   // 409 shell_occupied / unmanaged_harness — show the server's message
+      msg.textContent = (e.code ? e.code + ": " : "") + e.message;
+      btn.disabled = false;
+    }
+  };
+  pane.append(el("div", { className: "card if-newchat" },
+    el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is available."), btn, msg));
+}
+
+// Occupied/starting pane: header state line + terminal. Attaches writer-first
+// (writer-leases → stream-tickets role=writer → WS); a 409 on the lease means
+// another client holds it, so we attach read-only and offer Take-over.
+async function ifSessionPane(pane, sel) {
+  if (!sel.session_id) {
+    ifDetach();
+    pane.append(el("div", { className: "card muted" },
+      "Session is starting — no session id yet. Reselect the shell to retry."));
+    return;
+  }
+  const sessionId = sel.session_id;
+  // Reuse a live attach to the SAME session across re-renders (rail refresh,
+  // hash no-op) — the terminal keeps its scrollback; only the DOM is re-parented.
+  if (ifAttach && ifAttach.sessionId === sessionId &&
+      ifAttach.ws && ifAttach.ws.readyState <= WebSocket.OPEN) {
+    pane.append(ifAttach.headEl, ifAttach.termEl);
+    return;
+  }
+  ifDetach();
+  let sess;
+  try { sess = await apiIf("/interface/sessions/" + sessionId); }
+  catch (e) { pane.append(el("div", { className: "card" }, "error: " + e.message)); return; }
+
+  const st = {
+    harness: sess.harness || sel.harness || "—",
+    lifecycle: sess.lifecycle || "—",
+    composer: sess.composer || "unknown",
+    writer: sess.writer && sess.writer.held ? "held" : "none",
+    clients: sess.clients ?? 0,
+    note: "",
+  };
+  const headEl = el("div", { className: "if-head" });
+  const termEl = el("div", { className: "if-term" });
+  const a = { sessionId, shortname: sel.shortname, st, headEl, termEl,
+    ws: null, term: null, leaseId: null, leaseToken: null, role: "viewer",
+    seq: 1, inflight: 0, lastAck: 0, outBuf: "", awaiting: false, halted: false,
+    heartbeat: 0, resizeObs: null, paint: null };
+  a.paint = () => ifPaintHeader(a, sel, pane);
+  ifAttach = a;
+  pane.append(headEl, termEl);
+  a.paint();
+
+  try {
+    try {
+      const lease = await apiIf("/interface/writer-leases", "POST",
+        { session_id: sessionId, client_id: ifClientId, takeover: false });
+      if (ifAttach !== a) return ifReleaseLease(a);   // user moved on mid-attach
+      a.leaseId = lease.lease_id;
+      a.leaseToken = lease.lease_token;
+      a.role = "writer";
+      // The lease reseeds input seqs from the session's forwarded_seq + 1.
+      a.seq = lease.next_input_seq ?? 1;
+      a.st.writer = "active";
+    } catch (e) {
+      if (e.status !== 409) throw e;
+      a.st.writer = "held";   // read-only attach; Take-over button in the header
+    }
+    a.paint();
+    const t = await apiIf("/interface/stream-tickets", "POST",
+      { session_id: sessionId, role: a.role, client_id: ifClientId,
+        ...(a.leaseToken ? { lease_token: a.leaseToken } : {}) });
+    if (ifAttach !== a) return ifReleaseLease(a);
+    ifOpenStream(a, t.ticket);
+  } catch (e) {
+    if (ifAttach !== a) return ifReleaseLease(a);
+    a.st.note = "attach failed: " + e.message;
+    a.paint();
+  }
+}
+function ifReleaseLease(a) {
+  if (!a.leaseId || !ifCsrf) return;
+  fetch("/api/interface/writer-leases/" + a.leaseId, {
+    method: "DELETE", credentials: "same-origin", keepalive: true,
+    headers: { "X-CSRF": ifCsrf, "Idempotency-Key": crypto.randomUUID() },
+  }).catch(() => {});
+  a.leaseId = null;
+}
+
+function ifPaintHeader(a, sel, pane) {
+  const st = a.st;
+  const head = [
+    el("span", { className: "if-stat" }, "harness ", el("b", {}, String(st.harness))),
+    el("span", { className: "if-stat" }, "session ", el("b", {}, "#" + a.sessionId)),
+    el("span", { className: "if-stat" }, "lifecycle ", el("b", {}, String(st.lifecycle))),
+    el("span", { className: "if-stat" }, "composer ", el("b", {}, String(st.composer))),
+    el("span", { className: "if-stat" }, "writer ", el("b", {}, st.writer)),
+    el("span", { className: "if-stat" }, "clients ", el("b", {}, String(st.clients))),
+  ];
+  if (st.writer === "held" || st.writer === "revoked") {
+    const take = el("button", { className: "act", type: "button", textContent: "Take-over" });
+    take.onclick = () => ifTakeover(a);
+    head.push(take);
+  }
+  if (st.composer === "dirty" || st.composer === "unknown") {
+    const cert = el("button", { className: "act", type: "button", textContent: "certify clean" });
+    cert.onclick = async () => {
+      cert.disabled = true;
+      try {
+        await apiIf("/interface/clean-certifications", "POST",
+          { session_id: a.sessionId, client_id: ifClientId, client_seq: a.lastAck });
+        st.composer = "clean";
+      } catch (e) { st.note = "certify failed: " + e.message; }
+      a.paint();
+    };
+    head.push(cert);
+  }
+  const end = el("button", { className: "act", type: "button", textContent: "End chat" });
+  end.onclick = () => ifEndChat(a, sel, pane);
+  head.push(end);
+  if (st.note) head.push(el("span", { className: "if-note" }, st.note));
+  a.headEl.replaceChildren(...head);
+}
+
+async function ifEndChat(a, sel, pane) {
+  if (!confirm(`End chat with ${sel.display_name || sel.shortname}? This terminates session #${a.sessionId}.`)) return;
+  let r;
+  try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: false }); }
+  catch (e) {
+    if (e.status === 409 && e.body && e.body.reason) r = e.body;
+    else { a.st.note = "end chat failed: " + e.message; a.paint(); return; }
+  }
+  if (!r.terminated && r.reason === "graceful_timeout") {
+    if (!confirm(`Graceful stop timed out. Force-kill PID ${r.pid} (generation ${r.generation})?`)) return;
+    try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: true }); }
+    catch (e) { a.st.note = "force kill failed: " + e.message; a.paint(); return; }
+  }
+  if (r.terminated) {
+    ifDetach();
+    const root = pane.closest(".view");
+    if (root) renderInterface(root);
+  } else { a.st.note = "not terminated: " + (r.reason || "?"); a.paint(); }
+}
+
+// Take-over: fresh lease with takeover:true (new idempotency key — different
+// body), then re-open the stream as writer with the new lease token.
+async function ifTakeover(a) {
+  try {
+    const lease = await apiIf("/interface/writer-leases", "POST",
+      { session_id: a.sessionId, client_id: ifClientId, takeover: true });
+    if (ifAttach !== a) return ifReleaseLease(a);
+    a.leaseId = lease.lease_id;
+    a.leaseToken = lease.lease_token;
+    a.role = "writer";
+    a.seq = lease.next_input_seq ?? 1;
+    a.inflight = 0; a.outBuf = ""; a.awaiting = false; a.halted = false;
+    a.st.writer = "active";
+    a.paint();
+    const t = await apiIf("/interface/stream-tickets", "POST",
+      { session_id: a.sessionId, role: "writer", client_id: ifClientId, lease_token: a.leaseToken });
+    if (ifAttach !== a) return ifReleaseLease(a);
+    clearInterval(a.heartbeat);
+    a.resizeObs?.disconnect();
+    try { a.ws?.close(); } catch { /* already closed */ }
+    a.term?.dispose();
+    a.termEl.replaceChildren();
+    ifOpenStream(a, t.ticket);
+  } catch (e) { a.st.note = "take-over failed: " + e.message; a.paint(); }
+}
+
+// Open the sc-term.v1 stream: 0x00 output → write, 0x04 snapshot → reset+write;
+// keystrokes go out as 0x01 ‖ seq:u64be ‖ payload, one unacked frame at a time.
+function ifOpenStream(a, ticket) {
+  if (typeof Terminal === "undefined") {   // deferred vendor script not ready yet
+    a.st.note = "terminal library still loading — refresh the page";
+    a.paint();
+    return;
+  }
+  const term = new Terminal({ convertEol: false, cursorBlink: true,
+    fontFamily: "ui-monospace, monospace" });
+  a.term = term;
+  term.open(a.termEl);
+  const ws = new WebSocket(
+    (location.protocol === "https:" ? "wss://" : "ws://") + location.host +
+    "/api/interface/session-streams/" + a.sessionId + "?ticket=" + encodeURIComponent(ticket),
+    "sc-term.v1");
+  ws.binaryType = "arraybuffer";
+  a.ws = ws;
+  ws.onmessage = (ev) => {
+    if (ifAttach !== a) return;
+    if (typeof ev.data === "string") return ifControl(a, JSON.parse(ev.data));
+    const b = new Uint8Array(ev.data);
+    if (!b.length) return;
+    if (b[0] === 0x00) a.term.write(b.subarray(1));
+    else if (b[0] === 0x04) { a.term.reset(); a.term.write(b.subarray(1)); }
+  };
+  ws.onclose = () => {
+    if (ifAttach !== a) return;
+    a.st.note = "stream closed — reselect the shell to reattach";
+    if (a.role === "writer") a.st.writer = "none";
+    a.paint();
+  };
+  a.heartbeat = setInterval(() => {
+    if (a.ws && a.ws.readyState === WebSocket.OPEN) a.ws.send(JSON.stringify({ type: "heartbeat" }));
+  }, 10000);
+  if (a.role === "writer") term.onData((d) => ifSendInput(a, d));
+  term.onResize(({ rows, cols }) => ifSendResize(a, rows, cols));
+  // No FitAddon is vendored — estimate the char grid from the container and
+  // resize the terminal to fill it; the onResize hook above forwards it.
+  const fit = () => {
+    const w = a.termEl.clientWidth, h = a.termEl.clientHeight;
+    if (!w || !h) return;
+    const cols = Math.max(20, Math.floor((w - 12) / 9));
+    const rows = Math.max(4, Math.floor((h - 12) / 17));
+    if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
+  };
+  a.resizeObs = new ResizeObserver(fit);
+  a.resizeObs.observe(a.termEl);
+  fit();
+}
+
+function ifSendInput(a, data) {
+  if (a.halted || a.role !== "writer") return;
+  a.outBuf += data;   // one unacked frame per writer — buffer while awaiting ack
+  ifFlush(a);
+}
+function ifFlush(a) {
+  if (a.awaiting || a.halted || !a.outBuf) return;
+  if (!a.ws || a.ws.readyState !== WebSocket.OPEN) return;
+  const payload = new TextEncoder().encode(a.outBuf);
+  const frame = new Uint8Array(9 + payload.length);
+  frame[0] = 0x01;
+  new DataView(frame.buffer).setBigUint64(1, BigInt(a.seq));
+  frame.set(payload, 9);
+  a.ws.send(frame);
+  a.inflight = a.seq;
+  a.seq++;
+  a.outBuf = "";
+  a.awaiting = true;
+}
+function ifSendResize(a, rows, cols) {
+  if (!a.ws || a.ws.readyState !== WebSocket.OPEN) return;
+  const frame = new Uint8Array(5);
+  frame[0] = 0x03;
+  new DataView(frame.buffer).setUint16(1, rows);
+  new DataView(frame.buffer).setUint16(3, cols);
+  a.ws.send(frame);
+}
+
+function ifControl(a, m) {
+  switch (m.type) {
+    case "input_ack":   // may carry replayed:true — either way the frame landed
+      if (m.seq === a.inflight) { a.awaiting = false; a.lastAck = m.seq; ifFlush(a); }
+      break;
+    case "input_reject":   // seqs are session-scoped; stop until the next attach
+      a.awaiting = false;
+      a.halted = true;
+      a.st.note = `input rejected (seq ${m.seq}): ${m.reason || "?"} — reattach to resume`;
+      a.paint();
+      break;
+    case "writer":
+      a.st.writer = m.state;
+      if (m.state === "revoked" && a.role === "writer") {
+        a.role = "viewer"; a.leaseId = null; a.leaseToken = null; a.halted = false;
+        a.st.note = "writer lease revoked — now read-only";
+      }
+      a.paint();
+      break;
+    case "lifecycle":
+      if (m.lifecycle != null) a.st.lifecycle = m.lifecycle;
+      if (m.composer != null) a.st.composer = m.composer;
+      a.paint();
+      break;
+    case "resync":   // the 0x04 snapshot that follows repaints the screen
+    case "heartbeat":
+      break;
+    case "error":
+      a.st.note = "error: " + (m.code || "?");
+      a.paint();
+      break;
+  }
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
+  interface: ["#view-interface", renderInterface],
   shells: ["#view-shells", renderShells],
   skills: ["#view-skills", renderSkills],
   roadmap: ["#view-roadmap", renderRoadmap],
@@ -2115,17 +2585,24 @@ async function load(tab) {
 function show(tab) {
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
+  if (tab !== "interface") ifDetach();   // leaving the tab drops the stream + lease
   load(tab);
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
 // put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
 // hash; hashchange drives show — back/forward and deep links work too. The
 // roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
+// The interface tab carries its selected shell: #interface | #interface/DEV3.
 function routeFromHash() {
   const raw = location.hash.slice(1);
   if (raw === "roadmap" || raw.startsWith("roadmap-")) {
     roadmapView = raw === "roadmap-flow" ? "flow" : "board";
     show("roadmap");
+    return;
+  }
+  if (raw === "interface" || raw.startsWith("interface/")) {
+    ifSelected = raw.includes("/") ? decodeURIComponent(raw.slice(raw.indexOf("/") + 1)) : null;
+    show("interface");
     return;
   }
   show(VIEWS[raw] ? raw : "shells");

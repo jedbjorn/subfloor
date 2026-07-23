@@ -34,6 +34,24 @@ RUN apt-get update \
       sqlite3 git curl bash ca-certificates ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
+# tmux — the Interface process host (spec #20): a DECLARED, version-gated
+# dependency, not ambient host availability. bookworm main ships 3.3a; the
+# Interface stack is proven on 3.5a (spikes/interface-stream/RESULTS.md), which
+# bookworm-backports carries (3.5a-2~bpo12+1). The runtime additionally gates
+# `tmux -V` >= 3.4 at startup and reports Interface unavailable below that.
+RUN echo "deb http://deb.debian.org/debian bookworm-backports main" \
+      > /etc/apt/sources.list.d/bookworm-backports.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
+ && rm -rf /var/lib/apt/lists/*
+
+# Interface stream stack (spec #20; sprint 25 seq 3 pinned these):
+# websockets 16.1.1 (BSD-3-Clause) — the sans-io WS layer for the one-port
+# HTTP+WS transport (api/transport.py). Baked into the IMAGE python because
+# the engine server runs on the image's interpreter, not the fork's .venv.
+# (@xterm/headless installs below, after Node.)
+RUN pip install --no-cache-dir "websockets==16.1.1"
+
 # GitHub CLI (gh) — the in-container push/PR path: the GUI "publish" flow
 # (snapshot → render → commit → push → PR) and shells that open their own PRs.
 # Not in Debian's default repos, so add the official gh apt source. Auth is NOT
@@ -56,6 +74,13 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
+
+# @xterm/headless 6.0.0 (MIT) at /opt/sc-shadow — the shadow terminal the
+# Interface runtime mirrors output through for reconnect redraws (spec #20;
+# pinned by the seq-3 spike). The Node sidecar resolves it via NODE_PATH
+# (scripts/interface_runtime.py).
+RUN npm install --prefix /opt/sc-shadow "@xterm/headless@6.0.0" \
+ && chmod -R a+rX /opt/sc-shadow
 
 # Playwright E2E browser — baked at the IMAGE level on purpose, unlike the per-fork
 # app deps (those land in the fork's .venv / node_modules via `./sc deps`). It stays

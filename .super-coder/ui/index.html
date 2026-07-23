@@ -5,11 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>subfloor — review</title>
   <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
+  <script src="/vendor/xterm/xterm.js" defer></script>
 </head>
 <body>
   <header>
     <h1>subfloor<span id="repo"></span></h1>
     <nav>
+      <button data-tab="interface">Interface</button>
       <button data-tab="shells" class="active">Shells</button>
       <button data-tab="skills">Skills</button>
       <span class="navsep"></span>
@@ -29,6 +32,7 @@
     </div>
   </header>
   <main>
+    <section id="view-interface" class="view" hidden></section>
     <section id="view-shells" class="view"></section>
     <section id="view-skills" class="view" hidden></section>
     <section id="view-roadmap" class="view" hidden></section>
