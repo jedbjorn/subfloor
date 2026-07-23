@@ -43,14 +43,20 @@ import run as run_mod  # noqa: E402
 SHELLS = {
     "shells": [
         {"shell_id": 1, "shortname": "S1", "display_name": "One",
+         "flavor": "dev", "default_harness": "codex",
+         "default_model": "openai/gpt-5.6-sol",
          "availability": "available", "session_id": None, "lifecycle": None,
          "harness": None, "composer": None, "alerts": 0,
          "wake_state": "disarmed"},
         {"shell_id": 2, "shortname": "S2", "display_name": "Two",
+         "flavor": "dev", "default_harness": "codex",
+         "default_model": "openai/gpt-5.6-sol",
          "availability": "occupied", "session_id": 7, "lifecycle": "idle",
          "harness": "claude", "composer": "clean", "alerts": 0,
          "wake_state": "disarmed"},
         {"shell_id": 3, "shortname": "S3", "display_name": "Three",
+         "flavor": "reviewer", "default_harness": "claude",
+         "default_model": "opus",
          "availability": "lost", "session_id": 9, "lifecycle": "lost",
          "harness": "claude", "composer": "unknown", "alerts": 1,
          "wake_state": "disarmed"},
@@ -394,6 +400,11 @@ class InterfaceCliTest(unittest.TestCase):
                        "next_input_seq": 5})
         rc, _, _ = self.run_cli(["enter", "s2"])
         self.assertEqual(rc, 0)
+        self.assertEqual(
+            len(self.http.find("GET", "/api/interface/shells")), 1,
+            "direct selection must reuse the API rail response, not fetch a "
+            "second potentially different snapshot",
+        )
         self.assertEqual(self.http.find("POST", "/api/interface/sessions"), [])
         self.assertEqual(self.stream.call_args[0][1], "writer")
 
@@ -428,6 +439,95 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertIn("reconcile", err)
         self.assertEqual(self.http.find("POST", "/api/interface/sessions"), [])
         self.stream.assert_not_called()
+
+    def test_harness_default_comes_from_api_projection_without_db_read(self):
+        args = mock.Mock(harness=None)
+        with mock.patch.dict(ic.os.environ, {}, clear=True), \
+                mock.patch.object(run_mod, "detect_harnesses",
+                                  return_value=["codex"]), \
+                mock.patch.object(run_mod.db_driver, "connect",
+                                  side_effect=AssertionError(
+                                      "CLI must not read Interface state "
+                                      "from the DB")):
+            picked = ic._pick_harness(SHELLS["shells"][0], args)
+        self.assertEqual(picked, "codex")
+
+    def test_grouped_picker_snapshot_and_selection_order(self):
+        shells = [
+            {"shell_id": 1, "shortname": "REV1",
+             "display_name": "Reviewer", "flavor": "reviewer",
+             "availability": "lost", "default_harness": "claude",
+             "default_model": "opus"},
+            {"shell_id": 2, "shortname": "DEV1",
+             "display_name": "Builder", "flavor": "dev",
+             "availability": "available", "default_harness": "codex",
+             "default_model": "openai/gpt-5.6-sol"},
+            {"shell_id": 3, "shortname": "CUSTOM-LONG-NAME",
+             "display_name": "A bespoke shell with a long display name",
+             "flavor": None, "availability": None,
+             "default_harness": None, "default_model": None},
+        ]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(ic.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(ic.shutil, "get_terminal_size",
+                                  return_value=ic.os.terminal_size((100, 24))), \
+                mock.patch("builtins.input", return_value="2"):
+            chosen = ic._pick_shell(shells, None)
+        self.assertEqual(chosen["shortname"], "REV1")
+        self.assertEqual(
+            out.getvalue(),
+            "\nShells\n"
+            "  #  Name              Shortname    State          "
+            "Default (harness · model)     \n"
+            "\n"
+            "dev\n"
+            "  1  Builder           DEV1         available      "
+            "codex · gpt-5.6-sol\n"
+            "\n"
+            "reviewer\n"
+            "  2  Reviewer          REV1         lost           "
+            "claude · opus\n"
+            "\n"
+            "(bespoke)\n"
+            "  3  A bespoke shell … CUSTOM-LONG… unknown        \n",
+        )
+
+    def test_grouped_picker_is_readable_in_a_narrow_terminal(self):
+        shell = {
+            "shell_id": 1,
+            "shortname": "EXTRAORDINARILY-LONG",
+            "display_name": "A very long display name",
+            "flavor": "dev",
+            "availability": "starting",
+            "default_harness": "codex",
+            "default_model": "openai/gpt-5.6-sol",
+        }
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(ic.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(ic.shutil, "get_terminal_size",
+                                  return_value=ic.os.terminal_size((36, 24))), \
+                mock.patch("builtins.input", return_value="1"):
+            chosen = ic._pick_shell([shell], None)
+        self.assertEqual(chosen["shell_id"], 1)
+        lines = out.getvalue().splitlines()
+        self.assertLessEqual(max(map(len, lines)), 36)
+        self.assertIn("EXTRAORDINARI…", out.getvalue())
+        self.assertIn("starting", out.getvalue())
+        self.assertIn("codex · gpt-5.6-sol", out.getvalue())
+
+    def test_grouped_picker_can_be_cancelled_without_an_action(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch.object(ic.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(ic.shutil, "get_terminal_size",
+                                  return_value=ic.os.terminal_size((80, 24))), \
+                mock.patch("builtins.input", return_value="q"):
+            with self.assertRaises(SystemExit) as raised:
+                ic._pick_shell([SHELLS["shells"][0]], None)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("selection cancelled", err.getvalue())
 
 
 class FakeWS:

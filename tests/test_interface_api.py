@@ -26,6 +26,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import stat
@@ -219,10 +220,33 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_operator_bearer_lists_shells(self):
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            con.execute("UPDATE shells SET flavor='dev' WHERE shell_id=1")
+            con.commit()
         status, _, body = self.call("GET", "/api/interface/shells", (OP,))
         self.assertEqual(status, 200)
         self.assertEqual(len(body["shells"]), 2)
-        self.assertEqual(body["shells"][0]["availability"], "available")
+        self.assertEqual(
+            {
+                key: body["shells"][0][key]
+                for key in (
+                    "shell_id", "shortname", "display_name", "flavor",
+                    "availability", "default_harness", "default_model",
+                )
+            },
+            {
+                "shell_id": 1,
+                "shortname": "s1",
+                "display_name": "S1",
+                "flavor": "dev",
+                "availability": "available",
+                "default_harness": "codex",
+                "default_model": "gpt-5.6-sol",
+            },
+        )
+        self.assertIsNone(body["shells"][1]["flavor"])
+        self.assertIsNone(body["shells"][1]["default_harness"])
+        self.assertIsNone(body["shells"][1]["default_model"])
 
     def test_browser_bootstrap_same_origin_fence(self):
         # Cross-site Origin cannot mint a session (rejected before the

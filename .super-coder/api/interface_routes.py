@@ -745,14 +745,28 @@ def _list_shells():
     con = _db()
     try:
         snap = shell_liveness.compute()
+        defaults = {}
+        for flavor, harness, model in con.execute(
+                "SELECT flavor, harness, model FROM flavor_defaults "
+                "WHERE is_default=1"):
+            defaults[flavor] = {
+                "default_harness": harness,
+                "default_model": model,
+            }
         shells = con.execute(
-            "SELECT shell_id, shortname, display_name FROM shells "
+            "SELECT shell_id, shortname, display_name, flavor FROM shells "
             "WHERE COALESCE(is_deleted,0)=0 ORDER BY shell_id").fetchall()
         out = []
-        for shell_id, shortname, display_name in shells:
+        for shell_id, shortname, display_name, flavor in shells:
             proj = _availability(con, shell_id, snap)
+            launch_default = defaults.get(flavor, {})
             out.append({"shell_id": shell_id, "shortname": shortname,
                         "display_name": display_name,
+                        "flavor": flavor,
+                        "default_harness":
+                            launch_default.get("default_harness"),
+                        "default_model":
+                            launch_default.get("default_model"),
                         "wake_state": _wake_state(
                             con, planner_shell_id=shell_id), **proj})
         return _json(200, {"shells": out})
