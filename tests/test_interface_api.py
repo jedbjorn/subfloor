@@ -928,6 +928,37 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(shell["session_id"], session_id)
         self.assertEqual(shell["availability"], "unreconciled")
 
+    def test_new_chat_refuses_partially_ended_session(self):
+        session_id = self.occupy()
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "UPDATE interface_sessions SET occupancy='ended', "
+                "ended_at=datetime('now') WHERE session_id=?",
+                (session_id,))
+            con.execute(
+                "UPDATE interface_generations SET ended_at=datetime('now') "
+                "WHERE shell_id=1 AND generation=1")
+
+        status, _, body = self.create_session(key="k-partially-ended")
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "shell_occupied")
+        self.assertEqual(body["error"]["details"],
+                         {"session_id": session_id, "occupancy": "ended"})
+        with sqlite3.connect(self.db_path) as con:
+            sessions = con.execute(
+                "SELECT session_id, generation, occupancy, lifecycle, "
+                "ended_at IS NOT NULL FROM interface_sessions "
+                "WHERE shell_id=1 ORDER BY generation").fetchall()
+            generations = con.execute(
+                "SELECT shell_id, generation, ended_at IS NOT NULL "
+                "FROM interface_generations WHERE shell_id=1 "
+                "ORDER BY generation").fetchall()
+        self.assertEqual(
+            sessions, [(session_id, 1, "ended", "idle", 1)])
+        self.assertEqual(generations, [(1, 1, 1)])
+        self.assertEqual(len(self.runtime.spawned), 1)
+
     def test_terminal_state_without_ended_at_needs_reconciliation(self):
         session_id = self.occupy()
         con = sqlite3.connect(self.db_path)

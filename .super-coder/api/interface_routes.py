@@ -490,6 +490,7 @@ def _create_session(actor, headers, body):
     if unknown:
         return _err(422, "validation", f"unknown fields: {sorted(unknown)}")
 
+    active_session = interface_state.active_session_sql()
     con = _db()
     try:
         shell = con.execute(
@@ -507,7 +508,7 @@ def _create_session(actor, headers, body):
             # instead of tripping the occupied check on its own session.
             existing = con.execute(
                 "SELECT session_id, occupancy FROM interface_sessions "
-                "WHERE shell_id=? AND occupancy <> 'ended'",
+                f"WHERE shell_id=? AND {active_session}",
                 (shell_id,)).fetchone()
             if existing is not None:
                 return 409, {"error": {
@@ -683,7 +684,7 @@ def _create_session(actor, headers, body):
             # (the generations index fired first) — the retry reveals it.
             owner = con.execute(
                 "SELECT session_id, occupancy FROM interface_sessions "
-                "WHERE shell_id=? AND occupancy <> 'ended'",
+                f"WHERE shell_id=? AND {active_session}",
                 (shell_id,)).fetchone()
             return _err(409, "shell_occupied",
                         "a concurrent start owns this shell",
