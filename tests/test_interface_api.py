@@ -38,6 +38,7 @@ MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 import interface_routes as routes  # noqa: E402
+import run as run_mod  # noqa: E402
 
 
 def build_engine_db(path: Path) -> None:
@@ -124,9 +125,15 @@ class InterfaceApiTest(unittest.TestCase):
             mock.patch.object(routes, "RUN_DIR", run_dir),
             mock.patch.object(routes, "OPERATOR_TOKEN_PATH",
                               run_dir / "operator.token"),
+            # New chat provisions a missing shell worktree through the CLI
+            # boot's ensure_worktree (flag #61) — a real git mutation.
+            # Hermetic default: stub it; the provisioning tests below drive
+            # the stub explicitly.
+            mock.patch.object(run_mod, "ensure_worktree"),
         ]
         for p in self.patches:
             p.start()
+        self.ensure_wt = run_mod.ensure_worktree
         routes.ensure_operator_capability()
         (run_dir / "operator.token").write_text("optok")
         self.runtime = FakeRuntime()
@@ -347,6 +354,72 @@ class InterfaceApiTest(unittest.TestCase):
     def test_unknown_fields_rejected(self):
         status, _, body = self.create_session(shell_id=1, bogus=True)
         self.assertEqual(status, 422)
+
+    # -- worktree provisioning (flag #61) --------------------------------------
+
+    def _launch_token(self, session_id):
+        return json.loads(
+            (routes.RUN_DIR / f"launch-{session_id}.json").read_text())
+
+    def test_new_chat_provisions_missing_worktree(self):
+        """A shell never CLI-booted (e.g. a planner woken only through the
+        Interface) has no .sc-worktrees/<shortname>: New chat must provision
+        it through the CLI boot's ensure_worktree BEFORE the reservation —
+        the old failure was a raw 'not a directory' at exec time."""
+        root = Path(self.tmp.name)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            expected = str(root / ".sc-worktrees" / "s1")
+            status, _, body = self.create_session()
+        self.assertEqual(status, 201, body)
+        self.ensure_wt.assert_called_once_with(Path(expected), "s1")
+        self.assertEqual(self._launch_token(body["session_id"])["worktree"],
+                         expected)
+        self.assertEqual(self.runtime.spawned[0]["worktree"], expected)
+
+    def test_new_chat_existing_worktree_not_reprovisioned(self):
+        root = Path(self.tmp.name)
+        (root / ".sc-worktrees" / "s1").mkdir(parents=True)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 201, body)
+        self.ensure_wt.assert_not_called()
+
+    def test_new_chat_admin_resolves_repo_root(self):
+        """The admin flavor boots at the repo root (the CLI boot's rule) —
+        the Interface must resolve it there and provision nothing."""
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE shells SET flavor='admin' WHERE shell_id=1")
+        con.commit()
+        con.close()
+        root = Path(self.tmp.name)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 201, body)
+        self.ensure_wt.assert_not_called()
+        self.assertEqual(self._launch_token(body["session_id"])["worktree"],
+                         str(root))
+
+    def test_new_chat_provision_failure_is_actionable(self):
+        """A failed provision refuses cleanly: an actionable 500, and no
+        reservation row, token, or pane left behind."""
+        self.ensure_wt.side_effect = SystemExit(
+            "FATAL: could not create worktree at /x:\nfatal: branch conflict")
+        root = Path(self.tmp.name)
+        with mock.patch.object(run_mod, "REPO_ROOT", root):
+            status, _, body = self.create_session()
+        self.assertEqual(status, 500)
+        err = body["error"]
+        self.assertEqual(err["code"], "worktree_provision_failed")
+        self.assertIn("branch conflict", err["message"])
+        self.assertIn("git worktree list", err["message"])
+        self.assertNotIn("FATAL", err["message"])
+        con = sqlite3.connect(self.db_path)
+        count = con.execute("SELECT COUNT(*) FROM interface_sessions"
+                            ).fetchone()[0]
+        con.close()
+        self.assertEqual(count, 0)
+        self.assertEqual(list(routes.RUN_DIR.glob("launch-*.json")), [])
+        self.assertEqual(self.runtime.spawned, [])
 
     # -- reservation + spawn ---------------------------------------------------------------
 

@@ -250,6 +250,17 @@ def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {}, root)
 
 
+def shell_work_dir(shortname: "str | None", flavor: "str | None") -> Path:
+    """The one worktree rule, shared by every boot path (interactive CLI,
+    headless `sc run`, Interface exec): the admin flavor boots at the repo
+    root (it maintains `main` itself); every other shell — dev, planner,
+    reviewer alike — gets an isolated git worktree at
+    `.sc-worktrees/<shortname>` on branch `shell/<shortname>`."""
+    if shortname and flavor != "admin":
+        return REPO_ROOT / ".sc-worktrees" / shortname.lower()
+    return REPO_ROOT
+
+
 def ensure_worktree(work_dir: Path, shortname: str) -> None:
     """Create a git worktree for a shell at work_dir on branch shell/<shortname>.
 
@@ -942,10 +953,9 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
 
     # Worktree: identical rule to main() — every non-admin shell boots in
     # .sc-worktrees/<shortname>; admin boots at the repo root.
-    work_dir = REPO_ROOT
+    work_dir = shell_work_dir(chosen["shortname"], chosen["flavor"])
     sync_note = None
-    if chosen["shortname"] and chosen["flavor"] != "admin":
-        work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
+    if work_dir != REPO_ROOT:
         ensure_worktree(work_dir, chosen["shortname"])
         sync_note = sync_worktree(work_dir, chosen["shortname"])
         link_worktree_map(work_dir)
@@ -1269,11 +1279,10 @@ def main() -> None:
         # it maintains `main` itself (engine updates, migrations, applying approved
         # patches), so it boots in the repo root — no worktree, no shell/* branch.
         # The branch-guard exempts it via SC_SHELL_FLAVOR (exported at exec below).
-        work_dir = REPO_ROOT
+        work_dir = shell_work_dir(chosen["shortname"], chosen["flavor"])
         sync_note = None
-        if chosen["shortname"] and chosen["flavor"] != "admin":
+        if work_dir != REPO_ROOT:
             spinner.label = "syncing worktree"
-            work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
             ensure_worktree(work_dir, chosen["shortname"])
             sync_note = sync_worktree(work_dir, chosen["shortname"])
             map_note = link_worktree_map(work_dir)
