@@ -134,10 +134,16 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 
     def test_an_underivable_url_never_costs_the_operator_their_shell(self):
         """`sc` runs under `set -e`, so an unguarded print is a new way for
-        `enter` — the main entry path — to abort before the harness."""
+        `enter` — the main entry path — to abort before the harness.
+
+        Both entry verbs, because both carry their own guard: `enter-*` is a
+        second dispatch line, not a fallthrough into `enter`, and it is the
+        one `make dos-e s=<shell>` uses."""
         env = self._env(SC_PYTHON=str(self.bin / "no-ports-python"))
-        out = sc("enter", env=env)
-        self.assertEqual(out.returncode, 0, out.stderr)
+        for argv in (("enter",), ("enter-DEV1",)):
+            with self.subTest(verb=argv[0]):
+                out = sc(*argv, env=env)
+                self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_url_itself_refuses_loudly_rather_than_printing_nothing(self):
         """The recall command is the opposite case: silence plus exit 0 reads
