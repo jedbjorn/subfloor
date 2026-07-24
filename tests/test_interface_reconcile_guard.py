@@ -230,7 +230,7 @@ class LiveRefusalGuardTest(unittest.TestCase):
         reasons = interface_reconcile.live_refusal_reasons(self.db)
         self.assertTrue(any("ambiguity" in r for r in reasons))
 
-    def test_terminal_session_park_survives_startup_without_blocking(self):
+    def test_terminal_session_park_survives_restart_without_reopening_alert(self):
         sid = self._occupied_session()
         self.con.execute(
             "UPDATE interface_sessions SET occupancy='ended', lifecycle='ended', "
@@ -241,20 +241,31 @@ class LiveRefusalGuardTest(unittest.TestCase):
             "INSERT INTO interface_input_state (session_id, shell_id, generation, "
             "composer, delivery, pending_seq) "
             "VALUES (?,1,1,'unknown','delivery_unknown',9)", (sid,))
+        self.con.execute(
+            "INSERT INTO planner_alerts "
+            "(session_id, severity, reason, dedupe_key, resolved_at) "
+            "VALUES (?,'critical','crash_window_delivery_unknown',"
+            "? || '|-|-|crash_window_delivery_unknown',"
+            "'2026-07-23 00:00:00')", (sid, sid))
         self.con.commit()
         self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
 
         counts = interface_reconcile.startup_reconcile(self.con)
         self.assertEqual(counts["terminal_inputs_removed"], 0)
         self.assertEqual(counts["terminal_input_parks"], 1)
+        interface_reconcile.startup_reconcile(self.con)
         self.assertEqual(self.con.execute(
             "SELECT composer, delivery, pending_seq "
             "FROM interface_input_state WHERE session_id=?",
             (sid,)).fetchone(), ("unknown", "delivery_unknown", 9))
         self.assertEqual(self.con.execute(
-            "SELECT reason FROM planner_alerts WHERE session_id=? "
-            "AND resolved_at IS NULL", (sid,)).fetchone(),
-            ("crash_window_delivery_unknown",))
+            "SELECT reason, resolved_at FROM planner_alerts WHERE session_id=?",
+            (sid,)).fetchall(), [
+                ("crash_window_delivery_unknown", "2026-07-23 00:00:00")
+            ])
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM planner_alerts WHERE session_id=? "
+            "AND resolved_at IS NULL", (sid,)).fetchone())
 
     def test_shared_close_revokes_writer_and_preserves_ambiguity(self):
         sid = self._occupied_session()

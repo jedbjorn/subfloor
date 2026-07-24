@@ -80,7 +80,12 @@ def startup_reconcile(con) -> dict:
         "AND (i.pending_seq IS NOT NULL OR i.delivery='delivery_unknown')"
     ).fetchall()
     for (session_id,) in terminal_parks:
-        interface_broker.park_delivery_unknown(con, session_id)
+        # Keep the metadata-only ambiguity, but do not raise a new
+        # session-scoped alert: every alert for an ended session is resolved
+        # audit, including across repeated service starts (spec #30 req 19).
+        interface_state.transition(con, "composer", session_id, "unknown")
+        interface_state.transition(
+            con, "delivery", session_id, "delivery_unknown")
         counts["terminal_input_parks"] += 1
     cur = con.execute(
         "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "

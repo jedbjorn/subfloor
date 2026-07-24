@@ -1,4 +1,4 @@
--- 0083 — terminal Interface cleanup + orphan alert repair (#529, #533).
+-- 0084 — terminal Interface cleanup + orphan alert repair (#529, #533).
 --
 -- Older closure paths could leave generation-volatile input state attached to
 -- a fully ended session. Drop ordinary state, but preserve metadata-only
@@ -42,7 +42,17 @@ SELECT session_id,
        'crash_window_delivery_unknown',
        CAST(session_id AS TEXT) || '|-|-|crash_window_delivery_unknown'
 FROM interface_input_state
-WHERE delivery='delivery_unknown';
+WHERE delivery='delivery_unknown'
+  AND EXISTS (
+      SELECT 1
+      FROM interface_sessions s
+      WHERE s.session_id=interface_input_state.session_id
+        AND NOT (
+            s.occupancy='ended'
+            AND s.lifecycle='ended'
+            AND s.ended_at IS NOT NULL
+        )
+  );
 
 UPDATE interface_writer_leases
 SET revoked_at=COALESCE(revoked_at, datetime('now')),

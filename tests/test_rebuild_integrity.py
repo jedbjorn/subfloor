@@ -32,7 +32,7 @@ def digest(path: Path) -> str:
 
 
 class RebuildIntegrityTest(unittest.TestCase):
-    def test_cleanup_migration_parks_terminal_ambiguity_and_removes_orphans(self):
+    def test_cleanup_migration_keeps_ended_alert_resolved_and_removes_orphans(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             db = Path(raw_tmp) / "shell_db.db"
             apply_engine_schema(db)
@@ -61,20 +61,33 @@ class RebuildIntegrityTest(unittest.TestCase):
                 "VALUES (1,1,1,'client','hash')")
             con.execute(
                 "INSERT INTO planner_alerts "
+                "(alert_id, session_id, severity, reason, dedupe_key, resolved_at) "
+                "VALUES (42,1,'critical','crash_window_delivery_unknown',"
+                "'1|-|-|crash_window_delivery_unknown','2026-07-23 00:00:00')")
+            con.execute(
+                "INSERT INTO planner_alerts "
                 "(alert_id, session_id, severity, reason, dedupe_key) "
                 "VALUES (41,999,'warning','legacy-orphan','orphan')")
             con.commit()
 
-            con.executescript(
-                (MIGRATIONS / "0083_interface_integrity_cleanup.sql").read_text())
+            migration = (
+                MIGRATIONS / "0084_interface_integrity_cleanup.sql").read_text()
+            con.executescript(migration)
+            con.executescript(migration)
             self.assertEqual(con.execute(
                 "SELECT composer, delivery, pending_seq "
                 "FROM interface_input_state WHERE session_id=1"
             ).fetchone(), ("unknown", "delivery_unknown", 7))
             self.assertEqual(con.execute(
-                "SELECT reason FROM planner_alerts WHERE session_id=1 "
+                "SELECT reason, resolved_at FROM planner_alerts "
+                "WHERE session_id=1"
+            ).fetchall(), [
+                ("crash_window_delivery_unknown", "2026-07-23 00:00:00")
+            ])
+            self.assertIsNone(con.execute(
+                "SELECT 1 FROM planner_alerts WHERE session_id=1 "
                 "AND resolved_at IS NULL"
-            ).fetchone(), ("crash_window_delivery_unknown",))
+            ).fetchone())
             revoked_at, reason = con.execute(
                 "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
                 "WHERE session_id=1").fetchone()
