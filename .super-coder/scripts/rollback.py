@@ -148,15 +148,21 @@ def verify_engine_only_floor(prev_sha: str) -> None:
         con.close()
 
     introduced = current - previous
-    if not introduced or not (current - applied):
+    if not introduced:
         sys.exit(
             "rollback: --engine-only refused — the current engine/DB pair is "
             "not a proved new-engine/old-schema half floor.")
-    if previous - applied or introduced & applied:
+    missing = previous - applied
+    unexpected = applied - previous
+    if missing or unexpected:
+        mismatch = (
+            f"missing={sorted(missing)!r}, "
+            f"unexpected={sorted(unexpected)!r}"
+        )
         sys.exit(
             "rollback: --engine-only refused — the DB does not exactly retain "
-            "the previous engine migration floor. Use a verified paired backup "
-            "or operator-directed recovery instead.")
+            f"the previous engine migration floor ({mismatch}). Use a verified "
+            "paired backup or operator-directed recovery instead.")
 
 
 def main(argv: list[str] | None = None) -> int:

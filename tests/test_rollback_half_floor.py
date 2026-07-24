@@ -25,7 +25,11 @@ def git(root: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def write_db(path: Path, value: str) -> None:
+def write_db(
+    path: Path,
+    value: str,
+    migrations: tuple[str, ...] = ("0001_old.sql",),
+) -> None:
     con = sqlite3.connect(path)
     try:
         con.execute("CREATE TABLE state (value TEXT)")
@@ -33,8 +37,10 @@ def write_db(path: Path, value: str) -> None:
         con.execute(
             "CREATE TABLE schema_migrations "
             "(filename TEXT PRIMARY KEY, applied_at TEXT)")
-        con.execute(
-            "INSERT INTO schema_migrations (filename) VALUES ('0001_old.sql')")
+        con.executemany(
+            "INSERT INTO schema_migrations (filename) VALUES (?)",
+            ((filename,) for filename in migrations),
+        )
         con.commit()
     finally:
         con.close()
@@ -49,6 +55,58 @@ def read_db(path: Path) -> str:
 
 
 class HalfFloorRollbackTest(unittest.TestCase):
+    def test_engine_only_refuses_previous_floor_with_unrelated_extra(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            engine = root / ".super-coder"
+            state = root / ".sc-state"
+            migrations = engine / "migrations"
+            migrations.mkdir(parents=True)
+            state.mkdir()
+            (migrations / "0001_old.sql").write_text("old\n")
+            (migrations / "0002_new.sql").write_text("new\n")
+            db_path = engine / "shell_db.db"
+            write_db(
+                db_path,
+                "unknown schema floor",
+                ("0001_old.sql", "9999_unrelated.sql"),
+            )
+            (state / "engine.ref").write_text("new-sha\n")
+            (state / "engine.ref.prev").write_text("old-sha\n")
+
+            previous_tree = subprocess.CompletedProcess(
+                args=(), returncode=0,
+                stdout=".super-coder/migrations/0001_old.sql\n",
+            )
+            with mock.patch.multiple(
+                rollback,
+                ENGINE=engine,
+                DB_PATH=db_path,
+                ENGINE_REF=state / "engine.ref",
+                ENGINE_REF_PREV=state / "engine.ref.prev",
+            ), mock.patch.multiple(
+                rollback.update_mod,
+                EJECTED_MARKER=state / "ejected",
+                git=mock.Mock(return_value=previous_tree),
+            ), mock.patch.object(
+                rollback, "backup_current_db"
+            ) as backup, mock.patch.object(
+                rollback, "restore_engine"
+            ) as restore, self.assertRaises(SystemExit) as refused:
+                rollback.main(["--engine-only"])
+
+            self.assertIn(
+                "does not exactly retain the previous engine migration floor",
+                str(refused.exception),
+            )
+            self.assertIn("missing=[]", str(refused.exception))
+            self.assertIn(
+                "unexpected=['9999_unrelated.sql']",
+                str(refused.exception),
+            )
+            backup.assert_not_called()
+            restore.assert_not_called()
+
     def test_engine_only_preserves_db_with_no_or_older_restore_point(self):
         for older_backup in (False, True):
             with self.subTest(older_backup=older_backup), \
