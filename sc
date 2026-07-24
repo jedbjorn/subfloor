@@ -1297,6 +1297,28 @@ case "$cmd" in
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
     "$PY" "$S/rebuild.py"
+    # The engine source intentionally carries no per-instance snapshot in local
+    # artifact mode. Exercise the real fresh-fork initialization path before
+    # the headless boot when rebuild therefore produced an empty instance.
+    if "$PY" - "$DB" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+try:
+    populated = con.execute(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE is_active=1) "
+        "AND EXISTS(SELECT 1 FROM shells WHERE COALESCE(is_deleted,0)=0)"
+    ).fetchone()[0]
+finally:
+    con.close()
+raise SystemExit(0 if populated else 1)
+PY
+    then
+      :
+    else
+      "$PY" "$S/init_fork.py" --username verify
+    fi
     SC_ADMIN=1 "$PY" "$S/render.py" flat
     RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
