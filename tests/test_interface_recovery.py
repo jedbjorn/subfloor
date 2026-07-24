@@ -1327,6 +1327,71 @@ class WorktreeTest(RecoveryCase):
         self.assertFalse(details["discarded"])
         self.assertTrue(details["closed"])
 
+    # -- the index's DURABLE FLAGS are state a discard rewrites (SC-125) ---
+    # The index is a store, not a blob table: alongside mode/object/stage each
+    # entry carries skip-worktree and assume-unchanged bits, and `git restore
+    # --staged` clears them. Setting one moves NOTHING else — the working
+    # file, its lstat, the porcelain line and the entry's own mode/object/
+    # stage are byte-identical either side — so only binding the flag can
+    # tell the states apart.
+
+    def stage_only(self, wt: str, rel: str, text: str) -> None:
+        """Stage `text` with the working file holding the SAME bytes, so the
+        entry is `M ` — the one shape where setting a flag leaves the
+        porcelain line alone (on `MM` git reports `M ` once the worktree half
+        is suppressed, which would move the digest by itself)."""
+        (Path(wt) / rel).write_text(text)
+        self.git_run(wt, "add", "--", rel)
+
+    def index_tag(self, wt: str, rel: str) -> str:
+        """The `ls-files -v` tag letter: `H` plain, `S` skip-worktree,
+        lowercase when assume-unchanged is set."""
+        return self.git_run(wt, "ls-files", "-v", "--", rel).split()[0]
+
+    def assert_flag_change_refuses(self, wt: str, rel: str, flag: str) -> None:
+        self.assertIn(f"M  {rel}", self.porcelain(wt))
+        before_stage = self.git_run(wt, "ls-files", "--stage", "--", rel)
+        before_stamp = self.stamp(Path(wt) / rel)
+        before_text = (Path(wt) / rel).read_text()
+        self.assert_mutation_refuses(
+            wt, lambda: self.git_run(wt, "update-index", flag, "--", rel))
+        self.assertEqual(self.git_run(wt, "ls-files", "--stage", "--", rel),
+                         before_stage,
+                         "mode/object/stage moved — this case no longer "
+                         "isolates the flag")
+        self.assertEqual(self.stamp(Path(wt) / rel), before_stamp,
+                         "the working file moved — this case no longer "
+                         "isolates the index")
+        self.assertEqual((Path(wt) / rel).read_text(), before_text)
+
+    def test_discard_clears_the_durable_index_flags(self):
+        # The premise, reproduced rather than argued: `restore --staged`
+        # throws the entry back to HEAD and drops the bits with it, which is
+        # what obliges the digest to bind them.
+        wt = self.make_git_worktree()
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.git_run(wt, "update-index", "--skip-worktree", "--",
+                     "tracked.txt")
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "S")
+        self.git_run(wt, "restore", "--source=HEAD", "--staged", "--worktree",
+                     "--", "tracked.txt")
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "H",
+                         "restore left the flag standing — premise of SC-125 "
+                         "changed")
+
+    def test_skip_worktree_set_after_preview_refuses_discard(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.assert_flag_change_refuses(wt, "tracked.txt", "--skip-worktree")
+
+    def test_assume_unchanged_set_after_preview_refuses_discard(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.assert_flag_change_refuses(wt, "tracked.txt",
+                                        "--assume-unchanged")
+
     # -- incomplete evidence REFUSES, it never degrades (SC-087) -----------
 
     def assert_gap_refuses_discard_but_frees_the_shell(self, wt, patcher=None):
@@ -1906,6 +1971,135 @@ class WorktreeTest(RecoveryCase):
         # ...and the rest of the consented set still goes: keeping one entry
         # is not a licence to abandon the discard.
         self.assertFalse((Path(wt) / "untracked.txt").exists())
+
+    def test_restage_during_the_removal_loop_is_kept(self):
+        # SC-124: the per-entry re-check read the index ONCE, at the top of
+        # the discard, and the removal loop then runs for arbitrarily many
+        # entries before the destructive `restore`. A stage landing in that
+        # window is invisible to a snapshot taken before it, so the restore
+        # threw the blob away and still reported discarded=true. The index has
+        # to be revalidated where the worktree is — immediately before the
+        # destructive call. Injecting from `_open_parent` puts the stage
+        # exactly inside the loop: after the snapshot, before the restore.
+        wt = self.make_git_worktree()
+        self.stage_over_working_copy(wt, "tracked.txt", staged="staged-a",
+                                     working="working-b")
+        plan = self.plan(wt)
+        real_open = recovery._open_parent
+
+        def staging_open(worktree, rel):
+            fd = real_open(worktree, rel)
+            self.stage_blob(wt, "tracked.txt", "staged-c-mid-removal")
+            return fd
+
+        with mock.patch.object(recovery, "_open_parent", staging_open):
+            result = recovery._discard_worktree_files(wt, plan)
+        self.assertEqual(self.staged(wt, "tracked.txt"),
+                         "staged-c-mid-removal")
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "working-b")
+        self.assertEqual(result["kept"], ["tracked.txt"])
+        self.assertFalse(result["discarded"])
+        # ...and the rest of the consented set still goes.
+        self.assertFalse((Path(wt) / "untracked.txt").exists())
+
+    def test_unreadable_index_before_the_restore_keeps_everything(self):
+        # The revalidation fails closed the same way the first read does: an
+        # index that cannot be read immediately before the destructive call
+        # leaves every enumerated entry unverifiable, and an unverifiable
+        # identity is never a licence to restore over it.
+        wt = self.make_git_worktree()
+        plan = self.plan(wt)
+        real = recovery._index_identities
+        calls = []
+
+        def failing_after_the_first(worktree):
+            calls.append(worktree)
+            if len(calls) > 1:
+                raise recovery._GitEvidenceUnavailable("index gone")
+            return real(worktree)
+
+        with mock.patch.object(recovery, "_index_identities",
+                               failing_after_the_first):
+            result = recovery._discard_worktree_files(wt, plan)
+        self.assertGreater(len(calls), 1, "the index was never re-read")
+        self.assertFalse(result["discarded"])
+        self.assertIn("tracked.txt", result["kept"])
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+
+    def test_discard_preserves_the_durable_index_flags(self):
+        # SC-125, the other half. The bits are not part of HEAD, so "throw the
+        # entry back to HEAD" does not say what should happen to them —
+        # clearing them is a side effect, not a discarded change. The content
+        # goes (that is what was consented to); the flags are put back.
+        wt = self.make_git_worktree()
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.git_run(wt, "update-index", "--skip-worktree", "--",
+                     "tracked.txt")
+        self.git_run(wt, "update-index", "--assume-unchanged", "--",
+                     "tracked.txt")
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "s")
+        result = recovery._discard_worktree_files(wt, self.plan(wt))
+        self.assertTrue(result["discarded"], result)
+        self.assertEqual(result["flags_lost"], [])
+        self.assertEqual(self.staged(wt, "tracked.txt"), "v1")
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "s")
+
+    def test_flags_that_cannot_be_preserved_are_reported(self):
+        # A staged-NEW path leaves the index entirely, so its flag has nowhere
+        # to live. Preserve where the store allows it, report where it does
+        # not — never clear it silently.
+        wt = self.make_git_worktree()
+        (Path(wt) / "added.txt").write_text("new")
+        self.git_run(wt, "add", "--", "added.txt")
+        self.git_run(wt, "update-index", "--skip-worktree", "--", "added.txt")
+        result = recovery._discard_worktree_files(wt, self.plan(wt))
+        self.assertTrue(result["discarded"], result)
+        self.assertEqual(result["flags_lost"], ["added.txt"])
+        self.assertEqual(self.git_run(wt, "ls-files", "-v", "--",
+                                      "added.txt"), "")
+
+    def test_discard_never_recurses_into_a_submodule(self):
+        # The THIRD store. A submodule has its own worktree, index and refs,
+        # and none of them are inside this fence: the host sees only a gitlink
+        # and a directory, so a commit made inside the submodule after the
+        # preview moves neither. With `submodule.recurse` configured, `git
+        # restore` follows the gitlink and resets that store too — destroying
+        # work the operator was never shown. The discard pins the flag off, so
+        # a config setting cannot widen a consented blast radius.
+        wt = self.make_git_worktree()
+        sub = Path(self.tmp.name) / "submodule-origin"
+        sub.mkdir()
+        self.git_run(str(sub), "init", "-q", "-b", "main")
+        self.git_run(str(sub), "config", "user.email", "t@t")
+        self.git_run(str(sub), "config", "user.name", "t")
+        (sub / "s.txt").write_text("s1")
+        self.git_run(str(sub), "add", "-A")
+        self.git_run(str(sub), "commit", "-qm", "s1")
+        self.git_run(wt, "-c", "protocol.file.allow=always", "submodule",
+                     "add", "-q", str(sub), "sm")
+        self.git_run(wt, "commit", "-qm", "add submodule")
+        self.git_run(wt, "config", "submodule.recurse", "true")
+        # work committed INSIDE the submodule — the host's gitlink now differs
+        inner = str(Path(wt) / "sm")
+        (Path(inner) / "local.txt").write_text("work only the submodule holds")
+        self.git_run(inner, "add", "-A")
+        self.git_run(inner, "commit", "-qm", "inner work")
+        head = self.git_run(inner, "rev-parse", "HEAD")
+
+        result = recovery._discard_worktree_files(wt, self.plan(wt))
+        self.assertEqual(self.git_run(inner, "rev-parse", "HEAD"), head)
+        self.assertTrue((Path(inner) / "local.txt").exists())
+        # ...and say WHY it survived, so this cannot pass vacuously: today the
+        # SC-103 guard keeps it, because a checked-out submodule is a
+        # directory. That is a coincidence of a different rule.
+        self.assertIn("sm", result["kept"])
+
+        # So prove the pin does the work on its own, with that guard out of
+        # the way: the restore now really does run on the gitlink.
+        with mock.patch.object(recovery, "_is_dir", return_value=False):
+            recovery._discard_worktree_files(wt, self.plan(wt))
+        self.assertEqual(self.git_run(inner, "rev-parse", "HEAD"), head)
+        self.assertTrue((Path(inner) / "local.txt").exists())
 
     def test_unreadable_index_at_the_discard_keeps_everything(self):
         # An index that cannot be read between the gate and the delete means

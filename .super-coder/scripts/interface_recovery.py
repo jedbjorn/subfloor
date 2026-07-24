@@ -414,29 +414,71 @@ def _path_identity(path: str) -> str:
 _INDEX_ABSENT = "index:none"
 
 
+def _index_flags(identity: str) -> str:
+    """The durable-flag token out of one index identity — `--` for an entry
+    the index does not hold."""
+    return identity.rsplit(" ", 1)[-1] if " " in identity else "--"
+
+
 def _index_identities(worktree: str) -> dict[str, str]:
-    """What the INDEX holds, per path: mode, object id and merge stage.
+    """What the INDEX holds, per path: mode, object id, merge stage, and the
+    durable per-entry FLAGS.
 
     Read in ONE pass over the whole index rather than per path — every entry
     then comes from the same instant, the same way the path set does.
 
-    Blob id, mode and stage ONLY — never the index file's own mtime or its
-    stat cache. `git status` REFRESHES those as a side effect of the very
-    observation this fences, so binding them would make a preview stale
-    against itself and refuse every discard forever (the same trap st_atime
-    is excluded from `_path_identity` for). What a discard destroys is the
-    CONTENT the index holds, and that is what is recorded.
+    The index is a store in its own right, not a blob table, so what is bound
+    here is everything an entry durably carries that a discard can rewrite.
+    Enumerated from the on-disk index format rather than from memory, the
+    per-entry fields are: the stat cache (ctime/mtime/dev/ino/uid/gid/size),
+    mode, object id, and the flag word — assume-valid, merge stage, and the
+    v3 extended bits skip-worktree and intent-to-add. Of those:
+
+    - mode, object id and merge stage are the content a discard throws back to
+      HEAD, and are recorded.
+    - skip-worktree and assume-unchanged are recorded (SC-125). They are
+      durable index state that `restore --staged` CLEARS, and setting one
+      moves nothing else: on a staged-only entry the working file, its lstat,
+      the porcelain line and the entry's own mode/object/stage are all
+      byte-identical either side of the bit, so an unbound flag rode straight
+      through the fence.
+    - intent-to-add needs no separate field: it can only be set on a path the
+      index does not otherwise hold, and both transitions move the PORCELAIN
+      line the digest already binds (`??` <-> ` A`, which is distinct from a
+      real staged add's `A `). Recorded by the outer layer, not this one.
+    - the STAT CACHE is excluded, and by reproduction rather than by argument:
+      `git status` REFRESHES it as a side effect of the very observation this
+      fences, so binding it would make a preview stale against itself and
+      refuse every discard forever (the same trap st_atime is excluded from
+      `_path_identity` for). It is a cache of the worktree, and the worktree
+      half of `_entry_identity` binds the thing itself.
+
+    Index EXTENSIONS carry no per-entry work a discard destroys: cache-tree,
+    untracked-cache, fsmonitor and split-index are all caches git rebuilds,
+    and resolve-undo (REUC) survives the discard untouched — reproduced, not
+    assumed. `MERGE_HEAD` and an in-progress merge likewise survive it.
+
+    The flags are read via `ls-files -v`, whose tag letter is the only
+    interface to them. Its letter set also spans WORKTREE-derived states (`C`
+    modified, `R` removed, `K` to-be-killed) — none of which this invocation
+    can emit, since those require the matching listing option — so rather than
+    record the letter, the two durable bits are decoded out of it. A letter
+    this function does not expect therefore decodes to "no flags", exactly as
+    a plain `H` does, and can never move the digest on a volatile fact.
 
     An unmerged path carries several stage entries; all of them are recorded,
     sorted, because a conflict resolution rewrites exactly that set.
     """
     entries: dict[str, list[str]] = {}
-    for record in _git_out(worktree, "ls-files", "--stage", "-z",
+    for record in _git_out(worktree, "ls-files", "-v", "--stage", "-z",
                            timeout=30).split("\0"):
         if not record:
             continue
         meta, _tab, rel = record.partition("\t")
-        entries.setdefault(rel, []).append(" ".join(meta.split()))
+        tag, mode, obj, stage = meta.split()
+        flags = ("S" if tag.upper() == "S" else "-") \
+            + ("A" if tag.islower() else "-")
+        entries.setdefault(rel, []).append(f"{mode} {obj} {stage} {flags}")
     return {rel: "+".join(sorted(stages)) for rel, stages in entries.items()}
 
 
@@ -523,15 +565,20 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     h = hashlib.sha256()
     for line in sorted(porcelain):
         h.update(line.encode("utf-8", "surrogateescape") + b"\n")
-    identities = {}
+    identities, index_of = {}, {}
     for rel in sorted(tracked | untracked_files | untracked_dirs):
+        index_of[rel] = index.get(rel, _INDEX_ABSENT)
         identities[rel] = _entry_identity(worktree, rel, index)
         h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                  + identities[rel].encode() + b"\0")
+    # The index half is kept separately as well as inside `identities`, so the
+    # discard can re-verify it ALONE — at a point where the filesystem half
+    # has legitimately moved because the discard itself moved it (SC-124).
     return {"head": head, "tracked": sorted(tracked),
             "untracked_files": sorted(untracked_files),
             "untracked_dirs": sorted(untracked_dirs),
-            "identities": identities, "digest": h.hexdigest()}
+            "identities": identities, "index": index_of,
+            "digest": h.hexdigest()}
 
 
 def _observe_worktree(worktree: str) -> tuple[dict, dict]:
@@ -733,6 +780,48 @@ def _prune_dirs(worktree: str, plan: dict) -> list[str]:
             if os.path.lexists(os.path.join(worktree, rel.rstrip("/")))]
 
 
+_INDEX_FLAG_OPTS = {"S": "--skip-worktree", "A": "--assume-unchanged"}
+
+
+def _restore_index_flags(worktree: str, plan: dict,
+                         restored: list[str]) -> list[str]:
+    """Put back the durable index flags the restore cleared. Returns the
+    entries whose flags could NOT be put back.
+
+    The bits are not part of HEAD, so "throw the entry back to HEAD" does not
+    say what should happen to them — clearing them is a SIDE EFFECT of the
+    command, not a change the operator confirmed discarding. The content goes;
+    the operator's standing instruction about the path stays (SC-125, and
+    decision #45's preserve-and-report rather than silent clearing).
+
+    Where the store leaves no room for the flag it is REPORTED, never quietly
+    dropped: a staged-new path is gone from the index once the discard has
+    run, and on an unborn HEAD every entry is, so there is no entry left to
+    carry a bit. Outcomes are verified by re-reading the index rather than
+    trusted from an exit code — `update-index` is silent about a path it could
+    not mark.
+    """
+    want = {rel: _index_flags(plan["index"][rel]) for rel in restored}
+    want = {rel: flags for rel, flags in want.items() if flags != "--"}
+    if not want:
+        return []
+    for bit, opt in _INDEX_FLAG_OPTS.items():
+        paths = [rel for rel, flags in want.items() if bit in flags]
+        if not paths:
+            continue
+        subprocess.run(
+            ["git", "-C", worktree, "update-index", "-z", opt, "--stdin"],
+            input=b"".join(rel.encode("utf-8", "surrogateescape") + b"\0"
+                           for rel in paths),
+            capture_output=True, timeout=60, check=False)
+    try:
+        after = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        return sorted(want)
+    return sorted(rel for rel, flags in want.items()
+                  if _index_flags(after.get(rel, _INDEX_ABSENT)) != flags)
+
+
 def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     """Undo EXACTLY the entries `plan` enumerated — restore its tracked paths
     from HEAD, remove its untracked ones — and nothing else. Never deletes the
@@ -756,13 +845,19 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
 
     Each entry is also re-verified against the identity the fence observed,
     and left alone when it no longer matches — so a path is only ever removed
-    while it still IS what the operator was shown. The filesystem half of that
-    identity is re-read immediately before the entry is touched; the index
-    half comes from ONE snapshot taken at the top of this function, since
-    nothing here writes to the index before the final restore. That check
+    while it still IS what the operator was shown. BOTH halves of that
+    identity are re-read immediately before the command that destroys them:
+    the filesystem half before each `unlink`, the index half before the final
+    `restore`/`rm --cached`. Sampling the index ONCE at the top instead was
+    SC-124 — nothing HERE writes to the index before the restore, but the
+    operator does, and a `git add` landing while the removal loop runs was
+    then erased by a restore that had checked an older read. That check
     narrows, and does not close, the window between the check and the
     `unlink`/`restore` itself: no filesystem offers "remove only if
     unchanged", and the index is not transactional against us either.
+
+    Durable index flags the restore clears are put back afterwards, and named
+    in `flags_lost` where the store leaves nowhere to put them (SC-125).
 
     Runs AFTER the durable closure is committed, so a failure here must never
     escape as a 500 that hides what happened: each step's outcome is recorded
@@ -773,7 +868,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     """
     result: dict = {"worktree": worktree, "discarded": False,
                     "completed": [], "failed": None,
-                    "kept": [], "kept_count": 0}
+                    "kept": [], "kept_count": 0, "flags_lost": []}
     identities, restore, kept_files = plan["identities"], [], []
     # One index read for the whole pass: nothing below writes to the index
     # until the final `restore`/`rm --cached`, so this snapshot stays true for
@@ -862,8 +957,59 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
         restore = [rel for rel in restore if rel not in set(standing)]
     else:
         restore = [rel for rel in restore if rel in set(removed)]
+
+    # -- revalidate the INDEX immediately before the destructive call -------
+    # The snapshot above is taken at the top of this function and the removal
+    # loop then runs for as many entries as the plan holds. A `git add`
+    # landing in that window is invisible to a read taken before it, so the
+    # restore threw a blob away that no gate had seen — a check-then-act gap
+    # of exactly the shape already closed twice on the worktree (SC-124). The
+    # index therefore gets its own re-read HERE, at the same point the
+    # worktree half is re-read: the last instant before the command that
+    # destroys it.
+    #
+    # Only the INDEX half is re-checked, deliberately. The filesystem half
+    # cannot be: on an unborn HEAD the removal above unlinked these very
+    # files, so re-reading it would compare "absent" against the observed
+    # content and keep everything the discard just did the work for.
+    # Unreadable now -> nothing is verifiable, so nothing is restored over.
+    try:
+        fresh_index = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        fresh_index = None
+    still = []
+    for rel in restore:
+        if fresh_index is not None \
+                and fresh_index.get(rel, _INDEX_ABSENT) == plan["index"][rel]:
+            still.append(rel)
+        else:
+            keep(rel)
+    restore = still
+
     if restore:
-        args = ["restore", "--source=HEAD", "--staged", "--worktree"] \
+        # --no-recurse-submodules is PINNED, not left to config. A submodule is
+        # a third store — its own worktree, index and refs — and none of it is
+        # inside this fence: the host sees a gitlink and a directory, neither
+        # of which moves when work is committed inside the submodule. With
+        # `submodule.recurse` set, `git restore` follows the gitlink and
+        # resets that store too (reproduced: an inner commit and its files
+        # erased). The SC-103 `standing` guard happens to keep a checked-out
+        # submodule as well, since it is always a directory — but that guard is
+        # about collateral, not about submodules, and a consented blast radius
+        # must not depend on a coincidence or on the operator's config.
+        #
+        # --ignore-skip-worktree-bits is the other half of taking those bits
+        # seriously. Without it git filters our OWN pathspec down to
+        # non-sparse entries, and a staged-new path carrying skip-worktree
+        # matches neither HEAD nor the filtered index — so the command fails
+        # `pathspec did not match`, taking the restore of every other
+        # consented entry down with it. It cannot widen anything: the pathspec
+        # is the enumerated set, read from a file, and this only stops git
+        # discarding members of it. (A sparse checkout's excluded paths never
+        # reach here at all — they do not differ from HEAD, so nothing
+        # enumerates them.)
+        args = ["restore", "--source=HEAD", "--no-recurse-submodules",
+                "--ignore-skip-worktree-bits", "--staged", "--worktree"] \
             if plan["head"] else ["rm", "--cached", "--force", "--quiet"]
         try:
             out = subprocess.run(
@@ -881,6 +1027,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
                 "error": out.stderr.decode("utf-8", "replace").strip()[-200:]}
             return result
     result["completed"].append("restore")
+    result["flags_lost"] = _restore_index_flags(worktree, plan, restore)
     # A surviving DIRECTORY does not make the discard incomplete. It stands
     # because it holds something outside the delete set — an ignored file, a
     # nested repository, work written after the confirmation — and `clean -fd`
