@@ -35,14 +35,29 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # tmux — the Interface process host (spec #20): a DECLARED, version-gated
-# dependency, not ambient host availability. bookworm main ships 3.3a; the
-# Interface stack is proven on 3.5a (spikes/interface-stream/RESULTS.md), which
-# bookworm-backports carries (3.5a-2~bpo12+1). The runtime additionally gates
-# `tmux -V` >= 3.4 at startup and reports Interface unavailable below that.
-RUN echo "deb http://deb.debian.org/debian bookworm-backports main" \
-      > /etc/apt/sources.list.d/bookworm-backports.list \
- && apt-get update \
- && apt-get install -y --no-install-recommends -t bookworm-backports tmux \
+# dependency, not ambient host availability. The fence proofs are tmux-3.5a-
+# specific (alt-screen capture behavior, paste-before-bindings timing —
+# spikes/interface-stream/RESULTS.md "Chosen stack (pinned)"), so build the
+# pinned 3.5a release tarball from source with sha256 verification — NOT a
+# distro apt install (a repo pocket can drift or resolve differently per base
+# release → false green; the bookworm-backports this replaces also assumed a
+# bookworm base, and python:3.12-slim is trixie now). The runtime additionally
+# gates `tmux -V` >= 3.4 at startup and reports Interface unavailable below
+# that.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential libevent-dev libncurses-dev pkg-config bison \
+ && curl -fsSL -o /tmp/tmux-3.5a.tar.gz \
+      https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz \
+ && echo "16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951  /tmp/tmux-3.5a.tar.gz" \
+      | sha256sum -c - \
+ && tar -xzf /tmp/tmux-3.5a.tar.gz -C /tmp \
+ && cd /tmp/tmux-3.5a \
+ && ./configure --prefix=/usr/local \
+ && make -j"$(nproc)" \
+ && make install \
+ && cd / \
+ && rm -rf /tmp/tmux-3.5a /tmp/tmux-3.5a.tar.gz \
  && rm -rf /var/lib/apt/lists/*
 
 # Interface stream stack (spec #20; sprint 25 seq 3 pinned these):
@@ -75,11 +90,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
-# @xterm/headless 6.0.0 (MIT) at /opt/sc-shadow — the shadow terminal the
-# Interface runtime mirrors output through for reconnect redraws (spec #20;
-# pinned by the seq-3 spike). The Node sidecar resolves it via NODE_PATH
+# @xterm/headless 6.0.0 + @xterm/xterm 6.0.0 (MIT) at /opt/sc-shadow — the
+# shadow terminal the Interface runtime mirrors output through for reconnect
+# redraws, and the vendored browser terminal source (spec #20; pinned by the
+# seq-3 spike). The Node sidecar resolves them via NODE_PATH
 # (scripts/interface_runtime.py).
-RUN npm install --prefix /opt/sc-shadow "@xterm/headless@6.0.0" \
+RUN npm install --prefix /opt/sc-shadow "@xterm/headless@6.0.0" "@xterm/xterm@6.0.0" \
  && chmod -R a+rX /opt/sc-shadow
 
 # Playwright E2E browser — baked at the IMAGE level on purpose, unlike the per-fork
