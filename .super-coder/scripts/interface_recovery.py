@@ -1069,9 +1069,15 @@ def evidence_projection(evidence: dict, classification: str,
         else "unknown · left unread")
 
     if git and git.get("indeterminate"):
+        # Says what the system DOES, which stopped being "refuse everything"
+        # (SC-107). An operator told recovery is impossible does not attempt
+        # it, so the shell stays stranded on the strength of the sentence
+        # rather than the code — the objective failing through the projection.
+        # Canonical, so browser and CLI both inherit the correction.
         worktree_value = (
             f"state could not be observed completely ({git['indeterminate']})"
-            " · recovery refused until it can be")
+            " · discard declined · recover with files preserved (the default)"
+            " to free the shell — every file is left untouched")
     elif git:
         tracked = git.get("dirty_tracked")
         untracked = git.get("untracked")

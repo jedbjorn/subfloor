@@ -1221,7 +1221,17 @@ class WorktreeTest(RecoveryCase):
             obj = self.preview(1)
             self.assertIn("indeterminate", obj["evidence"]["git"])
             rows = {r["key"]: r["value"] for r in obj["evidence_projection"]}
-            self.assertIn("could not be observed completely", rows["worktree"])
+            # WHAT IT SAYS, not just that it says something (SC-107). The
+            # projection is canonical — browser and CLI render it verbatim —
+            # and it used to promise "recovery refused until it can be", which
+            # the two-tier gate made false. An operator who believes recovery
+            # is impossible does not attempt it, so a stale sentence strands
+            # the shell just as effectively as a refusing code path.
+            worktree = rows["worktree"]
+            self.assertIn("could not be observed completely", worktree)
+            self.assertIn("discard declined", worktree)
+            self.assertIn("free the shell", worktree)
+            self.assertNotIn("recovery refused", worktree)
             with mock.patch.object(recovery,
                                    "_discard_worktree_files") as disc, \
                     mock.patch.object(recovery,
@@ -1232,6 +1242,11 @@ class WorktreeTest(RecoveryCase):
                 self.assertEqual(status, 409, err)
                 self.assertEqual(err["error"]["code"],
                                  "recovery_observation_stale")
+                # the refusal names the escape route that actually works,
+                # rather than leaving the operator to guess there is one
+                message = err["error"]["message"]
+                self.assertIn("DISCARD is refused", message)
+                self.assertIn("without discard_worktree", message)
                 self.assert_nothing_discarded(wt)   # not even a closure
                 # ...and now the core path, on the same broken worktree.
                 # (Fresh idempotency key — a different body under the old one
