@@ -1692,6 +1692,72 @@ class WorktreeTest(RecoveryCase):
         # a surviving DIRECTORY is reported, but every consented FILE is gone
         self.assertTrue(result["discarded"], result)
 
+    def test_nothing_outside_the_plan_survives_adversarial_shapes(self):
+        """The boundary claim, tested the way the closure claim is: build every
+        shape that could let the discard reach outside the enumerated set, run
+        it, and only then say the boundary holds.
+
+        'Nothing outside the enumerated set is exposed' was stated three times
+        before it was true — ignored descendants of a file/directory conflict
+        were exposed the whole time (SC-103). The claim now has a test that
+        would go red if any of these leaked.
+        """
+        wt = self.make_git_worktree()
+        outside = Path(self.tmp.name) / "outside-the-worktree"
+        outside.mkdir()
+        (outside / "victim.txt").write_text("outside the worktree entirely")
+
+        def git(*args):
+            subprocess.run(["git", "-C", wt, *args], check=True,
+                           capture_output=True)
+
+        (Path(wt) / ".gitignore").write_text("*.pyc\n")
+        (Path(wt) / "node").write_text("committed")
+        (Path(wt) / "steady.txt").write_text("clean and tracked")
+        git("add", ".gitignore", "node", "steady.txt")
+        git("commit", "-qm", "boundary base")
+
+        # (a) tracked FILE replaced by a directory hiding an ignored descendant
+        #     several levels down — the bulk restore's own footprint (SC-103).
+        (Path(wt) / "node").unlink()
+        (Path(wt) / "node" / "deep").mkdir(parents=True)
+        (Path(wt) / "node" / "deep" / "keep.pyc").write_text("ignored deep")
+        # (b) an ignored file inside a directory that IS in the delete set
+        (Path(wt) / "untdir").mkdir()
+        (Path(wt) / "untdir" / "u.txt").write_text("consented")
+        (Path(wt) / "untdir" / "skip.pyc").write_text("ignored, inside it")
+        # (c) somebody else's repository inside that same directory
+        nested = Path(wt) / "untdir" / "nested"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q", str(nested)], check=True,
+                       capture_output=True)
+        (nested / "theirs.txt").write_text("another repo's work")
+        # (d) an enumerated untracked symlink AIMED out of the worktree: the
+        #     link goes, never the thing it points at
+        (Path(wt) / "ulink_out").symlink_to(outside / "victim.txt")
+        # (e) an ignored file at the top, and a clean tracked file — neither is
+        #     enumerated, so neither may move
+        (Path(wt) / "top.pyc").write_text("ignored at the root")
+
+        result = recovery._discard_worktree_files(wt, self.plan(wt))
+        self.assertIsNone(result["failed"], result)
+        for path, text in (
+                (outside / "victim.txt", "outside the worktree entirely"),
+                (Path(wt) / "node" / "deep" / "keep.pyc", "ignored deep"),
+                (Path(wt) / "untdir" / "skip.pyc", "ignored, inside it"),
+                (nested / "theirs.txt", "another repo's work"),
+                (Path(wt) / "top.pyc", "ignored at the root"),
+                (Path(wt) / "steady.txt", "clean and tracked")):
+            self.assertEqual(path.read_text(), text,
+                             f"{path} is outside the plan and was touched")
+        # ...while everything that WAS enumerated went, and the report says so
+        self.assertFalse((Path(wt) / "untdir" / "u.txt").exists())
+        self.assertFalse((Path(wt) / "untracked.txt").exists())
+        self.assertFalse((Path(wt) / "ulink_out").exists())
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
+        self.assertIn("node", result["kept"])       # refused, not exceeded
+        self.assertFalse(result["discarded"])
+
     def df_worktree(self, obstruction: str, *, ignored: bool) -> str:
         """HEAD tracks the FILE `node`; the worktree has replaced it with a
         DIRECTORY holding `obstruction`. `git diff HEAD` names `node`, so the
