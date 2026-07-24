@@ -35,6 +35,17 @@ Worktree discipline: files are preserved by default. discard_worktree is an
 independently confirmed escalation (typed shell shortname) that refuses
 when unpushed commits exist and never deletes the worktree or branch.
 
+Evidence discipline, both directions:
+- the freshness digest binds every attribute a discard REWRITES — content,
+  type, symlink target, permissions, ownership, timestamps — so that any
+  post-preview change to state the operator confirmed erasing moves it;
+- an observation that cannot be gathered WHOLE refuses. Git facts are a
+  complete observation, an explicit gap, or "there is no repository here";
+  a gap never degrades to absent facts, because a gap is deterministic — the
+  same undecodable output or unreadable entry at preview and at execute would
+  fingerprint EQUAL and let a discard run as though nothing had changed.
+  Absence of evidence is not evidence of safety.
+
 This module is stdlib-only: recovery must work HTTP-only, without the
 websockets-dependent Interface runtime (spec Restricted Admin).
 """
@@ -188,40 +199,109 @@ def terminate_process_group(pid: int, start_ticks: int,
 
 # ------------------------------------------------------------------ git facts
 
-def _path_identity(path: str) -> str:
-    """Identity of one working-tree path: its TYPE first, then what that type
-    carries. Classified with lstat — NO-FOLLOW, always.
+class _GitEvidenceUnavailable(Exception):
+    """A repository is there but its evidence could not be gathered whole.
 
-    - regular file -> its bytes (never mtime or size: a same-size overwrite
-      must move the hash) plus the executable bit, the one mode bit git
-      records and a confirmed discard therefore restores.
+    Distinct from "there is no repository": one is a gap, the other is a
+    complete observation. A gap must never reach the fence as absent facts —
+    absence of evidence is not evidence of safety.
+    """
+
+
+def _git_out(worktree: str, *args, timeout: int = 15) -> str:
+    """Git stdout, decoded losslessly; any failure raises.
+
+    surrogateescape, NEVER strict: a valid non-UTF-8 filename is real working
+    -tree state, and decoding it strictly raises — which is exactly how this
+    guard used to collapse to "no facts" (SC-087). Surrogates keep such names
+    distinct in the digest and hand os.* calls back the original bytes.
+    Non-zero exit, timeout and spawn failure all become a refusal, never a
+    partial answer.
+    """
+    try:
+        out = subprocess.run(["git", "-C", worktree, *args],
+                             capture_output=True, timeout=timeout,
+                             check=False)
+    except Exception as exc:  # spawn failure / timeout: a gap, not a fact
+        raise _GitEvidenceUnavailable(
+            f"git {args[0]}: {type(exc).__name__}") from exc
+    if out.returncode != 0:
+        raise _GitEvidenceUnavailable(f"git {args[0]}: exit {out.returncode}")
+    return out.stdout.decode("utf-8", "surrogateescape")
+
+
+def _head_exists(worktree: str) -> bool:
+    """True when HEAD resolves; False for an unborn HEAD — a repo with no
+    commits is a COMPLETE observation (nothing committed to diff against,
+    nothing that can be unpushed), not a gap. Any other exit is a gap."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "--verify", "-q", "HEAD"],
+            capture_output=True, timeout=15, check=False)
+    except Exception as exc:  # spawn failure / timeout: a gap, not a fact
+        raise _GitEvidenceUnavailable(
+            f"git rev-parse: {type(exc).__name__}") from exc
+    if out.returncode == 0:
+        return True
+    if out.returncode == 1 and not out.stdout.strip():
+        return False
+    raise _GitEvidenceUnavailable(f"git rev-parse: exit {out.returncode}")
+
+
+def _path_identity(path: str) -> str:
+    """Identity of one working-tree path: its TYPE and lstat metadata first,
+    then what that type carries. Classified with lstat — NO-FOLLOW, always.
+
+    The metadata prefix binds every attribute a discard REWRITES: the type,
+    the FULL permission bits, owner and group, size, and the mtime/ctime
+    `git checkout` replaces. `reset --hard` does not restore a dirty file in
+    place — it recreates it from the index, so its mode comes back as
+    umask-derived 0644/0666 and its owner as the recovering process's
+    (reproduced: 0640 -> reset -> 0666). Permissions are work; discard
+    destroys them; the digest therefore binds them.
+
+    On top of the prefix:
+    - regular file -> its bytes (never size or mtime alone: a same-size
+      overwrite must move the hash).
     - symlink -> the readlink TARGET STRING itself. Never the bytes behind
       it: resolving would miss a retarget onto a byte-identical file, and it
       would let the digest wander outside the worktree entirely. Link and
       target are distinct entities and stay distinguished.
-    - directory / fifo / socket / device -> the type alone.
-    - absent or unreadable -> a marker, itself a change.
+    - directory / fifo / socket / device -> the prefix alone.
+    - genuinely absent (ENOENT/ENOTDIR) -> a marker; that IS the state.
+    - unreadable for any other reason -> a GAP: raise, never a marker. A
+      marker is deterministic, so it would read equal at preview and execute
+      and let a discard erase whatever changed behind it.
 
-    The type prefix is what makes a transition (regular <-> symlink,
-    file <-> directory) move the identity even when the visible content
-    matches. Every branch fails toward stale, never toward "unchanged".
+    Only st_atime is excluded, and by reproduction rather than by argument:
+    this function lstats a path and then READS it, and on a file the shell
+    just wrote (every dirty file) that read moves atime — measured moving
+    ~1ms under relatime. The value recorded is the one observed BEFORE our
+    own read, so binding it would make the preview stale against itself and
+    refuse every discard forever.
     """
     try:
         st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
     except OSError as exc:
-        return f"absent:{exc.errno}"
+        # Paths and contents never enter the payload — errno only.
+        raise _GitEvidenceUnavailable(f"lstat: errno {exc.errno}") from exc
     mode = st.st_mode
+    meta = (f"{stat.S_IFMT(mode):o}:{stat.S_IMODE(mode):04o}:{st.st_uid}:"
+            f"{st.st_gid}:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}")
     if stat.S_ISLNK(mode):
         try:
             target = os.readlink(path)
         except OSError as exc:
-            return f"link-unreadable:{exc.errno}"
-        return "link:" + hashlib.sha256(
+            raise _GitEvidenceUnavailable(
+                f"readlink: errno {exc.errno}") from exc
+        return f"link:{meta}:" + hashlib.sha256(
             target.encode("utf-8", "surrogateescape")).hexdigest()
     if stat.S_ISDIR(mode):
-        return "dir:"
+        return f"dir:{meta}"
     if not stat.S_ISREG(mode):
-        return f"special:{stat.S_IFMT(mode):o}"
+        return f"special:{meta}"
     h = hashlib.sha256()
     try:
         # O_NOFOLLOW: the path was a regular file at lstat; if it became a
@@ -234,100 +314,113 @@ def _path_identity(path: str) -> str:
         finally:
             os.close(fd)
     except OSError as exc:
-        return f"unreadable:{exc.errno}"
-    return f"file:{'x' if mode & stat.S_IXUSR else '-'}:{h.hexdigest()}"
+        raise _GitEvidenceUnavailable(f"read: errno {exc.errno}") from exc
+    return f"file:{meta}:{h.hexdigest()}"
 
 
-def _change_digest(worktree: str, porcelain: list[str]) -> str:
+def _change_digest(worktree: str, porcelain: list[str], head: bool) -> str:
     """Fingerprint of what a discard would erase.
 
     INVARIANT: this digest MUST change if ANY safety-relevant aspect of the
     worktree state a discard would destroy has changed since the preview.
     Porcelain lines are far coarser than that — they stay byte-identical
-    while the work underneath them is rewritten, retargeted, or changes type
-    — so the line set is only the outer layer. Held against the invariant,
-    the state a discard destroys is: the SET of affected paths (the lines),
-    and for each path its ENTITY IDENTITY (`_path_identity`) — regular-file
-    bytes, symlink target string, or bare type, so that a content rewrite, a
-    same-size overwrite, a link retarget, and a type transition each move the
-    digest.
+    while the work underneath them is rewritten, retargeted, re-permissioned
+    or changes type — so the line set is only the outer layer. Held against
+    the invariant, the state a discard destroys is: the SET of affected paths
+    (the lines), and for each path its ENTITY IDENTITY (`_path_identity`) —
+    type, permissions, ownership, timestamps, and regular-file bytes or
+    symlink target.
 
-    Excluded deliberately: mode bits beyond the executable bit. Git records
-    only that bit, so it is the only one `git checkout`/`git clean` can
-    destroy or restore; a chmod 644->640 survives the discard untouched and
-    is not state the operator's confirmation was about.
+    The path set is what `reset --hard` + `clean -fd` would act on: the paths
+    differing from HEAD, plus untracked files, plus untracked DIRECTORIES —
+    `clean -fd` removes an empty untracked directory that `ls-files -o` (a
+    file listing) never names. Ignored files stay out: `clean -fd` without
+    -x does not touch them, so they are not state the confirmation is about.
     """
     def paths(*args) -> list[str]:
         # -z: paths verbatim, no C-quoting to unescape.
-        out = subprocess.run(["git", "-C", worktree, *args],
-                             capture_output=True, text=True, timeout=30,
-                             check=True).stdout
-        return [p for p in out.split("\0") if p]
+        return [p for p in _git_out(worktree, *args, timeout=30).split("\0")
+                if p]
 
     h = hashlib.sha256()
     for line in sorted(porcelain):
-        h.update(line.encode() + b"\n")
-    # diff HEAD --name-only: staged + unstaged + deletions, one row per path.
-    # ls-files -o: untracked FILES individually, never collapsed to a dir.
-    for rel in sorted(set(paths("diff", "HEAD", "--name-only", "-z"))
-                      | set(paths("ls-files", "-o", "--exclude-standard",
-                                  "-z"))):
-        h.update(rel.encode() + b"\0"
+        h.update(line.encode("utf-8", "surrogateescape") + b"\n")
+    # ls-files -o: untracked FILES individually, never collapsed to a dir;
+    # --directory: the untracked DIRECTORIES themselves, empty ones included.
+    rels = set(paths("ls-files", "-o", "--exclude-standard", "-z")) \
+        | set(paths("ls-files", "-o", "--directory", "--exclude-standard",
+                    "-z"))
+    if head:
+        # staged + unstaged + deletions, one row per path.
+        rels |= set(paths("diff", "HEAD", "--name-only", "-z"))
+    for rel in sorted(rels):
+        h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                  + _path_identity(os.path.join(worktree, rel)).encode()
                  + b"\0")
     return h.hexdigest()
 
 
 def _git_facts(worktree: str | None) -> dict | None:
-    """Advisory worktree facts. None on any failure — the preview stays
-    truthful ('no facts') rather than guessing. The discard path re-checks
-    unpushed commits itself and fails CLOSED."""
+    """Worktree facts for the freshness fence. Three outcomes, kept apart on
+    purpose:
+
+    - `None` — there is no repository to observe (no worktree, or no `.git`).
+      Complete evidence: there is no git-managed state here to erase.
+    - a facts dict — the complete observation.
+    - `{"indeterminate": <reason>}` — a repository IS there and its evidence
+      could not be gathered whole. NOT "no facts": execute refuses on it, so
+      an unobservable worktree can never read as a safe one (SC-087).
+    """
     if not worktree:
         return None
     dotgit = os.path.join(worktree, ".git")
     if not (os.path.isdir(dotgit) or os.path.isfile(dotgit)):
         return None
     try:
-        def git(*args) -> str:
-            return subprocess.run(
-                ["git", "-C", worktree, *args], capture_output=True,
-                text=True, timeout=15, check=True).stdout.strip()
-
-        branch = git("rev-parse", "--abbrev-ref", "HEAD")
-        porcelain = subprocess.run(
-            ["git", "-C", worktree, "status", "--porcelain"],
-            capture_output=True, text=True, timeout=15,
-            check=True).stdout.splitlines()
+        head = _head_exists(worktree)
+        branch = _git_out(worktree, "rev-parse", "--abbrev-ref", "HEAD") \
+            if head else _git_out(worktree, "branch", "--show-current")
+        porcelain = _git_out(worktree, "status", "--porcelain").splitlines()
         untracked = sum(1 for ln in porcelain if ln.startswith("??"))
         dirty = len(porcelain) - untracked
-        unpushed = int(git("rev-list", "HEAD", "--not", "--remotes",
-                           "--count") or 0)
-        return {"worktree": worktree, "branch": branch,
+        unpushed = int(_git_out(worktree, "rev-list", "HEAD", "--not",
+                                "--remotes", "--count").strip() or 0) \
+            if head else 0
+        return {"worktree": worktree, "branch": branch.strip(),
                 "dirty_tracked": dirty, "untracked": untracked,
                 "unpushed_commits": unpushed,
                 # WHICH paths changed and WHAT each one now IS — not just how
                 # many: equal-count churn (one file cleaned while another is
                 # dirtied), a rewrite of an already-listed path, a symlink
-                # retarget, and a type transition all move the freshness
-                # fingerprint. Paths and contents stay out of the payload.
-                "change_digest": _change_digest(worktree, porcelain)}
-    except Exception:  # noqa: BLE001 — advisory facts degrade to "none"
-        return None
+                # retarget, a chmod, and a type transition all move the
+                # freshness fingerprint. Paths and contents stay out of the
+                # payload.
+                "change_digest": _change_digest(worktree, porcelain, head)}
+    except (_GitEvidenceUnavailable, ValueError) as exc:
+        return {"indeterminate": str(exc)}
 
 
 def _unpushed_count(worktree: str) -> int:
     """The discard gate — exact and fail-closed: any error is a refusal,
     never an assumption of clean."""
-    out = subprocess.run(
-        ["git", "-C", worktree, "rev-list", "HEAD", "--not", "--remotes",
-         "--count"], capture_output=True, text=True, timeout=15, check=False)
-    if out.returncode != 0:
-        raise RecoveryError(
+    def refuse(detail: str):
+        return RecoveryError(
             409, "worktree_state_unknown",
             f"cannot enumerate unpushed commits in {worktree} — discard "
-            "refused (fail closed)",
-            {"stderr": out.stderr.strip()[-200:]})
-    return int(out.stdout.strip() or 0)
+            "refused (fail closed)", {"stderr": detail[-200:]})
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", worktree, "rev-list", "HEAD", "--not", "--remotes",
+             "--count"], capture_output=True, timeout=15, check=False)
+    except Exception as exc:  # timeout / spawn failure: refuse, never guess
+        raise refuse(f"{type(exc).__name__}: {exc}") from exc
+    if out.returncode != 0:
+        raise refuse(out.stderr.decode("utf-8", "replace").strip())
+    try:
+        return int(out.stdout.decode("utf-8", "replace").strip() or 0)
+    except ValueError as exc:
+        raise refuse("rev-list --count gave a non-numeric answer") from exc
 
 
 def _discard_worktree_files(worktree: str) -> dict:
@@ -599,7 +692,11 @@ def evidence_projection(evidence: dict, classification: str,
         f"{unread} · left unread" if isinstance(unread, int)
         else "unknown · left unread")
 
-    if git:
+    if git and git.get("indeterminate"):
+        worktree_value = (
+            f"state could not be observed completely ({git['indeterminate']})"
+            " · recovery refused until it can be")
+    elif git:
         tracked = git.get("dirty_tracked")
         untracked = git.get("untracked")
         if isinstance(tracked, int) and isinstance(untracked, int):
@@ -638,7 +735,7 @@ def evidence_projection(evidence: dict, classification: str,
 _VOLATILE_PROCESS_KEYS = ("pane_id", "pane_pid", "pane_start_ticks",
                           "pane_present", "pid_state", "pgid")
 _VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "untracked",
-                      "unpushed_commits", "change_digest")
+                      "unpushed_commits", "change_digest", "indeterminate")
 
 
 def _volatile_evidence(evidence: dict) -> dict:
@@ -735,6 +832,22 @@ def _load_observation(con, shell_id: int, observation_id: str,
             409, "recovery_observation_stale",
             "the observation has expired — preview again",
             {"observation_id": observation_id})
+    stored = json.loads(evidence)
+    # Fail closed on incomplete evidence, at EITHER end. A gap is
+    # deterministic — the same unreadable path or undecodable git output
+    # yields the same absent facts at preview and at execute — so it would
+    # fingerprint EQUAL and ride through as "nothing changed" while the work
+    # behind it was rewritten (SC-087). Absence of evidence is never
+    # evidence of safety.
+    for when, ev in (("the preview", stored), ("now", fresh_evidence)):
+        reason = (ev.get("git") or {}).get("indeterminate")
+        if reason:
+            raise RecoveryError(
+                409, "recovery_observation_stale",
+                f"the worktree could not be observed completely at {when} "
+                f"({reason}) — recovery refused before any signal, closure "
+                "or file removal; repair the repository and preview again",
+                {"observation_id": observation_id, "detail": reason})
     if fingerprint != _fingerprint(con, shell_id, fresh_evidence):
         raise RecoveryError(
             409, "recovery_observation_stale",
@@ -742,8 +855,7 @@ def _load_observation(con, shell_id: int, observation_id: str,
             "process/pane identity or worktree contents no longer match what "
             "the preview showed; preview again",
             {"observation_id": observation_id})
-    return classification, json.loads(legal_actions), \
-        json.loads(evidence), acted_at
+    return classification, json.loads(legal_actions), stored, acted_at
 
 
 def _close_durable_state(con, shell_id: int, evidence: dict,

@@ -47,6 +47,7 @@ import json
 import os
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1124,6 +1125,200 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual(err["error"]["code"], "recovery_observation_stale")
         self.assertEqual((Path(wt) / "clean.txt").read_text(), "newly dirty")
         self.assertTrue((Path(wt) / "untracked.txt").exists())
+
+    # -- the digest binds every attribute a discard REWRITES (SC-090) ------
+
+    def mode_of(self, path: Path) -> int:
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+    def test_discard_destroys_permissions(self):
+        # The premise, reproduced rather than argued: `reset --hard` does not
+        # edit a dirty file in place — it recreates it from the index, so the
+        # mode comes back umask-derived and a tightened one is simply gone.
+        # Permissions are work a discard destroys; that is why they are bound.
+        wt = self.make_git_worktree()
+        path = Path(wt) / "tracked.txt"
+        os.chmod(path, 0o640)
+        recovery._discard_worktree_files(wt)
+        self.assertNotEqual(
+            self.mode_of(path), 0o640,
+            "reset --hard left the mode intact — premise of SC-090 changed")
+
+    def test_mode_tightening_after_preview_refuses_discard(self):
+        # SC-090: same bytes, same porcelain, tighter permissions. Git records
+        # only the exec bit, but a discard rewrites ALL of them, so the digest
+        # must move on any of them.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        path = Path(wt) / "tracked.txt"
+        os.chmod(path, 0o640)
+        self.assert_mutation_refuses(wt, lambda: os.chmod(path, 0o600))
+        self.assertEqual(self.mode_of(path), 0o600)
+        self.assertEqual(path.read_text(), "dirty")
+
+    def test_untracked_mode_change_after_preview_refuses_discard(self):
+        # `clean -fd` deletes untracked files outright, so their mode is work
+        # a discard destroys just as completely.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        path = Path(wt) / "untracked.txt"
+        os.chmod(path, 0o644)
+        self.assert_mutation_refuses(wt, lambda: os.chmod(path, 0o600))
+        self.assertEqual(self.mode_of(path), 0o600)
+
+    @unittest.skipUnless(os.geteuid() == 0, "chown requires root")
+    def test_owner_change_after_preview_refuses_discard(self):
+        # Same recreate-from-index step hands the file to whoever runs the
+        # recovery, so ownership is destroyed by a discard too.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        path = Path(wt) / "tracked.txt"
+        self.assert_mutation_refuses(wt, lambda: os.chown(path, 1, 1))
+        self.assertEqual(os.lstat(path).st_uid, 1)
+
+    def test_empty_untracked_dir_after_preview_refuses_discard(self):
+        # `clean -fd` removes untracked DIRECTORIES, and an empty one is named
+        # by neither porcelain (git ignores empty dirs) nor a file listing —
+        # the digest enumerates directories in their own right.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        late = Path(wt) / "late_dir"
+        self.assert_mutation_refuses(wt, late.mkdir)
+        self.assertTrue(late.is_dir())
+
+    # -- incomplete evidence REFUSES, it never degrades (SC-087) -----------
+
+    def assert_gap_refuses(self, wt, patcher=None):
+        """A gap in the evidence must refuse at execute.
+
+        The danger is precisely that a gap is DETERMINISTIC: the same
+        undecodable output or unreadable entry yields the same absent facts at
+        preview and at execute, so it fingerprints EQUAL and rides through as
+        'nothing changed'. Both the preview and the execute run under the
+        patch here for exactly that reason.
+        """
+        with patcher or contextlib.nullcontext():
+            obj = self.preview(1)
+            self.assertIn("indeterminate", obj["evidence"]["git"])
+            rows = {r["key"]: r["value"] for r in obj["evidence_projection"]}
+            self.assertIn("could not be observed completely", rows["worktree"])
+            with mock.patch.object(recovery,
+                                   "_discard_worktree_files") as disc, \
+                    mock.patch.object(recovery,
+                                      "terminate_process_group") as term:
+                status, err = self.post(obj, preserve_worktree=False,
+                                        discard_worktree=True,
+                                        confirm_shortname="s1")
+                # Fail closed for the WHOLE execute, not just the discard: a
+                # closure the operator decided on unobservable evidence is the
+                # same defect one blast radius smaller. (Fresh idempotency
+                # key — a different body under the old one is a conflict.)
+                plain_status, plain_err = self.call(
+                    "POST", "/api/interface/shells/1/recovery",
+                    (OP, "Idempotency-Key: k-2"),
+                    {"observation_id": obj["observation_id"],
+                     "mode": "recover"})
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual(plain_status, 409, plain_err)
+        self.assertEqual(plain_err["error"]["code"],
+                         "recovery_observation_stale")
+        disc.assert_not_called()   # no reset, no clean
+        term.assert_not_called()   # no signal
+        self.assert_nothing_discarded(wt)
+
+    def test_non_utf8_path_is_observed_not_degraded(self):
+        # A valid non-UTF-8 filename is worktree STATE, not a failure. Reading
+        # git's NUL-delimited output as strict text raised on it and collapsed
+        # the whole observation to 'no facts' — which then compared equal at
+        # execute and let a discard run over post-preview work (SC-087).
+        wt = self.make_git_worktree()
+        (Path(wt) / os.fsdecode(b"caf\xe9.txt")).write_bytes(b"latin-1 name")
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        self.assertNotIn("indeterminate", obj["evidence"]["git"])
+        self.assertEqual(obj["evidence"]["git"]["untracked"], 2)
+        # ...and the fence still fences: unrelated tracked work written after
+        # the preview refuses the confirmed discard.
+        (Path(wt) / "clean.txt").write_text("work written after the preview")
+        status, err = self.post(obj, preserve_worktree=False,
+                                discard_worktree=True, confirm_shortname="s1")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual((Path(wt) / "clean.txt").read_text(),
+                         "work written after the preview")
+        self.assert_nothing_discarded(wt)
+
+    def test_git_command_failure_refuses(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        real = recovery._git_out
+
+        def failing(worktree, *args, **kwargs):
+            if args[0] == "status":
+                raise recovery._GitEvidenceUnavailable("git status: exit 128")
+            return real(worktree, *args, **kwargs)
+
+        self.assert_gap_refuses(
+            wt, mock.patch.object(recovery, "_git_out", failing))
+
+    def test_git_timeout_refuses(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        real = recovery.subprocess.run
+
+        def timing_out(cmd, *args, **kwargs):
+            if cmd[0] == "git" and "ls-files" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 30)
+            return real(cmd, *args, **kwargs)
+
+        self.assert_gap_refuses(
+            wt, mock.patch.object(recovery.subprocess, "run", timing_out))
+
+    def test_unreadable_entry_refuses(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        real = os.lstat
+
+        def denied(path, *args, **kwargs):
+            if str(path).endswith("untracked.txt"):
+                raise PermissionError(13, "permission denied")
+            return real(path, *args, **kwargs)
+
+        self.assert_gap_refuses(
+            wt, mock.patch.object(recovery.os, "lstat", denied))
+
+    def test_corrupt_repository_refuses(self):
+        # No patching at all: a repository whose HEAD does not resolve. Every
+        # observation the fence depends on is unavailable, so recovery refuses
+        # instead of reading the gap as an unchanged worktree.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        (Path(wt) / ".git" / "HEAD").write_text("not-a-ref\n")
+        self.assert_gap_refuses(wt)
+
+    def test_unborn_head_is_complete_evidence_not_a_gap(self):
+        # A repo with no commits is fully observable — nothing to diff
+        # against, nothing that can be unpushed. It must NOT be refused as an
+        # evidence gap, and its untracked side is still fenced.
+        wt = Path(self.tmp.name) / "unborn"
+        wt.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "feat/x", str(wt)],
+                       check=True, capture_output=True)
+        (wt / "untracked.txt").write_text("new")
+        (wt / "tracked.txt").write_text("dirty")
+        self.session_with_worktree(str(wt))
+        obj = self.preview(1)
+        self.assertNotIn("indeterminate", obj["evidence"]["git"])
+        self.assertEqual(obj["evidence"]["git"]["unpushed_commits"], 0)
+        self.assertEqual(obj["evidence"]["git"]["branch"], "feat/x")
+        (wt / "late.txt").write_text("written after the preview")
+        status, err = self.post(obj, preserve_worktree=False,
+                                discard_worktree=True, confirm_shortname="s1")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual((wt / "late.txt").read_text(),
+                         "written after the preview")
 
     def test_discard_git_failure_reports_exactly_what_completed(self):
         # clean fails AFTER reset succeeded and the closure committed: the
