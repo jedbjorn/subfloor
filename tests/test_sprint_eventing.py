@@ -150,11 +150,22 @@ class SchemaTest(unittest.TestCase):
         con.executescript(reseed)
         twice = con.execute(
             "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
+
+        # 0086 is idempotent on its own: applying it twice is applying it once.
+        self.assertEqual(twice, once)
+        # Its scope fix survives every LATER reseed. Asserting `once == asset`
+        # would pin 0086 as the last word on this skill and silently forbid any
+        # subsequent reseed, so replay the rest of the chain and require the
+        # chain — not one migration — to converge on the asset.
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name > "0086_reseed_sprint_watch_scope.sql":
+                con.executescript(migration.read_text())
+        final = con.execute(
+            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
         asset = (ENGINE / "assets" / "skills" / "sprint" /
                  "SKILL.md").read_text().split("---", 2)[2].strip()
-
-        self.assertEqual(once, asset)
-        self.assertEqual(twice, once)
+        self.assertEqual(final, asset)
+        self.assertIn("--sprint <doc-id>", final)
 
     def test_sprint_orchestration_requires_plan_billing_by_default(self):
         body = self.con.execute(

@@ -89,6 +89,26 @@ row and is worked like a review finding. Repeat your open calls in the
 review request (step 6) so the reviewer gates against your reading, not
 its own guess.
 
+**A premise that looks WRONG is reported BEFORE you build it, not at merge.**
+A spec, board or ruling can rest on a factual claim about the code that simply
+isn't true. Test it, then say so — do not silently cut the deliverable, and do
+not silently ship against a premise you believe false. Both outcomes are
+recoverable when the planner hears it early; neither is after merge. One dev
+proved a board deliverable could not reach the operator at all and reported it
+pre-build, so an invisible feature was replaced rather than shipped. Another
+re-verified a planner ruling against the parser source before complying with it
+and confirmed it at a level the planner had not checked.
+
+Comply after checking, not instead of checking. A planner instruction phrased as
+a bare directive can be wrong about the world — including destructively so, if it
+names a record by an identifier that resolves to a different row.
+
+**Resolve a record's identifier before you mutate it.** Display names and row ids
+live in different counters that can overlap in range, so "close SC-144" may
+resolve to a row that is not SC-144. Look the row up and read it before writing.
+If it is already resolved by another shell, leave it — re-closing overwrites that
+shell's verification notes with yours.
+
 ## Local long work — suites, benches, builds
 
 A harness background task is session-scoped: in a headless boot it dies
@@ -156,6 +176,9 @@ kickoff said "start now", or a planner `task` row says so):
   --base main` if the PR exists, otherwise note your base is gone — same
   discipline as the `git` skill's stacked-merge procedure;
 - `git fetch origin && git rebase origin/main` on your feature branch;
+- drain your inbox once more immediately before pushing — a ruling issued while
+  you were building will not have interrupted you, and pushing an approach that
+  was already overruled costs a cycle;
 - push, open your PR — then, in the SAME step:
 
 ```
@@ -198,7 +221,33 @@ not gates. Disagree with a severity call -> planner rules; don't litigate
 in the thread while the chain waits.
 
 **7. Merge on green + clean, file your unit report, hand off.** All
-checks green + reviewer declared review-clean + boundary above satisfied:
+checks green + reviewer declared review-clean + boundary above satisfied.
+
+**If `main` moved since your review, rebase first — and your verdict may not
+carry.** Your reviewer's verdict is bound to the exact SHA it judged. After
+rebasing onto current `main`, confirm checks green on the REBASED head and
+report that SHA. Then report, per file:
+
+- whether your **own contribution is diff-identical** — compare
+  `diff(old-base..old-head)` against `diff(new-base..new-head)` over your `+/-`
+  lines, normalised for `index`/`@@` noise. Resolve the bases with
+  `git merge-base` rather than assuming a SHA that looks current; a
+  non-ancestor base silently folds the other branch's content into your diff
+  and inflates it;
+- which reviewed files moved, and **whose content moved them**;
+- **disjointness as YOUR READ, not a proof** — say so plainly.
+
+Diff-identical + disjoint -> the verdict carries; say so with the evidence.
+Otherwise it does NOT carry: the reviewer re-confirms, narrowed to the
+interference question. File-level byte-identity is not the bar — two units can
+touch one file for unrelated reasons and leave every contribution line intact.
+
+If you **hand-resolve** any hunk: name the line and your reasoning, and do NOT
+re-run the mutation round trips yourself. A hand-resolved hunk is exactly what
+can silently unpin a test, so that check belongs to the reviewer — handing over
+your own answer to the question you are asking it defeats the point.
+
+Then:
 
 ```
 gh pr merge <your-pr> --squash --delete-branch
@@ -250,21 +299,36 @@ scope); this overlay changes only pace and severity:
    is next-in-queue work; a waiting review stalls the chain exactly like
    red CI. Keep a `SPRINT doc=<id> reviewing=<seq,seq,…>` line in
    `current_state`. No trackers, no scheduled polls.
-2. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
+2. **Check the head is worth reviewing, BEFORE you spend the pass.** Confirm
+   the PR head is the exact SHA you were asked for, that it has not been
+   superseded, and that current `main` is an ancestor of it
+   (`git merge-base --is-ancestor <main> <head>`). Refuse an unrequested,
+   force-pushed-away, or non-CI head and say so in a `result` row instead of
+   reviewing it anyway — a verdict on a doomed SHA is a wasted cycle, and green
+   checks on a stale base prove nothing about what will merge. Two holds on this
+   basis in one sprint each saved a full pass.
+3. **Run the mutation yourself.** When a unit's value rests on one property — an
+   ordering, a currency claim, a fail-closed gate — break it in the source,
+   watch the test go red, revert, watch it pass. A reported round trip is not a
+   verified one. One sprint found FIVE tests that could not fail, every one on
+   fully green CI, every one caught this way and none by CI. Ask it per
+   PROPERTY, not per test: a test can genuinely constrain the property it names
+   while leaving an adjacent one it appears to cover entirely free.
+4. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
    security / spec-violation (Major) or will-bite-soon (Medium) -> the dev
    fixes now; re-review on the fix push. Style / naming / nice-to-have
    refactors (Low) -> one summary note to the planner for the sprint
    report; Low never blocks merge and you don't re-litigate it.
-3. **Handoffs go direct** — scoped relaxation, same shape as the merge
+5. **Handoffs go direct** — scoped relaxation, same shape as the merge
    authority. The base `review` skill gates handoffs behind the FnB;
    inside an ACTIVE sprint, for your assigned units only: message the
    author dev your findings directly + copy the planner one line
    (`unit <seq>: N major, M medium — with <dev>` or `unit <seq>:
    review-clean`), --kind result. The FnB gate is unchanged everywhere
    else and returns the moment the doc freezes.
-4. **Clean is a declaration.** Say `review-clean` explicitly to dev +
+6. **Clean is a declaration.** Say `review-clean` explicitly to dev +
    planner — it is what unlocks the dev's merge; never leave it implied.
-5. **Stand down** on close-out: drop your SPRINT line, confirm to the
+7. **Stand down** on close-out: drop your SPRINT line, confirm to the
    planner in a final `result` row.
 
 ## Conformance slot

@@ -32,8 +32,28 @@ manage, you never load code. The full trail replays with
 
 Decompose the push into units a single shell can own end-to-end. Map
 dependency order stingily: a dependency edge = a real code dependency, not
-a preference. Units that don't touch each other run in parallel; keep
-chains short and the graph wide where the code allows.
+a preference. Keep chains short and the graph wide where the code allows.
+
+**Then check MERGE SURFACE, which is a different question from dependency.**
+Predict each unit's file set and compute the pairwise intersection. Logical
+independence does NOT imply merge independence: units that need none of each
+other's code still collide if they edit the same files, and that collision
+lands at merge time, after every review is done.
+
+- Empty intersection → genuinely parallel; say so.
+- Non-empty → either sequence them, or declare them parallel **with the merge
+  protocol and the overlap map attached at kickoff** so reviewers know from the
+  start that their verdicts are SHA-bound.
+- A file touched by **three or more** units → reconsider the cut, don't just
+  manage the merges.
+
+Record overlap in the board's `depends on` column. A bare dash means only "no
+logical dependency" and is read as "independent" — which is how one sprint
+declared five units independent while 21 of their 30 file-touches landed on
+nine shared files, three of them touched by three units apiece. The cost was a
+merge protocol invented mid-flight, four rebases, two voided verdicts and a
+hand-resolved conflict. Surfaces that concentrate a lot of behaviour into a few
+large files make this the normal case, not the exception.
 
 Assign each unit a dev shell + a reviewer shell (one reviewer may gate
 several units — don't let one reviewer become the whole sprint's
@@ -157,6 +177,10 @@ models: devs=<harness>/<model> · reviewers=<harness>/<model>
 | seq | unit | shell | reviewer | depends on | branch | pr | status |
 ```
 
+`depends on` carries BOTH facts: the logical dependency and any file overlap
+(`— · shares app.js with 3`). A dash alone asserts independence you may not
+have checked.
+
 Unit `status` walks `waiting → building → pr-open → in-review → fixing →
 merged`; `fixing` loops back to `in-review` until clean; `ci-red` can
 interleave anywhere from `pr-open` on.
@@ -167,6 +191,14 @@ it at close-out.
 
 You are the doc's only writer: devs report transitions as `result` rows;
 fold them into the board with `sc mem doc edit <id> --body-file`.
+
+**Verify every board edit.** A scripted edit whose pattern has drifted silently
+matches nothing and reports success. Assert the target text exists before
+replacing, then read the doc back and confirm the fields actually changed. One
+sprint reported unit statuses to the FnB for four turns off a board where three
+edits had no-op'd — a merged unit still read `building` and a whole row was
+missing — until a REVIEWER noticed the board contradicted the SHA in its own task
+row. You cannot report from memory and call it the board.
 
 ## Step 2: Arm the watcher, kick off
 
@@ -254,12 +286,32 @@ fold every state change in as it happens. The board + message table ARE
 the sprint's state: a rebooted planner replays the rows and loses
 nothing.
 
-Messages are your steering wheel: every dev checks its inbox at each
-step start, and a headless boot drains it first thing — your `task` row
-is read before that dev's next move. Steer with `task` rows — holds,
+Messages are your steering wheel: a headless boot drains the inbox first
+thing, and a dev checks it at each step start. Steer with `task` rows — holds,
 re-sequencing, nudges, rulings on reported reds. The board records state;
 messages change behavior; on conflict your latest message wins -> then
 update the board to match.
+
+**A message to a LIVE worker probably will not land before its next push.** A
+long build has few step starts, so a ruling issued mid-build routinely arrives
+after the work it was meant to change. Staleness runs BOTH ways: the worker is
+also reporting against a snapshot of you that has moved, so it may tell you that
+you don't know something you ruled on half an hour ago.
+
+Phrase instructions to live workers **idempotently** — "if you have not already
+X, do X" — and state the **observed facts** they rest on ("main is at X", "the
+intersection is empty"), not only the conclusion. A crossed message is then a
+no-op or a confirmation rather than an order against reality, and a worker whose
+state has moved can re-derive the right action. Three crossed messages in one
+sprint cost nothing worse than a CI cycle for exactly that reason — the devs
+reasoned from the facts. A fourth, phrased as a bare directive, would have
+destroyed a record had it been obeyed literally.
+
+**Never delegate a mutation by an identifier the tool does not take.** Give the
+tool's identifier and the human label together — "close flag_id 141 (SC-144)" —
+and prefer mutating your own records yourself. Display names and row ids sit in
+different counters that can overlap in range, so a name-only instruction can
+resolve to a different real row and destroy it while reporting success.
 
 Dev ambiguity reports (`ambiguity: … → chose …`) get a ruling on
 receipt: overrule by `task` row while the unit is still un-merged, or
@@ -335,6 +387,34 @@ durable state, and the events still wake you.
   untouched. Verify with `./sc sprint status --all`: every binding of
   the sprint shows released.
 
+## Merge protocol — declare it at kickoff, not at the first collision
+
+Needed whenever any two units share a file. Declare it in the kickoff `task`
+rows so reviewers know their verdicts are SHA-bound before they spend a pass.
+
+1. Before merging: rebase onto current `origin/main`, confirm checks green on
+   the **rebased** head, report that SHA.
+2. After any unit merges: every remaining unit re-rebases and re-confirms.
+3. Merge order is review-clean order unless you state otherwise.
+
+**A reviewer verdict is bound to the exact SHA it was given.** The carry-over
+rule: a verdict carries when the unit's **own contribution is diff-identical**
+and its hunks are **disjoint** from the incoming content — NOT when the reviewed
+files are byte-identical. File-identity conflates "did my reviewed change
+survive?" (answered exactly by diff-identity) with "did anything else touch this
+file?" (irrelevant), and demanding it forces a full re-review every time two
+units touch one file for unrelated reasons.
+
+When either condition fails, re-confirmation is required — because disjointness
+is a semantic claim, not a proof — but it is **narrowed to the interference
+question**, and the dev supplies the evidence that scopes it. A dev that
+hand-resolves a hunk names the line and leaves the mutation round trips to the
+reviewer: a hand-resolved hunk is precisely what can silently unpin a test.
+
+Never let a unit merge on a verdict attached to a superseded SHA. Two sprints
+have lost cycles to it; in the second, reviewers caught it twice and the planner
+missed it both times.
+
 ## Step 4: Unblock
 
 Stalls and the moves:
@@ -407,6 +487,17 @@ When every unit is `merged` and `main` is green:
    diffs, never the trail — and files four-way verdicts (`as-specced` /
    `deviated-intentionally` / `deviated-silently` / `unimplemented`) as
    a `CONFORMANCE: <title>` doc + a one-line `result` pointer.
+
+   **Declare the SCOPE before you boot the pass, and name which units it does
+   NOT cover.** A pass judges a spec, so it certifies only the units built to
+   that spec. Decision-driven units — no spec doc, built from a decision or a
+   flag — cannot be judged by it, and a verdict that appears to bless them is a
+   false certification. Their bar is their unit reports, their reviewer verdicts
+   at exact heads, and the mutation round trips. Put the split in the report's
+   Verdict so freezing cannot be read as certifying everything. Assign the pass
+   to a reviewer that did NOT review the unit being certified, and hand over any
+   DECLARED deviation up front so the pass judges whether the declaration is
+   honest rather than discovering it as a gap.
 
    **Rule on the findings** — they route like any sprint event:
    - **Major** -> insert a fix unit at the front of the chain under
