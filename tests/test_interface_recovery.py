@@ -1014,10 +1014,17 @@ class WorktreeTest(RecoveryCase):
         through a link, or ignores type, cannot tell the states apart.
         Pre-dirtied: `tlink` (tracked symlink, retargeted a->b), `ulink`
         (untracked symlink -> b), `ufile.txt` (untracked regular file)."""
-        origin = Path(self.tmp.name) / "origin.git"
+        nth = len(list(Path(self.tmp.name).glob("wt-*")))
+        wt = Path(self.tmp.name) / f"wt-{nth}"
+        # Each worktree gets its OWN bare origin. A shared one made the second
+        # worktree in a test push an unrelated history to the same `feat/x`,
+        # rejected as non-fast-forward — EXCEPT while both `base` commits
+        # landed in the same clock second, where identical trees, messages and
+        # timestamps hash to the identical SHA and the push is a silent no-op.
+        # So it passed on a fast machine and went red in CI on a slow one.
+        origin = Path(self.tmp.name) / f"origin-{nth}.git"
         subprocess.run(["git", "init", "-q", "--bare", str(origin)],
                        check=True, capture_output=True)
-        wt = Path(self.tmp.name) / f"wt-{len(list(Path(self.tmp.name).glob('wt-*')))}"
         wt.mkdir()
 
         def git(*args):
