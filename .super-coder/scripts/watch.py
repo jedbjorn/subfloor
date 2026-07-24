@@ -6,12 +6,12 @@ Spec: specs_sc/sprint-eventing.md + spec #20 (polling cutover). Three verbs,
 one vantage — everything shell-side rides the engine API (token identity,
 the `sc mem` doctrine):
 
-    ./sc watch pr <owner/repo> <n> [--shell <shortname>] [--sprint <doc-id>]
+    ./sc watch pr <owner/repo> <n> [--shell <shortname>] --sprint <doc-id>
                                                            register a watch
                                                            (defaults to the
                                                            calling shell;
-                                                           --sprint arms it
-                                                           to an ACTIVE sprint)
+                                                           scope is required
+                                                           and must be ACTIVE)
     ./sc watch list [--all]                                live watches
     ./sc watch inbox [--interval 30] [--timeout 21600]     block until this
                                                            shell has unread
@@ -146,8 +146,7 @@ def cmd_pr(args) -> int:
     payload: dict = {"repo": repo, "pr_number": args.number}
     if args.shell:
         payload["shell"] = args.shell
-    if args.sprint:
-        payload["sprint_doc_id"] = args.sprint
+    payload["sprint_doc_id"] = args.sprint
     r = _api("POST", "/_sc/watches", payload)
     who = args.shell or "you"
     if r.get("existing"):
@@ -170,7 +169,8 @@ def cmd_reconcile(args) -> int:
     r = _api("POST", "/_sc/watches/reconcile")
     print(f"watch: reconcile — {r.get('watches', 0)} armed watch(es), "
           f"{r.get('repos', 0)} repo(s) polled, {r.get('events', 0)} event(s), "
-          f"{r.get('errors', 0)} error(s), {r.get('skipped_backoff', 0)} in backoff")
+          f"{r.get('errors', 0)} error(s), {r.get('skipped_backoff', 0)} in backoff, "
+          f"{r.get('unscoped_alerts', 0)} unscoped alert(s)")
     return 0
 
 
@@ -273,8 +273,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("repo", help="owner/name")
     sp.add_argument("number", type=int, help="PR number")
     sp.add_argument("--shell", help="subscribe another shell (e.g. the planner) instead of you")
-    sp.add_argument("--sprint", type=int, default=0, metavar="DOC_ID",
-                    help="arm the watch to an ACTIVE sprint document (polls only while it stays ACTIVE)")
+    sp.add_argument("--sprint", type=int, required=True, metavar="DOC_ID",
+                    help="required ACTIVE sprint document scope")
     sp.set_defaults(fn=cmd_pr)
 
     sp = sub.add_parser("list", help="live watches (--all includes retired)")

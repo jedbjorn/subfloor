@@ -220,6 +220,22 @@ class PollCycleTest(unittest.TestCase):
                 "r1": {"pullRequest": gh_node(checks="PENDING")}})
         pr_poller.poll_cycle(self.con, fetch)
 
+    def test_unscoped_watch_raises_one_deduped_alert_without_being_fetched(self):
+        pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="PENDING"), gh_node(checks="PENDING")))
+        pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="PENDING"), gh_node(checks="PENDING")))
+
+        alerts = self.con.execute(
+            "SELECT watch_id, severity, reason, resolved_at "
+            "FROM planner_alerts WHERE reason='pr_watch_unscoped'").fetchall()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["watch_id"], 4)
+        self.assertEqual(alerts[0]["severity"], "critical")
+        self.assertIsNone(alerts[0]["resolved_at"])
+
     def test_transition_fans_out_scoped_and_idempotent(self):
         pr_poller.poll_cycle(self.con, fetch_ok(
             gh_node(checks="PENDING"), gh_node(checks="PENDING")))
@@ -288,6 +304,43 @@ class PollCycleTest(unittest.TestCase):
         live = {r["pr_number"] for r in self.con.execute(
             "SELECT pr_number FROM watched_prs WHERE closed_at IS NULL")}
         self.assertEqual(live, {1, 3})               # now retired
+
+    def test_scoped_merge_emits_pr_event_queues_wake_and_retires(self):
+        self.con.executescript(
+            "INSERT INTO interface_generations (shell_id, generation) VALUES (1, 1);"
+            "INSERT INTO interface_sessions "
+            "(shell_id, generation, occupancy, lifecycle) "
+            "VALUES (1, 1, 'occupied', 'idle');"
+            "INSERT INTO sprint_planner_bindings "
+            "(sprint_doc_id, planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (100, 1, 1, 1, 1);"
+            "UPDATE watched_prs SET last_seen="
+            "'{\"state\":\"OPEN\",\"sha\":\"abc1234def\",\"checks\":\"PENDING\","
+            "\"reviews\":0,\"review_state\":null}' "
+            "WHERE repo='o/r' AND pr_number=2 AND shell_id=1;")
+        self.con.commit()
+
+        n = pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="PENDING"),
+                     gh_node(state="MERGED", checks="SUCCESS")))
+
+        self.assertEqual(n["events"], 2)
+        self.assertEqual(n["retired"], 1)
+        merge = self.con.execute(
+            "SELECT message_id, kind, body, sprint_doc_id FROM shell_messages "
+            "WHERE body LIKE '%merged%'").fetchone()
+        self.assertEqual(merge["kind"], "pr_event")
+        self.assertEqual(merge["sprint_doc_id"], 100)
+        self.assertIn("watch retired", merge["body"])
+        item = self.con.execute(
+            "SELECT binding_id, state FROM planner_wake_items "
+            "WHERE message_id=?", (merge["message_id"],)).fetchone()
+        self.assertEqual((item["binding_id"], item["state"]), (1, "queued"))
+        row = self.con.execute(
+            "SELECT closed_at FROM watched_prs "
+            "WHERE repo='o/r' AND pr_number=2 AND shell_id=1").fetchone()
+        self.assertIsNotNone(row["closed_at"])
 
     def test_failed_fetch_audits_backs_off_then_marks_blind_window(self):
         state = pr_poller.PollerState()
@@ -481,6 +534,32 @@ class CutoverTest(unittest.TestCase):
             run = con.execute("SELECT source, status FROM pr_poll_runs").fetchone()
             self.assertEqual(run["source"], "startup")
             self.assertEqual(run["status"], "ok")
+        finally:
+            con.close()
+
+    def test_scheduler_surfaces_unscoped_watch_without_fetching_it(self):
+        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
+        con = build_db(tmp)
+        seed_shells(con)
+        con.execute(
+            "INSERT INTO watched_prs (repo, pr_number, shell_id) "
+            "VALUES ('o/r', 1, 1)")
+        con.commit()
+        con.close()
+        poller = pr_poller.Poller(
+            tmp, interval=30,
+            fetch=lambda q: self.fail("unscoped watch must not be fetched"))
+        poller.start()
+        time.sleep(0.5)
+        poller.stop()
+        poller.join(timeout=5)
+        con = sqlite3.connect(tmp)
+        try:
+            row = con.execute(
+                "SELECT severity, reason, resolved_at FROM planner_alerts "
+                "WHERE watch_id=1").fetchone()
+            self.assertEqual(row[:2], ("critical", "pr_watch_unscoped"))
+            self.assertIsNone(row[2])
         finally:
             con.close()
 
