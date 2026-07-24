@@ -623,11 +623,19 @@ class AppShellCspTest(unittest.TestCase):
             part.split()[1:] for part in
             headers["Content-Security-Policy"].split(";")
             if part.split() and part.split()[0] == "connect-src")
+        # Membership, not a scheme-source check: rejecting `ws:` alone let an
+        # explicit hostile origin through the served header while the sibling
+        # exact-string test correctly failed the same widening (REV2 Low).
+        allowed = {f"{scheme}://{host}:{self.port}"
+                   for scheme in ("ws", "wss")
+                   for host in routes._ALLOWED_HOSTS}
         for src in connect:
             with self.subTest(source=src):
-                self.assertFalse(
-                    src.endswith(":") and "//" not in src,
-                    f"{src!r} is a CSP scheme-source and matches any host")
+                self.assertTrue(
+                    src == "'self'" or src in allowed,
+                    f"{src!r} authorises a socket host this server does not "
+                    f"serve — a scheme-source matches any host, and so does "
+                    f"a named foreign origin")
         # ...and the stream the UI actually opens is still authorised.
         self.assertIn(f"ws://127.0.0.1:{self.port}", connect)
 
