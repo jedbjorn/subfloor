@@ -414,6 +414,125 @@ def classify(evidence: dict) -> tuple[str, list[str]]:
     return "available", []
 
 
+def evidence_projection(evidence: dict, classification: str,
+                        legal_actions: list[str]) -> list[dict[str, str]]:
+    """Canonical client-visible recovery evidence.
+
+    Browser and CLI render these exact rows.  Keeping the field selection and
+    absence wording here prevents either client from presenting a safer-looking
+    subset than the other for the same observation.
+    """
+    shell = evidence.get("shell") or {}
+    session = evidence.get("session")
+    generation = evidence.get("generation")
+    archive = evidence.get("archive")
+    binding = evidence.get("sprint_binding")
+    process = evidence.get("process") or {}
+    tmux = evidence.get("tmux")
+    git = evidence.get("git")
+
+    shortname = shell.get("shortname") or "unknown"
+    shell_id = shell.get("shell_id")
+    shell_value = f"{shortname} · id {shell_id if shell_id is not None else '—'}"
+
+    if session:
+        session_value = (
+            f"session #{session.get('session_id', '—')} · generation "
+            f"{session.get('generation', '—')} · "
+            f"{session.get('occupancy', '—')}/{session.get('lifecycle', '—')}"
+            f" · harness {session.get('harness') or '—'}")
+    else:
+        session_value = "no Interface session"
+
+    if generation:
+        ended = generation.get("ended_at")
+        generation_value = (
+            f"generation {generation.get('generation', '—')} · "
+            f"{'open' if ended is None else f'ended {ended}'} · "
+            f"last hook {generation.get('last_hook_seq', '—')}")
+    else:
+        generation_value = "no generation record"
+
+    if archive:
+        ended = archive.get("ended_at")
+        archive_value = (
+            f"archive #{archive.get('archive_id', '—')} · "
+            f"{'open' if ended is None else f'closed {ended}'}"
+            f"{' · active' if archive.get('active') else ''}")
+    else:
+        archive_value = "no archive relation"
+
+    if binding:
+        binding_value = (
+            f"binding #{binding.get('binding_id', '—')} · sprint doc "
+            f"#{binding.get('sprint_doc_id', '—')}")
+    else:
+        binding_value = "no armed sprint binding"
+
+    if process.get("pane_pid") is None or \
+            process.get("pane_start_ticks") is None:
+        process_value = "no recorded process identity"
+    else:
+        presence = process.get("pane_present")
+        presence_value = "presence unknown" if presence is None else \
+            ("present" if presence else "gone")
+        process_value = (
+            f"PID {process['pane_pid']} · start ticks "
+            f"{process['pane_start_ticks']} · PGID "
+            f"{process.get('pgid') if process.get('pgid') is not None else '—'}"
+            f" · {process.get('pid_state') or 'unknown'} · pane "
+            f"{process.get('pane_id') or '—'} ({presence_value})")
+
+    if tmux:
+        tmux_value = (
+            f"socket {tmux.get('socket') or '—'} · "
+            f"session {tmux.get('session') or '—'} · "
+            f"window {tmux.get('window') or '—'} · "
+            f"pane {tmux.get('pane_id') or '—'}")
+    else:
+        tmux_value = "no tmux relation"
+
+    unread = evidence.get("unread_messages")
+    unread_value = (
+        f"{unread} · left unread" if isinstance(unread, int)
+        else "unknown · left unread")
+
+    if git:
+        tracked = git.get("dirty_tracked")
+        untracked = git.get("untracked")
+        if isinstance(tracked, int) and isinstance(untracked, int):
+            cleanliness = "clean" if tracked == 0 and untracked == 0 \
+                else "not clean"
+            worktree_value = (
+                f"{cleanliness} · {tracked} tracked · {untracked} untracked · "
+                f"{git.get('unpushed_commits', '—')} unpushed commit(s) · "
+                f"branch {git.get('branch') or '—'} · "
+                f"{git.get('worktree') or 'worktree path unavailable'}")
+        else:
+            worktree_value = (
+                f"unknown cleanliness · branch {git.get('branch') or '—'} · "
+                f"{git.get('worktree') or 'worktree path unavailable'}")
+    else:
+        worktree_value = "worktree facts unavailable"
+
+    values = (
+        ("shell", "shell", shell_value),
+        ("classification", "classification", classification),
+        ("legal_actions", "legal actions",
+         ", ".join(legal_actions) if legal_actions else "none"),
+        ("session", "session", session_value),
+        ("generation", "generation", generation_value),
+        ("archive", "archive", archive_value),
+        ("sprint_binding", "sprint binding", binding_value),
+        ("process", "process", process_value),
+        ("tmux", "tmux", tmux_value),
+        ("unread_messages", "unread messages", unread_value),
+        ("worktree", "worktree", worktree_value),
+    )
+    return [{"key": key, "label": label, "value": value}
+            for key, label, value in values]
+
+
 def _fingerprint(con, shell_id: int) -> str:
     """sha256 over the durable state an observation depends on. Any change —
     closure, a new generation, a binding release, an archive hand-off —
@@ -463,7 +582,9 @@ def preview(con, shell_id: int, default_worktree: str | None) -> dict:
             "expires_in_s": OBSERVATION_TTL_S,
             "classification": classification,
             "legal_actions": legal_actions,
-            "evidence": evidence}
+            "evidence": evidence,
+            "evidence_projection": evidence_projection(
+                evidence, classification, legal_actions)}
 
 
 # ------------------------------------------------------------------ execute

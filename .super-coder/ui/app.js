@@ -2293,71 +2293,31 @@ async function ifStartingPane(pane, sel, root) {
   card.append(cancel, note);
 }
 
-// Recovery evidence is descriptive only. The browser may display it, but the
-// server's legal_actions list is the sole authority for Recover / Force
-// recover. Keeping request construction in one helper also makes discard an
-// explicit escalation rather than an accidental option on ordinary recovery.
+// Recovery evidence is descriptive only. Browser and CLI render the API's one
+// canonical evidence_projection; neither client independently chooses a safer-
+// looking subset. legal_actions remains the sole authority for Recover / Force.
+function ifRecoveryEvidenceRows(preview) {
+  const rows = preview.evidence_projection;
+  if (!Array.isArray(rows) || !rows.length) return [];
+  if (rows.some((row) => !row || typeof row.key !== "string" ||
+      typeof row.label !== "string" || typeof row.value !== "string"))
+    return [];
+  return rows.map((row) => ({
+    key: row.key, label: row.label, value: row.value,
+  }));
+}
+
 function ifRecoveryContext(sel, preview) {
   const evidence = preview.evidence || {};
   const shell = evidence.shell || {};
-  const session = evidence.session || {};
-  const generation = evidence.generation;
-  const archive = evidence.archive;
-  const sprintBinding = evidence.sprint_binding;
-  const process = evidence.process || {};
-  const tmux = evidence.tmux;
-  const git = evidence.git;
+  const rows = new Map(ifRecoveryEvidenceRows(preview)
+    .map((row) => [row.key, row.value]));
   const shellName = shell.shortname || sel.shortname || String(sel.shell_id);
-  const sessionName = session.session_id == null
-    ? "no Interface session"
-    : `session #${session.session_id} · generation ${session.generation ?? "—"} · ` +
-      `${session.occupancy ?? "—"}/${session.lifecycle ?? "—"}`;
-  const generationName = !generation
-    ? "no generation record"
-    : `generation ${generation.generation ?? "—"} · ` +
-      (generation.ended_at == null ? "open" : `ended ${generation.ended_at}`) +
-      ` · last hook ${generation.last_hook_seq ?? "—"}`;
-  const archiveName = !archive
-    ? "no archive relation"
-    : `archive #${archive.archive_id} · ` +
-      (archive.ended_at == null ? "open" : `closed ${archive.ended_at}`) +
-      (archive.active ? " · active" : "");
-  const sprintBindingName = !sprintBinding
-    ? "no armed sprint binding"
-    : `binding #${sprintBinding.binding_id} · sprint doc ` +
-      `#${sprintBinding.sprint_doc_id}`;
-  const processName = process.pane_pid == null || process.pane_start_ticks == null
-    ? "no recorded process identity"
-    : `PID ${process.pane_pid} · start ticks ${process.pane_start_ticks} · ` +
-      `PGID ${process.pgid ?? "—"} · ${process.pid_state ?? "unknown"} · ` +
-      `pane ${process.pane_id ?? "—"} ` +
-      (process.pane_present == null
-        ? "(presence unknown)"
-        : process.pane_present ? "(present)" : "(gone)");
-  const tmuxName = !tmux
-    ? "no tmux relation"
-    : `socket ${tmux.socket ?? "—"} · session ${tmux.session ?? "—"} · ` +
-      `window ${tmux.window ?? "—"} · pane ${tmux.pane_id ?? "—"}`;
-  const unreadMessagesName = Number.isInteger(evidence.unread_messages)
-    ? `${evidence.unread_messages} · left unread`
-    : "unknown · left unread";
-  let worktreeName = "unknown";
-  if (git) {
-    const tracked = Number.isInteger(git.dirty_tracked) ? git.dirty_tracked : null;
-    const untracked = Number.isInteger(git.untracked) ? git.untracked : null;
-    const clean = tracked === 0 && untracked === 0;
-    worktreeName = tracked == null || untracked == null
-      ? "unknown"
-      : clean
-        ? `clean · ${git.worktree || "worktree path unavailable"}`
-        : `not clean · ${tracked} tracked · ${untracked} untracked · ` +
-          `${git.worktree || "worktree path unavailable"}`;
-    if (Number.isInteger(git.unpushed_commits))
-      worktreeName += ` · ${git.unpushed_commits} unpushed commit(s)`;
-  }
   return {
-    shellName, sessionName, generationName, archiveName, sprintBindingName,
-    processName, tmuxName, unreadMessagesName, worktreeName,
+    shellName,
+    sessionName: rows.get("session") || "session evidence unavailable",
+    processName: rows.get("process") || "process evidence unavailable",
+    worktreeName: rows.get("worktree") || "worktree evidence unavailable",
   };
 }
 
@@ -2462,31 +2422,25 @@ function ifRecoveryControls(host, sel, root) {
       previewBtn.disabled = false;
       return;
     }
+    const evidenceRows = ifRecoveryEvidenceRows(preview);
+    if (!evidenceRows.length) {
+      note.textContent =
+        "Recovery preview omitted the canonical evidence projection. " +
+        "Update and restart the Interface service before recovering.";
+      previewBtn.disabled = false;
+      return;
+    }
     const context = ifRecoveryContext(sel, preview);
     const legal = Array.isArray(preview.legal_actions)
       ? preview.legal_actions : [];
     const body = el("div", { className: "if-recovery-preview" },
       el("div", { className: "if-diag" },
-        el("span", { className: "if-stat" }, "shell ",
-          el("b", {}, context.shellName)),
-        el("span", { className: "if-stat" }, "classification ",
-          el("b", {}, preview.classification || "—")),
-        el("span", { className: "if-stat" }, "session ",
-          el("b", {}, context.sessionName)),
-        el("span", { className: "if-stat" }, "generation ",
-          el("b", {}, context.generationName)),
-        el("span", { className: "if-stat" }, "archive ",
-          el("b", {}, context.archiveName)),
-        el("span", { className: "if-stat" }, "sprint binding ",
-          el("b", {}, context.sprintBindingName)),
-        el("span", { className: "if-stat" }, "process ",
-          el("b", {}, context.processName)),
-        el("span", { className: "if-stat" }, "tmux ",
-          el("b", {}, context.tmuxName)),
-        el("span", { className: "if-stat" }, "unread messages ",
-          el("b", {}, context.unreadMessagesName)),
-        el("span", { className: "if-stat" }, "worktree ",
-          el("b", {}, context.worktreeName))),
+        ...evidenceRows.map((row) => el("span", {
+          className: "if-stat",
+          recoveryEvidenceKey: row.key,
+          recoveryEvidenceLabel: row.label,
+          recoveryEvidenceValue: row.value,
+        }, row.label + " ", el("b", {}, row.value)))),
       el("div", { className: "muted" },
         `Observation ${preview.observation_id} · expires in ` +
         `${preview.expires_in_s ?? "—"}s.`));

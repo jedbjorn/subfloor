@@ -61,12 +61,12 @@ sys.path.insert(0, str(TESTS))
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 
-import interface_cli as ic
-import interface_recovery as recovery
-import interface_routes as routes
-import run as run_mod
-from test_interface_api import FakeRuntime, build_engine_db
-from test_interface_cli import SHELLS, FakeResp
+import interface_cli as ic  # noqa: E402
+import interface_recovery as recovery  # noqa: E402
+import interface_routes as routes  # noqa: E402
+import run as run_mod  # noqa: E402
+from test_interface_api import FakeRuntime, build_engine_db  # noqa: E402
+from test_interface_cli import SHELLS, FakeResp  # noqa: E402
 
 
 def hdrs(*lines) -> str:
@@ -224,6 +224,19 @@ class ClassificationTest(RecoveryCase):
         self.assertEqual(obj["classification"], "available")
         self.assertEqual(obj["legal_actions"], [])
         self.assertTrue(obj["observation_id"])
+        self.assertEqual(
+            [row["key"] for row in obj["evidence_projection"]],
+            ["shell", "classification", "legal_actions", "session",
+             "generation", "archive", "sprint_binding", "process", "tmux",
+             "unread_messages", "worktree"])
+        projected = {
+            row["key"]: row["value"] for row in obj["evidence_projection"]
+        }
+        self.assertEqual(projected["classification"], "available")
+        self.assertEqual(projected["legal_actions"], "none")
+        self.assertEqual(projected["session"], "no Interface session")
+        self.assertEqual(projected["process"],
+                         "no recorded process identity")
 
     def test_stale_lock_reservation_without_identity(self):
         self.make_session(1, occupancy="reserved", lifecycle="starting",
@@ -960,6 +973,10 @@ class CliRecoverTest(unittest.TestCase):
         self.patch_http.stop()
 
     def script(self, preview, result):
+        preview = dict(preview)
+        preview["evidence_projection"] = recovery.evidence_projection(
+            preview["evidence"], preview["classification"],
+            preview["legal_actions"])
         self.routes[("GET", "/api/interface/shells/3/recovery")] = preview
         if result is not None:
             self.routes[("POST", "/api/interface/shells/3/recovery")] = result
@@ -1019,8 +1036,11 @@ class CliRecoverTest(unittest.TestCase):
 
     def test_stale_observation_maps_to_refusal(self):
         from test_interface_cli import http_error
-        self.routes[("GET", "/api/interface/shells/3/recovery")] = \
-            dict(self.PREVIEW_ORPHAN)
+        preview = dict(self.PREVIEW_ORPHAN)
+        preview["evidence_projection"] = recovery.evidence_projection(
+            preview["evidence"], preview["classification"],
+            preview["legal_actions"])
+        self.routes[("GET", "/api/interface/shells/3/recovery")] = preview
         self.routes[("POST", "/api/interface/shells/3/recovery")] = \
             http_error(409, "recovery_observation_stale", "changed")
         code, _out, err = self.run_cli(["recover", "s3", "--yes"])

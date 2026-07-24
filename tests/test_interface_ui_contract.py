@@ -4,21 +4,69 @@ The UI is deliberately build-free vanilla JS/CSS. These checks pin the shared
 picker and responsive terminal behavior without inventing a second JS runtime
 or duplicating application logic in a test fixture.
 """
+import contextlib
+import io
+import json
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
+
+import interface_cli as ic  # noqa: E402
+import interface_recovery as recovery  # noqa: E402
+
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 CSS = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 PICKER = APP[APP.index("function dmModelPicker"):
              APP.index("async function renderDefaultModels")]
-RECOVERY = APP[APP.index("function ifRecoveryContext"):
+RECOVERY = APP[APP.index("function ifRecoveryEvidenceRows"):
                APP.index("// Sprint wake panel")]
 RENDER_INTERFACE = APP[APP.index("const IF_BADGE"):
                        APP.index("// A reservation is not a terminal")]
 AVAILABLE = APP[APP.index("function ifAvailablePane"):
                 APP.index("async function ifNewChatForm")]
+
+BASE_PREVIEW = {
+    "observation_id": "obs-1",
+    "expires_in_s": 120,
+    "classification": "exact_idle_orphan",
+    "legal_actions": ["recover"],
+    "evidence": {
+        "shell": {"shell_id": 3, "shortname": "S3"},
+        "session": {
+            "session_id": 9, "generation": 1, "occupancy": "occupied",
+            "lifecycle": "lost", "harness": "claude",
+        },
+        "generation": {
+            "generation": 1, "ended_at": None, "last_hook_seq": 7,
+        },
+        "archive": {
+            "archive_id": 12, "ended_at": None, "active": True,
+        },
+        "sprint_binding": {
+            "binding_id": 15, "sprint_doc_id": 31,
+        },
+        "process": {
+            "pane_id": "%1", "pane_pid": 4321, "pane_start_ticks": 999,
+            "pane_present": False, "pid_state": "alive", "pgid": 4321,
+        },
+        "tmux": {
+            "socket": "/run/if/tmux.sock", "session": "sc-S3",
+            "window": "chat", "pane_id": "%1",
+        },
+        "unread_messages": 2,
+        "git": {
+            "worktree": "/x/s3", "branch": "fix/x", "dirty_tracked": 1,
+            "untracked": 2, "unpushed_commits": 0,
+        },
+    },
+}
+BASE_PREVIEW["evidence_projection"] = recovery.evidence_projection(
+    BASE_PREVIEW["evidence"], BASE_PREVIEW["classification"],
+    BASE_PREVIEW["legal_actions"])
 
 
 def run_recovery_js(body):
@@ -77,42 +125,8 @@ function button(root, label) {
 function invariant(ok, message) {
   if (!ok) throw new Error(message);
 }
-const BASE_PREVIEW = {
-  observation_id: "obs-1",
-  expires_in_s: 120,
-  classification: "exact_idle_orphan",
-  legal_actions: ["recover"],
-  evidence: {
-    shell: { shell_id: 3, shortname: "S3" },
-    session: {
-      session_id: 9, generation: 1, occupancy: "occupied",
-      lifecycle: "lost",
-    },
-    generation: {
-      generation: 1, ended_at: null, last_hook_seq: 7,
-    },
-    archive: {
-      archive_id: 12, ended_at: null, active: true,
-    },
-    sprint_binding: {
-      binding_id: 15, sprint_doc_id: 31,
-    },
-    process: {
-      pane_id: "%1", pane_pid: 4321, pane_start_ticks: 999,
-      pane_present: false, pid_state: "alive", pgid: 4321,
-    },
-    tmux: {
-      socket: "/run/if/tmux.sock", session: "sc-S3",
-      window: "chat", pane_id: "%1",
-    },
-    unread_messages: 2,
-    git: {
-      worktree: "/x/s3", branch: "fix/x", dirty_tracked: 1,
-      untracked: 2, unpushed_commits: 0,
-    },
-  },
-};
-""" + "\n(async () => {\n" + body + r"""
+""" + "\nconst BASE_PREVIEW = " + json.dumps(BASE_PREVIEW) + ";\n" + \
+        "\n(async () => {\n" + body + r"""
 })().catch((error) => {
   console.error(error.stack || error);
   process.exit(1);
@@ -121,6 +135,7 @@ const BASE_PREVIEW = {
     result = subprocess.run(
         ["node", "-e", script], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+    return result.stdout
 
 
 def test_shared_picker_is_list_only_and_exact_route_only():
@@ -226,7 +241,15 @@ const cases = [
   { legal: [], present: null, absent: "Recover" },
 ];
 for (const test of cases) {
-  apiIf = async () => ({ ...BASE_PREVIEW, legal_actions: test.legal });
+  const projection = BASE_PREVIEW.evidence_projection.map((row) =>
+    row.key === "legal_actions"
+      ? { ...row, value: test.legal.join(", ") || "none" }
+      : row);
+  apiIf = async () => ({
+    ...BASE_PREVIEW,
+    legal_actions: test.legal,
+    evidence_projection: projection,
+  });
   const host = new FakeElement("div");
   ifRecoveryControls(host, { shell_id: 3, shortname: "S3" }, {});
   await button(host, "Preview recovery").onclick();
@@ -238,6 +261,8 @@ for (const test of cases) {
     `rendered unlisted ${test.absent}: ${labels}`);
   invariant(host.textContent.includes("session #9 · generation 1"),
     "session identity missing from diagnostics");
+  invariant(host.textContent.includes("harness claude"),
+    "session harness missing from diagnostics");
   invariant(host.textContent.includes("PID 4321 · start ticks 999 · PGID 4321"),
     "exact process identity missing from diagnostics");
   invariant(host.textContent.includes("generation 1 · open · last hook 7"),
@@ -253,11 +278,53 @@ for (const test of cases) {
     "unread-message evidence missing from diagnostics");
   invariant(host.textContent.includes("not clean · 1 tracked · 2 untracked"),
     "worktree cleanliness missing from diagnostics");
+  invariant(host.textContent.includes("branch fix/x"),
+    "git branch missing from diagnostics");
   if (!test.legal.length) invariant(
     host.textContent.includes("server lists no legal recovery action"),
     "empty legal-action explanation missing");
 }
 """)
+
+
+def test_browser_and_cli_render_identical_canonical_recovery_evidence():
+    browser_output = run_recovery_js(r"""
+confirm = () => false;
+prompt = () => null;
+apiIf = async () => BASE_PREVIEW;
+const host = new FakeElement("div");
+ifRecoveryControls(host, { shell_id: 3, shortname: "S3" }, {});
+await button(host, "Preview recovery").onclick();
+const rendered = all(host, (node) => Boolean(node.recoveryEvidenceKey))
+  .map((node) => [
+    node.recoveryEvidenceKey,
+    node.recoveryEvidenceLabel,
+    node.recoveryEvidenceValue,
+  ]);
+console.log(JSON.stringify(rendered));
+""")
+    browser_rows = json.loads(browser_output)
+
+    cli_output = io.StringIO()
+    with contextlib.redirect_stdout(cli_output):
+        ic._print_recovery_preview(BASE_PREVIEW)
+    cli_rows = []
+    by_label = {
+        row["label"]: (row["key"], row["label"], row["value"])
+        for row in BASE_PREVIEW["evidence_projection"]
+    }
+    for line in cli_output.getvalue().splitlines():
+        if not line.startswith("  "):
+            continue
+        label, value = line.strip().split(": ", 1)
+        key, _, _ = by_label[label]
+        cli_rows.append([key, label, value])
+
+    expected = [
+        [row["key"], row["label"], row["value"]]
+        for row in BASE_PREVIEW["evidence_projection"]
+    ]
+    assert browser_rows == cli_rows == expected
 
 
 def test_recovery_preview_execute_happy_path_uses_opaque_observation():
@@ -306,6 +373,18 @@ const archiveOnly = {
   ...BASE_PREVIEW,
   classification: "stale_durable_lock",
   legal_actions: ["recover"],
+  evidence_projection: BASE_PREVIEW.evidence_projection.map((row) => {
+    const replacements = {
+      classification: "stale_durable_lock",
+      session: "no Interface session",
+      generation: "no generation record",
+      sprint_binding: "no armed sprint binding",
+      process: "no recorded process identity",
+      tmux: "no tmux relation",
+    };
+    return replacements[row.key] === undefined
+      ? row : { ...row, value: replacements[row.key] };
+  }),
   evidence: {
     ...BASE_PREVIEW.evidence,
     session: null,
@@ -344,6 +423,10 @@ invariant(root.textContent.includes("no Interface session") &&
 const residual = {
   ...archiveOnly,
   classification: "exact_idle_orphan",
+  evidence_projection: archiveOnly.evidence_projection.map((row) =>
+    row.key === "classification"
+      ? { ...row, value: "exact_idle_orphan" }
+      : row),
   evidence: {
     ...BASE_PREVIEW.evidence,
     live_session: false,
@@ -433,6 +516,13 @@ const fresh = {
   observation_id: "obs-2",
   classification: "verified_live",
   legal_actions: ["force"],
+  evidence_projection: BASE_PREVIEW.evidence_projection.map((row) => {
+    if (row.key === "classification")
+      return { ...row, value: "verified_live" };
+    if (row.key === "legal_actions")
+      return { ...row, value: "force" };
+    return row;
+  }),
 };
 let previews = 0;
 confirm = () => true;
@@ -466,6 +556,13 @@ const preview = {
   ...BASE_PREVIEW,
   classification: "verified_live",
   legal_actions: ["force"],
+  evidence_projection: BASE_PREVIEW.evidence_projection.map((row) => {
+    if (row.key === "classification")
+      return { ...row, value: "verified_live" };
+    if (row.key === "legal_actions")
+      return { ...row, value: "force" };
+    return row;
+  }),
 };
 const calls = [];
 let allowForce = false;
