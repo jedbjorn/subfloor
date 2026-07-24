@@ -1312,6 +1312,7 @@ super-coder — forkable shell substrate
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
   ./sc update-harnesses    update claude + opencode + codex + vibe + kimi to latest (force-reruns official installers)
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
+                             --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
   ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)
   ./sc feature enable <f>  enable one: grant its skills to the owning flavors + create/point-at its instance.json block (disable reverses)
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)

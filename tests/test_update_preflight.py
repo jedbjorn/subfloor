@@ -113,8 +113,9 @@ class UpdatePreflightSentinelTest(unittest.TestCase):
                 update, "fetch_update_ref", return_value="a" * 40
             ) as fetch, mock.patch.object(
                 update.interface_reconcile,
-                "live_refusal_reasons",
-                return_value=["interface session 7 is occupied"],
+                "live_loss_manifest",
+                return_value=update.interface_reconcile.LiveLossManifest(
+                    sessions=(7,)),
             ), mock.patch.object(
                 update, "migrate_engine_untrack"
             ) as untrack, mock.patch.object(
@@ -239,12 +240,9 @@ class UpdateConsentTest(unittest.TestCase):
         patches = [
             mock.patch.object(
                 update.interface_reconcile,
-                "live_refusal_reasons",
-                return_value=[
-                    "generation 1/1 is live — end it first",
-                    "interface session 7 (shell 1) is occupied — "
-                    "end/reconcile it first",
-                ],
+                "live_loss_manifest",
+                return_value=update.interface_reconcile.LiveLossManifest(
+                    generations=((1, 1),), sessions=(7,)),
             ),
             mock.patch.object(
                 update.interface_reconcile,
@@ -266,17 +264,22 @@ class UpdateConsentTest(unittest.TestCase):
     def test_down_api_interactive_continue_warns_then_discards(self):
         discard, warning, prompt = self._preflight(
             interactive=True, answer="continue")
-        discard.assert_called_once_with(update.DB_PATH)
-        self.assertIn("generation 1/1 is live", warning)
-        self.assertIn("interface session 7", warning)
+        discard.assert_called_once_with(
+            update.DB_PATH,
+            update.interface_reconcile.LiveLossManifest(
+                generations=((1, 1),), sessions=(7,)),
+        )
+        self.assertIn("Interface generation(s): 1/1", warning)
+        self.assertIn("Interface session ID(s): 7", warning)
         self.assertIn("'continue'", prompt)
         self.assertIn("'rollback'", prompt)
 
     def test_interactive_rollback_mutates_nothing(self):
         with mock.patch.object(
             update.interface_reconcile,
-            "live_refusal_reasons",
-            return_value=["interface session 7 is occupied"],
+            "live_loss_manifest",
+            return_value=update.interface_reconcile.LiveLossManifest(
+                sessions=(7,)),
         ), mock.patch.object(
             update.interface_reconcile, "discard_live_state"
         ) as discard, mock.patch.object(
@@ -291,8 +294,9 @@ class UpdateConsentTest(unittest.TestCase):
     def test_headless_without_explicit_flag_fails_closed(self):
         with mock.patch.object(
             update.interface_reconcile,
-            "live_refusal_reasons",
-            return_value=["interface session 7 is occupied"],
+            "live_loss_manifest",
+            return_value=update.interface_reconcile.LiveLossManifest(
+                sessions=(7,)),
         ), mock.patch.object(
             update.interface_reconcile, "discard_live_state"
         ) as discard, mock.patch.object(
@@ -305,9 +309,58 @@ class UpdateConsentTest(unittest.TestCase):
     def test_headless_explicit_flag_discards_and_proceeds(self):
         discard, warning, prompt = self._preflight(
             interactive=False, explicit=True)
-        discard.assert_called_once_with(update.DB_PATH)
+        discard.assert_called_once_with(
+            update.DB_PATH,
+            update.interface_reconcile.LiveLossManifest(
+                generations=((1, 1),), sessions=(7,)),
+        )
         self.assertIn("explicit consent received", warning)
         self.assertIsNone(prompt)
+
+    def test_post_prompt_insertion_refuses_without_mutating_any_row(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            db_path = Path(raw_tmp) / "shell_db.db"
+            build_live_db(db_path)
+            after_insert = {}
+
+            def insert_new_live_state(_prompt):
+                con = sqlite3.connect(db_path)
+                try:
+                    con.execute(
+                        "INSERT INTO shells "
+                        "(shell_id, display_name, shortname, mandate, "
+                        "system_prompt, user_id, is_shared, has_identity, "
+                        "bootstrapped) "
+                        "VALUES (2,'Worker','WORK','test','test',1,0,1,1)")
+                    con.execute(
+                        "INSERT INTO interface_generations "
+                        "(shell_id, generation) VALUES (2,1)")
+                    con.execute(
+                        "INSERT INTO interface_sessions "
+                        "(shell_id, generation, occupancy, lifecycle) "
+                        "VALUES (2,1,'occupied','idle')")
+                    con.commit()
+                    after_insert["dump"] = list(con.iterdump())
+                finally:
+                    con.close()
+                return "continue"
+
+            with mock.patch.object(
+                update, "DB_PATH", db_path
+            ), mock.patch.object(
+                sys.stdin, "isatty", return_value=True
+            ), mock.patch(
+                "builtins.input", side_effect=insert_new_live_state
+            ), self.assertRaises(SystemExit) as refused:
+                update.preflight_live_state(allow_discard=True)
+
+            self.assertIn("changed while consent was pending",
+                          str(refused.exception))
+            con = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(list(con.iterdump()), after_insert["dump"])
+            finally:
+                con.close()
 
 
 if __name__ == "__main__":

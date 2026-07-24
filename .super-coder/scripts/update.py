@@ -324,18 +324,22 @@ def preflight_live_state(*, allow_discard: bool = False,
     ``--discard-live-state`` flag for a headless invocation.  The destructive
     path is deliberately local-DB only so it still works while the API is down.
     """
-    reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
-    if not reasons:
-        return
-    details = "\n  - " + "\n  - ".join(reasons)
     if not allow_discard:
+        reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
+        if not reasons:
+            return
+        details = "\n  - " + "\n  - ".join(reasons)
         sys.exit(
             "update: refusing — live Interface state exists; drain/reconcile "
             "it first:" + details)
 
+    manifest = interface_reconcile.live_loss_manifest(DB_PATH)
+    if manifest.empty():
+        return
+    details = "\n  - " + "\n  - ".join(manifest.loss_lines())
     print(
         "WARNING: update detected durable live Interface state.\n"
-        "Continuing will permanently end/cancel exactly this state:"
+        "Continuing will permanently terminalize exactly this loss manifest:"
         + details,
         file=sys.stderr,
     )
@@ -359,7 +363,13 @@ def preflight_live_state(*, allow_discard: bool = False,
             file=sys.stderr,
         )
 
-    counts = interface_reconcile.discard_live_state(DB_PATH)
+    try:
+        counts = interface_reconcile.discard_live_state(DB_PATH, manifest)
+    except interface_reconcile.LiveStateChanged:
+        sys.exit(
+            "update: refusing — live Interface state changed while consent "
+            "was pending; no rows were mutated. Re-run update to review and "
+            "consent to the fresh exact loss manifest.")
     changed = ", ".join(
         f"{name.replace('_', ' ')}={value}"
         for name, value in counts.items()

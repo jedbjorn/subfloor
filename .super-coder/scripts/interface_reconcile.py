@@ -29,6 +29,7 @@ DB (no Interface tables → no reasons).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import db_driver
@@ -40,6 +41,175 @@ def _has_table(con, name: str) -> bool:
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+@dataclass(frozen=True)
+class LiveLossManifest:
+    """Exact durable rows an operator-approved update will terminalize."""
+
+    generations: tuple[tuple[int, int], ...] = ()
+    sessions: tuple[int, ...] = ()
+    archives: tuple[int, ...] = ()
+    archive_links: tuple[tuple[int, int], ...] = ()
+    writer_leases: tuple[int, ...] = ()
+    input_states: tuple[int, ...] = ()
+    orphan_inputs: tuple[int, ...] = ()
+    bindings: tuple[int, ...] = ()
+    batches: tuple[int, ...] = ()
+    items: tuple[int, ...] = ()
+    alerts: tuple[int, ...] = ()
+
+    def empty(self) -> bool:
+        return not any((
+            self.generations, self.sessions, self.archives,
+            self.archive_links, self.writer_leases, self.input_states,
+            self.orphan_inputs, self.bindings, self.batches, self.items,
+            self.alerts,
+        ))
+
+    def loss_lines(self) -> list[str]:
+        rows = [
+            ("Interface generation(s)",
+             ", ".join(f"{shell}/{generation}"
+                       for shell, generation in self.generations)),
+            ("Interface session ID(s)", _csv(self.sessions)),
+            ("open archive ID(s)", _csv(self.archives)),
+            ("active archive link(s)",
+             ", ".join(f"shell {shell}→archive {archive}"
+                       for shell, archive in self.archive_links)),
+            ("writer lease ID(s)", _csv(self.writer_leases)),
+            ("input-state session ID(s)", _csv(self.input_states)),
+            ("orphan input-state session ID(s)", _csv(self.orphan_inputs)),
+            ("sprint binding ID(s)", _csv(self.bindings)),
+            ("wake batch ID(s)", _csv(self.batches)),
+            ("wake item ID(s)", _csv(self.items)),
+            ("open planner alert ID(s)", _csv(self.alerts)),
+        ]
+        return [f"{label}: {values}" for label, values in rows if values]
+
+
+class LiveStateChanged(RuntimeError):
+    """The consented loss set changed before the discard write lock."""
+
+
+def _csv(values) -> str:
+    return ", ".join(str(value) for value in values)
+
+
+def _ids(con, query: str, params=()) -> tuple[int, ...]:
+    return tuple(row[0] for row in con.execute(query, params).fetchall())
+
+
+def _live_loss_manifest(con) -> LiveLossManifest:
+    if not _has_table(con, "interface_sessions"):
+        return LiveLossManifest()
+
+    active_session = interface_state.active_session_sql("s")
+    sessions = _ids(
+        con,
+        "SELECT s.session_id FROM interface_sessions s "
+        f"WHERE {active_session} ORDER BY s.session_id",
+    )
+    bindings = _ids(
+        con,
+        "SELECT binding_id FROM sprint_planner_bindings "
+        "WHERE released_at IS NULL ORDER BY binding_id",
+    )
+
+    session_filter = ",".join("?" for _ in sessions)
+    binding_filter = ",".join("?" for _ in bindings)
+    archives = ()
+    archive_links = ()
+    writer_leases = ()
+    input_states = ()
+    if sessions:
+        archives = _ids(
+            con,
+            "SELECT DISTINCT s.archive_id FROM interface_sessions s "
+            "JOIN shell_memory_archives a ON a.archive_id=s.archive_id "
+            f"WHERE s.session_id IN ({session_filter}) "
+            "AND a.ended_at IS NULL ORDER BY s.archive_id",
+            sessions,
+        )
+        archive_links = tuple(tuple(row) for row in con.execute(
+            "SELECT s.shell_id, s.archive_id FROM interface_sessions s "
+            "JOIN shells sh ON sh.shell_id=s.shell_id "
+            f"WHERE s.session_id IN ({session_filter}) "
+            "AND sh.active_archive_id=s.archive_id "
+            "ORDER BY s.shell_id, s.archive_id",
+            sessions,
+        ).fetchall())
+        writer_leases = _ids(
+            con,
+            "SELECT lease_id FROM interface_writer_leases "
+            f"WHERE session_id IN ({session_filter}) AND revoked_at IS NULL "
+            "ORDER BY lease_id",
+            sessions,
+        )
+        input_states = _ids(
+            con,
+            "SELECT session_id FROM interface_input_state "
+            f"WHERE session_id IN ({session_filter}) ORDER BY session_id",
+            sessions,
+        )
+
+    alert_clauses = []
+    alert_params = []
+    if sessions:
+        alert_clauses.append(f"session_id IN ({session_filter})")
+        alert_params.extend(sessions)
+    if bindings:
+        alert_clauses.append(f"binding_id IN ({binding_filter})")
+        alert_params.extend(bindings)
+    alerts = ()
+    if alert_clauses:
+        alerts = _ids(
+            con,
+            "SELECT alert_id FROM planner_alerts WHERE resolved_at IS NULL "
+            f"AND ({' OR '.join(alert_clauses)}) ORDER BY alert_id",
+            alert_params,
+        )
+
+    return LiveLossManifest(
+        generations=tuple(tuple(row) for row in con.execute(
+            "SELECT shell_id, generation FROM interface_generations "
+            "WHERE ended_at IS NULL ORDER BY shell_id, generation"
+        ).fetchall()),
+        sessions=sessions,
+        archives=archives,
+        archive_links=archive_links,
+        writer_leases=writer_leases,
+        input_states=input_states,
+        orphan_inputs=_ids(
+            con,
+            "SELECT i.session_id FROM interface_input_state i "
+            "WHERE NOT EXISTS (SELECT 1 FROM interface_sessions s "
+            "WHERE s.session_id=i.session_id) ORDER BY i.session_id",
+        ),
+        bindings=bindings,
+        batches=_ids(
+            con,
+            "SELECT batch_id FROM planner_wake_batches "
+            "WHERE state <> 'complete' ORDER BY batch_id",
+        ),
+        items=_ids(
+            con,
+            "SELECT item_id FROM planner_wake_items "
+            "WHERE state NOT IN ('done','cancelled') ORDER BY item_id",
+        ),
+        alerts=alerts,
+    )
+
+
+def live_loss_manifest(db_path) -> LiveLossManifest:
+    """Read the exact loss set shown before destructive update consent."""
+    if not Path(str(db_path)).exists():
+        return LiveLossManifest()
+    con = db_driver.connect(str(db_path))
+    try:
+        return _live_loss_manifest(con)
+    finally:
+        con.close()
 
 
 def _alert(con, **kw) -> None:
@@ -235,14 +405,16 @@ def live_refusal_reasons(db_path) -> list[str]:
         con.close()
 
 
-def discard_live_state(db_path) -> dict[str, int]:
-    """Atomically abandon every durable Interface actor before an update.
+def discard_live_state(
+        db_path, expected: LiveLossManifest) -> dict[str, int]:
+    """Atomically abandon exactly the operator-consented Interface actors.
 
     This is the deliberately destructive, operator-consented escape hatch for
     an update whose API is down: it uses only the current engine and its local
     DB, so it cannot deadlock on an API-only recovery command.  Durable audit
     rows are terminalized rather than deleted; unread messages and unrelated
-    shell memory are untouched.
+    shell memory are untouched. The manifest is re-read under BEGIN IMMEDIATE
+    before the first write; any change refuses with zero mutation.
     """
     counts = {
         "sessions_ended": 0,
@@ -261,63 +433,62 @@ def discard_live_state(db_path) -> dict[str, int]:
         if not _has_table(con, "interface_sessions"):
             return counts
         con.execute("BEGIN IMMEDIATE")
+        current = _live_loss_manifest(con)
+        if current != expected:
+            raise LiveStateChanged(
+                "live Interface state changed while awaiting consent")
 
-        active_session = interface_state.active_session_sql("s")
-        sessions = con.execute(
-            "SELECT s.session_id, s.shell_id, s.archive_id "
-            "FROM interface_sessions s "
-            f"WHERE {active_session} ORDER BY s.session_id"
-        ).fetchall()
-        for session_id, shell_id, archive_id in sessions:
+        for session_id in expected.sessions:
+            shell_id, archive_id = con.execute(
+                "SELECT shell_id, archive_id FROM interface_sessions "
+                "WHERE session_id=?", (session_id,)
+            ).fetchone()
             result = interface_broker.close_session(
                 con, session_id, "update_discard")
             if not result["already_ended"]:
                 counts["sessions_ended"] += 1
-            if archive_id is not None:
+            if archive_id in expected.archives:
                 cur = con.execute(
                     "UPDATE shell_memory_archives SET ended_at=datetime('now') "
                     "WHERE archive_id=? AND ended_at IS NULL", (archive_id,))
                 counts["archives_closed"] += cur.rowcount
+            if (shell_id, archive_id) in expected.archive_links:
                 con.execute(
                     "UPDATE shells SET active_archive_id=NULL "
                     "WHERE shell_id=? AND active_archive_id=?",
                     (shell_id, archive_id))
 
-        cur = con.execute(
-            "UPDATE interface_generations SET ended_at=datetime('now') "
-            "WHERE ended_at IS NULL")
-        counts["generations_ended"] = cur.rowcount
+        for shell_id, generation in expected.generations:
+            cur = con.execute(
+                "UPDATE interface_generations SET ended_at=datetime('now') "
+                "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
+                (shell_id, generation))
+            counts["generations_ended"] += cur.rowcount
 
-        counts["batches_completed"] = con.execute(
-            "SELECT COUNT(*) FROM planner_wake_batches "
-            "WHERE state <> 'complete'").fetchone()[0]
-        counts["items_cancelled"] = con.execute(
-            "SELECT COUNT(*) FROM planner_wake_items "
-            "WHERE state NOT IN ('done','cancelled')").fetchone()[0]
+        counts["batches_completed"] = len(expected.batches)
+        counts["items_cancelled"] = len(expected.items)
 
-        bindings = con.execute(
-            "SELECT binding_id FROM sprint_planner_bindings "
-            "WHERE released_at IS NULL ORDER BY binding_id"
-        ).fetchall()
-        for (binding_id,) in bindings:
+        for binding_id in expected.bindings:
             interface_broker.release_binding(
                 con, binding_id, "update_discard")
             counts["bindings_released"] += 1
 
-        items = con.execute(
-            "SELECT item_id FROM planner_wake_items "
-            "WHERE state NOT IN ('done','cancelled') ORDER BY item_id"
-        ).fetchall()
-        for (item_id,) in items:
+        for item_id in expected.items:
+            state = con.execute(
+                "SELECT state FROM planner_wake_items WHERE item_id=?",
+                (item_id,)).fetchone()[0]
+            if state in ("done", "cancelled"):
+                continue
             interface_state.transition(
                 con, "wake_item", item_id, "cancelled",
                 extra_sets={"error": "discarded by operator-approved update"})
 
-        batches = con.execute(
-            "SELECT batch_id, state FROM planner_wake_batches "
-            "WHERE state <> 'complete' ORDER BY batch_id"
-        ).fetchall()
-        for batch_id, state in batches:
+        for batch_id in expected.batches:
+            state = con.execute(
+                "SELECT state FROM planner_wake_batches WHERE batch_id=?",
+                (batch_id,)).fetchone()[0]
+            if state == "complete":
+                continue
             if state == "submitting":
                 interface_state.transition(
                     con, "wake_batch", batch_id, "delivery_unknown")
@@ -326,20 +497,36 @@ def discard_live_state(db_path) -> dict[str, int]:
                 extra_sets={"completed_at": con.execute(
                     "SELECT datetime('now')").fetchone()[0]})
 
-        cur = con.execute(
-            "DELETE FROM interface_input_state "
-            "WHERE NOT EXISTS (SELECT 1 FROM interface_sessions s "
-            "WHERE s.session_id=interface_input_state.session_id)")
-        counts["orphan_inputs_removed"] = cur.rowcount
+        for session_id in expected.orphan_inputs:
+            cur = con.execute(
+                "DELETE FROM interface_input_state WHERE session_id=? "
+                "AND NOT EXISTS (SELECT 1 FROM interface_sessions s "
+                "WHERE s.session_id=interface_input_state.session_id)",
+                (session_id,))
+            counts["orphan_inputs_removed"] += cur.rowcount
 
-        con.execute(
-            "UPDATE planner_alerts SET resolved_at=datetime('now') "
-            "WHERE resolved_at IS NULL AND ("
-            "session_id IN (SELECT session_id FROM interface_sessions "
-            "WHERE occupancy='ended' AND lifecycle='ended' "
-            "AND ended_at IS NOT NULL) OR "
-            "binding_id IN (SELECT binding_id FROM sprint_planner_bindings "
-            "WHERE released_at IS NOT NULL))")
+        for alert_id in expected.alerts:
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE alert_id=? AND resolved_at IS NULL", (alert_id,))
+        # close_session may have created a delivery-unknown alert after the
+        # manifest was locked. It is operation-local, not concurrently-created
+        # state; resolve only those new alerts tied to the confirmed actors.
+        if expected.sessions or expected.bindings:
+            clauses = []
+            params = []
+            if expected.sessions:
+                marks = ",".join("?" for _ in expected.sessions)
+                clauses.append(f"session_id IN ({marks})")
+                params.extend(expected.sessions)
+            if expected.bindings:
+                marks = ",".join("?" for _ in expected.bindings)
+                clauses.append(f"binding_id IN ({marks})")
+                params.extend(expected.bindings)
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE resolved_at IS NULL "
+                f"AND ({' OR '.join(clauses)})", params)
         con.commit()
     except Exception:
         con.rollback()

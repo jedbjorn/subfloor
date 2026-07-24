@@ -61,7 +61,8 @@ class ServerSchemaGuardTest(unittest.TestCase):
             self.assertIn("installed engine/DB schema mismatch", message)
             self.assertIn(ACK_MIGRATION, message)
             self.assertIn("before first DB use", message)
-            self.assertIn("`./sc rollback`", message)
+            self.assertIn("`./sc rollback --engine-only`", message)
+            self.assertIn("preserving this unchanged DB", message)
             self.assertNotIn("no such column", message)
             backfill.assert_not_called()
 

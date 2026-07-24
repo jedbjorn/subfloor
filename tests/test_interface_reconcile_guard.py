@@ -341,12 +341,22 @@ class LiveRefusalGuardTest(unittest.TestCase):
             "(binding_id, message_id, batch_id, state) "
             "VALUES (?,?,?,'running')",
             (binding_id, message_id, batch_id)).lastrowid
+        alert_id = self.con.execute(
+            "INSERT INTO planner_alerts "
+            "(session_id, binding_id, severity, reason, dedupe_key) "
+            "VALUES (?,?,'warning','turn_failure','discard-test')",
+            (sid, binding_id)).lastrowid
         self.con.commit()
 
         before = interface_reconcile.live_refusal_reasons(self.db)
         self.assertTrue(any("session" in reason for reason in before))
         self.assertTrue(any("batch" in reason for reason in before))
-        counts = interface_reconcile.discard_live_state(self.db)
+        manifest = interface_reconcile.live_loss_manifest(self.db)
+        warning = "\n".join(manifest.loss_lines())
+        self.assertIn("open archive ID(s): 10", warning)
+        self.assertIn(f"wake item ID(s): {item_id}", warning)
+        self.assertIn(f"open planner alert ID(s): {alert_id}", warning)
+        counts = interface_reconcile.discard_live_state(self.db, manifest)
 
         self.assertEqual(counts["sessions_ended"], 1)
         self.assertEqual(counts["generations_ended"], 0,

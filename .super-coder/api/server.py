@@ -217,14 +217,19 @@ def require_current_schema(db_path=DB_PATH,
     if not missing:
         return
     names = ", ".join(missing)
+    ref_path = REPO_ROOT / ".sc-state" / "engine.ref"
+    ref = ref_path.read_text().strip()[:12] if ref_path.exists() else "un-pinned"
     sys.exit(
         "server: installed engine/DB schema mismatch — "
-        f"{Path(db_path).name} is missing {len(missing)} required "
+        f"installed engine {ref} requires migrations that "
+        f"{Path(db_path).name} has not applied; its ledger is missing "
+        f"{len(missing)} required "
         f"migration(s): {names}\n"
         "Refusing startup before first DB use; continuing would run new code "
         "against an old schema.\n"
-        "Recovery: run `./sc rollback` to restore the matched engine+DB pair, "
-        "then drain/reconcile live Interface state and retry `./sc update`.")
+        "Recovery: run `./sc rollback --engine-only` to restore the previous "
+        "engine/pin while preserving this unchanged DB, then drain/reconcile "
+        "live Interface state and retry `./sc update`.")
 
 
 def rows(cur) -> list[dict]:

@@ -19,11 +19,13 @@ never surprisingly lossy, always works. The only data lost is anything written
 
 Usage:
     ./sc rollback
+    ./sc rollback --engine-only  # new-engine / unchanged-old-DB half floor
     python3 .super-coder/scripts/rollback.py
 """
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +80,19 @@ def restore_db(src: Path) -> None:
 def restore_engine(prev_sha: str) -> None:
     """Re-materialize the engine at the prior pin. The SHA should already be in
     the object store (it is the ref we updated *from*); fetch as a fallback."""
+    previous_files = set(update_mod._engine_files_at(prev_sha))
+    current_sha = ENGINE_REF.read_text().strip() if ENGINE_REF.exists() else ""
+    current_files = (set(update_mod._engine_files_at(current_sha))
+                     if current_sha else set())
+    # materialize_engine overlays an archive and deliberately leaves upstream-
+    # retired files alone during a forward update. Rollback is different: a
+    # target-only migration left behind would make the restored old server
+    # demand the new schema again. Remove only files proved upstream-owned by
+    # the current pin and absent from the previous pin; fork-local files remain.
+    for rel in sorted(current_files - previous_files):
+        path = REPO_ROOT / rel
+        if path.is_file() or path.is_symlink():
+            path.unlink()
     try:
         update_mod.materialize_engine(prev_sha)
     except SystemExit:
@@ -93,16 +108,88 @@ def restore_engine(prev_sha: str) -> None:
     print(f"→ engine re-materialized at {prev_sha[:12]} (engine.ref restored)")
 
 
-def main() -> int:
+def verify_engine_only_floor(prev_sha: str) -> None:
+    """Prove the DB is still on the previous engine migration floor."""
+    current_sha = ENGINE_REF.read_text().strip() if ENGINE_REF.exists() else ""
+    if not current_sha or current_sha == prev_sha:
+        sys.exit(
+            "rollback: --engine-only is safe only for a newer materialized "
+            "engine over an unchanged older DB; the two engine pins do not "
+            "prove that state.")
+    if not DB_PATH.exists():
+        sys.exit("rollback: --engine-only cannot verify a missing DB.")
+
+    previous = {
+        Path(line).name
+        for line in update_mod.git(
+            "ls-tree", "-r", "--name-only", prev_sha, "--",
+            ".super-coder/migrations"
+        ).stdout.splitlines()
+        if line.endswith(".sql")
+    }
+    current = {
+        path.name for path in (ENGINE / "migrations").glob("*.sql")
+    }
+    con = sqlite3.connect(DB_PATH)
+    try:
+        table = con.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+        if table is None:
+            sys.exit(
+                "rollback: --engine-only cannot prove the DB migration floor "
+                "(schema_migrations is absent).")
+        applied = {
+            row[0] for row in con.execute(
+                "SELECT filename FROM schema_migrations")
+        }
+    finally:
+        con.close()
+
+    introduced = current - previous
+    if not introduced or not (current - applied):
+        sys.exit(
+            "rollback: --engine-only refused — the current engine/DB pair is "
+            "not a proved new-engine/old-schema half floor.")
+    if previous - applied or introduced & applied:
+        sys.exit(
+            "rollback: --engine-only refused — the DB does not exactly retain "
+            "the previous engine migration floor. Use a verified paired backup "
+            "or operator-directed recovery instead.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    unknown = [arg for arg in argv if arg != "--engine-only"]
+    if unknown:
+        sys.exit(f"rollback: unknown argument(s): {' '.join(unknown)}")
+    engine_only = "--engine-only" in argv
+
     if update_mod.EJECTED_MARKER.exists() and not update_mod.is_source_repo():
         sys.exit("rollback: this fork has EJECTED (.sc-state/ejected) — the "
                  "engine is fork source now, so update/rollback no longer apply. "
                  "Use plain git (revert/reset) on the tracked .super-coder/.")
+    prev_sha = ENGINE_REF_PREV.read_text().strip() if ENGINE_REF_PREV.exists() else ""
+    if engine_only:
+        if not prev_sha:
+            sys.exit(
+                "rollback: --engine-only requires .sc-state/engine.ref.prev; "
+                "the previous installed engine cannot be identified.")
+        verify_engine_only_floor(prev_sha)
+        print("→ repairing a new-engine / unchanged-DB half floor")
+        backup_current_db()
+        restore_engine(prev_sha)
+        ENGINE_REF_PREV.unlink(missing_ok=True)
+        print("\nrollback: done — restored the previous engine and preserved "
+              "the current DB byte-for-byte.")
+        print("  Restart your session to boot onto the restored state.")
+        return 0
+
     src = latest_db_restore_point()
     if src is None:
         sys.exit("rollback: no shell_db.prerebuild.*.db restore point found in "
                  f"{rebuild_mod.backup_dir()} — nothing to roll back to.")
-    prev_sha = ENGINE_REF_PREV.read_text().strip() if ENGINE_REF_PREV.exists() else ""
 
     print("→ rolling back the last update (DB + engine pair-restore)")
     backup_current_db()
