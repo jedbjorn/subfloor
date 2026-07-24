@@ -69,13 +69,24 @@ TICKET_TTL_S = 60
 RESERVATION_TTL_S = 60
 IDEM_TTL_S = 24 * 3600
 BROWSER_SESSION_TTL_S = 24 * 3600      # inactivity deadline (spec #26)
+# How long a bootstrap Idempotency-Key stays replayable. Short by intent: it
+# exists to absorb the retry of a lost 201 (spec #26 Session Lifecycle allows
+# exactly one), not to pin a credential for the session's whole 24 hours.
+BOOTSTRAP_REPLAY_TTL_S = 300
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+# The same allowlist as bare hosts, for comparing against a parsed authority
+# (`_authority_host()` returns the IPv6 literal unbracketed).
+_ALLOWED_HOST_SET = frozenset(h.strip("[]") for h in _ALLOWED_HOSTS)
 
 _runtime = None          # bound by bind_runtime()
 # Browser sessions are live-process state ONLY (spec #26 Session Lifecycle):
 # never the DB, a snapshot, or a log — so a service restart invalidates them
 # all, which is exactly the intended recovery path.
 _browser_sessions: dict = {}
+# Bootstrap idempotency replay records, same terms and same lock as the
+# sessions they shadow — live-process only, so a repeated key never reaches
+# the durable DB (spec #26) and a restart forgets it with everything else.
+_browser_bootstraps: dict = {}
 _browser_lock = threading.Lock()
 
 _ATTACHABLE_LIFECYCLES = {
@@ -149,9 +160,43 @@ class _Actor:
         self.sid = sid            # set for kind="browser" (re-checked at commit)
 
 
+def _authority_host(authority: str) -> str:
+    """The host of an `authority` (RFC 3986 `host[:port]`), port removed.
+
+    Splitting at the first colon is wrong for the one form that contains
+    colons in the host itself: a bracketed IPv6 literal. `[::1]:8800` split
+    that way yields `"["`, which is why conformance finding SC-150 found an
+    IPv6 loopback that `require_loopback_bind()` accepts at startup but that
+    could never pass this fence — a supported bind unable to reach its own
+    API. Bracketed literals are therefore read to their closing bracket, and
+    anything trailing that bracket which is not a port fails closed: this is
+    the DNS-rebind fence, so a malformed authority is never a near miss.
+
+    The port is validated for the same reason, and it closes a hole the old
+    `split(":")[0]` had on the IPv4 side too: `127.0.0.1:8800.evil.example.com`
+    parsed to `127.0.0.1` and passed. No browser emits it, so this is
+    hardening rather than a live exploit — but the fence's whole job is that
+    an authority which is not exactly an allowed one is refused, and
+    tightening the IPv6 branch while leaving that in place is just the next
+    finding."""
+    authority = (authority or "").strip()
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 0:
+            return ""
+        host, rest = authority[1:end], authority[end + 1:]
+        if rest and not rest.startswith(":"):
+            return ""
+        port = rest[1:]
+    else:
+        host, _, port = authority.partition(":")
+    if port and not port.isdigit():
+        return ""
+    return host.lower()
+
+
 def _host_ok(headers) -> bool:
-    host = (headers.get("Host") or "").split(":")[0].strip("[]").lower()
-    return host in {h.strip("[]") for h in _ALLOWED_HOSTS}
+    return _authority_host(headers.get("Host") or "") in _ALLOWED_HOST_SET
 
 
 def _same_origin_as_host(origin: str, host: str) -> "str | None":
@@ -301,6 +346,17 @@ def _sweep_browser_sessions(now: float) -> None:
     for sid in [s for s, sess in _browser_sessions.items()
                 if now - sess["last_seen"] >= BROWSER_SESSION_TTL_S]:
         del _browser_sessions[sid]
+
+
+def _sweep_bootstrap_replays(now: float) -> None:
+    """Drop expired bootstrap replay records. Same request-driven cleanup as
+    the sessions (spec #26: no scheduled model or harness poll), and bounded
+    by the number of successful mints in the last BOOTSTRAP_REPLAY_TTL_S
+    seconds — not by `_browser_sessions`, which a record outlives when
+    rotation revokes the session it names. Caller holds `_browser_lock`."""
+    for key in [k for k, rec in _browser_bootstraps.items()
+                if now - rec["created"] >= BOOTSTRAP_REPLAY_TTL_S]:
+        del _browser_bootstraps[key]
 
 
 # ------------------------------------------------------------------ idempotency
@@ -2301,15 +2357,45 @@ def _browser_session(headers, body):
                     "browser bootstrap presents no capability — the operator "
                     "capability is CLI/server-only and must never be sent "
                     "from browser code")
-    if not (headers.get("Idempotency-Key") or ""):
+    key = headers.get("Idempotency-Key") or ""
+    if not key:
         return _err(422, "idempotency_key_required",
                     "Idempotency-Key header is required for Interface mutations")
+    # The key is HONOURED here, not merely demanded (conformance finding
+    # SC-151). It cannot ride the general `_idempotent()` path: that one
+    # persists its replay record in `interface_idempotency_keys`, and spec #26
+    # forbids a browser session or its credentials ever reaching the durable
+    # DB. So the replay store is live-process state on exactly the terms the
+    # sessions themselves are — same lock, same request-driven sweep, gone on
+    # restart — and it holds one record per mint for a 288th of a session's
+    # life, so it is never the store that grows.
+    #
+    # The replayed "request" is the provenance the response is derived from
+    # (proven scheme + Host); the route reads no body. A key seen with
+    # different provenance is a conflict, matching `_idempotent()`'s contract.
+    canonical = hashlib.sha256(
+        json.dumps({"scheme": scheme, "host": headers.get("Host") or ""},
+                   sort_keys=True).encode()).hexdigest()
     now = time.time()
     sid = secrets.token_hex(24)
     csrf = secrets.token_hex(24)
     prior = _cookie_session_id(headers)
+    cookie = (f"sc_if={sid}; HttpOnly; SameSite=Strict; Path=/"
+              + ("; Secure" if scheme == "https" else ""))
     with _browser_lock:
         _sweep_browser_sessions(now)
+        _sweep_bootstrap_replays(now)
+        seen = _browser_bootstraps.get(key)
+        if seen is not None and seen["hash"] != canonical:
+            return _err(409, "idempotency_conflict",
+                        "Idempotency-Key reused from a different origin")
+        # Replay only while the session it names is still live. A recorded
+        # session that has since been revoked or expired would otherwise hand
+        # back a dead credential — an idempotent answer that is also a wrong
+        # one — so a stale record falls through to a fresh mint.
+        if seen is not None and seen["sid"] in _browser_sessions:
+            return _json(201, {"csrf": seen["csrf"]},
+                         headers=[("Set-Cookie", seen["cookie"])])
         # Rotation revokes: the session the caller presented dies in the same
         # critical section that mints its replacement, so no window exists in
         # which both the old and the new identifier are usable.
@@ -2317,8 +2403,9 @@ def _browser_session(headers, body):
             _browser_sessions.pop(prior, None)
         _browser_sessions[sid] = {"csrf": csrf, "created": now,
                                   "last_seen": now}
-    cookie = (f"sc_if={sid}; HttpOnly; SameSite=Strict; Path=/"
-              + ("; Secure" if scheme == "https" else ""))
+        _browser_bootstraps[key] = {"hash": canonical, "sid": sid,
+                                    "csrf": csrf, "cookie": cookie,
+                                    "created": now}
     return _json(201, {"csrf": csrf}, headers=[("Set-Cookie", cookie)])
 
 

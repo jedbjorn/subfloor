@@ -66,20 +66,43 @@ what enforces that, rather than restating "binds loopback only":
 - **Inside the sandbox container**: the bind *is* `0.0.0.0`, deliberately, so
   docker can publish the port — and the boundary is the published mapping,
   `-p 127.0.0.1:PORT:PORT`, which is loopback-only on the host whatever the
-  container binds. The in-process guard stands down there (it detects
-  `SC_SANDBOX`) because refusing would break `./sc launch` without removing
-  any exposure.
+  container binds. The in-process guard stands down there because refusing
+  would break `./sc launch` without removing any exposure.
+
+The exemption is granted on **observed** container evidence — a marker file a
+container runtime writes (`/.dockerenv`, `/run/.containerenv`), or PID 1's
+cgroup naming one. It is deliberately **not** granted on `SC_SANDBOX`, which
+is how this first shipped: an environment variable is a *claim* that a
+boundary exists, and setting `SC_SANDBOX=1` does not create a publish mapping,
+so `SC_SANDBOX=1 SC_BIND=0.0.0.0` on a bare host opened a listener this page
+described as fenced. Where the boundary cannot be positively observed, the
+refusal applies.
+
+Two things that evidence does **not** prove, said plainly, because a guard
+claiming more than it verifies is the defect this replaced. It shows the bind
+lands in a container's network namespace; it cannot show what the host did
+with the port, since the publish mapping is host-side and invisible from
+inside without the docker socket. So a container run with `--network=host`, or
+one whose port is published wide, still passes. Both require launching the
+engine outside `./sc launch`'s mapping — neither is reachable by setting a
+variable, which is the whole distance travelled.
 
 Net: reachable from the host's loopback interface only, enforced in-process
-off-sandbox and by docker's port mapping in it. Neither path exposes the
-Interface to the network, and neither claims more than it does. Remote access
-is a separate authenticated boundary you put in front (e.g. a tailnet) — never
-a wider bind.
+off-sandbox and by docker's port mapping in it. Remote access is a separate
+authenticated boundary you put in front (e.g. a tailnet) — never a wider bind.
 
 Same-origin script execution is operator-equivalent here. The restrictive CSP,
 the vendored scripts, the sanitized rendered content, and the absence of any
 third-party runtime asset are therefore security controls, not hygiene — an
 XSS bug in the Interface is a security defect, not a rendering defect.
+
+That CSP names its socket destinations explicitly —
+`connect-src 'self' ws://HOST:PORT …` for the Interface's own origins — rather
+than allowing the `ws:`/`wss:` schemes. Scheme sources match *any* host, so
+the earlier policy left injected same-origin script an outbound WebSocket
+channel to anywhere while the comment beside it promised same-origin only.
+Containment after an injection is the point of the header; a destination list
+that admits every host does not provide it.
 
 ## Why the browser is not given the operator capability
 
