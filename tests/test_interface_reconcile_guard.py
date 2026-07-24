@@ -243,26 +243,31 @@ class LiveRefusalGuardTest(unittest.TestCase):
             "VALUES (?,1,1,'unknown','delivery_unknown',9)", (sid,))
         self.con.execute(
             "INSERT INTO planner_alerts "
-            "(session_id, severity, reason, dedupe_key, resolved_at) "
-            "VALUES (?,'critical','crash_window_delivery_unknown',"
-            "? || '|-|-|crash_window_delivery_unknown',"
-            "'2026-07-23 00:00:00')", (sid, sid))
+            "(alert_id, session_id, severity, reason, dedupe_key) "
+            "VALUES (42,?,'critical','crash_window_delivery_unknown',"
+            "? || '|-|-|crash_window_delivery_unknown')", (sid, sid))
         self.con.commit()
         self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
 
         counts = interface_reconcile.startup_reconcile(self.con)
         self.assertEqual(counts["terminal_inputs_removed"], 0)
         self.assertEqual(counts["terminal_input_parks"], 1)
-        interface_reconcile.startup_reconcile(self.con)
+        self.assertEqual(counts["terminal_alerts_resolved"], 1)
+        first_alert = self.con.execute(
+            "SELECT alert_id, reason, resolved_at FROM planner_alerts "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(first_alert[:2], (
+            42, "crash_window_delivery_unknown"))
+        self.assertIsNotNone(first_alert[2])
+        second = interface_reconcile.startup_reconcile(self.con)
+        self.assertEqual(second["terminal_alerts_resolved"], 0)
         self.assertEqual(self.con.execute(
             "SELECT composer, delivery, pending_seq "
             "FROM interface_input_state WHERE session_id=?",
             (sid,)).fetchone(), ("unknown", "delivery_unknown", 9))
         self.assertEqual(self.con.execute(
-            "SELECT reason, resolved_at FROM planner_alerts WHERE session_id=?",
-            (sid,)).fetchall(), [
-                ("crash_window_delivery_unknown", "2026-07-23 00:00:00")
-            ])
+            "SELECT alert_id, reason, resolved_at FROM planner_alerts "
+            "WHERE session_id=?", (sid,)).fetchall(), [first_alert])
         self.assertIsNone(self.con.execute(
             "SELECT 1 FROM planner_alerts WHERE session_id=? "
             "AND resolved_at IS NULL", (sid,)).fetchone())

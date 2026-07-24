@@ -221,6 +221,16 @@ def main(argv: list[str]) -> int:
         else:
             print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
 
+        # content.sql loads after migrations and older snapshots may contain
+        # legacy open alerts for fully ended sessions. Reconcile the completed
+        # candidate, not merely the pre-snapshot schema, so rebuild cannot
+        # reattach actionable state to terminal audit.
+        con = db_driver.connect(candidate)
+        try:
+            interface_reconcile.startup_reconcile(con)
+        finally:
+            con.close()
+
         # The migrations above seeded every engine skill live (is_deleted=0) —
         # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
         # this fork has retired (a shell created before the next launch/update

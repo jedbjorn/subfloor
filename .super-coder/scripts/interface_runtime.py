@@ -1110,16 +1110,11 @@ class InterfaceRuntime:
             gen.broadcast_control({"type": "error", "code": "resync_failed"})
 
     def _alert(self, session_id: int, reason: str, severity: str) -> None:
-        """INSERT OR IGNORE shape replicated from interface_broker._alert
-        (private there): deduplicated while open via the partial unique
-        index on planner_alerts."""
+        """Write through the broker's terminal-session-aware alert helper."""
         con = db_driver.connect(self.db_path)
         try:
-            con.execute(
-                "INSERT OR IGNORE INTO planner_alerts "
-                "(session_id, severity, reason, dedupe_key) "
-                "VALUES (?,?,?,?)",
-                (session_id, severity, reason, f"{session_id}|-|{reason}"))
+            interface_broker._alert(
+                con, session_id=session_id, reason=reason, severity=severity)
             con.commit()
         finally:
             con.close()

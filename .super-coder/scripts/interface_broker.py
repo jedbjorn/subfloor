@@ -76,6 +76,37 @@ def _alert(con, *, severity: str, reason: str, session_id=None,
            binding_id=None, message_id=None) -> None:
     """Raise an alert, deduplicated while open (partial unique index)."""
     dedupe = f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}|{reason}"
+    if session_id is not None:
+        session = con.execute(
+            "SELECT occupancy, lifecycle, ended_at "
+            "FROM interface_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if session is not None and not interface_state.session_is_active(*session):
+            # A late runtime callback may race durable closure. Preserve one
+            # audit row for the event, but never attach an actionable alert to
+            # a session that can no longer act.
+            ended_at = session[2]
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=? "
+                "WHERE session_id=? AND resolved_at IS NULL",
+                (ended_at, session_id),
+            )
+            exists = con.execute(
+                "SELECT 1 FROM planner_alerts "
+                "WHERE session_id=? AND binding_id IS ? AND message_id IS ? "
+                "AND reason=? LIMIT 1",
+                (session_id, binding_id, message_id, reason),
+            ).fetchone()
+            if exists is None:
+                con.execute(
+                    "INSERT INTO planner_alerts "
+                    "(session_id, binding_id, message_id, severity, reason, "
+                    "dedupe_key, resolved_at) VALUES (?,?,?,?,?,?,?)",
+                    (session_id, binding_id, message_id, severity, reason,
+                     dedupe, ended_at),
+                )
+            return
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
         "(session_id, binding_id, message_id, severity, reason, dedupe_key) "

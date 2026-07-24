@@ -323,6 +323,9 @@ class InterfaceSnapshotTest(unittest.TestCase):
             alerts = set(rebuilt.execute(
                 "SELECT reason FROM planner_alerts "
                 "WHERE session_id=2 OR binding_id=2").fetchall())
+            open_session_alerts = rebuilt.execute(
+                "SELECT alert_id FROM planner_alerts "
+                "WHERE session_id=2 AND resolved_at IS NULL").fetchall()
             binding_row = rebuilt.execute(
                 "SELECT binding_id, sprint_doc_id, planner_shell_id, "
                 "session_id, generation, armed_at, released_at, release_reason "
@@ -341,6 +344,7 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.assertEqual(parked_item, ("submitting", 3, None))
         self.assertIn(("crash_window_delivery_unknown",), alerts)
         self.assertIn(("wake_batch_delivery_unknown",), alerts)
+        self.assertEqual(open_session_alerts, [])
         self.assertEqual(projected["wake_state"], "parked")
         self.assertEqual(projected["park"], {
             "batch_id": 3,

@@ -54,6 +54,25 @@ WHERE delivery='delivery_unknown'
         )
   );
 
+-- Legacy closure could leave an already-raised session alert open.  Keep the
+-- original audit row, but a fully ended session has no live actor and therefore
+-- no session-scoped alert may remain actionable.
+UPDATE planner_alerts
+SET resolved_at=(
+    SELECT s.ended_at
+    FROM interface_sessions s
+    WHERE s.session_id=planner_alerts.session_id
+)
+WHERE resolved_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM interface_sessions s
+      WHERE s.session_id=planner_alerts.session_id
+        AND s.occupancy='ended'
+        AND s.lifecycle='ended'
+        AND s.ended_at IS NOT NULL
+  );
+
 UPDATE interface_writer_leases
 SET revoked_at=COALESCE(revoked_at, datetime('now')),
     revoke_reason=COALESCE(revoke_reason, 'session_end')

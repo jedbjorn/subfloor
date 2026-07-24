@@ -61,9 +61,9 @@ class RebuildIntegrityTest(unittest.TestCase):
                 "VALUES (1,1,1,'client','hash')")
             con.execute(
                 "INSERT INTO planner_alerts "
-                "(alert_id, session_id, severity, reason, dedupe_key, resolved_at) "
+                "(alert_id, session_id, severity, reason, dedupe_key) "
                 "VALUES (42,1,'critical','crash_window_delivery_unknown',"
-                "'1|-|-|crash_window_delivery_unknown','2026-07-23 00:00:00')")
+                "'1|-|-|crash_window_delivery_unknown')")
             con.execute(
                 "INSERT INTO planner_alerts "
                 "(alert_id, session_id, severity, reason, dedupe_key) "
@@ -73,17 +73,21 @@ class RebuildIntegrityTest(unittest.TestCase):
             migration = (
                 MIGRATIONS / "0084_interface_integrity_cleanup.sql").read_text()
             con.executescript(migration)
+            first_alert = con.execute(
+                "SELECT alert_id, reason, resolved_at FROM planner_alerts "
+                "WHERE session_id=1").fetchone()
+            self.assertEqual(first_alert[:2], (
+                42, "crash_window_delivery_unknown"))
+            self.assertIsNotNone(first_alert[2])
             con.executescript(migration)
             self.assertEqual(con.execute(
                 "SELECT composer, delivery, pending_seq "
                 "FROM interface_input_state WHERE session_id=1"
             ).fetchone(), ("unknown", "delivery_unknown", 7))
             self.assertEqual(con.execute(
-                "SELECT reason, resolved_at FROM planner_alerts "
+                "SELECT alert_id, reason, resolved_at FROM planner_alerts "
                 "WHERE session_id=1"
-            ).fetchall(), [
-                ("crash_window_delivery_unknown", "2026-07-23 00:00:00")
-            ])
+            ).fetchall(), [first_alert])
             self.assertIsNone(con.execute(
                 "SELECT 1 FROM planner_alerts WHERE session_id=1 "
                 "AND resolved_at IS NULL"
@@ -97,6 +101,75 @@ class RebuildIntegrityTest(unittest.TestCase):
                 "SELECT 1 FROM planner_alerts WHERE alert_id=41"
             ).fetchone())
             con.close()
+
+    def test_rebuild_reconciles_open_ended_alert_loaded_after_migrations(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            outgoing = tmp / "shell_db.db"
+            snapshot = tmp / "content.sql"
+            apply_engine_schema(outgoing)
+            con = sqlite3.connect(outgoing)
+            con.execute(
+                "INSERT INTO users (user_id, username, is_active) "
+                "VALUES (1,'before',1)")
+            con.execute(
+                "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
+                "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
+                "VALUES (1,'Before','s1','test','sp',1,0,1,1)")
+            con.commit()
+            con.close()
+
+            snapshot.write_text(
+                "PRAGMA foreign_keys=OFF;\n"
+                "BEGIN;\n"
+                "DELETE FROM users;\n"
+                "INSERT INTO users (user_id, username, is_active) "
+                "VALUES (1,'after',1);\n"
+                "DELETE FROM shells;\n"
+                "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
+                "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
+                "VALUES (1,'After','s1','test','sp',1,0,1,1);\n"
+                "INSERT INTO interface_generations "
+                "(shell_id, generation, ended_at) "
+                "VALUES (1,1,'2026-07-20 00:00:00');\n"
+                "INSERT INTO interface_sessions "
+                "(session_id, shell_id, generation, occupancy, lifecycle, "
+                "ended_at) VALUES "
+                "(1,1,1,'ended','ended','2026-07-20 00:00:00');\n"
+                "INSERT INTO interface_input_state "
+                "(session_id, shell_id, generation, composer, delivery, "
+                "pending_seq) VALUES "
+                "(1,1,1,'unknown','delivery_unknown',7);\n"
+                "INSERT INTO planner_alerts "
+                "(alert_id, session_id, severity, reason, dedupe_key) "
+                "VALUES (42,1,'critical','crash_window_delivery_unknown',"
+                "'1|-|-|crash_window_delivery_unknown');\n"
+                "COMMIT;\n"
+                "PRAGMA foreign_keys=ON;\n"
+            )
+
+            with mock.patch.multiple(
+                rebuild,
+                ENGINE=tmp / ".super-coder",
+                DB_PATH=outgoing,
+                REPO_ROOT=tmp,
+                SNAPSHOT=snapshot,
+                SNAPSHOT_LEGACY=tmp / "missing-content.sql",
+            ), mock.patch.object(rebuild.map_repo, "main"):
+                self.assertEqual(rebuild.main(["--no-backup"]), 0)
+                self.assertEqual(rebuild.main(["--no-backup"]), 0)
+
+            con = sqlite3.connect(outgoing)
+            try:
+                alerts = con.execute(
+                    "SELECT alert_id, reason, resolved_at "
+                    "FROM planner_alerts WHERE session_id=1").fetchall()
+            finally:
+                con.close()
+            self.assertEqual(alerts, [
+                (42, "crash_window_delivery_unknown",
+                 "2026-07-20 00:00:00")
+            ])
 
     def test_valid_candidate_atomically_replaces_outgoing_db(self):
         with tempfile.TemporaryDirectory() as raw_tmp:

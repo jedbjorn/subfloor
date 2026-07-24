@@ -58,7 +58,8 @@ def startup_reconcile(con) -> dict:
               "batches_completed": 0, "leases_revoked": 0,
               "terminal_inputs_removed": 0,
               "terminal_input_parks": 0,
-              "terminal_leases_revoked": 0}
+              "terminal_leases_revoked": 0,
+              "terminal_alerts_resolved": 0}
 
     active_session = interface_state.active_session_sql("s")
 
@@ -87,6 +88,16 @@ def startup_reconcile(con) -> dict:
         interface_state.transition(
             con, "delivery", session_id, "delivery_unknown")
         counts["terminal_input_parks"] += 1
+    cur = con.execute(
+        "UPDATE planner_alerts SET resolved_at=("
+        "SELECT s.ended_at FROM interface_sessions s "
+        "WHERE s.session_id=planner_alerts.session_id) "
+        "WHERE resolved_at IS NULL AND EXISTS ("
+        "SELECT 1 FROM interface_sessions s "
+        "WHERE s.session_id=planner_alerts.session_id "
+        f"AND NOT ({active_session}))"
+    )
+    counts["terminal_alerts_resolved"] = cur.rowcount
     cur = con.execute(
         "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
         "revoke_reason='session_end' WHERE revoked_at IS NULL "

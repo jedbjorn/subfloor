@@ -336,9 +336,19 @@ def dump_table(con, table: str) -> list[str]:
     if not cols:
         return []
     collist = ", ".join(cols)
+    select_cols = list(cols)
+    if table == "planner_alerts" and "resolved_at" in cols:
+        index = cols.index("resolved_at")
+        select_cols[index] = (
+            "CASE WHEN session_id IS NOT NULL THEN COALESCE("
+            "resolved_at, (SELECT s.ended_at FROM interface_sessions s "
+            "WHERE s.session_id=planner_alerts.session_id)) "
+            "ELSE resolved_at END"
+        )
     where = SNAPSHOT_ROW_FILTERS.get(table, "")
     rows = con.execute(
-        f"SELECT {collist} FROM {table} {where} ORDER BY rowid").fetchall()
+        f"SELECT {', '.join(select_cols)} FROM {table} "
+        f"{where} ORDER BY rowid").fetchall()
     lines = [f"DELETE FROM {table};"]
     for row in rows:
         vals = ", ".join(quote(v) for v in row)
