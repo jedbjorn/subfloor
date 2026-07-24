@@ -32,13 +32,17 @@ import update  # noqa: E402
 # ENGINE_PATHS comment in update.py.
 PER_INSTANCE = {
     "instance.json", "shell_db.db", "shell_db.db-wal", "shell_db.db-shm", "map.db",
+    "source-policy.json",  # source-repo-only artifact publication policy
     "engine.manifest",  # derived hash baseline — rewritten by each materialize
 }
 
 # Tracked upstream, deliberately NOT materialized to forks (file or dir
 # prefix): assets/seed/ is super-coder-only (stripped on install) — see the
 # ENGINE_PATHS comment in engine_manifest.py.
-NOT_MATERIALIZED = (".super-coder/assets/seed/",)
+NOT_MATERIALIZED = (
+    ".super-coder/assets/seed/",
+    ".super-coder/source-policy.json",
+)
 
 
 def _covered(rel: str) -> bool:

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Rebuild the super-coder DB from git-tracked text.
+"""Rebuild the super-coder DB from public system text + instance state.
 
   1. apply schema.sql            (the v1 baseline)
   2. apply migrations/*.sql      (ordered deltas, ledger-tracked)
-  3. load .sc-state/content.sql  (per-instance content + memory)
+  3. load the active snapshot   (per-instance content + memory)
 
-The .db file is gitignored and disposable. Text serializations are the source
-of truth; the DB is a cache.
+The .db file is gitignored and disposable. Public migrations plus the active
+tracked/local instance serialization are the reconstruction source.
 
 Usage:
     python3 .super-coder/scripts/rebuild.py [--no-backup]
@@ -22,9 +22,9 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 SCHEMA_SQLITE = ENGINE / "schema.sql"
-SNAPSHOT       = REPO_ROOT / ".sc-state" / "content.sql"
 SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 import db_backup as db_backup_mod  # noqa: E402
 import db_driver    # noqa: E402
 import migrate as migrate_mod  # noqa: E402
@@ -37,10 +37,15 @@ import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
 # Writes resolve dynamically through backup_dir() so a restricted host seat can
 # fall through to SC_DB_BACKUP_DIR or the repo-local gitignored destination.
 BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
+SNAPSHOT = artifact_policy.content_path()
 
 
 def snapshot_path() -> Path:
-    return SNAPSHOT if SNAPSHOT.exists() else SNAPSHOT_LEGACY
+    artifact_policy.prepare_local_state()
+    if SNAPSHOT.exists():
+        return SNAPSHOT
+    tracked = REPO_ROOT / ".sc-state" / "content.sql"
+    return tracked if tracked.exists() else SNAPSHOT_LEGACY
 
 
 def read_existing_keys(db_path: Path | None = None) -> dict:
@@ -219,7 +224,8 @@ def main(argv: list[str]) -> int:
             finally:
                 con.close()
         else:
-            print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
+            print(f"rebuild: no {SNAPSHOT.relative_to(REPO_ROOT)} — built empty "
+                  "(no per-instance content).")
 
         # content.sql loads after migrations and older snapshots may contain
         # legacy open alerts for fully ended sessions. Reconcile the completed

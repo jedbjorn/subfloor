@@ -29,14 +29,17 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 SCHEMA = ENGINE / "schema.sql"
-CONTENT = REPO_ROOT / ".sc-state" / "content.sql"
 CONTENT_LEGACY = ENGINE / "snapshot" / "content.sql"   # pre-B7 fallback
 RENDERED = ["roadmap_sc.md", "specs_sc", "docs_sc", "skills_sc"]
 
 sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import flat  # noqa: E402
+import artifact_policy  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
+
+CONTENT = artifact_policy.content_path()
+ACTIVE_ROOT = artifact_policy.render_root()
 
 
 def _build_tracked_db(path: Path) -> None:
@@ -71,6 +74,10 @@ def _rel_files(base: Path) -> set[str]:
 
 
 def main() -> int:
+    artifact_policy.prepare_local_state()
+    if not artifact_policy.tracks_local_artifacts() and not ACTIVE_ROOT.exists():
+        print("✓ render-check: local artifact mode has no rendered instance state yet")
+        return 0
     with tempfile.TemporaryDirectory(prefix="sc-render-check-") as td:
         tmp = Path(td)
         db = tmp / "hermetic.db"
@@ -87,24 +94,25 @@ def main() -> int:
 
         # Drift = committed mirror != mirror rendered from committed source.
         rendered = _rel_files(out)
-        committed = _rel_files(REPO_ROOT)
+        committed = _rel_files(ACTIVE_ROOT)
         drifted = sorted(
             rel for rel in rendered | committed
-            if not ((out / rel).is_file() and (REPO_ROOT / rel).is_file()
-                    and (out / rel).read_bytes() == (REPO_ROOT / rel).read_bytes())
+            if not ((out / rel).is_file() and (ACTIVE_ROOT / rel).is_file()
+                    and (out / rel).read_bytes() == (ACTIVE_ROOT / rel).read_bytes())
         )
         if drifted:
             sys.stderr.write(
-                "✗ render drift: the committed flat _sc mirror does not match the\n"
-                "  mirror rendered from the tracked sources (schema + migrations +\n"
-                "  .sc-state/content.sql). A source edit was committed without\n"
+                "✗ render drift: the active flat _sc mirror does not match the\n"
+                "  mirror rendered from the active sources (schema + migrations +\n"
+                f"  {CONTENT.relative_to(REPO_ROOT)}). A source edit was made without\n"
                 "  re-rendering the mirror.\n\n  drifted:\n"
                 + "".join(f"    {p}\n" for p in drifted)
-                + "\n  fix:  ./sc rebuild && ./sc render flat && git add "
-                + " ".join(RENDERED) + "\n"
+                + "\n  fix:  ./sc rebuild && ./sc render flat"
+                + (" && git add " + " ".join(RENDERED)
+                   if artifact_policy.tracks_local_artifacts() else "") + "\n"
             )
             return 1
-    print("✓ render-check: flat _sc mirror matches the render of the tracked sources")
+    print("✓ render-check: flat _sc mirror matches the render of the active sources")
     return 0
 
 

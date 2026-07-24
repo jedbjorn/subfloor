@@ -56,6 +56,7 @@ from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
@@ -287,7 +288,7 @@ def ensure_worktree(work_dir: Path, shortname: str) -> None:
 
 
 def link_worktree_map(work_dir: Path) -> "str | None":
-    """Point a shell worktree's .sc-state/map.db at the ROOT's map DB.
+    """Point a shell worktree's compatibility map path at the active map DB.
 
     The dr_* repo map is a single derived cache at the main repo root (built by
     `./sc map`; read by map_db.py / compose.py via __file__, so writers + the
@@ -306,7 +307,7 @@ def link_worktree_map(work_dir: Path) -> "str | None":
     root, where `./sc map` then populates it."""
     sc_state = work_dir / ".sc-state"
     link = sc_state / "map.db"
-    target = REPO_ROOT / ".sc-state" / "map.db"
+    target = artifact_policy.map_db_path()
     try:
         sc_state.mkdir(parents=True, exist_ok=True)
         if link.is_symlink():

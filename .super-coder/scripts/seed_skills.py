@@ -40,11 +40,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import artifact_policy
+
 ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
 DB_PATH = ENGINE / "shell_db.db"
-RETIRED_FILE = ENGINE.parent / ".sc-state" / "skills_retired.json"
+RETIRED_FILE = artifact_policy.retired_skills_path()
 
 
 def sql_str(v) -> str:
@@ -131,6 +133,7 @@ def retired_skill_names() -> list[str]:
     so retirement must live OUTSIDE the DB and be re-applied after each sync —
     same shape as the flavor overlays (#247). Loud on a malformed file: a
     silently-ignored list means superseded skills quietly come back."""
+    artifact_policy.prepare_local_state()
     if not RETIRED_FILE.exists():
         return []
     try:

@@ -571,11 +571,13 @@ Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
 map. You alone do three things: **configure** how this repo is mapped, **wire**
 the automation that keeps it fresh, **heal** both on drift.
 
-Map db = `.sc-state/map.db`, separate from the engine memory db
+Map db = `.sc-state/map.db` in tracked mode or
+`.sc-state/local/map/map.db` in local mode, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
 map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
 map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/map_content.sql` on snapshot (admin/GUI step — see Standing jobs)
+`.sc-state/map_content.sql` (tracked mode) or
+`.sc-state/local/map/content.sql` (local mode) on snapshot (admin/GUI step — see Standing jobs)
 and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
@@ -606,9 +608,9 @@ and reload on a fresh map db.
    Eyeball the top-level dirs -> anything mis-classified, or a
    generated/vendored dir being indexed?
 
-2. **Author `.sc-state/map.config.json`** — authored content (tracked,
-   per-fork, survives `sc update`; lives in `.sc-state/`, outside the
-   gitignored engine dir). All keys optional; each merges over `map_repo.py`
+2. **Author the active map config** — `.sc-state/map.config.json` in tracked
+   mode or `.sc-state/local/map/config.json` in local mode. It is per-instance
+   and survives `sc update`. All keys optional; each merges over `map_repo.py`
    defaults:
    ```json
    {
@@ -1197,7 +1199,10 @@ re-decide a settled choice.
 Write through `sc mem doc add` (routes through the engine API): `--body-file`
 reads the markdown from a file (no shell-escaping a long body); `--seq`
 auto-increments within `(feature, kind)`; it renders + snapshots for you
-(pipeline = the `snapshot` skill):
+(pipeline = the `snapshot` skill). The render+snapshot is serialized by one
+in-process API lock — sufficient because these artifacts only ever come from
+manual admin-shell or GUI actions (single writer by design; cross-process
+concurrency is out of scope for v1, decision #20 / roadmap #21).
 ```
 # a doc against a feature (kind=''doc''); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
@@ -1770,6 +1775,8 @@ NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
 - `/.super-coder/` is gitignored — never force-add anything under it.
 - Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
 - From a worktree, commit only your project''s own files. Do NOT hand-commit `.sc-state/content.sql` (serialized DB memory), `.sc-state/engine.ref` (engine pin), or the tracked `_sc` renders — `sc` writes them to the main checkout root, so they aren''t in your worktree to stage. They enter the repo via Publish (below).
+- If `artifact_mode=local`, snapshot/render outputs live under ignored
+  `.sc-state/local/`; Publish persists them without creating a Git commit or PR.
 - Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
 
 ## After DB work — `sc mem` is already saved; Publish is separate
@@ -1777,6 +1784,9 @@ NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
 An `sc mem` write lands in the shared engine DB immediately (visible to every shell) and `sc rebuild` restores it from the serialized snapshot — there is no per-shell save step. NEVER run `sc snapshot` from a worktree — it refuses by design (`snapshot: refused — serializing to the shared main tree is an admin/GUI step`).
 
 Getting DB text into the repo = the Publish flow (snapshot -> render -> commit -> push -> PR on `sc_gui_content`): the GUI **Publish** button, or the admin shell on `main` running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills changed). Output lands at the main checkout root, NOT your worktree — don''t try to commit `content.sql` or `_sc` renders onto your branch. Feature-branch PRs carry project files; DB content publishes separately. See the `snapshot` skill.
+
+That paragraph is tracked-mode behavior. In local mode the same snapshot/render
+commands remain the durability step, but no content publication is attempted.
 
 ## Notes
 
@@ -1949,6 +1959,14 @@ Stale guidance (skill says X, engine does Y) files the same as a crash.
 ## Capture — while the failure is on screen
 
 - **engine ref** = `cat .sc-state/engine.ref` — first line of every report
+- **staleness** = compare that ref to upstream head:
+  `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
+  `current` or `behind head <sha7>`. Behind + the symptom is a missing
+  command or a skill/engine mismatch -> the fix may already be shipped:
+  ask your FnB for `./sc update` first, and file only if the defect
+  survives the update (or updating isn''t an option — then the staleness
+  note carries that caveat). Triage reads this line to tell a live
+  engine defect from a stale fork build.
 - **fork + seat**: repo name, shell flavor, sandbox/host
 - **ran / followed**: the exact command, or skill name + step
 - **expected vs actual**: exact output, trimmed to the failing lines
@@ -1966,7 +1984,7 @@ gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
 gh issue create --repo jedbjorn/subfloor \
   --title "[<fork>] <area>: <symptom>" \
   --body "$(cat <<''EOF''
-- engine ref: <sha from .sc-state/engine.ref>
+- engine ref: <sha from .sc-state/engine.ref> · <current | behind head <sha7>>
 - fork/seat: <repo> · <shell flavor> · <sandbox|host>
 
 **Ran / followed:** <command or skill+step>
@@ -2056,14 +2074,16 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn''t
-   own) into `.sc-state/content.sql` — what survives `sc update` and
+   own) into the active snapshot (`.sc-state/content.sql` in tracked mode,
+   `.sc-state/local/content.sql` in local mode) — what survives `sc update` and
    `sc rebuild`; the row + grants reconstruct from content.sql. Skip this ->
    the skill is lost on next update.
 
-5. **Commit.** Run `sc render-check` first — hermetic rebuild, fails if the
+5. **Finish.** Run `sc render-check` first — hermetic rebuild, fails if the
    `skills_sc/` mirror drifts from the DB render (the CI guard; see the
-   `snapshot` skill). Then stage `.sc-state/content.sql` + `skills_sc/`
-   together — snapshot without re-rendered mirror = the drift.
+   `snapshot` skill). In tracked mode, stage `.sc-state/content.sql` +
+   `skills_sc/` together. In local mode both stay ignored; only engine-owned
+   assets/migrations are committed.
 
 ## Updating a skill
 
@@ -2901,7 +2921,7 @@ you.
 4. **Record the crossing.** Append a narrative entry — identity event for a
    shell that updates its own floor. Note what changed + write the handoff.
 
-5. **Commit the full regenerated set — NEVER a bare `engine.ref` bump.**
+5. **Commit the full public set.**
    Stage every tracked file the update regenerated: `.sc-state/content.sql`
    (refreshed memory) + `.sc-state/engine.ref` (the pin) + the root `sc`
    dispatcher if it changed + any `_sc` renders. `sc` is the live tracked
@@ -2909,6 +2929,9 @@ you.
    engine just pinned, silently dropping commands the new engine ships.
    `.super-coder/` and `engine.ref.prev` are gitignored — nothing to commit
    there.
+   With `artifact_mode=local`, `content.sql` and `_sc` renders stay under
+   ignored `.sc-state/local/`; commit the engine pin/dispatcher and other
+   genuinely public files only.
    - **Render conflict** (committing via PR while main advances):
      `content.sql` + `_sc` renders are serialized DB state and collide with a
      concurrent publisher. NEVER hand-merge serialized SQL — live DB canonical,
@@ -2952,7 +2975,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'snapshot',
-  'Serialize DB work to git-tracked text via sc snapshot / sc render. The .db is the live shared source of truth; serializing writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.',
+  'Serialize DB work via sc snapshot / sc render under the instance artifact policy. Tracked mode publishes through Git; local mode persists under .sc-state/local without creating content commits.',
   'substrate',
   'sc snapshot',
   0,
@@ -2960,7 +2983,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Live `shell_db.db` = the single source of truth shared by every shell; a
 `sc mem` write is durable + visible to all shells the instant it commits. The
-`.db` is gitignored and reconstructs from git-tracked text on `sc rebuild` —
+`.db` is gitignored and reconstructs from schema, migrations, and the active
+per-instance snapshot on `sc rebuild` —
 an edit not yet serialized is discarded by a rebuild.
 
 Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
@@ -2978,21 +3002,26 @@ admin/GUI path.
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `sc seed-skills` |
-| `.sc-state/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants. Tracked, fork-owned, kept OUTSIDE the gitignored engine dir | no (stays local) | `sc snapshot` |
+| `.sc-state/content.sql` (tracked mode) or `.sc-state/local/content.sql` (local mode) | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only) | `sc snapshot` |
 
 The split: system content propagates via migrations; per-instance content stays
 in the snapshot. Skill *bodies* = system (migration); which shell is *granted*
 a skill = per-instance (snapshot).
 
+`artifact_mode` lives in `.super-coder/instance.json` and accepts `tracked` or
+`local`; downstream forks default to `tracked`. Local mode still snapshots and
+renders, but writes beneath `.sc-state/local/` (ignored) and Publish creates no
+Git branch, commit, or PR.
+
 ## When admin serializes (the GUI Publish button does all of this)
 
 All commands require `SC_ADMIN=1`, run from the main checkout.
 
-1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to
-   `.sc-state/content.sql`. Deterministic DELETE-then-INSERT in PK order ->
+1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to the active
+   snapshot path. Deterministic DELETE-then-INSERT in PK order ->
    re-running is byte-identical -> clean diffs.
 
-2. `SC_ADMIN=1 sc render` -> regenerates the tracked flat `_sc` files
+2. `SC_ADMIN=1 sc render` -> regenerates the flat `_sc` files
    (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run
    after changing a document body, the roadmap, or skills. Incremental —
    unchanged files not rewritten. (`.claude/skills/` rebuilds at boot and is
@@ -3007,12 +3036,13 @@ All commands require `SC_ADMIN=1`, run from the main checkout.
    `render-check`''s rebuild-first catches the stale mirror the live-DB render
    silently passed.
 
-4. Publish — do NOT hand-commit from a shell branch. snapshot/render write
+4. In tracked mode, Publish writes
    `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
    main checkout root (where the shared engine + DB live), not your worktree —
    they are not yours to stage. GUI **Publish** = snapshot -> render -> commit
    -> push -> PR on `sc_gui_content`; the admin shell on `main` may commit them
-   directly. NEVER commit the `.db` or anything under the gitignored
+   directly. In local mode it only snapshots/renders and reports that nothing
+   was published. NEVER commit the `.db` or anything under the gitignored
    `.super-coder/` engine dir. (super-coder SOURCE repo only: `schema.sql` +
    `migrations/` are tracked and committed here too.)
 
@@ -3025,9 +3055,9 @@ All commands require `SC_ADMIN=1`, run from the main checkout.
   *and* (source repo only) regenerates the seed migration. Not the snapshot.
   See `seed_skills.py`.
   - Sequence: `sc seed-skills && sc render`, then `sc render-check` before
-    committing. Commit the regenerated `migrations/0001_seed_skills.sql` +
-    the re-rendered `skills_sc/` mirror together — migration without mirror =
-    the drift.
+    committing. In tracked mode commit the regenerated
+    `migrations/0001_seed_skills.sql` + re-rendered `skills_sc/` mirror together.
+    In local mode only the migration is public; the mirror stays ignored.
 
 Steps 1–3 = durability (a `sc rebuild` cannot lose serialized work). Step 4 =
 the GUI Publish button; you rarely commit this text by hand.
@@ -3304,7 +3334,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'sprint',
-  'Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.',
+  'Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Wake ops (status, alerts, retry) are provider-neutral reads/recovery on the planner''s binding — a parked batch is never resubmitted, only requeued as a NEW gated batch. Load when a sprint task message names you a participant.',
   'craft',
   NULL,
   0,
@@ -3608,6 +3638,21 @@ between two units — are yours to catch.
 5. **Stand down** when the planner confirms receipt (a re-run on fix
    units arrives as a fresh scoped `task` row).
 
+## Wake ops (participant view)
+
+The planner''s wake machinery has operator surfaces you can read too —
+provider-neutral, identical on every harness: `./sc sprint status`
+(binding armed/released, sprint ACTIVE/frozen, batch state, park and
+quarantine reasons) and `./sc sprint alerts` (the only window into wake
+failures — session-loss, retries exhausted, quarantine,
+unmanaged-writer; deduplicated while open). When the loop looks stalled,
+check both before reporting a stall: an open critical alert already
+names it. Recovery is the planner''s/operator''s action —
+`./sc sprint retry --binding <id>` requeues a parked batch as a NEW
+gated batch and NEVER resubmits the park — so a parked or quarantined
+wake goes to the planner as a `result` row, never a hand-rolled
+resubmission of your own.
+
 ## Stance
 
 - No scheduled polling, ever: `task` rows and headless boots wake you;
@@ -3618,6 +3663,9 @@ between two units — are yours to catch.
   CI-vs-CI on one runner.
 - Register the watch in the same step that opens the PR — an unwatched PR
   is a silent link, and silent links revert the sprint to polling.
+- A parked wake is never resubmitted — retry requeues it as a NEW gated
+  batch; parks and quarantines are reported to the planner, never
+  worked around.
 - Report state transitions (`building → pr-open → in-review → fixing →
   merged`) as `result` rows, one line each — not progress prose. The
   unit report at merge is the one sanctioned multi-line row.
@@ -3634,7 +3682,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'sprint_orchestration',
-  'Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.',
+  'Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Wake ops are provider-neutral: arm the binding before the first wake, monitor `sc sprint status`/`alerts`, retry parks as NEW gated batches (never resubmit), close releases bindings and cancels queued wake work. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.',
   'craft',
   NULL,
   0,
@@ -3678,20 +3726,100 @@ that exist, reviewer bandwidth, how wide the dependency graph genuinely
 runs — and make the call. More units than shells is fine (units queue
 behind the chain); more shells than parallel work is waste.
 
-**The model & provider interview — exactly two questions to the FnB:**
+**The model & provider interview — two routine routing questions to the FnB:**
 
 1. **Devs** — which harness and model? One answer; every dev in the
    sprint runs it.
 2. **Reviewers** — which harness and model? One answer; every reviewer
    runs it.
 
+**Billing gate — Plan billing by default; observe, never mutate auth.** NEVER
+unset, scrub, replace, or print a credential. Before resolving models, classify
+the chosen harness exactly:
+
+```sh
+# OpenAI / Codex: exit 0 = plan; 10 = API override; 11 = persisted auth unknown.
+(
+  if [ -n "${CODEX_API_KEY+x}" ]; then
+    echo "billing=api source=CODEX_API_KEY"; exit 10
+  fi
+  status="$(codex login status 2>&1)"
+  if [ "$status" = "Logged in using ChatGPT" ]; then
+    echo "billing=plan source=ChatGPT"; exit 0
+  fi
+  echo "billing=api-or-unknown source=persisted-login"; exit 11
+)
+
+# Anthropic / Claude: exit 0 = plan; 10 = API key; 11 = unknown auth.
+claude auth status --json 2>/dev/null |
+  python3 -c ''import json,sys
+try: s=json.load(sys.stdin)
+except Exception: print("billing=unknown"); raise SystemExit(11)
+key=s.get("apiKeySource"); plan=s.get("loggedIn") and s.get("authMethod") == "claude.ai" and s.get("apiProvider") == "firstParty" and s.get("subscriptionType") and not key
+print("billing=plan source=claude.ai" if plan else ("billing=api source=" + str(key) if key else "billing=unknown")); raise SystemExit(0 if plan else (10 if key else 11))''
+```
+
+Exit 0 + `billing=plan` -> launch normally. Exit 10 -> hold and ask the FnB to
+authorize the metered route. Exit 11 -> hold until the FnB corrects the login or
+explicitly authorizes the unknown route. Model/harness selection is not billing
+permission.
+
+Ask in the planner turn, then stop before booting the worker:
+
+```
+Billing approval required: provider=<openai|anthropic> mode=<api|extra-usage> route=<harness/model> scope=<shell/unit/role/sprint> cap=<amount|provider limit|not specified> expires=<one launch|time|sprint close>. Authorize this metered run?
+```
+
+Only an explicit affirmative FnB reply counts. Silence, prior model selection,
+or an approval for another provider/scope does not. Default scope = one launch;
+broader authority must be stated explicitly.
+
+Record an approval before launching:
+
+```
+billing-exception: provider=<openai|anthropic> mode=<api|extra-usage> scope=<role, unit, or whole sprint> cap=<amount or provider limit> expires=<time or sprint close> approved-by=FnB
+```
+
+After approval, run the ordinary resolved `./sc run ...` command with the
+current environment unchanged; this preserves the credential the FnB approved.
+No matching, unexpired approval -> do not launch the metered route.
+
+CLI auth cannot see account-side overage controls. Do not claim Extra Usage was
+validated. If the provider reports an included-plan limit or offers paid
+continuation, hold and request the same scoped approval. Automatic overage is an
+FnB-owned account policy: treat it as permission only when the sprint doc records
+its scope/cap/expiry; otherwise the FnB keeps it disabled for plan-only sprints.
+
+`sc models resolve` proves callability, not billing; run it only after this gate.
+
 Flavor-uniform by design: shells of a flavor are interchangeable workers,
 and one answer per flavor keeps the board readable and the review lineage
 coherent — reviewers stay a different lineage from the code they gate,
 chosen per sprint instead of per boot. No answer -> `flavor_defaults`,
-unchanged (omit the `models:` line). The answers parameterize every
-`./sc run` you issue for this sprint. Per-unit model mixing is out of
-scope — the interview covers the real need, provider choice per role.
+unchanged (omit the `models:` line). Every sprint worker still runs at high
+effort. Per-unit model mixing is out of scope — the interview covers the real
+need, provider choice per role.
+
+**Resolve each answered route before declaring it.** Lazy-load only the two
+choices the FnB made — never trust a display name or translate a provider id by
+hand:
+
+```
+sc models resolve <devs-harness> <devs-model>
+sc models resolve <reviewers-harness> <reviewers-model>
+```
+
+Each must return `route:` plus an exact `call:` ending in `--effort high`.
+Failure means the selector is not locally callable, the harness lacks a
+headless/high-effort seam, or Refresh models has not seen it. Run
+`sc models list <harness>` for the local choices; the FnB''s **Refresh models**
+button in `/#shells` repopulates the same runtime table. Resolve again after a
+refresh. Never silently fall back across a provider or lineage.
+
+Common exact selectors: Claude aliases (`fable`, `opus`) and Codex ids
+(`gpt-5.6-sol`, `gpt-5.6-terra`) pass directly. Kimi takes the configured alias
+shown by `sc models list kimi` (for example `kimi-code/k3`), never the bare
+provider model `k3`.
 
 Write the board as a `documents` row:
 
@@ -3756,8 +3884,8 @@ sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. D
 # reviewers — assigned units, the severity bar:
 sc mem message send <reviewer> "SPRINT <doc-id>: you review units <seq,seq> — Major/Medium block, Low goes to the report. Load the sprint skill (reviewer slot). Review requests come to you directly as units go green." --kind task
 
-# boot each first-in-chain dev headless, with the sprint''s models:
-./sc run <dev> --harness <devs-harness> -m <devs-model>
+# boot each first-in-chain dev with the RESOLVED selector; high is invariant:
+./sc run <dev> --harness <devs-harness> -m <devs-model> --effort high
 ```
 
 `./sc run` renders the shell''s boot doc and drains its inbox
@@ -3820,6 +3948,74 @@ stay silent and the call stands. Either way log the call + outcome the
 moment it arrives — the sprint report lists every one, and calls
 reconstructed at close-out from old messages are calls lost.
 
+## Wake operations (Interface-backed planner wake)
+
+Provider-neutral operator workflow for the wake machinery — identical on
+every harness (claude / codex / kimi); there are no provider-specific
+steps. The operator surfaces are `sc sprint status` / `alerts` / `retry`
+and the Interface tab''s Sprint wake panel; both read the same API
+projection. None of it is scheduled polling — they are on-demand reads of
+durable state, and the events still wake you.
+
+- **Arm before the sprint''s first wake.** Once your Interface chat is
+  live, start one arm attempt by generating an attempt nonce once:
+
+  ```sh
+  arm_attempt_id="$(python3 -c ''import secrets; print(secrets.token_hex(16))'')"
+  ```
+
+  Retain that value until the attempt ends, then arm the binding with the
+  required idempotency header:
+
+  ```http
+  POST /api/interface/sprint-bindings
+  Idempotency-Key: sprint-bind-<sprint-doc-id>-<planner-shell-id>-<arm-attempt-id>
+
+  {"sprint_doc_id": <sprint-doc-id>, "planner_shell_id": <planner-shell-id>}
+  ```
+
+  Reuse that exact caller-stable key only for retries of this arm attempt,
+  including after an ambiguous transport failure. A successful release or a
+  conclusive refusal ends the attempt. Generate a new `arm_attempt_id` for
+  every later arm or re-arm; reusing a released attempt''s key would replay its
+  released binding and leave the sprint unarmed. Never generate a timestamp or
+  random value separately for each transport retry. A shell may arm only
+  itself; the operator may arm any planner. Arming is fail-closed: a frozen or
+  non-ACTIVE doc, a mandatory-hook gap, or a second ACTIVE binding is refused.
+  PR watches registered with `--sprint <doc-id>` ride the binding — an unarmed
+  binding means `pr_event` rows arrive but nothing wakes you.
+- **Monitor wake status.** `./sc sprint status` shows binding
+  armed/released, the sprint doc ACTIVE/frozen, the derived wake state
+  (armed/queued/submitting/running/parked), the current batch, the last
+  wake outcome, and the park/quarantine reason. The Interface tab''s
+  Sprint wake panel on your session shows the same projection.
+- **Read the alerts.** `./sc sprint alerts` (+ the Interface alert
+  panel) is the ONLY window into wake failures — session-loss,
+  delivery_unknown parks, pre-send retries exhausted, quarantine,
+  unmanaged-writer. Alerts are deduplicated while open; an open critical
+  alert means the loop is NOT healthy no matter how quiet the inbox
+  looks. Investigate the alert before concluding a stall is a shell''s
+  fault.
+- **Retry a park — never resubmit it.** A parked (`delivery_unknown`)
+  batch is never sent again: the parking invariant is law.
+  `./sc sprint retry --binding <id>` closes the park as audit, returns
+  its items to queued, and the coordinator forms a NEW batch that
+  re-gates everything (idle, clean composer, quiet, hooks healthy,
+  sprint ACTIVE) before a byte moves. When the input frame itself is
+  parked, retry needs your verdict on what reached the pane:
+  `--outcome delivered|not_delivered`. The Interface panel offers the
+  same action (Retry wake / Retry — input landed / Retry — input lost).
+- **Quarantine is yours to drain by hand.** An item that survives three
+  completed wake turns quarantines and alerts without blocking newer
+  work — read that message yourself and act on it; the wake machinery
+  deliberately leaves it alone.
+- **Close cleanly.** Setting `status: CLOSED` on the board (and the
+  freeze after it) releases the binding and cancels queued wake work in
+  the same transaction — no orphan armed binding, no stranded queued
+  batch survives the close. Messages stay unread; the Interface chat is
+  untouched. Verify with `./sc sprint status --all`: every binding of
+  the sprint shows released.
+
 ## Step 4: Unblock
 
 Stalls and the moves:
@@ -3839,13 +4035,14 @@ Stalls and the moves:
   fix unit at the front of the chain, resume when green.
 - **Review stall** (unit sitting `in-review` while its reviewer is idle):
   boot the reviewer — `./sc run <reviewer> --harness <reviewers-harness>
-  -m <reviewers-model>`; its inbox holds the review request. Still stuck
+  -m <reviewers-model> --effort high`; its inbox holds the review request. Still stuck
   -> reassign the unit to another reviewer. Severity dispute (dev says
   Low, reviewer says Medium) -> rule by message immediately — a chain
   waiting on a classification argument is pure loss. Dispute about what
   the unit *should do* -> FnB.
-- **Link gone quiet** (no `result` row, no `pr_event` movement): boot it —
-  `./sc run <shortname>` drains its inbox and acts; that IS the nudge in
+- **Link gone quiet** (no `result` row, no `pr_event` movement): boot it with
+  its declared sprint route — `./sc run <shortname> --harness <role-harness>
+  -m <role-model> --effort high` drains its inbox and acts; that IS the nudge in
   an event-driven sprint. The liveness guard refusing (session already
   live) + still silent -> escalate to the FnB with the worktree state.
   The bottleneck question in Step 3 is what surfaces a dead link.
@@ -3884,7 +4081,7 @@ When every unit is `merged` and `main` is green:
 
    ```
    sc mem message send <reviewer> "SPRINT <doc-id>: conformance pass — spec doc <spec-id>, main @ <merge-sha><, sections <scope> if sharded>. Ratified judgement calls: <list — the only narrative input>. Load the sprint skill (conformance slot)." --kind task
-   ./sc run <reviewer> --harness <reviewers-harness> -m <reviewers-model>
+   ./sc run <reviewer> --harness <reviewers-harness> -m <reviewers-model> --effort high
    ```
 
    The shell judges the spec against the code on `main` — never the

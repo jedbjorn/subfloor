@@ -20,6 +20,7 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import flat  # noqa: E402
 from _serialize_guard import require_admin  # noqa: E402
@@ -72,6 +73,7 @@ def main(argv: list[str]) -> int:
         if mode == "flat":
             require_admin("render flat")
             _heal_fresh(con)
+            artifact_policy.prepare_local_state()
             _report("flat", flat.render_visibility(con))
         elif mode in ("skills", "all"):
             if len(argv) < 2:
@@ -79,6 +81,7 @@ def main(argv: list[str]) -> int:
             if mode == "all":
                 require_admin("render flat")
                 _heal_fresh(con)
+                artifact_policy.prepare_local_state()
                 _report("flat", flat.render_visibility(con))
             shell_id = _resolve_shell(con, argv[1])
             _report(f"skills[{argv[1]}]", flat.render_skill_md(con, shell_id))

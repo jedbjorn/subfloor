@@ -12,11 +12,13 @@ Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
 map. You alone do three things: **configure** how this repo is mapped, **wire**
 the automation that keeps it fresh, **heal** both on drift.
 
-Map db = `.sc-state/map.db`, separate from the engine memory db
+Map db = `.sc-state/map.db` in tracked mode or
+`.sc-state/local/map/map.db` in local mode, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
 map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
 map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/map_content.sql` on snapshot (admin/GUI step — see Standing jobs)
+`.sc-state/map_content.sql` (tracked mode) or
+`.sc-state/local/map/content.sql` (local mode) on snapshot (admin/GUI step — see Standing jobs)
 and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
@@ -47,9 +49,9 @@ and reload on a fresh map db.
    Eyeball the top-level dirs -> anything mis-classified, or a
    generated/vendored dir being indexed?
 
-2. **Author `.sc-state/map.config.json`** — authored content (tracked,
-   per-fork, survives `sc update`; lives in `.sc-state/`, outside the
-   gitignored engine dir). All keys optional; each merges over `map_repo.py`
+2. **Author the active map config** — `.sc-state/map.config.json` in tracked
+   mode or `.sc-state/local/map/config.json` in local mode. It is per-instance
+   and survives `sc update`. All keys optional; each merges over `map_repo.py`
    defaults:
    ```json
    {

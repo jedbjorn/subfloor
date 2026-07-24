@@ -22,8 +22,8 @@ _root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/n
 ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
-MAPDB="$ROOT/.sc-state/map.db"
 S="$ENGINE/scripts"
+MAPDB="$("$PY" "$S/artifact_policy.py" path map-db)"
 
 # Python for the Interface verbs: PREFER an interpreter with `websockets`
 # (baked into the sandbox image's own python and pinned in requirements.txt
@@ -992,6 +992,7 @@ case "$cmd" in
   update-harnesses) exec "$PY" "$S/install.py" --update-harnesses ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
+  artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
   eject)        exec "$PY" "$S/eject.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
@@ -1029,7 +1030,7 @@ case "$cmd" in
   render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
   render-check) exec "$PY" "$S/render_check.py" ;;
   map)          case "${1:-}" in
-                  -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue (.sc-state/map.db); takes no arguments"
+                  -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue ($MAPDB); takes no arguments"
                              exit 0 ;;
                   ?*)        echo "sc map: unknown argument '$1' (takes none; -h for usage)" >&2
                              exit 2 ;;
@@ -1296,6 +1297,28 @@ case "$cmd" in
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
     "$PY" "$S/rebuild.py"
+    # The engine source intentionally carries no per-instance snapshot in local
+    # artifact mode. Exercise the real fresh-fork initialization path before
+    # the headless boot when rebuild therefore produced an empty instance.
+    if "$PY" - "$DB" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+try:
+    populated = con.execute(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE is_active=1) "
+        "AND EXISTS(SELECT 1 FROM shells WHERE COALESCE(is_deleted,0)=0)"
+    ).fetchone()[0]
+finally:
+    con.close()
+raise SystemExit(0 if populated else 1)
+PY
+    then
+      :
+    else
+      "$PY" "$S/init_fork.py" --username verify
+    fi
     SC_ADMIN=1 "$PY" "$S/render.py" flat
     RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
@@ -1318,7 +1341,7 @@ super-coder — forkable shell substrate
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
-  ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
+  ./sc snapshot            dump per-instance tables under the active artifact policy
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
@@ -1358,9 +1381,10 @@ super-coder — forkable shell substrate
                              Only for procedures with no API surface (map authoring) where a skill names it
   ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
                              shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
-                             list (.sc-state/skills_retired.json, rides updates); snapshot after writes to persist
-  ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
-  ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
+                             list (active tracked/local retire path, rides updates); snapshot after writes to persist
+  ./sc artifact-mode       show · set tracked|local — tracked is the downstream default; local persists beneath ignored .sc-state/local/
+  ./sc render              render flat _sc files under the active artifact policy
+  ./sc render-check        fail if the active flat _sc files drift from the DB render (hermetic check)
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
   ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)

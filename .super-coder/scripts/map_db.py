@@ -24,11 +24,13 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import artifact_policy
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-MAP_DB_PATH = REPO_ROOT / ".sc-state" / "map.db"
+MAP_DB_PATH = artifact_policy.map_db_path()
 MAP_SCHEMA = ENGINE / "map_schema.sql"
-MAP_CONTENT = REPO_ROOT / ".sc-state" / "map_content.sql"
+MAP_CONTENT = artifact_policy.map_content_path()
 ENGINE_DB = ENGINE / "shell_db.db"  # legacy source of pre-split dr_section
 
 
@@ -87,6 +89,7 @@ def seed_authored(con: sqlite3.Connection) -> None:
 def connect(*, seed: bool = True) -> sqlite3.Connection:
     """Open the map DB (creating + schema-applying if absent), row_factory set.
     When `seed`, also load the authored layer into a fresh DB."""
+    artifact_policy.prepare_local_state()
     MAP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(MAP_DB_PATH)
     con.row_factory = sqlite3.Row

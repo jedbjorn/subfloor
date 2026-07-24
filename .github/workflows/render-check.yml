@@ -1,10 +1,9 @@
 name: render-check
 
-# Guard against rendered-mirror drift. The flat _sc files (skills_sc/, specs_sc/,
-# docs_sc/, roadmap_sc.md) are RENDERED from the DB; their source lives in
-# assets/skills/*, the seed migration, and content.sql. A source edit committed
-# without re-rendering the mirror drifts it silently (see #57 → db_map.md). This
-# job rebuilds the DB from committed text, re-renders, and fails on any diff.
+# Guard both artifact modes. Tracked-mode forks compare their flat mirror with a
+# hermetic render; this source repo uses local mode, so CI instead proves the
+# public skill seed/migrations reconstruct the current engine catalogue without
+# requiring any maintainer snapshot or rendered instance files in Git.
 
 on:
   pull_request:
@@ -19,7 +18,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Rebuild the DB from committed text (schema + migrations + content.sql)
+      - name: Rebuild the DB from public system text
         run: ./sc rebuild
+      - name: Prove public skill migrations match engine assets
+        run: python3 tests/test_skills_freshness.py
       - name: Fail if the flat _sc mirror drifts from the DB render
         run: ./sc render-check

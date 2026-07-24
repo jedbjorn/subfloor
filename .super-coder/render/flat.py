@@ -5,9 +5,9 @@ Two render targets live here, both pure (read DB, write files — never the
 reverse):
 
   • Flat `_sc` visibility files — `specs_sc/`, `docs_sc/`, `skills_sc/`,
-    `roadmap_sc.md` at the repo root. These are TRACKED (committed) and exist
-    for the outsider FnB browsing the repo without localhost. The `_sc` suffix
-    flags provenance and avoids colliding with a host repo's own `/docs`.
+    `roadmap_sc.md`. Tracked mode writes them at the repo root; local mode writes
+    the same logical tree beneath ignored `.sc-state/local/renders/`. The `_sc`
+    suffix flags provenance and avoids colliding with a host repo's own `/docs`.
     DB → flat is one-way; the files are never read back.
 
   • Harness skills — `.claude/skills/<name>/SKILL.md` for the booting shell's
@@ -30,10 +30,13 @@ DB alone.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
+sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 
 # The do-not-edit banner (spec §Content & Render). No timestamp — render must be
 # deterministic so unchanged DB → unchanged file → clean diff.
@@ -76,6 +79,17 @@ def _write_if_changed(path: Path, content: str, written: list, skipped: list) ->
     written.append(path)
 
 
+def _document_target(root: Path, rel: str, kind: str) -> Path:
+    """Confine DB-authored render paths to their managed visibility folder."""
+    path = Path(rel)
+    expected = "specs_sc" if kind == "spec" else "docs_sc"
+    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != expected:
+        raise ValueError(
+            f"invalid {kind} render_path {rel!r}; expected a relative path under {expected}/"
+        )
+    return root / path
+
+
 # ── Flat visibility render ────────────────────────────────────────────────────
 
 def _render_documents(con, written, skipped, root: Path) -> None:
@@ -107,7 +121,8 @@ def _render_documents(con, written, skipped, root: Path) -> None:
             f"roadmap_status: {r['roadmap_status'] or ''}",
             f"frozen: {'true' if r['frozen'] else 'false'}",
         ]
-        _write_if_changed(root / rel, with_banner(r["body"], extra),
+        _write_if_changed(_document_target(root, rel, r["kind"]),
+                          with_banner(r["body"], extra),
                           written, skipped)
 
 
@@ -208,13 +223,15 @@ def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
 
 
 def render_visibility(con: sqlite3.Connection, root: "Path | None" = None) -> dict:
-    """Render the tracked flat `_sc` visibility files. Returns a written/skipped
+    """Render flat `_sc` visibility files under the active artifact root.
+
+    Returns a written/skipped
     summary. Incremental: unchanged artifacts are not rewritten.
 
-    `root` overrides the write base (defaults to the real REPO_ROOT). The
+    `root` overrides the write base (defaults to the active artifact root). The
     hermetic render-check passes a temp dir so it can render the committed
     SOURCE and diff it against the committed mirror without touching the tree."""
-    root = root or REPO_ROOT
+    root = root or artifact_policy.render_root()
     written: list[Path] = []
     skipped: list[Path] = []
     _render_documents(con, written, skipped, root)

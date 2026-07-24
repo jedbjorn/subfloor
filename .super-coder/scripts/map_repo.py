@@ -28,6 +28,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+import artifact_policy  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for script + importers)
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -36,7 +37,7 @@ REPO_ROOT = ENGINE.parent
 # skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
 # so a wholesale engine refresh never touches it. Absent → built-in defaults
 # only. The legacy in-engine path is read as a one-release fallback.
-CONFIG_PATH = REPO_ROOT / ".sc-state" / "map.config.json"
+CONFIG_PATH = artifact_policy.map_config_path()
 CONFIG_PATH_LEGACY = ENGINE / "map.config.json"
 
 # Built-in defaults. A fork's map.config.json EXTENDS the skip sets and may add
@@ -89,7 +90,11 @@ def load_config() -> dict:
                             {"glob": "*.proto", "role": "code"}]}
     Malformed config is a warning, not a failure — fall back to defaults so a
     bad edit never breaks the auto-remap hooks."""
-    path = CONFIG_PATH if CONFIG_PATH.exists() else CONFIG_PATH_LEGACY
+    artifact_policy.prepare_local_state()
+    tracked = REPO_ROOT / ".sc-state" / "map.config.json"
+    path = CONFIG_PATH if CONFIG_PATH.exists() else (
+        tracked if tracked.exists() else CONFIG_PATH_LEGACY
+    )
     if not path.exists():
         return {}
     try:

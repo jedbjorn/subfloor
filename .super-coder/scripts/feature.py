@@ -47,6 +47,7 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import artifact_policy  # noqa: E402
 
 # The registry. `block` is the instance.json key (None = procedure-only, no
 # infrastructure half); `block_auto` says whether enable may create it (only
@@ -159,12 +160,13 @@ def _grant_state(con, skill: str) -> list[str]:
 
 
 def _snapshot() -> None:
-    """Grants are fork memory — persist them to the tracked serialization."""
+    """Grants are fork memory — persist them under the active artifact policy."""
     env = {**os.environ, "SC_ADMIN": "1"}
     r = subprocess.run([PY, str(ENGINE / "scripts" / "snapshot.py")], env=env)
     if r.returncode != 0:
-        print("⚠ snapshot failed — grants are live in the DB but "
-              ".sc-state/content.sql is stale; run ./sc snapshot", file=sys.stderr)
+        target = artifact_policy.content_path().relative_to(REPO_ROOT)
+        print(f"⚠ snapshot failed — grants are live in the DB but {target} is stale; "
+              "run ./sc snapshot", file=sys.stderr)
 
 
 def cmd_list() -> int:

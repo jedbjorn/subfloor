@@ -55,14 +55,16 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn't
-   own) into `.sc-state/content.sql` — what survives `sc update` and
+   own) into the active snapshot (`.sc-state/content.sql` in tracked mode,
+   `.sc-state/local/content.sql` in local mode) — what survives `sc update` and
    `sc rebuild`; the row + grants reconstruct from content.sql. Skip this ->
    the skill is lost on next update.
 
-5. **Commit.** Run `sc render-check` first — hermetic rebuild, fails if the
+5. **Finish.** Run `sc render-check` first — hermetic rebuild, fails if the
    `skills_sc/` mirror drifts from the DB render (the CI guard; see the
-   `snapshot` skill). Then stage `.sc-state/content.sql` + `skills_sc/`
-   together — snapshot without re-rendered mirror = the drift.
+   `snapshot` skill). In tracked mode, stage `.sc-state/content.sql` +
+   `skills_sc/` together. In local mode both stay ignored; only engine-owned
+   assets/migrations are committed.
 
 ## Updating a skill
 
