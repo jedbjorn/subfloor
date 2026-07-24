@@ -8,8 +8,9 @@ One API-owned preview/execute workflow shared by browser and CLI:
   orphan / verified live / indeterminate) and the legal actions, and stores
   them as an opaque observation row fingerprinted against that evidence.
   The client never infers safety from raw fields.
-- **Execute** requires a fresh observation. The evidence is re-gathered
-  immediately before anything is signalled or closed and fingerprinted
+- **Execute** requires a fresh observation. The evidence is re-gathered as the
+  LAST precondition — after the legality, confirmation and unpushed gates, and
+  immediately before anything is signalled or closed — and fingerprinted
   against the preview: durable state (a concurrent recovery, a new
   generation, an archive hand-off) AND the volatile safety evidence the
   operator actually saw — exact process identity + liveness, pane/tmux
@@ -18,7 +19,12 @@ One API-owned preview/execute workflow shared by browser and CLI:
   sent, a row is closed, or a file is touched. Process identity is then
   re-verified once more at signal time (PID + /proc start ticks) — a PID
   reuse or unreadable /proc at that instant performs no signal and returns
-  an indeterminate result.
+  an indeterminate result. A confirmed discard re-reads the worktree ONE more
+  time immediately before `reset --hard`/`clean -fd`, because a shell can
+  write while it shuts down, i.e. after that fence has already passed; that
+  refusal deletes nothing but cannot unwind the signal or the closure. See
+  `_assert_worktree_unchanged` for the windows that remain open — a worktree
+  is not transactional and no claim of atomicity is made here.
 
 Signaling discipline (spec Shell Recovery): SIGTERM to the exact verified
 process group, the bounded existing grace period, SIGKILL only while the
@@ -402,13 +408,25 @@ def _git_facts(worktree: str | None) -> dict | None:
 
 def _unpushed_count(worktree: str) -> int:
     """The discard gate — exact and fail-closed: any error is a refusal,
-    never an assumption of clean."""
+    never an assumption of clean.
+
+    An unborn HEAD is NOT an error, for the same reason `_git_facts` reads it
+    as complete evidence: a repo with no commits has nothing that can be
+    unpushed. Reading it as a failure here made the two disagree — the preview
+    showed `0 unpushed` and this gate refused the discard it had just
+    authorised.
+    """
     def refuse(detail: str):
         return RecoveryError(
             409, "worktree_state_unknown",
             f"cannot enumerate unpushed commits in {worktree} — discard "
             "refused (fail closed)", {"stderr": detail[-200:]})
 
+    try:
+        if not _head_exists(worktree):
+            return 0
+    except _GitEvidenceUnavailable as exc:
+        raise refuse(str(exc)) from exc
     try:
         out = subprocess.run(
             ["git", "-C", worktree, "rev-list", "HEAD", "--not", "--remotes",
@@ -738,6 +756,13 @@ _VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "untracked",
                       "unpushed_commits", "change_digest", "indeterminate")
 
 
+def _volatile_git(git: dict | None) -> dict | None:
+    """The worktree facts the fence binds — every key, so a gap
+    (`indeterminate`) is a value like any other and can never read as absence."""
+    return {k: git.get(k) for k in _VOLATILE_GIT_KEYS} if git is not None \
+        else None
+
+
 def _volatile_evidence(evidence: dict) -> dict:
     """The safety-relevant facts that live OUTSIDE the database: the exact
     process identity and its liveness, pane/tmux membership, and the working
@@ -747,11 +772,9 @@ def _volatile_evidence(evidence: dict) -> dict:
     force a fresh preview, not ride the old one into a signal or a
     `git clean`."""
     process = evidence.get("process") or {}
-    git = evidence.get("git")
     return {"process": {k: process.get(k) for k in _VOLATILE_PROCESS_KEYS},
             "tmux": evidence.get("tmux"),
-            "git": ({k: git.get(k) for k in _VOLATILE_GIT_KEYS}
-                    if git is not None else None)}
+            "git": _volatile_git(evidence.get("git"))}
 
 
 def _fingerprint(con, shell_id: int, evidence: dict) -> str:
@@ -813,41 +836,60 @@ def preview(con, shell_id: int, default_worktree: str | None) -> dict:
 
 # ------------------------------------------------------------------ execute
 
-def _load_observation(con, shell_id: int, observation_id: str,
-                      fresh_evidence: dict):
+def _load_observation(con, shell_id: int, observation_id: str):
+    """Fetch the observation and reject an unknown or expired one.
+
+    Freshness is deliberately NOT judged here: the fence has to be the LAST
+    thing that happens before the destructive sequence, not the first thing
+    after the request is parsed (SC-091). This only loads what the
+    preconditions need to argue about.
+    """
     row = con.execute(
         "SELECT classification, legal_actions, evidence, fingerprint, "
-        " expires_at, acted_at FROM interface_recovery_observations "
+        " expires_at FROM interface_recovery_observations "
         "WHERE observation_id=? AND shell_id=?",
         (observation_id, shell_id)).fetchone()
     if row is None:
         raise RecoveryError(404, "no_such_observation",
                             f"recovery observation {observation_id} not "
                             f"found for shell {shell_id}")
-    classification, legal_actions, evidence, fingerprint, expires_at, \
-        acted_at = row
+    classification, legal_actions, evidence, fingerprint, expires_at = row
     now = con.execute("SELECT datetime('now')").fetchone()[0]
     if expires_at < now:
         raise RecoveryError(
             409, "recovery_observation_stale",
             "the observation has expired — preview again",
             {"observation_id": observation_id})
-    stored = json.loads(evidence)
-    # Fail closed on incomplete evidence, at EITHER end. A gap is
-    # deterministic — the same unreadable path or undecodable git output
-    # yields the same absent facts at preview and at execute — so it would
-    # fingerprint EQUAL and ride through as "nothing changed" while the work
-    # behind it was rewritten (SC-087). Absence of evidence is never
-    # evidence of safety.
-    for when, ev in (("the preview", stored), ("now", fresh_evidence)):
-        reason = (ev.get("git") or {}).get("indeterminate")
-        if reason:
-            raise RecoveryError(
-                409, "recovery_observation_stale",
-                f"the worktree could not be observed completely at {when} "
-                f"({reason}) — recovery refused before any signal, closure "
-                "or file removal; repair the repository and preview again",
-                {"observation_id": observation_id, "detail": reason})
+    return (classification, json.loads(legal_actions), json.loads(evidence),
+            fingerprint)
+
+
+def _assert_no_gap(observation_id: str, evidence: dict, when: str) -> None:
+    """Fail closed on incomplete evidence. A gap is deterministic — the same
+    unreadable path or undecodable git output yields the same absent facts at
+    preview and at execute — so it would fingerprint EQUAL and ride through as
+    "nothing changed" while the work behind it was rewritten (SC-087). Absence
+    of evidence is never evidence of safety."""
+    reason = (evidence.get("git") or {}).get("indeterminate")
+    if not reason:
+        return
+    raise RecoveryError(
+        409, "recovery_observation_stale",
+        f"the worktree could not be observed completely at {when} ({reason}) "
+        "— recovery refused before any signal, closure or file removal; "
+        "repair the repository and preview again",
+        {"observation_id": observation_id, "detail": reason})
+
+
+def _assert_fresh(con, shell_id: int, observation_id: str, stored: dict,
+                  fingerprint: str, default_worktree: str | None) -> None:
+    """Re-gather the whole evidence picture (a pure read) and refuse unless it
+    still matches the preview. Nothing has been signalled, closed or removed
+    when this runs — it is the last precondition, deliberately placed after
+    every other one so the check-then-act gap is as small as the sequence can
+    make it (SC-091)."""
+    fresh_evidence = gather(con, shell_id, default_worktree)
+    _assert_no_gap(observation_id, fresh_evidence, "now")
     if fingerprint != _fingerprint(con, shell_id, fresh_evidence):
         raise RecoveryError(
             409, "recovery_observation_stale",
@@ -855,7 +897,52 @@ def _load_observation(con, shell_id: int, observation_id: str,
             "process/pane identity or worktree contents no longer match what "
             "the preview showed; preview again",
             {"observation_id": observation_id})
-    return classification, json.loads(legal_actions), stored, acted_at
+
+
+def _assert_worktree_unchanged(observation_id: str, stored: dict,
+                               worktree: str, signal_result) -> None:
+    """The last gate before `git reset --hard && git clean -fd`.
+
+    Why a SECOND gate exists at all: `_assert_fresh` is the last thing before
+    the signal, but the signal is what makes a shell shut down, and a shell can
+    WRITE while it shuts down — the file appears after the fence passed and the
+    clean erases it (SC-091). Every other fact the fence binds (pid state, pane
+    membership, the durable rows) this recovery has by now deliberately
+    changed, so re-checking them is meaningless. The worktree is the one piece
+    of evidence a recovery must NOT change — and the only piece a discard
+    destroys. So that is what is re-read here, immediately before the delete.
+
+    NOT ATOMIC, and not claimed to be. A git worktree is not transactional:
+    unlike a row, `verify` and `reset --hard && clean -fd` cannot be made
+    indivisible. Two windows remain and are irreducible at this layer:
+
+      1. between this read and `git reset` actually opening a file — one
+         subprocess spawn, the smallest gap this ordering can reach;
+      2. anything writing DURING the reset/clean themselves.
+
+    What bounds them is not a lock but the sequence: the exact process this
+    recovery targeted was proven dead via /proc before we got here, so the
+    writer this protects against is already gone. A DIFFERENT process writing
+    into the worktree was never inside the observation's scope, and no check
+    here can serialise against it.
+
+    The refusal is honest about what already happened: the signal was sent and
+    the durable closure committed, and neither can be unwound. Only the
+    escalation is refused — nothing is reset, nothing is cleaned.
+    """
+    fresh = _volatile_git(_git_facts(worktree))
+    if fresh == _volatile_git(stored.get("git")):
+        return
+    raise RecoveryError(
+        409, "recovery_observation_stale",
+        "the worktree changed after the freshness fence — the discard is "
+        "refused and NOTHING was reset or cleaned. The exact process was "
+        "signalled and the durable state closed before this point (that is "
+        "the recovery itself, and it cannot be unwound); the files are "
+        "untouched. Preview again to see the new state and confirm the "
+        "discard against it.",
+        {"observation_id": observation_id, "worktree": worktree,
+         "signaled": signal_result, "closed": True, "discarded": False})
 
 
 def _close_durable_state(con, shell_id: int, evidence: dict,
@@ -962,12 +1049,13 @@ def execute(con, shell_id: int, body: dict,
                             "preserve_worktree=false — discard is never "
                             "implied by recover or force")
 
-    # The freshness fence: re-gather the whole evidence picture (a pure read)
-    # and refuse before any signal, closure or file removal if ANY of it moved
-    # since the preview.
-    classification, legal_actions, evidence, _acted = _load_observation(
-        con, shell_id, observation_id,
-        gather(con, shell_id, default_worktree))
+    classification, legal_actions, evidence, fingerprint = _load_observation(
+        con, shell_id, observation_id)
+    # The stored half of the fail-closed check needs no live read, so it runs
+    # first: an observation that could not be gathered WHOLE is unusable no
+    # matter what the live gates below would say, and the operator needs that
+    # reason, not whichever live git call the same broken repo trips next.
+    _assert_no_gap(observation_id, evidence, "the preview")
 
     if mode == "recover" and "recover" not in legal_actions:
         raise RecoveryError(
@@ -1012,6 +1100,16 @@ def execute(con, shell_id: int, body: dict,
                 f"{worktree} has {unpushed} commit(s) not on any remote — "
                 "discard refused; push or abandon them explicitly first",
                 {"worktree": worktree, "unpushed_commits": unpushed})
+
+    # -- the freshness fence: LAST precondition, nothing destructive yet ----
+    # Deliberately here and not at entry: every gate above is a pure read or a
+    # body check, and each one costs wall-clock (`_unpushed_count` shells out
+    # to git) during which the worktree can move. Validating at entry and
+    # destroying afterwards left exactly that gap — a file written while the
+    # preconditions ran was deleted by the clean (SC-091). A refusal from here
+    # performs NO signal, NO closure, NO reset and NO clean.
+    _assert_fresh(con, shell_id, observation_id, evidence, fingerprint,
+                  default_worktree)
 
     # -- signal (exact process-group, re-verified at signal time) ----------
     proc = evidence["process"]
@@ -1059,6 +1157,11 @@ def execute(con, shell_id: int, body: dict,
     discarded = None
     if discard:
         assert worktree is not None  # proven by the discard gate above
+        # Re-read the worktree immediately before the delete: the shell may
+        # have written during its own SIGTERM shutdown, after the fence above
+        # passed. See the docstring for the windows this does NOT close.
+        _assert_worktree_unchanged(observation_id, evidence, worktree,
+                                   signal_result)
         discarded = _discard_worktree_files(worktree)
 
     return {"shell_id": shell_id, "shortname": shortname,

@@ -15,6 +15,11 @@ module is stdlib-only by design — HTTP-only recovery):
   after the preview → 409 recovery_observation_stale with NO signal, closure,
   reset or clean; unknown id → 404; replay via Idempotency-Key returns the
   original response with no second side effect;
+- freshness at the DESTRUCTIVE COMMIT, not merely at execute entry: work
+  written while the preconditions run refuses before anything happens, and
+  work written while the shell shuts down (after the fence, during SIGTERM)
+  refuses the discard with nothing reset or cleaned — the refusal naming the
+  signal and closure it cannot unwind;
 - action legality: recover refused on verified_live, force refused without
   confirm_force or against non-verified-live classifications;
 - exact process-group signaling against REAL child processes: SIGTERM
@@ -1319,6 +1324,115 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual(err["error"]["code"], "recovery_observation_stale")
         self.assertEqual((wt / "late.txt").read_text(),
                          "written after the preview")
+
+    # -- freshness must hold at the DESTRUCTIVE COMMIT, not just at entry
+    #    (SC-091) -----------------------------------------------------------
+
+    def test_work_written_during_preconditions_refuses(self):
+        # The check-then-act gap: the fence used to run at execute ENTRY while
+        # the clean ran at the END, so everything in between — the confirmation
+        # gates and the `git rev-list` behind the unpushed check, real
+        # wall-clock — was unprotected. Work written there was deleted and 200
+        # returned. Injecting from _unpushed_count writes strictly inside that
+        # old gap; the fence is now the LAST precondition, so it refuses.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        late = Path(wt) / "late_during_preconditions.txt"
+        real = recovery._unpushed_count
+
+        def writing(worktree):
+            late.write_text("written while the preconditions ran")
+            return real(worktree)
+
+        with mock.patch.object(recovery, "_unpushed_count", writing), \
+                mock.patch.object(
+                    recovery, "_discard_worktree_files",
+                    return_value={"worktree": wt, "discarded": True,
+                                  "completed": ["reset", "clean"],
+                                  "failed": None}) as disc, \
+                mock.patch.object(recovery,
+                                  "terminate_process_group") as term:
+            status, err = self.post(obj, preserve_worktree=False,
+                                    discard_worktree=True,
+                                    confirm_shortname="s1")
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual(late.read_text(),
+                         "written while the preconditions ran")
+        disc.assert_not_called()   # no reset, no clean
+        term.assert_not_called()   # no signal
+        self.assert_nothing_discarded(wt)   # no closure either
+
+    def orphan_with_worktree(self, wt: str):
+        """A shell whose exact process is alive but whose pane is gone —
+        `recover` is legal and DOES signal, so the discard runs on the far
+        side of a real termination."""
+        proc, ticks = self.child()
+        self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks, worktree=wt)
+        return proc, ticks
+
+    def test_work_written_during_shutdown_refuses_discard(self):
+        # The window no entry fence can cover: the signal is what makes the
+        # shell shut down, and a shell can write on its way out — after every
+        # earlier check has already passed. The discard must not run on top of
+        # it. Injecting from terminate_process_group reproduces exactly that.
+        wt = self.make_git_worktree()
+        self.orphan_with_worktree(wt)
+        late = Path(wt) / "late_during_shutdown.txt"
+        real = recovery.terminate_process_group
+
+        def writing(pid, start_ticks, grace_s):
+            result = real(pid, start_ticks, grace_s)
+            late.write_text("flushed while the shell shut down")
+            return result
+
+        with mock.patch.object(recovery, "_pane_present", return_value=False):
+            obj = self.preview(1)
+            self.assertEqual(obj["classification"], "exact_idle_orphan")
+            with mock.patch.object(recovery, "terminate_process_group",
+                                   writing):
+                status, err = self.post(obj, preserve_worktree=False,
+                                        discard_worktree=True,
+                                        confirm_shortname="s1")
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        # Nothing was deleted: the late write, the dirty tracked file and the
+        # untracked file all survive.
+        self.assertEqual(late.read_text(), "flushed while the shell shut down")
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
+        # ...and the refusal is honest about what it could NOT unwind: the
+        # signal was sent and the durable closure committed before this point.
+        details = err["error"]["details"]
+        self.assertFalse(details["discarded"])
+        self.assertTrue(details["closed"])
+        self.assertTrue(details["signaled"]["signaled"])
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
+
+    def test_discard_after_real_termination_still_runs(self):
+        # The other side of the same gate: a termination that changes nothing
+        # in the worktree must NOT be read as a change. The second fence
+        # re-reads only the worktree precisely because the signal and the
+        # closure legitimately move everything else.
+        wt = self.make_git_worktree()
+        proc, ticks = self.orphan_with_worktree(wt)
+        with mock.patch.object(recovery, "_pane_present", return_value=False):
+            obj = self.preview(1)
+            status, result = self.post(obj, preserve_worktree=False,
+                                       discard_worktree=True,
+                                       confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["signaled"]["signaled"])
+        self.assertTrue(result["worktree"]["discarded"])
+        proc.wait(timeout=5)
+        self.assertEqual(recovery._proc_state(proc.pid, ticks), "dead")
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
+        self.assertFalse((Path(wt) / "untracked.txt").exists())
 
     def test_discard_git_failure_reports_exactly_what_completed(self):
         # clean fails AFTER reset succeeded and the closure committed: the
