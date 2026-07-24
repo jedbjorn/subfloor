@@ -940,6 +940,65 @@ class WorktreeTest(RecoveryCase):
                          "edited after the preview")
         self.assert_nothing_discarded(wt)
 
+    def porcelain(self, wt: str) -> str:
+        return subprocess.run(["git", "-C", wt, "status", "--porcelain"],
+                              capture_output=True, text=True,
+                              check=True).stdout
+
+    def assert_content_edit_refuses(self, wt, rel: str, text: str):
+        """Rewrite `rel` AFTER the preview without touching the path list, then
+        confirm the discard: the fence must refuse before anything runs."""
+        obj = self.preview(1)
+        before = self.porcelain(wt)
+        (Path(wt) / rel).write_text(text)
+        # The regression this pins: the status lines are byte-identical, so a
+        # path-list digest reads fresh while the content changed.
+        self.assertEqual(self.porcelain(wt), before)
+        with mock.patch.object(
+                recovery, "_discard_worktree_files",
+                return_value={"worktree": wt, "discarded": True,
+                              "completed": ["reset", "clean"],
+                              "failed": None}) as disc, \
+                mock.patch.object(recovery,
+                                  "terminate_process_group") as term:
+            status, err = self.post(obj, preserve_worktree=False,
+                                    discard_worktree=True,
+                                    confirm_shortname="s1")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        disc.assert_not_called()   # no reset, no clean
+        term.assert_not_called()   # no signal
+        self.assertEqual((Path(wt) / rel).read_text(), text)
+        con = self.db()
+        try:  # no closure
+            self.assertEqual(con.execute(
+                "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+            ).fetchone()[0], "reserved")
+        finally:
+            con.close()
+
+    def test_tracked_content_edit_after_preview_refuses_discard(self):
+        # Same already-dirty tracked path, new contents: SC-086 — the operator
+        # confirmed erasing what the preview showed, not this.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.assert_content_edit_refuses(wt, "tracked.txt",
+                                         "rewritten after the preview")
+
+    def test_untracked_content_edit_after_preview_refuses_discard(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.assert_content_edit_refuses(wt, "untracked.txt",
+                                         "rewritten after the preview")
+
+    def test_same_size_content_edit_after_preview_refuses_discard(self):
+        # "dirty" -> "drity": identical length, so a size/mtime-based digest
+        # would miss it. The fence is bound to the bytes.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assert_content_edit_refuses(wt, "tracked.txt", "drity")
+
     def test_equal_count_churn_after_preview_refuses_discard(self):
         # One file cleaned, another dirtied: dirty_tracked/untracked counts
         # are unchanged, but it is not the same work — the digest catches it.

@@ -187,6 +187,51 @@ def terminate_process_group(pid: int, start_ticks: int,
 
 # ------------------------------------------------------------------ git facts
 
+def _hash_file(path: str) -> str:
+    """Content identity of one working-tree file — its bytes, never its mtime
+    or size: a same-size overwrite must move the hash. An unreadable file
+    yields a marker, which is itself a change (fail toward stale, never
+    toward 'unchanged')."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 16), b""):
+                h.update(chunk)
+    except OSError as exc:
+        return f"unreadable:{exc.errno}"
+    return h.hexdigest()
+
+
+def _change_digest(worktree: str, porcelain: list[str]) -> str:
+    """Fingerprint of what a discard would erase, bound to file CONTENT.
+
+    A porcelain line stays byte-identical when the contents of an
+    already-dirty tracked path or an already-listed untracked file are
+    rewritten, so a digest over the line set alone reads fresh while the work
+    underneath it changed — and the confirmed discard then resets and cleans
+    post-preview work. So every path that differs from HEAD and every
+    untracked file is hashed by its bytes on top of the line set.
+    """
+    def paths(*args) -> list[str]:
+        # -z: paths verbatim, no C-quoting to unescape.
+        out = subprocess.run(["git", "-C", worktree, *args],
+                             capture_output=True, text=True, timeout=30,
+                             check=True).stdout
+        return [p for p in out.split("\0") if p]
+
+    h = hashlib.sha256()
+    for line in sorted(porcelain):
+        h.update(line.encode() + b"\n")
+    # diff HEAD --name-only: staged + unstaged + deletions, one row per path.
+    # ls-files -o: untracked FILES individually, never collapsed to a dir.
+    for rel in sorted(set(paths("diff", "HEAD", "--name-only", "-z"))
+                      | set(paths("ls-files", "-o", "--exclude-standard",
+                                  "-z"))):
+        h.update(rel.encode() + b"\0"
+                 + _hash_file(os.path.join(worktree, rel)).encode() + b"\0")
+    return h.hexdigest()
+
+
 def _git_facts(worktree: str | None) -> dict | None:
     """Advisory worktree facts. None on any failure — the preview stays
     truthful ('no facts') rather than guessing. The discard path re-checks
@@ -214,12 +259,12 @@ def _git_facts(worktree: str | None) -> dict | None:
         return {"worktree": worktree, "branch": branch,
                 "dirty_tracked": dirty, "untracked": untracked,
                 "unpushed_commits": unpushed,
-                # WHICH paths changed, not just how many: equal-count churn
-                # (one file cleaned while another is dirtied) still moves the
-                # freshness fingerprint. Paths themselves stay out of the
-                # payload.
-                "change_digest": hashlib.sha256(
-                    "\n".join(sorted(porcelain)).encode()).hexdigest()}
+                # WHICH paths changed and WHAT is in them — not just how many:
+                # equal-count churn (one file cleaned while another is
+                # dirtied) and a content rewrite of an already-listed path
+                # both move the freshness fingerprint. Paths and contents
+                # themselves stay out of the payload.
+                "change_digest": _change_digest(worktree, porcelain)}
     except Exception:  # noqa: BLE001 — advisory facts degrade to "none"
         return None
 
