@@ -6,14 +6,19 @@ One API-owned preview/execute workflow shared by browser and CLI:
 - **Preview** gathers the durable + process evidence for one shell, derives
   ONE server-side classification (available / stale durable lock / exact idle
   orphan / verified live / indeterminate) and the legal actions, and stores
-  them as an opaque observation row fingerprinted against the durable state.
+  them as an opaque observation row fingerprinted against that evidence.
   The client never infers safety from raw fields.
-- **Execute** requires a fresh observation: any change to the fingerprinted
-  durable state (pane exit surfaced durably, a concurrent recovery, a new
-  generation) refuses with 409 recovery_observation_stale. Process identity
-  is ALWAYS re-verified at signal time (PID + /proc start ticks) — a PID
-  reuse or unreadable /proc between preview and execute performs no signal
-  and returns an indeterminate result.
+- **Execute** requires a fresh observation. The evidence is re-gathered
+  immediately before anything is signalled or closed and fingerprinted
+  against the preview: durable state (a concurrent recovery, a new
+  generation, an archive hand-off) AND the volatile safety evidence the
+  operator actually saw — exact process identity + liveness, pane/tmux
+  membership, and the worktree's dirty/untracked/unpushed facts. Any
+  difference refuses with 409 recovery_observation_stale before a signal is
+  sent, a row is closed, or a file is touched. Process identity is then
+  re-verified once more at signal time (PID + /proc start ticks) — a PID
+  reuse or unreadable /proc at that instant performs no signal and returns
+  an indeterminate result.
 
 Signaling discipline (spec Shell Recovery): SIGTERM to the exact verified
 process group, the bounded existing grace period, SIGKILL only while the
@@ -208,7 +213,13 @@ def _git_facts(worktree: str | None) -> dict | None:
                            "--count") or 0)
         return {"worktree": worktree, "branch": branch,
                 "dirty_tracked": dirty, "untracked": untracked,
-                "unpushed_commits": unpushed}
+                "unpushed_commits": unpushed,
+                # WHICH paths changed, not just how many: equal-count churn
+                # (one file cleaned while another is dirtied) still moves the
+                # freshness fingerprint. Paths themselves stay out of the
+                # payload.
+                "change_digest": hashlib.sha256(
+                    "\n".join(sorted(porcelain)).encode()).hexdigest()}
     except Exception:  # noqa: BLE001 — advisory facts degrade to "none"
         return None
 
@@ -533,11 +544,35 @@ def evidence_projection(evidence: dict, classification: str,
             for key, label, value in values]
 
 
-def _fingerprint(con, shell_id: int) -> str:
-    """sha256 over the durable state an observation depends on. Any change —
-    closure, a new generation, a binding release, an archive hand-off —
+_VOLATILE_PROCESS_KEYS = ("pane_id", "pane_pid", "pane_start_ticks",
+                          "pane_present", "pid_state", "pgid")
+_VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "untracked",
+                      "unpushed_commits", "change_digest")
+
+
+def _volatile_evidence(evidence: dict) -> dict:
+    """The safety-relevant facts that live OUTSIDE the database: the exact
+    process identity and its liveness, pane/tmux membership, and the working
+    tree a discard would erase. The preview showed these to the operator, so
+    the operator's decision is only valid while they still hold — a changed
+    pid_state, a vanished pane, or a file written after the preview must
+    force a fresh preview, not ride the old one into a signal or a
+    `git clean`."""
+    process = evidence.get("process") or {}
+    git = evidence.get("git")
+    return {"process": {k: process.get(k) for k in _VOLATILE_PROCESS_KEYS},
+            "tmux": evidence.get("tmux"),
+            "git": ({k: git.get(k) for k in _VOLATILE_GIT_KEYS}
+                    if git is not None else None)}
+
+
+def _fingerprint(con, shell_id: int, evidence: dict) -> str:
+    """sha256 over everything an observation depends on: the durable state
+    (closure, a new generation, a binding release, an archive hand-off) and
+    the volatile process/tmux/worktree evidence above. Any change
     invalidates every outstanding observation."""
-    parts = []
+    parts = [json.dumps(_volatile_evidence(evidence), sort_keys=True,
+                        default=str)]
     live = _live_session(con, shell_id)
     parts.append(json.dumps(list(live) if live is not None else None,
                             default=str))
@@ -575,7 +610,8 @@ def preview(con, shell_id: int, default_worktree: str | None) -> dict:
         " fingerprint, expires_at) "
         "VALUES (?,?,?,?,?,?, datetime('now', ?))",
         (observation_id, shell_id, classification, json.dumps(legal_actions),
-         json.dumps(evidence, default=str), _fingerprint(con, shell_id),
+         json.dumps(evidence, default=str),
+         _fingerprint(con, shell_id, evidence),
          f"+{OBSERVATION_TTL_S} seconds"))
     con.commit()
     return {"observation_id": observation_id,
@@ -589,7 +625,8 @@ def preview(con, shell_id: int, default_worktree: str | None) -> dict:
 
 # ------------------------------------------------------------------ execute
 
-def _load_observation(con, shell_id: int, observation_id: str):
+def _load_observation(con, shell_id: int, observation_id: str,
+                      fresh_evidence: dict):
     row = con.execute(
         "SELECT classification, legal_actions, evidence, fingerprint, "
         " expires_at, acted_at FROM interface_recovery_observations "
@@ -607,11 +644,13 @@ def _load_observation(con, shell_id: int, observation_id: str):
             409, "recovery_observation_stale",
             "the observation has expired — preview again",
             {"observation_id": observation_id})
-    if fingerprint != _fingerprint(con, shell_id):
+    if fingerprint != _fingerprint(con, shell_id, fresh_evidence):
         raise RecoveryError(
             409, "recovery_observation_stale",
-            "the shell's durable state changed since the preview — preview "
-            "again", {"observation_id": observation_id})
+            "the shell's state changed since the preview — its durable rows, "
+            "process/pane identity or worktree contents no longer match what "
+            "the preview showed; preview again",
+            {"observation_id": observation_id})
     return classification, json.loads(legal_actions), \
         json.loads(evidence), acted_at
 
@@ -720,8 +759,12 @@ def execute(con, shell_id: int, body: dict,
                             "preserve_worktree=false — discard is never "
                             "implied by recover or force")
 
+    # The freshness fence: re-gather the whole evidence picture (a pure read)
+    # and refuse before any signal, closure or file removal if ANY of it moved
+    # since the preview.
     classification, legal_actions, evidence, _acted = _load_observation(
-        con, shell_id, observation_id)
+        con, shell_id, observation_id,
+        gather(con, shell_id, default_worktree))
 
     if mode == "recover" and "recover" not in legal_actions:
         raise RecoveryError(

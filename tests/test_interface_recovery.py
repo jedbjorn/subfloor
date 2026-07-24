@@ -10,9 +10,11 @@ module is stdlib-only by design — HTTP-only recovery):
   process, open active archive) / exact idle orphan (pane gone, exact pid
   alive; residual process after session end) / verified live / indeterminate
   (pane unknown, /proc unreadable);
-- observation fencing: changed durable state or expiry → 409
-  recovery_observation_stale; unknown id → 404; replay via Idempotency-Key
-  returns the original response with no second side effect;
+- observation fencing: expiry, changed durable state, a process/pane
+  transition after the preview, or tracked/untracked worktree work appearing
+  after the preview → 409 recovery_observation_stale with NO signal, closure,
+  reset or clean; unknown id → 404; replay via Idempotency-Key returns the
+  original response with no second side effect;
 - action legality: recover refused on verified_live, force refused without
   confirm_force or against non-verified-live classifications;
 - exact process-group signaling against REAL child processes: SIGTERM
@@ -640,20 +642,53 @@ class ExecuteTest(RecoveryCase):
             (sid,)).fetchone()[0], "ended")
         con.close()
 
-    def test_identity_loss_at_execute_signals_nothing_closes_nothing(self):
+    def test_process_exit_after_preview_is_stale_not_indeterminate(self):
+        # The exact process vanishes (exit, or a pid reused by a stranger)
+        # between preview and execute. The durable rows never moved, so the
+        # freshness fence is what must catch it — BEFORE any signal.
         proc, ticks = self.child()
         sid = self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
         with mock.patch.object(recovery, "_pane_present", return_value=False):
             obj = self.preview(1)
-        # The process vanishes between preview and execute (pid reused,
-        # exited): the durable state didn't change, so the observation is
-        # fresh — the signal-time re-verification is the fence.
-        with mock.patch.object(recovery, "_proc_state", return_value="dead"):
+            self.assertEqual(obj["classification"], "exact_idle_orphan")
+            with mock.patch.object(recovery, "_proc_state",
+                                   return_value="dead") as proc_state, \
+                    mock.patch.object(recovery,
+                                      "terminate_process_group") as term:
+                status, err = self.call(
+                    "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
+                    {"observation_id": obj["observation_id"],
+                     "mode": "recover"})
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertTrue(proc_state.called)  # the fence re-read /proc
+        term.assert_not_called()            # and refused before signalling
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE session_id=?",
+            (sid,)).fetchone()[0], "occupied")
+        con.close()
+
+    def test_pane_exit_after_preview_is_stale(self):
+        # Pane membership is part of what the operator was shown: a pane that
+        # disappears from the tmux server after the preview re-classifies the
+        # shell, so the old observation may not act.
+        proc, ticks = self.child()
+        sid = self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
+        with mock.patch.object(recovery, "_pane_present", return_value=True):
+            obj = self.preview(1)
+            self.assertEqual(obj["classification"], "verified_live")
+        with mock.patch.object(recovery, "_pane_present", return_value=False), \
+                mock.patch.object(recovery,
+                                  "terminate_process_group") as term:
             status, err = self.call(
                 "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
-                {"observation_id": obj["observation_id"], "mode": "recover"})
+                {"observation_id": obj["observation_id"], "mode": "force",
+                 "confirm_force": True})
         self.assertEqual(status, 409)
-        self.assertEqual(err["error"]["code"], "recovery_indeterminate")
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        term.assert_not_called()
+        self.assertEqual(recovery._proc_state(proc.pid, ticks), "alive")
         con = self.db()
         self.assertEqual(con.execute(
             "SELECT occupancy FROM interface_sessions WHERE session_id=?",
@@ -767,7 +802,9 @@ class WorktreeTest(RecoveryCase):
     def make_git_worktree(self, *, unpushed: bool = False) -> str:
         """A real git repo standing in for the shell worktree, with a bare
         origin so 'unpushed' is exact: one pushed commit, one dirty tracked
-        change, one untracked file (+ one local-only commit when unpushed)."""
+        change, one untracked file (+ one local-only commit when unpushed).
+        `clean.txt` is committed and left clean so a test can dirty it AFTER
+        the preview."""
         origin = Path(self.tmp.name) / "origin.git"
         subprocess.run(["git", "init", "-q", "--bare", str(origin)],
                        check=True, capture_output=True)
@@ -782,6 +819,7 @@ class WorktreeTest(RecoveryCase):
         git("config", "user.name", "t")
         git("remote", "add", "origin", str(origin))
         (wt / "tracked.txt").write_text("v1")
+        (wt / "clean.txt").write_text("c1")
         git("add", ".")
         git("commit", "-qm", "base")
         git("push", "-q", "-u", "origin", "feat/x")
@@ -859,6 +897,63 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
         self.assertFalse((Path(wt) / "untracked.txt").exists())
         self.assertTrue(Path(wt).is_dir())  # worktree itself never deleted
+
+    def assert_nothing_discarded(self, wt: str) -> None:
+        """No reset, no clean, no closure — the previewed state is intact."""
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
+        con = self.db()
+        try:
+            self.assertEqual(con.execute(
+                "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+            ).fetchone()[0], "reserved")
+        finally:
+            con.close()
+
+    def test_untracked_file_after_preview_refuses_discard(self):
+        # New work appears between the preview and the confirmed discard: the
+        # operator confirmed erasing what the preview listed, not this.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        self.assertEqual(obj["evidence"]["git"]["untracked"], 1)
+        (Path(wt) / "late.txt").write_text("work written after the preview")
+        status, err = self.post(obj, preserve_worktree=False,
+                                discard_worktree=True, confirm_shortname="s1")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual((Path(wt) / "late.txt").read_text(),
+                         "work written after the preview")
+        self.assert_nothing_discarded(wt)
+
+    def test_tracked_change_after_preview_refuses_discard(self):
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        self.assertEqual(obj["evidence"]["git"]["dirty_tracked"], 1)
+        (Path(wt) / "clean.txt").write_text("edited after the preview")
+        status, err = self.post(obj, preserve_worktree=False,
+                                discard_worktree=True, confirm_shortname="s1")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual((Path(wt) / "clean.txt").read_text(),
+                         "edited after the preview")
+        self.assert_nothing_discarded(wt)
+
+    def test_equal_count_churn_after_preview_refuses_discard(self):
+        # One file cleaned, another dirtied: dirty_tracked/untracked counts
+        # are unchanged, but it is not the same work — the digest catches it.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        (Path(wt) / "tracked.txt").write_text("v1")  # back to HEAD: clean
+        (Path(wt) / "clean.txt").write_text("newly dirty")
+        status, err = self.post(obj, preserve_worktree=False,
+                                discard_worktree=True, confirm_shortname="s1")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        self.assertEqual((Path(wt) / "clean.txt").read_text(), "newly dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
 
     def test_discard_git_failure_reports_exactly_what_completed(self):
         # clean fails AFTER reset succeeded and the closure committed: the
