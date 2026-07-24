@@ -39,6 +39,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import interface_routes as routes  # noqa: E402
 import run as run_mod  # noqa: E402
+import server  # noqa: E402  (the app shell's CSP, served)
 import transport as transport_mod  # noqa: E402
 
 from test_interface_api import FakeRuntime, build_engine_db  # noqa: E402
@@ -66,6 +67,7 @@ class ReleaseGateTest(unittest.TestCase):
         for p in self.patches:
             p.start()
         routes._browser_sessions.clear()
+        routes._browser_bootstraps.clear()
         routes.ensure_operator_capability()
         (run_dir / "operator.token").write_text("optok")
         routes.bind_runtime(FakeRuntime())
@@ -364,6 +366,7 @@ class ReleaseGateTest(unittest.TestCase):
         # A service restart drops live-process state: every session dies, and
         # the client is told to bootstrap rather than shown an error.
         routes._browser_sessions.clear()
+        routes._browser_bootstraps.clear()
         status, _, body = self.http("GET", "/api/interface/shells",
                                     {"Cookie": second})
         self.assertEqual(status, 401)
@@ -378,6 +381,127 @@ class ReleaseGateTest(unittest.TestCase):
                                  {"Cookie": third})
         self.assertEqual(status, 200)
 
+    # -- SC-150: the Host fence and the bind guard must agree ----------------
+
+    def test_an_ipv6_loopback_host_reaches_the_api_it_is_accepted_for(self):
+        """`require_loopback_bind()` accepts `::1` and `[::1]`, so a fork may
+        legitimately be configured that way — and every call used to come back
+        `403 host_not_allowed`, because the Host fence split `[::1]:PORT` at
+        the first colon and compared `"["` against the allowlist. A bind the
+        engine accepts at startup but that cannot use its own API is not a
+        supported bind, it is a broken one.
+
+        The socket still runs over 127.0.0.1: the fence reads the Host HEADER,
+        so the header is what this varies.
+        """
+        v6 = f"[::1]:{self.port}"
+        status, headers, body = self.http(
+            "POST", "/api/interface/browser-sessions",
+            {"Host": v6, "Origin": f"http://{v6}",
+             "Sec-Fetch-Site": "same-origin", "Idempotency-Key": "v6-mint"},
+            {})
+        self.assertEqual(status, 201, body)
+        cookie = headers["Set-Cookie"].split(";")[0]
+        status, _, body = self.http("GET", "/api/interface/shells",
+                                    {"Host": v6, "Cookie": cookie})
+        self.assertEqual(status, 200, body)
+
+    def test_a_malformed_bracketed_host_fails_closed(self):
+        # Widening the parse must not soften the DNS-rebind fence: anything
+        # that is not exactly an allowed authority is still refused.
+        # The last two are the port hole: an allowed host with a non-numeric
+        # "port" that the old `split(":")[0]` waved through on the IPv4 side.
+        for host in ("[::1", "[::1]evil.example.com", "[]", "[evil]:8800",
+                     "[::2]:8800", "[::1]:8800.evil.example.com",
+                     "127.0.0.1:8800.evil.example.com"):
+            with self.subTest(host=host):
+                status, _, body = self.http(
+                    "GET", "/api/interface/shells", {"Host": host})
+                self.assertEqual(status, 403, body)
+                self.assertEqual(body["error"]["code"], "host_not_allowed")
+
+    # -- SC-151: the bootstrap honours the key it demands --------------------
+
+    def _boot(self, key, **extra):
+        return self.http("POST", "/api/interface/browser-sessions",
+                         self.browser_headers(**{"Idempotency-Key": key,
+                                                 **extra}), {})
+
+    def test_an_exact_bootstrap_retry_replays_instead_of_minting_again(self):
+        """The endpoint required an `Idempotency-Key` and never keyed on it,
+        so the retry of a lost `201` minted a SECOND live session with
+        DIFFERENT credentials — the client keeping one and the server holding
+        two, with the orphan live for its full 24 hours. Demanding a guarantee
+        the route does not provide is the defect; this pins the guarantee."""
+        first = self._boot("boot-retry")
+        second = self._boot("boot-retry")
+        self.assertEqual((first[0], second[0]), (201, 201))
+        self.assertEqual(first[1]["Set-Cookie"], second[1]["Set-Cookie"])
+        self.assertEqual(first[2]["csrf"], second[2]["csrf"])
+        self.assertEqual(
+            len(routes._browser_sessions), 1,
+            "an exact retry minted a second live session")
+        # The replayed credential is a working one, not just an equal string.
+        status, _, body = self.http(
+            "GET", "/api/interface/shells",
+            {"Cookie": first[1]["Set-Cookie"].split(";")[0]})
+        self.assertEqual(status, 200, body)
+
+    def test_a_fresh_key_still_mints_an_independent_session(self):
+        # The counterweight to the replay: a second tab bootstraps with its
+        # own key and must get its own session, or the fix has broken
+        # concurrent browsers (spec #26 Session Lifecycle).
+        first = self._boot("boot-tab-1")
+        second = self._boot("boot-tab-2")
+        self.assertNotEqual(first[1]["Set-Cookie"], second[1]["Set-Cookie"])
+        self.assertNotEqual(first[2]["csrf"], second[2]["csrf"])
+        self.assertEqual(len(routes._browser_sessions), 2)
+
+    def test_a_key_reused_from_a_different_origin_conflicts(self):
+        # Both authorities are allowed, so this passes the provenance fence
+        # and fails on the key alone — matching `_idempotent()`'s contract
+        # rather than silently handing origin A's credential to origin B.
+        self.assertEqual(self._boot("boot-shared")[0], 201)
+        other = f"localhost:{self.port}"
+        status, _, body = self.http(
+            "POST", "/api/interface/browser-sessions",
+            {"Host": other, "Origin": f"http://{other}",
+             "Sec-Fetch-Site": "same-origin",
+             "Idempotency-Key": "boot-shared"}, {})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "idempotency_conflict")
+
+    def test_a_replay_whose_session_died_mints_fresh(self):
+        # Replaying a revoked or restart-lost credential would be idempotent
+        # and useless — an answer that is consistent and wrong. The record
+        # falls through to a real mint instead.
+        first = self._boot("boot-stale")
+        routes._browser_sessions.clear()          # what a restart does
+        second = self._boot("boot-stale")
+        self.assertEqual(second[0], 201)
+        self.assertNotEqual(second[1]["Set-Cookie"], first[1]["Set-Cookie"])
+        status, _, body = self.http(
+            "GET", "/api/interface/shells",
+            {"Cookie": second[1]["Set-Cookie"].split(";")[0]})
+        self.assertEqual(status, 200, body)
+
+    def test_a_replayed_bootstrap_never_reaches_the_durable_db(self):
+        # Spec #26: browser sessions and their credentials are live-process
+        # state only. The general `_idempotent()` path would have persisted
+        # the response body — which holds the anti-forgery token — so the
+        # replay store deliberately does not use it.
+        import sqlite3
+        self._boot("boot-durable")
+        self._boot("boot-durable")
+        con = sqlite3.connect(self.db_path)
+        try:
+            rows = con.execute(
+                "SELECT COUNT(*) FROM interface_idempotency_keys").fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(rows, 0,
+                         "a browser-session credential reached the durable DB")
+
     def test_expiry_over_the_wire_deletes_the_session(self):
         import time
         cookie, _ = self.mint()
@@ -389,6 +513,83 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "browser_session_expired")
         self.assertNotIn(sid, routes._browser_sessions)
+
+
+class AppShellCspTest(unittest.TestCase):
+    """The Content-Security-Policy a browser actually receives, read off a
+    real socket through the real `server.dispatch_http`.
+
+    Spec #26 Delivery Plan step 6 owed a CSP check and the tree contained
+    none, which is how `connect-src 'self' ws: wss:` shipped while the
+    comment above it promised same-origin connections only (conformance
+    finding SC-152). `CspSourceListTest` in test_server_schema_guard.py pins
+    the policy STRING; this pins that a served response carries it, because a
+    policy no response emits fences nothing — and the Playwright server that
+    rendered the UI never served the production header at all.
+    """
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def run():
+            asyncio.set_event_loop(self.loop)
+            self.transport = transport_mod.Transport(
+                "127.0.0.1", 0, server.dispatch_http, self._no_ws,
+                log=lambda *_: None)
+            self.loop.run_until_complete(self.transport.start())
+            self.port = self.transport.port
+            ready.set()
+            self.loop.run_forever()
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        self.assertTrue(ready.wait(10), "transport did not start")
+        # main() binds the policy to the port it serves; do the same for the
+        # ephemeral port here so the assertion below is end-to-end and not a
+        # comparison of the module default against itself.
+        csp = server._CSP
+        self.addCleanup(lambda: setattr(server, "_CSP", csp))
+        server._CSP = server._csp(self.port)
+
+    async def _no_ws(self, reader, writer, head_raw):  # pragma: no cover
+        writer.close()
+
+    def tearDown(self):
+        asyncio.run_coroutine_threadsafe(
+            self.transport.stop(), self.loop).result(timeout=10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=10)
+        self.loop.close()
+
+    def _get(self, path):
+        con = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            con.request("GET", path)
+            resp = con.getresponse()
+            resp.read()
+            return resp.status, dict(resp.getheaders())
+        finally:
+            con.close()
+
+    def test_the_app_shell_is_served_with_the_policy(self):
+        status, headers = self._get("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Security-Policy"), server._CSP)
+
+    def test_the_served_connect_src_authorises_no_arbitrary_socket_host(self):
+        _, headers = self._get("/")
+        connect = next(
+            part.split()[1:] for part in
+            headers["Content-Security-Policy"].split(";")
+            if part.split() and part.split()[0] == "connect-src")
+        for src in connect:
+            with self.subTest(source=src):
+                self.assertFalse(
+                    src.endswith(":") and "//" not in src,
+                    f"{src!r} is a CSP scheme-source and matches any host")
+        # ...and the stream the UI actually opens is still authorised.
+        self.assertIn(f"ws://127.0.0.1:{self.port}", connect)
 
 
 if __name__ == "__main__":
