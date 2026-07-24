@@ -218,8 +218,15 @@ def _open_interface(browser, ui_url: str, *, height: int):
 def _layout(page) -> dict[str, object]:
     return page.evaluate(
         """() => {
-          const term = document.querySelector(".if-term").getBoundingClientRect();
+          const pane = document.querySelector(".if-pane");
+          const termElement = document.querySelector(".if-term");
+          const term = termElement.getBoundingClientRect();
           const composer = document.querySelector(".if-composer").getBoundingClientRect();
+          const children = Array.from(pane.children);
+          const nonTermHeight = children
+            .filter((child) => child !== termElement)
+            .reduce((height, child) => height + child.getBoundingClientRect().height, 0);
+          const gap = parseFloat(getComputedStyle(pane).rowGap);
           const docHeight = Math.max(
             document.documentElement.scrollHeight,
             document.body.scrollHeight
@@ -229,6 +236,10 @@ def _layout(page) -> dict[str, object]:
             docHeight,
             pageScrolls: docHeight > window.innerHeight + 1,
             termHeight: term.height,
+            availableTermHeight:
+              pane.getBoundingClientRect().height -
+              nonTermHeight -
+              gap * Math.max(children.length - 1, 0),
             composerHeight: composer.height,
           };
         }"""
@@ -257,6 +268,9 @@ def test_tall_fit_short_floor_and_visual_qa(browser, ui_url, tmp_path):
         page.wait_for_timeout(100)
         fitted = _layout(page)
         assert fitted["termHeight"] >= 500
+        assert fitted["termHeight"] == pytest.approx(
+            fitted["availableTermHeight"], abs=2
+        )
         assert fitted["pageScrolls"] is False
 
         page.set_viewport_size({"width": 1600, "height": 900})
