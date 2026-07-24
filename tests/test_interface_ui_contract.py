@@ -212,6 +212,158 @@ if (lastScrolled.title !== "model-59" || lastScrolled.block !== "nearest") {
     assert result.returncode == 0, result.stderr
 
 
+PICKER_DOM = r"""
+class FakeClassList {
+  constructor() { this.names = new Set(); }
+  toggle(name, on) { if (on) this.names.add(name); else this.names.delete(name); }
+  remove(name) { this.names.delete(name); }
+  contains(name) { return this.names.has(name); }
+}
+// `children` is a live HTMLCollection in the browser: indexable and iterable,
+// but with NO array methods. Modelling it as a plain array lets code that calls
+// children.map/forEach pass here and silently no-op in the real UI, so this
+// fake withholds them on purpose.
+const collection = (nodes) => {
+  const c = { length: nodes.length,
+              [Symbol.iterator]: () => nodes[Symbol.iterator]() };
+  nodes.forEach((n, i) => { c[i] = n; });
+  return c;
+};
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag;
+    this.nodeType = 1;
+    this._kids = [];
+    this.classList = new FakeClassList();
+    this.isConnected = true;
+    this.value = "";
+    this._text = "";
+  }
+  get children() { return collection(this._kids); }
+  append(...nodes) { this._kids.push(...nodes); }
+  set textContent(value) {
+    this._text = value;
+    if (value === "") this._kids = [];
+  }
+  get textContent() {
+    return this._text + this._kids.map(
+      (c) => typeof c === "string" ? c : (c.textContent || "")).join("");
+  }
+  contains(node) { return this === node || this._kids.includes(node); }
+  scrollIntoView() {}
+  blur() {}
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: text }),
+  addEventListener() {},
+  removeEventListener() {},
+};
+const CAT = { stale: false, harnesses: { codex: { models: [
+  { id: "gpt-5.6-sol", name: "Sol", family: null, availability: "available" },
+  { id: "gpt-5.6-lun", name: "Lun", family: null, availability: "available" },
+] } } };
+const cardList = (picker) => picker.results.children[1];
+const invariant = (ok, message) => { if (!ok) throw new Error(message); };
+"""
+
+
+def run_picker_js(body):
+    el_helper = APP[APP.index("const el ="):APP.index("const esc =")]
+    result = subprocess.run(
+        ["node", "-e", el_helper + PICKER + PICKER_DOM +
+         "\n(async () => {\n" + body + "\n})().catch((e) => {"
+         "\n  console.error(e.stack || e); process.exit(1);\n});\n"],
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_hovering_a_model_card_never_replaces_the_node_being_clicked():
+    """The click-does-nothing bug. Hover moved the highlight by calling
+    paint(), which rebuilds every card — so the card under the cursor was
+    destroyed and replaced mid-gesture. mousedown landed on one node, mouseup
+    on its replacement, and with no common ancestor the browser never
+    synthesised a click. Only search-then-Enter could select a model.
+
+    Hover must move the highlight WITHOUT detaching a single card node."""
+    run_picker_js(r"""
+const picker = dmModelPicker("codex", CAT, { model: null }, async () => {});
+picker.input.onfocus();
+const before = [...cardList(picker).children];
+invariant(before.length === 3, `expected default + 2 models: ${before.length}`);
+
+// Hover each card in turn — the gesture a mouse makes crossing the list.
+for (let i = 0; i < before.length; i += 1) before[i].onmouseenter();
+
+const after = [...cardList(picker).children];
+invariant(after.length === before.length, "hover changed the option count");
+for (let i = 0; i < before.length; i += 1)
+  invariant(after[i] === before[i],
+    `hover replaced card ${i} — a real click would be swallowed mid-gesture`);
+""")
+
+
+def test_hover_still_moves_the_highlight_and_clicking_a_card_selects_it():
+    """Keeping the nodes alive is only half of it: hover must still visibly
+    highlight, and the click must actually reach save() and land on the row."""
+    run_picker_js(r"""
+const saved = [];
+const row = { model: null };
+const picker = dmModelPicker("codex", CAT, row,
+  async (v) => { saved.push(v); });
+picker.input.onfocus();
+const cards = cardList(picker).children;
+
+invariant(cards[0].classList.contains("dm-highlight"),
+  "the first option did not start highlighted");
+cards[2].onmouseenter();
+invariant(cards[2].classList.contains("dm-highlight") &&
+  !cards[0].classList.contains("dm-highlight"),
+  "hover did not move the highlight to the hovered card");
+invariant(cards[2].ariaSelected === "true" && cards[0].ariaSelected === "false",
+  "the highlight moved visually but aria-selected did not follow");
+
+await cards[2].onclick();
+invariant(saved.length === 1 && saved[0] === "gpt-5.6-lun",
+  `clicking a card did not save that model: ${JSON.stringify(saved)}`);
+invariant(row.model === "gpt-5.6-lun",
+  `the picked model never reached the row: ${row.model}`);
+
+// "Harness default" clears the override through the same click path.
+picker.input.onfocus();
+await cardList(picker).children[0].onclick();
+invariant(saved[1] === null && row.model === null,
+  `clicking Harness default did not clear the override: ${row.model}`);
+""")
+
+
+def test_arrow_keys_and_hover_share_one_in_place_highlight():
+    """Arrow keys repainted the whole list too. Same in-place move now — and
+    keyboard and mouse must agree on which option is active, or Enter selects
+    something other than what is highlighted."""
+    run_picker_js(r"""
+const saved = [];
+const picker = dmModelPicker("codex", CAT, { model: null },
+  async (v) => { saved.push(v); });
+picker.input.onfocus();
+const cards = [...cardList(picker).children];
+
+picker.input.onkeydown({ key: "ArrowDown", preventDefault() {} });
+invariant(cardList(picker).children[1] === cards[1],
+  "an arrow key rebuilt the list instead of moving the highlight");
+invariant(cards[1].classList.contains("dm-highlight"),
+  "ArrowDown did not highlight the next option");
+
+// Mouse takes over from the keyboard; Enter must follow the mouse.
+cards[2].onmouseenter();
+picker.input.onkeydown({ key: "Enter", preventDefault() {} });
+await new Promise((r) => setTimeout(r, 0));
+invariant(saved[0] === "gpt-5.6-lun",
+  `Enter selected an option other than the highlighted one: ${saved[0]}`);
+""")
+
+
 def test_browser_bootstrap_carries_no_capability_and_retries_once():
     """Spec #26: the browser signs itself in with same-origin provenance
     alone. The capability must not reappear in page code, the one silent

@@ -349,6 +349,15 @@ function dmModelPicker(harness, cat, row, save) {
                               role: "combobox", ariaExpanded: "false" });
   const results = el("div", { className: "dm-results", hidden: true });
   let open = false, highlighted = 0, choices = [];
+  // Moving the highlight must never go through paint(). paint() rebuilds every
+  // card node, so a repaint driven by hover destroys the card under the cursor
+  // — mousedown lands on one node, the rebuild detaches it, mouseup lands on
+  // its replacement, and with no common ancestor the browser never fires a
+  // click. That is why picking a model by mouse did nothing and only
+  // search-then-Enter worked. The highlight is presentational: move it in
+  // place. paint() stays for changes that genuinely alter the list.
+  let applyHighlight = () => {};
+  const setHighlight = (i) => { highlighted = i; applyHighlight(); };
 
   const close = () => {
     open = false; highlighted = 0; input.value = "";
@@ -376,6 +385,7 @@ function dmModelPicker(harness, cat, row, save) {
 
   const paint = () => {
     results.textContent = "";
+    applyHighlight = () => {};   // the list this closed over is detached now
     if (!open) { results.hidden = true; return; }
     const q = input.value.trim().toLowerCase();
     const hit = (m) => !q || [m.id, m.name, m.family]
@@ -394,18 +404,27 @@ function dmModelPicker(harness, cat, row, save) {
     const list = el("div", { className: "dm-cardlist", role: "listbox" });
     choices.forEach((choice, i) => {
       const card = el("button", {
-        className: "dm-mcard" + (i === highlighted ? " dm-highlight" : ""),
-        type: "button", role: "option", ariaSelected: String(i === highlighted),
+        className: "dm-mcard", type: "button", role: "option",
         title: choice.value || "Harness default",
       });
       card.append(el("b", {}, choice.label),
         el("span", { className: "dm-mcard-sub" }, choice.sub));
-      card.onmouseenter = () => { highlighted = i; paint(); };
+      card.onmouseenter = () => setHighlight(i);
       card.onclick = () => pick(choice.value);
       list.append(card);
     });
+    applyHighlight = () => {
+      // Index loop, not forEach — `children` is a live HTMLCollection in the
+      // browser and has no forEach, so an array method would silently no-op.
+      for (let j = 0; j < list.children.length; j += 1) {
+        const node = list.children[j];
+        node.classList.toggle("dm-highlight", j === highlighted);
+        node.ariaSelected = String(j === highlighted);
+      }
+      list.children[highlighted]?.scrollIntoView({ block: "nearest" });
+    };
     results.append(list);
-    list.children[highlighted]?.scrollIntoView({ block: "nearest" });
+    applyHighlight();
     results.hidden = false;
   };
 
@@ -418,8 +437,7 @@ function dmModelPicker(harness, cat, row, save) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const delta = e.key === "ArrowDown" ? 1 : -1;
-      highlighted = Math.max(0, Math.min(highlighted + delta, choices.length - 1));
-      paint();
+      setHighlight(Math.max(0, Math.min(highlighted + delta, choices.length - 1)));
       return;
     }
     if (e.key === "Enter" && choices[highlighted]) {
