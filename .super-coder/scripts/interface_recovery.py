@@ -1510,7 +1510,15 @@ def classify(evidence: dict) -> tuple[str, list[str]]:
             # never spawned, or a legacy row): nothing live to disprove the
             # lock — safe to close.
             return "stale_durable_lock", ["recover"]
-        if pid_state == "unreadable" or pane is None:
+        if pid_state == "unreadable":
+            return "indeterminate", []
+        if pane is None:
+            # tmux could not answer. A positively dead recorded identity
+            # still proves the managed process cannot act, so the shell is
+            # unstrandable without signalling anything (decision #49); with
+            # any other pid state the pane could still hold a live harness.
+            if pid_state == "dead":
+                return "stale_durable_lock", ["recover"]
             return "indeterminate", []
         if pane and pid_state == "alive":
             return "verified_live", ["force"]

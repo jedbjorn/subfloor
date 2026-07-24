@@ -869,3 +869,73 @@ invariant(confirmText.includes("PID 4321") &&
   confirmText.includes("start ticks 999"),
   "force confirmation did not name exact verified identity");
 """)
+
+
+END_CHAT = APP[APP.index("// End chat (spec Workflow 9)"):
+               APP.index("// Take-over:")]
+
+
+def test_end_chat_on_an_unreconciled_session_renders_recovery():
+    """The AMI /exit repro from the browser: End chat on a session the server
+    has already given up on answers 409 not_occupied. That is the recovery
+    path, not a dead end — the client must detach and re-render onto it
+    (decision #49). An unrelated failure must still say what broke."""
+    el_helper = APP[APP.index("const el ="):APP.index("const esc =")]
+    script = el_helper + r"""
+let apiIf, confirm;
+let detached = 0;
+let rendered = 0;
+function ifDetach() { detached += 1; }
+async function renderInterface() { rendered += 1; }
+""" + END_CHAT + r"""
+class FakeElement {
+  constructor(tag) { this.tagName = tag; this.nodeType = 1; this.children = []; }
+  append(...nodes) { this.children.push(...nodes); }
+  closest() { return this; }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
+};
+function invariant(ok, message) { if (!ok) throw new Error(message); }
+function attach() {
+  return { sessionId: 4, painted: 0, st: { note: "" },
+           paint() { this.painted += 1; } };
+}
+function fail(status, code, message) {
+  const e = new Error(message);
+  e.status = status;
+  e.code = code;
+  e.body = { error: { code, message } };
+  return e;
+}
+confirm = () => true;
+
+(async () => {
+  const a = attach();
+  apiIf = async () => {
+    throw fail(409, "not_occupied",
+      "session 4 is unreconciled — termination needs a verified identity");
+  };
+  await ifEndChat(a, { shortname: "S3" }, new FakeElement("div"), null);
+  invariant(detached === 1, `unreconciled End chat did not detach: ${detached}`);
+  invariant(rendered === 1,
+    `unreconciled End chat did not re-render onto recovery: ${rendered}`);
+  invariant(a.st.note === "",
+    `unstrandable shell was left with a terminal error: ${a.st.note}`);
+
+  const b = attach();
+  apiIf = async () => { throw fail(500, "internal", "boom"); };
+  await ifEndChat(b, { shortname: "S3" }, new FakeElement("div"), null);
+  invariant(detached === 1 && rendered === 1,
+    "an unrelated failure was swallowed as a recovery re-render");
+  invariant(b.st.note.includes("end chat failed") && b.painted === 1,
+    `unrelated failure was not reported: ${b.st.note}`);
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr

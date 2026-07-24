@@ -3223,6 +3223,16 @@ async function ifEndChat(a, sel, pane, btn) {
   let r;
   try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: false }); }
   catch (e) {
+    // not_occupied: the generation is unreconciled, so there is no verified
+    // identity left to terminate. That is not a failure the operator can act
+    // on from here — it is the recovery path, which the server may now list a
+    // legal action for. Detach and re-render onto it (decision #49) instead
+    // of leaving a terminal error on a shell that can be unstranded.
+    if (e.status === 409 && e.code === "not_occupied") {
+      ifDetach();
+      if (root) return renderInterface(root);
+      return;
+    }
     if (e.status === 409 && e.body && e.body.reason) r = e.body;
     else { a.st.note = "end chat failed: " + e.message; a.paint(); return; }
   }

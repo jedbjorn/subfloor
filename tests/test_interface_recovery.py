@@ -295,6 +295,41 @@ class ClassificationTest(RecoveryCase):
             obj = self.preview(1)
         self.assertEqual(obj["classification"], "indeterminate")
 
+    def test_dead_identity_with_unknown_pane_is_a_stale_lock(self):
+        """The AMI /exit repro: the session went unreconciled/lost, its
+        recorded identity is positively dead, and tmux cannot be reached so
+        pane presence is unknown. Death proves the managed process cannot
+        act, so recovery is legal (decision #49); classifying this
+        indeterminate left the shell stranded with no supported action."""
+        self.make_session(1, occupancy="unreconciled", lifecycle="lost",
+                          pane_pid=DEAD_PID, pane_ticks=1)
+        with mock.patch.object(recovery, "_pane_present", return_value=None):
+            obj = self.preview(1)
+        self.assertEqual(obj["classification"], "stale_durable_lock")
+        self.assertEqual(obj["legal_actions"], ["recover"])
+
+    def test_dead_identity_with_pane_present_stays_indeterminate(self):
+        """The other side of that boundary: a pane that IS there is owned by
+        something we cannot identify, so a dead record proves nothing about
+        it."""
+        self.make_session(1, occupancy="unreconciled", lifecycle="lost",
+                          pane_pid=DEAD_PID, pane_ticks=1)
+        with mock.patch.object(recovery, "_pane_present", return_value=True):
+            obj = self.preview(1)
+        self.assertEqual(obj["classification"], "indeterminate")
+        self.assertEqual(obj["legal_actions"], [])
+
+    def test_unreadable_identity_with_unknown_pane_stays_indeterminate(self):
+        """Unreadable is not dead: nothing is proven, whatever tmux says."""
+        self.make_session(1, occupancy="unreconciled", lifecycle="lost",
+                          pane_pid=DEAD_PID, pane_ticks=1)
+        with mock.patch.object(recovery, "_pane_present", return_value=None), \
+                mock.patch.object(recovery, "_proc_state",
+                                  return_value="unreadable"):
+            obj = self.preview(1)
+        self.assertEqual(obj["classification"], "indeterminate")
+        self.assertEqual(obj["legal_actions"], [])
+
     def test_residual_process_after_session_end_is_orphan(self):
         proc, ticks = self.child()
         sid = self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
@@ -629,6 +664,70 @@ class ExecuteTest(RecoveryCase):
             "SELECT read_at FROM shell_messages WHERE message_id=1"
         ).fetchone()[0])
         con.close()
+
+    def test_dead_identity_unknown_pane_recovers_without_signalling(self):
+        """The AMI /exit repro end to end, over the public routes: preview
+        offers `recover`, the recovery signals NOTHING (there is nothing left
+        to signal), closes the durable state, abandons the runtime generation
+        best-effort, preserves the worktree — and the shell can take a new
+        chat again, which is the whole point of unstranding it."""
+        sid = self.make_session(1, occupancy="unreconciled", lifecycle="lost",
+                                pane_pid=DEAD_PID, pane_ticks=1,
+                                archive_id=10)
+        con = self.db()
+        con.execute("UPDATE shells SET active_archive_id=10 WHERE shell_id=1")
+        con.execute(
+            "INSERT INTO documents (document_id, kind, title) "
+            "VALUES (50,'doc','SPRINT: t')")
+        con.execute(
+            "INSERT INTO sprint_planner_bindings "
+            "(sprint_doc_id, planner_shell_id, session_id, shell_id, "
+            " generation) VALUES (50,1,?,1,1)", (sid,))
+        con.commit()
+        con.close()
+
+        with mock.patch.object(recovery, "_pane_present", return_value=None):
+            obj = self.preview(1)
+            self.assertEqual(obj["classification"], "stale_durable_lock")
+            self.assertEqual(obj["legal_actions"], ["recover"])
+            with mock.patch.object(recovery, "terminate_process_group") as kill:
+                status, result = self.call(
+                    "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
+                    {"observation_id": obj["observation_id"],
+                     "mode": "recover"})
+        self.assertEqual(status, 200, result)
+        kill.assert_not_called()
+        self.assertIsNone(result["signaled"])
+        self.assertEqual(self.runtime.terminated, [])
+        self.assertEqual(self.runtime.abandoned, [sid])
+        self.assertEqual(result["closed"]["runtime"], {"abandoned": True})
+        self.assertEqual(result["classification"], "stale_durable_lock")
+        self.assertEqual(result["worktree"], {"preserved": True})
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(result["closed"]["session"]["session_id"], sid)
+        self.assertEqual(result["closed"]["archive"],
+                         {"archive_id": 10, "closed": True})
+        self.assertEqual(result["closed"]["binding"],
+                         {"binding_id": 1, "released": True})
+
+        con = self.db()
+        self.assertEqual(
+            con.execute("SELECT occupancy, lifecycle, end_reason "
+                        "FROM interface_sessions WHERE session_id=?",
+                        (sid,)).fetchone(),
+            ("ended", "ended", "operator_recovery"))
+        self.assertIsNotNone(con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0])
+        self.assertIsNone(con.execute(
+            "SELECT active_archive_id FROM shells WHERE shell_id=1"
+        ).fetchone()[0])
+        con.close()
+
+        status, body = self.call(
+            "POST", "/api/interface/sessions",
+            (OP, "Idempotency-Key: k-newchat"), {"shell_id": 1})
+        self.assertEqual(status, 201, body)
 
     def test_stale_observation_on_durable_change(self):
         sid = self.make_session(1, occupancy="reserved", lifecycle="starting",
