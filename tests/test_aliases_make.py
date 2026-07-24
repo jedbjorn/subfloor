@@ -25,6 +25,11 @@ DESCRIBED_LINE = re.compile(
     r" {2,}(\S.*?)\s*$"
 )
 
+# A description too long for one line wraps to the description column with no
+# target of its own. Folding it back means a pin reads the WHOLE description,
+# not just the clause that happened to fit on the first line.
+CONTINUATION_LINE = re.compile(r"^ {32}(\S.*?)\s*$")
+
 # Every target that lost its help description when dos-help was rewritten from
 # a boxed table into grouped lists (decision #58). Each one still exists and
 # still runs, so asserting the NAME appears proves nothing — assert the text.
@@ -46,15 +51,26 @@ COMMANDS_THAT_MUST_EXPLAIN_THEMSELVES = (
 
 
 def described_targets(help_text: str) -> dict[str, str]:
-    """Map every target in `help_text` to its description, alias pairs split."""
+    """Map every target in `help_text` to its description, alias pairs split.
+
+    Wrapped continuation lines fold into the entry above them; anything else
+    ends the entry, so a continuation can never drift onto a later target."""
     described: dict[str, str] = {}
+    current: list[str] = []
     for line in help_text.splitlines():
         match = DESCRIBED_LINE.match(line)
-        if not match:
+        if match:
+            names, _args, description = match.groups()
+            current = names.split(" / ")
+            for name in current:
+                described[name] = description
             continue
-        names, _args, description = match.groups()
-        for name in names.split(" / "):
-            described[name] = description
+        wrapped = CONTINUATION_LINE.match(line) if current else None
+        if wrapped:
+            for name in current:
+                described[name] += " " + wrapped.group(1)
+            continue
+        current = []
     return described
 
 
@@ -251,6 +267,41 @@ class MakeAliasContractTest(unittest.TestCase):
         description = described_targets(result.stdout)["dos-update-harnesses"]
         for harness in ("claude", "opencode", "codex", "vibe", "kimi"):
             self.assertIn(harness, description)
+
+    def test_branching_commands_help_describes_the_branch_not_the_headline(self):
+        """Four of these commands take a path that does something OTHER than
+        their headline, and help that states only the headline promises work
+        the code will not do (SC-146/147/148):
+
+        - rollback exits SUCCESS after restoring the DB ALONE when there is no
+          .sc-state/engine.ref.prev — the pair-restore is intent, not guarantee;
+        - deps skips venv/pip entirely for a host-managed .venv, verifying the
+          declared pins instead of installing anything into it;
+        - snapshot writes a SECOND artifact, the authored map layer, to
+          .sc-state/map_content.sql;
+        - verify runs the fresh-fork init first when the rebuilt instance has
+          no active user + shell.
+
+        Each marker below is the condition or artifact the happy-path wording
+        omitted; losing it is the wording regressing, not a rename.
+        """
+        result = make("dos-help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        described = described_targets(result.stdout)
+        for target, marker in (
+            ("dos-rollback", "engine.ref.prev"),
+            ("dos-deps", "host-managed"),
+            ("dos-snapshot", "map_content.sql"),
+            ("dos-verify", "empty instance"),
+        ):
+            with self.subTest(target=target):
+                self.assertIn(
+                    marker,
+                    described.get(target, ""),
+                    f"{target}'s help no longer states the branch that does "
+                    f"less than the headline (expected {marker!r}): "
+                    f"{described.get(target)!r}",
+                )
 
     def test_quick_chart_lists_the_url_recall_path(self):
         """dos-h is the chart an operator reaches for when the boot summary
