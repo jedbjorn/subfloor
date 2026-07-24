@@ -205,6 +205,18 @@ def _status_line(s: dict) -> str:
     return f"{short} {name} {avail} {' · '.join(bits)}".rstrip()
 
 
+def _model_cell(detail: dict) -> str:
+    """Same honesty rule as the browser rail (flag #130): report the model the
+    session was observed running, or the launch route MARKED as the launch
+    route when the analytics sweep has not seen this session yet. `model_route`
+    alone is the route it started on and goes stale on an in-harness /model
+    switch, so it is never printed as a bare 'model'."""
+    observed = detail.get("model_observed")
+    if observed:
+        return str(observed)
+    return f"{detail.get('model_route') or 'harness default'} (launched)"
+
+
 def cmd_status(args) -> int:
     if not args.shell:
         shells = _shells()
@@ -231,7 +243,7 @@ def cmd_status(args) -> int:
             ("occupancy", detail.get("occupancy")),
             ("lifecycle", detail.get("lifecycle")),
             ("harness", detail.get("harness")),
-            ("model", detail.get("model_route")),
+            ("model", _model_cell(detail)),
             ("composer", detail.get("composer")),
             ("writer", held),
             ("wake", detail.get("wake_state")),

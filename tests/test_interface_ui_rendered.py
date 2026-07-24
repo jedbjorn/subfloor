@@ -30,7 +30,10 @@ SHELL = {
     "session_id": 7,
     "generation": 1,
     "harness": "codex",
-    "model_route": "gpt-5.6-terra",
+    # Launched on one route, observed running another (flag #130): the rail
+    # must show what was observed, never the stale launch route.
+    "model_route": "gpt-5.6-sol",
+    "model_observed": "gpt-5.6-terra",
     "alerts": 2,
 }
 OTHER_SHELL = {
@@ -40,6 +43,7 @@ OTHER_SHELL = {
     "display_name": "Code-02",
     "session_id": 8,
     "model_route": "gpt-5.6-sol",
+    "model_observed": None,     # unswept — the fallback must say so
     "alerts": 0,
 }
 SESSION = {
@@ -48,7 +52,8 @@ SESSION = {
     "attachable": True,
     "identity_verified": True,
     "harness": "codex",
-    "model_route": "gpt-5.6-terra",
+    "model_route": "gpt-5.6-sol",
+    "model_observed": "gpt-5.6-terra",
     "lifecycle": "idle",
     "composer": "clean",
     "browser_composer": "clean",
@@ -445,7 +450,7 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         page.get_by_text("Alerts (2)", exact=True).wait_for()
         rail_models = page.locator(".if-row-sub").all_inner_texts()
         assert "DEV3 · codex · GPT 5.6 TERRA" in rail_models
-        assert "DEV4 · codex · GPT 5.6 SOL" in rail_models
+        assert "DEV4 · codex · GPT 5.6 SOL (launched)" in rail_models
         assert page.locator(".if-alerts").get_attribute("class").endswith(
             "critical"
         )
@@ -455,6 +460,7 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         page.get_by_text("Details", exact=True).click()
         details = page.locator(".if-details")
         assert "model GPT 5.6 TERRA" in details.inner_text()
+        assert "launched GPT 5.6 SOL" in details.inner_text()
         assert "session #7 · arc #172" in details.inner_text()
         assert "wake armed" in details.inner_text()
         assert "sprint #31 Interface corrective hardening · ACTIVE" in (

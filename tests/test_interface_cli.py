@@ -204,6 +204,25 @@ class InterfaceCliTest(unittest.TestCase):
         rc, out, _ = self.run_cli(["status", "s2"])
         self.assertIn("held by web-1", out)
 
+    def test_status_model_row_never_asserts_an_unobserved_route(self):
+        """flag #130 — `model_route` is the route the session was LAUNCHED
+        with, so status prints it marked as such; the swept live model wins
+        when the sweep has seen one."""
+        self.http.add("GET", "/api/interface/sessions/7",
+                      {**SESSION7, "model_route": "fable",
+                       "model_observed": None})
+        rc, out, _ = self.run_cli(["status", "s2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("model       fable (launched)", out)
+
+        self.http.add("GET", "/api/interface/sessions/7",
+                      {**SESSION7, "model_route": "fable",
+                       "model_observed": "claude-opus-5"})
+        rc, out, _ = self.run_cli(["status", "s2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("model       claude-opus-5", out)
+        self.assertNotIn("fable", out)
+
     def test_status_available_shell_has_no_session_fetch(self):
         rc, out, _ = self.run_cli(["status", "s1", "--json"])
         self.assertEqual(rc, 0)

@@ -2199,6 +2199,20 @@ function ifModelLabel(route) {
   return String(route).replace(/[-_]+/g, " ").trim().toUpperCase();
 }
 
+// What the surface may say about a session's model (flag #130). `model_route`
+// is only the route the session was LAUNCHED with — an in-harness /model switch
+// never reaches the engine — so it is never rendered as a bare claim about the
+// live model. `model_observed` comes from the analytics sweep, which reads the
+// harness's own transcript but is not real-time: an unswept session has none,
+// and then the launch route is shown MARKED as the launch route.
+function ifModelDisplay(observed, route) {
+  if (observed) return { text: ifModelLabel(observed),
+    title: "the model this session was last observed running (analytics sweep)" };
+  return { text: ifModelLabel(route) + " (launched)",
+    title: "the route this session was launched with — its live model has not "
+         + "been observed yet, and an in-harness /model switch would not show here" };
+}
+
 async function renderInterface(root) {
   root.replaceChildren();
   let shells;
@@ -2230,17 +2244,16 @@ async function renderInterface(root) {
     if (s.alerts > 0)
       head.append(el("span", { className: "pill if-badge bad",
         title: s.alerts + " current alert(s)" }, "⚠ " + s.alerts));
-    const occupiedModel = s.availability === "occupied"
-      ? " · " + ifModelLabel(s.model_route)
-      : "";
-    row.append(head,
-      el("div", { className: "if-row-sub" },
-        s.shortname + (s.harness ? " · " + s.harness : "") + occupiedModel));
+    const model = s.availability === "occupied"
+      ? ifModelDisplay(s.model_observed, s.model_route)
+      : null;
+    const sub = el("div", { className: "if-row-sub" },
+      s.shortname + (s.harness ? " · " + s.harness : ""));
+    if (model) sub.append(el("span", { title: model.title }, " · " + model.text));
+    row.append(head, sub);
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
-    const mobileModel = s.availability === "occupied"
-      ? " · " + ifModelLabel(s.model_route)
-      : "";
+    const mobileModel = model ? " · " + model.text : "";
     const opt = el("option", { value: s.shortname },
       `${s.display_name || s.shortname} · ${s.shortname}` +
       `${s.harness ? " · " + s.harness : ""}${mobileModel}` +
@@ -2974,7 +2987,8 @@ async function ifSessionPane(pane, sel) {
 
   const st = {
     harness: sess.harness || sel.harness || "—",
-    model: sess.model_route || "harness default",
+    model: sess.model_observed || null,      // observed live model, or unobserved
+    modelRoute: sess.model_route || null,    // the route it was LAUNCHED with
     lifecycle: sess.lifecycle || "—",
     composer: sess.composer || "unknown",
     browserComposer: sess.browser_composer || "clean",
@@ -3089,12 +3103,19 @@ function ifAge(ts) {
 function ifPaintHeader(a, sel, pane) {
   const st = a.st;
   const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(st.lifecycle);
-  const stat = (k, v) => el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v)));
+  const stat = (k, v, title) => el("span",
+    title ? { className: "if-stat", title } : { className: "if-stat" },
+    k + " ", el("b", {}, String(v)));
   // Read-only session telemetry stays available without consuming the terminal
   // header. Actions remain outside the disclosure beside the state they change.
+  // model = what the session was observed running; the launch route is only
+  // shown as its own labelled stat, never as a claim about the live model.
+  const model = ifModelDisplay(st.model, st.modelRoute);
   a.sessionDetailsEl.replaceChildren(
     stat("harness", st.harness),
-    stat("model", ifModelLabel(st.model)),
+    stat("model", model.text, model.title),
+    ...(st.model ? [stat("launched", ifModelLabel(st.modelRoute),
+      "the route this session was launched with")] : []),
     stat("session", "#" + a.sessionId + (st.archive != null ? " · arc #" + st.archive : "")),
     stat("age", ifAge(st.since)),
     stat("lifecycle", st.lifecycle),
