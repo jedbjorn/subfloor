@@ -720,6 +720,28 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
   padding: .5rem .8rem;
 }
+.if-disclosure {
+  position: relative; color: var(--dim); font-size: .8rem;
+}
+.if-disclosure summary {
+  list-style: none; cursor: pointer; border: 1px solid var(--line);
+  border-radius: 999px; padding: .35rem .7rem; color: var(--ink);
+  user-select: none;
+}
+.if-disclosure summary::-webkit-details-marker { display: none; }
+.if-disclosure summary::after { content: " ▾"; color: var(--dim); }
+.if-disclosure[open] summary::after { content: " ▴"; }
+.if-disclosure > :not(summary) {
+  margin-top: .5rem;
+}
+.if-disclosure[open] {
+  flex-basis: 100%;
+  order: 10;
+}
+.if-alerts.warning summary { color: var(--warn); border-color: var(--warn); }
+.if-alerts.critical summary { color: #d45a5a; border-color: #d45a5a; }
+.if-alerts-body { color: var(--ink); }
+.if-inline-actions { display: flex; align-items: center; gap: .4rem; }
 .if-stat { color: var(--dim); font-size: .8rem; }
 .if-stat b { color: var(--ink); font-weight: 600; }
 .if-head .act { margin-top: 0; }
@@ -738,7 +760,12 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   min-height: 42px; resize: none; overflow-y: hidden;
   font: 14px/1.4 ui-monospace, monospace;
 }
+.if-composer-actions { display: flex; align-items: stretch; gap: .4rem; }
 .if-composer .act { margin: 0; min-height: 42px; }
+.if-composer .if-end-chat {
+  color: #ef7777; border-color: #a74444; background: rgba(167,68,68,.08);
+}
+.if-composer .if-end-chat:hover { border-color: #ef7777; }
 .if-composer .if-note { grid-column: 1 / -1; min-height: 1.2em; }
 .if-newchat .act { margin-top: .8rem; }
 .if-newchat .muted { margin-top: .5rem; }
@@ -765,10 +792,19 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
    terminal viewport, becomes the scroll surface. */
 .if-picker { display: none; }
 @media (max-width: 760px) {
+  body.interface-view header {
+    max-width: 100vw; overflow-x: auto; gap: .75rem;
+  }
+  body.interface-view header h1,
+  body.interface-view header .tools { display: none; }
+  body.interface-view header nav { flex: 0 0 max-content; }
   .if-wrap { flex-direction: column; }
   .if-rail { display: none; }
   .if-picker { display: block; width: 100%; background: var(--panel);
     border: 1px solid var(--line); border-radius: var(--r); color: var(--ink);
     font: inherit; padding: .45rem .6rem; }
   .if-pane { width: 100%; }
+  .if-head { gap: .5rem; }
+  .if-composer { grid-template-columns: minmax(0, 1fr); }
+  .if-composer-actions { justify-content: flex-end; }
 }

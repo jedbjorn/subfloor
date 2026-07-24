@@ -10,6 +10,8 @@ integration paths earlier units deferred to the real-tmux gate:
   holds (out-of-order and replayed seqs rejected, last_hook_seq monotonic)
   while ordered input streams through real tmux — no lost frames, no
   interleaved bytes.
+- composer submit: one frame containing text plus terminal Enter advances a
+  real tmux command past its line read exactly once.
 - parking-under-crash: a broker crash mid-write (the private tmux server
   dies between the wake preflight and send-keys) parks the batch
   delivery_unknown with an alert, and no drain, startup pass, or notify
@@ -275,7 +277,56 @@ class WakeTmuxE2ETest(unittest.TestCase):
             self.rt.runtime_state(self.sid)["continuity_broken"])
         await self.rt.stop()
 
-    # -- e2e 3: parking under a mid-write broker crash ----------------------------
+    # -- e2e 3: one composed frame starts one real terminal turn ------------------
+
+    def test_composed_text_and_submit_start_one_real_turn(self):
+        asyncio.run(self._flow_composed_turn())
+
+    async def _flow_composed_turn(self):
+        await self._spawn([
+            "/bin/sh",
+            "-c",
+            "printf READY; IFS= read -r line; "
+            "printf '\\nTURN_STARTED:%s\\n' \"$line\"; sleep 5",
+        ])
+        lease_id = self._acquire_writer()
+        writer = FakeClient(
+            self.sid,
+            role="writer",
+            client_id="tab-1",
+            lease_id=lease_id,
+            lease_token="tok-1",
+        )
+        await self.rt.attach(writer)
+
+        # This is the browser composer's one generation-fenced acceptance:
+        # text and terminal submit share one sequence and one broker frame.
+        self.rt.enqueue_input(writer, 1, b"one composed turn\r")
+        await wait_for(
+            lambda: len([
+                ack for ack in writer.by_type("input_ack")
+                if ack.get("seq") == 1 and not ack.get("replayed")
+            ]) == 1,
+            what="one composer input acknowledgement",
+        )
+        marker = b"TURN_STARTED:one composed turn"
+        await wait_for(
+            lambda: marker in b"".join(writer.outputs),
+            what="real terminal command advanced past its line read",
+        )
+        await asyncio.sleep(0.3)
+        self.assertEqual(
+            b"".join(writer.outputs).count(marker),
+            1,
+            "one composed acceptance must start exactly one turn",
+        )
+        self.assertEqual(
+            [ack["seq"] for ack in writer.by_type("input_ack")],
+            [1],
+        )
+        await self.rt.stop()
+
+    # -- e2e 4: parking under a mid-write broker crash ----------------------------
 
     def test_broker_crash_mid_write_parks_delivery_unknown(self):
         asyncio.run(self._flow_parking_under_crash())
