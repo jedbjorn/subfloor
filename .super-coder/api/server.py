@@ -2220,15 +2220,18 @@ class Handler(BaseHTTPRequestHandler):
             if not repo or repo.count("/") != 1 or pr is None:
                 return self._send(400, {"error": "repo (owner/name) and pr_number (int) required"})
             sprint_doc_id = body.get("sprint_doc_id")
-            if sprint_doc_id is not None:
-                try:
-                    sprint_doc_id = int(sprint_doc_id)
-                except (TypeError, ValueError):
-                    return self._send(400, {"error": "sprint_doc_id must be an int"})
-                if not pr_poller.is_active_sprint(con, sprint_doc_id):
-                    return self._send(409, {"error":
-                        f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
-                        "SPRINT doc — watches arm only to active sprints"})
+            if sprint_doc_id is None:
+                return self._send(400, {"error":
+                    "sprint_doc_id (int) required — unscoped watches are "
+                    "dormant and cannot be registered"})
+            try:
+                sprint_doc_id = int(sprint_doc_id)
+            except (TypeError, ValueError):
+                return self._send(400, {"error": "sprint_doc_id must be an int"})
+            if not pr_poller.is_active_sprint(con, sprint_doc_id):
+                return self._send(409, {"error":
+                    f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
+                    "SPRINT doc — watches arm only to active sprints"})
             target = sid
             if body.get("shell"):
                 r = con.execute(
@@ -2273,6 +2276,11 @@ class Handler(BaseHTTPRequestHandler):
                     "UPDATE watched_prs SET sprint_doc_id=?, last_seen=? "
                     "WHERE watch_id=?",
                     (sprint_doc_id, json.dumps(fp), unscoped["watch_id"]))
+                con.execute(
+                    "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                    "WHERE watch_id=? AND reason='pr_watch_unscoped' "
+                    "AND resolved_at IS NULL",
+                    (unscoped["watch_id"],))
                 con.commit()
                 return self._send(200, {"watch_id": unscoped["watch_id"],
                                         "rebound": True, "daemon": daemon})

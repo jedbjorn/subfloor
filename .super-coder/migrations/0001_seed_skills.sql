@@ -3462,14 +3462,16 @@ kickoff said "start now", or a planner `task` row says so):
 - push, open your PR — then, in the SAME step:
 
 ```
-./sc watch pr <owner/repo> <pr-number> --shell <planner-shortname>
+./sc watch pr <owner/repo> <pr-number> --shell <planner-shortname> --sprint <doc-id>
 sc mem message send <planner> "sprint <doc-id>: unit <seq> pr-open — PR #<n>" --kind result
 ```
 
 The watch is what makes the loop event-driven: the daemon now turns every
 CI conclusion, review, and merge on your PR into a `pr_event` row in the
 planner''s inbox. Registration is explicit and happens at PR open — a PR
-without a watch is invisible to the sprint.
+without a watch is invisible to the sprint. Sprint scope is mandatory:
+registration without `--sprint`, or against a non-ACTIVE board, fails loudly
+instead of creating a dormant watch.
 
 **5. Babysit CI while live.** `gh pr checks <your-pr> --watch` blocks in
 your session at zero scheduled cost — use it while you''re booted; if your

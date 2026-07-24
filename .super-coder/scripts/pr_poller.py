@@ -240,6 +240,15 @@ def armed_watches(con) -> list:
         "ORDER BY repo, pr_number, watch_id", tuple(sorted(active))).fetchall()
 
 
+def live_unscoped_watch_ids(con) -> list[int]:
+    """Legacy watches that cannot be polled because they have no sprint scope.
+    New registration rejects this state; old rows remain repairable by rebind."""
+    return [r[0] for r in con.execute(
+        "SELECT watch_id FROM watched_prs "
+        "WHERE closed_at IS NULL AND sprint_doc_id IS NULL "
+        "ORDER BY watch_id").fetchall()]
+
+
 # ── Per-repo backoff + blind windows ─────────────────────────────────────────
 
 class PollerState:
@@ -296,6 +305,19 @@ def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
         (watch_id, severity, reason, dedupe))
 
 
+def surface_unscoped_watches(con) -> int:
+    """Turn dormant legacy state into an operator-visible, deduped alert.
+    Returns the number of affected watches, whether newly alerted or already
+    carrying the same open alert."""
+    watch_ids = live_unscoped_watch_ids(con)
+    for watch_id in watch_ids:
+        _alert(con, severity="critical", reason="pr_watch_unscoped",
+               watch_id=watch_id)
+    if watch_ids:
+        con.commit()
+    return len(watch_ids)
+
+
 def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     """One semantic transition → idempotent pr_event + same-transaction wake
     item. Dedupe keyed (watch, transition, head SHA, state) via the message's
@@ -336,7 +358,8 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
     state = state if state is not None else PollerState()
     now = now if now is not None else time.monotonic()
     summary = {"watches": 0, "repos": 0, "skipped_backoff": 0,
-               "events": 0, "errors": 0, "retired": 0}
+               "events": 0, "errors": 0, "retired": 0,
+               "unscoped_alerts": surface_unscoped_watches(con)}
     emitted_ids: list[int] = []
     watches = armed_watches(con)
     summary["watches"] = len(watches)
@@ -466,7 +489,7 @@ class Poller(threading.Thread):
                         print(f"pr-poller: heartbeat error ({e})", flush=True)
                     # The DB read is cheap and local; the bounded GitHub poll
                     # happens only while ACTIVE sprint watches exist.
-                    if armed_watches(con):
+                    if armed_watches(con) or live_unscoped_watch_ids(con):
                         n = poll_cycle(con, fetch=self._fetch, source=source,
                                        state=self.state, interval=self._interval)
                         if n["events"] or n["errors"]:

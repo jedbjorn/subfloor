@@ -1587,6 +1587,12 @@ _ALERT_COPY = {
         "Detach the unmanaged client before retrying automatic wake.",
         "warning",
     ),
+    "pr_watch_unscoped": (
+        "A live PR watch has no sprint scope, so it cannot emit planner wake "
+        "events or retire itself.",
+        "Rebind the watch with `sc watch pr … --sprint <doc-id>`.",
+        "warning",
+    ),
 }
 
 
@@ -1641,15 +1647,19 @@ def _sprint_alerts(actor, query: dict):
         conds.append(
             "(a.session_id IN (SELECT session_id FROM interface_sessions "
             "WHERE shell_id=?) OR a.binding_id IN (SELECT binding_id FROM "
-            "sprint_planner_bindings WHERE planner_shell_id=?))")
-        params += [actor.shell_id, actor.shell_id]
+            "sprint_planner_bindings WHERE planner_shell_id=?) OR "
+            "a.watch_id IN (SELECT watch_id FROM watched_prs "
+            "WHERE shell_id=?))")
+        params += [actor.shell_id, actor.shell_id, actor.shell_id]
         planner = actor.shell_id
     elif planner is not None:
         conds.append(
             "(a.session_id IN (SELECT session_id FROM interface_sessions "
             "WHERE shell_id=?) OR a.binding_id IN (SELECT binding_id FROM "
-            "sprint_planner_bindings WHERE planner_shell_id=?))")
-        params += [planner, planner]
+            "sprint_planner_bindings WHERE planner_shell_id=?) OR "
+            "a.watch_id IN (SELECT watch_id FROM watched_prs "
+            "WHERE shell_id=?))")
+        params += [planner, planner, planner]
     if session_id is not None:
         conds.append("a.session_id=?")
         params.append(session_id)
@@ -1672,7 +1682,8 @@ def _sprint_alerts(actor, query: dict):
         else:
             generation = current[0]
     if generation is not None:
-        conds.append("COALESCE(s.generation, b.generation)=?")
+        conds.append(
+            "(a.watch_id IS NOT NULL OR COALESCE(s.generation, b.generation)=?)")
         params.append(generation)
     if not include_resolved:
         conds.append("a.resolved_at IS NULL AND a.acknowledged_at IS NULL")

@@ -67,6 +67,14 @@ def seed_shells(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def seed_sprint_doc(con: sqlite3.Connection, doc_id: int = 100) -> None:
+    con.execute(
+        "INSERT INTO documents (document_id, kind, title, body, frozen) "
+        "VALUES (?, 'doc', 'SPRINT: T', '# SPRINT: T\nstatus: ACTIVE\n', 0)",
+        (doc_id,))
+    con.commit()
+
+
 # ── schema: kind column + watched_prs ────────────────────────────────────────
 
 class SchemaTest(unittest.TestCase):
@@ -121,6 +129,32 @@ class SchemaTest(unittest.TestCase):
         body = self.con.execute(
             "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
         self.assertEqual(body, asset)
+
+    def test_sprint_watch_scope_reseed_matches_asset_and_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.executescript(SCHEMA.read_text())
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name == "0086_reseed_sprint_watch_scope.sql":
+                break
+            con.executescript(migration.read_text())
+
+        old = con.execute(
+            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
+        self.assertNotIn("--sprint <doc-id>", old.split("**5. Babysit", 1)[0])
+
+        reseed = (MIGRATIONS / "0086_reseed_sprint_watch_scope.sql").read_text()
+        con.executescript(reseed)
+        once = con.execute(
+            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
+        con.executescript(reseed)
+        twice = con.execute(
+            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
+        asset = (ENGINE / "assets" / "skills" / "sprint" /
+                 "SKILL.md").read_text().split("---", 2)[2].strip()
+
+        self.assertEqual(once, asset)
+        self.assertEqual(twice, once)
 
     def test_sprint_orchestration_requires_plan_billing_by_default(self):
         body = self.con.execute(
@@ -356,6 +390,7 @@ class ApiTest(unittest.TestCase):
         cls.db = cls.tmp / "shell_db.db"
         con = build_db(cls.db)
         seed_shells(con)
+        seed_sprint_doc(con)
         con.close()
         server.DB_PATH = cls.db  # db() reads the module global at call time
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -387,39 +422,43 @@ class ApiTest(unittest.TestCase):
             con.close()
 
     def test_register_defaults_to_the_token_shell(self):
-        self.assertEqual(watch.main(["pr", "own/repo", "11"]), 0)
-        rows = self.q("SELECT shell_id, closed_at FROM watched_prs "
+        self.assertEqual(
+            watch.main(["pr", "own/repo", "11", "--sprint", "100"]), 0)
+        rows = self.q("SELECT shell_id, closed_at, sprint_doc_id FROM watched_prs "
                       "WHERE repo='own/repo' AND pr_number=11")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shell_id"], 1)   # the token shell (plan1)
+        self.assertEqual(rows[0]["sprint_doc_id"], 100)
 
     def test_register_for_another_shell(self):
-        watch.main(["pr", "own/repo", "12", "--shell", "dev1"])
+        watch.main(["pr", "own/repo", "12", "--shell", "dev1",
+                    "--sprint", "100"])
         rows = self.q("SELECT shell_id FROM watched_prs WHERE pr_number=12")
         self.assertEqual(rows[0]["shell_id"], 2)
 
     def test_register_unknown_shell_dies(self):
         with self.assertRaises(SystemExit):
-            watch.main(["pr", "own/repo", "13", "--shell", "nobody"])
+            watch.main(["pr", "own/repo", "13", "--shell", "nobody",
+                        "--sprint", "100"])
 
     def test_register_bad_repo_dies(self):
         with self.assertRaises(SystemExit):
-            watch.main(["pr", "not-a-repo", "14"])
+            watch.main(["pr", "not-a-repo", "14", "--sprint", "100"])
 
     def test_duplicate_live_watch_is_idempotent(self):
-        watch.main(["pr", "own/repo", "15"])
-        watch.main(["pr", "own/repo", "15"])
+        watch.main(["pr", "own/repo", "15", "--sprint", "100"])
+        watch.main(["pr", "own/repo", "15", "--sprint", "100"])
         self.assertEqual(len(self.q(
             "SELECT 1 FROM watched_prs WHERE pr_number=15")), 1)
 
     def test_retired_watch_reregisters_as_new_row_keeping_history(self):
-        watch.main(["pr", "own/repo", "16"])
+        watch.main(["pr", "own/repo", "16", "--sprint", "100"])
         con = sqlite3.connect(self.db)
         con.execute("UPDATE watched_prs SET closed_at=datetime('now'), "
                     "last_seen='{\"state\":\"MERGED\"}' WHERE pr_number=16")
         con.commit()
         con.close()
-        watch.main(["pr", "own/repo", "16"])
+        watch.main(["pr", "own/repo", "16", "--sprint", "100"])
         rows = self.q("SELECT closed_at, last_seen FROM watched_prs "
                       "WHERE pr_number=16 ORDER BY watch_id")
         # The 0080 cutover: the closed row is RETAINED (with its fingerprint)
@@ -435,20 +474,56 @@ class ApiTest(unittest.TestCase):
         pr_poller.gh_fetch = lambda q: pr_poller.GhResult(error="connect timeout")
         try:
             with self.assertRaises(SystemExit):   # _api dies on the 502
-                watch.main(["pr", "own/repo", "18"])
+                watch.main(["pr", "own/repo", "18", "--sprint", "100"])
         finally:
             pr_poller.gh_fetch = real
         self.assertEqual(self.q("SELECT 1 FROM watched_prs WHERE pr_number=18"), [])
 
     def test_registration_stores_the_baseline(self):
-        watch.main(["pr", "own/repo", "19"])
+        watch.main(["pr", "own/repo", "19", "--sprint", "100"])
         row = self.q("SELECT last_seen FROM watched_prs WHERE pr_number=19")[0]
         self.assertIn('"state": "OPEN"', row["last_seen"])
         self.assertIn('"sha": "abc1234def"', row["last_seen"])
 
+    def test_scoped_registration_rebinds_legacy_and_resolves_alert(self):
+        con = sqlite3.connect(self.db)
+        watch_id = con.execute(
+            "INSERT INTO watched_prs (repo, pr_number, shell_id) "
+            "VALUES ('own/repo', 21, 1)").lastrowid
+        con.execute(
+            "INSERT INTO planner_alerts "
+            "(watch_id, severity, reason, dedupe_key) VALUES "
+            "(?, 'critical', 'pr_watch_unscoped', ?)",
+            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+        con.commit()
+        con.close()
+
+        watch.main(["pr", "own/repo", "21", "--sprint", "100"])
+
+        rows = self.q(
+            "SELECT watch_id, sprint_doc_id, last_seen FROM watched_prs "
+            "WHERE pr_number=21")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["watch_id"], watch_id)
+        self.assertEqual(rows[0]["sprint_doc_id"], 100)
+        self.assertIn('"checks": "PENDING"', rows[0]["last_seen"])
+        alert = self.q(
+            "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
+            watch_id)[0]
+        self.assertIsNotNone(alert["resolved_at"])
+
     def test_list_shows_live_watches(self):
-        watch.main(["pr", "own/repo", "17"])
+        watch.main(["pr", "own/repo", "17", "--sprint", "100"])
         self.assertEqual(watch.main(["list"]), 0)
+
+    def test_unscoped_registration_fails_loudly_without_a_row(self):
+        with self.assertRaises(SystemExit):
+            watch.main(["pr", "own/repo", "20"])
+        with self.assertRaises(SystemExit):
+            watch._api("POST", "/_sc/watches",
+                       {"repo": "own/repo", "pr_number": 20})
+        self.assertEqual(
+            self.q("SELECT 1 FROM watched_prs WHERE pr_number=20"), [])
 
     def test_send_with_kind_lands_typed(self):
         mem.main(["message", "send", "dev1", "build unit 2", "--kind", "task"])
@@ -568,6 +643,7 @@ class DaemonLivenessApiTest(unittest.TestCase):
         cls.db = cls.tmp / "shell_db.db"
         con = build_db(cls.db)
         seed_shells(con)
+        seed_sprint_doc(con)
         con.close()
         server.DB_PATH = cls.db
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -614,9 +690,13 @@ class DaemonLivenessApiTest(unittest.TestCase):
         self.assertGreaterEqual(d["age_s"], 3600)
 
     def test_d_registration_response_carries_daemon(self):
-        r = watch._api("POST", "/_sc/watches", {"repo": "own/repo", "pr_number": 44})
+        r = watch._api("POST", "/_sc/watches",
+                       {"repo": "own/repo", "pr_number": 44,
+                        "sprint_doc_id": 100})
         self.assertTrue(r["daemon"]["stale"])   # still the -1h beat from test_c
-        r = watch._api("POST", "/_sc/watches", {"repo": "own/repo", "pr_number": 44})
+        r = watch._api("POST", "/_sc/watches",
+                       {"repo": "own/repo", "pr_number": 44,
+                        "sprint_doc_id": 100})
         self.assertTrue(r.get("existing"))      # idempotent path carries it too
         self.assertTrue(r["daemon"]["stale"])
 

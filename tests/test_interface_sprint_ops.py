@@ -317,6 +317,37 @@ class SprintOpsRoutesTest(unittest.TestCase):
                                  (SHELL2,))
         self.assertEqual(body["alerts"], [])
 
+    def test_unscoped_watch_alert_is_visible_only_to_its_owner(self):
+        con = sqlite3.connect(self.db_path)
+        watch_id = con.execute(
+            "INSERT INTO watched_prs (repo, pr_number, shell_id) "
+            "VALUES ('o/r', 7, 1)").lastrowid
+        con.execute(
+            "INSERT INTO planner_alerts "
+            "(watch_id, severity, reason, dedupe_key) VALUES "
+            "(?, 'critical', 'pr_watch_unscoped', ?)",
+            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+        con.commit()
+        con.close()
+
+        status, body = self.call(
+            "GET", "/api/interface/sprint-alerts", (SHELL1,))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["alerts"]), 1)
+        self.assertEqual(body["alerts"][0]["reason"], "pr_watch_unscoped")
+        self.assertIn("--sprint <doc-id>", body["alerts"][0]["next_action"])
+
+        status, body = self.call(
+            "GET", "/api/interface/sprint-alerts", (SHELL2,))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["alerts"], [])
+
+        status, body = self.call(
+            "GET", "/api/interface/sprint-alerts?planner_shell_id=1", (OP,))
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [a["reason"] for a in body["alerts"]], ["pr_watch_unscoped"])
+
     def test_alert_acknowledgement_dismisses_current_but_keeps_audit(self):
         con = sqlite3.connect(self.db_path)
         interface_broker._alert(
