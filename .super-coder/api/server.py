@@ -187,6 +187,51 @@ def db():
     return db_driver.connect(DB_PATH)
 
 
+def require_current_schema(db_path=DB_PATH,
+                           migrations_dir=ENGINE / "migrations") -> None:
+    """Fail loudly before new engine code touches an older DB schema.
+
+    A pre-fix updater can materialize the target engine and pin before its
+    live-state refusal fires.  The newly installed server must therefore
+    recognize that half-applied floor from the migration ledger before key
+    provisioning, Interface reconciliation, or request handling reaches a
+    column the old DB does not have.
+    """
+    expected = {path.name for path in migrations_dir.glob("*.sql")}
+    con = db_driver.connect(db_path)
+    try:
+        table = con.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+        applied = set() if table is None else {
+            row[0] for row in con.execute(
+                "SELECT filename FROM schema_migrations")
+        }
+    except db_driver.OperationalError:
+        applied = set()
+    finally:
+        con.close()
+
+    missing = sorted(expected - applied)
+    if not missing:
+        return
+    names = ", ".join(missing)
+    ref_path = REPO_ROOT / ".sc-state" / "engine.ref"
+    ref = ref_path.read_text().strip()[:12] if ref_path.exists() else "un-pinned"
+    sys.exit(
+        "server: installed engine/DB schema mismatch — "
+        f"installed engine {ref} requires migrations that "
+        f"{Path(db_path).name} has not applied; its ledger is missing "
+        f"{len(missing)} required "
+        f"migration(s): {names}\n"
+        "Refusing startup before first DB use; continuing would run new code "
+        "against an old schema.\n"
+        "Recovery: run `./sc rollback --engine-only` to restore the previous "
+        "engine/pin while preserving this unchanged DB, then drain/reconcile "
+        "live Interface state and retry `./sc update`.")
+
+
 def rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
@@ -2726,6 +2771,7 @@ def main(argv):
         port = ports_mod.resolve().get("port", 8800)
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
+    require_current_schema(DB_PATH)
     # Provision API keys at startup: every shell needs an api_key to reach this
     # server's token-scoped routes, but shells created before migration 0027 (or
     # on a fork that never ran the one-off backfill) come up NULL-keyed and would

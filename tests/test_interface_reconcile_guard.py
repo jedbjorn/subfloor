@@ -306,6 +306,107 @@ class LiveRefusalGuardTest(unittest.TestCase):
             "WHERE session_id=?", (sid,)).fetchone(),
             ("delivery_unknown", 4))
 
+    def test_operator_approved_discard_terminalizes_all_live_state(self):
+        sid = self._occupied_session()
+        self.con.execute(
+            "INSERT INTO shell_memory_archives "
+            "(archive_id, shell_id, date, full_narrative) "
+            "VALUES (10,1,'2026-07-24','unsaved turn')")
+        self.con.execute(
+            "UPDATE interface_sessions SET archive_id=10 WHERE session_id=?",
+            (sid,))
+        self.con.execute(
+            "UPDATE shells SET active_archive_id=10 WHERE shell_id=1")
+        self.con.execute(
+            "INSERT INTO interface_input_state "
+            "(session_id, shell_id, generation, composer, pending_seq) "
+            "VALUES (?,1,1,'unknown',4)", (sid,))
+        self.con.execute(
+            "INSERT INTO interface_writer_leases "
+            "(session_id, shell_id, generation, client_id, token_hash) "
+            "VALUES (?,1,1,'client','hash')", (sid,))
+        binding_id = self.con.execute(
+            "INSERT INTO sprint_planner_bindings "
+            "(sprint_doc_id, planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (1,1,?,1,1)", (sid,)).lastrowid
+        batch_id = self.con.execute(
+            "INSERT INTO planner_wake_batches "
+            "(binding_id, shell_id, generation, state) "
+            "VALUES (?,1,1,'running')", (binding_id,)).lastrowid
+        message_id = self.con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body) "
+            "VALUES (2,1,'must remain unread')").lastrowid
+        item_id = self.con.execute(
+            "INSERT INTO planner_wake_items "
+            "(binding_id, message_id, batch_id, state) "
+            "VALUES (?,?,?,'running')",
+            (binding_id, message_id, batch_id)).lastrowid
+        alert_id = self.con.execute(
+            "INSERT INTO planner_alerts "
+            "(session_id, binding_id, severity, reason, dedupe_key) "
+            "VALUES (?,?,'warning','turn_failure','discard-test')",
+            (sid, binding_id)).lastrowid
+        self.con.commit()
+
+        before = interface_reconcile.live_refusal_reasons(self.db)
+        self.assertTrue(any("session" in reason for reason in before))
+        self.assertTrue(any("batch" in reason for reason in before))
+        manifest = interface_reconcile.live_loss_manifest(self.db)
+        warning = "\n".join(manifest.loss_lines())
+        self.assertIn("open archive ID(s): 10", warning)
+        self.assertIn(f"wake item ID(s): {item_id}", warning)
+        self.assertIn(f"open planner alert ID(s): {alert_id}", warning)
+        counts = interface_reconcile.discard_live_state(self.db, manifest)
+
+        self.assertEqual(counts["sessions_ended"], 1)
+        self.assertEqual(counts["generations_ended"], 0,
+                         "close_session owns the matching generation")
+        self.assertEqual(counts["archives_closed"], 1)
+        self.assertEqual(counts["bindings_released"], 1)
+        self.assertEqual(counts["batches_completed"], 1)
+        self.assertEqual(counts["items_cancelled"], 1)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT occupancy, lifecycle, end_reason "
+                "FROM interface_sessions WHERE session_id=?", (sid,)
+            ).fetchone(),
+            ("ended", "ended", "update_discard"),
+        )
+        self.assertIsNotNone(self.con.execute(
+            "SELECT ended_at FROM interface_generations "
+            "WHERE shell_id=1 AND generation=1").fetchone()[0])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT ended_at FROM shell_memory_archives "
+                "WHERE archive_id=10").fetchone()[0] is not None,
+            True,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_archive_id FROM shells WHERE shell_id=1"
+        ).fetchone()[0])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT release_reason FROM sprint_planner_bindings "
+                "WHERE binding_id=?", (binding_id,)).fetchone()[0],
+            "update_discard",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state, completed_at FROM planner_wake_batches "
+                "WHERE batch_id=?", (batch_id,)).fetchone()[0],
+            "complete",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state, error FROM planner_wake_items WHERE item_id=?",
+                (item_id,)).fetchone(),
+            ("cancelled", "discarded by operator-approved update"),
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT read_at FROM shell_messages WHERE message_id=?",
+            (message_id,)).fetchone()[0])
+        self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
+
     def test_fully_drained_passes(self):
         sid = self._occupied_session()
         self.con.execute(
