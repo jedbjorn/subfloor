@@ -2629,7 +2629,6 @@ async function ifSprintPanel(pane, sel) {
   } catch { return; }   // surface down — never break the pane over the panel
   if (!pane.isConnected || (!sel.session_id && !bindings.length && !alerts.length)) return;
   const card = el("div", { className: "card" });
-  card.append(el("div", {}, el("b", {}, "Generation alerts / Sprint wake")));
   const note = el("div", { className: "if-note" });
 
   if (bindings.length) {
@@ -2879,7 +2878,7 @@ async function ifSessionPane(pane, sel) {
   // hash no-op) — the terminal keeps its scrollback; only the DOM is re-parented.
   if (ifAttach && ifAttach.sessionId === sessionId &&
       ifAttach.ws && ifAttach.ws.readyState <= WebSocket.OPEN) {
-    pane.append(ifAttach.headEl, ifAttach.termEl);
+    pane.append(ifAttach.headEl, ifAttach.termEl, ifAttach.composerEl);
     ifSprintPanel(pane, sel);
     return;
   }
@@ -2898,7 +2897,9 @@ async function ifSessionPane(pane, sel) {
     model: sess.model_route || "harness default",
     lifecycle: sess.lifecycle || "—",
     composer: sess.composer || "unknown",
+    browserComposer: sess.browser_composer || "clean",
     writer: sess.writer && sess.writer.held ? "held" : "none",
+    writerReason: "",
     clients: sess.clients ?? 0,
     wake: sess.wake_state || "disarmed",
     archive: sess.archive_id ?? null,
@@ -2907,13 +2908,29 @@ async function ifSessionPane(pane, sel) {
   };
   const headEl = el("div", { className: "if-head" });
   const termEl = el("div", { className: "if-term" });
+  const composerEl = el("div", { className: "if-composer" });
   const a = { sessionId, shortname: sel.shortname, st, headEl, termEl,
+    composerEl,
+    legalActions: new Set(
+      Array.isArray(sess.legal_actions) ? sess.legal_actions : []),
+    stateReason: sess.state_reason || "",
     ws: null, term: null, leaseId: null, leaseToken: null, role: "viewer",
     seq: 1, inflight: 0, lastAck: 0, outBuf: "", awaiting: false, halted: false,
-    heartbeat: 0, resizeObs: null, paint: null };
-  a.paint = () => ifPaintHeader(a, sel, pane);
+    heartbeat: 0, resizeObs: null, paint: null,
+    composerInput: null, composerSend: null, composerNote: null,
+    composerPendingSeq: null, browserComposerState: st.browserComposer,
+    browserComposerWanted: st.browserComposer, browserComposerError: "",
+    browserComposerSyncing: false, browserComposerVersion: 0,
+    browserComposerChain: Promise.resolve(),
+    composerProjectionPending: false, composerProjectionVersion: 0,
+    composerProjectionSync: Promise.resolve() };
+  ifBuildComposer(a);
+  a.paint = () => {
+    ifPaintHeader(a, sel, pane);
+    ifPaintComposer(a);
+  };
   ifAttach = a;
-  pane.append(headEl, termEl);
+  pane.append(headEl, termEl, composerEl);
   ifSprintPanel(pane, sel);
   a.paint();
 
@@ -2928,9 +2945,11 @@ async function ifSessionPane(pane, sel) {
       // The lease reseeds input seqs from the session's forwarded_seq + 1.
       a.seq = lease.next_input_seq ?? 1;
       a.st.writer = "active";
+      a.st.writerReason = "";
     } catch (e) {
       if (e.status !== 409 || e.code !== "writer_held") throw e;
       a.st.writer = "held";   // read-only attach; Take-over button in the header
+      a.st.writerReason = e.message;
     }
     a.paint();
     const t = await apiIf("/interface/stream-tickets", "POST",
@@ -3018,6 +3037,157 @@ function ifPaintHeader(a, sel, pane) {
   a.headEl.replaceChildren(...head);
 }
 
+function ifSizeComposer(input) {
+  input.style.height = "auto";
+  input.style.height = Math.max(42, input.scrollHeight || 42) + "px";
+}
+
+function ifComposerWritable(a) {
+  return a.legalActions.has("send_input") &&
+    a.role === "writer" && a.st.writer === "active" && !a.halted &&
+    !a.composerProjectionPending;
+}
+
+function ifComposerDisabledReason(a) {
+  if (a.composerProjectionPending)
+    return "Read-only while server input authority refreshes.";
+  if (!a.legalActions.has("send_input"))
+    return a.stateReason ||
+      "Read-only — the server does not list input as legal.";
+  if (a.role !== "writer" || a.st.writer !== "active")
+    return a.st.writerReason ||
+      "Read-only — this client does not hold the server writer lease.";
+  if (a.halted)
+    return a.st.note || "Input halted — reattach before sending.";
+  return "";
+}
+
+function ifPaintComposer(a) {
+  if (!a.composerInput) return;
+  const writable = ifComposerWritable(a);
+  const pending = a.composerPendingSeq != null;
+  const hasMessage = Boolean(a.composerInput.value.trim());
+  // Do not let a new draft appear while a clean transition is in flight:
+  // that would briefly project clean server-side while the box is non-empty.
+  // Dirty transitions need not freeze typing because every later character
+  // remains covered by the already-requested dirty state.
+  a.composerInput.disabled = !writable || pending ||
+    (a.browserComposerSyncing && a.browserComposerWanted === "clean");
+  a.composerSend.disabled = !writable || pending || a.awaiting ||
+    Boolean(a.outBuf) || !hasMessage || a.browserComposerSyncing ||
+    Boolean(a.browserComposerError) || a.browserComposerState !== "dirty";
+  if (pending) {
+    a.composerNote.textContent =
+      "Sending through the generation-fenced input broker…";
+  } else if (a.browserComposerError) {
+    a.composerNote.textContent =
+      "Draft safety sync failed; sending is disabled: " +
+      a.browserComposerError;
+  } else {
+    const disabled = ifComposerDisabledReason(a);
+    if (disabled) a.composerNote.textContent = disabled;
+    else if (!a.composerInput.value && a.browserComposerState === "dirty")
+      a.composerNote.textContent =
+        "A prior browser draft is still marked composing; edit then clear " +
+        "this box to release the planner wake gate.";
+    else a.composerNote.textContent = "";
+  }
+}
+
+function ifRefreshComposerProjection(a) {
+  const version = ++a.composerProjectionVersion;
+  a.composerProjectionPending = true;
+  a.paint();
+  a.composerProjectionSync = apiIf(
+    "/interface/sessions/" + a.sessionId
+  ).then((session) => {
+    if (ifAttach !== a || version !== a.composerProjectionVersion) return;
+    a.legalActions = new Set(
+      Array.isArray(session.legal_actions) ? session.legal_actions : []);
+    a.stateReason = session.state_reason || "";
+  }).catch((e) => {
+    if (ifAttach !== a || version !== a.composerProjectionVersion) return;
+    a.legalActions.delete("send_input");
+    a.stateReason = "Server input authority unavailable: " + e.message;
+  }).finally(() => {
+    if (ifAttach !== a || version !== a.composerProjectionVersion) return;
+    a.composerProjectionPending = false;
+    a.paint();
+  });
+}
+
+function ifSyncBrowserComposer(a, state) {
+  if (state === a.browserComposerWanted && !a.browserComposerError) return;
+  a.browserComposerWanted = state;
+  const version = ++a.browserComposerVersion;
+  a.browserComposerSyncing = true;
+  a.paint();
+  a.browserComposerChain = a.browserComposerChain.catch(() => {}).then(async () => {
+    const result = await apiIf("/interface/browser-composer", "POST", {
+      session_id: a.sessionId,
+      client_id: ifClientId,
+      state,
+    });
+    if (ifAttach !== a) return;
+    a.browserComposerState = result.browser_composer;
+    a.st.browserComposer = result.browser_composer;
+    a.browserComposerError = "";
+  }).catch((e) => {
+    if (ifAttach === a) a.browserComposerError = e.message;
+  }).finally(() => {
+    if (ifAttach !== a || version !== a.browserComposerVersion) return;
+    a.browserComposerSyncing = false;
+    a.paint();
+  });
+}
+
+function ifComposerSend(a) {
+  const value = a.composerInput.value;
+  if (!value.trim() || !ifComposerWritable(a) ||
+      a.composerPendingSeq != null || a.awaiting || a.outBuf ||
+      a.browserComposerSyncing || a.browserComposerError ||
+      a.browserComposerState !== "dirty")
+    return;
+  // xterm emits carriage return for Enter. Reuse that exact byte convention
+  // after the composed text so the existing broker submits the message.
+  const seq = ifSendInput(a, value + "\r");
+  if (seq == null) {
+    a.st.note = "message was not queued — reattach and try again";
+    a.paint();
+    return;
+  }
+  a.composerPendingSeq = seq;
+  a.paint();
+}
+
+function ifBuildComposer(a) {
+  const input = el("textarea", {
+    className: "if-composer-input", rows: 1,
+    placeholder: "Message this session…",
+    ariaLabel: "Message composer",
+  });
+  const send = el("button", {
+    className: "act primary", type: "button", textContent: "Send",
+  });
+  const note = el("div", { className: "if-note" });
+  a.composerInput = input;
+  a.composerSend = send;
+  a.composerNote = note;
+  input.oninput = () => {
+    ifSizeComposer(input);
+    ifSyncBrowserComposer(a, input.value ? "dirty" : "clean");
+    a.paint();
+  };
+  input.onkeydown = (event) => {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    ifComposerSend(a);
+  };
+  send.onclick = () => ifComposerSend(a);
+  a.composerEl.append(input, send, note);
+  ifSizeComposer(input);
+}
+
 // End chat (spec Workflow 9): explicit + confirmed, graceful first. Force is
 // a SEPARATE action that exists only after the graceful request timed out —
 // the API enforces the same gate (force_requires_graceful_timeout) and the
@@ -3066,6 +3236,7 @@ async function ifTakeover(a) {
     a.seq = lease.next_input_seq ?? 1;
     a.inflight = 0; a.outBuf = ""; a.awaiting = false; a.halted = false;
     a.st.writer = "active";
+    a.st.writerReason = "";
     a.paint();
     const t = await apiIf("/interface/stream-tickets", "POST",
       { session_id: a.sessionId, role: "writer", client_id: ifClientId, lease_token: a.leaseToken });
@@ -3135,13 +3306,13 @@ function ifOpenStream(a, ticket) {
 }
 
 function ifSendInput(a, data) {
-  if (a.halted || a.role !== "writer") return;
+  if (a.halted || a.role !== "writer") return null;
   a.outBuf += data;   // one unacked frame per writer — buffer while awaiting ack
-  ifFlush(a);
+  return ifFlush(a);
 }
 function ifFlush(a) {
-  if (a.awaiting || a.halted || !a.outBuf) return;
-  if (!a.ws || a.ws.readyState !== WebSocket.OPEN) return;
+  if (a.awaiting || a.halted || !a.outBuf) return null;
+  if (!a.ws || a.ws.readyState !== WebSocket.OPEN) return null;
   const payload = new TextEncoder().encode(a.outBuf);
   const frame = new Uint8Array(9 + payload.length);
   frame[0] = 0x01;
@@ -3152,6 +3323,7 @@ function ifFlush(a) {
   a.seq++;
   a.outBuf = "";
   a.awaiting = true;
+  return a.inflight;
 }
 function ifSendResize(a, rows, cols) {
   if (!a.ws || a.ws.readyState !== WebSocket.OPEN) return;
@@ -3167,17 +3339,31 @@ function ifSendResize(a, rows, cols) {
 function ifRevoked(a) {
   a.role = "viewer"; a.leaseId = null; a.leaseToken = null;
   a.awaiting = false; a.halted = false; a.outBuf = "";
+  a.composerPendingSeq = null;
   a.st.writer = "held";
+  a.st.writerReason = "Control was taken by another client.";
   a.st.note = "control was taken by another client — you are now read-only (Take-over to reclaim)";
 }
 
 function ifControl(a, m) {
   switch (m.type) {
     case "input_ack":   // may carry replayed:true — either way the frame landed
-      if (m.seq === a.inflight) { a.awaiting = false; a.lastAck = m.seq; ifFlush(a); }
+      if (m.seq === a.inflight) {
+        a.awaiting = false;
+        a.lastAck = m.seq;
+        if (m.seq === a.composerPendingSeq) {
+          a.composerPendingSeq = null;
+          a.composerInput.value = "";
+          ifSizeComposer(a.composerInput);
+          ifSyncBrowserComposer(a, "clean");
+        }
+        ifFlush(a);
+        a.paint();
+      }
       break;
     case "input_reject":
       a.awaiting = false;
+      if (m.seq === a.composerPendingSeq) a.composerPendingSeq = null;
       // writer_revoked = a takeover revoked our lease; the runtime learns of
       // it at the next keystroke and rejects the frame. Same flip as a
       // writer-state revoke — not a halt.
@@ -3198,7 +3384,10 @@ function ifControl(a, m) {
       a.paint();
       break;
     case "lifecycle":
-      if (m.lifecycle != null) a.st.lifecycle = m.lifecycle;
+      if (m.lifecycle != null && m.lifecycle !== a.st.lifecycle) {
+        a.st.lifecycle = m.lifecycle;
+        ifRefreshComposerProjection(a);
+      }
       if (m.composer != null) a.st.composer = m.composer;
       a.paint();
       break;
@@ -3232,6 +3421,7 @@ async function load(tab) {
 function show(tab) {
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
+  document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") ifDetach();   // leaving the tab drops the stream + lease
   load(tab);
 }

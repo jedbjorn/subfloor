@@ -281,7 +281,10 @@ def _client_state(con, session_id: int) -> dict:
             verified = False
     attachable = compatible and verified
     if attachable:
-        actions = ["view", "acquire_writer", "takeover", "certify", "terminate"]
+        actions = [
+            "view", "acquire_writer", "takeover", "send_input", "certify",
+            "terminate",
+        ]
         reason = None
     elif occupancy == "reserved" and lifecycle == "starting":
         actions = ["cancel_start"]
@@ -712,7 +715,8 @@ def _get_session(session_id: int):
             return _err(404, "no_such_session",
                         f"interface session {session_id} not found")
         istate = con.execute(
-            "SELECT composer, delivery, forwarded_seq, last_human_input_at "
+            "SELECT composer, browser_composer, delivery, forwarded_seq, "
+            "last_human_input_at "
             "FROM interface_input_state WHERE session_id=?",
             (session_id,)).fetchone()
         writer = interface_broker.current_writer(con, session_id)
@@ -727,9 +731,10 @@ def _get_session(session_id: int):
             "ended_at": row[11], "end_reason": row[12],
             "error_detail": row[13],
             "composer": istate[0] if istate else None,
-            "delivery": istate[1] if istate else None,
-            "forwarded_seq": istate[2] if istate else None,
-            "last_human_input_at": istate[3] if istate else None,
+            "browser_composer": istate[1] if istate else None,
+            "delivery": istate[2] if istate else None,
+            "forwarded_seq": istate[3] if istate else None,
+            "last_human_input_at": istate[4] if istate else None,
             "writer": {"held": writer is not None,
                        "client_id": writer[1] if writer else None},
             "wake_state": _wake_state(con, session_id=session_id),
@@ -915,6 +920,45 @@ def _certify_clean(actor, headers, body):
             interface_wake.notify_session(session_id)
             return 201, {"session_id": session_id, "composer": "clean"}
         return _idempotent(con, actor, "certify_clean", headers, body, produce)
+    finally:
+        con.close()
+
+
+def _set_browser_composer(actor, headers, body):
+    session_id = body.get("session_id")
+    client_id = body.get("client_id")
+    state = body.get("state")
+    if not isinstance(session_id, int) or not client_id \
+            or state not in ("clean", "dirty"):
+        return _err(
+            422, "validation",
+            "session_id (int), client_id, and state (clean|dirty) required")
+    con = _db()
+    try:
+        def produce():
+            client_state = _client_state(con, session_id)
+            if not client_state["exists"]:
+                return 404, _err_obj(
+                    "no_such_session",
+                    f"interface session {session_id} not found")
+            if not client_state["attachable"]:
+                return _client_state_error(client_state)
+            lease = interface_broker.current_writer(con, session_id)
+            if lease is None or lease[1] != str(client_id):
+                return 409, _err_obj(
+                    "not_the_writer",
+                    "browser composer state rides the current writer lease")
+            interface_broker.set_browser_composer(
+                con, session_id, str(client_id), state)
+            if state == "clean":
+                interface_wake.notify_session(session_id)
+            return 200, {
+                "session_id": session_id,
+                "browser_composer": state,
+            }
+
+        return _idempotent(
+            con, actor, "browser_composer.set", headers, body, produce)
     finally:
         con.close()
 
@@ -2200,6 +2244,8 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _release_lease(actor, headers, data, _path_id(p))
         if p == "/api/interface/clean-certifications" and method == "POST":
             return _certify_clean(actor, headers, data)
+        if p == "/api/interface/browser-composer" and method == "POST":
+            return _set_browser_composer(actor, headers, data)
         if p == "/api/interface/termination-requests" and method == "POST":
             return _terminate(actor, headers, data)
         if p == "/api/interface/reconciliations" and method == "POST":

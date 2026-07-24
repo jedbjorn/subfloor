@@ -24,6 +24,10 @@ PICKER = APP[APP.index("function dmModelPicker"):
              APP.index("async function renderDefaultModels")]
 RECOVERY = APP[APP.index("function ifRecoveryEvidenceRows"):
                APP.index("// Sprint wake panel")]
+COMPOSER = APP[APP.index("function ifSizeComposer"):
+               APP.index("// End chat")]
+INPUT_BROKER = APP[APP.index("function ifSendInput"):
+                   APP.index("// ── Tabs + boot")]
 RENDER_INTERFACE = APP[APP.index("const IF_BADGE"):
                        APP.index("// A reservation is not a terminal")]
 AVAILABLE = APP[APP.index("function ifAvailablePane"):
@@ -205,10 +209,14 @@ if (lastScrolled.title !== "model-59" || lastScrolled.block !== "nearest") {
     assert result.returncode == 0, result.stderr
 
 
-def test_interface_terminal_has_exact_caps_and_live_resize_reporting():
+def test_interface_terminal_flexes_to_viewport_with_floor_and_live_resize():
     assert "#view-interface { max-width: calc(230px + 1rem + 1300px); }" in CSS
     assert "max-width: 1300px" in CSS
-    assert "max-height: 850px" in CSS
+    assert "body.interface-view { height: 100dvh; overflow-y: auto; }" in CSS
+    assert "flex: 1 1 500px; min-height: 500px" in CSS
+    assert "max-height: 850px" not in CSS
+    assert "calc(100dvh - 140px)" not in CSS
+    assert "document.body.classList.toggle(\"interface-view\"" in APP
     assert "ResizeObserver(fit)" in APP
     assert "ws.onopen" in APP
     assert "ifSendResize(a, term.rows, term.cols)" in APP
@@ -228,6 +236,158 @@ def test_alerts_render_provenance_action_and_durable_acknowledgement():
     assert "a.generation" in APP
     assert "/acknowledge" in APP
     assert "Alert history" in APP
+    assert "Generation alerts / Sprint wake" not in APP
+
+
+def test_message_composer_uses_broker_ack_and_preserves_raw_terminal_input():
+    el_helper = APP[APP.index("const el ="):APP.index("const esc =")]
+    script = el_helper + COMPOSER + INPUT_BROKER + r"""
+globalThis.WebSocket = { OPEN: 1 };
+globalThis.ifClientId = "web-1";
+globalThis.ifAttach = null;
+const apiCalls = [];
+let sessionProjection = {
+  legal_actions: ["send_input"],
+  state_reason: null,
+};
+async function apiIf(path, method, body) {
+  if (path === "/interface/sessions/7") return sessionProjection;
+  apiCalls.push({ path, method, body });
+  return { browser_composer: body.state };
+}
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.style = {};
+    this.value = "";
+    this.disabled = false;
+    this.scrollHeight = 42;
+    this._text = "";
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  set textContent(value) { this._text = String(value ?? ""); }
+  get textContent() { return this._text; }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
+};
+function invariant(ok, message) {
+  if (!ok) throw new Error(message);
+}
+const frames = [];
+const a = {
+  sessionId: 7,
+  legalActions: new Set(["send_input"]),
+  stateReason: "",
+  role: "writer",
+  st: {
+    writer: "active", writerReason: "", note: "", lifecycle: "idle",
+    browserComposer: "clean",
+  },
+  halted: false,
+  awaiting: false,
+  outBuf: "",
+  seq: 4,
+  inflight: 0,
+  lastAck: 0,
+  ws: { readyState: 1, send: (frame) => frames.push(frame) },
+  composerEl: new FakeElement("div"),
+  composerPendingSeq: null,
+  browserComposerState: "clean",
+  browserComposerWanted: "clean",
+  browserComposerError: "",
+  browserComposerSyncing: false,
+  browserComposerVersion: 0,
+  browserComposerChain: Promise.resolve(),
+  composerProjectionPending: false,
+  composerProjectionVersion: 0,
+  composerProjectionSync: Promise.resolve(),
+};
+a.paint = () => ifPaintComposer(a);
+ifAttach = a;
+ifBuildComposer(a);
+a.paint();
+
+(async () => {
+  a.composerInput.value = "hello\nworld";
+  a.composerInput.scrollHeight = 70;
+  a.composerInput.oninput();
+  await a.browserComposerChain;
+  invariant(apiCalls.length === 1 &&
+    apiCalls[0].path === "/interface/browser-composer" &&
+    apiCalls[0].body.state === "dirty",
+    `draft state did not reach the server: ${JSON.stringify(apiCalls)}`);
+  let prevented = false;
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: true, preventDefault() { prevented = true; },
+  });
+  invariant(!prevented && frames.length === 0,
+    "Shift+Enter must remain a local newline");
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, preventDefault() { prevented = true; },
+  });
+  invariant(prevented && frames.length === 1,
+    "Enter did not send exactly one broker frame");
+  const payload = new TextDecoder().decode(frames[0].subarray(9));
+  invariant(payload === "hello\nworld\r",
+    `composer bytes bypassed terminal Enter semantics: ${JSON.stringify(payload)}`);
+  invariant(a.composerInput.value === "hello\nworld" &&
+    a.composerPendingSeq === 4,
+    "draft cleared before the generation-fenced broker ack");
+  ifControl(a, { type: "input_ack", seq: 4 });
+  invariant(a.composerInput.disabled,
+    "new typing was allowed while the server clean transition was in flight");
+  await a.browserComposerChain;
+  invariant(a.composerInput.value === "" && a.composerPendingSeq === null,
+    "acknowledged composer draft was not cleared");
+  invariant(!a.composerInput.disabled,
+    "composer stayed disabled after the clean transition was acknowledged");
+  invariant(apiCalls.length === 2 && apiCalls[1].body.state === "clean",
+    "acknowledged send did not release browser composing state");
+
+  a.composerInput.value = " \n";
+  a.composerInput.oninput();
+  await a.browserComposerChain;
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, preventDefault() {},
+  });
+  invariant(frames.length === 1, "whitespace-only input sent a second frame");
+
+  a.role = "viewer";
+  a.st.writer = "held";
+  a.st.writerReason = "writer held by another client";
+  a.paint();
+  invariant(a.composerInput.disabled &&
+    a.composerNote.textContent.includes("writer held"),
+    "non-writer composer was not disabled with the server reason");
+
+  a.role = "writer";
+  a.st.writer = "active";
+  a.legalActions = new Set(["send_input"]);
+  sessionProjection = {
+    legal_actions: [],
+    state_reason: "generation has ended",
+  };
+  ifControl(a, { type: "lifecycle", lifecycle: "ended" });
+  invariant(a.composerInput.disabled &&
+    a.composerNote.textContent.includes("authority refreshes"),
+    "lifecycle change left input enabled before server projection refreshed");
+  await a.composerProjectionSync;
+  invariant(a.composerInput.disabled &&
+    a.composerNote.textContent.includes("generation has ended"),
+    "ended session did not retain the server-projected disabled reason");
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "term.onData((d) => ifSendInput(a, d))" in APP
 
 
 def test_recovery_renders_only_server_listed_actions_and_full_diagnostics():

@@ -319,6 +319,28 @@ class WakeGateHardeningTest(WakeFixture):
         self.assertEqual(writes, [])
         self.assertEqual(self.batch_state(batch_id), "queued")
 
+    def test_nonempty_browser_composer_blocks_same_wake_gate(self):
+        batch_id = self._armed_batch()
+        self.con.execute(
+            "UPDATE interface_input_state SET browser_composer='dirty' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        writes = []
+        out = self.submit(batch_id, writes.append)
+        self.assertFalse(out["submitted"])
+        self.assertEqual(out["reason"], "browser composer is dirty")
+        self.assertEqual(writes, [], "a browser draft must block every wake byte")
+        self.assertEqual(self.batch_state(batch_id), "queued")
+
+        self.con.execute(
+            "UPDATE interface_input_state SET browser_composer='clean' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        out = self.submit(batch_id, writes.append)
+        self.assertTrue(out["submitted"])
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(self.batch_state(batch_id), "submitting")
+
     def test_unmanaged_writable_client_disarms_and_alerts(self):
         batch_id = self._armed_batch()
         writes = []
