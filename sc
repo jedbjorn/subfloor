@@ -1432,6 +1432,8 @@ super-coder — forkable shell substrate
                              view <shell> (read-only) · attach <shell> (writer) · take-control <shell>
                              stop <shell> [--force] · reconcile <shell> [--close]
                              recover <shell> [--force] [--discard-worktree] [--yes] — mutations take --json
+                             (the browser opens the Interface with no sign-in step: what that trusts and
+                             what it still defends against is .super-coder/docs/interface-trust-boundary.md)
   make dos-help            supported operator aliases for lifecycle, Interface, models,
                              sprint/watch/job, maintenance, browser token, and generic ./sc forwarding
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·

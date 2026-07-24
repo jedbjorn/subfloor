@@ -7,20 +7,29 @@ Runs on the transport's executor threads (blocking sqlite, per-request
 connections) and reaches the asyncio runtime only through its thread-safe
 `call()` facade.
 
-Authority (spec #20 API Resources / Security):
+Authority (spec #20 API Resources / Security, spec #26 Trust Boundary):
 - reads + mutations: the operator bearer (`.super-coder/run/interface/
   operator.token`, mode 0600, provisioned at server boot) or a browser
   session cookie; mutations additionally need the session's anti-forgery
   token (X-CSRF).
-- browser bootstrap (POST /browser-sessions) EXCHANGES the operator
-  capability (bearer) for the cookie, and additionally requires same-origin
-  fetch proof (Origin == Host, or Sec-Fetch-Site: same-origin) — a hostile
-  site cannot mint a session, and a local process without the mode-0600
-  token cannot either. The cookie is HttpOnly + SameSite=Strict.
+- browser bootstrap (POST /browser-sessions) presents NO capability
+  (spec #26, decision #29): Subfloor is a personal-machine tool, so the
+  machine's own local users and processes are not the adversary — a request
+  the browser itself vouches for (exact allowed Host, exact same-origin
+  Origin, Sec-Fetch-Site: same-origin) mints a scoped session on its own.
+  The operator capability stays CLI/server-only; a bearer sent from browser
+  code is refused, because a capability reachable from browser JavaScript is
+  itself the leakage risk. The cookie is HttpOnly + SameSite=Strict.
+- browser sessions are live-process state only (never the DB, snapshot, or
+  logs), expire after 24h of inactivity, and rotate on every bootstrap.
 - hook callbacks authenticate with the generation-scoped hook token only;
   it can call NOTHING else.
 - every Interface route rejects a Host outside 127.0.0.1/localhost (DNS
   rebind) and a cross-site Origin/Sec-Fetch-Site on mutations.
+
+The retained boundary is the hostile web origin, not the local machine: a
+foreign page can forge neither Origin nor Sec-Fetch-Site, CORS stays off,
+and the SameSite=Strict cookie plus X-CSRF fences cross-site mutation.
 
 Every mutation (hook-callbacks excepted — hook_seq is its idempotency)
 requires Idempotency-Key; an exact retry replays the stored response, a key
@@ -59,9 +68,13 @@ import shell_liveness  # noqa: E402
 TICKET_TTL_S = 60
 RESERVATION_TTL_S = 60
 IDEM_TTL_S = 24 * 3600
+BROWSER_SESSION_TTL_S = 24 * 3600      # inactivity deadline (spec #26)
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 _runtime = None          # bound by bind_runtime()
+# Browser sessions are live-process state ONLY (spec #26 Session Lifecycle):
+# never the DB, a snapshot, or a log — so a service restart invalidates them
+# all, which is exactly the intended recovery path.
 _browser_sessions: dict = {}
 _browser_lock = threading.Lock()
 
@@ -128,11 +141,12 @@ def _parse_headers(headers_raw: str):
 
 class _Actor:
     def __init__(self, kind: str, scope: str, csrf_ok: bool,
-                 shell_id: "int | None" = None):
+                 shell_id: "int | None" = None, sid: str = ""):
         self.kind = kind          # "operator" | "browser" | "shell"
         self.scope = scope        # idempotency actor_scope
         self.csrf_ok = csrf_ok    # mutation authority for browser actors
         self.shell_id = shell_id  # set for kind="shell" (the planner's token)
+        self.sid = sid            # set for kind="browser" (re-checked at commit)
 
 
 def _host_ok(headers) -> bool:
@@ -140,25 +154,50 @@ def _host_ok(headers) -> bool:
     return host in {h.strip("[]") for h in _ALLOWED_HOSTS}
 
 
-def _same_origin_proof(headers) -> bool:
-    """The bootstrap's hostile-site fence: an explicit Origin must match the
-    request's Host; without one, Sec-Fetch-Site (which browsers forbid sites
-    from forging) must say same-origin or be absent (CLI)."""
-    origin = headers.get("Origin")
+def _same_origin_as_host(origin: str, host: str) -> "str | None":
+    """Exact origin match, returning the matched scheme (None = no match).
+
+    A serialized origin (RFC 6454) is `scheme://host[:port]` and nothing
+    else — no path, no query, no fragment. Comparing only the netloc would
+    accept `http://127.0.0.1:8800/anything?q=1` as same-origin; no browser
+    emits that, so anything that does is a non-browser caller dressing up as
+    one, and this is the surface where exactness is the whole point.
+    Userinfo needs no separate rule: it lives in netloc, so `evil@host`
+    already fails the comparison."""
+    from urllib.parse import urlparse
+    parsed = urlparse(origin)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.path or parsed.params or parsed.query or parsed.fragment:
+        return None
+    if parsed.netloc != host:
+        return None
+    return parsed.scheme
+
+
+def _browser_origin(headers) -> "str | None":
+    """The bootstrap's hostile-site fence (spec #26 Bootstrap Flow 2). This
+    route is browser-only, so — unlike the header-tolerant mutation check
+    below, which also serves the CLI — provenance must be positively proven:
+    an exact same-origin Origin AND `Sec-Fetch-Site: same-origin`, both of
+    which a browser forbids a foreign page from forging. Missing,
+    cross-site, or malformed provenance returns None (fail closed).
+    Returns the proven Origin's scheme, which decides the cookie's
+    `Secure` attribute."""
+    origin = headers.get("Origin") or ""
     host = headers.get("Host") or ""
-    if origin:
-        from urllib.parse import urlparse
-        return urlparse(origin).netloc == host
-    sfs = headers.get("Sec-Fetch-Site")
-    return sfs in (None, "same-origin", "none")
+    if not origin or not host:
+        return None
+    if (headers.get("Sec-Fetch-Site") or "") != "same-origin":
+        return None
+    return _same_origin_as_host(origin, host)
 
 
 def _mutation_site_ok(headers) -> bool:
     origin = headers.get("Origin")
-    if origin:
-        from urllib.parse import urlparse
-        if urlparse(origin).netloc != (headers.get("Host") or ""):
-            return False
+    if origin and _same_origin_as_host(origin,
+                                       headers.get("Host") or "") is None:
+        return False
     sfs = headers.get("Sec-Fetch-Site")
     return sfs in (None, "same-origin", "none")
 
@@ -185,17 +224,83 @@ def _resolve_actor(headers) -> "_Actor | None":
                 return _Actor("shell", f"shell:{row[0]}", True,
                               shell_id=row[0])
         return None
-    cookie = headers.get("Cookie") or ""
-    for part in cookie.split(";"):
-        k, _, v = part.strip().partition("=")
-        if k == "sc_if" and v:
-            with _browser_lock:
-                sess = _browser_sessions.get(v)
+    sid = _cookie_session_id(headers)
+    if sid:
+        now = time.time()
+        with _browser_lock:
+            _sweep_browser_sessions(now)
+            sess = _browser_sessions.get(sid)
             if sess is None:
                 return None
-            csrf_ok = (headers.get("X-CSRF") or "") == sess["csrf"]
-            return _Actor("browser", f"browser:{v[:16]}", csrf_ok)
+            csrf = sess["csrf"]
+        # NB: the inactivity deadline is NOT advanced here. Resolving a cookie
+        # is not yet "successful authenticated use" (spec #26 Session
+        # Lifecycle) — the anti-forgery, provenance, and scope fences below
+        # can still reject this request, and a rejected request must not keep
+        # a session alive. `_commit_browser_use` does it once those pass.
+        return _Actor("browser", f"browser:{sid[:16]}",
+                      (headers.get("X-CSRF") or "") == csrf, sid=sid)
     return None
+
+
+def _commit_browser_use(sid: str) -> bool:
+    """Authorize a browser request at the point of dispatch, in one critical
+    section, and advance its inactivity deadline.
+
+    Two findings share this function because they are the same window. The
+    fences run against a session resolved earlier in the request, and
+    `_browser_lock` is released in between — so a bootstrap arriving
+    concurrently can revoke that session (rotation removes the presented sid)
+    after the request was authorized but before its handler runs any side
+    effect. Re-checking membership here, immediately before dispatch, is what
+    makes spec #26's "atomically replaces" true against in-flight requests:
+    it collapses that window from the whole fence chain to the gap described
+    below.
+
+    The alternative — holding `_browser_lock` across dispatch — was rejected:
+    handlers do blocking sqlite and subprocess work, so it would serialize
+    every Interface request behind the slowest one. So the lock is released
+    when this returns, and route selection and the handler run outside it.
+    The residual window is therefore: ANY REQUEST THAT HAS PASSED THIS RECHECK
+    MAY FINISH. Revocation landing after the recheck returns True — whether
+    the handler has started or not — does not stop that request; it completes
+    under the authority it held when it passed. The narrower phrasing this
+    replaced ("a revoked identifier cannot reach a handler", residual =
+    revocation during a handler's own execution) claimed more than the code
+    does: rotation landing between this return and the handler's first line
+    still reaches the handler. Stated rather than papered over.
+
+    Returns False when the session is gone (rotated away, expired, or lost to
+    a restart) — the caller answers 401 and the UI recovers.
+    """
+    now = time.time()
+    with _browser_lock:
+        _sweep_browser_sessions(now)
+        sess = _browser_sessions.get(sid)
+        if sess is None:
+            return False
+        # Only successful authenticated use advances the deadline (spec #26).
+        sess["last_seen"] = now
+        return True
+
+
+def _cookie_session_id(headers) -> str:
+    """The `sc_if` browser-session identifier, or '' when absent."""
+    for part in (headers.get("Cookie") or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == "sc_if" and v:
+            return v
+    return ""
+
+
+def _sweep_browser_sessions(now: float) -> None:
+    """Drop every session past its inactivity deadline. Cleanup rides the
+    requests that touch the store (spec #26: no scheduled model or harness
+    poll); the store is one dict per live process, so the sweep is bounded
+    by the number of live browser sessions. Caller holds `_browser_lock`."""
+    for sid in [s for s, sess in _browser_sessions.items()
+                if now - sess["last_seen"] >= BROWSER_SESSION_TTL_S]:
+        del _browser_sessions[sid]
 
 
 # ------------------------------------------------------------------ idempotency
@@ -2170,28 +2275,50 @@ def _on_unexpected_exit(session_id: int) -> None:
 # ------------------------------------------------------------------ bootstrap
 
 def _browser_session(headers, body):
-    """Bootstrap = an EXCHANGE (spec #20 API Resources, decision on flag
-    #43): the caller presents the mode-0600 operator capability and gets an
-    HttpOnly SameSite=Strict browser session back. Same-origin proof alone
-    mints NOTHING — without the capability any local process could
-    self-mint operator-equivalent authority."""
-    if not _same_origin_proof(headers):
+    """Bootstrap = automatic same-origin minting (spec #26, decision #29,
+    superseding the operator-capability exchange of decision #26): Subfloor
+    is a personal-machine tool, so the machine's own local users and
+    processes are not principals it isolates itself from. A request the
+    browser itself vouches for therefore mints a scoped session with NO
+    capability presented.
+
+    What that trades away is friction against a local self-minter — an
+    excluded actor. What it buys is that the mode-0600 operator capability
+    never enters browser JavaScript at all, since a capability reachable
+    from page script is itself the leakage risk (decision #30). The bearer
+    is refused here rather than ignored, so browser code cannot start
+    sending one back. The fences that remain are the ones that face the web:
+    exact Host (DNS rebind), exact same-origin Origin + Sec-Fetch-Site
+    (hostile page), HttpOnly + SameSite=Strict cookie, and X-CSRF on every
+    mutation."""
+    scheme = _browser_origin(headers)
+    if scheme is None:
         return _err(403, "not_same_origin",
-                    "browser sessions mint only from the same-origin UI")
-    authz = headers.get("Authorization") or ""
-    token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
-    if not token or token != _operator_token():
-        return _err(401, "operator_capability_required",
-                    "browser bootstrap exchanges the operator capability "
-                    "(Authorization: Bearer <operator token>)")
+                    "browser sessions mint only from a same-origin Interface "
+                    "page (exact Origin + Sec-Fetch-Site: same-origin)")
+    if headers.get("Authorization"):
+        return _err(403, "bearer_not_accepted",
+                    "browser bootstrap presents no capability — the operator "
+                    "capability is CLI/server-only and must never be sent "
+                    "from browser code")
     if not (headers.get("Idempotency-Key") or ""):
         return _err(422, "idempotency_key_required",
                     "Idempotency-Key header is required for Interface mutations")
-    token = secrets.token_hex(24)
+    now = time.time()
+    sid = secrets.token_hex(24)
     csrf = secrets.token_hex(24)
+    prior = _cookie_session_id(headers)
     with _browser_lock:
-        _browser_sessions[token] = {"csrf": csrf, "created": time.time()}
-    cookie = (f"sc_if={token}; HttpOnly; SameSite=Strict; Path=/")
+        _sweep_browser_sessions(now)
+        # Rotation revokes: the session the caller presented dies in the same
+        # critical section that mints its replacement, so no window exists in
+        # which both the old and the new identifier are usable.
+        if prior:
+            _browser_sessions.pop(prior, None)
+        _browser_sessions[sid] = {"csrf": csrf, "created": now,
+                                  "last_seen": now}
+    cookie = (f"sc_if={sid}; HttpOnly; SameSite=Strict; Path=/"
+              + ("; Secure" if scheme == "https" else ""))
     return _json(201, {"csrf": csrf}, headers=[("Set-Cookie", cookie)])
 
 
@@ -2227,7 +2354,8 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     from urllib.parse import parse_qs, urlparse
     headers = _parse_headers(headers_raw)
     if not _host_ok(headers):
-        return _err(403, "bad_host", "Interface API serves 127.0.0.1/localhost only")
+        return _err(403, "host_not_allowed",
+                    "Interface API serves 127.0.0.1/localhost only")
     u = urlparse(path)
     p = u.path
     query = parse_qs(u.query)
@@ -2250,6 +2378,13 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
 
     actor = _resolve_actor(headers)
     if actor is None:
+        # A cookie the store no longer knows — expired, revoked by a
+        # rotation, or wiped by a service restart. Naming that distinctly is
+        # what lets the UI bootstrap once and retry silently (spec #26
+        # Session Lifecycle) instead of surfacing an error to the operator.
+        if _cookie_session_id(headers) and not headers.get("Authorization"):
+            return _err(401, "browser_session_expired",
+                        "browser session expired — bootstrap a new one")
         return _err(401, "unauthorized",
                     "operator bearer or browser session required")
     # Shell actors (the planner's own API token) reach ONLY the sprint-wake
@@ -2269,6 +2404,13 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
         if not _mutation_site_ok(headers):
             return _err(403, "not_same_origin",
                         "cross-site mutation rejected")
+    # Every fence above has passed, and nothing below this line rejects on
+    # authority — so this is the one point where the request is known to be
+    # successful authenticated use. Re-check the session against a concurrent
+    # rotation and advance its deadline in the same critical section.
+    if actor.kind == "browser" and not _commit_browser_use(actor.sid):
+        return _err(401, "browser_session_expired",
+                    "browser session expired — bootstrap a new one")
 
     try:
         if p == "/api/interface/shells" and method == "GET":

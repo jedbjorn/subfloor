@@ -4,8 +4,9 @@ seq 5). Covers the vertical-slice contract WITHOUT tmux (the runtime is a
 fake implementing the facade; tmux integration lives in
 tests/test_interface_runtime.py):
 
-- authority: host allowlist, operator bearer, browser bootstrap same-origin
-  fence, CSRF on browser mutations, cross-site Origin rejection;
+- authority: host allowlist, operator bearer, automatic same-origin browser
+  bootstrap and its provenance fence (spec #26), browser-session rotation and
+  inactivity expiry, CSRF on browser mutations, cross-site Origin rejection;
 - idempotency: missing key → 422, exact replay returns the original
   resource with NO second side effect, key + different body → 409;
 - New chat: legacy/unmanaged harness refusal (409 unmanaged_harness),
@@ -33,6 +34,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -117,6 +119,9 @@ def hdrs(*lines) -> str:
 
 
 OP = "Authorization: Bearer optok"
+# What a real Interface page sends: exact same-origin Origin plus the fetch
+# metadata a browser forbids a foreign page from forging.
+BROWSER = ("Origin: http://127.0.0.1:8800", "Sec-Fetch-Site: same-origin")
 
 
 class InterfaceApiTest(unittest.TestCase):
@@ -140,6 +145,9 @@ class InterfaceApiTest(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.ensure_wt = run_mod.ensure_worktree
+        # Browser sessions are process-global live state — start each test
+        # from the empty store a fresh server would have.
+        routes._browser_sessions.clear()
         routes.ensure_operator_capability()
         (run_dir / "operator.token").write_text("optok")
         self.runtime = FakeRuntime()
@@ -210,7 +218,7 @@ class InterfaceApiTest(unittest.TestCase):
         raw = "Host: evil.example.com\r\n" + OP
         status, _, body = routes.handle("GET", "/api/interface/shells", raw, b"")
         self.assertEqual(status, 403)
-        self.assertEqual(json.loads(body)["error"]["code"], "bad_host")
+        self.assertEqual(json.loads(body)["error"]["code"], "host_not_allowed")
 
     def test_auth_required(self):
         status, _, _ = self.call("GET", "/api/interface/shells")
@@ -332,49 +340,314 @@ class InterfaceApiTest(unittest.TestCase):
             if "model" in k and not k.startswith("default_"))
         self.assertEqual(set(session_model_keys), {"model_route"})
 
-    def test_browser_bootstrap_same_origin_fence(self):
-        # Cross-site Origin cannot mint a session (rejected before the
-        # capability is even consulted).
-        status, _, _ = self.call(
+    def _bootstrap(self, *extra, key="b-mint"):
+        return self.call(
             "POST", "/api/interface/browser-sessions",
-            ("Origin: http://evil.example.com", "Idempotency-Key: b1"), {})
-        self.assertEqual(status, 403)
-        # Missing idempotency key → 422.
-        status, _, _ = self.call(
-            "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", OP), {})
-        self.assertEqual(status, 422)
-        # Same-origin proof + the operator capability mints cookie +
-        # anti-forgery token.
-        status, headers, body = self.call(
-            "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", OP, "Idempotency-Key: b2"), {})
-        self.assertEqual(status, 201)
-        self.assertIn("csrf", body)
+            (*BROWSER, f"Idempotency-Key: {key}", *extra), {})
+
+    def test_browser_bootstrap_mints_without_a_capability(self):
+        # Spec #26 / decision #29: the browser presents NOTHING and still
+        # gets a scoped session — the operator capability never has to reach
+        # page JavaScript.
+        status, headers, body = self._bootstrap()
+        self.assertEqual(status, 201, body)
+        self.assertTrue(body.get("csrf"))
         cookie = headers["Set-Cookie"]
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
-
-    def test_browser_bootstrap_requires_operator_capability(self):
-        # Same-origin alone mints NOTHING (flag #43): a local process without
-        # the mode-0600 operator token cannot self-mint browser authority.
-        status, _, body = self.call(
-            "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", "Idempotency-Key: b5"), {})
-        self.assertEqual(status, 401)
-        self.assertEqual(body["error"]["code"], "operator_capability_required")
-        # A wrong token is refused the same way.
+        self.assertIn("Path=/", cookie)
+        # Plain http on loopback: no Secure attribute to make the cookie
+        # unsendable. The anti-forgery token is body-only, never a cookie.
+        self.assertNotIn("Secure", cookie)
+        self.assertNotIn(body["csrf"], cookie)
+        # CORS stays off — no header invites another origin to read this.
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        # The minted session is immediately usable for reads.
         status, _, _ = self.call(
+            "GET", "/api/interface/shells",
+            (f"Cookie: {cookie.split(';')[0]}",))
+        self.assertEqual(status, 200)
+
+    def test_browser_bootstrap_sets_secure_on_https(self):
+        status, headers, _ = self.call(
             "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", "Authorization: Bearer wrong",
-             "Idempotency-Key: b6"), {})
+            ("Origin: https://127.0.0.1:8800", "Sec-Fetch-Site: same-origin",
+             "Idempotency-Key: b-https"), {})
+        self.assertEqual(status, 201)
+        self.assertIn("Secure", headers["Set-Cookie"])
+
+    def test_browser_bootstrap_provenance_fence(self):
+        """Automatic minting rests entirely on provenance a foreign page
+        cannot forge, so every way of arriving without it must fail closed."""
+        for label, hdr_lines in (
+            ("other-origin page",
+             ("Origin: http://evil.example.com",
+              "Sec-Fetch-Site: cross-site")),
+            ("other-origin page claiming same-origin fetch metadata",
+             ("Origin: http://evil.example.com",
+              "Sec-Fetch-Site: same-origin")),
+            ("cross-site form submission (no Origin echo we can trust)",
+             ("Sec-Fetch-Site: cross-site",)),
+            ("missing Origin",
+             ("Sec-Fetch-Site: same-origin",)),
+            ("missing fetch metadata",
+             ("Origin: http://127.0.0.1:8800",)),
+            ("opaque Origin",
+             ("Origin: null", "Sec-Fetch-Site: same-origin")),
+            ("top-level navigation, not a page fetch",
+             ("Origin: http://127.0.0.1:8800", "Sec-Fetch-Site: none")),
+            ("scheme-relative junk Origin",
+             ("Origin: 127.0.0.1:8800", "Sec-Fetch-Site: same-origin")),
+            # A serialized origin is scheme://host[:port] and stops there. A
+            # netloc-only comparison would wave all three of these through.
+            ("Origin bearing a path",
+             ("Origin: http://127.0.0.1:8800/ui/app.js",
+              "Sec-Fetch-Site: same-origin")),
+            ("Origin bearing a query",
+             ("Origin: http://127.0.0.1:8800?x=1",
+              "Sec-Fetch-Site: same-origin")),
+            ("Origin bearing a fragment",
+             ("Origin: http://127.0.0.1:8800#frag",
+              "Sec-Fetch-Site: same-origin")),
+            ("no browser provenance at all", ()),
+        ):
+            with self.subTest(label):
+                status, _, body = self.call(
+                    "POST", "/api/interface/browser-sessions",
+                    (*hdr_lines, "Idempotency-Key: b-deny"), {})
+                self.assertEqual(status, 403, label)
+                self.assertEqual(body["error"]["code"], "not_same_origin")
+        self.assertEqual(routes._browser_sessions, {})
+
+    def test_browser_bootstrap_rejects_a_rebound_host(self):
+        raw = ("Host: interface.evil.example.com\r\n"
+               "Origin: http://interface.evil.example.com\r\n"
+               "Sec-Fetch-Site: same-origin\r\nIdempotency-Key: b-rebind")
+        status, _, body = routes.handle(
+            "POST", "/api/interface/browser-sessions", raw, b"{}")
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"]["code"], "host_not_allowed")
+        self.assertEqual(routes._browser_sessions, {})
+
+    def test_browser_bootstrap_refuses_a_browser_supplied_bearer(self):
+        # The operator capability is CLI/server-only. Refusing it here (not
+        # ignoring it) is what stops page code from ever carrying one.
+        for label, bearer in (("the real capability", OP),
+                              ("a guess", "Authorization: Bearer wrong")):
+            with self.subTest(label):
+                status, _, body = self._bootstrap(bearer, key=f"b-{label[:4]}")
+                self.assertEqual(status, 403)
+                self.assertEqual(body["error"]["code"], "bearer_not_accepted")
+        self.assertEqual(routes._browser_sessions, {})
+
+    def test_browser_bootstrap_requires_idempotency_key(self):
+        status, _, body = self.call(
+            "POST", "/api/interface/browser-sessions", BROWSER, {})
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "idempotency_key_required")
+
+    def test_browser_bootstrap_rotates_and_revokes(self):
+        first, first_csrf = self._browser()
+        status, headers, body = self._bootstrap(f"Cookie: {first}",
+                                                key="b-rotate")
+        self.assertEqual(status, 201)
+        second = headers["Set-Cookie"].split(";")[0]
+        self.assertNotEqual(second, first)
+        self.assertNotEqual(body["csrf"], first_csrf)
+        # The presented session died in the same step that minted its
+        # replacement — no window where both identifiers work.
+        self.assertEqual(len(routes._browser_sessions), 1)
+        status, _, err = self.call("GET", "/api/interface/shells",
+                                   (f"Cookie: {first}",))
         self.assertEqual(status, 401)
+        self.assertEqual(err["error"]["code"], "browser_session_expired")
+        status, _, _ = self.call("GET", "/api/interface/shells",
+                                 (f"Cookie: {second}",))
+        self.assertEqual(status, 200)
+
+    def test_independent_browsers_hold_separate_sessions(self):
+        # A second tab bootstraps without presenting the first's cookie, so
+        # nothing is revoked: both read concurrently, with no distinct
+        # identity or privilege between them (writer authority stays with the
+        # lease protocol).
+        first, _ = self._browser()
+        status, headers, _ = self._bootstrap(key="b-second")
+        self.assertEqual(status, 201)
+        second = headers["Set-Cookie"].split(";")[0]
+        self.assertNotEqual(second, first)
+        for cookie in (first, second):
+            status, _, _ = self.call("GET", "/api/interface/shells",
+                                     (f"Cookie: {cookie}",))
+            self.assertEqual(status, 200)
+
+    def test_browser_session_expires_after_inactivity(self):
+        cookie, _ = self._browser()
+        sid = cookie.split("=", 1)[1]
+        routes._browser_sessions[sid]["last_seen"] = (
+            time.time() - routes.BROWSER_SESSION_TTL_S - 1)
+        status, _, body = self.call("GET", "/api/interface/shells",
+                                    (f"Cookie: {cookie}",))
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "browser_session_expired")
+        # Expiry deletes server-side state rather than merely refusing it.
+        self.assertNotIn(sid, routes._browser_sessions)
+
+    def test_browser_use_advances_the_deadline(self):
+        cookie, _ = self._browser()
+        sid = cookie.split("=", 1)[1]
+        stale = time.time() - routes.BROWSER_SESSION_TTL_S + 60
+        routes._browser_sessions[sid]["last_seen"] = stale
+        status, _, _ = self.call("GET", "/api/interface/shells",
+                                 (f"Cookie: {cookie}",))
+        self.assertEqual(status, 200)
+        self.assertGreater(routes._browser_sessions[sid]["last_seen"], stale)
+
+    def test_rejected_calls_do_not_advance_the_deadline(self):
+        """Spec #26: ONLY successful authenticated use advances the
+        inactivity deadline. A call that a fence rejected is not use — so a
+        session cannot be kept alive indefinitely by traffic that never
+        authenticates, including traffic a hostile page can cause."""
+        cookie, csrf = self._browser()
+        sid = cookie.split("=", 1)[1]
+        stale = time.time() - routes.BROWSER_SESSION_TTL_S + 60
+        rejected = (
+            ("cookie-only mutation", (f"Cookie: {cookie}",
+                                      "Idempotency-Key: d1")),
+            ("malformed anti-forgery token",
+             (f"Cookie: {cookie}", "X-CSRF: not-the-token",
+              "Idempotency-Key: d2")),
+            ("cross-site mutation",
+             (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+              "Origin: http://evil.example.com",
+              "Sec-Fetch-Site: cross-site", "Idempotency-Key: d3")),
+        )
+        for label, header_lines in rejected:
+            with self.subTest(label):
+                routes._browser_sessions[sid]["last_seen"] = stale
+                status, _, _ = self.call("POST", "/api/interface/sessions",
+                                         header_lines, {"shell_id": 1})
+                self.assertEqual(status, 403)
+                self.assertEqual(
+                    routes._browser_sessions[sid]["last_seen"], stale,
+                    f"{label} refreshed the inactivity deadline")
+
+    def test_rotation_revokes_a_request_already_in_flight(self):
+        """Spec #26 Bootstrap Flow 4: a bootstrap atomically REPLACES the
+        session named by the presented cookie. Sequential revocation is
+        already covered above; what this pins is the concurrent case, which
+        is where the claim was previously false.
+
+        The interleaving is forced deterministically rather than raced: the
+        rotation is driven from inside the fence that runs after the old
+        cookie resolved to an actor and before dispatch — exactly the window
+        a concurrent bootstrap would land in. The in-flight request must be
+        answered 401 and must NOT reach its handler."""
+        cookie, csrf = self._browser()
+        first = cookie.split("=", 1)[1]
+        rotated = []
+        real_site_ok = routes._mutation_site_ok
+
+        def rotate_then_check(headers):
+            # Runs once, after _resolve_actor accepted the old cookie.
+            if not rotated:
+                status, hdrs_, _ = self._bootstrap(f"Cookie: {cookie}",
+                                                   key="b-inflight")
+                assert status == 201
+                rotated.append(hdrs_["Set-Cookie"].split(";")[0])
+            return real_site_ok(headers)
+
+        def count_sessions():
+            con = sqlite3.connect(self.db_path)
+            try:
+                return con.execute(
+                    "SELECT COUNT(*) FROM interface_sessions").fetchone()[0]
+            finally:
+                con.close()
+
+        before = count_sessions()
+        with mock.patch.object(routes, "_mutation_site_ok",
+                               rotate_then_check):
+            status, _, body = self.call(
+                "POST", "/api/interface/sessions",
+                (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+                 "Idempotency-Key: c-inflight"), {"shell_id": 1})
+        self.assertEqual(status, 401, body)
+        self.assertEqual(body["error"]["code"], "browser_session_expired")
+        # The handler never ran: revocation beat the side effect, not just
+        # the response code.
+        self.assertEqual(count_sessions(), before,
+                         "a revoked session still created a chat")
+        self.assertNotIn(first, routes._browser_sessions)
+        # The replacement minted in that same window is the live one.
+        new_cookie = rotated[0]
+        status, _, _ = self.call("GET", "/api/interface/shells",
+                                 (f"Cookie: {new_cookie}",))
+        self.assertEqual(status, 200)
+
+    def test_rotation_after_the_dispatch_recheck_does_not_stop_the_request(self):
+        """The residual window, pinned instead of only described.
+
+        The re-check above is deliberately NOT held across dispatch — handlers
+        do blocking sqlite and subprocess work, so holding it would serialize
+        every Interface request behind the slowest one. The honest consequence
+        is that a rotation landing after the re-check returns True cannot stop
+        that request, whether or not its handler has started: it finishes under
+        the authority it held when it passed. `_commit_browser_use` and the
+        trust-boundary doc state exactly that bound, and this test is what
+        holds the prose to it — strengthen the synchronization and this goes
+        red, which is the correct time to rewrite both."""
+        cookie, csrf = self._browser()
+        first = cookie.split("=", 1)[1]
+        rotated = []
+        real_commit = routes._commit_browser_use
+
+        def commit_then_rotate(sid):
+            # Runs once, AFTER the real re-check has authorized this request —
+            # the exact gap before route selection reaches the handler.
+            ok = real_commit(sid)
+            if ok and not rotated:
+                status, hdrs_, _ = self._bootstrap(f"Cookie: {cookie}",
+                                                   key="b-postcheck")
+                assert status == 201
+                rotated.append(hdrs_["Set-Cookie"].split(";")[0])
+            return ok
+
+        with mock.patch.object(routes, "_commit_browser_use",
+                               commit_then_rotate):
+            status, _, body = self.call(
+                "POST", "/api/interface/sessions",
+                (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+                 "Idempotency-Key: c-postcheck"), {"shell_id": 1})
+        # The request completed: revocation after the re-check does not reach
+        # back into a request the re-check already let through.
+        self.assertEqual(status, 201, body)
+        # And the rotation really did happen — this is the residual window,
+        # not a test that quietly failed to revoke anything.
+        self.assertTrue(rotated, "the concurrent bootstrap never ran")
+        self.assertNotIn(first, routes._browser_sessions)
+
+    def test_browser_sessions_are_live_process_state_only(self):
+        """A restart wipes them — which is exactly the contract the UI's one
+        silent re-bootstrap relies on, and why they never touch the DB."""
+        cookie, _ = self._browser()
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            tables = [r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")]
+            for table in tables:
+                rows = con.execute(f"SELECT * FROM {table}").fetchall()
+                self.assertNotIn(
+                    cookie.split("=", 1)[1],
+                    " ".join(str(c) for row in rows for c in row),
+                    f"browser session leaked into {table}")
+        routes._browser_sessions.clear()          # what a restart does
+        status, _, body = self.call("GET", "/api/interface/shells",
+                                    (f"Cookie: {cookie}",))
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "browser_session_expired")
 
     def _browser(self):
-        status, headers, body = self.call(
-            "POST", "/api/interface/browser-sessions",
-            ("Origin: http://127.0.0.1:8800", OP, "Idempotency-Key: b3"), {})
-        assert status == 201
+        status, headers, body = self._bootstrap(key="b3")
+        assert status == 201, body
         cookie = headers["Set-Cookie"].split(";")[0]
         return cookie, body["csrf"]
 
@@ -387,6 +660,13 @@ class InterfaceApiTest(unittest.TestCase):
         status, _, body = self.call(
             "POST", "/api/interface/sessions",
             (f"Cookie: {cookie}", "Idempotency-Key: c1"), {"shell_id": 1})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "csrf")
+        # A malformed / guessed anti-forgery token is refused the same way.
+        status, _, body = self.call(
+            "POST", "/api/interface/sessions",
+            (f"Cookie: {cookie}", "X-CSRF: not-the-token",
+             "Idempotency-Key: c1b"), {"shell_id": 1})
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["code"], "csrf")
         # Cookie + anti-forgery token: mutation proceeds.
@@ -402,6 +682,29 @@ class InterfaceApiTest(unittest.TestCase):
             (OP, "Idempotency-Key: c3", "Origin: http://evil.example.com"),
             {"shell_id": 1})
         self.assertEqual(status, 403)
+        # Same for a browser session driven from a foreign page: even holding
+        # both the cookie and its anti-forgery token, cross-site provenance
+        # loses.
+        cookie, csrf = self._browser()
+        status, _, body = self.call(
+            "POST", "/api/interface/sessions",
+            (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+             "Origin: http://evil.example.com",
+             "Sec-Fetch-Site: cross-site", "Idempotency-Key: c4"),
+            {"shell_id": 1})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "not_same_origin")
+        # The mutation fence is header-tolerant (it also serves the CLI, which
+        # sends no Origin at all), but tolerant is not the same as loose: an
+        # Origin that IS present still has to be an exact serialized origin,
+        # not merely one whose netloc happens to match.
+        status, _, body = self.call(
+            "POST", "/api/interface/sessions",
+            (OP, "Idempotency-Key: c5",
+             "Origin: http://127.0.0.1:8800/ui/index.html?x=1"),
+            {"shell_id": 1})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "not_same_origin")
 
     # -- idempotency ---------------------------------------------------------------
 

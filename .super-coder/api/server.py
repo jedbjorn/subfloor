@@ -27,6 +27,7 @@ import base64
 import gzip
 import http.client
 import io
+import ipaddress
 import json
 import os
 import subprocess
@@ -2809,6 +2810,44 @@ async def _ws_unavailable(reader, writer, head_raw: bytes) -> None:
         writer.close()
 
 
+def require_loopback_bind(bind: str) -> None:
+    """Spec #26 Failure Modes: a non-loopback bind refuses to start, because
+    the Interface hands a browser session to anything that can present an
+    allowed `Host` and a same-origin `Origin` — headers a REMOTE client
+    chooses freely. On a host, a non-loopback bind therefore turns automatic
+    minting into remote authority, and no other fence stands behind it.
+
+    The guard is host-scoped by design, and the exception is not a loophole.
+    In the sandbox container `./sc launch` sets SC_BIND=0.0.0.0 deliberately
+    so docker can publish the port, and the boundary is supplied there by the
+    `-p 127.0.0.1:PORT:PORT` mapping — loopback-only on the host regardless of
+    the in-container bind. Refusing 0.0.0.0 unconditionally would make the
+    sandbox unlaunchable while removing no real exposure. SC_SANDBOX=1 is set
+    by that same launch path and is the available discriminator.
+
+    So the guarantee is: reachable only from the host's loopback interface —
+    enforced in-process off-sandbox, and by docker's port mapping in it.
+    """
+    if os.environ.get("SC_SANDBOX"):
+        return
+    host = (bind or "").strip().strip("[]")
+    if host.lower() == "localhost":
+        return
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return
+    except ValueError:
+        pass
+    sys.exit(
+        f"server: refusing to start — SC_BIND={bind!r} is not a loopback "
+        "address (spec #26). The Interface mints a browser session for any "
+        "caller that can set Host and Origin, so a non-loopback bind would "
+        "expose it to the network. Unset SC_BIND or set it to 127.0.0.1. "
+        "Remote access needs a separately authenticated boundary (e.g. a "
+        "tailnet), not a wider bind."
+    )
+
+
 def main(argv):
     port = None
     if "--port" in argv:
@@ -2857,6 +2896,7 @@ def main(argv):
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which
     # keeps it loopback-only on the host regardless of the in-container bind.
     bind = os.environ.get("SC_BIND", "127.0.0.1")
+    require_loopback_bind(bind)
     import transport  # noqa: E402  (api/ — asyncio one-port multiplex)
 
     async def _serve():

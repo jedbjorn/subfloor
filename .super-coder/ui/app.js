@@ -2108,50 +2108,40 @@ function ifError(r, data) {
   err.body = data;
   return err;
 }
-// Bootstrap the operator browser session: EXCHANGES the operator capability
-// (the mode-0600 token at .super-coder/run/interface/operator.token) for the
-// HttpOnly SameSite=Strict cookie + the CSRF token we then send as X-CSRF on
-// every call. The capability is used ONCE for the exchange, then discarded —
-// never persisted (no sessionStorage) and cleared from JS memory the moment
-// the session mints, so no long-lived credential sits where XSS can reach it.
-// A later 401 (session gone: refresh, server restart) re-prompts the operator.
-let ifOpToken = null;
-// Drop any capability an older build persisted before the one-shot model.
+// Bootstrap the browser session (spec #26, decision #29): a same-origin POST
+// mints the HttpOnly SameSite=Strict cookie plus the anti-forgery token we
+// send as X-CSRF on every call. The browser presents NO capability — the
+// mode-0600 operator token stays CLI/server-only and never enters this file,
+// page memory, storage, a URL, or a request, because a credential reachable
+// from page script is itself what leaks. The anti-forgery token lives in JS
+// memory only and is replaced on every bootstrap.
+// Drop any capability an older build left behind — nothing here writes one.
 try { sessionStorage.removeItem("sc-if-op"); } catch { /* storage blocked */ }
 async function ifBootstrap() {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const headers = { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() };
-    if (ifOpToken) headers["Authorization"] = "Bearer " + ifOpToken;
-    let r;
-    try {
-      r = await fetch("/api/interface/browser-sessions", {
-        method: "POST", credentials: "same-origin", headers, body: "{}",
-      });
-    } catch (e) {
-      ifOpToken = null;   // network failure — never keep a half-used capability
-      throw e;
-    }
-    const data = await r.json().catch(() => ({}));
-    if (r.ok) { ifCsrf = data.csrf; ifOpToken = null; return; }
-    if (r.status === 401 && attempt === 0) {
-      const t = prompt(
-        "Interface operator capability required — paste the contents of\n" +
-        ".super-coder/run/interface/operator.token (mode 0600, operator-only):",
-        "");
-      if (!t) { ifOpToken = null; throw ifError(r, data); }
-      ifOpToken = t.trim();
-      continue;
-    }
-    // EVERY other non-ok exit (rejected 401 retry, 403, 409, 422, 5xx,
-    // malformed body) drops the capability uniformly — it never survives a
-    // failed exchange, no matter which branch failed.
-    ifOpToken = null;
-    throw ifError(r, data);
-  }
+  // The session IS the cookie, so a browser refusing cookies cannot hold one.
+  // Say that plainly rather than looping: there is no credential to fall back
+  // on by design.
+  if (!navigator.cookieEnabled)
+    throw new Error("Interface browser sessions unavailable — this browser is blocking cookies.");
+  const r = await fetch("/api/interface/browser-sessions", {
+    method: "POST", credentials: "same-origin", body: "{}",
+    headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw ifError(r, data);
+  ifCsrf = data.csrf;
 }
-// api() twin for /api/interface/* — same-origin credentials + X-CSRF, fresh
-// Idempotency-Key per ATTEMPT on POST/DELETE (an intentional retry reuses the
-// caller's key). One silent re-bootstrap + retry on 401/403.
+// api() twin for /api/interface/* — same-origin credentials + X-CSRF. One
+// silent re-bootstrap + retry on the first 401 ONLY: 401 is the spec's
+// recovery signal (the session expired, was rotated away, or the server
+// restarted). A 403 is a fence that fired — a malformed anti-forgery token, a
+// cross-site mutation, a disallowed Host — and those must fail closed and
+// surface, because re-bootstrapping on 403 would hand the caller a fresh
+// valid token and turn the CSRF gate into a retry (spec #26 Session
+// Lifecycle: "On the first 401"). The Idempotency-Key is minted once per
+// CALL, never per attempt, so that retry replays the original mutation
+// instead of running a second one — recovery must not be able to duplicate a
+// mutation (spec #26).
 async function apiIf(path, method = "GET", body, idemKey) {
   const key = method === "GET" ? undefined : (idemKey || crypto.randomUUID());
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -2163,7 +2153,7 @@ async function apiIf(path, method = "GET", body, idemKey) {
       method, credentials: "same-origin", headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if ((r.status === 401 || r.status === 403) && attempt === 0) { ifCsrf = null; continue; }
+    if (r.status === 401 && attempt === 0) { ifCsrf = null; continue; }
     const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
     if (!r.ok) throw ifError(r, data);
     return data;

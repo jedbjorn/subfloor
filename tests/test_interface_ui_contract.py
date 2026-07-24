@@ -32,6 +32,8 @@ RENDER_INTERFACE = APP[APP.index("const IF_BADGE"):
                        APP.index("// A reservation is not a terminal")]
 AVAILABLE = APP[APP.index("function ifAvailablePane"):
                 APP.index("async function ifNewChatForm")]
+BOOTSTRAP = APP[APP.index("function ifError"):
+                APP.index("// Best-effort teardown")]
 
 BASE_PREVIEW = {
     "observation_id": "obs-1",
@@ -204,6 +206,117 @@ for (let i = 0; i < 60; i += 1) {
 if (lastScrolled.title !== "model-59" || lastScrolled.block !== "nearest") {
   throw new Error(`active option was not scrolled: ${JSON.stringify(lastScrolled)}`);
 }
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_browser_bootstrap_carries_no_capability_and_retries_once():
+    """Spec #26: the browser signs itself in with same-origin provenance
+    alone. The capability must not reappear in page code, the one silent
+    recovery must reuse the original idempotency key so a retry cannot
+    duplicate a mutation, and recovery fires on 401 ONLY — a 403 fence must
+    fail closed rather than be answered with a fresh token."""
+    assert "operator.token" not in BOOTSTRAP
+    assert "Authorization" not in BOOTSTRAP
+    assert "prompt(" not in BOOTSTRAP
+    script = r"""
+let ifCsrf = null;
+const calls = [];
+let cookiesOn = true;
+// Node ships a read-only `navigator` global, so define over it.
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  get: () => ({ cookieEnabled: cookiesOn }),
+});
+let plan = [];
+globalThis.fetch = async (url, opts) => {
+  calls.push({ url, ...opts });
+  const next = plan.shift();
+  return {
+    ok: next.status < 400, status: next.status, statusText: "",
+    json: async () => next.body || {},
+  };
+};
+const invariant = (cond, msg) => { if (!cond) throw new Error(msg); };
+""" + BOOTSTRAP + r"""
+(async () => {
+  // 1. A mutation on a cold tab: bootstrap, then the call itself.
+  plan = [{ status: 201, body: { csrf: "tok-1" } }, { status: 201, body: {} }];
+  await apiIf("/interface/sessions", "POST", { shell_id: 1 });
+  invariant(calls.length === 2, `expected bootstrap + call, got ${calls.length}`);
+  const boot = calls[0];
+  invariant(boot.url === "/api/interface/browser-sessions", boot.url);
+  invariant(boot.credentials === "same-origin", "bootstrap dropped same-origin credentials");
+  invariant(!("Authorization" in boot.headers), "bootstrap sent a capability");
+  invariant(boot.headers["Idempotency-Key"], "bootstrap sent no idempotency key");
+  invariant(calls[1].headers["X-CSRF"] === "tok-1", "anti-forgery token not carried");
+  const firstKey = calls[1].headers["Idempotency-Key"];
+
+  // 2. The session dies (expiry / restart): ONE silent bootstrap, and the
+  //    retry reuses the ORIGINAL key — including the one apiIf generated
+  //    itself — so the server replays the mutation instead of running it
+  //    twice.
+  calls.length = 0;
+  plan = [{ status: 401, body: {} }, { status: 201, body: { csrf: "tok-2" } },
+          { status: 201, body: {} }];
+  await apiIf("/interface/sessions", "POST", { shell_id: 1 });
+  invariant(calls.length === 3, `expected call+bootstrap+retry, got ${calls.length}`);
+  const generated = calls[0].headers["Idempotency-Key"];
+  invariant(generated && generated !== firstKey, "no fresh key for a new mutation");
+  invariant(calls[2].headers["Idempotency-Key"] === generated,
+    "retry changed the idempotency key — recovery could duplicate the mutation");
+  invariant(calls[2].headers["X-CSRF"] === "tok-2", "retry reused the dead anti-forgery token");
+
+  // ...and an explicit caller key is honoured on both attempts.
+  calls.length = 0;
+  plan = [{ status: 401, body: {} }, { status: 201, body: { csrf: "tok-2b" } },
+          { status: 201, body: {} }];
+  await apiIf("/interface/sessions", "POST", { shell_id: 1 }, "caller-key");
+  invariant(calls[0].headers["Idempotency-Key"] === "caller-key", "first attempt lost the key");
+  invariant(calls[2].headers["Idempotency-Key"] === "caller-key", "retry lost the caller key");
+
+  // 3. A second failure surfaces the error instead of looping forever.
+  calls.length = 0;
+  plan = [{ status: 401, body: {} }, { status: 201, body: { csrf: "tok-3" } },
+          { status: 401, body: { error: { code: "browser_session_expired" } } }];
+  let raised = null;
+  try { await apiIf("/interface/shells"); } catch (e) { raised = e; }
+  invariant(raised && raised.code === "browser_session_expired", "second 401 did not surface");
+  invariant(calls.length === 3, `retry looped: ${calls.length} calls`);
+
+  // 3b. A 403 is a fence that fired, NOT a recovery signal: fail closed.
+  //     Re-bootstrapping here would answer a rejected anti-forgery token with
+  //     a freshly minted valid one, turning the CSRF gate into a retry — the
+  //     exact negative case spec #26's release gate names. One call, no
+  //     bootstrap, error surfaced.
+  for (const code of ["csrf", "not_same_origin"]) {
+    calls.length = 0;
+    ifCsrf = "tok-live";
+    plan = [{ status: 403, body: { error: { code } } }];
+    raised = null;
+    try { await apiIf("/interface/sessions", "POST", { shell_id: 1 }); } catch (e) { raised = e; }
+    invariant(raised && raised.code === code, `403 ${code} did not surface`);
+    invariant(calls.length === 1, `403 ${code} was retried: ${calls.length} calls`);
+    invariant(calls[0].url !== "/api/interface/browser-sessions",
+      `403 ${code} triggered a re-bootstrap`);
+    invariant(ifCsrf === "tok-live", `403 ${code} discarded the live token`);
+  }
+
+  // 4. No cookies, no session — and no fallback to a pasted credential.
+  calls.length = 0;
+  cookiesOn = false;
+  ifCsrf = null;
+  plan = [];
+  raised = null;
+  try { await apiIf("/interface/shells"); } catch (e) { raised = e; }
+  invariant(raised && /unavailable/i.test(raised.message), `unclear failure: ${raised}`);
+  invariant(calls.length === 0, "asked the server for a session it could not hold");
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
 """
     result = subprocess.run(
         ["node", "-e", script], text=True, capture_output=True, check=False)
