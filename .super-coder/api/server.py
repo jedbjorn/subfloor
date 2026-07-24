@@ -104,14 +104,48 @@ _STATIC = {
     "/vendor/xterm/xterm.css": ("vendor/xterm/xterm.css", "text/css; charset=utf-8"),
 }
 
-# Content-Security-Policy for the app shell (spec #20 Security And Privacy):
-# vendored scripts and same-origin (incl. WebSocket) connections only. Styles
-# keep 'unsafe-inline' — the no-build UI sets style attributes via DOM and the
-# doc renderer emits inline styling; scripts stay strict.
-_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "connect-src 'self' ws: wss:; img-src 'self' data:; "
-        "font-src 'self'; object-src 'none'; base-uri 'none'; "
-        "frame-ancestors 'none'")
+# The Interface's own authorities, for the socket sources in the CSP below —
+# the same three `interface_routes._ALLOWED_HOSTS` fences the API to. Spelled
+# out again here rather than imported: the Interface stack is an optional
+# import on this server, and the app shell must carry a policy either way.
+_CSP_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _csp(port: int) -> str:
+    """Content-Security-Policy for the app shell (spec #20 Security And
+    Privacy; spec #26 Trust Boundary, where same-origin script execution is
+    operator-equivalent and this header is therefore release-critical):
+    vendored scripts and same-origin connections only.
+
+    `connect-src` names the socket origins EXPLICITLY. It used to read
+    `'self' ws: wss:`, and conformance finding SC-152 was right that this
+    contradicted the "same-origin only" claim standing next to it: `ws:` and
+    `wss:` are CSP *scheme-sources*, and a scheme-source matches any host
+    using that scheme (https://www.w3.org/TR/CSP3/#match-url-to-source-expression).
+    That left injected same-origin script an outbound WebSocket channel to
+    anywhere — the exact containment the policy exists to provide. Naming
+    `scheme://host:port` closes it to this server's own origins.
+
+    The socket origins are listed rather than left to `'self'` alone because
+    `'self'` matching ws/wss arrived late and unevenly across browsers, and
+    the terminal stream is not a feature to lose to a browser-version
+    difference. Styles keep 'unsafe-inline' — the no-build UI sets style
+    attributes via DOM and the doc renderer emits inline styling; scripts
+    stay strict.
+    """
+    sockets = " ".join(f"{scheme}://{host}:{port}"
+                       for host in _CSP_HOSTS for scheme in ("ws", "wss"))
+    return ("default-src 'self'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            f"connect-src 'self' {sockets}; img-src 'self' data:; "
+            "font-src 'self'; object-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'")
+
+
+# Rebound in main() once the real port resolves — the socket sources are
+# port-exact, so a fork on a non-default port would otherwise refuse its own
+# terminal stream. This default only covers a shell rendered without main().
+_CSP = _csp(8800)
 
 # md-converter inline deep-link. The doc's markdown rides IN the URL as the `c=`
 # param — gzip → base64url (no padding) — which the live md-converter decodes on
@@ -2810,6 +2844,47 @@ async def _ws_unavailable(reader, writer, head_raw: bytes) -> None:
         writer.close()
 
 
+# Filesystem artifacts a container RUNTIME creates inside the container — not
+# configuration this process, its operator, or a stray shell can assert. Docker
+# writes /.dockerenv; podman and the other OCI runtimes write /run/.containerenv.
+_CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
+_PID1_CGROUP = Path("/proc/1/cgroup")
+
+
+def in_container() -> bool:
+    """Positive evidence that this process runs inside a container, observed
+    rather than asserted (spec #26, conformance finding SC-149).
+
+    What it checks, in order of trustworthiness: a runtime-created marker file
+    (`/.dockerenv`, `/run/.containerenv`), then PID 1's cgroup path naming a
+    container runtime — the cgroup-v1-shaped fallback for runtimes that write
+    no marker. Both are artifacts of the runtime that built the sandbox.
+
+    What it PROVES: this process's bind lands in a container network
+    namespace, so `0.0.0.0` here is the container's wildcard, not the host's.
+
+    What it does NOT prove, stated plainly because the finding this fixes was
+    a guard claiming more than it verified: it does not prove the host
+    published the port to loopback only. That mapping (`-p 127.0.0.1:PORT:PORT`,
+    `sc:1206-1207`) lives on the host side and is invisible from in here
+    without the docker socket. Two residual cases therefore pass this check
+    with no loopback boundary behind them — a container run with
+    `--network=host` (which shares the host's namespace), and a container
+    whose port is published wide. Both require someone to deliberately launch
+    the engine outside `./sc launch`'s mapping; neither is reachable by
+    setting an environment variable, which is the entire distance travelled
+    from the `SC_SANDBOX` check this replaces.
+    """
+    if any(os.path.exists(m) for m in _CONTAINER_MARKERS):
+        return True
+    try:
+        cgroup = _PID1_CGROUP.read_text()
+    except OSError:
+        return False
+    return any(tag in cgroup for tag in
+               ("/docker/", "/docker-", "containerd", "/lxc/", "kubepods"))
+
+
 def require_loopback_bind(bind: str) -> None:
     """Spec #26 Failure Modes: a non-loopback bind refuses to start, because
     the Interface hands a browser session to anything that can present an
@@ -2817,19 +2892,22 @@ def require_loopback_bind(bind: str) -> None:
     chooses freely. On a host, a non-loopback bind therefore turns automatic
     minting into remote authority, and no other fence stands behind it.
 
-    The guard is host-scoped by design, and the exception is not a loophole.
-    In the sandbox container `./sc launch` sets SC_BIND=0.0.0.0 deliberately
-    so docker can publish the port, and the boundary is supplied there by the
-    `-p 127.0.0.1:PORT:PORT` mapping — loopback-only on the host regardless of
-    the in-container bind. Refusing 0.0.0.0 unconditionally would make the
-    sandbox unlaunchable while removing no real exposure. SC_SANDBOX=1 is set
-    by that same launch path and is the available discriminator.
+    The sandbox is the one legitimate non-loopback bind: `./sc launch` sets
+    SC_BIND=0.0.0.0 (`sc:1198`) so docker can publish the port, and the
+    boundary is the `-p 127.0.0.1:PORT:PORT` mapping (`sc:1206-1207`) —
+    loopback-only on the host regardless of the in-container bind. Refusing
+    0.0.0.0 unconditionally would make the sandbox unlaunchable while removing
+    no real exposure.
 
-    So the guarantee is: reachable only from the host's loopback interface —
-    enforced in-process off-sandbox, and by docker's port mapping in it.
+    That exception is gated on `in_container()`, NOT on SC_SANDBOX. The
+    original amendment keyed it on the env var and conformance finding SC-149
+    was right to reject it: an environment variable is a CLAIM that a boundary
+    exists, and setting `SC_SANDBOX=1` does not create a publish mapping, so
+    `SC_SANDBOX=1 SC_BIND=0.0.0.0` on a bare host opened a listener the spec
+    asserted was fenced. Where the boundary cannot be positively observed, the
+    refusal applies — see `in_container()` for exactly how far the observation
+    reaches.
     """
-    if os.environ.get("SC_SANDBOX"):
-        return
     host = (bind or "").strip().strip("[]")
     if host.lower() == "localhost":
         return
@@ -2838,13 +2916,17 @@ def require_loopback_bind(bind: str) -> None:
             return
     except ValueError:
         pass
+    if in_container():
+        return
     sys.exit(
         f"server: refusing to start — SC_BIND={bind!r} is not a loopback "
-        "address (spec #26). The Interface mints a browser session for any "
-        "caller that can set Host and Origin, so a non-loopback bind would "
-        "expose it to the network. Unset SC_BIND or set it to 127.0.0.1. "
-        "Remote access needs a separately authenticated boundary (e.g. a "
-        "tailnet), not a wider bind."
+        "address and this process is not in a container (spec #26). The "
+        "Interface mints a browser session for any caller that can set Host "
+        "and Origin, so a non-loopback bind would expose it to the network. "
+        "Unset SC_BIND or set it to 127.0.0.1. SC_SANDBOX no longer grants "
+        "this exception — it is a claim, not a boundary. Remote access needs "
+        "a separately authenticated boundary (e.g. a tailnet), not a wider "
+        "bind."
     )
 
 
@@ -2854,6 +2936,10 @@ def main(argv):
         port = int(argv[argv.index("--port") + 1])
     if port is None:
         port = ports_mod.resolve().get("port", 8800)
+    # The app shell's socket sources are port-exact (see `_csp`), so bind the
+    # policy to the port actually being served before any request can render it.
+    global _CSP
+    _CSP = _csp(port)
     if not DB_PATH.exists():
         sys.exit(f"server: no DB at {DB_PATH} — run `./sc rebuild` first.")
     require_current_schema(DB_PATH)
