@@ -46,6 +46,7 @@ from pathlib import Path
 import db_driver
 import interface_broker
 import interface_wake
+import ports
 
 ENGINE = Path(__file__).resolve().parents[1]
 SHADOW_DIR = ENGINE / "shadow"
@@ -666,6 +667,60 @@ class InterfaceRuntime:
                 f"{err.decode(errors='replace').strip()}")
         return out
 
+    async def _new_session(self, window: str, cols: int, rows: int,
+                           shell_line: str) -> None:
+        """Create the one tmux session and dress it. Two call sites reach
+        here (first spawn, and the respawn after a kill-window took the
+        server down with it) — they share this so the session can never be
+        created two different ways."""
+        await self.tmux("new-session", "-d", "-s", TMUX_SESSION,
+                        "-n", window, "-x", str(cols), "-y", str(rows),
+                        shell_line)
+        self._tmux_session_started = True
+        await self._set_status_line()
+
+    async def _set_status_line(self) -> None:
+        """Engine-owned tmux status line (decision #50): the review GUI URL
+        alongside whichever shell owns the current window.
+
+        Stated explicitly, every option of it. The engine otherwise sets NO
+        tmux option and inherits the environment's ~/.tmux.conf, so
+        `status off` or a 10-column `status-left-length` in operator config
+        would silently swallow this; the defaults are not ours to assume.
+        The URL is a session option and the shortname a per-window one
+        (`_set_window_label`), because one session holds every shell's
+        window.
+
+        Best-effort by design: a status line is an operator affordance, and
+        a tmux that will not take one must not cost a shell its session. The
+        whole region is guarded — including ports.resolve(), which reads
+        instance.json off disk — and a failure is logged, never swallowed.
+        """
+        try:
+            url = f"http://127.0.0.1:{ports.resolve()['port']}"
+            for opt, val in (
+                ("status", "on"),
+                ("status-left", " #[bold]super-coder#[default] #{@sc_shell} "),
+                ("status-left-length", "40"),
+                ("status-right", " Review GUI #[bold]#{@sc_url}#[default] "),
+                ("status-right-length", "60"),
+                ("@sc_url", url),
+            ):
+                await self.tmux("set-option", "-t", TMUX_SESSION, opt, val)
+        except Exception as exc:  # noqa: BLE001 — cosmetic, never fatal
+            _log("tmux", f"status line not set ({exc!r})")
+
+    async def _set_window_label(self, window: str, shortname: str) -> None:
+        """Per-window half of the status line — which shell owns this pane.
+        Falls back to the window name (`s<session_id>`) when the caller has
+        no shortname, so the line never renders a blank slot."""
+        try:
+            await self.tmux("set-option", "-w", "-t",
+                            f"{TMUX_SESSION}:{window}", "@sc_shell",
+                            shortname or window)
+        except Exception as exc:  # noqa: BLE001 — cosmetic, never fatal
+            _log(window, f"status line label not set ({exc!r})")
+
     def _send_keys_sync(self, pane_id: str, payload: bytes) -> None:
         """The injected broker writer: chunked send-keys -H, ≤512 bytes per
         invocation, called exactly once per accepted frame (as many tmux
@@ -784,11 +839,12 @@ class InterfaceRuntime:
 
     async def spawn(self, *, session_id: int, shell_id: int, generation: int,
                     worktree: str, sc_path: str, token_path: str,
-                    rows: int, cols: int,
+                    rows: int, cols: int, shortname: str = "",
                     command: list[str] | None = None) -> dict:
         """Create the tmux window + FIFO pump + shadow for one generation.
-        `command` overrides the exec line — tests only. Returns the pane
-        identity the caller persists to interface_sessions.
+        `command` overrides the exec line — tests only. `shortname` labels
+        the window in the engine's status line. Returns the pane identity
+        the caller persists to interface_sessions.
 
         The generation is registered BEFORE the tmux work so a cancel
         start landing mid-spawn (SC-064) can see and tear it down through
@@ -818,10 +874,7 @@ class InterfaceRuntime:
                 f"exec {exec_line}")
             window = gen.sid
             if not self._tmux_session_started:
-                await self.tmux("new-session", "-d", "-s", TMUX_SESSION,
-                                "-n", window, "-x", str(cols), "-y", str(rows),
-                                shell_line)
-                self._tmux_session_started = True
+                await self._new_session(window, cols, rows, shell_line)
             else:
                 try:
                     await self.tmux("new-window", "-d", "-t", f"{TMUX_SESSION}:",
@@ -831,14 +884,12 @@ class InterfaceRuntime:
                         raise
                     # last kill-window took the session (and server) down with it
                     self._tmux_session_started = False
-                    await self.tmux("new-session", "-d", "-s", TMUX_SESSION,
-                                    "-n", window, "-x", str(cols), "-y",
-                                    str(rows), shell_line)
-                    self._tmux_session_started = True
+                    await self._new_session(window, cols, rows, shell_line)
                 else:
                     await self.tmux("resize-window", "-t",
                                     f"{TMUX_SESSION}:{window}",
                                     "-x", str(cols), "-y", str(rows))
+            await self._set_window_label(window, shortname)
             out = await self.tmux("display-message", "-p", "-t",
                                   f"{TMUX_SESSION}:{window}",
                                   "#{pane_id} #{pane_pid}")

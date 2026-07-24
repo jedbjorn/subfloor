@@ -42,6 +42,7 @@ class MakeAliasContractTest(unittest.TestCase):
             (("dos-test", "ARGS=tests/test_aliases_make.py"),
              "./sc test tests/test_aliases_make.py"),
             (("dos-t",), "./sc test"),
+            (("dos-url",), "./sc url"),
             (("dos-status", "s=DEV1", "ARGS=--json"),
              "./sc interface status DEV1 --json"),
             (("dos-start", "s=DEV1", "ARGS=--harness codex"),
@@ -152,9 +153,17 @@ class MakeAliasContractTest(unittest.TestCase):
             "dos-job",
             "dos-setup",
             "dos-token",
+            "dos-url",
             "dos ARGS='<cmd>'",
         ):
             self.assertIn(target, help_text)
+
+    def test_quick_chart_lists_the_url_recall_path(self):
+        """dos-h is the chart an operator reaches for when the boot summary
+        has scrolled away — the recall command has to be ON it."""
+        result = make("dos-h")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dos-url", result.stdout)
 
 
 if __name__ == "__main__":

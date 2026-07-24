@@ -597,7 +597,8 @@ def _create_session(actor, headers, body):
                     session_id=session_id, shell_id=shell_id,
                     generation=gen_no, worktree=worktree,
                     sc_path=str(REPO_ROOT / "sc"),
-                    token_path=str(token_path), rows=rows, cols=cols))
+                    token_path=str(token_path), rows=rows, cols=cols,
+                    shortname=shortname))
             except Exception as exc:  # noqa: BLE001 — see below
                 # Definite pre-spawn failure (runtime down, bad worktree)
                 # closes the reservation through the one closure helper —

@@ -21,6 +21,7 @@
 #   make dos-d   / dos-down      stop the sandbox
 #   make dos-u   / dos-update    fetch + materialize the engine, reconcile in place
 #   make dos-t   / dos-test      backend (pytest/unittest) + UI (vitest) suites
+#   make dos-url                 print the review GUI + dev-server URLs
 #   make dos-h                   list the commands
 #   make dos-help                list + describe the commands
 #
@@ -32,7 +33,7 @@
 #
 SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
-        dos-t dos-test dos-h dos-help dos-build dos-logs dos-serve dos-health dos-ports \
+        dos-t dos-test dos-h dos-help dos-url dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
         dos-update-harnesses dos-feat dos-feature dos-eject dos-token dos-status \
         dos-start dos-view dos-attach dos-take dos-take-control dos-stop \
@@ -59,6 +60,9 @@ dos-update:           ; $(SC) update $(ARGS)
 dos-u: dos-update
 dos-test:             ; $(SC) test $(ARGS)
 dos-t: dos-test
+# The links an operator loses when the boot summary scrolls away — derived per
+# fork, never a fixed 8800 (decision #50).
+dos-url:              ; $(SC) url
 
 # Interface operator workflow. These are the accepted public API-backed verbs;
 # server-only primitives and direct DB/tmux operations intentionally stay out.
@@ -121,6 +125,7 @@ dos-h:
 	@echo "  │ dos-d │ dos-down    │ stop the sandbox                         │"
 	@echo "  │ dos-u │ dos-update  │ update the engine in place               │"
 	@echo "  │ dos-t │ dos-test    │ run backend + UI test suites             │"
+	@echo "  │       │ dos-url     │ print the review GUI + dev-server URLs   │"
 	@echo "  └───────┴─────────────┴──────────────────────────────────────────┘"
 	@echo "  more:  make dos-help  (full list + long-only)   ·   make dos ARGS=<cmd>"
 	@echo ""
@@ -135,6 +140,7 @@ dos-help:
 	@echo "    dos-d / dos-down            stop and remove the sandbox"
 	@echo "    dos-u / dos-update          update and reconcile the engine (ARGS forwarded)"
 	@echo "    dos-t / dos-test            run backend + UI suites (ARGS forwarded)"
+	@echo "    dos-url                     print the review GUI + dev-server URLs for this fork"
 	@echo ""
 	@echo "  INTERFACE  (API-backed; actions marked s=x require a shell shortname)"
 	@echo "    dos-status [s=x]            rail status, optionally one shell"
