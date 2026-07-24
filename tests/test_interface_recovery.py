@@ -3364,6 +3364,58 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual((Path(wt) / "clean.txt").read_text(), "HIDDEN")
         self.assertEqual(self.index_tag(wt, "clean.txt"), "h")
 
+    def test_temp_index_close_failure_is_a_gap_not_a_500(self):
+        # SC-133, the second failing step. `mkstemp` returns a descriptor AND
+        # a path already on disk, so closing it is the one step whose failure
+        # leaves a file behind: raised outside the translation it escaped as a
+        # sanitized 500 *and* leaked the copy the `finally` exists to remove.
+        # The mkstemp negative above cannot see that — moving `os.close` back
+        # out of the try leaves every one of its assertions green — so the
+        # step gets its own proof, taken through the public endpoint.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.hidden_dirty(wt, "clean.txt", "HIDDEN")
+
+        real_mkstemp, real_close = recovery.tempfile.mkstemp, recovery.os.close
+        made, ours = [], set()
+
+        def watched_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            made.append(path)
+            ours.add(fd)
+            return fd, path
+
+        def refusing_close(fd, *args, **kwargs):
+            # ONLY the descriptor we handed out: `recovery.os` is the real os
+            # module, so an unconditional raise would break subprocess's own
+            # fd bookkeeping and prove nothing about the recovery path. Fire
+            # once and forget the number — freed fds get reused.
+            mine = fd in ours
+            ours.discard(fd)
+            real_close(fd, *args, **kwargs)   # the descriptor still goes back
+            if mine:
+                raise OSError(errno.EIO, "input/output error")
+
+        @contextlib.contextmanager
+        def closing_the_copy_fails():
+            with mock.patch.object(recovery.tempfile, "mkstemp",
+                                   watched_mkstemp), \
+                    mock.patch.object(recovery.os, "close", refusing_close):
+                yield
+
+        self.assert_gap_refuses_discard_but_frees_the_shell(
+            wt, closing_the_copy_fails())
+        # ...the hidden file and its hint are untouched by the refusal...
+        self.assertEqual((Path(wt) / "clean.txt").read_text(), "HIDDEN")
+        self.assertEqual(self.index_tag(wt, "clean.txt"), "h")
+        # ...and the copy the close aborted over is gone, which only holds
+        # while the close sits inside the try whose `finally` unlinks it.
+        self.assertTrue(made, "no throwaway index was created — the case "
+                              "never reached the code it claims to test")
+        for path in made:
+            self.assertFalse(os.path.exists(path),
+                             f"leaked throwaway index {path}")
+
     # -- NOTHING after the durable commit may surface as a 500 (SC-128) -----
 
     def test_late_gate_failure_after_the_commit_reports_a_partial_discard(
