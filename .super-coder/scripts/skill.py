@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db_driver  # noqa: E402
+import artifact_policy  # noqa: E402
 import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -87,7 +88,9 @@ def resolve_skill(con, name: str) -> int:
 
 
 def persist_note() -> None:
-    print("→ persist: ./sc snapshot   (serializes to .sc-state/content.sql — commit it)")
+    target = artifact_policy.content_path().relative_to(ENGINE.parent)
+    suffix = " — commit it" if artifact_policy.tracks_local_artifacts() else " — local, ignored"
+    print(f"→ persist: ./sc snapshot   (serializes to {target}{suffix})")
 
 
 def cmd_list(con) -> int:
@@ -140,8 +143,17 @@ def cmd_revoke(con, name: str, shell_refs: list[str]) -> int:
 
 
 def _write_retire_list(names: list[str]) -> None:
-    seed_skills.RETIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    seed_skills.RETIRED_FILE.write_text(json.dumps(sorted(set(names)), indent=2) + "\n")
+    artifact_policy.atomic_write_text(
+        seed_skills.RETIRED_FILE,
+        json.dumps(sorted(set(names)), indent=2) + "\n",
+    )
+
+
+def _display_retire_file() -> Path:
+    try:
+        return seed_skills.RETIRED_FILE.relative_to(ENGINE.parent)
+    except ValueError:
+        return seed_skills.RETIRED_FILE
 
 
 def cmd_retire(con, name: str) -> int:
@@ -160,11 +172,12 @@ def cmd_retire(con, name: str) -> int:
     dormant = con.execute(
         "SELECT COUNT(*) FROM shell_skills ss JOIN skills s ON s.skill_id=ss.skill_id "
         "WHERE s.name=?", (name,)).fetchone()[0]
-    rel = seed_skills.RETIRED_FILE.relative_to(seed_skills.RETIRED_FILE.parents[1])
+    rel = _display_retire_file()
     print(f"retire: {name}" + ("  (already listed)" if already else "")
           + f" — retired fork-wide; {dormant} grant(s) kept dormant "
           "(restored on unretire).")
-    print(f"→ commit {rel} — the list rides `./sc update`.")
+    action = "commit" if artifact_policy.tracks_local_artifacts() else "kept local at"
+    print(f"→ {action} {rel} — the list rides `./sc update`.")
     return 0
 
 
@@ -178,9 +191,10 @@ def cmd_unretire(con, name: str) -> int:
     grants = con.execute(
         "SELECT COUNT(*) FROM shell_skills ss JOIN skills s ON s.skill_id=ss.skill_id "
         "WHERE s.name=?", (name,)).fetchone()[0]
-    rel = seed_skills.RETIRED_FILE.relative_to(seed_skills.RETIRED_FILE.parents[1])
+    rel = _display_retire_file()
     print(f"unretire: {name} — restored with {grants} grant(s) live again.")
-    print(f"→ commit {rel}.")
+    action = "commit" if artifact_policy.tracks_local_artifacts() else "kept local at"
+    print(f"→ {action} {rel}.")
     return 0
 
 

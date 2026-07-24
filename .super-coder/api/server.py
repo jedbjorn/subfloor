@@ -59,6 +59,7 @@ DECISIONS_INDEX_CAP = 30
 _LOG_LOCK = threading.Lock()
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
@@ -910,12 +911,13 @@ def set_grant(con, sid, skill_id, granted):
 # the GUI passes only a registry KEY, never a command, so nothing arbitrary runs.
 # Order = display order; `danger` ones prompt for confirmation in the UI.
 _PY = sys.executable
+_ARTIFACT_DEST = artifact_policy.content_path().relative_to(REPO_ROOT)
 _SCRIPTS = {
-    "snapshot": ("Snapshot", "Serialize the per-instance tables → .sc-state/content.sql "
+    "snapshot": ("Snapshot", f"Serialize the per-instance tables → {_ARTIFACT_DEST} "
                  "(deterministic, idempotent). Run after editing identity, roadmap, "
                  "docs, or flags so the change survives a rebuild.",
                  [_PY, str(ENGINE / "scripts/snapshot.py")], False),
-    "render": ("Render flat", "Regenerate the tracked flat _sc files "
+    "render": ("Render flat", "Regenerate the flat _sc files under the active artifact root "
                "(specs_sc / docs_sc / skills_sc / roadmap_sc.md) from the DB. Incremental.",
                [_PY, str(ENGINE / "scripts/render.py"), "flat"], False),
     "seed_skills": ("Seed skills", "Upsert assets/skills/ into the live DB "
@@ -1113,6 +1115,14 @@ def _redact(s: str, token: str) -> str:
 
 
 def git_publish() -> dict:
+    if not artifact_policy.tracks_local_artifacts():
+        output = run_snapshot_render()
+        message = (
+            f"{output}\n✓ artifact_mode=local — state is durable under "
+            ".sc-state/local/; no Git branch, commit, or PR was created"
+        )
+        log_event("publish", ok=True, pushed=False, pr_url=None, detail=message)
+        return {"ok": True, "output": message, "pr_url": None, "local": True}
     out: list[str] = []
     # state survives into the finally so cleanup knows whether the commit reached
     # origin (safe to drop the local branch) or only exists locally (keep it).

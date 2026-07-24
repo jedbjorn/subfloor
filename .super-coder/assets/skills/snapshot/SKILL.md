@@ -1,6 +1,6 @@
 ---
 name: snapshot
-description: Serialize DB work to git-tracked text via sc snapshot / sc render. The .db is the live shared source of truth; serializing writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.
+description: Serialize DB work via sc snapshot / sc render under the instance artifact policy. Tracked mode publishes through Git; local mode persists under .sc-state/local without creating content commits.
 category: substrate
 command: sc snapshot
 common: false
@@ -10,7 +10,8 @@ common: false
 
 Live `shell_db.db` = the single source of truth shared by every shell; a
 `sc mem` write is durable + visible to all shells the instant it commits. The
-`.db` is gitignored and reconstructs from git-tracked text on `sc rebuild` —
+`.db` is gitignored and reconstructs from schema, migrations, and the active
+per-instance snapshot on `sc rebuild` —
 an edit not yet serialized is discarded by a rebuild.
 
 Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
@@ -28,21 +29,26 @@ admin/GUI path.
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `sc seed-skills` |
-| `.sc-state/content.sql` | **this repo's** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants. Tracked, fork-owned, kept OUTSIDE the gitignored engine dir | no (stays local) | `sc snapshot` |
+| `.sc-state/content.sql` (tracked mode) or `.sc-state/local/content.sql` (local mode) | **this repo's** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only) | `sc snapshot` |
 
 The split: system content propagates via migrations; per-instance content stays
 in the snapshot. Skill *bodies* = system (migration); which shell is *granted*
 a skill = per-instance (snapshot).
 
+`artifact_mode` lives in `.super-coder/instance.json` and accepts `tracked` or
+`local`; downstream forks default to `tracked`. Local mode still snapshots and
+renders, but writes beneath `.sc-state/local/` (ignored) and Publish creates no
+Git branch, commit, or PR.
+
 ## When admin serializes (the GUI Publish button does all of this)
 
 All commands require `SC_ADMIN=1`, run from the main checkout.
 
-1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to
-   `.sc-state/content.sql`. Deterministic DELETE-then-INSERT in PK order ->
+1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to the active
+   snapshot path. Deterministic DELETE-then-INSERT in PK order ->
    re-running is byte-identical -> clean diffs.
 
-2. `SC_ADMIN=1 sc render` -> regenerates the tracked flat `_sc` files
+2. `SC_ADMIN=1 sc render` -> regenerates the flat `_sc` files
    (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run
    after changing a document body, the roadmap, or skills. Incremental —
    unchanged files not rewritten. (`.claude/skills/` rebuilds at boot and is
@@ -57,12 +63,13 @@ All commands require `SC_ADMIN=1`, run from the main checkout.
    `render-check`'s rebuild-first catches the stale mirror the live-DB render
    silently passed.
 
-4. Publish — do NOT hand-commit from a shell branch. snapshot/render write
+4. In tracked mode, Publish writes
    `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
    main checkout root (where the shared engine + DB live), not your worktree —
    they are not yours to stage. GUI **Publish** = snapshot -> render -> commit
    -> push -> PR on `sc_gui_content`; the admin shell on `main` may commit them
-   directly. NEVER commit the `.db` or anything under the gitignored
+   directly. In local mode it only snapshots/renders and reports that nothing
+   was published. NEVER commit the `.db` or anything under the gitignored
    `.super-coder/` engine dir. (super-coder SOURCE repo only: `schema.sql` +
    `migrations/` are tracked and committed here too.)
 
@@ -75,9 +82,9 @@ All commands require `SC_ADMIN=1`, run from the main checkout.
   *and* (source repo only) regenerates the seed migration. Not the snapshot.
   See `seed_skills.py`.
   - Sequence: `sc seed-skills && sc render`, then `sc render-check` before
-    committing. Commit the regenerated `migrations/0001_seed_skills.sql` +
-    the re-rendered `skills_sc/` mirror together — migration without mirror =
-    the drift.
+    committing. In tracked mode commit the regenerated
+    `migrations/0001_seed_skills.sql` + re-rendered `skills_sc/` mirror together.
+    In local mode only the migration is public; the mirror stays ignored.
 
 Steps 1–3 = durability (a `sc rebuild` cannot lose serialized work). Step 4 =
 the GUI Publish button; you rarely commit this text by hand.

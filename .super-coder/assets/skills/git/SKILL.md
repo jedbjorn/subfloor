@@ -72,6 +72,8 @@ NEVER delete a branch carrying unmerged, un-PR'd work — no PR = lost work.
 - `/.super-coder/` is gitignored — never force-add anything under it.
 - Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
 - From a worktree, commit only your project's own files. Do NOT hand-commit `.sc-state/content.sql` (serialized DB memory), `.sc-state/engine.ref` (engine pin), or the tracked `_sc` renders — `sc` writes them to the main checkout root, so they aren't in your worktree to stage. They enter the repo via Publish (below).
+- If `artifact_mode=local`, snapshot/render outputs live under ignored
+  `.sc-state/local/`; Publish persists them without creating a Git commit or PR.
 - Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
 
 ## After DB work — `sc mem` is already saved; Publish is separate
@@ -79,6 +81,9 @@ NEVER delete a branch carrying unmerged, un-PR'd work — no PR = lost work.
 An `sc mem` write lands in the shared engine DB immediately (visible to every shell) and `sc rebuild` restores it from the serialized snapshot — there is no per-shell save step. NEVER run `sc snapshot` from a worktree — it refuses by design (`snapshot: refused — serializing to the shared main tree is an admin/GUI step`).
 
 Getting DB text into the repo = the Publish flow (snapshot -> render -> commit -> push -> PR on `sc_gui_content`): the GUI **Publish** button, or the admin shell on `main` running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills changed). Output lands at the main checkout root, NOT your worktree — don't try to commit `content.sql` or `_sc` renders onto your branch. Feature-branch PRs carry project files; DB content publishes separately. See the `snapshot` skill.
+
+That paragraph is tracked-mode behavior. In local mode the same snapshot/render
+commands remain the durability step, but no content publication is attempted.
 
 ## Notes
 

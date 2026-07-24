@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Serialize this fork's per-instance content + memory to text.
 
-Dumps the per-instance tables of the live `shell_db.db` to
-`.sc-state/content.sql` as a deterministic, idempotent SQL script:
+Dumps the per-instance tables of the live `shell_db.db` to the active tracked
+or local content path as a deterministic, idempotent SQL script:
 each table is `DELETE`d then re-`INSERT`ed in primary-key order, so re-running
 produces a byte-identical file (clean git diffs) and loading it is repeatable.
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 import sqlite3  # kept for map.db (which stays SQLite)
 from pathlib import Path
 
+import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/
 import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
@@ -33,8 +34,8 @@ from _serialize_guard import require_admin  # noqa: E402
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
-# Per-fork memory lives OUTSIDE the gitignored engine dir (B7) — see rebuild.py.
-OUT_PATH = REPO_ROOT / ".sc-state" / "content.sql"
+# The artifact policy decides whether per-instance text is tracked or local.
+OUT_PATH = artifact_policy.content_path()
 # One-release cleanup: if a not-yet-migrated fork still carries the old in-engine
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
@@ -358,7 +359,7 @@ def dump_table(con, table: str) -> list[str]:
 
 
 def snapshot_map() -> None:
-    """Serialize the map's AUTHORED layer (dr_section) to .sc-state/map_content.sql.
+    """Serialize the map's authored layer under the active artifact policy.
 
     The map DB (.sc-state/map.db) is a derived cache — its files/deps/env are
     re-mapped, not snapshotted. Only the cartographer-curated sections must
@@ -385,8 +386,7 @@ def snapshot_map() -> None:
             *dump_table(con, "dr_section"),
             "COMMIT;",
         ]
-        map_db.MAP_CONTENT.parent.mkdir(parents=True, exist_ok=True)
-        map_db.MAP_CONTENT.write_text("\n".join(out) + "\n")
+        artifact_policy.atomic_write_text(map_db.MAP_CONTENT, "\n".join(out) + "\n")
         print(f"snapshot: wrote {map_db.MAP_CONTENT.relative_to(REPO_ROOT)}")
     finally:
         con.close()
@@ -394,6 +394,9 @@ def snapshot_map() -> None:
 
 def main() -> int:
     require_admin("snapshot")
+    copied = artifact_policy.prepare_local_state()
+    if copied:
+        print(f"snapshot: localized {len(copied)} existing artifact(s)")
     if not DB_PATH.exists():
         raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
     con = db_driver.connect(DB_PATH)
@@ -413,8 +416,7 @@ def main() -> int:
             if table_exists(con, table):
                 out.extend(dump_table(con, table))
         out.extend(["COMMIT;", "PRAGMA foreign_keys=ON;"])
-        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        OUT_PATH.write_text("\n".join(out) + "\n")
+        artifact_policy.atomic_write_text(OUT_PATH, "\n".join(out) + "\n")
     finally:
         con.close()
     # Relocate-on-write: drop a stale legacy copy so the new .sc-state/ path is

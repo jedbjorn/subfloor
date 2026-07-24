@@ -66,6 +66,7 @@ ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
@@ -571,7 +572,11 @@ def main(argv: list[str]) -> int:
         branch_hint = f"repin-{pin}" if pin else "repin-<sha>"
         print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
         print(f"    git checkout -b {branch_hint}")
-        print("    git add .sc-state/engine.ref .sc-state/content.sql   # + any _sc renders / Makefile")
+        if artifact_policy.tracks_local_artifacts():
+            print("    git add .sc-state/engine.ref .sc-state/content.sql   "
+                  "# + any _sc renders / Makefile")
+        else:
+            print("    git add .sc-state/engine.ref   # local artifacts stay ignored")
         print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")
         print("    gh pr create")
         print("    git checkout main        # return to main — don't stay stranded on the repin branch")

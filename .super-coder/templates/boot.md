@@ -11,9 +11,10 @@ from the repo root) — that is the *engine's* store. The product this repo buil
 keeps its own runtime data in a **separate app database** (see DATABASES below);
 "memory" here never means the product's data.
 
-The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
-git-tracked text (`schema.sql` + `migrations/` + `.sc-state/content.sql`). It is
-a cache, not the source. This boot artifact (`CLAUDE.md` / `AGENTS.md`) is
+The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from public
+system text (`schema.sql` + `migrations/`) plus this instance's active snapshot
+(`.sc-state/content.sql` in tracked mode or `.sc-state/local/content.sql` in
+local mode). It is a cache, not the source. This boot artifact (`CLAUDE.md` / `AGENTS.md`) is
 likewise rebuilt at launch — never hand-edit it.
 
 One memory system, not two. Auto-memory is disabled by design.

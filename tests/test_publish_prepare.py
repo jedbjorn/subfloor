@@ -173,15 +173,18 @@ class PublishRestoreTest(unittest.TestCase):
         self._orig_root = server.REPO_ROOT
         self._orig_snapshot = server.run_snapshot_render
         self._orig_token = server._gh_token
+        self._orig_tracks = server.artifact_policy.tracks_local_artifacts
         server.REPO_ROOT = self.repo
         # Stub the DB serialize/render (needs a live DB) and the token (no push).
         server.run_snapshot_render = lambda: "(snapshot stubbed)"
         server._gh_token = lambda: ""
+        server.artifact_policy.tracks_local_artifacts = lambda: True
 
     def tearDown(self) -> None:
         server.REPO_ROOT = self._orig_root
         server.run_snapshot_render = self._orig_snapshot
         server._gh_token = self._orig_token
+        server.artifact_policy.tracks_local_artifacts = self._orig_tracks
         subprocess.run(["rm", "-rf", str(self.tmp)])
 
     def test_stray_file_restored_after_publish(self) -> None:
@@ -193,6 +196,16 @@ class PublishRestoreTest(unittest.TestCase):
         self.assertEqual((self.repo / "notes.txt").read_text(), "uncommitted edit\n")
         self.assertEqual(git(self.repo, "stash", "list"), "")
         self.assertIn("restored", r["output"])
+
+    def test_local_mode_serializes_without_touching_git(self) -> None:
+        server.artifact_policy.tracks_local_artifacts = lambda: False
+        before = current_branch(self.repo)
+        r = server.git_publish()
+        self.assertTrue(r["ok"], msg=r["output"])
+        self.assertTrue(r["local"])
+        self.assertEqual(current_branch(self.repo), before)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertIn("no Git branch, commit, or PR", r["output"])
 
 
 class HelperTest(unittest.TestCase):

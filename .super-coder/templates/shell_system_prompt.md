@@ -10,7 +10,7 @@ one cwd — no cross-repo confusion.
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
+`schema.sql` + `migrations/` + the active tracked/local instance snapshot). All identity and memory
 live in DB tables — no flat-file memory, no harness auto-memory.
 
 | Surface | Where |

@@ -5,27 +5,31 @@ is the substrate that runs it.
 
 ## The DB is rebuilt, never committed
 
-`shell_db.db` is **gitignored**. It reconstructs from two git-tracked text
-serializations:
+`shell_db.db` is **gitignored**. It reconstructs from public system text plus
+one per-instance snapshot:
 
 | Category | File(s) | Git? | Role |
 |---|---|---|---|
 | **System migrations** | `migrations/*.sql` | tracked | ordered; **propagate** to forks; schema + system content |
-| **Per-instance snapshot** | `.sc-state/content.sql` | tracked (fork-owned, outside the engine dir) | idempotent dump of *this* repo's content + memory; **stays local** |
+| **Per-instance snapshot** | `.sc-state/content.sql` or `.sc-state/local/content.sql` | tracked by default; ignored when `artifact_mode=local` | idempotent dump of *this* repo's content + memory |
 | **Baseline schema** | `schema.sql` | tracked | full current schema; applied on fresh build |
 | **`.db`, boot artifact** | — | ignored | rebuilt at launch |
 
 The split that matters: **system content propagates, per-instance content does
-not.** Migrations are pulled downstream by every fork; the snapshot belongs to
-one repo only.
+not.** Downstream forks default to tracked artifacts for compatibility. An
+instance may set `artifact_mode: "local"` in `instance.json`; snapshot, map
+authorship, skill retirement, and flat renders then live under ignored
+`.sc-state/local/` and Publish creates no content commit.
+Use `./sc artifact-mode show` or `./sc artifact-mode set tracked|local`; after
+switching, run `SC_ADMIN=1 ./sc snapshot && SC_ADMIN=1 ./sc render`.
 
 ## Scripts
 
 | Script | Does |
 |---|---|
-| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load `.sc-state/content.sql`. Builds a fresh `.db`. |
+| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load the active per-instance snapshot. Builds a fresh `.db`. |
 | `scripts/migrate.py` | apply pending `migrations/*.sql` to an existing `.db`; record in `schema_migrations`. |
-| `scripts/snapshot.py` | dump per-instance tables → `.sc-state/content.sql` (deterministic). |
+| `scripts/snapshot.py` | dump per-instance tables → the active artifact root (deterministic). |
 | `scripts/update.py` | fetch + materialize the engine (gitignored dep) at an upstream ref → pin `.sc-state/engine.ref` → migrate in place → sync skills → snapshot. |
 | `scripts/rollback.py` | sound undo of a bad update — restore the DB + engine (`engine.ref.prev`) pair. |
 | `scripts/run.py` | launcher: username-only auth → pick shell → render boot (`CLAUDE.md` + `AGENTS.md`) → exec harness. |
@@ -40,7 +44,7 @@ matches disk is skipped, so an unchanged DB renders to nothing):
 |---|---|---|---|
 | Boot doc → `CLAUDE.md` + `AGENTS.md` | `compose.py` | ignored | the harness at launch |
 | Per-shell skills → `.claude/skills/<name>/SKILL.md` | `flat.render_skill_md` | ignored | the harness (Agent Skills) |
-| Flat `_sc` files → `specs_sc/` `docs_sc/` `skills_sc/` `roadmap_sc.md` | `flat.render_visibility` | **tracked** | the outsider FnB browsing the repo |
+| Flat `_sc` files → `specs_sc/` `docs_sc/` `skills_sc/` `roadmap_sc.md` | `flat.render_visibility` | tracked mode: repo root; local mode: ignored local render root | operator/browser visibility |
 
 The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
 shell — gitignored caches, like `.db`. The flat `_sc` files are the tracked

@@ -49,7 +49,7 @@ you.
 4. **Record the crossing.** Append a narrative entry — identity event for a
    shell that updates its own floor. Note what changed + write the handoff.
 
-5. **Commit the full regenerated set — NEVER a bare `engine.ref` bump.**
+5. **Commit the full public set.**
    Stage every tracked file the update regenerated: `.sc-state/content.sql`
    (refreshed memory) + `.sc-state/engine.ref` (the pin) + the root `sc`
    dispatcher if it changed + any `_sc` renders. `sc` is the live tracked
@@ -57,6 +57,9 @@ you.
    engine just pinned, silently dropping commands the new engine ships.
    `.super-coder/` and `engine.ref.prev` are gitignored — nothing to commit
    there.
+   With `artifact_mode=local`, `content.sql` and `_sc` renders stay under
+   ignored `.sc-state/local/`; commit the engine pin/dispatcher and other
+   genuinely public files only.
    - **Render conflict** (committing via PR while main advances):
      `content.sql` + `_sc` renders are serialized DB state and collide with a
      concurrent publisher. NEVER hand-merge serialized SQL — live DB canonical,

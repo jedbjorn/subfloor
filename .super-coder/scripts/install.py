@@ -452,6 +452,9 @@ _GITIGNORE_BLOCK = f"""
 # .sc-state/ is TRACKED (content.sql + engine.ref). Only ephemeral/derived
 # state is ignored: the pre-update pointer, map cache, and local DB backups.
 /.sc-state/engine.ref.prev
+# Opt-out artifact mode stores snapshots, map authorship, and flat renders here.
+# Tracked mode remains the default for downstream forks.
+/.sc-state/local/
 # Map DB — derived cache of the repo (dr_*), rebuilt by `./sc map`. Its authored
 # layer (sections) is tracked in .sc-state/map_content.sql.
 /.sc-state/map.db
