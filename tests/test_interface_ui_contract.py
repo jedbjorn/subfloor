@@ -1,4 +1,4 @@
-"""Static browser contract checks for spec #30 requirements 18-20.
+"""Browser contract checks for spec #30 requirements 18-20 and 24.
 
 The UI is deliberately build-free vanilla JS/CSS. These checks pin the shared
 picker and responsive terminal behavior without inventing a second JS runtime
@@ -14,14 +14,27 @@ CSS = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 PICKER = APP[APP.index("function dmModelPicker"):
              APP.index("async function renderDefaultModels")]
 RECOVERY = APP[APP.index("function ifRecoveryContext"):
-               APP.index("// Lost/error/unreconciled pane")]
+               APP.index("// Sprint wake panel")]
+RENDER_INTERFACE = APP[APP.index("const IF_BADGE"):
+                       APP.index("// A reservation is not a terminal")]
+AVAILABLE = APP[APP.index("function ifAvailablePane"):
+                APP.index("async function ifNewChatForm")]
 
 
 def run_recovery_js(body):
     """Exercise the real recovery UI helpers in Node with a minimal DOM."""
     el_helper = APP[APP.index("const el ="):APP.index("const esc =")]
-    script = el_helper + "\nlet apiIf, renderInterface, confirm, prompt;\n" + \
-        RECOVERY + r"""
+    script = el_helper + r"""
+let apiIf, confirm, prompt;
+let ifSelected = "S3";
+let ifAttach = null;
+function ifDetach() {}
+async function ifStartingPane() {}
+async function ifSessionPane() {}
+async function ifSprintPanel() {}
+async function ifNewChatForm() {}
+globalThis.location = { hash: "" };
+""" + RENDER_INTERFACE + RECOVERY + AVAILABLE + r"""
 class FakeElement {
   constructor(tag) {
     this.tagName = tag;
@@ -30,9 +43,12 @@ class FakeElement {
     this._text = "";
     this.checked = false;
     this.disabled = false;
+    this.isConnected = true;
   }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = [...nodes]; this._text = ""; }
+  remove() {}
+  closest() { return this; }
   set textContent(value) {
     this._text = String(value ?? "");
     this.children = [];
@@ -72,10 +88,24 @@ const BASE_PREVIEW = {
       session_id: 9, generation: 1, occupancy: "occupied",
       lifecycle: "lost",
     },
+    generation: {
+      generation: 1, ended_at: null, last_hook_seq: 7,
+    },
+    archive: {
+      archive_id: 12, ended_at: null, active: true,
+    },
+    sprint_binding: {
+      binding_id: 15, sprint_doc_id: 31,
+    },
     process: {
       pane_id: "%1", pane_pid: 4321, pane_start_ticks: 999,
       pane_present: false, pid_state: "alive", pgid: 4321,
     },
+    tmux: {
+      socket: "/run/if/tmux.sock", session: "sc-S3",
+      window: "chat", pane_id: "%1",
+    },
+    unread_messages: 2,
     git: {
       worktree: "/x/s3", branch: "fix/x", dirty_tracked: 1,
       untracked: 2, unpushed_commits: 0,
@@ -210,6 +240,17 @@ for (const test of cases) {
     "session identity missing from diagnostics");
   invariant(host.textContent.includes("PID 4321 · start ticks 999 · PGID 4321"),
     "exact process identity missing from diagnostics");
+  invariant(host.textContent.includes("generation 1 · open · last hook 7"),
+    "generation evidence missing from diagnostics");
+  invariant(host.textContent.includes("archive #12 · open · active"),
+    "archive evidence missing from diagnostics");
+  invariant(host.textContent.includes("binding #15 · sprint doc #31"),
+    "sprint binding evidence missing from diagnostics");
+  invariant(host.textContent.includes(
+    "socket /run/if/tmux.sock · session sc-S3 · window chat · pane %1"),
+    "tmux evidence missing from diagnostics");
+  invariant(host.textContent.includes("2 · left unread"),
+    "unread-message evidence missing from diagnostics");
   invariant(host.textContent.includes("not clean · 1 tracked · 2 untracked"),
     "worktree cleanliness missing from diagnostics");
   if (!test.legal.length) invariant(
@@ -249,7 +290,138 @@ invariant(!("confirm_force" in calls[1].body),
 invariant(confirmText.includes("S3") && confirmText.includes("session #9") &&
   confirmText.includes("PID 4321") && confirmText.includes("worktree not clean"),
   `confirmation omitted scoped diagnostics: ${confirmText}`);
-invariant(rendered === 1, `expected one successful rerender, got ${rendered}`);
+invariant(rendered === 0,
+  `result was discarded by an automatic rerender: ${rendered}`);
+invariant(host.textContent.includes("Recovery result") &&
+  host.textContent.includes("Worktree preserved"),
+  `successful result was not retained: ${host.textContent}`);
+await button(host, "Refresh shell state").onclick();
+invariant(rendered === 1, `explicit refresh did not rerender: ${rendered}`);
+""")
+
+
+def test_available_and_no_session_states_can_reach_server_owned_recovery():
+    run_recovery_js(r"""
+const archiveOnly = {
+  ...BASE_PREVIEW,
+  classification: "stale_durable_lock",
+  legal_actions: ["recover"],
+  evidence: {
+    ...BASE_PREVIEW.evidence,
+    session: null,
+    generation: null,
+    sprint_binding: null,
+    process: {
+      pane_id: null, pane_pid: null, pane_start_ticks: null,
+      pane_present: null, pid_state: "none", pgid: null,
+    },
+    tmux: null,
+  },
+};
+confirm = () => false;
+prompt = () => null;
+apiIf = async (path) => path === "/interface/shells"
+  ? { shells: [{
+      shell_id: 3, shortname: "S3", display_name: "Shell 3",
+      availability: "available", session_id: null,
+    }] }
+  : archiveOnly;
+const root = new FakeElement("div");
+await renderInterface(root);
+const availablePreview = button(root, "Preview recovery");
+invariant(Boolean(availablePreview),
+  "available/archive-only route omitted shell recovery preview");
+await availablePreview.onclick();
+invariant(Boolean(button(root, "Recover")),
+  "available/archive-only route hid the server-listed recovery action");
+invariant(root.textContent.includes("no Interface session") &&
+  root.textContent.includes("no generation record") &&
+  root.textContent.includes("no armed sprint binding") &&
+  root.textContent.includes("no recorded process identity") &&
+  root.textContent.includes("no tmux relation"),
+  `absent recovery evidence was not rendered truthfully: ${root.textContent}`);
+
+const residual = {
+  ...archiveOnly,
+  classification: "exact_idle_orphan",
+  evidence: {
+    ...BASE_PREVIEW.evidence,
+    live_session: false,
+  },
+};
+const requested = [];
+apiIf = async (path) => {
+  requested.push(path);
+  return residual;
+};
+const pane = new FakeElement("div");
+await ifRecoveryPane(pane, {
+  shell_id: 3, shortname: "S3", display_name: "Shell 3",
+  availability: "unreconciled", session_id: null,
+}, root);
+const orphanPreview = button(pane, "Preview recovery");
+invariant(Boolean(orphanPreview),
+  "unreconciled/no-session route omitted shell recovery preview");
+await orphanPreview.onclick();
+invariant(Boolean(button(pane, "Recover")),
+  "unreconciled/no-session route hid the server-listed recovery action");
+invariant(!requested.some((path) => path.includes("/sessions/")),
+  `no-session route fetched invalid session detail: ${requested}`);
+""")
+
+
+def test_recovery_partial_result_keeps_exact_remediation_until_refresh():
+    run_recovery_js(r"""
+let rendered = 0;
+confirm = () => true;
+prompt = () => "S3";
+renderInterface = async () => { rendered += 1; };
+apiIf = async (path, method = "GET") => {
+  if (method === "GET") return BASE_PREVIEW;
+  return {
+    shell_id: 3, shortname: "S3",
+    classification: "exact_idle_orphan", mode: "recover",
+    signaled: null,
+    closed: {
+      session: {
+        session_id: 9, end_reason: "operator_recovery",
+        already_ended: false,
+      },
+      archive: { archive_id: 12, closed: true },
+      binding: null,
+      alerts_resolved: 3,
+      parked: [{
+        binding_id: 15,
+        next_action: "review sprint delivery and release binding manually",
+      }],
+    },
+    worktree: {
+      worktree: "/x/s3", discarded: false, completed: ["reset"],
+      failed: { step: "clean", error: "fatal: clean boom" },
+    },
+    unread_messages: 2,
+    availability: "available",
+  };
+};
+const host = new FakeElement("div");
+ifRecoveryControls(host, { shell_id: 3, shortname: "S3" }, {});
+await button(host, "Preview recovery").onclick();
+const discard = all(host, (node) =>
+  node.tagName === "input" && node.type === "checkbox")[0];
+discard.checked = true;
+await button(host, "Recover").onclick();
+invariant(rendered === 0,
+  "partial recovery result was swallowed by an automatic refresh");
+invariant(host.textContent.includes(
+  "Parked ambiguous binding #15: review sprint delivery and release binding manually"),
+  `parked-binding remediation missing: ${host.textContent}`);
+invariant(host.textContent.includes(
+  "completed [reset], failed at clean (fatal: clean boom)"),
+  `per-step discard remediation missing: ${host.textContent}`);
+invariant(host.textContent.includes("Durable closure is committed"),
+  "partial-success boundary was not explained");
+await button(host, "Refresh shell state").onclick();
+invariant(rendered === 1, "explicit refresh did not rerender");
 """)
 
 
