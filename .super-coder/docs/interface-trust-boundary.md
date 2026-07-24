@@ -123,9 +123,12 @@ rendered state, or a log.
 - **Rotation revokes.** Every bootstrap mints a new identifier and a new
   anti-forgery token, and destroys the session the caller presented in the
   same step. A request still in flight under the revoked identifier is
-  re-checked at dispatch and answered `401` rather than completing — the one
-  exception being a handler already executing, which finishes under the
-  authority it started with.
+  re-checked at dispatch and answered `401` rather than completing. The
+  exception is bounded by that check, not by the handler: once a request has
+  passed the dispatch re-check it finishes under the authority it held when it
+  passed, whether or not its handler has started. The re-check is not held
+  across dispatch — doing so would serialize every Interface request behind
+  the slowest blocking handler.
 - **A service restart invalidates every session.** That is the normal recovery
   path, not a fault.
 - **One silent retry.** On the first `401` the UI bootstraps once and retries

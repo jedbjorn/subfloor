@@ -254,14 +254,21 @@ def _commit_browser_use(sid: str) -> bool:
     after the request was authorized but before its handler runs any side
     effect. Re-checking membership here, immediately before dispatch, is what
     makes spec #26's "atomically replaces" true against in-flight requests:
-    a revoked identifier cannot reach a handler.
+    it collapses that window from the whole fence chain to the gap described
+    below.
 
     The alternative — holding `_browser_lock` across dispatch — was rejected:
     handlers do blocking sqlite and subprocess work, so it would serialize
-    every Interface request behind the slowest one. The residual window is
-    therefore revocation landing DURING a handler's own execution, which is
-    not interrupted; that request completes under the authority it held when
-    it started. Stated rather than papered over.
+    every Interface request behind the slowest one. So the lock is released
+    when this returns, and route selection and the handler run outside it.
+    The residual window is therefore: ANY REQUEST THAT HAS PASSED THIS RECHECK
+    MAY FINISH. Revocation landing after the recheck returns True — whether
+    the handler has started or not — does not stop that request; it completes
+    under the authority it held when it passed. The narrower phrasing this
+    replaced ("a revoked identifier cannot reach a handler", residual =
+    revocation during a handler's own execution) claimed more than the code
+    does: rotation landing between this return and the handler's first line
+    still reaches the handler. Stated rather than papered over.
 
     Returns False when the session is gone (rotated away, expired, or lost to
     a restart) — the caller answers 401 and the UI recovers.

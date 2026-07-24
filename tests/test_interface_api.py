@@ -584,6 +584,48 @@ class InterfaceApiTest(unittest.TestCase):
                                  (f"Cookie: {new_cookie}",))
         self.assertEqual(status, 200)
 
+    def test_rotation_after_the_dispatch_recheck_does_not_stop_the_request(self):
+        """The residual window, pinned instead of only described.
+
+        The re-check above is deliberately NOT held across dispatch — handlers
+        do blocking sqlite and subprocess work, so holding it would serialize
+        every Interface request behind the slowest one. The honest consequence
+        is that a rotation landing after the re-check returns True cannot stop
+        that request, whether or not its handler has started: it finishes under
+        the authority it held when it passed. `_commit_browser_use` and the
+        trust-boundary doc state exactly that bound, and this test is what
+        holds the prose to it — strengthen the synchronization and this goes
+        red, which is the correct time to rewrite both."""
+        cookie, csrf = self._browser()
+        first = cookie.split("=", 1)[1]
+        rotated = []
+        real_commit = routes._commit_browser_use
+
+        def commit_then_rotate(sid):
+            # Runs once, AFTER the real re-check has authorized this request —
+            # the exact gap before route selection reaches the handler.
+            ok = real_commit(sid)
+            if ok and not rotated:
+                status, hdrs_, _ = self._bootstrap(f"Cookie: {cookie}",
+                                                   key="b-postcheck")
+                assert status == 201
+                rotated.append(hdrs_["Set-Cookie"].split(";")[0])
+            return ok
+
+        with mock.patch.object(routes, "_commit_browser_use",
+                               commit_then_rotate):
+            status, _, body = self.call(
+                "POST", "/api/interface/sessions",
+                (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+                 "Idempotency-Key: c-postcheck"), {"shell_id": 1})
+        # The request completed: revocation after the re-check does not reach
+        # back into a request the re-check already let through.
+        self.assertEqual(status, 201, body)
+        # And the rotation really did happen — this is the residual window,
+        # not a test that quietly failed to revoke anything.
+        self.assertTrue(rotated, "the concurrent bootstrap never ran")
+        self.assertNotIn(first, routes._browser_sessions)
+
     def test_browser_sessions_are_live_process_state_only(self):
         """A restart wipes them — which is exactly the contract the UI's one
         silent re-bootstrap relies on, and why they never touch the DB."""
