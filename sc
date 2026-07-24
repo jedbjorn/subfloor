@@ -41,6 +41,29 @@ ifpy() {
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
+# The two localhost URLs an operator needs, derived from this fork's ports —
+# never a fixed 8800, because every fork lands on its own offset (ports.py).
+# One printer, three callers (`url`, `enter`, `enter-<shortname>`): the boot
+# summary now paints INSIDE the tmux pane where the harness TUI overdraws it,
+# so `enter` restates the links host-side before attaching and `./sc url` /
+# `make dos-url` is the recall path once they have scrolled away (decision #50).
+sc_urls() {
+  # Under `set -e` a failed derivation would abort the caller, so it is a
+  # return here and `enter` ignores it: an operator who cannot be told the
+  # URL still gets their shell. `url` propagates it — a recall command that
+  # printed nothing and exited 0 would read as "this fork has no GUI".
+  sc_url_gui="$(port)" && sc_url_dev="$(devport)" || {
+    echo "✗ could not derive this fork's ports — is ${PY} able to run $S/ports.py?" >&2
+    return 1
+  }
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    printf '  \033[1mReview GUI  \033[36mhttp://127.0.0.1:%s\033[0m\n' "$sc_url_gui"
+  else
+    printf '  Review GUI  http://127.0.0.1:%s\n' "$sc_url_gui"
+  fi
+  printf '  dev server  http://127.0.0.1:%s\n' "$sc_url_dev"
+}
+
 # Host-side docker orchestration (raw docker — no compose plugin dependency).
 # The sandbox runs as you (uid/gid → no root-owned files), bind-mounts this repo
 # at its host path + your harness creds rw, and publishes this fork's derived
@@ -1046,6 +1069,7 @@ case "$cmd" in
   # (the raw-SQL grant's silent no-op class). Snapshot is still the persist step.
   skill)        exec "$PY" "$S/skill.py" "$@" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
+  url)          sc_urls ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
@@ -1238,8 +1262,8 @@ case "$cmd" in
   # Interactive entry goes through the Interface API (spec #20): the in-container
   # target resolves occupancy, starts a New chat (picker + reservation) for an
   # available shell, or reattaches the occupied generation. Never a raw boot.
-  enter)        exec docker exec -it "$CNAME" ./sc interface enter "$@" ;;
-  enter-*)      exec docker exec -it "$CNAME" ./sc interface enter "${cmd#enter-}" "$@" ;;
+  enter)        sc_urls || true; exec docker exec -it "$CNAME" ./sc interface enter "$@" ;;
+  enter-*)      sc_urls || true; exec docker exec -it "$CNAME" ./sc interface enter "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
@@ -1377,7 +1401,8 @@ super-coder — forkable shell substrate
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
-  sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
+  sc sql-rw · sc map-sql-rw
+                           read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
                              Only for procedures with no API surface (map authoring) where a skill names it
   ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
                              shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
@@ -1385,6 +1410,9 @@ super-coder — forkable shell substrate
   ./sc artifact-mode       show · set tracked|local — tracked is the downstream default; local persists beneath ignored .sc-state/local/
   ./sc render              render flat _sc files under the active artifact policy
   ./sc render-check        fail if the active flat _sc files drift from the DB render (hermetic check)
+  ./sc analytics sweep     parse each harness's on-disk token usage for this repo into session_token_usage
+                             (incremental + idempotent; --harness <name> · --quiet · --full re-parses everything).
+                             Also runs at boot and behind the GUI Analytics tab
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
   ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)
@@ -1479,7 +1507,11 @@ super-coder — forkable shell substrate
   the supervised engine service is now the fork's SOLE PR poller; it starts
   with `launch` and polls only watches armed to an ACTIVE sprint. The legacy
   direct-DB host daemon is retired — `sc watch daemon` prints the cutover
-  notice and exits clean. These verbs remain to REMOVE legacy supervision:
+  notice and exits clean. The start verbs are kept dispatchable for the same
+  reason, so old muscle memory gets the cutover notice instead of a bare
+  "unknown command"; the rest remain to REMOVE legacy supervision:
+  ./sc watch-daemon-up     RETIRED — prints the cutover notice, starts nothing (exit 0)
+  ./sc watch-daemon-install RETIRED — refuses on stderr, pointing at watch-daemon-uninstall (exit 1)
   ./sc watch-daemon-down   stop a still-running legacy background daemon
   ./sc watch-daemon-uninstall remove a legacy systemd --user unit
 
@@ -1501,6 +1533,8 @@ super-coder — forkable shell substrate
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health
   ./sc ports               show this fork's derived port
+  ./sc url                 print this fork's review GUI + dev-server URLs (derived, never a fixed 8800)
+                             — the recall path when the boot summary has scrolled away. Alias: make dos-url
   ./sc preview             live-preview every dev shell's worktree UI on one port,
                              routed by subdomain (http://<shortname>.localhost:<dev_port>/)
   ./sc clean-db            remove the rebuilt .db (text serializations untouched)

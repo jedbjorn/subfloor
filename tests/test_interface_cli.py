@@ -561,6 +561,61 @@ class FakeWS:
         return [f for f in self.sent if f[:1] == b"\x01"]
 
 
+class Transcript:
+    """One ordered buffer behind BOTH streams run_stream writes to: pane
+    payloads (stdout.buffer, bytes) and notices (stderr, text).
+
+    Capturing the two separately records what each stream said but never
+    which came first — and for the GUI notice the order IS the feature, so
+    a separate-capture test passes just as happily with the notice emitted
+    before the redraw that paints over it. `text` is the terminal's own
+    view: the bytes in the order the operator's terminal received them.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._parts: list[str] = []
+        self._pane = bytearray()
+        self.buffer = _TranscriptBytes(self)     # the stdout.buffer stand-in
+
+    def write(self, text: str) -> int:           # the stderr (text) side
+        with self._lock:
+            self._parts.append(text)
+        return len(text)
+
+    def _write_pane(self, data: bytes) -> int:
+        with self._lock:
+            self._pane += data
+            self._parts.append(data.decode("utf-8", "replace"))
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def text(self) -> str:
+        """Both streams, interleaved in write order."""
+        with self._lock:
+            return "".join(self._parts)
+
+    def pane(self) -> bytes:
+        """Only the bytes that went to the pane."""
+        with self._lock:
+            return bytes(self._pane)
+
+
+class _TranscriptBytes:
+    """The binary half of a Transcript — stands in for sys.stdout.buffer."""
+
+    def __init__(self, transcript: Transcript):
+        self._t = transcript
+
+    def write(self, data: bytes) -> int:
+        return self._t._write_pane(data)
+
+    def flush(self):
+        pass
+
+
 class StdinScript:
     """A scripted stdin for run_stream's input seams: the test feeds reads;
     `ready` blocks (like select) until one is pending."""
@@ -598,10 +653,13 @@ class RunStreamTest(unittest.TestCase):
     """The real run_stream against FakeWS + StdinScript: client-side broker
     protocol semantics (spec #20 Input Broker — review r1 M1)."""
 
-    def run_stream(self, ws, stdin, role="writer", start_seq=5):
-        """Drives run_stream on a thread; returns (thread, stderr StringIO).
-        The caller feeds frames/keystrokes, then `ws.end()` and joins."""
-        err = io.StringIO()
+    def run_stream(self, ws, stdin, role="writer", start_seq=5, err=None):
+        """Drives run_stream on a thread; returns (thread, stderr sink).
+        The caller feeds frames/keystrokes, then `ws.end()` and joins.
+
+        `err` defaults to a private StringIO; pass a Transcript to capture
+        stderr in the same buffer as the pane bytes."""
+        err = io.StringIO() if err is None else err
         patches = [
             mock.patch.object(ic, "_stdin_ready", stdin.ready),
             mock.patch.object(ic, "_read_stdin", stdin.read),
@@ -713,6 +771,64 @@ class RunStreamTest(unittest.TestCase):
         self.assertNotIn("input_ack", text)
         self.assertNotIn("\x1b[2m", text, "no dimmed per-frame echo in raw "
                                           "mode — transitions/errors only")
+
+    def _capture_stdout(self, buffer=None):
+        """run_stream writes pane payloads to sys.stdout.buffer — hand it a
+        buffer so the test can read them instead of the terminal."""
+        fake = mock.Mock(buffer=io.BytesIO() if buffer is None else buffer)
+        patch = mock.patch.object(ic.sys, "stdout", fake)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return fake.buffer
+
+    def test_attach_names_the_review_gui_once_riding_the_first_payload(self):
+        """Decision #52. `./sc enter` hands the terminal straight to the
+        harness, so the session view is the only surface left that can name
+        the GUI — and the GUI is on a different port per fork.
+
+        It has to ride the first pane payload: attach opens with a
+        full-screen redraw, and a line printed before that redraw is painted
+        straight over by it. It also has to fire exactly once — this sits in
+        the output hot path, and a line per pane write would make the
+        session unusable.
+
+        Both streams land in ONE transcript, because the guarantee is an
+        ordering across them: the notice must follow the redraw bytes into
+        the terminal, and a test that reads stdout and stderr separately
+        cannot tell that apart from the defect."""
+        ws, stdin = FakeWS(), StdinScript()
+        tr = Transcript()
+        self._capture_stdout(tr.buffer)
+        t, _ = self.run_stream(ws, stdin, role="viewer", err=tr)
+
+        # Control frames before any pane bytes: still no link, or the redraw
+        # that follows would erase it.
+        ws.feed(json.dumps({"type": "lifecycle", "lifecycle": "running",
+                            "composer": "idle"}))
+        self.assertTrue(wait_for(lambda: "lifecycle running" in tr.text()))
+        self.assertNotIn("Review GUI", tr.text())
+
+        ws.feed(b"\x04REDRAW")
+        self.assertTrue(wait_for(lambda: "Review GUI" in tr.text()))
+        self.assertIn(ic.API_BASE, tr.text())
+        self.assertIn("./sc url", tr.text(),
+                      "the line names the durable recall path, not just a URL")
+
+        ws.feed(b"\x00OUTPUT")
+        ws.feed(b"\x00MORE")
+        self.assertTrue(wait_for(lambda: tr.pane() == b"REDRAWOUTPUTMORE"))
+
+        # The anti-overdraw guarantee itself: in the terminal's own byte
+        # order the attach redraw is already painted when the link appears.
+        text = tr.text()
+        self.assertLess(text.index("REDRAW"), text.index("Review GUI"),
+                        "the notice must land AFTER the attach redraw — "
+                        "before it, the redraw paints straight over it")
+        self.assertEqual(text.count("Review GUI"), 1,
+                         "once per attach, not once per pane write")
+        ws.end()
+        t.join(10)
+        self.assertFalse(t.is_alive())
 
 
 class RawLaunchRefusalTest(unittest.TestCase):
