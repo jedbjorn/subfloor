@@ -345,12 +345,13 @@ def _availability(con, shell_id: int, snap) -> dict:
     clears it — a legacy/unmanaged harness makes it unreconciled."""
     active_session = interface_state.active_session_sql("s")
     row = con.execute(
-        "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, s.harness "
+        "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, "
+        "s.harness, s.model_route "
         "FROM interface_sessions s WHERE s.shell_id=? "
         f"AND {active_session} ORDER BY s.session_id DESC LIMIT 1",
         (shell_id,)).fetchone()
     if row is not None:
-        session_id, generation, occupancy, lifecycle, harness = row
+        session_id, generation, occupancy, lifecycle, harness, model_route = row
         client = _client_state(con, session_id)
         if occupancy == "reserved":
             availability = "starting"
@@ -365,15 +366,17 @@ def _availability(con, shell_id: int, snap) -> dict:
         return {"availability": availability, "session_id": session_id,
                 "generation": generation,
                 "lifecycle": lifecycle, "harness": harness,
+                "model_route": model_route,
                 "composer": composer[0] if composer else None,
                 "alerts": _alert_count(con, session_id), **client}
     state = shell_liveness.session_state(_shortname(con, shell_id), snap)
     if state is not None:
         return {"availability": "unreconciled", "session_id": None,
                 "lifecycle": None, "harness": None, "composer": None,
-                "alerts": 0}
+                "model_route": None, "alerts": 0}
     return {"availability": "available", "session_id": None,
-            "lifecycle": None, "harness": None, "composer": None, "alerts": 0}
+            "lifecycle": None, "harness": None, "model_route": None,
+            "composer": None, "alerts": 0}
 
 
 def _shortname(con, shell_id: int) -> str:

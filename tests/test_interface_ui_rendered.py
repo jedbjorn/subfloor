@@ -1,4 +1,4 @@
-"""Rendered Interface layout and live-resize coverage for spec #33.
+"""Rendered Interface layout, disclosures, and submit coverage for spec #30.
 
 The normal engine suite stays dependency-light, so this module skips unless
 Playwright is installed.  The ``interface-rendered`` CI job installs the same
@@ -30,7 +30,8 @@ SHELL = {
     "session_id": 7,
     "generation": 1,
     "harness": "codex",
-    "alerts": 1,
+    "model_route": "gpt-5.6-terra",
+    "alerts": 2,
 }
 SESSION = {
     "session_id": 7,
@@ -38,7 +39,7 @@ SESSION = {
     "attachable": True,
     "identity_verified": True,
     "harness": "codex",
-    "model_route": "gpt-5.6-sol",
+    "model_route": "gpt-5.6-terra",
     "lifecycle": "idle",
     "composer": "clean",
     "browser_composer": "clean",
@@ -64,6 +65,22 @@ ALERT = {
     "acknowledged_at": None,
     "acknowledged_by": None,
     "resolved_at": None,
+}
+CRITICAL_ALERT = {
+    **ALERT,
+    "alert_id": 121,
+    "severity": "critical",
+    "reason": "delivery_unknown",
+    "meaning": "Delivery may have crossed the broker crash boundary.",
+}
+CAPABILITY = {
+    **ALERT,
+    "alert_id": 122,
+    "category": "capability",
+    "severity": "info",
+    "reason": "optional_hook_missing",
+    "meaning": "Optional hook detail is unavailable.",
+    "dismissible": False,
 }
 
 
@@ -146,7 +163,7 @@ def _mock_api(route) -> None:
                 for index in range(14)
             ]
             return _json(route, {"alerts": history})
-        return _json(route, {"alerts": [ALERT]})
+        return _json(route, {"alerts": [ALERT, CRITICAL_ALERT, CAPABILITY]})
     return _json(route, {})
 
 
@@ -154,6 +171,8 @@ INIT_SCRIPT = r"""
 window.__wsInstances = 0;
 window.__wsResizeFrames = [];
 window.__terminalResizes = [];
+window.__inputFrames = [];
+window.__lastWs = null;
 
 class RenderedWebSocket {
   static CONNECTING = 0;
@@ -162,6 +181,7 @@ class RenderedWebSocket {
   static CLOSED = 3;
   constructor() {
     window.__wsInstances += 1;
+    window.__lastWs = this;
     this.readyState = RenderedWebSocket.OPEN;
     queueMicrotask(() => this.onopen?.());
   }
@@ -172,6 +192,9 @@ class RenderedWebSocket {
         rows: view.getUint16(1),
         cols: view.getUint16(3),
       });
+    }
+    if (frame instanceof Uint8Array && frame[0] === 0x01) {
+      window.__inputFrames.push(Array.from(frame));
     }
   }
   close() { this.readyState = RenderedWebSocket.CLOSED; }
@@ -206,8 +229,8 @@ window.Terminal = RenderedTerminal;
 """
 
 
-def _open_interface(browser, ui_url: str, *, height: int):
-    context = browser.new_context(viewport={"width": 1600, "height": height})
+def _open_interface(browser, ui_url: str, *, height: int, width: int = 1600):
+    context = browser.new_context(viewport={"width": width, "height": height})
     page = context.new_page()
     page.add_init_script(INIT_SCRIPT)
     page.route("**/vendor/xterm/xterm.js", lambda route: route.fulfill(
@@ -294,7 +317,7 @@ def test_tall_fit_short_floor_and_visual_qa(browser, ui_url, tmp_path):
         )
         assert fitted["pageScrolls"] is False
 
-        page.set_viewport_size({"width": 1600, "height": 900})
+        page.set_viewport_size({"width": 1600, "height": 700})
         page.wait_for_timeout(100)
         short = _layout(page)
         assert 500 <= short["termHeight"] <= 502
@@ -356,10 +379,143 @@ def test_alert_history_and_multiline_composer_respect_terminal_floor(
             or composed["pageScrolls"] is True
         )
 
+        page.get_by_text("Alerts (2)", exact=True).click()
         page.get_by_role("button", name="Alert history").click()
         page.locator(".if-history").wait_for()
         expanded = _layout(page)
         assert expanded["termHeight"] >= 500
         assert expanded["pageScrolls"] is True
+    finally:
+        context.close()
+
+
+def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
+    browser, ui_url, tmp_path
+):
+    desktop, page = _open_interface(browser, ui_url, height=1100)
+    try:
+        page.get_by_text("Alerts (2)", exact=True).wait_for()
+        assert "DEV3 · codex · GPT 5.6 TERRA" in page.locator(
+            ".if-row-sub"
+        ).inner_text()
+        assert page.locator(".if-alerts").get_attribute("class").endswith(
+            "critical"
+        )
+        assert page.locator(".if-details").get_attribute("open") is None
+        assert page.locator(".if-alerts").get_attribute("open") is None
+
+        page.get_by_text("Details", exact=True).click()
+        details = page.locator(".if-details")
+        assert "model GPT 5.6 TERRA" in details.inner_text()
+        assert "session #7 · arc #172" in details.inner_text()
+        assert "wake armed" in details.inner_text()
+
+        page.get_by_text("Alerts (2)", exact=True).click()
+        alerts = page.locator(".if-alerts")
+        assert alerts.get_by_text("critical", exact=True).count() == 1
+        assert alerts.get_by_text("warning", exact=True).count() == 1
+        assert alerts.get_by_text(
+            "Capability information", exact=True
+        ).count() == 1
+
+        actions = page.locator(".if-composer-actions")
+        assert actions.locator("button").all_inner_texts() == [
+            "Send",
+            "End chat",
+        ]
+        boxes = actions.locator("button").evaluate_all(
+            """(buttons) => buttons.map((button) => {
+              const box = button.getBoundingClientRect();
+              return { x: box.x, y: box.y };
+            })"""
+        )
+        assert abs(boxes[0]["y"] - boxes[1]["y"]) < 1
+        assert boxes[1]["x"] > boxes[0]["x"]
+        page.evaluate(
+            "ifControl(ifAttach, { type: 'lifecycle', lifecycle: 'ended' })"
+        )
+        assert page.get_by_role("button", name="End chat").is_hidden()
+        page.evaluate(
+            "ifControl(ifAttach, { type: 'lifecycle', lifecycle: 'idle' })"
+        )
+        assert page.get_by_role("button", name="End chat").is_visible()
+        page.screenshot(
+            path=str(_artifact(tmp_path, "interface-details-desktop.png")),
+            full_page=True,
+        )
+    finally:
+        desktop.close()
+
+    mobile, page = _open_interface(
+        browser, ui_url, width=390, height=900
+    )
+    try:
+        page.get_by_text("Alerts (2)", exact=True).wait_for()
+        geometry = page.evaluate(
+            """() => ({
+              viewport: window.innerWidth,
+              documentWidth: document.documentElement.scrollWidth,
+              pickerDisplay: getComputedStyle(
+                document.querySelector(".if-picker")
+              ).display,
+              actionsWidth: document.querySelector(
+                ".if-composer-actions"
+              ).getBoundingClientRect().width,
+              paneWidth: document.querySelector(
+                ".if-pane"
+              ).getBoundingClientRect().width,
+              paneRight: document.querySelector(
+                ".if-pane"
+              ).getBoundingClientRect().right,
+              headerClientWidth: document.querySelector("header").clientWidth,
+              headerScrollWidth: document.querySelector("header").scrollWidth,
+              headerOverflowX: getComputedStyle(
+                document.querySelector("header")
+              ).overflowX,
+            })"""
+        )
+        assert geometry["documentWidth"] <= geometry["viewport"]
+        assert geometry["pickerDisplay"] != "none"
+        assert geometry["actionsWidth"] <= geometry["paneWidth"]
+        assert geometry["paneRight"] <= geometry["viewport"]
+        assert geometry["headerScrollWidth"] > geometry["headerClientWidth"]
+        assert geometry["headerOverflowX"] == "auto"
+        assert page.locator(".if-composer-actions button").all_inner_texts() == [
+            "Send",
+            "End chat",
+        ]
+        page.screenshot(
+            path=str(_artifact(tmp_path, "interface-details-mobile.png")),
+            full_page=True,
+        )
+    finally:
+        mobile.close()
+
+
+def test_enter_sends_one_frame_and_missing_ack_retains_draft(
+    browser, ui_url
+):
+    context, page = _open_interface(browser, ui_url, height=1000)
+    try:
+        composer = page.locator(".if-composer-input")
+        composer.fill("one composed turn")
+        page.get_by_role("button", name="Send").wait_for(state="visible")
+        page.wait_for_function(
+            "() => !document.querySelector('.if-composer-actions button').disabled"
+        )
+
+        composer.press("Enter")
+        page.wait_for_function("window.__inputFrames.length === 1")
+        frame = page.evaluate("window.__inputFrames[0]")
+        payload = bytes(frame[9:]).decode()
+        assert payload == "one composed turn\r"
+        assert composer.input_value() == "one composed turn"
+
+        page.evaluate("window.__lastWs.onclose()")
+        assert composer.input_value() == "one composed turn"
+        assert "draft was retained" in page.locator(
+            ".if-composer .if-note"
+        ).inner_text()
+        assert page.evaluate("window.__inputFrames.length") == 1
     finally:
         context.close()

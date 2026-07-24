@@ -2193,6 +2193,11 @@ const IF_BADGE = { available: "ok", starting: "warn", occupied: "accent",
 const IF_ATTACHABLE_LIFECYCLES = new Set(
   ["starting", "idle", "busy", "approval", "user_input"]);
 
+function ifModelLabel(route) {
+  if (!route) return "HARNESS DEFAULT";
+  return String(route).replace(/[-_]+/g, " ").trim().toUpperCase();
+}
+
 async function renderInterface(root) {
   root.replaceChildren();
   let shells;
@@ -2223,9 +2228,13 @@ async function renderInterface(root) {
       el("span", { className: "pill if-badge " + (IF_BADGE[s.availability] || "") }, s.availability));
     if (s.alerts > 0)
       head.append(el("span", { className: "pill if-badge bad",
-        title: s.alerts + " unread alert(s)" }, "⚠ " + s.alerts));
+        title: s.alerts + " current alert(s)" }, "⚠ " + s.alerts));
+    const occupiedModel = s.availability === "occupied"
+      ? " · " + ifModelLabel(s.model_route)
+      : "";
     row.append(head,
-      el("div", { className: "if-row-sub" }, s.shortname + (s.harness ? " · " + s.harness : "")));
+      el("div", { className: "if-row-sub" },
+        s.shortname + (s.harness ? " · " + s.harness : "") + occupiedModel));
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
     const opt = el("option", { value: s.shortname },
@@ -2633,7 +2642,8 @@ async function ifRecoveryPane(pane, sel, root) {
 // come from GET /interface/sprint-bindings + /interface/sprint-alerts; the
 // action gates mirror the server's own preconditions (retry.applicable /
 // retry.needs_outcome). Nothing renders for a shell with no sprint history.
-async function ifSprintPanel(pane, sel) {
+async function ifSprintPanel(pane, sel, sessionUi = null) {
+  const renderVersion = sessionUi ? ++sessionUi.sprintPanelVersion : 0;
   let bindings = [], alerts = [];
   const alertScope = sel.session_id
     ? "session_id=" + encodeURIComponent(sel.session_id) +
@@ -2648,16 +2658,31 @@ async function ifSprintPanel(pane, sel) {
     ]);
     bindings = b.bindings || [];
     alerts = a.alerts || [];
-  } catch { return; }   // surface down — never break the pane over the panel
-  if (!pane.isConnected || (!sel.session_id && !bindings.length && !alerts.length)) return;
-  const card = el("div", { className: "card" });
-  const note = el("div", { className: "if-note" });
+  } catch {
+    if (sessionUi && ifAttach === sessionUi) {
+      sessionUi.alertsBody.replaceChildren(
+        el("div", { className: "muted" }, "Alert state unavailable."));
+    }
+    return;
+  }
+  if (!pane.isConnected ||
+      (sessionUi && (ifAttach !== sessionUi ||
+        renderVersion !== sessionUi.sprintPanelVersion)) ||
+      (!sel.session_id && !bindings.length && !alerts.length)) return;
+
+  const detailNodes = [];
+  const actionNodes = [];
+  const alertNodes = [];
+  const actionNote = el("div", { className: "if-note" });
+  const alertNote = el("div", { className: "if-note" });
+  let legacyCard = null;
 
   if (bindings.length) {
     const b = bindings[0];   // unreleased first, then most recent
     const doc = b.sprint || {};
-    const diag = el("div", { className: "if-diag" });
-    const drow = (k, v) => diag.append(el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v ?? "—"))));
+    const drow = (k, v) => detailNodes.push(
+      el("span", { className: "if-stat" },
+        k + " ", el("b", {}, String(v ?? "—"))));
     drow("sprint", "#" + b.sprint_doc_id + " " + (doc.title || "?") +
       " · " + (doc.active ? "ACTIVE" : "not-ACTIVE") + (doc.frozen ? " · frozen" : ""));
     drow("binding", "#" + b.binding_id + " " +
@@ -2672,25 +2697,26 @@ async function ifSprintPanel(pane, sel) {
     if (b.quarantined && b.quarantined.length)
       drow("quarantined", b.quarantined.length +
         " item(s) — " + (b.quarantined[0].error || "wake limit"));
-    card.append(diag);
     if (b.park)
-      card.append(el("div", { className: "if-note" },
+      detailNodes.push(el("div", { className: "if-note" },
         "PARKED: " + (b.park.reason || "delivery_unknown") +
         (b.park.input_park ? " — the input frame's delivery is unknown; retry needs your verdict" : "")));
     const retry = b.retry || {};
     if (retry.applicable && !b.released_at) {
-      const acts = el("div", {});
-      const refresh = () => { card.remove(); ifSprintPanel(pane, sel); };
+      const refresh = () => ifSprintPanel(pane, sel, sessionUi);
       const doRetry = async (outcome, btn) => {
-        btn.disabled = true; note.textContent = "";
+        btn.disabled = true; actionNote.textContent = "";
         try {
           const r = await apiIf("/interface/sprint-bindings/" + b.binding_id + "/retry",
             "POST", outcome ? { outcome } : {});
-          note.textContent = "retried — wake now " + r.wake_state +
+          actionNote.textContent = "retried — wake now " + r.wake_state +
             " (" + (r.actions || []).join("; ") + ")";
-          setTimeout(refresh, 800);
+          setTimeout(() => {
+            legacyCard?.remove();
+            refresh();
+          }, 800);
         } catch (e) {
-          note.textContent = (e.code ? e.code + ": " : "") + e.message;
+          actionNote.textContent = (e.code ? e.code + ": " : "") + e.message;
           btn.disabled = false;
         }
       };
@@ -2707,7 +2733,7 @@ async function ifSprintPanel(pane, sel) {
           if (confirm("Confirm the parked input NEVER reached the planner. The parked batch closes as audit and its items requeue as a NEW gated batch."))
             doRetry("not_delivered", lost);
         };
-        acts.append(landed, " ", lost);
+        actionNodes.push(landed, lost);
       } else {
         const retryBtn = el("button", { className: "act", type: "button", textContent: "Retry wake",
           title: "requeue parked/stalled wake work as a NEW gated batch — the parked batch is never resubmitted" });
@@ -2715,13 +2741,11 @@ async function ifSprintPanel(pane, sel) {
           if (confirm("Retry this binding's wake work? The parked batch closes as audit and its items requeue as a NEW gated batch."))
             doRetry(null, retryBtn);
         };
-        acts.append(retryBtn);
+        actionNodes.push(retryBtn);
       }
-      card.append(acts);
     }
   }
   if (alerts.length) {
-    const list = el("div", { className: "if-diag" });
     for (const a of alerts) {
       const capability = a.category === "capability";
       const item = el("div", {
@@ -2741,19 +2765,21 @@ async function ifSprintPanel(pane, sel) {
           try {
             await apiIf("/interface/sprint-alerts/" + a.alert_id + "/acknowledge",
               "POST", {});
-            card.remove();
-            ifSprintPanel(pane, sel);
+            legacyCard?.remove();
+            ifSprintPanel(pane, sel, sessionUi);
           } catch (e) {
-            note.textContent = (e.code ? e.code + ": " : "") + e.message;
+            alertNote.textContent = (e.code ? e.code + ": " : "") + e.message;
             ack.disabled = false;
           }
         };
         item.append(ack);
       }
-      list.append(item);
+      alertNodes.push(item);
     }
-    card.append(list);
   }
+  if (!alertNodes.length)
+    alertNodes.push(el("div", { className: "muted" },
+      "No current alerts or capability notices."));
   const history = el("button", { className: "act", type: "button",
     textContent: "Alert history" });
   history.onclick = async () => {
@@ -2774,12 +2800,36 @@ async function ifSprintPanel(pane, sel) {
         rows.append(el("div", { className: "muted" }, "No alert history for this generation."));
       history.replaceWith(rows);
     } catch (e) {
-      note.textContent = (e.code ? e.code + ": " : "") + e.message;
+      alertNote.textContent = (e.code ? e.code + ": " : "") + e.message;
       history.disabled = false;
     }
   };
-  card.append(history);
-  card.append(note);
+  alertNodes.push(history, alertNote);
+
+  if (sessionUi) {
+    sessionUi.sprintDetailsEl.replaceChildren(...detailNodes);
+    sessionUi.sprintActionsEl.replaceChildren(
+      ...actionNodes, ...(actionNodes.length ? [actionNote] : []));
+    sessionUi.alertsBody.replaceChildren(...alertNodes);
+    const current = alerts.filter((a) =>
+      a.category !== "capability" && a.severity !== "info" &&
+      !a.resolved_at && !a.acknowledged_at);
+    const severity = current.some((a) => a.severity === "critical")
+      ? "critical"
+      : current.length ? "warning" : "neutral";
+    sessionUi.alertsEl.className =
+      "if-disclosure if-alerts " + severity;
+    sessionUi.alertsSummary.textContent =
+      current.length ? "Alerts (" + current.length + ")" : "Alerts";
+    return;
+  }
+
+  const card = el("div", { className: "card" });
+  legacyCard = card;
+  if (detailNodes.length)
+    card.append(el("div", { className: "if-diag" }, ...detailNodes));
+  if (actionNodes.length) card.append(...actionNodes, actionNote);
+  card.append(...alertNodes);
   pane.append(card);
 }
 function ifCounts(counts) {
@@ -2901,7 +2951,9 @@ async function ifSessionPane(pane, sel) {
   if (ifAttach && ifAttach.sessionId === sessionId &&
       ifAttach.ws && ifAttach.ws.readyState <= WebSocket.OPEN) {
     pane.append(ifAttach.headEl, ifAttach.termEl, ifAttach.composerEl);
-    ifSprintPanel(pane, sel);
+    ifAttach.pane = pane;
+    ifAttach.sel = sel;
+    ifSprintPanel(pane, sel, ifAttach);
     return;
   }
   ifDetach();
@@ -2929,21 +2981,40 @@ async function ifSessionPane(pane, sel) {
     note: "",
   };
   const headEl = el("div", { className: "if-head" });
+  const sessionDetailsEl = el("div", { className: "if-diag" });
+  const sprintDetailsEl = el("div", { className: "if-diag" });
+  const detailsEl = el("details", { className: "if-disclosure if-details" },
+    el("summary", { textContent: "Details" }),
+    sessionDetailsEl, sprintDetailsEl);
+  const alertsSummary = el("summary", { textContent: "Alerts" });
+  const alertsBody = el("div", { className: "if-alerts-body" });
+  const alertsEl = el("details", { className: "if-disclosure if-alerts neutral" },
+    alertsSummary, alertsBody);
+  const sessionActionsEl = el("div", { className: "if-inline-actions" });
+  const sprintActionsEl = el("div", { className: "if-inline-actions" });
+  const statusNoteEl = el("div", { className: "if-note" });
+  headEl.append(detailsEl, alertsEl, sessionActionsEl, sprintActionsEl,
+    statusNoteEl);
   const termEl = el("div", { className: "if-term" });
   const composerEl = el("div", { className: "if-composer" });
   const a = { sessionId, shortname: sel.shortname, st, headEl, termEl,
-    composerEl,
+    composerEl, pane, sel, sessionDetailsEl, sprintDetailsEl, detailsEl,
+    alertsEl, alertsSummary, alertsBody, sessionActionsEl, sprintActionsEl,
+    statusNoteEl,
     legalActions: new Set(
       Array.isArray(sess.legal_actions) ? sess.legal_actions : []),
     stateReason: sess.state_reason || "",
     ws: null, term: null, leaseId: null, leaseToken: null, role: "viewer",
     seq: 1, inflight: 0, lastAck: 0, outBuf: "", awaiting: false, halted: false,
     heartbeat: 0, resizeObs: null, paint: null,
-    composerInput: null, composerSend: null, composerNote: null,
+    composerInput: null, composerSend: null, composerEnd: null,
+    composerNote: null,
     composerPendingSeq: null, browserComposerState: st.browserComposer,
     browserComposerWanted: st.browserComposer, browserComposerError: "",
     browserComposerSyncing: false, browserComposerVersion: 0,
     browserComposerChain: Promise.resolve(),
+    composerSubmitLatched: false,
+    sprintPanelVersion: 0,
     composerProjectionPending: false, composerProjectionVersion: 0,
     composerProjectionSync: Promise.resolve() };
   ifBuildComposer(a);
@@ -2953,7 +3024,7 @@ async function ifSessionPane(pane, sel) {
   };
   ifAttach = a;
   pane.append(headEl, termEl, composerEl);
-  ifSprintPanel(pane, sel);
+  ifSprintPanel(pane, sel, a);
   a.paint();
 
   try {
@@ -3012,21 +3083,19 @@ function ifPaintHeader(a, sel, pane) {
   const st = a.st;
   const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(st.lifecycle);
   const stat = (k, v) => el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v)));
-  // Spec Interface Layout header: harness/model, archive/session age, writer
-  // or read-only state, draft (composer) state, sprint wake state, then the
-  // exact recovery actions. idle/busy/approval/user_input stay lifecycle
-  // details HERE — they never replace occupancy in the rail.
-  const head = [
+  // Read-only session telemetry stays available without consuming the terminal
+  // header. Actions remain outside the disclosure beside the state they change.
+  a.sessionDetailsEl.replaceChildren(
     stat("harness", st.harness),
-    stat("model", st.model),
+    stat("model", ifModelLabel(st.model)),
     stat("session", "#" + a.sessionId + (st.archive != null ? " · arc #" + st.archive : "")),
     stat("age", ifAge(st.since)),
     stat("lifecycle", st.lifecycle),
-    stat("composer", st.composer),
+    stat("composer", st.composer + " · browser " + st.browserComposer),
     stat("writer", st.writer === "active" ? "you" : st.writer === "held" ? "read-only" : st.writer),
     stat("clients", st.clients),
-    stat("wake", st.wake),
-  ];
+    stat("wake", st.wake));
+  const actions = [];
   if (controlsActive && (st.writer === "held" || st.writer === "revoked")) {
     const take = el("button", { className: "act", type: "button", textContent: "Take-over",
       title: "explicitly take the writer lease — the current writer turns read-only" });
@@ -3034,7 +3103,7 @@ function ifPaintHeader(a, sel, pane) {
       if (confirm("Take control of this session? The current writer (another tab or CLI) becomes read-only."))
         ifTakeover(a);
     };
-    head.push(take);
+    actions.push(take);
   }
   if (controlsActive && (st.composer === "dirty" || st.composer === "unknown")) {
     const cert = el("button", { className: "act", type: "button", textContent: "certify clean" });
@@ -3047,16 +3116,14 @@ function ifPaintHeader(a, sel, pane) {
       } catch (e) { st.note = "certify failed: " + e.message; }
       a.paint();
     };
-    head.push(cert);
+    actions.push(cert);
   }
-  if (controlsActive) {
-    const end = el("button", { className: "act", type: "button", textContent: "End chat",
-      title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout" });
-    end.onclick = () => ifEndChat(a, sel, pane, end);
-    head.push(end);
+  a.sessionActionsEl.replaceChildren(...actions);
+  if (a.composerEnd) {
+    a.composerEnd.hidden = !controlsActive;
+    a.composerEnd.disabled = !controlsActive;
   }
-  if (st.note) head.push(el("span", { className: "if-note" }, st.note));
-  a.headEl.replaceChildren(...head);
+  a.statusNoteEl.textContent = st.note;
 }
 
 function ifSizeComposer(input) {
@@ -3067,6 +3134,7 @@ function ifSizeComposer(input) {
 function ifComposerWritable(a) {
   return a.legalActions.has("send_input") &&
     a.role === "writer" && a.st.writer === "active" && !a.halted &&
+    a.ws && a.ws.readyState === WebSocket.OPEN &&
     !a.composerProjectionPending;
 }
 
@@ -3076,11 +3144,13 @@ function ifComposerDisabledReason(a) {
   if (!a.legalActions.has("send_input"))
     return a.stateReason ||
       "Read-only — the server does not list input as legal.";
+  if (a.halted)
+    return a.st.note || "Input halted — reattach before sending.";
   if (a.role !== "writer" || a.st.writer !== "active")
     return a.st.writerReason ||
       "Read-only — this client does not hold the server writer lease.";
-  if (a.halted)
-    return a.st.note || "Input halted — reattach before sending.";
+  if (!a.ws || a.ws.readyState !== WebSocket.OPEN)
+    return "Connecting to the generation-fenced input broker…";
   return "";
 }
 
@@ -3095,12 +3165,18 @@ function ifPaintComposer(a) {
   // remains covered by the already-requested dirty state.
   a.composerInput.disabled = !writable || pending ||
     (a.browserComposerSyncing && a.browserComposerWanted === "clean");
+  const dirtyReady = a.browserComposerState === "dirty";
+  const dirtySyncing = a.browserComposerSyncing &&
+    a.browserComposerWanted === "dirty";
   a.composerSend.disabled = !writable || pending || a.awaiting ||
-    Boolean(a.outBuf) || !hasMessage || a.browserComposerSyncing ||
-    Boolean(a.browserComposerError) || a.browserComposerState !== "dirty";
+    Boolean(a.outBuf) || !hasMessage || Boolean(a.browserComposerError) ||
+    (!dirtyReady && !dirtySyncing);
   if (pending) {
     a.composerNote.textContent =
       "Sending through the generation-fenced input broker…";
+  } else if (a.composerSubmitLatched) {
+    a.composerNote.textContent =
+      "Send queued once; waiting for broker readiness…";
   } else if (a.browserComposerError) {
     a.composerNote.textContent =
       "Draft safety sync failed; sending is disabled: " +
@@ -3127,6 +3203,7 @@ function ifRefreshComposerProjection(a) {
     a.legalActions = new Set(
       Array.isArray(session.legal_actions) ? session.legal_actions : []);
     a.stateReason = session.state_reason || "";
+    if (!a.legalActions.has("send_input")) a.composerSubmitLatched = false;
   }).catch((e) => {
     if (ifAttach !== a || version !== a.composerProjectionVersion) return;
     a.legalActions.delete("send_input");
@@ -3153,12 +3230,20 @@ function ifSyncBrowserComposer(a, state) {
     if (ifAttach !== a) return;
     a.browserComposerState = result.browser_composer;
     a.st.browserComposer = result.browser_composer;
-    a.browserComposerError = "";
+    a.browserComposerError = result.browser_composer === state
+      ? ""
+      : "server did not acknowledge the requested draft state";
   }).catch((e) => {
-    if (ifAttach === a) a.browserComposerError = e.message;
+    if (ifAttach === a) {
+      a.browserComposerError = e.message;
+      a.composerSubmitLatched = false;
+    }
   }).finally(() => {
     if (ifAttach !== a || version !== a.browserComposerVersion) return;
     a.browserComposerSyncing = false;
+    if (a.browserComposerError) a.composerSubmitLatched = false;
+    else if (a.composerSubmitLatched && a.browserComposerState === "dirty")
+      ifComposerSend(a);
     a.paint();
   });
 }
@@ -3166,10 +3251,18 @@ function ifSyncBrowserComposer(a, state) {
 function ifComposerSend(a) {
   const value = a.composerInput.value;
   if (!value.trim() || !ifComposerWritable(a) ||
-      a.composerPendingSeq != null || a.awaiting || a.outBuf ||
-      a.browserComposerSyncing || a.browserComposerError ||
-      a.browserComposerState !== "dirty")
+      a.composerPendingSeq != null || a.browserComposerError)
     return;
+  if (a.browserComposerSyncing || a.browserComposerState !== "dirty" ||
+      a.awaiting || a.outBuf) {
+    if (a.browserComposerWanted === "dirty" ||
+        a.browserComposerState === "dirty") {
+      a.composerSubmitLatched = true;
+      a.paint();
+    }
+    return;
+  }
+  a.composerSubmitLatched = false;
   // xterm emits carriage return for Enter. Reuse that exact byte convention
   // after the composed text so the existing broker submits the message.
   const seq = ifSendInput(a, value + "\r");
@@ -3201,12 +3294,20 @@ function ifBuildComposer(a) {
     a.paint();
   };
   input.onkeydown = (event) => {
-    if (event.key !== "Enter" || event.shiftKey) return;
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing ||
+        event.keyCode === 229) return;
     event.preventDefault();
     ifComposerSend(a);
   };
   send.onclick = () => ifComposerSend(a);
-  a.composerEl.append(input, send, note);
+  const end = el("button", {
+    className: "act bad if-end-chat", type: "button", textContent: "End chat",
+    title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout",
+  });
+  end.onclick = () => ifEndChat(a, a.sel, a.pane, end);
+  a.composerEnd = end;
+  const actions = el("div", { className: "if-composer-actions" }, send, end);
+  a.composerEl.append(input, actions, note);
   ifSizeComposer(input);
 }
 
@@ -3310,7 +3411,16 @@ function ifOpenStream(a, ticket) {
   };
   ws.onclose = () => {
     if (ifAttach !== a) return;
-    a.st.note = "stream closed — reselect the shell to reattach";
+    if (a.composerPendingSeq != null || a.composerSubmitLatched) {
+      a.composerPendingSeq = null;
+      a.composerSubmitLatched = false;
+      a.awaiting = false;
+      a.halted = true;
+      a.st.note = "stream closed before the message acknowledgement — " +
+        "the draft was retained; inspect the terminal before retrying";
+    } else {
+      a.st.note = "stream closed — reselect the shell to reattach";
+    }
     if (a.role === "writer") a.st.writer = "none";
     a.paint();
   };
@@ -3333,6 +3443,7 @@ function ifOpenStream(a, ticket) {
   ws.onopen = () => {
     fit();
     ifSendResize(a, term.rows, term.cols);
+    a.paint();
   };
   fit();
 }
@@ -3372,6 +3483,7 @@ function ifRevoked(a) {
   a.role = "viewer"; a.leaseId = null; a.leaseToken = null;
   a.awaiting = false; a.halted = false; a.outBuf = "";
   a.composerPendingSeq = null;
+  a.composerSubmitLatched = false;
   a.st.writer = "held";
   a.st.writerReason = "Control was taken by another client.";
   a.st.note = "control was taken by another client — you are now read-only (Take-over to reclaim)";
@@ -3390,12 +3502,14 @@ function ifControl(a, m) {
           ifSyncBrowserComposer(a, "clean");
         }
         ifFlush(a);
+        if (a.composerSubmitLatched) ifComposerSend(a);
         a.paint();
       }
       break;
     case "input_reject":
       a.awaiting = false;
       if (m.seq === a.composerPendingSeq) a.composerPendingSeq = null;
+      a.composerSubmitLatched = false;
       // writer_revoked = a takeover revoked our lease; the runtime learns of
       // it at the next keystroke and rejects the frame. Same flip as a
       // writer-state revoke — not a halt.
@@ -3418,6 +3532,8 @@ function ifControl(a, m) {
     case "lifecycle":
       if (m.lifecycle != null && m.lifecycle !== a.st.lifecycle) {
         a.st.lifecycle = m.lifecycle;
+        if (!IF_ATTACHABLE_LIFECYCLES.has(m.lifecycle))
+          a.composerSubmitLatched = false;
         ifRefreshComposerProjection(a);
       }
       if (m.composer != null) a.st.composer = m.composer;

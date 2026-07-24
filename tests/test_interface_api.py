@@ -232,6 +232,7 @@ class InterfaceApiTest(unittest.TestCase):
                 for key in (
                     "shell_id", "shortname", "display_name", "flavor",
                     "availability", "default_harness", "default_model",
+                    "model_route",
                 )
             },
             {
@@ -242,11 +243,40 @@ class InterfaceApiTest(unittest.TestCase):
                 "availability": "available",
                 "default_harness": "codex",
                 "default_model": "gpt-5.6-sol",
+                "model_route": None,
             },
         )
         self.assertIsNone(body["shells"][1]["flavor"])
         self.assertIsNone(body["shells"][1]["default_harness"])
         self.assertIsNone(body["shells"][1]["default_model"])
+
+    def test_occupied_shell_projection_includes_live_model_route(self):
+        session_id = self.occupy()
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "UPDATE interface_sessions SET model_route=? "
+                "WHERE session_id=?",
+                ("gpt-5.6-terra", session_id),
+            )
+
+        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
+
+        self.assertEqual(status, 200)
+        shell = body["shells"][0]
+        self.assertEqual(
+            {
+                "availability": shell["availability"],
+                "session_id": shell["session_id"],
+                "harness": shell["harness"],
+                "model_route": shell["model_route"],
+            },
+            {
+                "availability": "occupied",
+                "session_id": session_id,
+                "harness": "claude",
+                "model_route": "gpt-5.6-terra",
+            },
+        )
 
     def test_browser_bootstrap_same_origin_fence(self):
         # Cross-site Origin cannot mint a session (rejected before the

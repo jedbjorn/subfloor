@@ -1,4 +1,4 @@
-"""Browser contract checks for spec #30 requirements 18-20 and 24.
+"""Browser contract checks for spec #30 requirements 18-20, 24, and 26.
 
 The UI is deliberately build-free vanilla JS/CSS. These checks pin the shared
 picker and responsive terminal behavior without inventing a second JS runtime
@@ -246,6 +246,8 @@ def test_message_composer_uses_broker_ack_and_preserves_raw_terminal_input():
 globalThis.WebSocket = { OPEN: 1 };
 globalThis.ifClientId = "web-1";
 globalThis.ifAttach = null;
+const IF_ATTACHABLE_LIFECYCLES = new Set(
+  ["starting", "idle", "busy", "approval", "user_input"]);
 const apiCalls = [];
 let sessionProjection = {
   legal_actions: ["send_input"],
@@ -303,6 +305,7 @@ const a = {
   browserComposerSyncing: false,
   browserComposerVersion: 0,
   browserComposerChain: Promise.resolve(),
+  composerSubmitLatched: false,
   composerProjectionPending: false,
   composerProjectionVersion: 0,
   composerProjectionSync: Promise.resolve(),
@@ -316,11 +319,6 @@ a.paint();
   a.composerInput.value = "hello\nworld";
   a.composerInput.scrollHeight = 70;
   a.composerInput.oninput();
-  await a.browserComposerChain;
-  invariant(apiCalls.length === 1 &&
-    apiCalls[0].path === "/interface/browser-composer" &&
-    apiCalls[0].body.state === "dirty",
-    `draft state did not reach the server: ${JSON.stringify(apiCalls)}`);
   let prevented = false;
   a.composerInput.onkeydown({
     key: "Enter", shiftKey: true, preventDefault() { prevented = true; },
@@ -328,10 +326,24 @@ a.paint();
   invariant(!prevented && frames.length === 0,
     "Shift+Enter must remain a local newline");
   a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, isComposing: true,
+    preventDefault() { prevented = true; },
+  });
+  invariant(!prevented && frames.length === 0,
+    "IME composition Enter must not submit");
+  a.composerInput.onkeydown({
     key: "Enter", shiftKey: false, preventDefault() { prevented = true; },
   });
+  a.composerSend.onclick();
+  invariant(prevented && frames.length === 0 && a.composerSubmitLatched,
+    "send during dirty-state sync was not latched exactly once");
+  await a.browserComposerChain;
+  invariant(apiCalls.length === 1 &&
+    apiCalls[0].path === "/interface/browser-composer" &&
+    apiCalls[0].body.state === "dirty",
+    `draft state did not reach the server: ${JSON.stringify(apiCalls)}`);
   invariant(prevented && frames.length === 1,
-    "Enter did not send exactly one broker frame");
+    "latched Enter and Send did not converge on exactly one broker frame");
   const payload = new TextDecoder().decode(frames[0].subarray(9));
   invariant(payload === "hello\nworld\r",
     `composer bytes bypassed terminal Enter semantics: ${JSON.stringify(payload)}`);
@@ -349,14 +361,29 @@ a.paint();
   invariant(apiCalls.length === 2 && apiCalls[1].body.state === "clean",
     "acknowledged send did not release browser composing state");
 
+  a.halted = false;
+  a.composerInput.value = "retain on reject";
+  a.composerInput.oninput();
+  await a.browserComposerChain;
+  a.composerSend.onclick();
+  invariant(frames.length === 2 && a.composerPendingSeq === 5,
+    "visible Send did not use the same broker path");
+  ifControl(a, { type: "input_reject", seq: 5, reason: "stale_generation" });
+  invariant(a.composerInput.value === "retain on reject" &&
+    a.composerPendingSeq === null &&
+    a.composerNote.textContent.includes("input rejected"),
+    "broker rejection did not retain the draft with an actionable error");
+
   a.composerInput.value = " \n";
   a.composerInput.oninput();
   await a.browserComposerChain;
   a.composerInput.onkeydown({
     key: "Enter", shiftKey: false, preventDefault() {},
   });
-  invariant(frames.length === 1, "whitespace-only input sent a second frame");
+  invariant(frames.length === 2, "whitespace-only input sent another frame");
 
+  a.halted = false;
+  a.st.note = "";
   a.role = "viewer";
   a.st.writer = "held";
   a.st.writerReason = "writer held by another client";
