@@ -1308,6 +1308,7 @@ super-coder — forkable shell substrate
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
+                             live Interface state asks continue-or-rollback; headless discard requires --discard-live-state
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
   ./sc update-harnesses    update claude + opencode + codex + vibe + kimi to latest (force-reruns official installers)
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together

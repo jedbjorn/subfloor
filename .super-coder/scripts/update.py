@@ -45,6 +45,7 @@ materialize to a specific upstream version instead of the branch head.
 
 Usage:
     ./sc update [--no-fetch] [--branch <name>] [--ref <tag|sha>] [--force]
+                [--discard-live-state]
     python3 .super-coder/scripts/update.py [same flags]
 """
 from __future__ import annotations
@@ -314,13 +315,57 @@ def fetch_and_materialize(branch: str, ref: str | None = None,
     materialize_fetched_engine(sha, force=force)
 
 
-def preflight_live_state() -> None:
-    """Refuse from the currently installed engine before any floor mutation."""
+def preflight_live_state(*, allow_discard: bool = False,
+                         discard_requested: bool = False) -> None:
+    """Guard from the current engine before any installed-floor mutation.
+
+    Normal callers fail closed.  ``update.main`` additionally offers an
+    interactive continue-or-roll-back choice, or accepts the explicit
+    ``--discard-live-state`` flag for a headless invocation.  The destructive
+    path is deliberately local-DB only so it still works while the API is down.
+    """
     reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
-    if reasons:
+    if not reasons:
+        return
+    details = "\n  - " + "\n  - ".join(reasons)
+    if not allow_discard:
         sys.exit(
             "update: refusing — live Interface state exists; drain/reconcile "
-            "it first:\n  - " + "\n  - ".join(reasons))
+            "it first:" + details)
+
+    print(
+        "WARNING: update detected durable live Interface state.\n"
+        "Continuing will permanently end/cancel exactly this state:"
+        + details,
+        file=sys.stderr,
+    )
+    if not discard_requested:
+        if not sys.stdin.isatty():
+            sys.exit(
+                "update: refusing — no interactive consent is available. "
+                "Drain/reconcile after starting the API, or explicitly accept "
+                "the loss with `./sc update --discard-live-state`.")
+        answer = input(
+            "Choose 'continue' to discard it, or 'rollback' to leave the "
+            "installed floor unchanged [rollback]: "
+        ).strip().lower()
+        if answer != "continue":
+            sys.exit(
+                "update: rolled back — installed engine, pins, and database "
+                "state are unchanged.")
+    else:
+        print(
+            "  --discard-live-state: explicit consent received; discarding.",
+            file=sys.stderr,
+        )
+
+    counts = interface_reconcile.discard_live_state(DB_PATH)
+    changed = ", ".join(
+        f"{name.replace('_', ' ')}={value}"
+        for name, value in counts.items()
+        if value
+    ) or "no rows changed"
+    print(f"→ discarded durable Interface state ({changed})")
 
 
 def migrate_engine_untrack() -> None:
@@ -406,6 +451,7 @@ def regrant() -> int:
 def main(argv: list[str]) -> int:
     no_fetch = "--no-fetch" in argv
     force = "--force" in argv
+    discard_live_state = "--discard-live-state" in argv
     branch = "main"
     if "--branch" in argv:
         i = argv.index("--branch")
@@ -435,7 +481,8 @@ def main(argv: list[str]) -> int:
     target_sha = None
     if not source and not no_fetch:
         target_sha = fetch_update_ref(branch, ref=ref)
-    preflight_live_state()
+    preflight_live_state(
+        allow_discard=True, discard_requested=discard_live_state)
 
     if source:
         # The source repo IS the engine — it has no upstream to materialize from

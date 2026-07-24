@@ -233,3 +233,123 @@ def live_refusal_reasons(db_path) -> list[str]:
         return reasons
     finally:
         con.close()
+
+
+def discard_live_state(db_path) -> dict[str, int]:
+    """Atomically abandon every durable Interface actor before an update.
+
+    This is the deliberately destructive, operator-consented escape hatch for
+    an update whose API is down: it uses only the current engine and its local
+    DB, so it cannot deadlock on an API-only recovery command.  Durable audit
+    rows are terminalized rather than deleted; unread messages and unrelated
+    shell memory are untouched.
+    """
+    counts = {
+        "sessions_ended": 0,
+        "generations_ended": 0,
+        "archives_closed": 0,
+        "bindings_released": 0,
+        "batches_completed": 0,
+        "items_cancelled": 0,
+        "orphan_inputs_removed": 0,
+    }
+    if not Path(str(db_path)).exists():
+        return counts
+
+    con = db_driver.connect(str(db_path))
+    try:
+        if not _has_table(con, "interface_sessions"):
+            return counts
+        con.execute("BEGIN IMMEDIATE")
+
+        active_session = interface_state.active_session_sql("s")
+        sessions = con.execute(
+            "SELECT s.session_id, s.shell_id, s.archive_id "
+            "FROM interface_sessions s "
+            f"WHERE {active_session} ORDER BY s.session_id"
+        ).fetchall()
+        for session_id, shell_id, archive_id in sessions:
+            result = interface_broker.close_session(
+                con, session_id, "update_discard")
+            if not result["already_ended"]:
+                counts["sessions_ended"] += 1
+            if archive_id is not None:
+                cur = con.execute(
+                    "UPDATE shell_memory_archives SET ended_at=datetime('now') "
+                    "WHERE archive_id=? AND ended_at IS NULL", (archive_id,))
+                counts["archives_closed"] += cur.rowcount
+                con.execute(
+                    "UPDATE shells SET active_archive_id=NULL "
+                    "WHERE shell_id=? AND active_archive_id=?",
+                    (shell_id, archive_id))
+
+        cur = con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now') "
+            "WHERE ended_at IS NULL")
+        counts["generations_ended"] = cur.rowcount
+
+        counts["batches_completed"] = con.execute(
+            "SELECT COUNT(*) FROM planner_wake_batches "
+            "WHERE state <> 'complete'").fetchone()[0]
+        counts["items_cancelled"] = con.execute(
+            "SELECT COUNT(*) FROM planner_wake_items "
+            "WHERE state NOT IN ('done','cancelled')").fetchone()[0]
+
+        bindings = con.execute(
+            "SELECT binding_id FROM sprint_planner_bindings "
+            "WHERE released_at IS NULL ORDER BY binding_id"
+        ).fetchall()
+        for (binding_id,) in bindings:
+            interface_broker.release_binding(
+                con, binding_id, "update_discard")
+            counts["bindings_released"] += 1
+
+        items = con.execute(
+            "SELECT item_id FROM planner_wake_items "
+            "WHERE state NOT IN ('done','cancelled') ORDER BY item_id"
+        ).fetchall()
+        for (item_id,) in items:
+            interface_state.transition(
+                con, "wake_item", item_id, "cancelled",
+                extra_sets={"error": "discarded by operator-approved update"})
+
+        batches = con.execute(
+            "SELECT batch_id, state FROM planner_wake_batches "
+            "WHERE state <> 'complete' ORDER BY batch_id"
+        ).fetchall()
+        for batch_id, state in batches:
+            if state == "submitting":
+                interface_state.transition(
+                    con, "wake_batch", batch_id, "delivery_unknown")
+            interface_state.transition(
+                con, "wake_batch", batch_id, "complete",
+                extra_sets={"completed_at": con.execute(
+                    "SELECT datetime('now')").fetchone()[0]})
+
+        cur = con.execute(
+            "DELETE FROM interface_input_state "
+            "WHERE NOT EXISTS (SELECT 1 FROM interface_sessions s "
+            "WHERE s.session_id=interface_input_state.session_id)")
+        counts["orphan_inputs_removed"] = cur.rowcount
+
+        con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE resolved_at IS NULL AND ("
+            "session_id IN (SELECT session_id FROM interface_sessions "
+            "WHERE occupancy='ended' AND lifecycle='ended' "
+            "AND ended_at IS NOT NULL) OR "
+            "binding_id IN (SELECT binding_id FROM sprint_planner_bindings "
+            "WHERE released_at IS NOT NULL))")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    remaining = live_refusal_reasons(db_path)
+    if remaining:
+        raise RuntimeError(
+            "operator-approved Interface discard did not drain: "
+            + "; ".join(remaining))
+    return counts
