@@ -283,6 +283,35 @@ class TmuxStatusLineTest(unittest.TestCase):
         self.assertEqual(self._render("s1", "#{pane_width}x#{pane_height}"),
                          "100x30")
 
+    def test_spawn_labels_the_window_with_the_shell_it_booted(self):
+        """The seam, not just the helper: a status line whose label is never
+        wired into spawn renders the fallback for every shell, and every
+        helper test still passes. Real tmux, stubbed sidecar — the shadow
+        stack is what gates the heavier integration suites, and none of it
+        is on the path from `shortname` to `set-option -w`."""
+        self.rt.available = True
+        self.rt.shadow = mock.MagicMock()
+        with mock.patch.object(interface_runtime, "_read_start_ticks",
+                               return_value=0), \
+             mock.patch.object(self.rt, "_pipe_pane",
+                               new=mock.AsyncMock()), \
+             mock.patch.object(self.rt, "_start_consumers"):
+            info = asyncio.run(self.rt.spawn(
+                session_id=7, shell_id=1, generation=1,
+                worktree=str(self.tmp), sc_path="/bin/sc",
+                token_path="/tmp/tok", rows=24, cols=80, shortname="DEV5",
+                command=["/bin/sh", "-c", "sleep 30"]))
+        window = info["tmux_window"]
+        self.assertIn("DEV5", self._render(window, "#{E:status-left}"))
+        self.assertIn(self.url, self._render(window, "#{E:status-right}"))
+
+    def test_an_unlabelled_window_still_names_something(self):
+        """No shortname (the runtime's own default) must render the window
+        name, not an empty slot that reads as "no shell here"."""
+        self._open()
+        self._label("s1", "")
+        self.assertIn("s1", self._render("s1", "#{E:status-left}"))
+
     def test_a_refused_status_line_never_costs_a_shell_its_session(self):
         """Cosmetic, so it is fail-open — but loudly: the failure is logged,
         and the guard covers reading instance.json, not just the tmux call."""
