@@ -18,7 +18,6 @@ Delivery sections. Two deliberate readings of the spec's edge lists:
 """
 from __future__ import annotations
 
-
 # One definition of whether a durable Interface session can still act or needs
 # reconciliation. A row is closed only when all three terminal markers agree;
 # every partial/legacy combination remains active and therefore fail-closed.

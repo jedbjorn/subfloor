@@ -17,20 +17,22 @@ kept as `.sc-state/engine.ref.prev` — the engine half of the restore point tha
 makes `./sc rollback` sound (DB + engine restored together).
 
 Flow:
-    1. capture the restore point: the current `engine.ref` → `engine.ref.prev`.
-    2. fetch upstream; materialize the engine paths at the new ref into the
+    1. fetch upstream objects, then run the installed engine's read-only live
+       state guard. A refusal changes no installed file or pin.
+    2. capture the restore point: the current `engine.ref` → `engine.ref.prev`.
+    3. materialize the engine paths at the new ref into the
        gitignored `.super-coder/` dir; write the new `engine.ref`. Per-instance
        content (`.sc-state/`, the DB, instance.json) is never in the materialize
        set, so it survives untouched. --no-fetch reconciles the working tree as-is.
-    3. back up the live DB (the other half of the restore point).
-    4. migrate IN PLACE — apply only un-applied migrations (ledger-tracked),
+    4. back up the live DB (the other half of the restore point).
+    5. migrate IN PLACE — apply only un-applied migrations (ledger-tracked),
        preserving all rows incl. in-session writes. No DB yet (fresh fork) ->
        fall back to a from-text rebuild.
-    5. sync the engine skills catalogue (idempotent, id-stable UPSERT) —
+    6. sync the engine skills catalogue (idempotent, id-stable UPSERT) —
        new/changed engine skills reach the fork without a rebuild, while
        project-local skills are left intact.
-    6. re-grant common skills to all shells.
-    7. wire the auto-remap hooks + map the repo + snapshot the (live) state.
+    7. re-grant common skills to all shells.
+    8. wire the auto-remap hooks + map the repo + snapshot the (live) state.
 
 Then review + commit (only `.sc-state/` — content.sql + engine.ref — moves; the
 engine is ignored). Restart the session to boot onto the new floor.
@@ -264,20 +266,27 @@ def check_local_edits(force: bool) -> None:
         "  - ./sc eject            one-way: stop tracking upstream and own the engine")
 
 
-def fetch_and_materialize(branch: str, ref: str | None = None,
-                          force: bool = False) -> None:
+def fetch_update_ref(branch: str, ref: str | None = None) -> str:
+    """Refresh remote objects and resolve the engine ref without touching the
+    installed floor. Git object refresh is the sole mutation allowed before
+    the live-state refusal preflight."""
     remote = super_coder_remote()
     if ref:
         # Pin to an explicit upstream version. `git fetch <remote> <ref>` serves
         # a branch, a tag, or (on GitHub) a reachable commit SHA; FETCH_HEAD is
         # the one name that works for all three.
-        print(f"→ fetch {remote} + materialize engine (pinned ref: {ref})")
+        print(f"→ fetch engine objects (pinned ref: {ref})")
         git("fetch", remote, ref)
         sha = git("rev-parse", "FETCH_HEAD").stdout.strip()
     else:
-        print(f"→ fetch {remote} + materialize engine ({remote}/{branch})")
+        print(f"→ fetch engine objects ({remote}/{branch})")
         git("fetch", remote, branch)
         sha = git("rev-parse", f"{remote}/{branch}").stdout.strip()
+    return sha
+
+
+def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
+    """Lay an already-fetched ref onto the installed floor."""
 
     check_local_edits(force)
 
@@ -295,6 +304,23 @@ def fetch_and_materialize(branch: str, ref: str | None = None,
     n = engine_manifest.write_manifest(_engine_paths_at(sha),
                                        files=_engine_files_at(sha))
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
+
+
+def fetch_and_materialize(branch: str, ref: str | None = None,
+                          force: bool = False) -> None:
+    """Compatibility wrapper for callers that already performed their own
+    preflight. update.main deliberately calls the two phases separately."""
+    sha = fetch_update_ref(branch, ref=ref)
+    materialize_fetched_engine(sha, force=force)
+
+
+def preflight_live_state() -> None:
+    """Refuse from the currently installed engine before any floor mutation."""
+    reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
+    if reasons:
+        sys.exit(
+            "update: refusing — live Interface state exists; drain/reconcile "
+            "it first:\n  - " + "\n  - ".join(reasons))
 
 
 def migrate_engine_untrack() -> None:
@@ -316,19 +342,16 @@ def migrate_engine_untrack() -> None:
         print("→ B7: added /.super-coder/ to .gitignore")
 
 
-def migrate_or_rebuild() -> None:
+def migrate_or_rebuild(*, live_preflight_done: bool = False) -> None:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
-    # Spec #20: update/materialize refuses while live Interface state exists
-    # (non-ended session, unreleased binding, nonterminal batch, input
-    # ambiguity) — same guard as rebuild, before any structural change.
-    reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
-    if reasons:
-        sys.exit(
-            "update: refusing — live Interface state exists; drain/reconcile "
-            "it first:\n  - " + "\n  - ".join(reasons))
+    # Direct callers still get the live guard. update.main passes the explicit
+    # preflight receipt so no second, post-materialization refusal can strand a
+    # half-applied installed floor.
+    if not live_preflight_done:
+        preflight_live_state()
     rebuild_mod.backup_existing()  # restore point before any structural change
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
@@ -404,6 +427,16 @@ def main(argv: list[str]) -> int:
                  "upstream to update from; edit .super-coder/ directly and commit "
                  "like any other code. (To re-adopt upstream, that's a manual "
                  "re-fork — see README → 'Customize a fork vs diverge from it'.)")
+
+    # Fetch may refresh remote Git objects, but nothing installed is touched
+    # until the CURRENT engine's guard has approved the live floor. In
+    # particular this precedes untracking/ignore edits, engine materialization,
+    # workflow seeding, and both pin files (#528).
+    target_sha = None
+    if not source and not no_fetch:
+        target_sha = fetch_update_ref(branch, ref=ref)
+    preflight_live_state()
+
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
@@ -422,7 +455,8 @@ def main(argv: list[str]) -> int:
         print("→ --no-fetch: reconciling against the current working tree "
               "(engine + engine.ref unchanged)")
     else:
-        fetch_and_materialize(branch, ref=ref, force=force)
+        assert target_sha is not None
+        materialize_fetched_engine(target_sha, force=force)
 
     workflow_action, workflow_changes = ensure_workflows(source_repo=source)
     if workflow_action == "seeded":
@@ -443,7 +477,7 @@ def main(argv: list[str]) -> int:
     print("→ ensure harnesses installed (claude + opencode + codex + vibe + kimi)")
     install_mod.ensure_harnesses()
 
-    migrate_or_rebuild()
+    migrate_or_rebuild(live_preflight_done=True)
 
     print("→ sync skills catalogue (id-stable)")
     sync_skills()

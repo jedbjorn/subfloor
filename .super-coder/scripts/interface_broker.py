@@ -74,8 +74,46 @@ def _session(con, session_id: int):
 
 def _alert(con, *, severity: str, reason: str, session_id=None,
            binding_id=None, message_id=None) -> None:
-    """Raise an alert, deduplicated while open (partial unique index)."""
+    """Raise an alert, deduplicated while open (partial unique index).
+
+    A session-scoped alert takes the write lock before reading terminal state.
+    That makes the read + write atomic with durable closure: closure either
+    lands first and this row is resolved audit, or lands second and resolves
+    the row itself. The caller still owns the surrounding transaction.
+    """
     dedupe = f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}|{reason}"
+    if session_id is not None:
+        _begin_immediate(con)
+        session = con.execute(
+            "SELECT occupancy, lifecycle, ended_at "
+            "FROM interface_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if session is not None and not interface_state.session_is_active(*session):
+            # A late runtime callback may race durable closure. Preserve one
+            # audit row for the event, but never attach an actionable alert to
+            # a session that can no longer act.
+            ended_at = session[2]
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=? "
+                "WHERE session_id=? AND resolved_at IS NULL",
+                (ended_at, session_id),
+            )
+            exists = con.execute(
+                "SELECT 1 FROM planner_alerts "
+                "WHERE session_id=? AND binding_id IS ? AND message_id IS ? "
+                "AND reason=? LIMIT 1",
+                (session_id, binding_id, message_id, reason),
+            ).fetchone()
+            if exists is None:
+                con.execute(
+                    "INSERT INTO planner_alerts "
+                    "(session_id, binding_id, message_id, severity, reason, "
+                    "dedupe_key, resolved_at) VALUES (?,?,?,?,?,?,?)",
+                    (session_id, binding_id, message_id, severity, reason,
+                     dedupe, ended_at),
+                )
+            return
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
         "(session_id, binding_id, message_id, severity, reason, dedupe_key) "
@@ -298,6 +336,32 @@ def reconcile_input(con, session_id: int, outcome: str) -> None:
                     "forwarded_seq": new_forwarded})
 
 
+def _close_volatile_children(con, session_id: int) -> None:
+    """Terminalize/remove generation-volatile state in the caller's txn.
+
+    A delivery-unknown input row is no longer live, but it remains the
+    metadata-only ambiguity record required by decision #16.  Preserve that
+    park and its operator alert; remove only input state with no pending or
+    ambiguous delivery evidence.
+    """
+    con.execute(
+        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
+        "revoke_reason='session_end' "
+        "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
+    input_state = con.execute(
+        "SELECT pending_seq, delivery FROM interface_input_state "
+        "WHERE session_id=?", (session_id,)).fetchone()
+    if input_state is None:
+        return
+    pending_seq, delivery = input_state
+    if pending_seq is None and delivery != "delivery_unknown":
+        con.execute(
+            "DELETE FROM interface_input_state WHERE session_id=?",
+            (session_id,))
+        return
+    park_delivery_unknown(con, session_id)
+
+
 def close_session(con, session_id: int, end_reason: str) -> dict:
     """THE one closure helper (spec #30 Lifecycle Contract) — every close
     producer (operator terminate, cancel start, reconcile-close, spawn
@@ -309,11 +373,12 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     `stopping` where no direct edge exists — a hook that won the race can
     never strand occupied/ended, and nothing ever moves terminal →
     nonterminal), ends the matching generation, revokes active leases,
-    and resolves or parks session-scoped wake state by the existing
-    ambiguity rules (a pending human frame parks delivery_unknown; a
-    batch with a proven stop reconciles from read state; a batch with no
-    stop evidence parks — no live harness will re-drive it). Queued wake
-    work is deliberately left queued for a future generation.
+    removes ordinary volatile input state, preserves a metadata-only
+    delivery-unknown park, and resolves or parks durable session-scoped wake
+    state by the existing ambiguity rules (a batch with a proven stop
+    reconciles from read state; a batch with no stop evidence parks — no live
+    harness will re-drive it). Queued wake work is deliberately left queued
+    for a future generation.
 
     Idempotent: a FULLY terminal session (occupancy AND lifecycle ended)
     returns its original terminal result without state churn. A partially
@@ -321,14 +386,15 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
     left lifecycle nonterminal — is converged, never silently no-op'ed
     (SC-065); its original end reason/time are kept."""
     row = con.execute(
-        "SELECT shell_id, generation, occupancy, lifecycle, end_reason "
+        "SELECT shell_id, generation, occupancy, lifecycle, ended_at, end_reason "
         "FROM interface_sessions WHERE session_id=?",
         (session_id,),
     ).fetchone()
     if row is None:
         raise BrokerError(f"interface session {session_id} not found")
-    shell_id, generation, occupancy, lifecycle, prior_reason = row
-    if occupancy == "ended" and lifecycle == "ended":
+    shell_id, generation, occupancy, lifecycle, ended_at, prior_reason = row
+    if not interface_state.session_is_active(occupancy, lifecycle, ended_at):
+        _close_volatile_children(con, session_id)
         con.execute(
             "UPDATE planner_alerts SET resolved_at=datetime('now') "
             "WHERE session_id=? AND resolved_at IS NULL", (session_id,))
@@ -355,21 +421,15 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
         "UPDATE interface_generations SET ended_at=datetime('now') "
         "WHERE shell_id=? AND generation=? AND ended_at IS NULL",
         (shell_id, generation))
-    con.execute(
-        "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
-        "revoke_reason='session_end' "
-        "WHERE session_id=? AND revoked_at IS NULL", (session_id,))
+    # Ordinary input/composer state is generation-volatile.  A pending or
+    # delivery-unknown row is different: it is the decision #16 ambiguity
+    # record, so park it durably while the live guard ignores its terminal
+    # parent.  Everything else is removed in this same transaction (#529).
+    _close_volatile_children(con, session_id)
 
-    # Session-scoped wake state: the generation is provably over, so a
-    # pending human frame can never be acked and a live batch can never
-    # see its stop hook. Resolve from durable evidence or park — the same
-    # rules startup reconciliation applies (decision #22).
-    istate = con.execute(
-        "SELECT pending_seq, delivery FROM interface_input_state "
-        "WHERE session_id=?", (session_id,)).fetchone()
-    if istate is not None and istate[0] is not None \
-            and istate[1] != "delivery_unknown":
-        park_delivery_unknown(con, session_id)
+    # Session-scoped wake state: the generation is provably over, so a live
+    # batch can never see its stop hook. Resolve from durable evidence or park
+    # the durable batch audit; queued work remains for a future generation.
     batches = con.execute(
         "SELECT batch_id, binding_id, state, stop_hook_seq "
         "FROM planner_wake_batches "

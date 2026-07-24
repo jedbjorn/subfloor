@@ -25,6 +25,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import interface_reconcile  # noqa: E402
+import interface_broker  # noqa: E402
 import rebuild  # noqa: E402
 import update  # noqa: E402
 
@@ -213,7 +214,8 @@ class LiveRefusalGuardTest(unittest.TestCase):
         self.con.execute(
             "UPDATE sprint_planner_bindings SET released_at=datetime('now')")
         self.con.execute(
-            "UPDATE interface_sessions SET occupancy='ended'")
+            "UPDATE interface_sessions SET occupancy='ended', lifecycle='ended', "
+            "ended_at=datetime('now')")
         self.con.execute(
             "UPDATE interface_generations SET ended_at=datetime('now')")
         self.con.commit()
@@ -227,6 +229,82 @@ class LiveRefusalGuardTest(unittest.TestCase):
         self.con.commit()
         reasons = interface_reconcile.live_refusal_reasons(self.db)
         self.assertTrue(any("ambiguity" in r for r in reasons))
+
+    def test_terminal_session_park_survives_restart_without_reopening_alert(self):
+        sid = self._occupied_session()
+        self.con.execute(
+            "UPDATE interface_sessions SET occupancy='ended', lifecycle='ended', "
+            "ended_at=datetime('now') WHERE session_id=?", (sid,))
+        self.con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now')")
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, generation, "
+            "composer, delivery, pending_seq) "
+            "VALUES (?,1,1,'unknown','delivery_unknown',9)", (sid,))
+        self.con.execute(
+            "INSERT INTO planner_alerts "
+            "(alert_id, session_id, severity, reason, dedupe_key) "
+            "VALUES (42,?,'critical','crash_window_delivery_unknown',"
+            "? || '|-|-|crash_window_delivery_unknown')", (sid, sid))
+        self.con.commit()
+        self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
+
+        counts = interface_reconcile.startup_reconcile(self.con)
+        self.assertEqual(counts["terminal_inputs_removed"], 0)
+        self.assertEqual(counts["terminal_input_parks"], 1)
+        self.assertEqual(counts["terminal_alerts_resolved"], 1)
+        first_alert = self.con.execute(
+            "SELECT alert_id, reason, resolved_at FROM planner_alerts "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertEqual(first_alert[:2], (
+            42, "crash_window_delivery_unknown"))
+        self.assertIsNotNone(first_alert[2])
+        second = interface_reconcile.startup_reconcile(self.con)
+        self.assertEqual(second["terminal_alerts_resolved"], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT composer, delivery, pending_seq "
+            "FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone(), ("unknown", "delivery_unknown", 9))
+        self.assertEqual(self.con.execute(
+            "SELECT alert_id, reason, resolved_at FROM planner_alerts "
+            "WHERE session_id=?", (sid,)).fetchall(), [first_alert])
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM planner_alerts WHERE session_id=? "
+            "AND resolved_at IS NULL", (sid,)).fetchone())
+
+    def test_shared_close_revokes_writer_and_preserves_ambiguity(self):
+        sid = self._occupied_session()
+        self.con.execute(
+            "INSERT INTO interface_input_state (session_id, shell_id, generation, "
+            "composer, pending_seq) VALUES (?,1,1,'unknown',4)", (sid,))
+        self.con.execute(
+            "INSERT INTO interface_writer_leases (session_id, shell_id, "
+            "generation, client_id, token_hash) VALUES (?,1,1,'client','hash')",
+            (sid,))
+        interface_broker.close_session(self.con, sid, "operator_end")
+        self.con.commit()
+
+        self.assertEqual(self.con.execute(
+            "SELECT composer, delivery, pending_seq "
+            "FROM interface_input_state WHERE session_id=?",
+            (sid,)).fetchone(), ("unknown", "delivery_unknown", 4))
+        revoked_at, reason = self.con.execute(
+            "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
+            "WHERE session_id=?", (sid,)).fetchone()
+        self.assertIsNotNone(revoked_at)
+        self.assertEqual(reason, "session_end")
+        self.assertEqual(interface_reconcile.live_refusal_reasons(self.db), [])
+
+        # A repeated close preserves the same evidence without reopening or
+        # restamping the terminal session.
+        result = interface_broker.close_session(
+            self.con, sid, "different_retry_reason")
+        self.assertTrue(result["already_ended"])
+        self.assertEqual(result["end_reason"], "operator_end")
+        self.assertEqual(self.con.execute(
+            "SELECT delivery, pending_seq FROM interface_input_state "
+            "WHERE session_id=?", (sid,)).fetchone(),
+            ("delivery_unknown", 4))
 
     def test_fully_drained_passes(self):
         sid = self._occupied_session()

@@ -175,6 +175,40 @@ class AvailabilityTest(unittest.TestCase):
         return interface_runtime.InterfaceRuntime(
             str(self.db), run_dir=str(self.tmp / "run"))
 
+    def test_late_runtime_alert_keeps_ended_session_audit_resolved(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO interface_generations "
+            "(shell_id, generation, ended_at) "
+            "VALUES (1,1,'2026-07-20 00:00:00')")
+        sid = con.execute(
+            "INSERT INTO interface_sessions "
+            "(shell_id, generation, occupancy, lifecycle, ended_at) "
+            "VALUES (1,1,'ended','ended','2026-07-20 00:00:00')"
+        ).lastrowid
+        con.execute(
+            "INSERT INTO planner_alerts "
+            "(alert_id, session_id, severity, reason, dedupe_key) "
+            "VALUES (42,?,'warning','interface_continuity_broken',"
+            "? || '|-|-|interface_continuity_broken')", (sid, sid))
+        con.commit()
+        con.close()
+
+        rt = self._runtime()
+        rt._alert(sid, "interface_continuity_broken", "warning")
+        rt._alert(sid, "interface_continuity_broken", "warning")
+
+        con = sqlite3.connect(self.db)
+        try:
+            alerts = con.execute(
+                "SELECT alert_id, reason, resolved_at FROM planner_alerts "
+                "WHERE session_id=?", (sid,)).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(alerts, [
+            (42, "interface_continuity_broken", "2026-07-20 00:00:00")
+        ])
+
     def test_no_tmux_marks_unavailable(self):
         with mock.patch.object(interface_runtime.shutil, "which",
                                return_value=None):

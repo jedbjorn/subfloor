@@ -43,7 +43,7 @@ def snapshot_path() -> Path:
     return SNAPSHOT if SNAPSHOT.exists() else SNAPSHOT_LEGACY
 
 
-def read_existing_keys() -> dict:
+def read_existing_keys(db_path: Path | None = None) -> dict:
     """shell_id -> (api_key, api_key_rotated_at) from the outgoing DB.
 
     content.sql never serializes api_key (secret in a git-tracked file), so
@@ -60,12 +60,13 @@ def read_existing_keys() -> dict:
     a CLI transaction racing `sc verify`) used to be swallowed into {}, which
     silently rotated every key and 401'd all live sessions (#279). A rebuild
     that cannot read the keys it is about to destroy must not proceed."""
-    if not DB_PATH.exists():
+    path = db_path or DB_PATH
+    if not path.exists():
         print("rebuild: no outgoing DB — every shell will be minted a fresh key.")
         return {}
     con = None
     try:
-        con = db_driver.connect(DB_PATH)
+        con = db_driver.connect(path)
         rows = con.execute(
             "SELECT shell_id, api_key, api_key_rotated_at FROM shells "
             "WHERE api_key IS NOT NULL"
@@ -91,14 +92,14 @@ def read_existing_keys() -> dict:
     return keys
 
 
-def restore_keys(keys: dict) -> int:
+def restore_keys(keys: dict, db_path: Path | None = None) -> int:
     """Re-attach carried keys to the rebuilt shells. Guarded on api_key IS
     NULL so a loaded value (should content.sql ever carry one) is never
     clobbered; a shell_id absent from the new content matches nothing and its
     key is dropped with it."""
     if not keys:
         return 0
-    con = db_driver.connect(DB_PATH)
+    con = db_driver.connect(db_path or DB_PATH)
     try:
         restored = 0
         for sid, (key, rotated) in keys.items():
@@ -128,12 +129,12 @@ def prune_backups(prefix: str, directory: Path | None = None) -> None:
         old.unlink(missing_ok=True)
 
 
-def backup_db(dst: Path, src: Path = DB_PATH) -> None:
+def backup_db(dst: Path, src: Path | None = None) -> None:
     """WAL-safe snapshot via sqlite3's online-backup API. A plain file copy of
     a live WAL database misses every un-checkpointed page (they live in the
     -wal sidecar), so a copy2 restore point could silently drop the most
     recent writes — the exact rows it exists to protect."""
-    src_con = sqlite3.connect(src)
+    src_con = sqlite3.connect(src or DB_PATH)
     dst_con = sqlite3.connect(dst)
     try:
         with dst_con:
@@ -154,13 +155,33 @@ def backup_existing() -> None:
     print(f"rebuild: backed up existing DB -> {dst}")
 
 
+def _remove_database(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+
+
+def validate_foreign_keys(path: Path) -> None:
+    """Refuse a candidate with the exact first orphan named."""
+    con = db_driver.connect(path)
+    try:
+        violations = con.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            table, rowid, parent, fk_id = violations[0]
+            raise SystemExit(
+                "rebuild: foreign-key check failed: "
+                f"table {table} row {rowid} references {parent} (fk {fk_id}) "
+                "— outgoing DB and backup preserved")
+        # Make the candidate main file self-contained before its atomic rename.
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+    finally:
+        con.close()
+
+
 def main(argv: list[str]) -> int:
     schema = SCHEMA_SQLITE
     if not schema.exists():
         sys.exit(f"rebuild: missing {schema}")
 
-    if "--no-backup" not in argv:
-        backup_existing()
     keys = read_existing_keys()
     # Spec #20: a rebuild destroys the live DB, so it refuses while any live
     # Interface state would be lost — non-ended session, unreleased binding,
@@ -172,55 +193,75 @@ def main(argv: list[str]) -> int:
             "rebuild: refusing — live Interface state exists; the clean "
             "operator drain path is required first:\n  - "
             + "\n  - ".join(reasons))
-    for suffix in ("", "-wal", "-shm"):
-        p = Path(str(DB_PATH) + suffix)
-        if p.exists():
-            p.unlink()
+    if "--no-backup" not in argv:
+        backup_existing()
 
-    con = db_driver.connect(DB_PATH)
+    candidate = Path(str(DB_PATH) + ".rebuild")
+    _remove_database(candidate)
     try:
-        con.executescript(schema.read_text())
-        con.commit()
-        print("rebuild: schema.sql applied")
-    finally:
-        con.close()
-
-    migrate_mod.migrate(str(DB_PATH))
-
-    snap = snapshot_path()
-    if snap.exists():
-        con = db_driver.connect(DB_PATH)
+        con = db_driver.connect(candidate)
         try:
-            con.executescript(snap.read_text())
+            con.executescript(schema.read_text())
             con.commit()
-            print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
+            print("rebuild: schema.sql applied")
         finally:
             con.close()
-    else:
-        print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
 
-    # The migrations above seeded every engine skill live (is_deleted=0) —
-    # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
-    # this fork has retired (a shell created before the next launch/update
-    # would otherwise be granted them).
-    con = db_driver.connect(DB_PATH)
-    try:
-        flipped = seed_skills.apply_retired(con)
-    finally:
-        con.close()
-    if flipped:
-        print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
+        migrate_mod.migrate(str(candidate))
 
-    # Re-attach the keys carried over from the outgoing DB (content.sql never
-    # carries api_key — it is a secret and content.sql is git-tracked, see
-    # snapshot.py's no-serialize set), then mint only what is still missing:
-    # new shells from the content load, or everything on a fresh/pre-key build.
-    # Rotation is never a rebuild side effect — live sessions keep the
-    # SC_API_TOKEN they booted with (#265). Rotate deliberately, not here.
-    restored = restore_keys(keys)
-    if restored:
-        print(f"rebuild: preserved {restored} shell api_key(s)")
-    backfill_shell_api_keys.backfill(str(DB_PATH))
+        snap = snapshot_path()
+        if snap.exists():
+            con = db_driver.connect(candidate)
+            try:
+                con.executescript(snap.read_text())
+                con.commit()
+                print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
+            finally:
+                con.close()
+        else:
+            print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
+
+        # content.sql loads after migrations and older snapshots may contain
+        # legacy open alerts for fully ended sessions. Reconcile the completed
+        # candidate, not merely the pre-snapshot schema, so rebuild cannot
+        # reattach actionable state to terminal audit.
+        con = db_driver.connect(candidate)
+        try:
+            interface_reconcile.startup_reconcile(con)
+        finally:
+            con.close()
+
+        # The migrations above seeded every engine skill live (is_deleted=0) —
+        # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
+        # this fork has retired (a shell created before the next launch/update
+        # would otherwise be granted them).
+        con = db_driver.connect(candidate)
+        try:
+            flipped = seed_skills.apply_retired(con)
+        finally:
+            con.close()
+        if flipped:
+            print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
+
+        # Re-attach carried keys and mint only what remains absent on the
+        # candidate. The outgoing DB stays untouched until every load and
+        # integrity check has succeeded.
+        restored = restore_keys(keys, candidate)
+        if restored:
+            print(f"rebuild: preserved {restored} shell api_key(s)")
+        backfill_shell_api_keys.backfill(str(candidate))
+        validate_foreign_keys(candidate)
+    except BaseException:
+        _remove_database(candidate)
+        raise
+
+    # The candidate is closed, checkpointed, and valid. Remove stale sidecars
+    # belonging to the outgoing inode, then atomically replace only now.
+    for suffix in ("-wal", "-shm"):
+        Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+    candidate.replace(DB_PATH)
+    for suffix in ("-wal", "-shm"):
+        Path(str(candidate) + suffix).unlink(missing_ok=True)
 
     try:
         map_repo.main()

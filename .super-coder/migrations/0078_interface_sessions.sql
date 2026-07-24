@@ -17,9 +17,10 @@
 -- interface_reconcile.startup_reconcile + tests/test_interface_crash_window.py).
 --
 -- Snapshot stance: volatile runtime tables (interface_writer_leases,
--- interface_input_state, pr_poll_runs) are deliberately absent from
--- snapshot.py's PER_INSTANCE_TABLES (the 0075 precedent); durable audit tables
--- are snapshotted with row filters (live rows excluded — rebuild/update refuse
+-- pr_poll_runs) are deliberately absent from snapshot.py's
+-- PER_INSTANCE_TABLES (the 0075 precedent). interface_input_state preserves
+-- only terminal delivery-unknown metadata; durable audit tables are
+-- snapshotted with row filters (live rows excluded — rebuild/update refuse
 -- while any of them exist anyway) and volatile columns (tmux socket,
 -- PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
 
@@ -112,10 +113,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_interface_writer_leases_current
     ON interface_writer_leases(session_id) WHERE revoked_at IS NULL;
 
 -- ── Input state: metadata only, never bytes ─────────────────────────────────
--- VOLATILE — excluded from snapshot (pending-input metadata). One row per
--- session. pending_seq is the crash-window reservation: set before the tmux
--- write, cleared only by the forward commit AFTER the write. last_submit_seq
--- is the fenced submit-callback proof that lets dirty → clean.
+-- LIVE rows are volatile and snapshot-excluded. A terminal
+-- delivery_unknown row is durable recovery metadata (never input bytes) and
+-- survives rebuild. One row per session. pending_seq is the crash-window
+-- reservation: set before the tmux write, cleared only by the forward commit
+-- AFTER the write. last_submit_seq is the fenced submit-callback proof that
+-- lets dirty → clean.
 
 CREATE TABLE IF NOT EXISTS interface_input_state (
     session_id          INTEGER PRIMARY KEY
