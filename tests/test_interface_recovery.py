@@ -3060,6 +3060,30 @@ class CliRecoverTest(unittest.TestCase):
         self.assertIn("classification: exact_idle_orphan", out)
         self.assertIn("S3 is available", out)
 
+    def test_runtime_that_would_not_let_go_is_printed(self):
+        # The operator-facing half of SC-128. Naming the failure in the
+        # payload and rendering nothing is the silence it was named to end:
+        # the recovery still succeeds (the durable rows ARE closed), so this
+        # belongs on stderr as a follow-up, not as a failed exit.
+        result = dict(self.RESULT)
+        result["closed"] = dict(result["closed"],
+                                runtime={"abandoned": False,
+                                         "error": "RuntimeError: no"})
+        self.script(dict(self.PREVIEW_ORPHAN), result)
+        code, out, err = self.run_cli(["recover", "s3", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertIn("S3 is available", out)
+        self.assertIn("would not release the session generation", err)
+        self.assertIn("RuntimeError: no", err)
+
+    def test_runtime_released_cleanly_says_nothing(self):
+        result = dict(self.RESULT)
+        result["closed"] = dict(result["closed"], runtime={"abandoned": True})
+        self.script(dict(self.PREVIEW_ORPHAN), result)
+        code, _out, err = self.run_cli(["recover", "s3", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("generation", err)
+
     def test_force_confirms_exact_identity(self):
         self.script(dict(self.PREVIEW_LIVE), dict(self.RESULT, mode="force"))
         code, _out, _err = self.run_cli(["recover", "s3", "--force", "--yes"])

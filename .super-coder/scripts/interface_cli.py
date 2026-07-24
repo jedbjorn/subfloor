@@ -693,6 +693,14 @@ def cmd_recover(args) -> int:
     for parked in closed.get("parked", []):
         print(f"→ parked ambiguous binding {parked['binding_id']}: "
               f"{parked['next_action']}")
+    runtime = closed.get("runtime")
+    if runtime and not runtime.get("abandoned"):
+        # The durable rows are closed either way, so this is not a failed
+        # recovery — but the generation may still be attached, and a field
+        # nobody prints is the same silence it was named to end (SC-128).
+        print("→ the runtime would not release the session generation "
+              f"({runtime.get('error', 'unknown error')}) — the durable "
+              "state IS closed; check the Interface runtime", file=sys.stderr)
     wt = result.get("worktree") or {}
     if wt.get("failed"):
         done = ", ".join(wt.get("completed") or []) or "nothing"
