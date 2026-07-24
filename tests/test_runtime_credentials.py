@@ -9,8 +9,13 @@ Two halves, one contract:
   sweeps artifacts whose shell is gone, demoted, deleted, or unkeyed.
 - `mem.py` discovery — with BOTH SC_API_BASE/SC_API_TOKEN absent, `sc mem`
   adopts the unique Admin artifact and still calls the API; multiple Admins
-  refuse until SC_MEM_AS names one; an insecure artifact and a stale
-  (rotated) token refuse with the supported action.
+  refuse until SC_MEM_AS names one; a symlinked or otherwise insecure
+  artifact and a stale (rotated) token refuse with the supported action.
+
+The trust boundary is the real artifact, never a path: neither half may follow
+a symlink planted at the artifact name — discovery refuses it, provisioning
+replaces it — and `./sc token` gives the two refusal classes distinct nonzero
+exit statuses (1 nothing-to-read, 2 unsafe artifact; spec doc #30 req 23).
 
 Discovery tests stand up the real `server.Handler` against a throwaway engine
 DB (same harness as test_mem — the token is the only identity), so a
@@ -48,6 +53,24 @@ import mem_credentials  # noqa: E402
 import server  # noqa: E402
 import operator_token as sc_token  # noqa: E402
 from test_mem import TOKEN, PEER_TOKEN, build_engine_db  # noqa: E402
+
+
+def refuse(fn):
+    """Run a refusing entrypoint; return (exit status, stderr text).
+
+    `mem.die` keeps the historical `sys.exit("<message>")` for status 1 — there
+    the message IS the SystemExit payload — and prints + exits with the number
+    for the other classes. The process sees stderr plus a status either way, so
+    normalise both shapes into that here."""
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        try:
+            fn()
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                return 1, exc.code
+            return exc.code, err.getvalue()
+    raise AssertionError("expected a refusal, got a clean return")
 
 
 def build_shells_db(path: Path) -> None:
@@ -118,6 +141,23 @@ class ProvisionTest(unittest.TestCase):
         self.provision()
         data = json.loads((self.run_dir / "ADM1.json").read_text())
         self.assertEqual(data["token"], "k-adm1-rotated")
+
+    def test_symlinked_artifact_is_replaced_never_followed(self):
+        """A same-user symlink at the artifact path must not become a write
+        channel: provisioning replaces the link with a real 0600 file and the
+        link's target keeps its contents (no truncate, no token written)."""
+        self.run_dir.mkdir(parents=True)
+        target = self.tmp / "victim.txt"
+        target.write_text("not-a-credential")
+        (self.run_dir / "ADM1.json").symlink_to(target)
+        self.provision()
+        artifact = self.run_dir / "ADM1.json"
+        self.assertFalse(artifact.is_symlink())
+        self.assertEqual(target.read_text(), "not-a-credential")
+        self.assertEqual(json.loads(artifact.read_text())["token"], "k-adm1")
+        self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+        # the write goes through a temp inode — none of it is left behind
+        self.assertEqual([p.name for p in self.run_dir.iterdir()], ["ADM1.json"])
 
     def test_stale_artifacts_are_swept(self):
         self.run_dir.mkdir(parents=True)
@@ -228,10 +268,35 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_insecure_artifact_is_refused(self):
         self.write_artifact("TC", TOKEN, mode=0o644)
-        with self.assertRaises(SystemExit) as cm:
-            self.run_which()
-        self.assertIn("owner-only", str(cm.exception))
-        self.assertIn("restart", str(cm.exception))
+        code, err = refuse(self.run_which)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("owner-only", err)
+        self.assertIn("restart", err)
+
+    def test_symlinked_artifact_is_refused(self):
+        """A same-user symlink pointing at a perfectly valid, owner-only file
+        must not be adopted: the trust boundary is the real artifact, and a
+        link is someone else's choice of what discovery reads."""
+        outside = Path(tempfile.mkdtemp()) / "planted.json"
+        outside.write_text(json.dumps({
+            "shell_id": 1, "shortname": "TC",
+            "api_base": f"http://127.0.0.1:{self.port}", "token": TOKEN,
+        }))
+        outside.chmod(0o600)
+        before = outside.read_text()
+        (self.cred_dir / "TC.json").symlink_to(outside)
+        code, err = refuse(self.run_which)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("symbolic link", err)
+        self.assertIsNone(mem._DISCOVERED_FROM)      # nothing adopted
+        self.assertEqual(mem.SC_API_TOKEN, "")
+        self.assertEqual(outside.read_text(), before)  # target untouched
+
+    def test_dangling_symlink_is_refused_not_reported_missing(self):
+        (self.cred_dir / "TC.json").symlink_to(self.cred_dir / "gone.json")
+        code, err = refuse(self.run_which)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("symbolic link", err)
 
     def test_malformed_artifact_is_refused(self):
         p = self.cred_dir / "TC.json"
@@ -326,10 +391,25 @@ class TokenCommandTest(unittest.TestCase):
 
     def test_insecure_artifact_is_refused(self):
         self.write_artifact("TC", TOKEN, mode=0o644)
-        with self.assertRaises(SystemExit) as cm:
-            self.run_token()
-        self.assertIn("owner-only", str(cm.exception))
-        self.assertNotIn(TOKEN, str(cm.exception))  # refusal never leaks the value
+        code, err = refuse(self.run_token)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("owner-only", err)
+        self.assertNotIn(TOKEN, err)                # refusal never leaks the value
+
+    def test_symlinked_artifact_is_refused(self):
+        outside = Path(tempfile.mkdtemp()) / "planted.json"
+        outside.write_text(json.dumps({
+            "shell_id": 1, "shortname": "TC",
+            "api_base": "http://127.0.0.1:8800", "token": TOKEN,
+        }))
+        outside.chmod(0o600)
+        before = outside.read_text()
+        (self.cred_dir / "TC.json").symlink_to(outside)
+        code, err = refuse(self.run_token)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("symbolic link", err)
+        self.assertNotIn(TOKEN, err)
+        self.assertEqual(outside.read_text(), before)
 
     def test_malformed_artifact_is_refused(self):
         p = self.cred_dir / "TC.json"
@@ -345,9 +425,9 @@ class TokenCommandTest(unittest.TestCase):
         self.write_artifact("TC", TOKEN, mode=0o644)
         mem.SC_API_TOKEN = "env-token"
         mem.SC_API_BASE = "http://127.0.0.1:8800"
-        with self.assertRaises(SystemExit) as cm:
-            self.run_token()
-        self.assertIn("owner-only", str(cm.exception))
+        code, err = refuse(self.run_token)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("owner-only", err)
 
     def test_help_labels_without_printing(self):
         self.write_artifact("TC", TOKEN)
@@ -357,20 +437,59 @@ class TokenCommandTest(unittest.TestCase):
         self.assertIn("./sc token", out)
         self.assertNotIn(TOKEN, out)
 
+    def run_script(self):
+        """Real interpreter, real process — the only place the exit *status*
+        (as opposed to the SystemExit payload) is observable."""
+        env = dict(os.environ, SC_MEM_CRED_DIR=str(self.cred_dir))
+        env.pop("SC_MEM_AS", None)
+        return subprocess.run(
+            [sys.executable, str(ENGINE / "scripts" / "operator_token.py")],
+            capture_output=True, text=True, env=env)
+
     def test_script_end_to_end(self):
         """Real interpreter, real artifact: stdout is the token and only the
         token. (The `token)` line in ./sc is the same one-line exec pattern as
         every other verb; a bash-dispatcher subprocess test would resolve the
         engine at the MAIN worktree root and break in linked dev worktrees.)"""
         self.write_artifact("TC", TOKEN)
-        env = dict(os.environ, SC_MEM_CRED_DIR=str(self.cred_dir))
-        env.pop("SC_MEM_AS", None)
-        proc = subprocess.run(
-            [sys.executable,
-             str(ENGINE / "scripts" / "operator_token.py")],
-            capture_output=True, text=True, env=env)
+        proc = self.run_script()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, TOKEN + "\n")
+
+    def test_script_exit_status_unavailable(self):
+        """Nothing to read (service not running / no artifact) → status 1."""
+        proc = self.run_script()
+        self.assertEqual(proc.returncode, mem.EXIT_UNAVAILABLE)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("./sc restart", proc.stderr)
+
+    def test_script_exit_status_unsafe_artifact(self):
+        """An artifact that fails the trust boundary is a DIFFERENT nonzero
+        status from 'nothing to read' (spec doc #30 req 23) — a caller can
+        branch on it without parsing stderr."""
+        self.write_artifact("TC", TOKEN, mode=0o644)
+        proc = self.run_script()
+        self.assertEqual(proc.returncode, mem.EXIT_UNSAFE)
+        self.assertNotEqual(mem.EXIT_UNSAFE, mem.EXIT_UNAVAILABLE)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("owner-only", proc.stderr)
+        self.assertNotIn(TOKEN, proc.stderr)
+
+    def test_script_symlinked_artifact_refuses_without_printing(self):
+        outside = Path(tempfile.mkdtemp()) / "planted.json"
+        outside.write_text(json.dumps({
+            "shell_id": 1, "shortname": "TC",
+            "api_base": "http://127.0.0.1:8800", "token": TOKEN,
+        }))
+        outside.chmod(0o600)
+        before = outside.read_text()
+        (self.cred_dir / "TC.json").symlink_to(outside)
+        proc = self.run_script()
+        self.assertEqual(proc.returncode, mem.EXIT_UNSAFE)
+        self.assertEqual(proc.stdout, "")            # the planted token stays unread
+        self.assertIn("symbolic link", proc.stderr)
+        self.assertNotIn(TOKEN, proc.stderr)
+        self.assertEqual(outside.read_text(), before)
 
 
 if __name__ == "__main__":

@@ -22,9 +22,9 @@ Host Admin discovery (spec doc #30 req 11): a host Admin seat booted outside
 run.py has neither var. When BOTH are absent, `sc mem` may adopt the unique
 owner-only runtime credential the supervised API provisions per Admin shell
 (`.super-coder/run/mem/<shortname>.json`, mode 0600) — `SC_MEM_AS=<shortname>`
-selects one when several exist; ambiguity, an insecure artifact, and a stale
-(rotated) token all refuse with the supported action. Discovery still calls
-the API; it is never a direct-DB path.
+selects one when several exist; ambiguity, a symlinked or otherwise insecure
+artifact, and a stale (rotated) token all refuse with the supported action.
+Discovery still calls the API; it is never a direct-DB path.
 
 Run from the repo root, like every engine command:
 
@@ -70,6 +70,7 @@ per-invocation dedupe_key, so a retry can never write a duplicate, #333).
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import signal
@@ -102,8 +103,27 @@ _DISCOVERED_FROM: "Path | None" = None  # artifact the token came from, if any
 _PROG = "mem"
 
 
-def die(msg: str) -> "NoReturn":  # noqa: F821
-    sys.exit(f"{_PROG}: {msg}")
+# Two refusal classes, two stable exit statuses (spec doc #30 req 23): a caller
+# can tell "there is nothing usable to read" from "an artifact is there but sits
+# outside the trust boundary" without parsing stderr.
+EXIT_UNAVAILABLE = 1   # service down / artifact missing, unreadable, malformed, ambiguous
+EXIT_UNSAFE = 2        # artifact present but not an owner-only regular file
+
+
+def die(msg: str, code: int = EXIT_UNAVAILABLE) -> "NoReturn":  # noqa: F821
+    if code == EXIT_UNAVAILABLE:
+        sys.exit(f"{_PROG}: {msg}")   # sys.exit(str) := stderr + status 1
+    print(f"{_PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _read_all(fd: int) -> bytes:
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
 
 
 def _load_runtime_credential(path: Path) -> None:
@@ -111,23 +131,38 @@ def _load_runtime_credential(path: Path) -> None:
 
     Accepted only under the existing local trust boundary: a regular file,
     owned by this user, with no group/world permission bits (the service
-    writes 0600 under a 0700 dir). Anything weaker is refused, not used."""
+    writes 0600 under a 0700 dir). Anything weaker is refused, not used.
+
+    The check is on the opened inode, never on the path: O_NOFOLLOW refuses a
+    symlink outright (a same-user link could otherwise point discovery at a
+    file that passes the checks), and fstat + read on that one descriptor
+    leaves no window to swap the path between checking and using it."""
     global SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM
     try:
-        st = path.stat()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            die(f"runtime credential {path} is a symbolic link — the trust "
+                "boundary covers only a real owner-only file; remove the link "
+                "and let the supervised service re-provision it "
+                "(`./sc restart` / `make dos-r`).", EXIT_UNSAFE)
         die(f"runtime credential {path} is unreadable ({exc}) — restart the "
             "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
-        die(f"runtime credential {path} is not an owner-only regular file "
-            f"(mode {oct(stat.S_IMODE(st.st_mode))}) — the supervised service "
-            "re-provisions it with mode 0600 at boot: `./sc restart` / `make dos-r`.")
     try:
-        data = json.loads(path.read_text())
-        token, base = data["token"], data["api_base"]
-    except (OSError, ValueError, KeyError):
-        die(f"runtime credential {path} is malformed — the supervised service "
-            "re-provisions it at boot: `./sc restart` / `make dos-r`.")
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            die(f"runtime credential {path} is not an owner-only regular file "
+                f"(mode {oct(stat.S_IMODE(st.st_mode))}) — the supervised service "
+                "re-provisions it with mode 0600 at boot: `./sc restart` / `make dos-r`.",
+                EXIT_UNSAFE)
+        try:
+            data = json.loads(_read_all(fd))
+            token, base = data["token"], data["api_base"]
+        except (OSError, ValueError, KeyError):
+            die(f"runtime credential {path} is malformed — the supervised service "
+                "re-provisions it at boot: `./sc restart` / `make dos-r`.")
+    finally:
+        os.close(fd)
     SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM = token, base, path
 
 
