@@ -746,6 +746,12 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-stat b { color: var(--ink); font-weight: 600; }
 .if-head .act { margin-top: 0; }
 .if-note { color: var(--warn); font-size: .8rem; flex-basis: 100%; }
+/* The header's status notes are usually empty, but flex-basis:100% still forced
+   a second flex line — costing .if-head's 1rem row-gap (16px) of dead space
+   under the toolbar for no visible text. Collapse the empty ones; a note that
+   has something to say lays out exactly as before. Scoped to .if-head so the
+   composer's note keeps its reserved min-height line (no jump on first note). */
+.if-head > .if-note:empty { display: none; }
 .if-term {
   background: #000; border: 1px solid var(--line); border-radius: var(--r);
   padding: 6px; width: 100%; max-width: 1300px;

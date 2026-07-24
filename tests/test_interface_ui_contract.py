@@ -916,6 +916,9 @@ invariant(Boolean(button(pane, "Recover")),
   "unreconciled/no-session route hid the server-listed recovery action");
 invariant(!requested.some((path) => path.includes("/sessions/")),
   `no-session route fetched invalid session detail: ${requested}`);
+// renderInterface above armed the rail poll; stop it the way leaving the tab
+// does, so this harness's event loop can drain and node can exit.
+ifStopRailPoll();
 """)
 
 
@@ -976,6 +979,105 @@ def test_rail_routes_working_away_from_recovery_and_paints_it_amber():
     recovery_route = RENDER_INTERFACE[
         RENDER_INTERFACE.index('sel.availability === "lost"'):]
     assert '"working"' not in recovery_route.split("ifRecoveryPane")[0]
+
+
+RAIL_POLL_SETUP = r"""
+const shellRow = (shortname, availability, extra = {}) => ({
+  shell_id: shortname === "S3" ? 3 : 4, shortname,
+  display_name: "Shell " + shortname, availability,
+  session_id: availability === "occupied" ? 9 : null, ...extra });
+let served = [];
+const serveShells = (rows) => { served = rows; };
+apiIf = async (path) => path === "/interface/shells"
+  ? { shells: served }
+  : BASE_PREVIEW;
+const railOf = (root) => all(root, (n) => n.className === "if-rail")[0];
+const badges = (root) => all(railOf(root), (n) =>
+  String(n.className || "").includes("if-badge")).map((n) => n.textContent);
+"""
+
+
+def test_rail_poll_repaints_badges_without_rebuilding_the_pane():
+    """The badges must go live without the poll tearing down a live terminal.
+    A change anywhere else in the fleet repaints the rail only; the pane (and
+    with it the xterm attach, scrollback, and writer lease) is rebuilt solely
+    when the SELECTED shell's own availability moves."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+serveShells([shellRow("S3", "available"), shellRow("S4", "available")]);
+const root = new FakeElement("div");
+await renderInterface(root);
+invariant(badges(root).join(",") === "available,available",
+  `rail did not paint the served fleet: ${badges(root)}`);
+
+// From here the real renderInterface is replaced by a counter: any pane
+// rebuild is now observable.
+let rendered = 0;
+renderInterface = async () => { rendered += 1; };
+
+// 1. Another shell moves. The badge follows; the pane is untouched.
+serveShells([shellRow("S3", "available"), shellRow("S4", "occupied")]);
+await ifPollRail();
+invariant(badges(root).join(",") === "available,occupied",
+  `poll did not repaint a peer shell's badge: ${badges(root)}`);
+invariant(rendered === 0,
+  "a peer shell's badge change rebuilt the pane and would kill the terminal");
+
+// 2. Nothing moved. No repaint at all — an unconditional rebuild would drop
+//    focus from a rail button every tick.
+const railBefore = railOf(root).children[0];
+await ifPollRail();
+invariant(railOf(root).children[0] === railBefore,
+  "an unchanged poll still rebuilt the rail rows");
+invariant(rendered === 0, "an unchanged poll rebuilt the pane");
+
+// 3. The SELECTED shell moves. Now the pane is showing the wrong thing, so a
+//    full re-render is the correct — and only — response.
+serveShells([shellRow("S3", "occupied"), shellRow("S4", "occupied")]);
+await ifPollRail();
+invariant(rendered === 1,
+  "the selected shell changed availability and the pane was left stale");
+ifStopRailPoll();
+""")
+
+
+def test_rail_poll_leaves_a_busy_selected_session_attached():
+    """The regression that would hurt most: a shell the operator is typing in
+    stays `occupied` while its alert count or sprint label churns. That must
+    never re-render the pane — the terminal would be torn down mid-session."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+ifSelected = "S3";
+serveShells([shellRow("S3", "occupied", { alerts: 0 })]);
+const root = new FakeElement("div");
+await renderInterface(root);
+let rendered = 0;
+renderInterface = async () => { rendered += 1; };
+
+serveShells([shellRow("S3", "occupied", { alerts: 2, sprint_ref: "38" })]);
+await ifPollRail();
+invariant(rendered === 0,
+  "a still-occupied session was re-rendered — the live terminal would drop");
+invariant(badges(root).some((b) => b.includes("2")),
+  `the new alert count never reached the rail: ${badges(root)}`);
+ifStopRailPoll();
+""")
+
+
+def test_rail_poll_stops_when_the_operator_leaves_the_interface_tab():
+    """A timer that outlives the view keeps polling forever in the background."""
+    assert "ifStopRailPoll();" in APP[APP.index('if (tab !== "interface")'):
+                                      APP.index('if (tab !== "interface")') + 200]
+    # Every early return in renderInterface must leave no orphan timer.
+    head = RENDER_INTERFACE[RENDER_INTERFACE.index("async function renderInterface"):]
+    assert "ifStopRailPoll();" in head[:head.index("let shells;")]
+
+
+def test_empty_header_note_does_not_reserve_a_flex_row():
+    """The header's status note is empty almost always, but flex-basis:100%
+    still forced a second flex line and charged .if-head's 1rem row-gap for
+    it — dead padding under the toolbar. The composer's note keeps its
+    reserved line (it has min-height to stop a jump), so the rule is scoped."""
+    assert ".if-head > .if-note:empty { display: none; }" in CSS
+    assert ".if-composer .if-note" in CSS and "min-height: 1.2em" in CSS
 
 
 def test_recovery_partial_result_keeps_exact_remediation_until_refresh():

@@ -2221,6 +2221,7 @@ function ifSprintSuffix(sel) {
 
 async function renderInterface(root) {
   root.replaceChildren();
+  ifStopRailPoll();   // every early return below leaves no orphan timer
   let shells;
   try { ({ shells } = await apiIf("/interface/shells")); }
   catch (e) {
@@ -2235,8 +2236,35 @@ async function renderInterface(root) {
   const pane = el("div", { className: "if-pane" });
   // Mobile shell picker (CSS-hidden on desktop): same selection, same hash.
   const picker = el("select", { className: "if-picker", title: "shell" });
-  picker.append(el("option", { value: "" }, "select a shell…"));
   root.append(el("div", { className: "if-wrap" }, picker, rail, pane));
+  ifBuildRail(rail, picker, shells);
+  ifStartRailPoll(root, rail, picker, shells);
+  const sel = shells.find((s) => s.shortname === ifSelected);
+  if (!sel) {
+    ifDetach();
+    if (shells.length) pane.append(el("div", { className: "card muted" }, "Select a shell on the left."));
+    return;
+  }
+  if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
+  if (sel.availability === "working") {
+    ifDetach();
+    return ifWorkingPane(pane, sel, root);
+  }
+  if (sel.availability === "lost" || sel.availability === "error" || sel.availability === "unreconciled") {
+    ifDetach();
+    return ifRecoveryPane(pane, sel, root);
+  }
+  if (sel.availability === "starting") return ifStartingPane(pane, sel, root);
+  return ifSessionPane(pane, sel);   // verified occupied generation only
+}
+
+// The rail + mobile picker, rebuilt from a shells payload. Split out of
+// renderInterface so the poll below can repaint the badges alone — re-running
+// renderInterface would tear down and rebuild the pane, and with it the live
+// terminal attachment.
+function ifBuildRail(rail, picker, shells) {
+  rail.replaceChildren();
+  picker.replaceChildren(el("option", { value: "" }, "select a shell…"));
   for (const s of shells) {
     // Projection happens SERVER-side (_availability): reserved+starting →
     // starting, occupied+(idle|busy|approval|user_input) → occupied,
@@ -2271,23 +2299,64 @@ async function renderInterface(root) {
   }
   picker.onchange = () => { if (picker.value) location.hash = "interface/" + picker.value; };
   if (!shells.length) rail.append(el("div", { className: "muted" }, "No shells."));
+}
+
+// ── Rail poll ─────────────────────────────────────────────────────────────────
+// The rail badges were a snapshot taken at render: a shell going occupied or
+// falling over showed a stale pill until the operator navigated. Poll
+// /interface/shells and repaint.
+//
+// Two rules keep it from fighting the terminal. Repaint only on an actual
+// change (signature compare) — an unconditional rebuild would drop focus from a
+// rail button and slam a mobile picker's open dropdown shut every tick. And
+// repaint the RAIL only; the pane is re-rendered solely when the SELECTED
+// shell's availability changes, i.e. when the pane is showing the wrong thing
+// anyway. A selected shell that merely stays occupied never triggers a
+// re-render, so the xterm attach, scrollback, and writer lease survive.
+const IF_POLL_MS = 5000;
+let ifPoll = null;
+
+function ifRailSig(shells) {
+  return JSON.stringify(shells.map((s) => [s.shortname, s.availability, s.alerts,
+    s.harness, s.model_route, s.sprint_ref, s.sprint_title, s.display_name]));
+}
+
+function ifStopRailPoll() {
+  if (!ifPoll) return;
+  clearInterval(ifPoll.timer);
+  ifPoll = null;
+}
+
+function ifStartRailPoll(root, rail, picker, shells) {
+  ifStopRailPoll();
   const sel = shells.find((s) => s.shortname === ifSelected);
-  if (!sel) {
-    ifDetach();
-    if (shells.length) pane.append(el("div", { className: "card muted" }, "Select a shell on the left."));
-    return;
-  }
-  if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
-  if (sel.availability === "working") {
-    ifDetach();
-    return ifWorkingPane(pane, sel, root);
-  }
-  if (sel.availability === "lost" || sel.availability === "error" || sel.availability === "unreconciled") {
-    ifDetach();
-    return ifRecoveryPane(pane, sel, root);
-  }
-  if (sel.availability === "starting") return ifStartingPane(pane, sel, root);
-  return ifSessionPane(pane, sel);   // verified occupied generation only
+  ifPoll = { root, rail, picker, sig: ifRailSig(shells), timer: null,
+    rendered: sel ? sel.availability : null };   // what the pane was built for
+  ifPoll.timer = setInterval(ifPollRail, IF_POLL_MS);
+}
+
+async function ifPollRail() {
+  const p = ifPoll;
+  // A background tab has no one watching; a detached rail means some other
+  // render already replaced us and this tick is stale.
+  if (!p || document.hidden || !p.rail.isConnected) return;
+  let shells;
+  try { ({ shells } = await apiIf("/interface/shells")); }
+  catch { return; }              // transient — the next tick retries
+  if (!Array.isArray(shells)) return;                // nothing to repaint from
+  if (ifPoll !== p || !p.rail.isConnected) return;   // re-rendered while in flight
+  const sig = ifRailSig(shells);
+  if (sig === p.sig) return;
+  p.sig = sig;
+  const sel = shells.find((s) => s.shortname === ifSelected);
+  const now = sel ? sel.availability : null;
+  // Same catch the router's load() puts around a view render — without it a
+  // single failed re-render rejects into nothing, having already blanked the
+  // view and stopped the poll.
+  if (now !== p.rendered)
+    return void renderInterface(p.root).catch((e) => p.root.replaceChildren(
+      el("div", { className: "card" }, "error: " + e.message)));
+  ifBuildRail(p.rail, p.picker, shells);
 }
 
 // A reservation is not a terminal. It exposes only Cancel start; cached output,
@@ -3676,7 +3745,7 @@ function show(tab) {
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
-  if (tab !== "interface") ifDetach();   // leaving the tab drops the stream + lease
+  if (tab !== "interface") { ifDetach(); ifStopRailPoll(); }   // leaving drops stream + lease + poll
   load(tab);
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
