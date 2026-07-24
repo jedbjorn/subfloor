@@ -384,8 +384,9 @@ def run_stream(ws_url: str, role: str, start_seq: int,
     flips the client READ-ONLY with a loud notice — input stops, output
     continues (the browser's flip for a lost lease). Routine control frames
     (input_ack, heartbeat acks, unchanged state) are never echoed: raw-mode
-    stderr carries errors and state transitions only, so the attached TUI
-    isn't garbled. 0x00/0x04 payloads → stdout, 0x03 resize on start +
+    stderr carries errors, state transitions, and one attach line naming the
+    review GUI (decision #52) — nothing else, so the attached TUI isn't
+    garbled. 0x00/0x04 payloads → stdout, 0x03 resize on start +
     SIGWINCH, 20s writer heartbeat (halted on read-only), clean exit on
     close/terminated. The writer lease is released on the way out (a
     closing client releases only ITS lease — tmux and the harness
@@ -477,12 +478,23 @@ def run_stream(ws_url: str, role: str, start_seq: int,
         t.start()
 
     out = sys.stdout.buffer
+    # The review GUI link, stated once into the session the operator is
+    # actually looking at (decision #52). It rides the FIRST pane payload
+    # rather than preceding the loop: attach opens with a full-screen
+    # redraw, so a line printed before it is painted over by the very next
+    # write. The link lives on a different port per fork, and `./sc enter`
+    # now hands the terminal straight to the harness — this is the only
+    # place inside the session view that restates it.
+    announced = False
     try:
         for message in ws:
             if isinstance(message, bytes):
                 if message[:1] in (b"\x00", b"\x04"):
                     out.write(message[1:])
                     out.flush()
+                    if not announced:
+                        announced = True
+                        notice(f"Review GUI {API_BASE}  ·  recall: ./sc url")
                 continue
             msg = json.loads(message)
             mtype = msg.get("type")

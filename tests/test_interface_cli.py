@@ -714,6 +714,51 @@ class RunStreamTest(unittest.TestCase):
         self.assertNotIn("\x1b[2m", text, "no dimmed per-frame echo in raw "
                                           "mode — transitions/errors only")
 
+    def _capture_stdout(self):
+        """run_stream writes pane payloads to sys.stdout.buffer — hand it a
+        BytesIO so the test can read them instead of the terminal."""
+        fake = mock.Mock(buffer=io.BytesIO())
+        patch = mock.patch.object(ic.sys, "stdout", fake)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return fake.buffer
+
+    def test_attach_names_the_review_gui_once_riding_the_first_payload(self):
+        """Decision #52. `./sc enter` hands the terminal straight to the
+        harness, so the session view is the only surface left that can name
+        the GUI — and the GUI is on a different port per fork.
+
+        It has to ride the first pane payload: attach opens with a
+        full-screen redraw, and a line printed before that redraw is painted
+        straight over by it. It also has to fire exactly once — this sits in
+        the output hot path, and a line per pane write would make the
+        session unusable."""
+        ws, stdin = FakeWS(), StdinScript()
+        pane = self._capture_stdout()
+        t, err = self.run_stream(ws, stdin, role="viewer")
+
+        # Control frames before any pane bytes: still no link, or the redraw
+        # that follows would erase it.
+        ws.feed(json.dumps({"type": "lifecycle", "lifecycle": "running",
+                            "composer": "idle"}))
+        self.assertTrue(wait_for(lambda: "lifecycle running" in err.getvalue()))
+        self.assertNotIn("Review GUI", err.getvalue())
+
+        ws.feed(b"\x04REDRAW")
+        self.assertTrue(wait_for(lambda: "Review GUI" in err.getvalue()))
+        self.assertIn(ic.API_BASE, err.getvalue())
+        self.assertIn("./sc url", err.getvalue(),
+                      "the line names the durable recall path, not just a URL")
+
+        ws.feed(b"\x00OUTPUT")
+        ws.feed(b"\x00MORE")
+        self.assertTrue(wait_for(lambda: pane.getvalue() == b"REDRAWOUTPUTMORE"))
+        self.assertEqual(err.getvalue().count("Review GUI"), 1,
+                         "once per attach, not once per pane write")
+        ws.end()
+        t.join(10)
+        self.assertFalse(t.is_alive())
+
 
 class RawLaunchRefusalTest(unittest.TestCase):
     """run.py's public interactive entry refuses without the reservation

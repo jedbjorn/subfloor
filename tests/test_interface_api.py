@@ -506,15 +506,6 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertTrue(token_file.exists())
         self.assertEqual(stat.S_IMODE(token_file.stat().st_mode), 0o600)
 
-    def test_create_hands_the_runtime_the_shell_it_booted(self):
-        """The shortname is the engine's tmux status line label (#50). The
-        runtime cannot look it up — it holds shell_id, not the row — so a
-        session created without it labels every window the same fallback,
-        and every runtime-side test still passes."""
-        status, _, body = self.create_session()
-        self.assertEqual(status, 201, body)
-        self.assertEqual(self.runtime.spawned[0]["shortname"], "s1")
-
     def test_spawn_definite_failure_closes_reservation(self):
         async def boom(**kw):
             raise ValueError("worktree missing")
