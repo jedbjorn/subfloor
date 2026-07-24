@@ -51,6 +51,7 @@ import errno
 import io
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import stat
@@ -1355,7 +1356,7 @@ class WorktreeTest(RecoveryCase):
                                    confirm_shortname="s1")
         self.assertEqual(status, 200, result)
         self.assertTrue(result["worktree"]["discarded"], result["worktree"])
-        self.assertEqual(result["worktree"]["completed"], ["restore", "remove"])
+        self.assertEqual(result["worktree"]["completed"], ["remove", "restore"])
         self.assertFalse((wt / "staged.txt").exists())
         self.assertFalse((wt / "untracked.txt").exists())
         self.assertTrue(wt.is_dir())   # the worktree itself is never deleted
@@ -1691,6 +1692,87 @@ class WorktreeTest(RecoveryCase):
         # a surviving DIRECTORY is reported, but every consented FILE is gone
         self.assertTrue(result["discarded"], result)
 
+    def df_worktree(self, obstruction: str, *, ignored: bool) -> str:
+        """HEAD tracks the FILE `node`; the worktree has replaced it with a
+        DIRECTORY holding `obstruction`. `git diff HEAD` names `node`, so the
+        plan enumerates it — as one entity, `dir:…`, which says nothing about
+        what is inside."""
+        wt = self.make_git_worktree()
+
+        def git(*args):
+            subprocess.run(["git", "-C", wt, *args], check=True,
+                           capture_output=True)
+
+        (Path(wt) / ".gitignore").write_text("*.pyc\n")
+        (Path(wt) / "node").write_text("the committed file")
+        git("add", ".gitignore", "node")
+        git("commit", "-qm", "node")
+        (Path(wt) / "node").unlink()
+        (Path(wt) / "node").mkdir()
+        (Path(wt) / "node" / obstruction).write_text("not in the delete set"
+                                                     if ignored else "consented")
+        return wt
+
+    def test_tracked_path_now_a_dir_of_ignored_files_is_not_restored_over(self):
+        # SC-103, and no concurrent writer is needed. `git restore` on a path
+        # the worktree turned into a directory deletes the DIRECTORY — here
+        # taking an ignored file the plan never enumerated, so the bounded-set
+        # claim failed on the command's own footprint rather than on a race.
+        wt = self.df_worktree("cache.pyc", ignored=True)
+        plan = self.plan(wt)
+        self.assertIn("node", plan["tracked"])
+        self.assertNotIn("node/cache.pyc", plan["untracked_files"])
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertIsNone(result["failed"], result)
+        self.assertEqual((Path(wt) / "node" / "cache.pyc").read_text(),
+                         "not in the delete set")
+        self.assertEqual(result["kept"], ["node"])
+        self.assertFalse(result["discarded"])
+        # the rest of the confirmed set still went
+        self.assertFalse((Path(wt) / "untracked.txt").exists())
+
+    def test_tracked_path_now_a_dir_of_enumerated_files_is_restored(self):
+        # The other half, and the truth bug: with the obstruction ENUMERATED,
+        # restoring first deleted it as collateral and the removal loop then
+        # saw it gone, decided it had "changed", and reported it kept — a file
+        # named as spared that the discard had in fact just erased. Removing
+        # first empties the directory, so the restore is bounded and the
+        # report is true.
+        wt = self.df_worktree("u.txt", ignored=False)
+        plan = self.plan(wt)
+        self.assertIn("node/u.txt", plan["untracked_files"])
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertIsNone(result["failed"], result)
+        self.assertEqual((Path(wt) / "node").read_text(), "the committed file")
+        self.assertEqual(result["kept"], [])
+        self.assertTrue(result["discarded"], result)
+
+    def test_tracked_dir_now_a_file_is_restored(self):
+        # The mirror: HEAD tracks `d/x`, the worktree replaced `d` with a
+        # FILE. Restoring first cannot create `d/x` through it — and under the
+        # old order the restore deleted the untracked file `d` and the removal
+        # loop then reported it kept. Removal first clears the path.
+        wt = self.make_git_worktree()
+
+        def git(*args):
+            subprocess.run(["git", "-C", wt, *args], check=True,
+                           capture_output=True)
+
+        (Path(wt) / "d").mkdir()
+        (Path(wt) / "d" / "x").write_text("committed")
+        git("add", "d/x")
+        git("commit", "-qm", "d")
+        shutil.rmtree(Path(wt) / "d")
+        (Path(wt) / "d").write_text("a file now")
+        plan = self.plan(wt)
+        self.assertIn("d/x", plan["tracked"])
+        self.assertIn("d", plan["untracked_files"])
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertIsNone(result["failed"], result)
+        self.assertEqual((Path(wt) / "d" / "x").read_text(), "committed")
+        self.assertEqual(result["kept"], [])
+        self.assertTrue(result["discarded"], result)
+
     def test_dir_emptied_by_the_restore_goes_too(self):
         # Parity with the operation this replaces: `clean -fd` removed the
         # directory a staged-new file left behind. Git tracks no directories,
@@ -1796,9 +1878,45 @@ class WorktreeTest(RecoveryCase):
         self.assertTrue((Path(wt) / "untracked.txt").exists())
 
     def test_discard_git_failure_reports_exactly_what_completed(self):
-        # removal fails AFTER the restore succeeded and the closure committed:
-        # the response stays 200 and names the completed/failed steps — never a
-        # bare 500 that hides a partial discard.
+        # the restore fails AFTER the removal succeeded and the closure
+        # committed: the response stays 200 and names the completed/failed
+        # steps — never a bare 500 that hides a partial discard.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        real_run = recovery.subprocess.run
+
+        def failing_restore(*args, **kwargs):
+            if "restore" in args[0]:
+                return subprocess.CompletedProcess(
+                    args=args[0], returncode=1, stdout=b"",
+                    stderr=b"fatal: restore boom")
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(recovery.subprocess, "run",
+                               side_effect=failing_restore):
+            status, result = self.post(obj, preserve_worktree=False,
+                                       discard_worktree=True,
+                                       confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        wt_result = result["worktree"]
+        self.assertFalse(wt_result["discarded"])
+        self.assertEqual(wt_result["completed"], ["remove"])
+        self.assertEqual(wt_result["failed"]["step"], "restore")
+        self.assertIn("restore boom", wt_result["failed"]["error"])
+        # the removal ran (untracked gone), the restore did not (tracked is
+        # still dirty), and the durable closure still committed.
+        self.assertFalse((Path(wt) / "untracked.txt").exists())
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
+
+    def test_discard_remove_failure_stops_before_the_restore(self):
+        # The first step failing stops the sequence: nothing is restored, so a
+        # partial discard never reads as a completed one.
         wt = self.make_git_worktree()
         self.session_with_worktree(wt)
         obj = self.preview(1)
@@ -1813,18 +1931,11 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual(status, 200, result)
         wt_result = result["worktree"]
         self.assertFalse(wt_result["discarded"])
-        self.assertEqual(wt_result["completed"], ["restore"])
+        self.assertEqual(wt_result["completed"], [])
         self.assertEqual(wt_result["failed"]["step"], "remove")
         self.assertIn("untracked.txt", wt_result["failed"]["error"])
-        # the restore ran (tracked restored), the removal did not (untracked
-        # survives), and the durable closure still committed.
-        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
         self.assertTrue((Path(wt) / "untracked.txt").exists())
-        con = self.db()
-        self.assertEqual(con.execute(
-            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
-        ).fetchone()[0], "ended")
-        con.close()
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
 
     def test_discard_git_timeout_reported_not_raised(self):
         wt = self.make_git_worktree()
@@ -1844,7 +1955,7 @@ class WorktreeTest(RecoveryCase):
                                        confirm_shortname="s1")
         self.assertEqual(status, 200, result)
         self.assertFalse(result["worktree"]["discarded"])
-        self.assertEqual(result["worktree"]["completed"], [])
+        self.assertEqual(result["worktree"]["completed"], ["remove"])
         self.assertEqual(result["worktree"]["failed"]["step"], "restore")
 
 

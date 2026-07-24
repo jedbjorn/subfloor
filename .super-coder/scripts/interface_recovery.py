@@ -600,6 +600,16 @@ def _unpushed_count(worktree: str) -> int:
         raise refuse("rev-list --count gave a non-numeric answer") from exc
 
 
+def _is_dir(path: str) -> bool:
+    """A REAL directory at this path — lstat, so a symlink to one is not it.
+    `git restore` replaces a symlink outright; only a directory makes it
+    recurse."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def _prune_dirs(worktree: str, plan: dict) -> list[str]:
     """Remove the enumerated untracked directories once their enumerated files
     are gone. Returns the enumerated roots that are still there.
@@ -645,14 +655,19 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     existing. The blast radius is exactly what the preview showed, which is
     what decision #41 requires of a consented destructive path.
 
+    Bounding the SET is not enough on its own, because one git command's own
+    footprint can exceed the path it is given: `git restore` on a path the
+    worktree has turned into a directory deletes that directory whole,
+    ignored files and all (SC-103). So the removal runs FIRST — clearing the
+    enumerated entries out of such a directory — and a path still standing as
+    a directory afterwards is left alone rather than restored over.
+
     Each entry is also re-verified against the identity the fence observed,
     immediately before it is touched, and left alone when it no longer
     matches — so a path is only ever removed while it still IS what the
     operator was shown. That check narrows, and does not close, the window
     between the check and the `unlink`/`restore` itself: no filesystem offers
-    "remove only if unchanged". What it does close is the case that window
-    used to swallow whole — work written during the several-millisecond
-    `git restore` spawn now survives.
+    "remove only if unchanged".
 
     Runs AFTER the durable closure is committed, so a failure here must never
     escape as a 500 that hides what happened: each step's outcome is recorded
@@ -680,12 +695,58 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
         if len(result["kept"]) < _KEPT_REPORTED:
             result["kept"].append(rel)
 
-    # -- restore the enumerated tracked paths -------------------------------
-    # Born HEAD: index + worktree back to HEAD. Unborn: HEAD holds nothing, so
-    # "back to HEAD" means dropping the index entry — the file then falls into
-    # the removal step below with the untracked ones.
+    # Decided BEFORE anything moves, because the removal below is what clears
+    # a directory sitting on a tracked path — after it, "absent" is our own
+    # doing and would read as a change.
     for rel in plan["tracked"]:
         (restore.append if unchanged(rel) else keep)(rel)
+
+    # -- remove the enumerated untracked entries ----------------------------
+    # FIRST, and that ordering is load-bearing (SC-103). `git restore` on a
+    # path the worktree has turned into a DIRECTORY deletes that directory
+    # whole — everything under it, enumerated or not. Removing the enumerated
+    # entries first empties such a directory so the restore has nothing to
+    # recurse through; whatever is left afterwards was never in the delete set,
+    # and the restore below refuses to run over it.
+    removable = list(plan["untracked_files"])
+    if not plan["head"]:
+        # Unborn: `git rm --cached` never touches the worktree, so these files
+        # are removed here with the untracked ones and unstaged below.
+        removable += restore
+    removed = []
+    for rel in sorted(removable):
+        if not unchanged(rel):
+            keep(rel)
+            continue
+        try:
+            os.unlink(os.path.join(worktree, rel))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            result["failed"] = {"step": "remove",
+                                "error": f"{rel[-120:]}: errno {exc.errno}"}
+            return result
+        removed.append(rel)
+    for rel in _prune_dirs(worktree, plan):
+        keep(rel, is_file=False)
+    result["completed"].append("remove")
+
+    # -- restore the enumerated tracked paths -------------------------------
+    # Born HEAD: index + worktree back to HEAD. Unborn: HEAD holds nothing, so
+    # "back to HEAD" is just dropping the index entry — and only for entries
+    # the removal above actually handled.
+    if plan["head"]:
+        standing = [rel for rel in restore
+                    if _is_dir(os.path.join(worktree, rel))]
+        for rel in standing:
+            # Still a directory, so it holds something the discard was not
+            # allowed to remove — an ignored file, a nested repository, work
+            # written later. Restoring would erase it as collateral, so the
+            # path is left exactly as it is and reported.
+            keep(rel)
+        restore = [rel for rel in restore if rel not in set(standing)]
+    else:
+        restore = [rel for rel in restore if rel in set(removed)]
     if restore:
         args = ["restore", "--source=HEAD", "--staged", "--worktree"] \
             if plan["head"] else ["rm", "--cached", "--force", "--quiet"]
@@ -705,26 +766,6 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
                 "error": out.stderr.decode("utf-8", "replace").strip()[-200:]}
             return result
     result["completed"].append("restore")
-
-    # -- remove the enumerated untracked entries ----------------------------
-    removable = list(plan["untracked_files"])
-    if not plan["head"]:
-        removable += restore          # just unstaged; the files are still there
-    for rel in sorted(removable):
-        if not unchanged(rel):
-            keep(rel)
-            continue
-        try:
-            os.unlink(os.path.join(worktree, rel))
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            result["failed"] = {"step": "remove",
-                                "error": f"{rel[-120:]}: errno {exc.errno}"}
-            return result
-    for rel in _prune_dirs(worktree, plan):
-        keep(rel, is_file=False)
-    result["completed"].append("remove")
     # A surviving DIRECTORY does not make the discard incomplete. It stands
     # because it holds something outside the delete set — an ignored file, a
     # nested repository, work written after the confirmation — and `clean -fd`
