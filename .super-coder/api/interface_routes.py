@@ -2100,6 +2100,19 @@ def _path_id(path: str, segment: int = -1) -> int:
         raise _BadPathId(f"invalid path identifier: {path!r}")
 
 
+def _route_shape(path: str, *segments: str | None) -> bool:
+    """Match one exact route shape; ``None`` is a single-segment wildcard."""
+    parts = path.split("/")
+    return (
+        len(parts) == len(segments) + 1
+        and parts[0] == ""
+        and all(
+            expected is None or actual == expected
+            for actual, expected in zip(parts[1:], segments)
+        )
+    )
+
+
 def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     from urllib.parse import parse_qs, urlparse
     headers = _parse_headers(headers_raw)
@@ -2150,20 +2163,25 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     try:
         if p == "/api/interface/shells" and method == "GET":
             return _list_shells()
-        if p.startswith("/api/interface/shells/") and p.endswith("/recovery"):
+        if _route_shape(
+                p, "api", "interface", "shells", None, "recovery"):
             if method == "GET":
                 return _get_recovery(_path_id(p, -2))
             if method == "POST":
                 return _post_recovery(actor, headers, data, _path_id(p, -2))
         if p == "/api/interface/sessions" and method == "POST":
             return _create_session(actor, headers, data)
-        if p.startswith("/api/interface/sessions/") and method == "GET":
+        if _route_shape(
+                p, "api", "interface", "sessions", None) \
+                and method == "GET":
             return _get_session(_path_id(p))
         if p == "/api/interface/stream-tickets" and method == "POST":
             return _mint_ticket(actor, headers, data)
         if p == "/api/interface/writer-leases" and method == "POST":
             return _acquire_lease(actor, headers, data)
-        if p.startswith("/api/interface/writer-leases/") and method == "DELETE":
+        if _route_shape(
+                p, "api", "interface", "writer-leases", None) \
+                and method == "DELETE":
             return _release_lease(actor, headers, data, _path_id(p))
         if p == "/api/interface/clean-certifications" and method == "POST":
             return _certify_clean(actor, headers, data)
@@ -2177,19 +2195,24 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _binding_status(actor, query)
         if p == "/api/interface/sprint-alerts" and method == "GET":
             return _sprint_alerts(actor, query)
-        if p.startswith("/api/interface/sprint-alerts/") \
-                and p.endswith("/acknowledge") and method == "POST":
+        if _route_shape(
+                p, "api", "interface", "sprint-alerts", None,
+                "acknowledge") and method == "POST":
             return _acknowledge_alert(
                 actor, headers, data, _path_id(p, -2))
-        if p.startswith("/api/interface/sprint-bindings/") \
-                and p.endswith("/retry") and method == "POST":
+        if _route_shape(
+                p, "api", "interface", "sprint-bindings", None,
+                "retry") and method == "POST":
             return _retry_binding(actor, headers, data, _path_id(p, -2))
-        if p.startswith("/api/interface/sprint-bindings/") \
+        if _route_shape(
+                p, "api", "interface", "sprint-bindings", None) \
                 and method == "DELETE":
             return _release_binding(actor, headers, data, _path_id(p))
         if p == "/api/planner-action-receipts" and method == "POST":
             return _begin_receipt(actor, headers, data)
-        if p.startswith("/api/planner-action-receipts/") and method == "PATCH":
+        if _route_shape(
+                p, "api", "planner-action-receipts", None) \
+                and method == "PATCH":
             return _update_receipt(actor, headers, data, _path_id(p))
         return _err(404, "no_such_route", f"no route: {method} {p}")
     except _BadPathId as exc:

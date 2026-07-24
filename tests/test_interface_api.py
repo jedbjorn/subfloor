@@ -817,6 +817,27 @@ class InterfaceApiTest(unittest.TestCase):
              "lease_token": token2})
         self.assertEqual(status, 201)
         self.assertIn("ticket", body)
+
+    def test_extra_segment_writer_release_does_not_revoke_lease(self):
+        sid = self.occupy()
+        status, _, lease = self.acquire_lease(sid)
+        self.assertEqual(status, 201, lease)
+        lease_id = lease["lease_id"]
+
+        status, _, body = self.call(
+            "DELETE",
+            f"/api/interface/writer-leases/999/{lease_id}",
+            (OP, "Idempotency-Key: malformed-release"),
+            {"lease_token": lease["lease_token"]})
+
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            row = con.execute(
+                "SELECT revoked_at, revoke_reason "
+                "FROM interface_writer_leases WHERE lease_id=?",
+                (lease_id,)).fetchone()
+        self.assertEqual(row, (None, None))
         # Viewer ticket needs no lease.
         status, _, body = self.call(
             "POST", "/api/interface/stream-tickets",
@@ -1508,6 +1529,15 @@ class InterfaceApiTest(unittest.TestCase):
                                     (OP,))
         self.assertEqual(status, 422)
         self.assertEqual(body["error"]["code"], "invalid_path_id")
+
+    def test_extra_segment_session_read_is_404(self):
+        status, _, created = self.create_session()
+        self.assertEqual(status, 201, created)
+        status, _, body = self.call(
+            "GET", f"/api/interface/sessions/999/{created['session_id']}",
+            (OP,))
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
 
     def test_unknown_route_still_404(self):
         status, _, body = self.call("GET", "/api/interface/bogus", (OP,))

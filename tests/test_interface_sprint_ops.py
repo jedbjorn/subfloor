@@ -347,6 +347,30 @@ class SprintOpsRoutesTest(unittest.TestCase):
         self.assertIn("meaning", body["alerts"][0])
         self.assertIn("next_action", body["alerts"][0])
 
+    def test_extra_segment_alert_acknowledgement_leaves_alert_open(self):
+        con = sqlite3.connect(self.db_path)
+        interface_broker._alert(
+            con, severity="warning", reason="turn_failure",
+            session_id=self.sid)
+        alert_id = con.execute(
+            "SELECT alert_id FROM planner_alerts WHERE session_id=?",
+            (self.sid,)).fetchone()[0]
+        con.commit()
+        con.close()
+
+        status, body = self.call(
+            "POST",
+            f"/api/interface/sprint-alerts/999/{alert_id}/acknowledge",
+            (OP, "Idempotency-Key: malformed-ack"), {})
+
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+        self.assertEqual(
+            self.q(
+                "SELECT acknowledged_at, acknowledged_by, resolved_at "
+                "FROM planner_alerts WHERE alert_id=?", (alert_id,)),
+            (None, None, None))
+
     def test_planner_alert_query_defaults_to_current_generation(self):
         con = sqlite3.connect(self.db_path)
         con.execute(
@@ -411,6 +435,60 @@ class SprintOpsRoutesTest(unittest.TestCase):
             "SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL"))
         # The coordinator was signalled — the drain re-gates from live state.
         self.assertIn(binding_id, self.coordinator.bindings)
+
+    def test_extra_segment_binding_retry_leaves_parked_work_unchanged(self):
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        mid = self.queue_message()
+        batch = self.park_batch(binding_id, mid)
+        notifications_before = list(self.coordinator.bindings)
+
+        status, body = self.call(
+            "POST",
+            f"/api/interface/sprint-bindings/999/{binding_id}/retry",
+            (OP, "Idempotency-Key: malformed-retry"),
+            {"outcome": "not_delivered"})
+
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+        self.assertEqual(
+            self.q(
+                "SELECT state, completed_at FROM planner_wake_batches "
+                "WHERE batch_id=?", (batch,)),
+            ("delivery_unknown", None))
+        self.assertEqual(
+            self.q(
+                "SELECT state, batch_id FROM planner_wake_items "
+                "WHERE message_id=?", (mid,)),
+            ("batched", batch))
+        self.assertEqual(
+            self.q(
+                "SELECT delivery FROM interface_input_state "
+                "WHERE session_id=?", (self.sid,))[0],
+            "delivery_unknown")
+        self.assertIsNotNone(self.q(
+            "SELECT 1 FROM planner_alerts WHERE binding_id=? "
+            "AND resolved_at IS NULL", (binding_id,)))
+        self.assertEqual(self.coordinator.bindings, notifications_before)
+
+    def test_extra_segment_binding_release_leaves_binding_armed(self):
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+
+        status, body = self.call(
+            "DELETE",
+            f"/api/interface/sprint-bindings/999/{binding_id}",
+            (OP, "Idempotency-Key: malformed-binding-release"),
+            {"reason": "must not release"})
+
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+        self.assertEqual(
+            self.q(
+                "SELECT released_at, release_reason "
+                "FROM sprint_planner_bindings WHERE binding_id=?",
+                (binding_id,)),
+            (None, None))
 
     def test_retry_presend_stalled_resignals(self):
         _, body = self.arm()
@@ -544,6 +622,29 @@ class SprintOpsRoutesTest(unittest.TestCase):
                                 "WHERE batch_id=?", (batch,))[0], "complete")
         self.assertEqual(self.q("SELECT COUNT(*) FROM planner_wake_items "
                                 "WHERE state='queued'")[0], 1)
+
+    def test_extra_segment_receipt_patch_leaves_intent_unchanged(self):
+        status, body = self.call(
+            "POST", "/api/planner-action-receipts",
+            (SHELL1, "Idempotency-Key: malformed-receipt-begin"),
+            {"operation": "merge", "target": "#42"})
+        self.assertEqual(status, 201, body)
+        receipt_id = body["receipt_id"]
+
+        status, body = self.call(
+            "PATCH",
+            f"/api/planner-action-receipts/999/{receipt_id}",
+            (SHELL1, "Idempotency-Key: malformed-receipt-patch"),
+            {"state": "complete"})
+
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+        self.assertEqual(
+            self.q(
+                "SELECT state, completed_at, reconciled_at "
+                "FROM planner_action_receipts WHERE receipt_id=?",
+                (receipt_id,)),
+            ("intent", None, None))
 
 
 class SprintCloseTest(unittest.TestCase):

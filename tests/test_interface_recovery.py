@@ -442,6 +442,30 @@ class ProcessGroupSignalTest(unittest.TestCase):
 
 class ExecuteTest(RecoveryCase):
 
+    def test_extra_segment_recovery_leaves_session_unchanged(self):
+        sid = self.make_session(
+            1, occupancy="reserved", lifecycle="starting",
+            pane_pid=None, pane_ticks=None, pane_id=None)
+        observation = self.preview(1)
+
+        status, body = self.call(
+            "POST", "/api/interface/shells/999/1/recovery", (OP, IDEM),
+            {"observation_id": observation["observation_id"],
+             "mode": "recover"})
+
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body["error"]["code"], "no_such_route")
+        with contextlib.closing(self.db()) as con:
+            session = con.execute(
+                "SELECT occupancy, lifecycle, ended_at, end_reason "
+                "FROM interface_sessions WHERE session_id=?",
+                (sid,)).fetchone()
+            generation = con.execute(
+                "SELECT ended_at FROM interface_generations "
+                "WHERE shell_id=1 AND generation=1").fetchone()
+        self.assertEqual(session, ("reserved", "starting", None, None))
+        self.assertEqual(generation, (None,))
+
     def test_recover_closes_everything_atomically(self):
         sid = self.make_session(1, occupancy="reserved", lifecycle="starting",
                                 pane_pid=None, pane_ticks=None, pane_id=None,
