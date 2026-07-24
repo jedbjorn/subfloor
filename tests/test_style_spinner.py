@@ -118,7 +118,7 @@ class ShellStatusTest(unittest.TestCase):
             self.assertEqual("Unknown",
                              run._shell_status(sprint_shell, partial).strip())
 
-    def test_only_active_unfrozen_sprint_docs_reserve_shells(self) -> None:
+    def _sprint_db(self):
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.row_factory = sqlite3.Row
@@ -153,6 +153,10 @@ class ShellStatusTest(unittest.TestCase):
                 (5, 'Bad marker', 'DEV4', '', 0, 'dev', 'SPRINT doc=oops unit=4', 1, 0),
                 (6, 'Bad tracker', 'DEV5', '', 0, 'dev', 'SPRINT doc=24 unit=5', 1, 0);
         """)
+        return con
+
+    def test_only_active_unfrozen_sprint_docs_reserve_shells(self) -> None:
+        con = self._sprint_db()
 
         shells = {shell["shortname"]: shell
                   for shell in run.list_shells(con, user_id=1)}
@@ -188,6 +192,129 @@ class ShellStatusTest(unittest.TestCase):
         self.assertIs(shell, chosen)
         self.assertIn("Shortname     Status      Default", stdout.getvalue())
         self.assertIn("DEV1          Available", stdout.getvalue())
+
+
+class SprintRefTest(unittest.TestCase):
+    """shell_memory_archives.sprint_ref (migration 0071) is what lets the
+    Interface rail name WHICH sprint a working shell is on (flag #94). The
+    recording path always worked; nothing ever set the value. Source priority
+    per the planner's ruling: explicit SC_SPRINT_REF, then the armed
+    sprint_planner_bindings row, then NULL. current_state's `SPRINT doc=`
+    marker is deliberately NOT a source — it is prose."""
+
+    def _bindings(self, *armed, released=()):
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.executescript("""
+            CREATE TABLE sprint_planner_bindings (
+                binding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sprint_doc_id INTEGER NOT NULL,
+                planner_shell_id INTEGER NOT NULL,
+                released_at TEXT);
+        """)
+        for doc in armed:
+            con.execute("INSERT INTO sprint_planner_bindings "
+                        "(sprint_doc_id, planner_shell_id) VALUES (?, 9)",
+                        (doc,))
+        for doc in released:
+            con.execute("INSERT INTO sprint_planner_bindings "
+                        "(sprint_doc_id, planner_shell_id, released_at) "
+                        "VALUES (?, 9, '2026-07-24T00:00:00Z')", (doc,))
+        con.commit()
+        return con
+
+    def test_explicit_env_wins_over_the_armed_binding(self) -> None:
+        con = self._bindings(38)
+        with mock.patch.dict(run.os.environ, {"SC_SPRINT_REF": "40"},
+                             clear=True):
+            self.assertEqual("40", run.resolve_sprint_ref(con))
+
+    def test_explicitly_empty_env_declares_a_non_sprint_boot(self) -> None:
+        """Set-but-empty is meaningful: it opts a known non-sprint boot out of
+        the armed-binding fallback rather than falling through to it."""
+        con = self._bindings(38)
+        for blank in ("", "   "):
+            with self.subTest(blank=blank):
+                with mock.patch.dict(run.os.environ,
+                                     {"SC_SPRINT_REF": blank}, clear=True):
+                    self.assertIsNone(run.resolve_sprint_ref(con))
+
+    def test_armed_binding_is_the_fallback(self) -> None:
+        con = self._bindings(38)
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            self.assertEqual("38", run.resolve_sprint_ref(con))
+
+    def test_released_binding_stamps_nothing(self) -> None:
+        """Released transactionally at sprint close — a closed sprint must
+        stop labelling later boots."""
+        con = self._bindings(released=(38,))
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            self.assertIsNone(run.resolve_sprint_ref(con))
+
+    def test_two_armed_sprints_refuse_to_guess(self) -> None:
+        con = self._bindings(31, 38)
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            self.assertIsNone(run.resolve_sprint_ref(con))
+
+    def test_one_sprint_bound_twice_still_resolves(self) -> None:
+        """Re-arming the same sprint is not ambiguity — DISTINCT collapses it."""
+        con = self._bindings(38, 38)
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            self.assertEqual("38", run.resolve_sprint_ref(con))
+
+    def test_missing_table_never_blocks_a_boot(self) -> None:
+        """A fork mid-migration degrades to no label, not a failed launch."""
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            self.assertIsNone(run.resolve_sprint_ref(con))
+
+    def test_current_state_prose_is_never_a_source(self) -> None:
+        """The ruling's whole point: a shell whose current_state names an
+        ACTIVE sprint doc still stamps nothing without a binding or the env.
+        Deriving hard state from prose is the defect class this unit fixes."""
+        con = self._bindings()
+        con.executescript("""
+            CREATE TABLE shells (
+                shell_id INTEGER PRIMARY KEY, display_name TEXT,
+                shortname TEXT, mandate TEXT,
+                is_shared INTEGER NOT NULL DEFAULT 0, flavor TEXT,
+                current_state TEXT, user_id INTEGER,
+                is_deleted INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE documents (
+                document_id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+                frozen INTEGER NOT NULL DEFAULT 0, body TEXT);
+            INSERT INTO documents VALUES (38,'doc',0,'# SPRINT\nstatus: ACTIVE');
+            INSERT INTO shells VALUES
+                (1,'Dev','DEV6','',0,'dev','SPRINT doc=38 unit=4',1,0);
+        """)
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            self.assertIsNone(run.resolve_sprint_ref(con))
+
+    def test_headless_boot_writes_the_resolved_ref_onto_the_archive(self) -> None:
+        """End to end through open_session: the column the rail reads is
+        populated by a `./sc run` boot, not left NULL."""
+        con = self._bindings(38)
+        con.executescript("""
+            CREATE TABLE shells (
+                shell_id INTEGER PRIMARY KEY, active_archive_id INTEGER);
+            CREATE TABLE shell_memory_archives (
+                archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shell_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+                date TEXT NOT NULL, full_narrative TEXT NOT NULL,
+                started_at TEXT, harness TEXT, provider TEXT, model TEXT,
+                sprint_ref TEXT, UNIQUE (shell_id, session_id));
+            CREATE TABLE session_token_usage (archive_id INTEGER);
+            INSERT INTO shells VALUES (1, NULL);
+        """)
+        with mock.patch.dict(run.os.environ, {}, clear=True):
+            run.open_session(con, 1, lifecycle={
+                "harness": "claude", "provider": "anthropic", "model": "opus",
+                "sprint_ref": run.resolve_sprint_ref(con)})
+        self.assertEqual(
+            ("38",),
+            tuple(con.execute(
+                "SELECT sprint_ref FROM shell_memory_archives").fetchone()))
 
 
 class SpinnerTest(unittest.TestCase):
@@ -295,6 +422,8 @@ class BootPhaseLabelTest(unittest.TestCase):
         full = {"shell_id": 1, "display_name": "Dev One", "api_key": None}
         con = mock.Mock()
         con.execute.return_value.fetchone.return_value = full
+        # No armed sprint binding — resolve_sprint_ref stamps nothing.
+        con.execute.return_value.fetchall.return_value = []
         labels: list[str] = []
 
         @contextmanager

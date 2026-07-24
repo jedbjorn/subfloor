@@ -634,6 +634,49 @@ def _is_sprint_reserved(shell) -> bool:
     return bool(dict(shell).get("sprint_reserved"))
 
 
+def resolve_sprint_ref(con) -> "str | None":
+    """The tracker doc id to stamp on this boot's archive (migration 0071's
+    shell_memory_archives.sprint_ref) — the column that lets the Interface rail
+    and the session list name WHICH sprint a worker is on (flag #94). Designed
+    and left unwired: the recording path always worked, nothing ever set the
+    value.
+
+    Source priority is the planner's ruling, and deliberately excludes
+    current_state's `SPRINT doc=` marker: that is PROSE, and a surface deriving
+    hard state from prose is the exact defect class this unit exists to fix —
+    a shell whose state does not name the doc yields nothing, a stale mention
+    yields a confidently WRONG ref.
+
+    1. An explicit SC_SPRINT_REF wins — the designed hook, now set as standard
+       practice on planner-issued worker boots. Set-but-empty is meaningful:
+       it declares 'not a sprint boot' and stamps nothing.
+    2. Otherwise the ARMED BINDING: sprint_planner_bindings holds one
+       authoritative row per active sprint and is released transactionally at
+       sprint close, so it needs neither caller discipline nor prose parsing.
+       Exactly one armed sprint or nothing — two would be a guess.
+    3. Neither resolves → NULL. Never guess.
+
+    Rung 2's known approximation, accepted deliberately: the binding records
+    WHICH SPRINT IS ARMED, not which shells enlisted in it, so a non-sprint
+    boot during an active sprint is stamped with that sprint. Rung 1 is the
+    normal path and is exact; rung 2 is a best-effort safety net for
+    hand-booted or legacy workers, and an explicitly empty SC_SPRINT_REF opts
+    any known non-sprint boot out of it.
+
+    Best-effort throughout: a fork mid-migration without the table degrades to
+    None rather than failing a boot. TEXT, matching the column and server.py's
+    CAST join to documents."""
+    if "SC_SPRINT_REF" in os.environ:
+        return os.environ["SC_SPRINT_REF"].strip() or None
+    try:
+        armed = con.execute(
+            "SELECT DISTINCT sprint_doc_id FROM sprint_planner_bindings "
+            "WHERE released_at IS NULL").fetchall()
+    except db_driver.OperationalError:
+        return None
+    return str(armed[0][0]) if len(armed) == 1 else None
+
+
 def _shell_status(shell, snap: "dict | None") -> str:
     """Styled picker status derived from liveness plus sprint reservation."""
     if shell["flavor"] == "admin":
@@ -1319,7 +1362,7 @@ def main() -> None:
                 "harness": harness,
                 "provider": session_provider(harness, session_model),
                 "model": session_model,
-                "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+                "sprint_ref": resolve_sprint_ref(con),
             })
         except SessionOpenError as exc:
             con.close()

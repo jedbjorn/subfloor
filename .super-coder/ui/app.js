@@ -2189,8 +2189,11 @@ function ifDetach() {
 }
 window.addEventListener("pagehide", ifDetach);
 
+// `working` is amber, not red (flag #94): a live non-orphan harness holds the
+// worktree — someone is genuinely working outside the Interface. Only the
+// orphan verdict (`unreconciled`) is a stranded remnant worth recovering.
 const IF_BADGE = { available: "ok", starting: "warn", occupied: "accent",
-  lost: "bad", error: "bad", unreconciled: "bad" };
+  working: "warn", lost: "bad", error: "bad", unreconciled: "bad" };
 const IF_ATTACHABLE_LIFECYCLES = new Set(
   ["starting", "idle", "busy", "approval", "user_input"]);
 
@@ -2212,6 +2215,18 @@ const IF_LAUNCHED_TITLE =
 
 function ifLaunchedDisplay(route) {
   return { text: ifModelLabel(route) + " (launched)", title: IF_LAUNCHED_TITLE };
+}
+
+// The sprint a working shell is on, from the archive's sprint_ref (server-side
+// _sprint_context). Blank when the boot carried no sprint marker — an
+// unlabelled worker is still a worker, so absence never implies idle.
+function ifSprintLabel(sel) {
+  if (!sel || !sel.sprint_ref) return "";
+  return sel.sprint_title || "sprint #" + sel.sprint_ref;
+}
+function ifSprintSuffix(sel) {
+  const label = ifSprintLabel(sel);
+  return label ? " · " + label : "";
 }
 
 async function renderInterface(root) {
@@ -2252,6 +2267,7 @@ async function renderInterface(root) {
       s.shortname + (s.harness ? " · " + s.harness : ""));
     if (launched)
       sub.append(el("span", { title: launched.title }, " · " + launched.text));
+    sub.append(ifSprintSuffix(s));
     row.append(head, sub);
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
@@ -2259,7 +2275,7 @@ async function renderInterface(root) {
     const opt = el("option", { value: s.shortname },
       `${s.display_name || s.shortname} · ${s.shortname}` +
       `${s.harness ? " · " + s.harness : ""}${mobileModel}` +
-      ` · ${s.availability}`);
+      ` · ${s.availability}${ifSprintSuffix(s)}`);
     if (s.shortname === ifSelected) opt.selected = true;
     picker.append(opt);
   }
@@ -2272,6 +2288,10 @@ async function renderInterface(root) {
     return;
   }
   if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
+  if (sel.availability === "working") {
+    ifDetach();
+    return ifWorkingPane(pane, sel, root);
+  }
   if (sel.availability === "lost" || sel.availability === "error" || sel.availability === "unreconciled") {
     ifDetach();
     return ifRecoveryPane(pane, sel, root);
@@ -2581,6 +2601,35 @@ function ifRecoveryControls(host, sel, root) {
     previewBtn.disabled = false;
   };
   previewBtn.onclick = () => load();
+}
+
+// Working pane (flag #94): a LIVE non-orphan harness holds this shell's
+// worktree — a `./sc run` sprint worker, or any harness launched outside the
+// Interface. It is not a fault and it is not stranded, so this pane states
+// what is happening, names the sprint when the archive carries one, and does
+// NOT lead with recovery. New chat stays blocked exactly as before (the server
+// refuses with unmanaged_harness either way); recovery is still reachable, but
+// demoted behind the fact that killing it would destroy live work.
+function ifWorkingPane(pane, sel, root) {
+  const sprint = ifSprintLabel(sel);
+  const card = el("div", { className: "card" },
+    el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
+      el("span", { className: "pill if-badge warn" }, "working"),
+      sprint ? " on " + sprint + "." : "."));
+  card.append(el("div", { className: "muted" },
+    "A live harness process holds this shell's worktree outside the " +
+    "Interface — there is no managed generation to attach to. New chat is " +
+    "blocked until that session ends. Nothing here needs recovering."));
+  pane.append(card);
+  const recovery = el("div", { className: "card if-recovery" },
+    el("div", {}, el("b", {}, "Shell recovery")),
+    el("div", { className: "muted" },
+      "Only if you believe this process is stuck. Recovery on a working " +
+      "shell destroys live work — the preview shows the exact process and " +
+      "worktree evidence first."));
+  ifRecoveryControls(recovery, sel, root);
+  pane.append(recovery);
+  ifSprintPanel(pane, sel);
 }
 
 // Lost/error/unreconciled pane (spec Interface Layout): diagnostics and

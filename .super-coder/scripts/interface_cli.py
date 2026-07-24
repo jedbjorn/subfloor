@@ -782,6 +782,9 @@ def _picker_status(shell: dict) -> str:
         "available": style.green,
         "occupied": style.amber,
         "starting": style.yellow,
+        # Live work outside the Interface — amber like `occupied`, never red:
+        # only the orphan verdict is a stranded remnant (flag #94).
+        "working": style.amber,
         "lost": style.red,
         "error": style.red,
         "unreconciled": style.red,
