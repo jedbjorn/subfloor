@@ -2105,6 +2105,140 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual(self.git_run(inner, "rev-parse", "HEAD"), head)
         self.assertTrue((Path(inner) / "local.txt").exists())
 
+    # -- the REPORTED OUTCOME is a guarantee, not a by-product --------------
+    # Everything above asserts a safety property: the work survives. These
+    # assert the other half — that the result SAYS what actually happened.
+    # `discarded` true only if everything consented to was really undone,
+    # `kept` naming everything spared, `flags_lost` naming every bit that
+    # could not be put back, and a failure after the durable commit reported
+    # as a partial discard rather than an opaque 500 (decision #45 ranks
+    # misreporting alongside destruction).
+
+    def nested_dirty_tracked(self, wt: str) -> None:
+        """A tracked, dirty file one directory down — the shape whose parent
+        can be replaced without the entry's own identity moving."""
+        (Path(wt) / "d").mkdir()
+        (Path(wt) / "d" / "f.txt").write_text("v1")
+        self.git_run(wt, "add", "-A")
+        self.git_run(wt, "commit", "-qm", "nested")
+        (Path(wt) / "d" / "f.txt").write_text("dirty")
+
+    def test_restore_that_exits_zero_without_working_is_not_claimed(self):
+        # SC-127's class: an exit code is not an outcome. `discarded` must
+        # mean "verified undone", not "the command did not complain". Forced
+        # deterministically — the restore is replaced by a no-op that exits 0
+        # — because what must hold is independent of which git versions can be
+        # provoked into skipping a path.
+        wt = self.make_git_worktree()
+        plan = self.plan(wt)
+        real_run = subprocess.run
+
+        def lying_restore(args, **kw):
+            if "restore" in args:
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+            return real_run(args, **kw)
+
+        with mock.patch.object(recovery.subprocess, "run", lying_restore):
+            result = recovery._discard_worktree_files(wt, plan)
+        self.assertIn("tracked.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+        self.assertIsNone(result["failed"])
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+
+    def test_parent_swapped_for_a_same_inode_symlink_is_reported_truthfully(
+            self):
+        # The shape SC-127 was reported as: after the late gate the entry's
+        # parent is moved out of the worktree and a symlink to the SAME inode
+        # put in its place, so the per-entry re-check still matches — it
+        # lstats the leaf, and the leaf is the same file.
+        #
+        # On git 2.47.3 the restore does NOT skip: it removes the symlink,
+        # recreates the real directory and writes HEAD content, so the
+        # worktree entry genuinely IS discarded and `discarded=true` is
+        # truthful. The dirty bytes that survive are the copy the operator
+        # moved OUTSIDE the worktree, which no discard was ever scoped to
+        # touch. Pinned because the report and the safety property are easy to
+        # confuse here, and because a future git that really did skip would
+        # now be caught by the verification above rather than mis-reported.
+        wt = self.make_git_worktree()
+        self.nested_dirty_tracked(wt)
+        plan = self.plan(wt)
+        moved = Path(self.tmp.name) / "moved-parent"
+        os.rename(Path(wt) / "d", moved)
+        os.symlink(moved, Path(wt) / "d")
+
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertEqual((moved / "f.txt").read_text(), "dirty")  # outside
+        self.assertEqual((Path(wt) / "d" / "f.txt").read_text(), "v1")
+        self.assertFalse(Path(Path(wt) / "d").is_symlink())
+        self.assertTrue(result["discarded"], result)
+        self.assertEqual(result["kept"], [])
+
+    def test_parent_swapped_for_a_different_symlink_is_kept(self):
+        # ...and when the swap DOES make the entry unreadable as observed, it
+        # is kept and named — the existing per-entry check already covers it,
+        # which is the other half of why the same-inode case above is the only
+        # one that reaches the restore at all.
+        wt = self.make_git_worktree()
+        self.nested_dirty_tracked(wt)
+        (Path(wt) / "other").mkdir()
+        plan = self.plan(wt)
+        os.rename(Path(wt) / "d", Path(self.tmp.name) / "elsewhere")
+        os.symlink("other", Path(wt) / "d")
+
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertIn("d/f.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+
+    def test_flag_restoration_failure_is_reported_not_raised(self):
+        # SC-126. `_restore_index_flags` runs AFTER the destructive restore
+        # and after the durable closure is committed, so an exception there
+        # cannot be unwound and must not escape: it would surface as an opaque
+        # 500 while the staged content is already reset and the flag already
+        # cleared — the truth absent exactly where it matters most. The
+        # failure is absorbed and the real loss is reported, verified by
+        # re-reading the index rather than trusted from an exit code.
+        wt = self.make_git_worktree()
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.git_run(wt, "update-index", "--skip-worktree", "--",
+                     "tracked.txt")
+        plan = self.plan(wt)
+        real_run = subprocess.run
+
+        def timeout_on_update_index(args, **kw):
+            if "update-index" in args:
+                raise subprocess.TimeoutExpired(args, 60)
+            return real_run(args, **kw)
+
+        with mock.patch.object(recovery.subprocess, "run",
+                               timeout_on_update_index):
+            result = recovery._discard_worktree_files(wt, plan)
+        self.assertEqual(result["flags_lost"], ["tracked.txt"])
+        self.assertIsNone(result["failed"])   # the discard itself completed
+        self.assertTrue(result["discarded"])
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "H")
+
+    def test_unexpected_failure_after_the_commit_reports_a_partial_discard(
+            self):
+        # The net, at the endpoint. Whatever goes wrong once the durable
+        # closure is committed, the operator gets a result describing their
+        # files — never a 500 that says only that something broke. Reported,
+        # not swallowed: the exception is named in `failed`.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        with mock.patch.object(recovery, "_restore_index_flags",
+                               side_effect=RuntimeError("boom")):
+            status, result = self.post(obj, preserve_worktree=False,
+                                       discard_worktree=True,
+                                       confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        self.assertFalse(result["worktree"]["discarded"])
+        self.assertEqual(result["worktree"]["failed"]["step"], "unexpected")
+        self.assertIn("RuntimeError", result["worktree"]["failed"]["error"])
+        # the closure still happened and is still reported honestly
+        self.assertEqual(result["availability"], "available")
+
     def test_unreadable_index_at_the_discard_keeps_everything(self):
         # An index that cannot be read between the gate and the delete means
         # no entry's identity can be verified — and an unverifiable identity

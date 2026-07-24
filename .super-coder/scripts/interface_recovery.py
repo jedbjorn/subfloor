@@ -565,19 +565,22 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     h = hashlib.sha256()
     for line in sorted(porcelain):
         h.update(line.encode("utf-8", "surrogateescape") + b"\n")
-    identities, index_of = {}, {}
+    identities, index_of, fs_of = {}, {}, {}
     for rel in sorted(tracked | untracked_files | untracked_dirs):
         index_of[rel] = index.get(rel, _INDEX_ABSENT)
-        identities[rel] = _entry_identity(worktree, rel, index)
+        fs_of[rel] = _path_identity(os.path.join(worktree, rel))
+        identities[rel] = fs_of[rel] + "\0" + index_of[rel]
         h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                  + identities[rel].encode() + b"\0")
-    # The index half is kept separately as well as inside `identities`, so the
-    # discard can re-verify it ALONE — at a point where the filesystem half
-    # has legitimately moved because the discard itself moved it (SC-124).
+    # The two halves are kept separately as well as composed, because the
+    # discard has to re-verify each one ALONE at a point where the other has
+    # legitimately moved: the index just before the destructive call, when the
+    # removal may already have unlinked the file (SC-124), and the filesystem
+    # just after it, when the restore has already rewritten the index (SC-127).
     return {"head": head, "tracked": sorted(tracked),
             "untracked_files": sorted(untracked_files),
             "untracked_dirs": sorted(untracked_dirs),
-            "identities": identities, "index": index_of,
+            "identities": identities, "index": index_of, "fs": fs_of,
             "digest": h.hexdigest()}
 
 
@@ -780,6 +783,52 @@ def _prune_dirs(worktree: str, plan: dict) -> list[str]:
             if os.path.lexists(os.path.join(worktree, rel.rstrip("/")))]
 
 
+def _unrestored(worktree: str, plan: dict, restored: list[str]) -> list[str]:
+    """Of the entries the restore reported success for, the ones it did NOT
+    actually undo. Never raises.
+
+    An exit code is not an outcome. `git restore` can exit 0 having silently
+    skipped a path: with a SYMLINK standing in for one of its parent
+    directories it refuses to write through the link, updates the index, and
+    leaves the working file exactly as it was (SC-127, reproduced). The safety
+    property holds — nothing outside the worktree is touched, which is what
+    SC-105 asked for — and that is precisely what hid this: the result claimed
+    `discarded=true` over a dirty file still sitting there. Decision #45 ranks
+    that misreporting with destruction, so the outcome is VERIFIED.
+
+    What makes the check exact: every enumerated tracked entry differs from
+    HEAD by construction, and a restore that ran makes it equal HEAD — a
+    different entity, and in any case a rewritten one, so its identity cannot
+    still be the one the operator was shown. An entry whose filesystem
+    identity is byte-identical to the consented one was therefore not touched.
+    The INDEX cannot answer this: the skipped restore updated it (reproduced),
+    so the index reads discarded while the work is still on disk.
+
+    Unreadable now -> unverifiable, and an unverifiable outcome is never
+    reported as a success.
+
+    On an unborn HEAD there is nothing to restore TO — the removal loop
+    already unlinked these files and `git rm --cached` drops the entry — so
+    what is checked there is that the index no longer holds it.
+    """
+    if not plan["head"]:
+        try:
+            index = _index_identities(worktree)
+        except _GitEvidenceUnavailable:
+            return sorted(restored)
+        return sorted(rel for rel in restored if rel in index)
+    stale = []
+    for rel in restored:
+        try:
+            now = _path_identity(os.path.join(worktree, rel))
+        except _GitEvidenceUnavailable:
+            stale.append(rel)
+        else:
+            if now == plan["fs"][rel]:
+                stale.append(rel)
+    return sorted(stale)
+
+
 _INDEX_FLAG_OPTS = {"S": "--skip-worktree", "A": "--assume-unchanged"}
 
 
@@ -809,11 +858,15 @@ def _restore_index_flags(worktree: str, plan: dict,
         paths = [rel for rel, flags in want.items() if bit in flags]
         if not paths:
             continue
-        subprocess.run(
-            ["git", "-C", worktree, "update-index", "-z", opt, "--stdin"],
-            input=b"".join(rel.encode("utf-8", "surrogateescape") + b"\0"
-                           for rel in paths),
-            capture_output=True, timeout=60, check=False)
+        try:
+            subprocess.run(
+                ["git", "-C", worktree, "update-index", "-z", opt, "--stdin"],
+                input=b"".join(rel.encode("utf-8", "surrogateescape") + b"\0"
+                               for rel in paths),
+                capture_output=True, timeout=60, check=False)
+        except Exception:  # noqa: BLE001, S110 — timeout or spawn failure;
+            pass           # the verification below reports what actually
+                           # stuck, which is the truth an exit code is not
     try:
         after = _index_identities(worktree)
     except _GitEvidenceUnavailable:
@@ -865,10 +918,31 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     `discarded` is true only when every enumerated FILE was undone; anything
     left behind — files and directories alike — is named in `kept`, never
     silently dropped.
+
+    That promise is now STRUCTURAL rather than a claim about the steps below
+    (SC-126). Every known failure mode is handled where it happens, but the
+    operator's files have already been touched by the time anything here can
+    go wrong, and a 500 tells them nothing about what state those files are
+    in — the worst report there is. So the whole sequence returns its
+    part-filled result rather than raising, and an unexpected failure is NAMED
+    in `failed` rather than swallowed.
     """
     result: dict = {"worktree": worktree, "discarded": False,
                     "completed": [], "failed": None,
                     "kept": [], "kept_count": 0, "flags_lost": []}
+    try:
+        _discard_steps(worktree, plan, result)
+    except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
+        result["discarded"] = False
+        result["failed"] = result["failed"] or {
+            "step": "unexpected",
+            "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return result
+
+
+def _discard_steps(worktree: str, plan: dict, result: dict) -> None:
+    """The discard itself, filling `result` as it goes. Split out so that
+    whatever happens, the caller still has what completed (see above)."""
     identities, restore, kept_files = plan["identities"], [], []
     # One index read for the whole pass: nothing below writes to the index
     # until the final `restore`/`rm --cached`, so this snapshot stays true for
@@ -933,7 +1007,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
         except OSError as exc:
             result["failed"] = {"step": "remove",
                                 "error": f"{rel[-120:]}: errno {exc.errno}"}
-            return result
+            return
         finally:
             os.close(fd)
         removed.append(rel)
@@ -1020,13 +1094,19 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
                 capture_output=True, timeout=60, check=False)
         except Exception as exc:  # noqa: BLE001 — timeout etc: report it
             result["failed"] = {"step": "restore", "error": str(exc)[:200]}
-            return result
+            return
         if out.returncode != 0:
             result["failed"] = {
                 "step": "restore",
                 "error": out.stderr.decode("utf-8", "replace").strip()[-200:]}
-            return result
+            return
     result["completed"].append("restore")
+    # The restore's exit code says it ran, not that it worked (SC-127). Verify
+    # each entry actually moved before any of it is reported as discarded.
+    skipped = _unrestored(worktree, plan, restore)
+    for rel in skipped:
+        keep(rel)
+    restore = [rel for rel in restore if rel not in set(skipped)]
     result["flags_lost"] = _restore_index_flags(worktree, plan, restore)
     # A surviving DIRECTORY does not make the discard incomplete. It stands
     # because it holds something outside the delete set — an ignored file, a
@@ -1037,7 +1117,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     # not, which is the only way consented work outlives a discard. Both are
     # named in `kept`; only the second moves `discarded`.
     result["discarded"] = not kept_files
-    return result
+    return
 
 
 # ------------------------------------------------------------------ evidence
