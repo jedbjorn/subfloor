@@ -112,7 +112,17 @@ def _read_stat(pid: int) -> tuple[int, str]:
 def _proc_state(pid: int, start_ticks: int) -> str:
     """Exact-identity liveness: 'alive' (pid present, ticks match, not a
     zombie), 'dead' (pid gone, recycled, or reaped), 'unreadable' (present
-    but /proc refuses us — fail closed, never 'dead')."""
+    but /proc will not give us a usable answer — fail closed, never 'dead').
+
+    'Unreadable' covers a refused read AND an unusable one. A short or
+    malformed `/proc/<pid>/stat` — the file is a live snapshot and can be read
+    mid-teardown — makes `_read_stat` raise ValueError or IndexError, which
+    escaped every caller: this one is called from inside the signalling
+    sequence, where an escape after SIGTERM became an opaque 500 over an
+    already-delivered signal (SC-131). Answering 'unreadable' here is both the
+    honest reading and the fail-closed one, and it is fixed at the definition
+    so no caller has to guard it separately.
+    """
     try:
         ticks, state = _read_stat(pid)
     except FileNotFoundError:
@@ -120,6 +130,8 @@ def _proc_state(pid: int, start_ticks: int) -> str:
     except (PermissionError, ProcessLookupError):
         return "unreadable"
     except OSError:
+        return "unreadable"
+    except (ValueError, IndexError):
         return "unreadable"
     if ticks != start_ticks:
         return "dead"  # recycled pid: a different process, not ours
@@ -168,7 +180,26 @@ def terminate_process_group(pid: int, start_ticks: int,
     indeterminate — the caller maps that to a refusal, never a closure.
     `dead` is True ONLY on /proc-proven absence: a signal is not proof of
     death, and 'unreadable' or a SIGKILL survivor (D-state) leaves the
-    caller to refuse closure with a named next action."""
+    caller to refuse closure with a named next action.
+
+    ALWAYS returns a result; never raises. The delivery of the first signal is
+    a seam exactly like the durable commit: before it, a failure is a refusal
+    and nothing has happened; after it, an irreversible act has been performed
+    and an exception escaping to the route as an opaque 500 tells the operator
+    neither that their process was signalled nor that nothing was closed
+    (SC-131). So the boundary sits AT the seam, and the failure modes are
+    enumerated by where they fall relative to it rather than by which of them
+    a probe has already found:
+
+    - before delivery — a stale identity, an unreadable process group, and a
+      SIGTERM that cannot be delivered at all (EPERM on a group we may not
+      signal, ESRCH on one that died since the identity check). All report
+      `signaled: False`, which the caller maps to a refusal;
+    - after delivery — everything else, whatever it is. The grace poll, the
+      identity re-check, the SIGKILL itself and its poll all run under one
+      boundary that returns `signaled: True` with the phase it broke in, so
+      the caller can state what was done to the process and what was not.
+    """
     state = _proc_state(pid, start_ticks)
     if state != "alive":
         return {"signaled": False, "dead": False, "reason": "indeterminate",
@@ -178,39 +209,61 @@ def terminate_process_group(pid: int, start_ticks: int,
     except OSError:
         return {"signaled": False, "dead": False, "reason": "indeterminate",
                 "detail": "process group unreadable at signal time"}
-    os.killpg(pgid, signal.SIGTERM)
-    state = _wait_dead(pid, start_ticks, grace_s)
-    if state == "dead":
-        return {"signaled": True, "dead": True, "escalated": False,
-                "pid": pid, "pgid": pgid}
-    if state == "unreadable":
-        return {"signaled": True, "dead": False, "escalated": False,
-                "pid": pid, "pgid": pgid, "reason": "absence_unproven",
-                "detail": "SIGTERM sent but /proc turned unreadable during "
-                          "the grace — absence not proven"}
-    # Grace expired with the process alive. Re-verify the EXACT identity
-    # before SIGKILL — the window is long enough for exit + PID reuse, and
-    # the rule is never signal an uncertain process.
-    state = _proc_state(pid, start_ticks)
-    if state != "alive":
-        return {"signaled": True, "dead": state == "dead",
-                "escalated": False, "pid": pid, "pgid": pgid,
-                "note": "identity changed during grace — no SIGKILL sent"}
     try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        return {"signaled": True, "dead": False, "escalated": False,
-                "pid": pid, "pgid": pgid,
-                "note": "process exited during grace — no SIGKILL sent"}
-    os.killpg(pgid, signal.SIGKILL)
-    state = _wait_dead(pid, start_ticks, grace_s)
-    if state == "dead":
-        return {"signaled": True, "dead": True, "escalated": True,
-                "pid": pid, "pgid": pgid}
-    return {"signaled": True, "dead": False, "escalated": True,
-            "pid": pid, "pgid": pgid, "reason": "absence_unproven",
-            "detail": f"process state {state} after SIGKILL — absence not "
-                      "proven (an unkillable D-state process survives)"}
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError as exc:
+        # Nothing was delivered, so this is a refusal like the two above and
+        # not a partial act — the distinction the caller acts on.
+        return {"signaled": False, "dead": False, "reason": "indeterminate",
+                "detail": f"SIGTERM could not be delivered to PGID {pgid}: "
+                          f"{type(exc).__name__}: {str(exc)[:200]}"}
+    # -- the signal is delivered: NOTHING below may raise -------------------
+    phase, escalated = "grace_wait", False
+    try:
+        state = _wait_dead(pid, start_ticks, grace_s)
+        if state == "dead":
+            return {"signaled": True, "dead": True, "escalated": False,
+                    "pid": pid, "pgid": pgid}
+        if state == "unreadable":
+            return {"signaled": True, "dead": False, "escalated": False,
+                    "pid": pid, "pgid": pgid, "reason": "absence_unproven",
+                    "detail": "SIGTERM sent but /proc turned unreadable "
+                              "during the grace — absence not proven"}
+        # Grace expired with the process alive. Re-verify the EXACT identity
+        # before SIGKILL — the window is long enough for exit + PID reuse, and
+        # the rule is never signal an uncertain process.
+        phase = "escalation_recheck"
+        state = _proc_state(pid, start_ticks)
+        if state != "alive":
+            return {"signaled": True, "dead": state == "dead",
+                    "escalated": False, "pid": pid, "pgid": pgid,
+                    "note": "identity changed during grace — no SIGKILL sent"}
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            return {"signaled": True, "dead": False, "escalated": False,
+                    "pid": pid, "pgid": pgid,
+                    "note": "process exited during grace — no SIGKILL sent"}
+        phase = "sigkill"
+        os.killpg(pgid, signal.SIGKILL)
+        escalated, phase = True, "kill_wait"
+        state = _wait_dead(pid, start_ticks, grace_s)
+        if state == "dead":
+            return {"signaled": True, "dead": True, "escalated": True,
+                    "pid": pid, "pgid": pgid}
+        return {"signaled": True, "dead": False, "escalated": True,
+                "pid": pid, "pgid": pgid, "reason": "absence_unproven",
+                "detail": f"process state {state} after SIGKILL — absence not "
+                          "proven (an unkillable D-state process survives)"}
+    except Exception as exc:  # noqa: BLE001 — post-signal: report, never raise
+        return {"signaled": True, "dead": False, "escalated": escalated,
+                "pid": pid, "pgid": pgid, "reason": "signal_failed",
+                "phase": phase,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "detail": f"SIGTERM was delivered to PGID {pgid} and cannot "
+                          f"be unwound; the sequence then failed in {phase} "
+                          f"({type(exc).__name__}: {str(exc)[:200]}) — "
+                          "absence not proven"}
 
 
 # ------------------------------------------------------------------ git facts
@@ -408,6 +461,158 @@ def _path_identity(path: str) -> str:
         "torn read: an entry kept changing while it was observed")
 
 
+# What `_entry_identity` records for a path the index holds nothing for.
+# A value, not an absence: a path GAINING or LOSING an index entry is itself
+# a change the digest must move on.
+_INDEX_ABSENT = "index:none"
+
+
+def _index_flags(identity: str) -> str:
+    """The durable-flag token out of one index identity — `--` for an entry
+    the index does not hold."""
+    return identity.rsplit(" ", 1)[-1] if " " in identity else "--"
+
+
+def _index_identities(worktree: str) -> dict[str, str]:
+    """What the INDEX holds, per path: mode, object id, merge stage, and the
+    durable per-entry FLAGS.
+
+    Read in ONE pass over the whole index rather than per path — every entry
+    then comes from the same instant, the same way the path set does.
+
+    The index is a store in its own right, not a blob table, so what is bound
+    here is everything an entry durably carries that a discard can rewrite.
+    Enumerated from the on-disk index format rather than from memory, the
+    per-entry fields are: the stat cache (ctime/mtime/dev/ino/uid/gid/size),
+    mode, object id, and the flag word — assume-valid, merge stage, and the
+    v3 extended bits skip-worktree and intent-to-add. Of those:
+
+    - mode, object id and merge stage are the content a discard throws back to
+      HEAD, and are recorded.
+    - skip-worktree and assume-unchanged are recorded (SC-125). They are
+      durable index state that `restore --staged` CLEARS, and setting one
+      moves nothing else: on a staged-only entry the working file, its lstat,
+      the porcelain line and the entry's own mode/object/stage are all
+      byte-identical either side of the bit, so an unbound flag rode straight
+      through the fence.
+    - intent-to-add needs no separate field: it can only be set on a path the
+      index does not otherwise hold, and both transitions move the PORCELAIN
+      line the digest already binds (`??` <-> ` A`, which is distinct from a
+      real staged add's `A `). Recorded by the outer layer, not this one.
+    - the STAT CACHE is excluded, and by reproduction rather than by argument:
+      `git status` REFRESHES it as a side effect of the very observation this
+      fences, so binding it would make a preview stale against itself and
+      refuse every discard forever (the same trap st_atime is excluded from
+      `_path_identity` for). It is a cache of the worktree, and the worktree
+      half of `_entry_identity` binds the thing itself.
+
+    Index EXTENSIONS carry no per-entry work a discard destroys: cache-tree,
+    untracked-cache, fsmonitor and split-index are all caches git rebuilds,
+    and resolve-undo (REUC) survives the discard untouched — reproduced, not
+    assumed. `MERGE_HEAD` and an in-progress merge likewise survive it.
+
+    The flags are read via `ls-files -v`, whose tag letter is the only
+    interface to them. Its letter set also spans WORKTREE-derived states (`C`
+    modified, `R` removed, `K` to-be-killed) — none of which this invocation
+    can emit, since those require the matching listing option — so rather than
+    record the letter, the two durable bits are decoded out of it. A letter
+    this function does not expect therefore decodes to "no flags", exactly as
+    a plain `H` does, and can never move the digest on a volatile fact.
+
+    An unmerged path carries several stage entries; all of them are recorded,
+    sorted, because a conflict resolution rewrites exactly that set.
+    """
+    entries: dict[str, list[str]] = {}
+    for record in _git_out(worktree, "ls-files", "-v", "--stage", "-z",
+                           timeout=30).split("\0"):
+        if not record:
+            continue
+        meta, _tab, rel = record.partition("\t")
+        tag, mode, obj, stage = meta.split()
+        flags = ("S" if tag.upper() == "S" else "-") \
+            + ("A" if tag.islower() else "-")
+        entries.setdefault(rel, []).append(f"{mode} {obj} {stage} {flags}")
+    return {rel: "+".join(sorted(stages)) for rel, stages in entries.items()}
+
+
+def _entry_identity(worktree: str, rel: str, index: dict[str, str]) -> str:
+    """One enumerated entry's COMPLETE identity — what the filesystem holds at
+    that path, and what the index holds for it.
+
+    Staged work does not live in the worktree, and a discard destroys it all
+    the same: `git restore --source=HEAD --staged` throws the index back to
+    HEAD, and on an unborn HEAD `git rm --cached` drops the entry outright. So
+    an operator who stages a change AFTER the preview had, until SC-123, work
+    inside the confirmed blast radius that no gate could see — the working
+    file, its lstat and the porcelain line all stay byte-identical while the
+    blob underneath is replaced (`git add -p` produces exactly that shape).
+
+    Same rule as every attribute already bound: if the discard would create,
+    delete or rewrite it, the digest binds it. The index is simply the one
+    place that state is not a file.
+    """
+    return (_path_identity(os.path.join(worktree, rel)) + "\0"
+            + index.get(rel, _INDEX_ABSENT))
+
+
+def _enumerate(worktree: str, head: bool) -> tuple[set, set, set, set]:
+    """`(tracked, index_only, untracked_files, untracked_dirs)` — the entries a
+    discard would have to undo, as of now, classified by what undoing one does.
+
+    THE definition of the destructive set, and the only one. It has three
+    consumers and states itself to none of them: the plan the operator
+    confirms and the destruction it bounds (`_discard_plan`), the check that
+    decides whether the discard actually worked (`_unrestored`), and the
+    preview the operator reads (`evidence_projection`, through
+    `_observe_worktree`). Each restatement was a place the contract could
+    drift from itself, and each one drifted: the verification asked a proxy
+    question (SC-129), and the preview counted porcelain lines instead —
+    which is why it described a staged blob's destruction in the same words as
+    an ordinary file deletion (SC-130).
+
+    `index_only` is a SUBSET of `tracked`, and it is the class the operator
+    cannot otherwise see: the entry's content lives in the index and the
+    working tree does not show it, so nothing on disk changes appearance when
+    the discard destroys it. On a born HEAD that is exactly "differs from HEAD
+    in the index while the working tree agrees with HEAD" — the `AD` staged-
+    then-deleted path, and equally a staged edit whose file was written back
+    to HEAD's content. On an unborn HEAD, where there is no HEAD to agree
+    with, it is an index entry with no file on disk at all: the same class,
+    reached by the same reasoning rather than by the one case a probe found.
+    """
+    def paths(*args) -> list[str]:
+        # -z: paths verbatim, no C-quoting to unescape.
+        return [p for p in _git_out(worktree, *args, timeout=30).split("\0")
+                if p]
+
+    listed = set(paths("ls-files", "-o", "--exclude-standard", "-z"))
+    untracked_dirs = {p for p in
+                      paths("ls-files", "-o", "--directory",
+                            "--exclude-standard", "-z") if p.endswith("/")}
+    # A trailing slash in the FILE listing is a nested repository — git names
+    # it once and never descends. It is a directory: unlinking it would fail
+    # the whole discard, and `clean -fd` leaves it alone too.
+    untracked_dirs |= {p for p in listed if p.endswith("/")}
+    untracked_files = {p for p in listed if not p.endswith("/")}
+    if not head:
+        tracked = set(paths("ls-files", "-z"))
+        index_only = {rel for rel in tracked
+                      if not os.path.lexists(os.path.join(worktree, rel))}
+        return tracked, index_only, untracked_files, untracked_dirs
+    # BOTH diffs, because neither alone is the set. `diff HEAD` compares HEAD
+    # to the WORKING TREE, so a path staged and then deleted (`AD`) reads as
+    # no change — absent in HEAD, absent on disk — while the index still holds
+    # its blob. It was therefore in no delete set and no preview, survived the
+    # discard, and `discarded=true` was returned over staged work still
+    # sitting in the index. `reset --hard`, the operation this replaces, threw
+    # that entry away; found by asking the SC-129 question of the enumeration
+    # itself rather than of the check that reads it.
+    in_worktree = set(paths("diff", "HEAD", "--name-only", "-z"))
+    in_index = set(paths("diff", "--cached", "HEAD", "--name-only", "-z"))
+    return in_worktree | in_index, in_index - in_worktree, \
+        untracked_files, untracked_dirs
+
+
 def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     """WHAT a discard would destroy, named entry by entry: the exact SET of
     worktree entries, each entry's identity, and the digest over the whole
@@ -429,16 +634,21 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     underneath them is rewritten, retargeted, re-permissioned or changes type —
     so the line set is only the outer layer. Held against the invariant, that
     state is: the SET of affected entries, and for each its ENTITY IDENTITY
-    (`_path_identity`) — type, permissions, ownership, timestamps, and
-    regular-file bytes or symlink target.
+    (`_entry_identity`) — type, permissions, ownership, timestamps, and
+    regular-file bytes or symlink target, PLUS the index entry (mode, object,
+    stage) standing behind it. The last is not a filesystem fact at all and
+    was missed for exactly that reason (SC-123): `git restore --staged`
+    destroys staged content the worktree never shows.
 
     The set is what the discard must undo:
     - untracked FILES individually (`ls-files -o`), never collapsed to a dir;
     - untracked DIRECTORIES in their own right (`--directory`, trailing `/`),
       empty ones included: `clean -fd` removes a directory that a file listing
       never names;
-    - born HEAD -> every path differing from HEAD (`diff HEAD`): staged,
-      unstaged and deletions, one row each;
+    - born HEAD -> every path differing from HEAD in the working tree OR in
+      the index (`diff HEAD` and `diff --cached HEAD`): staged, unstaged and
+      deletions, one row each. Both, because a path staged and then deleted
+      differs from HEAD only in the index — see `_enumerate`;
     - unborn HEAD -> every INDEX entry (`ls-files`). Nothing has been
       committed, so a discard drops the whole index and the files with it —
       and `ls-files -o` cannot see a staged path, which left staged work
@@ -447,35 +657,30 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     Ignored files stay out: `clean -fd` without -x does not touch them, so
     they are not state the confirmation is about.
     """
-    def paths(*args) -> list[str]:
-        # -z: paths verbatim, no C-quoting to unescape.
-        return [p for p in _git_out(worktree, *args, timeout=30).split("\0")
-                if p]
-
-    listed = set(paths("ls-files", "-o", "--exclude-standard", "-z"))
-    untracked_dirs = {p for p in
-                      paths("ls-files", "-o", "--directory",
-                            "--exclude-standard", "-z") if p.endswith("/")}
-    # A trailing slash in the FILE listing is a nested repository — git names
-    # it once and never descends. It is a directory: unlinking it would fail
-    # the whole discard, and `clean -fd` leaves it alone too.
-    untracked_dirs |= {p for p in listed if p.endswith("/")}
-    untracked_files = {p for p in listed if not p.endswith("/")}
-    tracked = set(paths("diff", "HEAD", "--name-only", "-z")) if head \
-        else set(paths("ls-files", "-z"))
+    tracked, index_only, untracked_files, untracked_dirs = _enumerate(
+        worktree, head)
+    index = _index_identities(worktree)
 
     h = hashlib.sha256()
     for line in sorted(porcelain):
         h.update(line.encode("utf-8", "surrogateescape") + b"\n")
-    identities = {}
+    identities, index_of = {}, {}
     for rel in sorted(tracked | untracked_files | untracked_dirs):
-        identities[rel] = _path_identity(os.path.join(worktree, rel))
+        index_of[rel] = index.get(rel, _INDEX_ABSENT)
+        identities[rel] = (_path_identity(os.path.join(worktree, rel)) + "\0"
+                           + index_of[rel])
         h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                  + identities[rel].encode() + b"\0")
+    # The INDEX half is kept separately as well as composed, because the
+    # discard has to re-verify it ALONE at a point where the filesystem half
+    # has legitimately moved: immediately before the destructive call, when the
+    # removal may already have unlinked the file (SC-124).
     return {"head": head, "tracked": sorted(tracked),
+            "index_only": sorted(index_only),
             "untracked_files": sorted(untracked_files),
             "untracked_dirs": sorted(untracked_dirs),
-            "identities": identities, "digest": h.hexdigest()}
+            "identities": identities, "index": index_of,
+            "digest": h.hexdigest()}
 
 
 def _observe_worktree(worktree: str) -> tuple[dict, dict]:
@@ -488,14 +693,22 @@ def _observe_worktree(worktree: str) -> tuple[dict, dict]:
     branch = _git_out(worktree, "rev-parse", "--abbrev-ref", "HEAD") \
         if head else _git_out(worktree, "branch", "--show-current")
     porcelain = _git_out(worktree, "status", "--porcelain").splitlines()
-    untracked = sum(1 for ln in porcelain if ln.startswith("??"))
-    dirty = len(porcelain) - untracked
     unpushed = int(_git_out(worktree, "rev-list", "HEAD", "--not",
                             "--remotes", "--count").strip() or 0) \
         if head else 0
     plan = _discard_plan(worktree, porcelain, head)
+    # COUNTED OFF THE PLAN, never off porcelain. What the operator is shown
+    # has to be generated by the same thing that decides what happens, or the
+    # two can describe different worlds — and did: porcelain renders an `AD`
+    # staged-then-deleted path as one dirty line, indistinguishable from an
+    # ordinary deletion, while the plan destroys a staged blob nothing on disk
+    # shows (SC-130). Porcelain stays an INPUT to the digest, where its
+    # coarseness is harmless; it is no longer a second statement of the set.
     return {"worktree": worktree, "branch": branch.strip(),
-            "dirty_tracked": dirty, "untracked": untracked,
+            "dirty_tracked": len(plan["tracked"]),
+            "index_only": len(plan["index_only"]),
+            "untracked": len(plan["untracked_files"]),
+            "untracked_dirs": len(plan["untracked_dirs"]),
             "unpushed_commits": unpushed,
             # WHICH paths changed and WHAT each one now IS — not just how
             # many: equal-count churn (one file cleaned while another is
@@ -677,6 +890,118 @@ def _prune_dirs(worktree: str, plan: dict) -> list[str]:
             if os.path.lexists(os.path.join(worktree, rel.rstrip("/")))]
 
 
+def _unrestored(worktree: str, plan: dict, restored: list[str]) -> list[str]:
+    """Of the entries the restore reported success for, the ones it did NOT
+    actually undo. Never raises.
+
+    An exit code is not an outcome. `git restore` can exit 0 without having
+    put the entry where it promised, and the result then claims `discarded`
+    over work still sitting on disk — misreporting, which decision #45 ranks
+    with destruction. So the outcome is VERIFIED rather than inferred.
+
+    Verified against the CONTRACT, and that distinction is the whole of
+    SC-129. The first version of this check asked whether the entry had
+    changed from the identity the operator consented to — a PROXY: the
+    contract implies it, so the right answer satisfies it, but so does a
+    restore that writes some THIRD state, which is neither the old content nor
+    HEAD. It passed and the discard was reported complete. (Same shape as
+    F7's SC-121 one unit over: asserting a floor the correct implementation
+    also clears.)
+
+    The contract is "this entry is no longer one a discard would have to
+    undo", so that is what is asked — by re-running the enumeration that
+    DEFINED the set (`_enumerate`) and requiring the entry to be absent from
+    it. Nothing is restated in a second form that could drift: a third state
+    still differs from HEAD and is named; a staged-new path whose file
+    survived its de-staging is named as untracked; an entry the restore left
+    alone is named exactly as it was at plan time.
+
+    That enumeration reads the worktree half of a flagged entry THROUGH the
+    index — `git diff` trusts skip-worktree and assume-unchanged and will not
+    look at the file — so an entry still carrying a durable bit here cannot be
+    verified by it and is reported kept. Reachable enumerated entries do not
+    hit this: a bit only exists on an index entry, and an index entry the plan
+    holds differs from HEAD, so the restore rewrites it and drops the bit with
+    it (reproduced). An entry whose bit survived is one where something other
+    than that happened, which is not a state to report success from.
+
+    Unreadable now -> unverifiable, and an unverifiable outcome is never
+    reported as a success.
+
+    On an unborn HEAD the same enumeration is the same contract: the entry
+    must be gone from the index (`ls-files`) and gone from disk, where it
+    would otherwise reappear in the untracked listing.
+    """
+    if not restored:
+        return []
+    try:
+        tracked, _index_only, untracked_files, untracked_dirs = _enumerate(
+            worktree, plan["head"])
+        index = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        return sorted(restored)
+    still = tracked | untracked_files | untracked_dirs
+    return sorted(
+        rel for rel in restored
+        if rel in still
+        or _index_flags(index.get(rel, _INDEX_ABSENT)) != "--")
+
+
+_INDEX_FLAG_OPTS = {"S": "--skip-worktree", "A": "--assume-unchanged"}
+
+
+def _restore_index_flags(worktree: str, plan: dict,
+                         restored: list[str]) -> list[str]:
+    """Put back the durable index flags the restore cleared. Returns the
+    entries whose flags could NOT be put back.
+
+    The bits are not part of HEAD, so "throw the entry back to HEAD" does not
+    say what should happen to them — clearing them is a SIDE EFFECT of the
+    command, not a change the operator confirmed discarding. The content goes;
+    the operator's standing instruction about the path stays (SC-125, and
+    decision #45's preserve-and-report rather than silent clearing).
+
+    Where the store leaves no room for the flag it is REPORTED, never quietly
+    dropped: a staged-new path is gone from the index once the discard has
+    run, and on an unborn HEAD every entry is, so there is no entry left to
+    carry a bit. Outcomes are verified by re-reading the index rather than
+    trusted from an exit code — `update-index` is silent about a path it could
+    not mark.
+    """
+    want = {rel: _index_flags(plan["index"][rel]) for rel in restored}
+    want = {rel: flags for rel, flags in want.items() if flags != "--"}
+    if not want:
+        return []
+    for bit, opt in _INDEX_FLAG_OPTS.items():
+        paths = [rel for rel, flags in want.items() if bit in flags]
+        if not paths:
+            continue
+        try:
+            subprocess.run(
+                ["git", "-C", worktree, "update-index", "-z", opt, "--stdin"],
+                input=b"".join(rel.encode("utf-8", "surrogateescape") + b"\0"
+                               for rel in paths),
+                capture_output=True, timeout=60, check=False)
+        except Exception:  # noqa: BLE001, S110 — timeout or spawn failure;
+            pass           # the verification below reports what actually
+                           # stuck, which is the truth an exit code is not
+    try:
+        after = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        return sorted(want)
+    return sorted(rel for rel, flags in want.items()
+                  if _index_flags(after.get(rel, _INDEX_ABSENT)) != flags)
+
+
+def _discard_result(worktree: str) -> dict:
+    """The shape EVERY discard outcome is reported in, whether the sequence
+    ran to the end, stopped at a named step, or never started because the gate
+    ahead of it broke. One builder so those cannot drift into three answers to
+    the same question."""
+    return {"worktree": worktree, "discarded": False, "completed": [],
+            "failed": None, "kept": [], "kept_count": 0, "flags_lost": []}
+
+
 def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     """Undo EXACTLY the entries `plan` enumerated — restore its tracked paths
     from HEAD, remove its untracked ones — and nothing else. Never deletes the
@@ -699,11 +1024,20 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     a directory afterwards is left alone rather than restored over.
 
     Each entry is also re-verified against the identity the fence observed,
-    immediately before it is touched, and left alone when it no longer
-    matches — so a path is only ever removed while it still IS what the
-    operator was shown. That check narrows, and does not close, the window
-    between the check and the `unlink`/`restore` itself: no filesystem offers
-    "remove only if unchanged".
+    and left alone when it no longer matches — so a path is only ever removed
+    while it still IS what the operator was shown. BOTH halves of that
+    identity are re-read immediately before the command that destroys them:
+    the filesystem half before each `unlink`, the index half before the final
+    `restore`/`rm --cached`. Sampling the index ONCE at the top instead was
+    SC-124 — nothing HERE writes to the index before the restore, but the
+    operator does, and a `git add` landing while the removal loop runs was
+    then erased by a restore that had checked an older read. That check
+    narrows, and does not close, the window between the check and the
+    `unlink`/`restore` itself: no filesystem offers "remove only if
+    unchanged", and the index is not transactional against us either.
+
+    Durable index flags the restore clears are put back afterwards, and named
+    in `flags_lost` where the store leaves nowhere to put them (SC-125).
 
     Runs AFTER the durable closure is committed, so a failure here must never
     escape as a 500 that hides what happened: each step's outcome is recorded
@@ -711,16 +1045,44 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     `discarded` is true only when every enumerated FILE was undone; anything
     left behind — files and directories alike — is named in `kept`, never
     silently dropped.
+
+    That promise is now STRUCTURAL rather than a claim about the steps below
+    (SC-126). Every known failure mode is handled where it happens, but the
+    operator's files have already been touched by the time anything here can
+    go wrong, and a 500 tells them nothing about what state those files are
+    in — the worst report there is. So the whole sequence returns its
+    part-filled result rather than raising, and an unexpected failure is NAMED
+    in `failed` rather than swallowed.
     """
-    result: dict = {"worktree": worktree, "discarded": False,
-                    "completed": [], "failed": None,
-                    "kept": [], "kept_count": 0}
+    result = _discard_result(worktree)
+    try:
+        _discard_steps(worktree, plan, result)
+    except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
+        result["discarded"] = False
+        result["failed"] = result["failed"] or {
+            "step": "unexpected",
+            "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return result
+
+
+def _discard_steps(worktree: str, plan: dict, result: dict) -> None:
+    """The discard itself, filling `result` as it goes. Split out so that
+    whatever happens, the caller still has what completed (see above)."""
     identities, restore, kept_files = plan["identities"], [], []
+    # One index read for the whole pass: nothing below writes to the index
+    # until the final `restore`/`rm --cached`, so this snapshot stays true for
+    # every re-check. Unreadable -> `index` is None and NOTHING verifies,
+    # which keeps every entry rather than deleting on an unchecked identity.
+    try:
+        index = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        index = None
 
     def unchanged(rel: str) -> bool:
+        if index is None:
+            return False
         try:
-            return _path_identity(
-                os.path.join(worktree, rel)) == identities[rel]
+            return _entry_identity(worktree, rel, index) == identities[rel]
         except _GitEvidenceUnavailable:
             return False   # unreadable now: never a licence to delete
 
@@ -770,7 +1132,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
         except OSError as exc:
             result["failed"] = {"step": "remove",
                                 "error": f"{rel[-120:]}: errno {exc.errno}"}
-            return result
+            return
         finally:
             os.close(fd)
         removed.append(rel)
@@ -794,8 +1156,59 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
         restore = [rel for rel in restore if rel not in set(standing)]
     else:
         restore = [rel for rel in restore if rel in set(removed)]
+
+    # -- revalidate the INDEX immediately before the destructive call -------
+    # The snapshot above is taken at the top of this function and the removal
+    # loop then runs for as many entries as the plan holds. A `git add`
+    # landing in that window is invisible to a read taken before it, so the
+    # restore threw a blob away that no gate had seen — a check-then-act gap
+    # of exactly the shape already closed twice on the worktree (SC-124). The
+    # index therefore gets its own re-read HERE, at the same point the
+    # worktree half is re-read: the last instant before the command that
+    # destroys it.
+    #
+    # Only the INDEX half is re-checked, deliberately. The filesystem half
+    # cannot be: on an unborn HEAD the removal above unlinked these very
+    # files, so re-reading it would compare "absent" against the observed
+    # content and keep everything the discard just did the work for.
+    # Unreadable now -> nothing is verifiable, so nothing is restored over.
+    try:
+        fresh_index = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        fresh_index = None
+    still = []
+    for rel in restore:
+        if fresh_index is not None \
+                and fresh_index.get(rel, _INDEX_ABSENT) == plan["index"][rel]:
+            still.append(rel)
+        else:
+            keep(rel)
+    restore = still
+
     if restore:
-        args = ["restore", "--source=HEAD", "--staged", "--worktree"] \
+        # --no-recurse-submodules is PINNED, not left to config. A submodule is
+        # a third store — its own worktree, index and refs — and none of it is
+        # inside this fence: the host sees a gitlink and a directory, neither
+        # of which moves when work is committed inside the submodule. With
+        # `submodule.recurse` set, `git restore` follows the gitlink and
+        # resets that store too (reproduced: an inner commit and its files
+        # erased). The SC-103 `standing` guard happens to keep a checked-out
+        # submodule as well, since it is always a directory — but that guard is
+        # about collateral, not about submodules, and a consented blast radius
+        # must not depend on a coincidence or on the operator's config.
+        #
+        # --ignore-skip-worktree-bits is the other half of taking those bits
+        # seriously. Without it git filters our OWN pathspec down to
+        # non-sparse entries, and a staged-new path carrying skip-worktree
+        # matches neither HEAD nor the filtered index — so the command fails
+        # `pathspec did not match`, taking the restore of every other
+        # consented entry down with it. It cannot widen anything: the pathspec
+        # is the enumerated set, read from a file, and this only stops git
+        # discarding members of it. (A sparse checkout's excluded paths never
+        # reach here at all — they do not differ from HEAD, so nothing
+        # enumerates them.)
+        args = ["restore", "--source=HEAD", "--no-recurse-submodules",
+                "--ignore-skip-worktree-bits", "--staged", "--worktree"] \
             if plan["head"] else ["rm", "--cached", "--force", "--quiet"]
         try:
             out = subprocess.run(
@@ -806,13 +1219,25 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
                 capture_output=True, timeout=60, check=False)
         except Exception as exc:  # noqa: BLE001 — timeout etc: report it
             result["failed"] = {"step": "restore", "error": str(exc)[:200]}
-            return result
+            return
         if out.returncode != 0:
             result["failed"] = {
                 "step": "restore",
                 "error": out.stderr.decode("utf-8", "replace").strip()[-200:]}
-            return result
+            return
     result["completed"].append("restore")
+    # The restore's exit code says it ran, not that it worked (SC-127), and
+    # "it moved" is not the promise either (SC-129). Verify each entry against
+    # the contract before any of it is reported as discarded.
+    skipped = _unrestored(worktree, plan, restore)
+    for rel in skipped:
+        keep(rel)
+    # Every entry the restore RAN OVER gets its bits put back, including the
+    # ones just reported kept: the command clears them whether or not it went
+    # on to do what it promised, and an entry reported as spared whose durable
+    # bit was silently dropped is spared in name only (SC-125's rule, applied
+    # to the set the command touched rather than the set it satisfied).
+    result["flags_lost"] = _restore_index_flags(worktree, plan, restore)
     # A surviving DIRECTORY does not make the discard incomplete. It stands
     # because it holds something outside the delete set — an ignored file, a
     # nested repository, work written after the confirmation — and `clean -fd`
@@ -822,7 +1247,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     # not, which is the only way consented work outlives a discard. Both are
     # named in `kept`; only the second moves `discarded`.
     result["discarded"] = not kept_files
-    return result
+    return
 
 
 # ------------------------------------------------------------------ evidence
@@ -1081,11 +1506,26 @@ def evidence_projection(evidence: dict, classification: str,
     elif git:
         tracked = git.get("dirty_tracked")
         untracked = git.get("untracked")
-        if isinstance(tracked, int) and isinstance(untracked, int):
-            cleanliness = "clean" if tracked == 0 and untracked == 0 \
-                else "not clean"
+        untracked_dirs = git.get("untracked_dirs")
+        index_only = git.get("index_only")
+        if all(isinstance(n, int)
+               for n in (tracked, untracked, untracked_dirs, index_only)):
+            cleanliness = "clean" if not (tracked or untracked
+                                          or untracked_dirs) else "not clean"
+            # The enumerated entries are rendered BY EFFECT, because the
+            # operator's consent is what makes destroying them legitimate and
+            # they cannot consent to what they cannot see. An index-only entry
+            # is the class with no appearance on disk at all — it read as an
+            # ordinary dirty file, so a discard destroying staged work looked
+            # byte-identical to one deleting a file the operator could see
+            # (SC-130). Named here, in the one projection both clients render.
+            staged = (f" ({index_only} of them staged-only: content held in "
+                      "the git index that the working tree does not show — a "
+                      "discard destroys it)") if index_only else ""
             worktree_value = (
-                f"{cleanliness} · {tracked} tracked · {untracked} untracked · "
+                f"{cleanliness} · {tracked} tracked{staged} · "
+                f"{untracked} untracked file(s) · "
+                f"{untracked_dirs} untracked dir(s) · "
                 f"{git.get('unpushed_commits', '—')} unpushed commit(s) · "
                 f"branch {git.get('branch') or '—'} · "
                 f"{git.get('worktree') or 'worktree path unavailable'}")
@@ -1116,8 +1556,9 @@ def evidence_projection(evidence: dict, classification: str,
 
 _VOLATILE_PROCESS_KEYS = ("pane_id", "pane_pid", "pane_start_ticks",
                           "pane_present", "pid_state", "pgid")
-_VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "untracked",
-                      "unpushed_commits", "change_digest", "indeterminate")
+_VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "index_only",
+                      "untracked", "untracked_dirs", "unpushed_commits",
+                      "change_digest", "indeterminate")
 
 
 def _volatile_git(git: dict | None) -> dict | None:
@@ -1456,6 +1897,61 @@ def _close_durable_state(con, shell_id: int, evidence: dict,
     return changed
 
 
+def _abandon_runtime(abandon, evidence: dict) -> dict | None:
+    """Drop the live runtime generation now that the durable state is closed.
+    `None` when there was nothing to abandon.
+
+    Best-effort by design — the closure is already committed and a runtime
+    that will not let go is not something to fail a recovery over — but
+    REPORTED, which it was not. A swallowed failure here is post-commit
+    misreporting in the one shape that never produces a 500: the response says
+    the shell is available while a generation may still be attached to it, and
+    the operator has nothing to act on. Same rule as everywhere else in this
+    unit — handle it where something can be done about it, and name it either
+    way (SC-128).
+    """
+    if abandon is None or not evidence["live_session"] \
+            or not evidence["session"]:
+        return None
+    try:
+        abandon(evidence["session"]["session_id"])
+    except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
+        return {"abandoned": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return {"abandoned": True}
+
+
+def _discard_after_closure(observation_id: str, evidence: dict, worktree: str,
+                           signal_result) -> dict:
+    """The late gate AND the discard, under one result-producing boundary.
+
+    `_discard_worktree_files` promises never to raise (SC-126), and that
+    promise was read as covering the post-commit path. It covered the sequence
+    inside it: `_assert_worktree_unchanged` runs after the same durable commit,
+    can throw for reasons that are not its refusal — an unreadable worktree,
+    a git that will not spawn — and threw straight past the structure into a
+    500 with the session already ended (SC-128).
+
+    So the boundary belongs at the seam between "the durable state is closed"
+    and "the files are dealt with", not around one of the two helpers on the
+    far side of it. The gate's own `RecoveryError` still leaves: it is the
+    honest refusal, and states both the closure it performed and that nothing
+    was discarded. Anything else becomes a discard result naming the step that
+    broke, which at this point is all the operator can act on.
+    """
+    try:
+        plan = _assert_worktree_unchanged(observation_id, evidence, worktree,
+                                          signal_result)
+    except RecoveryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
+        result = _discard_result(worktree)
+        result["failed"] = {"step": "worktree_gate",
+                            "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        return result
+    return _discard_worktree_files(worktree, plan)
+
+
 def execute(con, shell_id: int, body: dict,
             default_worktree: str | None,
             grace_s: float = GRACEFUL_TERMINATE_S,
@@ -1561,14 +2057,32 @@ def execute(con, shell_id: int, body: dict,
                 "sent, no state closed; preview again",
                 {"detail": signal_result.get("detail")})
         if not signal_result.get("dead"):
+            # Two ways to reach here and the operator acts on them
+            # differently: the process outlived the signals, or the sequence
+            # itself broke after delivering one. Both are refusals — nothing
+            # closed, nothing discarded — and both say so rather than letting
+            # the second escape as an opaque 500 over an irreversible
+            # signal (SC-131).
+            failed = signal_result.get("reason") == "signal_failed"
             raise RecoveryError(
                 409, "recovery_absence_unproven",
-                "a signal was sent but /proc never proved the process gone "
-                "— durable closure refused (closure only on proven "
-                "absence). Next action: preview again; if the process "
-                "persists, inspect /proc/"
-                f"{proc['pane_pid']} and resolve it at the OS level first",
-                {"pid": proc["pane_pid"],
+                ("a signal was delivered and the termination sequence then "
+                 f"failed in {signal_result.get('phase')} "
+                 f"({signal_result.get('error')}) — absence never proven, so "
+                 "no session, archive, alert or binding was closed and "
+                 "nothing was reset or cleaned. "
+                 if failed else
+                 "a signal was sent but /proc never proved the process gone "
+                 "— durable closure refused (closure only on proven "
+                 "absence). ") +
+                "Next action: preview again; if the process persists, "
+                f"inspect /proc/{proc['pane_pid']} and resolve it at the OS "
+                "level first",
+                {"pid": proc["pane_pid"], "signaled": True,
+                 "escalated": signal_result.get("escalated"),
+                 "phase": signal_result.get("phase"),
+                 "error": signal_result.get("error"),
+                 "closed": False, "discarded": False,
                  "detail": signal_result.get("detail")})
 
     # -- atomic durable closure on proven absence ---------------------------
@@ -1581,30 +2095,56 @@ def execute(con, shell_id: int, body: dict,
             "SET acted_at=datetime('now') WHERE observation_id=?",
             (observation_id,))
         con.commit()
-    except Exception:
+    except Exception as exc:
+        # The rollback makes the DURABLE half a clean no-op — and says nothing
+        # about the half that cannot be rolled back. By here the exact process
+        # has been signalled and proven dead, so a bare 500 leaves the operator
+        # with a shell whose rows still read live and whose process is gone,
+        # and no way to tell that from a recovery that never started. Same rule
+        # as the post-commit paths, one step earlier: an irreversible action
+        # already performed is NAMED, whichever direction the failure goes
+        # (SC-128's category, taken to the whole sequence rather than to the
+        # side of the commit it was found on).
         con.rollback()
-        raise
-    if abandon is not None and evidence["live_session"] and evidence["session"]:
-        try:
-            abandon(evidence["session"]["session_id"])
-        except Exception:  # noqa: BLE001, S110 — runtime cleanup is
-            pass         # best-effort; durable state is already closed
-
-    discarded = None
+        raise RecoveryError(
+            500, "recovery_closure_failed",
+            "the durable closure failed and was rolled back — no session, "
+            "archive, alert or binding was changed, and NOTHING was reset or "
+            "cleaned. " + (
+                f"The exact process (PID {signal_result.get('pid')}) was "
+                "already signalled and proven dead (that cannot be unwound), "
+                "so the shell's rows still describe a process that is gone; "
+                "recover it again to close them."
+                if signal_result else
+                "No process was signalled. Recover again."),
+            {"observation_id": observation_id, "signaled": signal_result,
+             "closed": False, "discarded": False,
+             "error": f"{type(exc).__name__}: {str(exc)[:200]}"}) from exc
+    # -- past the point of no return: NOTHING below may become a 500 --------
+    # The durable state is committed and cannot be unwound, and for a discard
+    # the operator's files are about to be — or by now already have been —
+    # touched. An exception escaping from here reaches the route as an opaque
+    # internal error whose body says which of those happened: nothing. That is
+    # the worst report there is, and decision #45 ranks it with the
+    # destruction itself. SC-126 gave that guarantee to the discard sequence;
+    # SC-128 was the identical defect one call EARLIER, in the late gate,
+    # which sat outside the structure built for it. So the boundary is drawn
+    # around the whole tail rather than around another helper: the response is
+    # assembled HERE, out of values already in hand, and every step after it
+    # only fills one of its fields in. Three things can still go wrong past
+    # this line and each returns rather than raises — the runtime abandon, the
+    # late gate, and the discard — the single exception being the gate's own
+    # refusal, which is not opaque: it names the closure it performed and that
+    # nothing was discarded.
+    result = {"shell_id": shell_id, "shortname": shortname,
+              "classification": classification, "mode": mode,
+              "signaled": signal_result,
+              "closed": changed,
+              "worktree": {"preserved": True},
+              "unread_messages": evidence["unread_messages"],
+              "availability": "available"}
+    changed["runtime"] = _abandon_runtime(abandon, evidence)
     if discard:
-        assert worktree is not None  # proven by the discard gate above
-        # Re-read the worktree immediately before the delete: the shell may
-        # have written during its own SIGTERM shutdown, after the fence above
-        # passed. The gate hands back the enumerated set that read confirmed,
-        # and the discard is bounded by it — see both docstrings.
-        plan = _assert_worktree_unchanged(observation_id, evidence, worktree,
-                                          signal_result)
-        discarded = _discard_worktree_files(worktree, plan)
-
-    return {"shell_id": shell_id, "shortname": shortname,
-            "classification": classification, "mode": mode,
-            "signaled": signal_result,
-            "closed": changed,
-            "worktree": discarded or {"preserved": True},
-            "unread_messages": evidence["unread_messages"],
-            "availability": "available"}
+        result["worktree"] = _discard_after_closure(
+            observation_id, evidence, worktree, signal_result)
+    return result

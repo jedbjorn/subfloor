@@ -2387,6 +2387,15 @@ function ifRecoveryResult(result) {
       `Parked ambiguous binding #${parked.binding_id}: ` +
       `${parked.next_action || "manual remediation required"}`));
   }
+  if (closed.runtime && !closed.runtime.abandoned) {
+    // Not a failed recovery — the durable rows are closed either way — but
+    // the generation may still be attached, and a field nobody renders is
+    // the same silence it was named to end (SC-128).
+    body.append(el("div", { className: "if-note bad" },
+      "The runtime would not release the session generation " +
+      `(${closed.runtime.error || "unknown error"}). Durable state IS ` +
+      "closed; check the Interface runtime."));
+  }
   if (worktree.failed) {
     const completed = (worktree.completed || []).join(", ") || "nothing";
     body.append(el("div", { className: "if-note bad" },
