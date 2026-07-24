@@ -59,7 +59,31 @@ PROJECT_VS_ENGINE_SOURCE = (
     "\n"
     "Engine skills speak fork-language. Where a skill says \"never edit\n"
     "`.super-coder/`\" or \"report/file it upstream\", that guidance is for forks —\n"
-    "here you author the fix directly instead."
+    "here you author the fix directly instead.\n"
+    "\n"
+    "**You are operating on the engine you are running — surgery on a moving\n"
+    "car.** Four standing consequences, all of which have produced wrong answers\n"
+    "in this repo:\n"
+    "\n"
+    "1. **Your `./sc` resolves the engine from the MAIN CHECKOUT, not your\n"
+    "   worktree** (`sc:11-21` derives it from git's common dir). That tree also\n"
+    "   hosts the gitignored live DB and runs the server. Being current in your\n"
+    "   own worktree says nothing about it — see the `floor:` line in ACTIVE\n"
+    "   SESSION, which reports exactly that.\n"
+    "2. **Verify claims about engine code against the remote, not your tree** —\n"
+    "   `git show origin/main:<path>` — because a stale checkout answers\n"
+    "   confidently and a command that reads it inherits the staleness.\n"
+    "3. **Pull after every merge; reconcile and restart at sprint boundaries.**\n"
+    "   Pulling is cheap and safe. `./sc update` refuses on live Interface state\n"
+    "   by design and a restart kills live sessions — never mid-sprint, and the\n"
+    "   restart is the FnB's.\n"
+    "4. **The live DB is the one you are migrating.** Back it up before applying\n"
+    "   anything, and name the DB path explicitly rather than trusting whichever\n"
+    "   one the dispatcher resolves.\n"
+    "\n"
+    "Procedure for the heavier moves — three-artifact engine-skill commits,\n"
+    "migrating the live DB, reconcile-vs-restart sequencing — is the\n"
+    "`engine_surgery` skill."
 )
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
@@ -241,6 +265,7 @@ def fetch_counts(con, shell_id: int) -> dict:
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  archive_id: int, work_dir: "Path | None" = None,
                  sync_note: "str | None" = None,
+                 floor_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
                  source_mode: bool = False) -> str:
@@ -251,7 +276,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     operates from a worktree rather than the repo root. sync_note is the
     launcher's worktree-drift status (run.sync_worktree) — surfaced alongside
     so a stale or divergent worktree is ambient knowledge, not something the
-    shell must remember to check. source_mode flips PROJECT vs ENGINE to the
+    shell must remember to check. floor_note is run.main_checkout_note — the
+    MAIN CHECKOUT's drift, which is a different tree from the shell's worktree
+    and the one every `./sc` resolves the engine from; it renders for EVERY
+    shell including admin at the repo root, because admin maintains main and was
+    previously the only shell given no drift line at all. source_mode flips
+    PROJECT vs ENGINE to the
     source-repo variant (caller decides via install.is_source_repo() — compose
     stays a pure render, no git).
     """
@@ -341,6 +371,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
             "- working dir: repo root, branch `main` — you maintain main "
             "directly (the only shell that does; every other shell works "
             "from a worktree and lands changes via PRs)")
+    # The engine floor is a DIFFERENT tree from the shell's cwd, so it is
+    # reported unconditionally — a worktree can be current while the tree its
+    # ./sc resolves from is stale, and admin (repo root) got no drift line here
+    # at all before this.
+    if floor_note:
+        active_session.append(f"- floor: {floor_note}")
 
     parts = [
         template,

@@ -392,9 +392,14 @@ durable state, and the events still wake you.
 Needed whenever any two units share a file. Declare it in the kickoff `task`
 rows so reviewers know their verdicts are SHA-bound before they spend a pass.
 
-1. Before merging: rebase onto current `origin/main`, confirm checks green on
-   the **rebased** head, report that SHA.
-2. After any unit merges: every remaining unit re-rebases and re-confirms.
+1. Before merging, check whether anything merged since the head was cut touches
+   THIS unit's files. Overlapping -> rebase onto current `origin/main`, confirm
+   checks green on the **rebased** head, report that SHA. Empty intersection ->
+   the head stands; say so with the evidence and merge. Do not rebase reflexively:
+   with disjoint file sets a rebase is ceremony that costs a CI cycle and buys
+   nothing, and it invites a fresh review for no reason.
+2. After any unit merges, every remaining unit re-applies step 1 — which for a
+   disjoint unit means re-checking the intersection, not necessarily re-rebasing.
 3. Merge order is review-clean order unless you state otherwise.
 
 **A reviewer verdict is bound to the exact SHA it was given.** The carry-over

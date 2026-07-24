@@ -414,6 +414,47 @@ def sync_worktree(work_dir: Path, shortname: str) -> str:
         return "drift check skipped (git timed out or errored)"
 
 
+def main_checkout_note(repo_root: Path) -> "str | None":
+    """Report the MAIN CHECKOUT's position against the default branch — the tree
+    every shell's `./sc` resolves the engine from (sc:11-21 derives ROOT via
+    git's common dir), which hosts the gitignored live DB and runs the
+    supervised server.
+
+    Why this exists separately from sync_worktree: that function reports the
+    SHELL'S OWN worktree, so a shell could be exactly current, be told so at
+    boot, and still drive a stale engine. That produced three wrong answers in
+    one session — a `./sc help` query answered from a stale tree, a
+    pending-migration check that came back empty because it globbed a stale
+    migrations dir, and dormant PR watches against a stale running floor.
+    Admin is the shell that maintains main directly and, before this, was the
+    only shell given no drift line at all.
+
+    STRICTLY READ-ONLY. sync_worktree may `reset --hard` a shell base; this must
+    never touch the main checkout — the server is running from it and a reset
+    would discard whatever the operator has in flight. Soft-fails like its
+    sibling: an offline boot must not block on a drift check.
+    """
+    default = (os.environ.get("SC_PROTECTED_BRANCHES") or "main").split()[0]
+    upstream = f"origin/{default}"
+    try:
+        if _git(repo_root, "rev-parse", "--verify", "--quiet",
+                upstream).returncode != 0:
+            return None
+        behind = int(_git(repo_root, "rev-list", "--count",
+                          f"HEAD..{upstream}").stdout.strip() or 0)
+        if behind == 0:
+            return f"engine floor current with {upstream}"
+        return (f"\u26a0 engine floor is {behind} commit(s) BEHIND {upstream} — "
+                f"your `./sc`, the live DB and the running server all resolve "
+                f"from `{repo_root}`, so commands may answer from stale code. "
+                "Verify engine claims with `git show origin/"
+                f"{default}:<path>` rather than the working tree, and ask the "
+                "FnB to pull + reconcile (restart is theirs; it kills live "
+                "sessions).")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
 def ensure_harness_path() -> None:
     """Prepend the dirs where the official installers drop harness binaries onto
     this process's PATH, so detection (shutil.which) and exec (execvpe) agree
@@ -1061,10 +1102,14 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         link_worktree_map(work_dir)
         if harness == "codex":
             trust_codex_worktree(work_dir)
+    # Every shell — including admin at the repo root — is told whether the tree
+    # its ./sc resolves from is current. Read-only; never syncs main.
+    floor_note = main_checkout_note(REPO_ROOT)
 
     content = compose_boot(con, full, user, session_id, archive_id,
                            work_dir=work_dir if work_dir != REPO_ROOT else None,
                            sync_note=sync_note,
+                           floor_note=floor_note,
                            source_mode=install.is_source_repo(),
                            api_key=full["api_key"],
                            api_port=api_port)
@@ -1393,6 +1438,9 @@ def main() -> None:
             map_note = link_worktree_map(work_dir)
             if harness == "codex":
                 trust_note = trust_codex_worktree(work_dir)
+        # Read-only floor check for EVERY shell, admin included — see
+        # main_checkout_note. The tree ./sc resolves from is not the shell's own.
+        floor_note = main_checkout_note(REPO_ROOT)
 
         # Repo-global branch hygiene: delete local branches whose PR is provably
         # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
@@ -1413,6 +1461,7 @@ def main() -> None:
         content = compose_boot(con, full, user, session_id, archive_id,
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
+                               floor_note=floor_note,
                                source_mode=install.is_source_repo(),
                                api_key=full["api_key"],
                                api_port=api_port)
