@@ -338,11 +338,39 @@ def _exact_identity_verified(con, session_id: int) -> bool:
         return False
 
 
+_NO_SPRINT = {"sprint_ref": None, "sprint_title": None}
+
+
+def _sprint_context(con, shell_id: int) -> dict:
+    """The sprint a shell's CURRENT session is working, from the archive's
+    sprint_ref (migration 0071, written at headless boot by run.py). Lets the
+    rail name WHICH sprint holds a working shell rather than only that someone
+    is working. Empty when the shell has no active archive or the archive
+    carries no ref — an unlabelled worker is still a worker."""
+    row = con.execute(
+        "SELECT a.sprint_ref, d.title FROM shells s "
+        "JOIN shell_memory_archives a ON a.archive_id = s.active_archive_id "
+        "LEFT JOIN documents d ON CAST(d.document_id AS TEXT) = a.sprint_ref "
+        "WHERE s.shell_id=?", (shell_id,)).fetchone()
+    if row is None or not row[0]:
+        return dict(_NO_SPRINT)
+    return {"sprint_ref": row[0], "sprint_title": row[1]}
+
+
 def _availability(con, shell_id: int, snap) -> dict:
     """The rail projection (spec #20 Occupancy Model): occupancy + lifecycle
     projected for compact display; New-chat authority never changes here. A
     shell with no live session is available ONLY after the liveness scan
-    clears it — a legacy/unmanaged harness makes it unreconciled."""
+    clears it — an unmanaged harness process keeps holding the shell.
+
+    Which unmanaged verdict is the operator-visible part (flag #94):
+    session_state() already separates 'busy' (a LIVE non-orphan process holds
+    the worktree — someone is genuinely working, e.g. a `./sc run` sprint
+    worker whose parent is alive) from 'orphan' (EVERY pid is orphaned —
+    a closed terminal or dead parent, a real stranded remnant). Collapsing
+    both to 'unreconciled' told the operator to recover healthy live work,
+    inverting decision #45's preservation-first stance. 'busy' projects as
+    'working'; 'orphan' keeps 'unreconciled' and its recovery affordance."""
     active_session = interface_state.active_session_sql("s")
     row = con.execute(
         "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, "
@@ -363,20 +391,29 @@ def _availability(con, shell_id: int, snap) -> dict:
         composer = con.execute(
             "SELECT composer FROM interface_input_state WHERE session_id=?",
             (session_id,)).fetchone()
+        # A managed generation claims no sprint: the Interface launch path
+        # does not stamp sprint_ref, so reading the archive here would label
+        # the chat with a PREVIOUS headless boot's sprint. Silence is honest.
         return {"availability": availability, "session_id": session_id,
                 "generation": generation,
                 "lifecycle": lifecycle, "harness": harness,
                 "model_route": model_route,
                 "composer": composer[0] if composer else None,
-                "alerts": _alert_count(con, session_id), **client}
+                "alerts": _alert_count(con, session_id),
+                **_NO_SPRINT, **client}
     state = shell_liveness.session_state(_shortname(con, shell_id), snap)
     if state is not None:
-        return {"availability": "unreconciled", "session_id": None,
+        # Only a WORKING shell names a sprint. A remnant must not borrow its
+        # dead session's label and read as live work.
+        working = state == "busy"
+        return {"availability": "working" if working else "unreconciled",
+                "session_id": None,
                 "lifecycle": None, "harness": None, "composer": None,
-                "model_route": None, "alerts": 0}
+                "model_route": None, "alerts": 0,
+                **(_sprint_context(con, shell_id) if working else _NO_SPRINT)}
     return {"availability": "available", "session_id": None,
             "lifecycle": None, "harness": None, "model_route": None,
-            "composer": None, "alerts": 0}
+            "composer": None, "alerts": 0, **_NO_SPRINT}
 
 
 def _shortname(con, shell_id: int) -> str:
@@ -527,14 +564,25 @@ def _create_session(actor, headers, body):
             # harness process launched outside the API blocks New chat —
             # absence of a managed row is never proof of availability.
             snap = shell_liveness.compute()
-            if shell_liveness.session_state(shortname, snap) is not None:
+            state = shell_liveness.session_state(shortname, snap)
+            if state is not None:
+                # Authority is unchanged — BOTH verdicts still refuse (flag
+                # #94's bound: a working shell must not become startable).
+                # Only the reason differs: telling the operator to prove a
+                # LIVE worker absent is the inversion this unit removes.
                 return 409, {"error": {
                     "code": "unmanaged_harness",
-                    "message": "a legacy or directly launched harness "
-                               "process holds this shell's worktree — New "
-                               "chat is blocked as unreconciled until "
-                               "absence is proved",
-                    "details": {"shortname": shortname}}}
+                    "message": (
+                        "a live harness process is working in this shell's "
+                        "worktree outside the Interface — New chat is "
+                        "blocked until that session ends"
+                        if state == "busy" else
+                        "a legacy or directly launched harness "
+                        "process holds this shell's worktree — New "
+                        "chat is blocked as unreconciled until "
+                        "absence is proved"),
+                    "details": {"shortname": shortname,
+                                "liveness_state": state}}}
             harness, model = _resolved_launch_route(
                 con, flavor, body.get("harness"), body.get("model"))
             if model and not _model_route_available(con, harness, model):

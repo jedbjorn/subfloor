@@ -806,6 +806,65 @@ invariant(!requested.some((path) => path.includes("/sessions/")),
 """)
 
 
+def test_working_shell_pane_states_the_work_and_never_leads_with_recovery():
+    """Flag #94: DEV3 and DEV5 were building sprint-38 units while this pane
+    told the operator they ran a legacy harness and offered Preview recovery
+    as the primary affordance. A working shell states what it is doing,
+    names its sprint, and demotes recovery behind that."""
+    run_recovery_js(r"""
+apiIf = async () => { throw new Error("working pane must not call the API"); };
+const pane = new FakeElement("div");
+ifWorkingPane(pane, {
+  shell_id: 6, shortname: "DEV6", display_name: "Code-04",
+  availability: "working", session_id: null,
+  sprint_ref: "38", sprint_title: "SPRINT: Launcher operator surface",
+}, new FakeElement("div"));
+const text = pane.textContent;
+invariant(text.includes("working"), `working pane never says working: ${text}`);
+invariant(text.includes("SPRINT: Launcher operator surface"),
+  `working pane did not name the sprint: ${text}`);
+invariant(!text.includes("legacy or unmanaged harness"),
+  "working pane reused the stranded-shell copy");
+invariant(!text.includes("Prove the process absent"),
+  "working pane told the operator to prove a LIVE worker absent");
+invariant(pane.children[0].textContent.includes("working"),
+  "recovery card preceded the statement that the shell is working");
+invariant(Boolean(button(pane, "Preview recovery")),
+  "working pane dropped recovery entirely — a stuck worker needs the path");
+invariant(pane.children[1].textContent.includes("destroys live work"),
+  "recovery on a working shell carried no live-work warning");
+""")
+
+
+def test_working_shell_without_a_sprint_marker_still_reads_as_working():
+    """An archive with no sprint_ref must not make the pane hedge — absence
+    of a label is not evidence the shell is idle or stranded."""
+    run_recovery_js(r"""
+const pane = new FakeElement("div");
+ifWorkingPane(pane, {
+  shell_id: 6, shortname: "DEV6", display_name: "Code-04",
+  availability: "working", session_id: null,
+  sprint_ref: null, sprint_title: null,
+}, new FakeElement("div"));
+const text = pane.textContent;
+invariant(text.includes("working"), `unlabelled worker not working: ${text}`);
+invariant(!text.includes("sprint #"), `invented a sprint label: ${text}`);
+invariant(!text.includes("null") && !text.includes("undefined"),
+  `leaked a missing sprint into the copy: ${text}`);
+""")
+
+
+def test_rail_routes_working_away_from_recovery_and_paints_it_amber():
+    """The rail projection itself: `working` is warn (live work), not bad
+    (stranded), and selecting it never lands on the recovery pane."""
+    assert 'working: "warn"' in RENDER_INTERFACE
+    assert 'sel.availability === "working"' in RENDER_INTERFACE
+    # The recovery route must not have grown a `working` arm.
+    recovery_route = RENDER_INTERFACE[
+        RENDER_INTERFACE.index('sel.availability === "lost"'):]
+    assert '"working"' not in recovery_route.split("ifRecoveryPane")[0]
+
+
 def test_recovery_partial_result_keeps_exact_remediation_until_refresh():
     run_recovery_js(r"""
 let rendered = 0;

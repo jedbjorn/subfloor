@@ -434,15 +434,29 @@ class InterfaceApiTest(unittest.TestCase):
 
     # -- New chat refusal ---------------------------------------------------------------
 
-    def test_unmanaged_harness_refusal(self):
+    def unmanaged(self, orphaned, shortname="s1"):
+        """Point the liveness scan at one unmanaged harness holding a shell's
+        worktree. `orphaned` is the per-process verdict classify_orphan would
+        return: falsy = a live parent (a working `./sc run` worker), a reason
+        string = a stranded remnant."""
         self.liveness.stop()
         self.liveness = mock.patch.object(
             routes.shell_liveness, "compute",
             return_value={"supported": True, "processes": [
-                {"pid": 777, "comm": "kimi", "cwd": "/x/.sc-worktrees/s1",
-                 "region": "worktree", "shortname": "s1",
-                 "display_name": "S1", "is_self": False, "orphaned": False}]})
+                {"pid": 777, "comm": "kimi",
+                 "cwd": f"/x/.sc-worktrees/{shortname}",
+                 "region": "worktree", "shortname": shortname,
+                 "display_name": shortname.upper(), "is_self": False,
+                 "orphaned": orphaned}]})
         self.liveness.start()
+
+    def rail(self, shell_id=1):
+        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
+        self.assertEqual(status, 200)
+        return next(s for s in body["shells"] if s["shell_id"] == shell_id)
+
+    def test_unmanaged_harness_refusal(self):
+        self.unmanaged(orphaned="tty-gone")
         status, _, body = self.create_session()
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "unmanaged_harness")
@@ -453,8 +467,90 @@ class InterfaceApiTest(unittest.TestCase):
         con.close()
         self.assertEqual(count, 0)
         # …and the rail projects unreconciled, not available.
-        status, _, body = self.call("GET", "/api/interface/shells", (OP,))
-        self.assertEqual(body["shells"][0]["availability"], "unreconciled")
+        self.assertEqual(self.rail()["availability"], "unreconciled")
+
+    # -- working vs stranded (flag #94) -------------------------------------------
+
+    def test_working_shell_is_not_reported_unreconciled(self):
+        """The sprint-worker inversion: a LIVE non-orphan harness holds the
+        worktree, so session_state() says 'busy'. Reporting that as
+        'unreconciled' told the operator to recover healthy live work."""
+        self.unmanaged(orphaned=None)
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "working")
+        self.assertIsNone(shell["session_id"])
+
+    def test_stranded_shell_still_reports_unreconciled(self):
+        """The other half of the split must not move: every pid orphaned is a
+        real remnant and keeps its recovery affordance."""
+        self.unmanaged(orphaned="detached")
+        self.assertEqual(self.rail()["availability"], "unreconciled")
+
+    def test_working_shell_still_refuses_new_chat(self):
+        """The hard bound: New-chat authority does not widen. A working shell
+        refuses exactly as before — only the stated reason changes, and it no
+        longer tells the operator to prove a live worker absent."""
+        self.unmanaged(orphaned=None)
+        status, _, body = self.create_session()
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "unmanaged_harness")
+        self.assertEqual(body["error"]["details"]["liveness_state"], "busy")
+        self.assertNotIn("absence", body["error"]["message"])
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            self.assertEqual(con.execute(
+                "SELECT COUNT(*) FROM interface_sessions").fetchone()[0], 0)
+
+    def test_working_shell_names_its_sprint_from_the_archive(self):
+        """Deliverable 2's payoff: the rail names WHICH sprint, from the
+        archive's sprint_ref that run.py stamps on a headless boot."""
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            con.execute(
+                "INSERT INTO documents (document_id, kind, title, body) "
+                "VALUES (38,'doc','SPRINT: Launcher operator surface','x')")
+            con.execute("UPDATE shell_memory_archives SET sprint_ref='38' "
+                        "WHERE archive_id=10")
+            con.execute("UPDATE shells SET active_archive_id=10 "
+                        "WHERE shell_id=1")
+            con.commit()
+        self.unmanaged(orphaned=None)
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "working")
+        self.assertEqual(shell["sprint_ref"], "38")
+        self.assertEqual(shell["sprint_title"],
+                         "SPRINT: Launcher operator surface")
+
+    def test_unlabelled_worker_is_still_working(self):
+        """An archive with no sprint_ref must not demote the verdict — absence
+        of a marker is not evidence the shell is idle or stranded."""
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            con.execute("UPDATE shells SET active_archive_id=10 "
+                        "WHERE shell_id=1")
+            con.commit()
+        self.unmanaged(orphaned=None)
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "working")
+        self.assertIsNone(shell["sprint_ref"])
+        self.assertIsNone(shell["sprint_title"])
+
+    def test_stranded_shell_claims_no_sprint(self):
+        """A remnant must not borrow its dead session's sprint label and read
+        as live work — the operator needs recovery to stay unambiguous."""
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            con.execute("UPDATE shell_memory_archives SET sprint_ref='38' "
+                        "WHERE archive_id=10")
+            con.execute("UPDATE shells SET active_archive_id=10 "
+                        "WHERE shell_id=1")
+            con.commit()
+        self.unmanaged(orphaned="tty-gone")
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "unreconciled")
+        self.assertIsNone(shell["sprint_ref"])
+
+    def test_one_working_shell_does_not_taint_the_rest(self):
+        """The projection is per shell: s2 is dormant and stays available."""
+        self.unmanaged(orphaned=None, shortname="s1")
+        self.assertEqual(self.rail(1)["availability"], "working")
+        self.assertEqual(self.rail(2)["availability"], "available")
 
     def test_shell_occupied_race(self):
         status, _, _ = self.create_session()

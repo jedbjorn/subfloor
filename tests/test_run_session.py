@@ -311,6 +311,8 @@ class OpenSessionContentionTest(unittest.TestCase):
 class HeadlessSessionFailureTest(unittest.TestCase):
     def test_sc_run_exits_before_worktree_or_harness_artifacts(self) -> None:
         con = mock.Mock()
+        # No armed sprint binding — resolve_sprint_ref stamps nothing.
+        con.execute.return_value.fetchall.return_value = []
         chosen = {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"}
         fdefaults = {
             "dev": {"default_harness": "claude", "models": {"claude": "sonnet"}}
