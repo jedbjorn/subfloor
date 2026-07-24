@@ -250,7 +250,7 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertIsNone(body["shells"][1]["default_harness"])
         self.assertIsNone(body["shells"][1]["default_model"])
 
-    # -- model: launch route vs observed model (flag #130) ----------------------
+    # -- the model surfaces carry the launch route only (flag #130, dec #55) ---
 
     def set_route(self, session_id, route):
         with sqlite3.connect(self.db_path) as con:
@@ -258,16 +258,30 @@ class InterfaceApiTest(unittest.TestCase):
                 "UPDATE interface_sessions SET model_route=? "
                 "WHERE session_id=?", (route, session_id))
 
-    def sweep_usage(self, model, archive_id=10, ref="t1", ended_at=None):
-        """One analytics-sweep row (feature #17) — the ground truth the rail
-        reads. UNIQUE(harness, harness_session_ref, model) lets one harness
-        session carry several models, which is the /model-switch case."""
+    def sweep_switch_back(self, archive_id=10):
+        """The analytics sweep's REAL output for an A→B→A model switch inside
+        one harness session, as `token_parsers/claude.py` emits it — the shape
+        that makes a current-model claim underivable (flag #136):
+
+        * one row per (session × model), both stamped with the SAME
+          session-wide started_at/ended_at (the parser builds them from the
+          transcript's first/last timestamp and reuses that pair for every
+          model row — verified live on archive 8, usage_id 6 and 7);
+        * UNIQUE (harness, harness_session_ref, model) collapses the return to
+          A into the existing A row, so the switch-back leaves no trace and
+          the LAST-inserted row is B — the model that is not running now.
+
+        Any ordering over these rows therefore reports B. That is why the
+        surfaces state the launch route instead of guessing."""
+        window = ("2026-07-24T09:39:27Z", "2026-07-24T11:53:12Z")
         with sqlite3.connect(self.db_path) as con:
-            con.execute(
-                "INSERT INTO session_token_usage "
-                "(archive_id, shell_id, harness, harness_session_ref, model, "
-                " ended_at, status) VALUES (?,1,'claude',?,?,?,'ok')",
-                (archive_id, ref, model, ended_at))
+            for model in ("claude-opus-5", "claude-fable-5"):
+                con.execute(
+                    "INSERT INTO session_token_usage "
+                    "(archive_id, shell_id, harness, harness_session_ref, "
+                    " model, started_at, ended_at, status) "
+                    "VALUES (?,1,'claude','t1',?,?,?,'ok')",
+                    (archive_id, model, *window))
 
     def shell_projection(self):
         status, _, body = self.call("GET", "/api/interface/shells", (OP,))
@@ -294,49 +308,29 @@ class InterfaceApiTest(unittest.TestCase):
                 "model_route": "gpt-5.6-terra",
             },
         )
-        # Nothing swept yet: the projection says so instead of passing the
-        # launch route off as the live model.
-        self.assertIsNone(shell["model_observed"])
 
-    def test_projection_reports_swept_model_beside_the_launch_route(self):
-        # The reproduction from flag #130: launched on fable, running Opus 5.
+    def test_model_surfaces_stay_the_launch_route_across_a_switch_back(self):
+        # Launched on fable, ran opus, switched back to opus's predecessor and
+        # back again: the sweep cannot express that, so neither surface may
+        # derive a "current" model from it. `model_route` — the launch route,
+        # named as such — stays the only model-bearing field on both.
         session_id = self.occupy()
         self.set_route(session_id, "fable")
-        self.sweep_usage("claude-opus-5")
+        self.sweep_switch_back()
 
         shell = self.shell_projection()
-
-        self.assertEqual(shell["model_observed"], "claude-opus-5")
-        self.assertEqual(shell["model_route"], "fable")
-
-    def test_observed_model_follows_the_latest_in_harness_switch(self):
-        session_id = self.occupy()
-        self.set_route(session_id, "fable")
-        self.sweep_usage("claude-fable-5", ended_at="2026-07-24 09:00:00")
-        self.sweep_usage("claude-opus-5", ended_at="2026-07-24 11:00:00")
-
-        self.assertEqual(self.shell_projection()["model_observed"],
-                         "claude-opus-5")
-
-    def test_observed_model_is_scoped_to_this_session_archive(self):
-        # occupy() attributes session 1 to archive 10; a sweep row on another
-        # archive belongs to another session and must not be reported here.
-        self.occupy()
-        self.sweep_usage("claude-opus-5", archive_id=20, ref="other")
-
-        self.assertIsNone(self.shell_projection()["model_observed"])
-
-    def test_session_detail_carries_route_and_observed_model(self):
-        session_id = self.occupy()
-        self.set_route(session_id, "fable")
-        self.sweep_usage("claude-opus-5")
-
-        status, _, body = self.call(
+        status, _, detail = self.call(
             "GET", f"/api/interface/sessions/{session_id}", (OP,))
 
         self.assertEqual(status, 200)
-        self.assertEqual((body["model_route"], body["model_observed"]),
-                         ("fable", "claude-opus-5"))
+        self.assertEqual(shell["model_route"], "fable")
+        self.assertEqual(detail["model_route"], "fable")
+        # `default_model` is the flavor default the NEXT launch would use, not
+        # a claim about this session, so it is excluded here.
+        session_model_keys = sorted(
+            k for k in (*shell, *detail)
+            if "model" in k and not k.startswith("default_"))
+        self.assertEqual(set(session_model_keys), {"model_route"})
 
     def test_browser_bootstrap_same_origin_fence(self):
         # Cross-site Origin cannot mint a session (rejected before the

@@ -2199,18 +2199,19 @@ function ifModelLabel(route) {
   return String(route).replace(/[-_]+/g, " ").trim().toUpperCase();
 }
 
-// What the surface may say about a session's model (flag #130). `model_route`
-// is only the route the session was LAUNCHED with — an in-harness /model switch
-// never reaches the engine — so it is never rendered as a bare claim about the
-// live model. `model_observed` comes from the analytics sweep, which reads the
-// harness's own transcript but is not real-time: an unswept session has none,
-// and then the launch route is shown MARKED as the launch route.
-function ifModelDisplay(observed, route) {
-  if (observed) return { text: ifModelLabel(observed),
-    title: "the model this session was last observed running (analytics sweep)" };
-  return { text: ifModelLabel(route) + " (launched)",
-    title: "the route this session was launched with — its live model has not "
-         + "been observed yet, and an in-harness /model switch would not show here" };
+// What the surface may say about a session's model (flag #130, decision #55).
+// `model_route` is only the route the session was LAUNCHED with — an in-harness
+// /model switch never reaches the engine — so it is labelled as the launch
+// route and never rendered as a claim about the live model. The analytics sweep
+// cannot supply the live one either: its rows carry one model per session-wide
+// window, so they cannot express switch order (flag #136). Deriving a truthful
+// current model is a feature #17 follow-up, not something this surface guesses.
+const IF_LAUNCHED_TITLE =
+  "the route this session was launched with — not necessarily the model it is "
+  + "running now, since an in-harness /model switch never reaches the engine";
+
+function ifLaunchedDisplay(route) {
+  return { text: ifModelLabel(route) + " (launched)", title: IF_LAUNCHED_TITLE };
 }
 
 async function renderInterface(root) {
@@ -2244,16 +2245,17 @@ async function renderInterface(root) {
     if (s.alerts > 0)
       head.append(el("span", { className: "pill if-badge bad",
         title: s.alerts + " current alert(s)" }, "⚠ " + s.alerts));
-    const model = s.availability === "occupied"
-      ? ifModelDisplay(s.model_observed, s.model_route)
+    const launched = s.availability === "occupied"
+      ? ifLaunchedDisplay(s.model_route)
       : null;
     const sub = el("div", { className: "if-row-sub" },
       s.shortname + (s.harness ? " · " + s.harness : ""));
-    if (model) sub.append(el("span", { title: model.title }, " · " + model.text));
+    if (launched)
+      sub.append(el("span", { title: launched.title }, " · " + launched.text));
     row.append(head, sub);
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
-    const mobileModel = model ? " · " + model.text : "";
+    const mobileModel = launched ? " · " + launched.text : "";
     const opt = el("option", { value: s.shortname },
       `${s.display_name || s.shortname} · ${s.shortname}` +
       `${s.harness ? " · " + s.harness : ""}${mobileModel}` +
@@ -2987,7 +2989,6 @@ async function ifSessionPane(pane, sel) {
 
   const st = {
     harness: sess.harness || sel.harness || "—",
-    model: sess.model_observed || null,      // observed live model, or unobserved
     modelRoute: sess.model_route || null,    // the route it was LAUNCHED with
     lifecycle: sess.lifecycle || "—",
     composer: sess.composer || "unknown",
@@ -3108,14 +3109,11 @@ function ifPaintHeader(a, sel, pane) {
     k + " ", el("b", {}, String(v)));
   // Read-only session telemetry stays available without consuming the terminal
   // header. Actions remain outside the disclosure beside the state they change.
-  // model = what the session was observed running; the launch route is only
-  // shown as its own labelled stat, never as a claim about the live model.
-  const model = ifModelDisplay(st.model, st.modelRoute);
+  // The launch route gets its own labelled stat — there is no `model` stat,
+  // because nothing here observes the model the session is running now.
   a.sessionDetailsEl.replaceChildren(
     stat("harness", st.harness),
-    stat("model", model.text, model.title),
-    ...(st.model ? [stat("launched", ifModelLabel(st.modelRoute),
-      "the route this session was launched with")] : []),
+    stat("launched", ifModelLabel(st.modelRoute), IF_LAUNCHED_TITLE),
     stat("session", "#" + a.sessionId + (st.archive != null ? " · arc #" + st.archive : "")),
     stat("age", ifAge(st.since)),
     stat("lifecycle", st.lifecycle),

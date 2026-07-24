@@ -338,51 +338,20 @@ def _exact_identity_verified(con, session_id: int) -> bool:
         return False
 
 
-def _observed_model(con, archive_id) -> "str | None":
-    """The model this session was OBSERVED running, or None if unobserved.
-
-    `interface_sessions.model_route` is only the route the session was LAUNCHED
-    with; an in-harness `/model` switch never reaches the engine (the lifecycle
-    hook contract discards the native payload by design — spec #20 Harness
-    Hooks), so the route goes stale the moment the operator switches. The
-    feature #17 analytics sweep is the seam that does observe it:
-    `session_token_usage` carries harness-reported model ids read out of the
-    harness's own transcript, one row per (harness session x model), so a
-    switch shows up as an extra row and the most recently active one is what
-    is actually running.
-
-    The sweep runs at boot, not in real time, so a live session may have no row
-    yet — that is None, and callers must render it as unobserved rather than
-    falling back silently to the launch route (flag #130)."""
-    if archive_id is None:
-        return None
-    row = con.execute(
-        "SELECT model FROM session_token_usage "
-        "WHERE archive_id=? AND model IS NOT NULL "
-        "ORDER BY ended_at DESC, started_at DESC, usage_id DESC LIMIT 1",
-        (archive_id,)).fetchone()
-    return row[0] if row else None
-
-
 def _availability(con, shell_id: int, snap) -> dict:
     """The rail projection (spec #20 Occupancy Model): occupancy + lifecycle
     projected for compact display; New-chat authority never changes here. A
     shell with no live session is available ONLY after the liveness scan
-    clears it — a legacy/unmanaged harness makes it unreconciled.
-
-    `model_route` and `model_observed` are two different claims and ship as two
-    fields: the route the session was launched with, and the model the sweep
-    has actually seen it run (None = not observed yet)."""
+    clears it — a legacy/unmanaged harness makes it unreconciled."""
     active_session = interface_state.active_session_sql("s")
     row = con.execute(
         "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, "
-        "s.harness, s.model_route, s.archive_id "
+        "s.harness, s.model_route "
         "FROM interface_sessions s WHERE s.shell_id=? "
         f"AND {active_session} ORDER BY s.session_id DESC LIMIT 1",
         (shell_id,)).fetchone()
     if row is not None:
-        (session_id, generation, occupancy, lifecycle, harness, model_route,
-         archive_id) = row
+        session_id, generation, occupancy, lifecycle, harness, model_route = row
         client = _client_state(con, session_id)
         if occupancy == "reserved":
             availability = "starting"
@@ -398,17 +367,16 @@ def _availability(con, shell_id: int, snap) -> dict:
                 "generation": generation,
                 "lifecycle": lifecycle, "harness": harness,
                 "model_route": model_route,
-                "model_observed": _observed_model(con, archive_id),
                 "composer": composer[0] if composer else None,
                 "alerts": _alert_count(con, session_id), **client}
     state = shell_liveness.session_state(_shortname(con, shell_id), snap)
     if state is not None:
         return {"availability": "unreconciled", "session_id": None,
                 "lifecycle": None, "harness": None, "composer": None,
-                "model_route": None, "model_observed": None, "alerts": 0}
+                "model_route": None, "alerts": 0}
     return {"availability": "available", "session_id": None,
             "lifecycle": None, "harness": None, "model_route": None,
-            "model_observed": None, "composer": None, "alerts": 0}
+            "composer": None, "alerts": 0}
 
 
 def _shortname(con, shell_id: int) -> str:
@@ -761,7 +729,6 @@ def _get_session(session_id: int):
         return _json(200, {
             "session_id": row[0], "shell_id": row[1], "generation": row[2],
             "archive_id": row[3], "harness": row[4], "model_route": row[5],
-            "model_observed": _observed_model(con, row[3]),
             "worktree": row[6], "occupancy": row[7], "lifecycle": row[8],
             "created_at": row[9], "occupied_at": row[10],
             "ended_at": row[11], "end_reason": row[12],
