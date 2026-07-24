@@ -408,6 +408,58 @@ def _path_identity(path: str) -> str:
         "torn read: an entry kept changing while it was observed")
 
 
+# What `_entry_identity` records for a path the index holds nothing for.
+# A value, not an absence: a path GAINING or LOSING an index entry is itself
+# a change the digest must move on.
+_INDEX_ABSENT = "index:none"
+
+
+def _index_identities(worktree: str) -> dict[str, str]:
+    """What the INDEX holds, per path: mode, object id and merge stage.
+
+    Read in ONE pass over the whole index rather than per path — every entry
+    then comes from the same instant, the same way the path set does.
+
+    Blob id, mode and stage ONLY — never the index file's own mtime or its
+    stat cache. `git status` REFRESHES those as a side effect of the very
+    observation this fences, so binding them would make a preview stale
+    against itself and refuse every discard forever (the same trap st_atime
+    is excluded from `_path_identity` for). What a discard destroys is the
+    CONTENT the index holds, and that is what is recorded.
+
+    An unmerged path carries several stage entries; all of them are recorded,
+    sorted, because a conflict resolution rewrites exactly that set.
+    """
+    entries: dict[str, list[str]] = {}
+    for record in _git_out(worktree, "ls-files", "--stage", "-z",
+                           timeout=30).split("\0"):
+        if not record:
+            continue
+        meta, _tab, rel = record.partition("\t")
+        entries.setdefault(rel, []).append(" ".join(meta.split()))
+    return {rel: "+".join(sorted(stages)) for rel, stages in entries.items()}
+
+
+def _entry_identity(worktree: str, rel: str, index: dict[str, str]) -> str:
+    """One enumerated entry's COMPLETE identity — what the filesystem holds at
+    that path, and what the index holds for it.
+
+    Staged work does not live in the worktree, and a discard destroys it all
+    the same: `git restore --source=HEAD --staged` throws the index back to
+    HEAD, and on an unborn HEAD `git rm --cached` drops the entry outright. So
+    an operator who stages a change AFTER the preview had, until SC-123, work
+    inside the confirmed blast radius that no gate could see — the working
+    file, its lstat and the porcelain line all stay byte-identical while the
+    blob underneath is replaced (`git add -p` produces exactly that shape).
+
+    Same rule as every attribute already bound: if the discard would create,
+    delete or rewrite it, the digest binds it. The index is simply the one
+    place that state is not a file.
+    """
+    return (_path_identity(os.path.join(worktree, rel)) + "\0"
+            + index.get(rel, _INDEX_ABSENT))
+
+
 def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     """WHAT a discard would destroy, named entry by entry: the exact SET of
     worktree entries, each entry's identity, and the digest over the whole
@@ -429,8 +481,11 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     underneath them is rewritten, retargeted, re-permissioned or changes type —
     so the line set is only the outer layer. Held against the invariant, that
     state is: the SET of affected entries, and for each its ENTITY IDENTITY
-    (`_path_identity`) — type, permissions, ownership, timestamps, and
-    regular-file bytes or symlink target.
+    (`_entry_identity`) — type, permissions, ownership, timestamps, and
+    regular-file bytes or symlink target, PLUS the index entry (mode, object,
+    stage) standing behind it. The last is not a filesystem fact at all and
+    was missed for exactly that reason (SC-123): `git restore --staged`
+    destroys staged content the worktree never shows.
 
     The set is what the discard must undo:
     - untracked FILES individually (`ls-files -o`), never collapsed to a dir;
@@ -463,13 +518,14 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     untracked_files = {p for p in listed if not p.endswith("/")}
     tracked = set(paths("diff", "HEAD", "--name-only", "-z")) if head \
         else set(paths("ls-files", "-z"))
+    index = _index_identities(worktree)
 
     h = hashlib.sha256()
     for line in sorted(porcelain):
         h.update(line.encode("utf-8", "surrogateescape") + b"\n")
     identities = {}
     for rel in sorted(tracked | untracked_files | untracked_dirs):
-        identities[rel] = _path_identity(os.path.join(worktree, rel))
+        identities[rel] = _entry_identity(worktree, rel, index)
         h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                  + identities[rel].encode() + b"\0")
     return {"head": head, "tracked": sorted(tracked),
@@ -699,11 +755,14 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     a directory afterwards is left alone rather than restored over.
 
     Each entry is also re-verified against the identity the fence observed,
-    immediately before it is touched, and left alone when it no longer
-    matches — so a path is only ever removed while it still IS what the
-    operator was shown. That check narrows, and does not close, the window
-    between the check and the `unlink`/`restore` itself: no filesystem offers
-    "remove only if unchanged".
+    and left alone when it no longer matches — so a path is only ever removed
+    while it still IS what the operator was shown. The filesystem half of that
+    identity is re-read immediately before the entry is touched; the index
+    half comes from ONE snapshot taken at the top of this function, since
+    nothing here writes to the index before the final restore. That check
+    narrows, and does not close, the window between the check and the
+    `unlink`/`restore` itself: no filesystem offers "remove only if
+    unchanged", and the index is not transactional against us either.
 
     Runs AFTER the durable closure is committed, so a failure here must never
     escape as a 500 that hides what happened: each step's outcome is recorded
@@ -716,11 +775,20 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
                     "completed": [], "failed": None,
                     "kept": [], "kept_count": 0}
     identities, restore, kept_files = plan["identities"], [], []
+    # One index read for the whole pass: nothing below writes to the index
+    # until the final `restore`/`rm --cached`, so this snapshot stays true for
+    # every re-check. Unreadable -> `index` is None and NOTHING verifies,
+    # which keeps every entry rather than deleting on an unchecked identity.
+    try:
+        index = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        index = None
 
     def unchanged(rel: str) -> bool:
+        if index is None:
+            return False
         try:
-            return _path_identity(
-                os.path.join(worktree, rel)) == identities[rel]
+            return _entry_identity(worktree, rel, index) == identities[rel]
         except _GitEvidenceUnavailable:
             return False   # unreadable now: never a licence to delete
 
