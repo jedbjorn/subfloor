@@ -154,6 +154,27 @@ def _host_ok(headers) -> bool:
     return host in {h.strip("[]") for h in _ALLOWED_HOSTS}
 
 
+def _same_origin_as_host(origin: str, host: str) -> "str | None":
+    """Exact origin match, returning the matched scheme (None = no match).
+
+    A serialized origin (RFC 6454) is `scheme://host[:port]` and nothing
+    else — no path, no query, no fragment. Comparing only the netloc would
+    accept `http://127.0.0.1:8800/anything?q=1` as same-origin; no browser
+    emits that, so anything that does is a non-browser caller dressing up as
+    one, and this is the surface where exactness is the whole point.
+    Userinfo needs no separate rule: it lives in netloc, so `evil@host`
+    already fails the comparison."""
+    from urllib.parse import urlparse
+    parsed = urlparse(origin)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.path or parsed.params or parsed.query or parsed.fragment:
+        return None
+    if parsed.netloc != host:
+        return None
+    return parsed.scheme
+
+
 def _browser_origin(headers) -> "str | None":
     """The bootstrap's hostile-site fence (spec #26 Bootstrap Flow 2). This
     route is browser-only, so — unlike the header-tolerant mutation check
@@ -163,25 +184,20 @@ def _browser_origin(headers) -> "str | None":
     cross-site, or malformed provenance returns None (fail closed).
     Returns the proven Origin's scheme, which decides the cookie's
     `Secure` attribute."""
-    from urllib.parse import urlparse
     origin = headers.get("Origin") or ""
     host = headers.get("Host") or ""
     if not origin or not host:
         return None
-    parsed = urlparse(origin)
-    if parsed.scheme not in ("http", "https") or parsed.netloc != host:
-        return None
     if (headers.get("Sec-Fetch-Site") or "") != "same-origin":
         return None
-    return parsed.scheme
+    return _same_origin_as_host(origin, host)
 
 
 def _mutation_site_ok(headers) -> bool:
     origin = headers.get("Origin")
-    if origin:
-        from urllib.parse import urlparse
-        if urlparse(origin).netloc != (headers.get("Host") or ""):
-            return False
+    if origin and _same_origin_as_host(origin,
+                                       headers.get("Host") or "") is None:
+        return False
     sfs = headers.get("Sec-Fetch-Site")
     return sfs in (None, "same-origin", "none")
 

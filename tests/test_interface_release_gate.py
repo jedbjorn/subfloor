@@ -106,10 +106,13 @@ class ReleaseGateTest(unittest.TestCase):
         writer.close()
 
     def _stop_transport(self):
+        # Shut the transport down while the loop is still RUNNING and wait for
+        # it. Scheduling stop() after loop.stop() only creates a task nothing
+        # ever executes, so the listening socket outlives the test class.
+        asyncio.run_coroutine_threadsafe(
+            self.transport.stop(), self.loop).result(timeout=10)
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=10)
-        self.loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(self.transport.stop()))
         self.loop.close()
 
     # -- a real HTTP request -------------------------------------------------

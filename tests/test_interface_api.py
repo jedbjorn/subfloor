@@ -398,6 +398,17 @@ class InterfaceApiTest(unittest.TestCase):
              ("Origin: http://127.0.0.1:8800", "Sec-Fetch-Site: none")),
             ("scheme-relative junk Origin",
              ("Origin: 127.0.0.1:8800", "Sec-Fetch-Site: same-origin")),
+            # A serialized origin is scheme://host[:port] and stops there. A
+            # netloc-only comparison would wave all three of these through.
+            ("Origin bearing a path",
+             ("Origin: http://127.0.0.1:8800/ui/app.js",
+              "Sec-Fetch-Site: same-origin")),
+            ("Origin bearing a query",
+             ("Origin: http://127.0.0.1:8800?x=1",
+              "Sec-Fetch-Site: same-origin")),
+            ("Origin bearing a fragment",
+             ("Origin: http://127.0.0.1:8800#frag",
+              "Sec-Fetch-Site: same-origin")),
             ("no browser provenance at all", ()),
         ):
             with self.subTest(label):
@@ -638,6 +649,17 @@ class InterfaceApiTest(unittest.TestCase):
             (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
              "Origin: http://evil.example.com",
              "Sec-Fetch-Site: cross-site", "Idempotency-Key: c4"),
+            {"shell_id": 1})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "not_same_origin")
+        # The mutation fence is header-tolerant (it also serves the CLI, which
+        # sends no Origin at all), but tolerant is not the same as loose: an
+        # Origin that IS present still has to be an exact serialized origin,
+        # not merely one whose netloc happens to match.
+        status, _, body = self.call(
+            "POST", "/api/interface/sessions",
+            (OP, "Idempotency-Key: c5",
+             "Origin: http://127.0.0.1:8800/ui/index.html?x=1"),
             {"shell_id": 1})
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["code"], "not_same_origin")
