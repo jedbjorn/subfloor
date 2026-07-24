@@ -99,6 +99,23 @@ class AssemblerSmokeTest(unittest.TestCase):
     def test_get_shell_missing_returns_none(self) -> None:
         self.assertIsNone(server.get_shell(self.con, 999999))
 
+    def test_health_exposes_local_artifact_capabilities(self) -> None:
+        with mock.patch.object(server.ports_mod, "resolve",
+                               return_value={"repo": "source", "port": 17171}), \
+             mock.patch.object(server.artifact_policy, "mode", return_value="local"):
+            out = server.health_payload()
+        self.assertEqual(out["artifact_mode"], "local")
+        self.assertFalse(out["git_publication"])
+        self.assertEqual(out["repo"], "source")
+
+    def test_health_keeps_tracked_forks_publishable(self) -> None:
+        with mock.patch.object(server.ports_mod, "resolve",
+                               return_value={"repo": "fork", "port": 17172}), \
+             mock.patch.object(server.artifact_policy, "mode", return_value="tracked"):
+            out = server.health_payload()
+        self.assertEqual(out["artifact_mode"], "tracked")
+        self.assertTrue(out["git_publication"])
+
     def test_get_roadmap_with_linked_flag_and_doc(self) -> None:
         # The regression: this path raised KeyError('feature_id') when a flag
         # was linked to a feature. Assert it assembles and carries the links.

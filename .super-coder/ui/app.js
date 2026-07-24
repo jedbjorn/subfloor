@@ -3480,13 +3480,35 @@ document.addEventListener("keydown", (e) => {
     overlays[overlays.length - 1]?.remove();
   }
 });
+let localArtifactMode = false;
+function configureArtifactActions(health) {
+  localArtifactMode = health.artifact_mode === "local" || health.git_publication === false;
+  const snapshot = $("#snapshot");
+  const publish = $("#publish");
+  if (localArtifactMode) {
+    snapshot.textContent = "save locally ⤓";
+    snapshot.title = "snapshot + render into ignored .sc-state/local/";
+    publish.textContent = "publish off";
+    publish.title = "Git publication is disabled in local artifact mode";
+    publish.disabled = true;
+  } else {
+    snapshot.textContent = "snapshot ⤓";
+    publish.textContent = "publish ⤴";
+    publish.disabled = false;
+  }
+}
 $("#snapshot").onclick = async () => {
-  setStatus("snapshotting…");
-  try { const r = await api("/snapshot", "POST"); toast(r.output || "done"); setStatus("snapshot done"); }
+  setStatus(localArtifactMode ? "saving locally…" : "snapshotting…");
+  try {
+    const r = await api("/snapshot", "POST");
+    toast(r.output || "done");
+    setStatus(localArtifactMode ? "saved locally" : "snapshot done");
+  }
   catch (e) { toast("error: " + e.message); }
 };
 $("#publish").onclick = async (e) => {
   const btn = e.currentTarget;
+  if (localArtifactMode) return;
   btn.disabled = true;
   setStatus("publishing…");
   try {
@@ -3498,7 +3520,12 @@ $("#publish").onclick = async (e) => {
   finally { btn.disabled = false; }
 };
 (async () => {
-  try { const h = await api("/health"); $("#repo").textContent = h.repo; setStatus("port " + h.port); }
+  try {
+    const h = await api("/health");
+    $("#repo").textContent = h.repo;
+    configureArtifactActions(h);
+    setStatus(localArtifactMode ? "local artifacts · port " + h.port : "port " + h.port);
+  }
   catch { setStatus("offline"); }
   routeFromHash();   // honor #tab on load (refresh / deep link), else Shells
 })();

@@ -940,6 +940,19 @@ def script_list() -> list[dict]:
             for k, v in _SCRIPTS.items()]
 
 
+def health_payload() -> dict:
+    """Runtime identity plus the artifact actions the Interface may offer."""
+    cfg = ports_mod.resolve()
+    active_mode = artifact_policy.mode()
+    return {
+        "ok": True,
+        "repo": cfg.get("repo"),
+        "port": cfg.get("port"),
+        "artifact_mode": active_mode,
+        "git_publication": active_mode == artifact_policy.TRACKED,
+    }
+
+
 def run_script(key: str) -> dict | None:
     spec = _SCRIPTS.get(key)
     if not spec:
@@ -2375,9 +2388,7 @@ class Handler(BaseHTTPRequestHandler):
         con = db()
         try:
             if path == "/api/health":
-                cfg = ports_mod.resolve()
-                return self._send(200, {"ok": True, "repo": cfg.get("repo"),
-                                        "port": cfg.get("port")})
+                return self._send(200, health_payload())
             if path == "/api/shells":
                 return self._send(200, {"shells": get_shells(con)})
             if path == "/api/shell-templates":

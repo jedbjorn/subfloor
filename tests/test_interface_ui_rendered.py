@@ -110,7 +110,12 @@ def _mock_api(route) -> None:
     request = route.request
     path = request.url.split("/api", 1)[-1]
     if path == "/health":
-        return _json(route, {"repo": "rendered-fixture", "port": 0})
+        return _json(route, {
+            "repo": "rendered-fixture",
+            "port": 0,
+            "artifact_mode": "local",
+            "git_publication": False,
+        })
     if path == "/interface/browser-sessions":
         return _json(route, {"csrf": "rendered-fixture"})
     if path == "/interface/shells":
@@ -253,6 +258,22 @@ def _artifact(tmp_path: Path, name: str) -> Path:
         directory = ROOT / directory
     directory.mkdir(parents=True, exist_ok=True)
     return directory / name
+
+
+def test_local_artifact_mode_keeps_save_and_disables_publish(browser, ui_url):
+    context = browser.new_context(viewport={"width": 1600, "height": 1000})
+    page = context.new_page()
+    page.route("**/api/**", _mock_api)
+    try:
+        page.goto(ui_url, wait_until="networkidle")
+        snapshot = page.locator("#snapshot")
+        publish = page.locator("#publish")
+        assert snapshot.text_content() == "save locally ⤓"
+        assert publish.text_content() == "publish off"
+        assert publish.is_disabled()
+        assert "local artifacts" in page.locator("#status").text_content()
+    finally:
+        context.close()
 
 
 def test_tall_fit_short_floor_and_visual_qa(browser, ui_url, tmp_path):
