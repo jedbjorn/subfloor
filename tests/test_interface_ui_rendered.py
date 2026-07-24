@@ -30,6 +30,9 @@ SHELL = {
     "session_id": 7,
     "generation": 1,
     "harness": "codex",
+    # The route the session was LAUNCHED with — the only model fact the engine
+    # has (flag #130, decision #55), so every surface must label it as such
+    # rather than render it as the model the session is running now.
     "model_route": "gpt-5.6-terra",
     "alerts": 2,
 }
@@ -443,9 +446,11 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
     desktop, page = _open_interface(browser, ui_url, height=1100)
     try:
         page.get_by_text("Alerts (2)", exact=True).wait_for()
+        # Every occupied row labels its route as the launch route — the rail
+        # never states a bare model it does not observe (flag #130, dec #55).
         rail_models = page.locator(".if-row-sub").all_inner_texts()
-        assert "DEV3 · codex · GPT 5.6 TERRA" in rail_models
-        assert "DEV4 · codex · GPT 5.6 SOL" in rail_models
+        assert "DEV3 · codex · GPT 5.6 TERRA (launched)" in rail_models
+        assert "DEV4 · codex · GPT 5.6 SOL (launched)" in rail_models
         assert page.locator(".if-alerts").get_attribute("class").endswith(
             "critical"
         )
@@ -454,7 +459,8 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
 
         page.get_by_text("Details", exact=True).click()
         details = page.locator(".if-details")
-        assert "model GPT 5.6 TERRA" in details.inner_text()
+        assert "launched GPT 5.6 TERRA" in details.inner_text()
+        assert "model " not in details.inner_text()
         assert "session #7 · arc #172" in details.inner_text()
         assert "wake armed" in details.inner_text()
         assert "sprint #31 Interface corrective hardening · ACTIVE" in (
@@ -543,11 +549,11 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         assert geometry["headerOverflowX"] == "auto"
         options = page.locator(".if-picker option").all_inner_texts()
         assert (
-            "Code-01 · DEV3 · codex · GPT 5.6 TERRA · occupied"
+            "Code-01 · DEV3 · codex · GPT 5.6 TERRA (launched) · occupied"
             in options
         )
         assert (
-            "Code-02 · DEV4 · codex · GPT 5.6 SOL · occupied"
+            "Code-02 · DEV4 · codex · GPT 5.6 SOL (launched) · occupied"
             in options
         )
         assert page.locator(".if-composer-actions button").all_inner_texts() == [

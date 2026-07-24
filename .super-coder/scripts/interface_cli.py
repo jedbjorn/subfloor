@@ -205,6 +205,15 @@ def _status_line(s: dict) -> str:
     return f"{short} {name} {avail} {' · '.join(bits)}".rstrip()
 
 
+def _launched_cell(detail: dict) -> str:
+    """Same honesty rule as the browser rail (flag #130, decision #55): state
+    the LAUNCH ROUTE as the launch route and never claim the live model.
+    `model_route` is only what the session was started with — an in-harness
+    `/model` switch never reaches the engine (spec #20 Harness Hooks discards
+    the native payload) — so it is never printed under a bare `model` key."""
+    return str(detail.get("model_route") or "harness default")
+
+
 def cmd_status(args) -> int:
     if not args.shell:
         shells = _shells()
@@ -231,7 +240,7 @@ def cmd_status(args) -> int:
             ("occupancy", detail.get("occupancy")),
             ("lifecycle", detail.get("lifecycle")),
             ("harness", detail.get("harness")),
-            ("model", detail.get("model_route")),
+            ("launched", _launched_cell(detail)),
             ("composer", detail.get("composer")),
             ("writer", held),
             ("wake", detail.get("wake_state")),

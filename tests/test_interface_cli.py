@@ -204,6 +204,25 @@ class InterfaceCliTest(unittest.TestCase):
         rc, out, _ = self.run_cli(["status", "s2"])
         self.assertIn("held by web-1", out)
 
+    def test_status_states_the_launch_route_as_the_launch_route(self):
+        """flag #130 / decision #55 — `model_route` is only what the session
+        was LAUNCHED with, so status reports it under `launched` and never
+        under a bare `model` key that would read as the live model. Same rule
+        as the browser rail, which is the parity the sprint unit requires."""
+        self.http.add("GET", "/api/interface/sessions/7",
+                      {**SESSION7, "model_route": "fable"})
+        rc, out, _ = self.run_cli(["status", "s2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("launched    fable", out)
+        self.assertNotIn("model", out)
+
+    def test_status_launch_route_falls_back_to_the_harness_default(self):
+        self.http.add("GET", "/api/interface/sessions/7",
+                      {**SESSION7, "model_route": None})
+        rc, out, _ = self.run_cli(["status", "s2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("launched    harness default", out)
+
     def test_status_available_shell_has_no_session_fetch(self):
         rc, out, _ = self.run_cli(["status", "s1", "--json"])
         self.assertEqual(rc, 0)

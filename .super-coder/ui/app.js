@@ -2199,6 +2199,21 @@ function ifModelLabel(route) {
   return String(route).replace(/[-_]+/g, " ").trim().toUpperCase();
 }
 
+// What the surface may say about a session's model (flag #130, decision #55).
+// `model_route` is only the route the session was LAUNCHED with — an in-harness
+// /model switch never reaches the engine — so it is labelled as the launch
+// route and never rendered as a claim about the live model. The analytics sweep
+// cannot supply the live one either: its rows carry one model per session-wide
+// window, so they cannot express switch order (flag #136). Deriving a truthful
+// current model is a feature #17 follow-up, not something this surface guesses.
+const IF_LAUNCHED_TITLE =
+  "the route this session was launched with — not necessarily the model it is "
+  + "running now, since an in-harness /model switch never reaches the engine";
+
+function ifLaunchedDisplay(route) {
+  return { text: ifModelLabel(route) + " (launched)", title: IF_LAUNCHED_TITLE };
+}
+
 async function renderInterface(root) {
   root.replaceChildren();
   let shells;
@@ -2230,17 +2245,17 @@ async function renderInterface(root) {
     if (s.alerts > 0)
       head.append(el("span", { className: "pill if-badge bad",
         title: s.alerts + " current alert(s)" }, "⚠ " + s.alerts));
-    const occupiedModel = s.availability === "occupied"
-      ? " · " + ifModelLabel(s.model_route)
-      : "";
-    row.append(head,
-      el("div", { className: "if-row-sub" },
-        s.shortname + (s.harness ? " · " + s.harness : "") + occupiedModel));
+    const launched = s.availability === "occupied"
+      ? ifLaunchedDisplay(s.model_route)
+      : null;
+    const sub = el("div", { className: "if-row-sub" },
+      s.shortname + (s.harness ? " · " + s.harness : ""));
+    if (launched)
+      sub.append(el("span", { title: launched.title }, " · " + launched.text));
+    row.append(head, sub);
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
-    const mobileModel = s.availability === "occupied"
-      ? " · " + ifModelLabel(s.model_route)
-      : "";
+    const mobileModel = launched ? " · " + launched.text : "";
     const opt = el("option", { value: s.shortname },
       `${s.display_name || s.shortname} · ${s.shortname}` +
       `${s.harness ? " · " + s.harness : ""}${mobileModel}` +
@@ -2974,7 +2989,7 @@ async function ifSessionPane(pane, sel) {
 
   const st = {
     harness: sess.harness || sel.harness || "—",
-    model: sess.model_route || "harness default",
+    modelRoute: sess.model_route || null,    // the route it was LAUNCHED with
     lifecycle: sess.lifecycle || "—",
     composer: sess.composer || "unknown",
     browserComposer: sess.browser_composer || "clean",
@@ -3089,12 +3104,16 @@ function ifAge(ts) {
 function ifPaintHeader(a, sel, pane) {
   const st = a.st;
   const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(st.lifecycle);
-  const stat = (k, v) => el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v)));
+  const stat = (k, v, title) => el("span",
+    title ? { className: "if-stat", title } : { className: "if-stat" },
+    k + " ", el("b", {}, String(v)));
   // Read-only session telemetry stays available without consuming the terminal
   // header. Actions remain outside the disclosure beside the state they change.
+  // The launch route gets its own labelled stat — there is no `model` stat,
+  // because nothing here observes the model the session is running now.
   a.sessionDetailsEl.replaceChildren(
     stat("harness", st.harness),
-    stat("model", ifModelLabel(st.model)),
+    stat("launched", ifModelLabel(st.modelRoute), IF_LAUNCHED_TITLE),
     stat("session", "#" + a.sessionId + (st.archive != null ? " · arc #" + st.archive : "")),
     stat("age", ifAge(st.since)),
     stat("lifecycle", st.lifecycle),

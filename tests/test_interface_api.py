@@ -250,19 +250,50 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertIsNone(body["shells"][1]["default_harness"])
         self.assertIsNone(body["shells"][1]["default_model"])
 
-    def test_occupied_shell_projection_includes_live_model_route(self):
-        session_id = self.occupy()
+    # -- the model surfaces carry the launch route only (flag #130, dec #55) ---
+
+    def set_route(self, session_id, route):
         with sqlite3.connect(self.db_path) as con:
             con.execute(
                 "UPDATE interface_sessions SET model_route=? "
-                "WHERE session_id=?",
-                ("gpt-5.6-terra", session_id),
-            )
+                "WHERE session_id=?", (route, session_id))
 
+    def sweep_switch_back(self, archive_id=10):
+        """The analytics sweep's REAL output for an A→B→A model switch inside
+        one harness session, as `token_parsers/claude.py` emits it — the shape
+        that makes a current-model claim underivable (flag #136):
+
+        * one row per (session × model), both stamped with the SAME
+          session-wide started_at/ended_at (the parser builds them from the
+          transcript's first/last timestamp and reuses that pair for every
+          model row — verified live on archive 8, usage_id 6 and 7);
+        * UNIQUE (harness, harness_session_ref, model) collapses the return to
+          A into the existing A row, so the switch-back leaves no trace and
+          the LAST-inserted row is B — the model that is not running now.
+
+        Any ordering over these rows therefore reports B. That is why the
+        surfaces state the launch route instead of guessing."""
+        window = ("2026-07-24T09:39:27Z", "2026-07-24T11:53:12Z")
+        with sqlite3.connect(self.db_path) as con:
+            for model in ("claude-opus-5", "claude-fable-5"):
+                con.execute(
+                    "INSERT INTO session_token_usage "
+                    "(archive_id, shell_id, harness, harness_session_ref, "
+                    " model, started_at, ended_at, status) "
+                    "VALUES (?,1,'claude','t1',?,?,?,'ok')",
+                    (archive_id, model, *window))
+
+    def shell_projection(self):
         status, _, body = self.call("GET", "/api/interface/shells", (OP,))
-
         self.assertEqual(status, 200)
-        shell = body["shells"][0]
+        return body["shells"][0]
+
+    def test_occupied_shell_projection_includes_launch_model_route(self):
+        session_id = self.occupy()
+        self.set_route(session_id, "gpt-5.6-terra")
+
+        shell = self.shell_projection()
+
         self.assertEqual(
             {
                 "availability": shell["availability"],
@@ -277,6 +308,29 @@ class InterfaceApiTest(unittest.TestCase):
                 "model_route": "gpt-5.6-terra",
             },
         )
+
+    def test_model_surfaces_stay_the_launch_route_across_a_switch_back(self):
+        # Launched on fable, ran opus, switched back to opus's predecessor and
+        # back again: the sweep cannot express that, so neither surface may
+        # derive a "current" model from it. `model_route` — the launch route,
+        # named as such — stays the only model-bearing field on both.
+        session_id = self.occupy()
+        self.set_route(session_id, "fable")
+        self.sweep_switch_back()
+
+        shell = self.shell_projection()
+        status, _, detail = self.call(
+            "GET", f"/api/interface/sessions/{session_id}", (OP,))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(shell["model_route"], "fable")
+        self.assertEqual(detail["model_route"], "fable")
+        # `default_model` is the flavor default the NEXT launch would use, not
+        # a claim about this session, so it is excluded here.
+        session_model_keys = sorted(
+            k for k in (*shell, *detail)
+            if "model" in k and not k.startswith("default_"))
+        self.assertEqual(set(session_model_keys), {"model_route"})
 
     def test_browser_bootstrap_same_origin_fence(self):
         # Cross-site Origin cannot mint a session (rejected before the
