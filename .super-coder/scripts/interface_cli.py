@@ -598,35 +598,27 @@ def _confirm(prompt: str, yes: bool) -> None:
         die("aborted by operator", EXIT_REFUSED)
 
 
+def _recovery_evidence_rows(preview: dict) -> list[tuple[str, str, str]]:
+    """Validate and expose the API's one canonical evidence projection."""
+    rows = preview.get("evidence_projection")
+    if not isinstance(rows, list) or not rows:
+        die("recovery preview omitted the canonical evidence projection — "
+            "update and restart the Interface service", EXIT_REFUSED)
+    projected = []
+    for row in rows:
+        if not isinstance(row, dict) or not all(
+                isinstance(row.get(field), str)
+                for field in ("key", "label", "value")):
+            die("recovery preview returned an invalid evidence projection — "
+                "update and restart the Interface service", EXIT_REFUSED)
+        projected.append((row["key"], row["label"], row["value"]))
+    return projected
+
+
 def _print_recovery_preview(preview: dict) -> None:
-    ev = preview["evidence"]
-    print(f"→ classification: {preview['classification']} "
-          f"(legal actions: {', '.join(preview['legal_actions']) or 'none'})")
-    sess = ev.get("session")
-    if sess:
-        print(f"  session {sess['session_id']} gen {sess['generation']}: "
-              f"{sess['occupancy']}/{sess['lifecycle']} "
-              f"({sess.get('harness') or '?'})")
-    proc = ev.get("process") or {}
-    if proc.get("pane_pid"):
-        print(f"  process: pid {proc['pane_pid']} "
-              f"ticks {proc['pane_start_ticks']} "
-              f"pgid {proc.get('pgid')} — {proc['pid_state']}"
-              + ("" if proc.get("pane_present") is None else
-                 f", pane {'present' if proc['pane_present'] else 'gone'}"))
-    archive = ev.get("archive")
-    if archive:
-        print(f"  archive {archive['archive_id']}: "
-              f"{'open' if archive['ended_at'] is None else 'closed'}"
-              + (" (active)" if archive.get("active") else ""))
-    if ev.get("sprint_binding"):
-        print(f"  sprint binding {ev['sprint_binding']['binding_id']} armed")
-    print(f"  unread messages: {ev['unread_messages']} (left unread)")
-    git = ev.get("git")
-    if git:
-        print(f"  worktree {git['worktree']}: branch {git['branch']}, "
-              f"{git['dirty_tracked']} dirty tracked, {git['untracked']} "
-              f"untracked, {git['unpushed_commits']} unpushed commit(s)")
+    print("→ recovery preview")
+    for _key, label, value in _recovery_evidence_rows(preview):
+        print(f"  {label}: {value}")
 
 
 def cmd_recover(args) -> int:

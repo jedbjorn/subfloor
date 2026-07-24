@@ -2293,85 +2293,311 @@ async function ifStartingPane(pane, sel, root) {
   card.append(cancel, note);
 }
 
+// Recovery evidence is descriptive only. Browser and CLI render the API's one
+// canonical evidence_projection; neither client independently chooses a safer-
+// looking subset. legal_actions remains the sole authority for Recover / Force.
+function ifRecoveryEvidenceRows(preview) {
+  const rows = preview.evidence_projection;
+  if (!Array.isArray(rows) || !rows.length) return [];
+  if (rows.some((row) => !row || typeof row.key !== "string" ||
+      typeof row.label !== "string" || typeof row.value !== "string"))
+    return [];
+  return rows.map((row) => ({
+    key: row.key, label: row.label, value: row.value,
+  }));
+}
+
+function ifRecoveryContext(sel, preview) {
+  const evidence = preview.evidence || {};
+  const shell = evidence.shell || {};
+  const rows = new Map(ifRecoveryEvidenceRows(preview)
+    .map((row) => [row.key, row.value]));
+  const shellName = shell.shortname || sel.shortname || String(sel.shell_id);
+  return {
+    shellName,
+    sessionName: rows.get("session") || "session evidence unavailable",
+    processName: rows.get("process") || "process evidence unavailable",
+    worktreeName: rows.get("worktree") || "worktree evidence unavailable",
+  };
+}
+
+function ifRecoveryBody(preview, mode, discard, confirmShortname) {
+  const legal = Array.isArray(preview.legal_actions)
+    ? preview.legal_actions : [];
+  if (!legal.includes(mode)) return null;
+  const body = {
+    observation_id: preview.observation_id,
+    mode,
+    preserve_worktree: !discard,
+  };
+  if (mode === "force") body.confirm_force = true;
+  if (discard) {
+    body.discard_worktree = true;
+    body.confirm_shortname = confirmShortname;
+  }
+  return body;
+}
+
+function ifRecoveryResult(result) {
+  const closed = result.closed || {};
+  const signaled = result.signaled;
+  const worktree = result.worktree || {};
+  const body = el("div", { className: "if-recovery-result" },
+    el("div", {}, el("b", {}, "Recovery result")),
+    el("div", { className: "if-diag" },
+      el("span", { className: "if-stat" }, "shell ",
+        el("b", {}, result.shortname || String(result.shell_id ?? "—"))),
+      el("span", { className: "if-stat" }, "classification ",
+        el("b", {}, result.classification || "—")),
+      el("span", { className: "if-stat" }, "mode ",
+        el("b", {}, result.mode || "—")),
+      el("span", { className: "if-stat" }, "availability ",
+        el("b", {}, result.availability || "—")),
+      el("span", { className: "if-stat" }, "unread messages ",
+        el("b", {}, `${result.unread_messages ?? "—"} · left unread`))));
+  if (signaled) {
+    body.append(el("div", { className: "if-note" },
+      signaled.signaled
+        ? `Process signal completed for PID ${signaled.pid ?? "—"} · ` +
+          `PGID ${signaled.pgid ?? "—"}` +
+          (signaled.escalated ? " · escalated to SIGKILL" : "")
+        : `Process signal did not complete${signaled.detail
+          ? ` · ${signaled.detail}` : ""}.`));
+  }
+  if (closed.session) {
+    body.append(el("div", { className: "if-note" },
+      `Session #${closed.session.session_id} ended · ` +
+      `${closed.session.end_reason || "reason unavailable"}` +
+      (closed.session.already_ended ? " · already ended" : "")));
+  }
+  if (closed.archive) {
+    body.append(el("div", { className: "if-note" },
+      `Archive #${closed.archive.archive_id} ` +
+      (closed.archive.closed ? "closed" : "unchanged")));
+  }
+  if (closed.binding) {
+    body.append(el("div", { className: "if-note" },
+      `Sprint binding #${closed.binding.binding_id} ` +
+      (closed.binding.released ? "released" : "unchanged")));
+  }
+  body.append(el("div", { className: "if-note" },
+    `Alerts resolved: ${closed.alerts_resolved ?? 0}.`));
+  for (const parked of closed.parked || []) {
+    body.append(el("div", { className: "if-note bad" },
+      `Parked ambiguous binding #${parked.binding_id}: ` +
+      `${parked.next_action || "manual remediation required"}`));
+  }
+  if (worktree.failed) {
+    const completed = (worktree.completed || []).join(", ") || "nothing";
+    body.append(el("div", { className: "if-note bad" },
+      `Worktree discard INCOMPLETE in ${worktree.worktree || "unknown worktree"}: ` +
+      `completed [${completed}], failed at ${worktree.failed.step || "unknown"} ` +
+      `(${worktree.failed.error || "unknown error"}). Durable closure is ` +
+      "committed; finish the discard remediation manually."));
+  } else if (worktree.discarded) {
+    body.append(el("div", { className: "if-note" },
+      `Worktree ${worktree.worktree || ""} changes discarded.`));
+  } else {
+    body.append(el("div", { className: "if-note" }, "Worktree preserved."));
+  }
+  return body;
+}
+
+function ifRecoveryControls(host, sel, root) {
+  const note = el("div", { className: "if-note" });
+  const previewBtn = el("button", { className: "act", type: "button",
+    textContent: "Preview recovery",
+    title: "inspect server-classified recovery evidence; preview never changes state" });
+  host.append(previewBtn, note);
+
+  const load = async (notice = "") => {
+    previewBtn.disabled = true;
+    note.textContent = notice || "Loading recovery evidence…";
+    let preview;
+    try {
+      preview = await apiIf(
+        "/interface/shells/" + sel.shell_id + "/recovery");
+    } catch (e) {
+      note.textContent = (e.code ? e.code + ": " : "") + e.message;
+      previewBtn.disabled = false;
+      return;
+    }
+    const evidenceRows = ifRecoveryEvidenceRows(preview);
+    if (!evidenceRows.length) {
+      note.textContent =
+        "Recovery preview omitted the canonical evidence projection. " +
+        "Update and restart the Interface service before recovering.";
+      previewBtn.disabled = false;
+      return;
+    }
+    const context = ifRecoveryContext(sel, preview);
+    const legal = Array.isArray(preview.legal_actions)
+      ? preview.legal_actions : [];
+    const body = el("div", { className: "if-recovery-preview" },
+      el("div", { className: "if-diag" },
+        ...evidenceRows.map((row) => el("span", {
+          className: "if-stat",
+          recoveryEvidenceKey: row.key,
+          recoveryEvidenceLabel: row.label,
+          recoveryEvidenceValue: row.value,
+        }, row.label + " ", el("b", {}, row.value)))),
+      el("div", { className: "muted" },
+        `Observation ${preview.observation_id} · expires in ` +
+        `${preview.expires_in_s ?? "—"}s.`));
+    if (notice) body.append(el("div", { className: "if-note" }, notice));
+
+    const actions = el("div", { className: "if-recovery-actions" });
+    if (!legal.includes("recover") && !legal.includes("force")) {
+      actions.append(el("div", { className: "muted" },
+        "The server lists no legal recovery action for this observation."));
+      host.replaceChildren(previewBtn, body, actions, note);
+      previewBtn.disabled = false;
+      return;
+    }
+
+    const discard = el("input", { type: "checkbox" });
+    const discardLabel = el("label", { className: "muted" }, discard,
+      " Discard worktree changes (separate escalation; unpushed commits are refused)");
+    const execute = async (mode, button) => {
+      const label = mode === "force" ? "Force recover" : "Recover";
+      const preserve = !discard.checked;
+      if (!confirm(
+        `${label} ${context.shellName}? ${context.sessionName}; ` +
+        `${context.processName}; worktree ${context.worktreeName}. ` +
+        (preserve
+          ? "All worktree files will be preserved."
+          : "Worktree discard still requires a separate typed confirmation.")))
+        return;
+
+      let typed = null;
+      if (!preserve) {
+        typed = prompt(
+          `Discard tracked and untracked changes only in ${context.shellName}'s ` +
+          `exact worktree? Unpushed commits are never removed.\n` +
+          `Type ${context.shellName} to confirm:`, "");
+        if (typed !== context.shellName) {
+          note.textContent =
+            `Discard cancelled — confirmation must exactly match ${context.shellName}.`;
+          return;
+        }
+      }
+      const request = ifRecoveryBody(preview, mode, !preserve, typed);
+      if (!request) {
+        note.textContent =
+          `${label} is no longer listed as legal; preview again.`;
+        return;
+      }
+      button.disabled = true;
+      discard.disabled = true;
+      note.textContent = `${label} in progress…`;
+      try {
+        const result = await apiIf(
+          "/interface/shells/" + sel.shell_id + "/recovery",
+          "POST", request);
+        const refresh = el("button", { className: "act", type: "button",
+          textContent: "Refresh shell state" });
+        refresh.onclick = () => renderInterface(root);
+        previewBtn.disabled = false;
+        note.textContent = "";
+        host.replaceChildren(
+          previewBtn, ifRecoveryResult(result), refresh, note);
+        return;
+      } catch (e) {
+        if (e.status === 409 && e.code === "recovery_observation_stale") {
+          return load(
+            "Recovery state changed. Review this fresh preview before acting.");
+        }
+        note.textContent = (e.code ? e.code + ": " : "") + e.message;
+        button.disabled = false;
+        discard.disabled = false;
+      }
+    };
+    if (legal.includes("recover")) {
+      const recover = el("button", { className: "act primary", type: "button",
+        textContent: "Recover" });
+      recover.onclick = () => execute("recover", recover);
+      actions.append(recover);
+    }
+    if (legal.includes("force")) {
+      const force = el("button", { className: "act bad", type: "button",
+        textContent: "Force recover" });
+      force.onclick = () => execute("force", force);
+      actions.append(force);
+    }
+    actions.append(discardLabel);
+    host.replaceChildren(previewBtn, body, actions, note);
+    previewBtn.disabled = false;
+  };
+  previewBtn.onclick = () => load();
+}
+
 // Lost/error/unreconciled pane (spec Interface Layout): diagnostics and
-// queued-work counts come straight from GET /sessions/<id> — occupancy,
-// lifecycle, error_detail, the input pipeline (composer/delivery/forwarded
-// seq), wake and alerts. The API exposes no explicit allowed-actions field,
-// so the action gates mirror the route's own 409 preconditions exactly:
-// verify any time the session isn't ended (this pane never shows ended),
-// close ONLY while occupancy is unreconciled (occupied refuses with
-// not_unreconciled; absence is re-proved server-side on every close). A
-// closed session derives available → New chat IS the fresh-generation action.
+// queued-work counts come straight from GET /sessions/<id>. Reconcile remains
+// the exact-identity repair path; closure and process recovery are offered only
+// after the API returns a fresh recovery observation with a legal action.
 async function ifRecoveryPane(pane, sel, root) {
   const card = el("div", { className: "card" },
     el("div", {}, el("b", {}, sel.display_name || sel.shortname), " is ",
       el("span", { className: "pill if-badge bad" }, sel.availability), "."));
   pane.append(card);
+  let sess = null;
   if (!sel.session_id) {
     card.append(el("div", { className: "muted" },
       "New chat is blocked — this shell runs a legacy or unmanaged harness. " +
       "Prove the process absent (or adopt a managed generation) to free it."));
-    return;
-  }
-  let sess;
-  try { sess = await apiIf("/interface/sessions/" + sel.session_id); }
-  catch (e) {
-    card.append(el("div", { className: "muted" },
-      "session state unavailable (" + e.message + ") — reselect the shell to retry. " +
-      "Recovery actions stay hidden while the exact state is unknown."));
-    return;
-  }
-  const diag = el("div", { className: "if-diag" });
-  const drow = (k, v) => diag.append(el("span", { className: "if-stat" }, k + " ", el("b", {}, String(v ?? "—"))));
-  drow("session", "#" + sess.session_id + " · gen " + (sess.generation ?? "—"));
-  drow("occupancy", sess.occupancy);
-  drow("lifecycle", sess.lifecycle);
-  drow("harness", sess.harness || "—");
-  drow("composer", sess.composer);
-  drow("delivery", sess.delivery);
-  drow("forwarded seq", sess.forwarded_seq);
-  drow("wake", sess.wake_state);
-  drow("alerts", sess.alerts ?? 0);
-  card.append(diag);
-  if (sess.error_detail)
-    card.append(el("div", { className: "if-note" }, "diagnostics: " + sess.error_detail));
-  card.append(el("div", { className: "muted" },
-    "New chat is blocked until this generation is reconciled or closed."));
-
-  const note = el("div", { className: "if-note" });
-  const acts = el("div", {});
-  const recon = el("button", { className: "act", type: "button", textContent: "Reconcile",
-    title: "re-verify tmux/process identity — a verified unreconciled session returns to occupied" });
-  recon.onclick = async () => {
-    recon.disabled = true; note.textContent = "";
+  } else {
     try {
-      const r = await apiIf("/interface/reconciliations", "POST",
-        { session_id: sess.session_id, action: "verify" });
-      if (r.verified) return renderInterface(root);
-      note.textContent = (r.actions || [])[0] ||
-        "identity could not be verified — close it if the process is gone.";
-    } catch (e) { note.textContent = (e.code ? e.code + ": " : "") + e.message; }
-    recon.disabled = false;
-  };
-  acts.append(recon);
-  if (sess.occupancy === "unreconciled") {
-    const close = el("button", { className: "act", type: "button", textContent: "Close session",
-      title: "only after absence is proved (re-checked server-side) — frees the shell for a fresh generation" });
-    close.onclick = async () => {
-      if (!confirm(`Close session #${sess.session_id}? Allowed only after the process is proved absent. This frees ${sel.display_name || sel.shortname} for a new chat.`)) return;
-      close.disabled = true; note.textContent = "";
+      sess = await apiIf("/interface/sessions/" + sel.session_id);
+    } catch (e) {
+      card.append(el("div", { className: "muted" },
+        "session state unavailable (" + e.message + ") — recovery preview " +
+        "remains available from the shell-level evidence."));
+    }
+  }
+  if (sess) {
+    const diag = el("div", { className: "if-diag" });
+    const drow = (k, v) => diag.append(el("span", { className: "if-stat" },
+      k + " ", el("b", {}, String(v ?? "—"))));
+    drow("session", "#" + sess.session_id + " · gen " + (sess.generation ?? "—"));
+    drow("occupancy", sess.occupancy);
+    drow("lifecycle", sess.lifecycle);
+    drow("harness", sess.harness || "—");
+    drow("composer", sess.composer);
+    drow("delivery", sess.delivery);
+    drow("forwarded seq", sess.forwarded_seq);
+    drow("wake", sess.wake_state);
+    drow("alerts", sess.alerts ?? 0);
+    card.append(diag);
+    if (sess.error_detail)
+      card.append(el("div", { className: "if-note" },
+        "diagnostics: " + sess.error_detail));
+    card.append(el("div", { className: "muted" },
+      "New chat is blocked until this generation is reconciled or closed."));
+
+    const note = el("div", { className: "if-note" });
+    const acts = el("div", {});
+    const recon = el("button", { className: "act", type: "button",
+      textContent: "Reconcile",
+      title: "re-verify tmux/process identity — a verified unreconciled session returns to occupied" });
+    recon.onclick = async () => {
+      recon.disabled = true; note.textContent = "";
       try {
-        await apiIf("/interface/reconciliations", "POST",
-          { session_id: sess.session_id, action: "close" });
-        return renderInterface(root);
+        const r = await apiIf("/interface/reconciliations", "POST",
+          { session_id: sess.session_id, action: "verify" });
+        if (r.verified) return renderInterface(root);
+        note.textContent = (r.actions || [])[0] ||
+          "identity could not be verified — close it if the process is gone.";
       } catch (e) {
         note.textContent = (e.code ? e.code + ": " : "") + e.message;
-        close.disabled = false;
       }
+      recon.disabled = false;
     };
-    acts.append(" ", close);
+    acts.append(recon);
+    card.append(acts, note);
   }
-  card.append(acts, note);
+  const recovery = el("div", { className: "if-recovery" });
+  card.append(recovery);
+  ifRecoveryControls(recovery, sel, root);
   ifSprintPanel(pane, sel);
 }
 
@@ -2554,7 +2780,10 @@ function ifAvailablePane(pane, sel, root) {
   const open = el("button", { className: "act primary", type: "button", textContent: "New chat" });
   open.onclick = () => { open.remove(); ifNewChatForm(card, sel, root); };
   card.append(open);
-  pane.append(card);
+  const recovery = el("div", { className: "card if-recovery" },
+    el("div", {}, el("b", {}, "Shell recovery")));
+  ifRecoveryControls(recovery, sel, root);
+  pane.append(card, recovery);
 }
 
 async function ifNewChatForm(card, sel, root) {
