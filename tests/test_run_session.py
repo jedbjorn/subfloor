@@ -40,6 +40,16 @@ CREATE TABLE shell_memory_archives (
 CREATE TABLE session_token_usage (
     archive_id INTEGER
 );
+CREATE TABLE skills (
+    skill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL,
+    category TEXT NOT NULL,
+    command TEXT,
+    common INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE lock_probe (
     probe_id INTEGER PRIMARY KEY,
     value INTEGER NOT NULL
@@ -81,6 +91,10 @@ class _RollbackSignal:
         return getattr(self._con, name)
 
 
+class _StopAfterSession(RuntimeError):
+    """Stop main after the real boot prelude and session-open path complete."""
+
+
 class OpenSessionContentionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -96,6 +110,23 @@ class OpenSessionContentionTest(unittest.TestCase):
         con.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         self.addCleanup(con.close)
         return con
+
+    def _seed_fresh_engine_skills(self, con) -> None:
+        for skill in run.seed_skills._engine_specs():
+            con.execute(
+                "INSERT INTO skills "
+                "(name, description, category, command, common, content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    skill["name"],
+                    skill["description"],
+                    skill["category"],
+                    skill["command"],
+                    skill["common"],
+                    skill["content"],
+                ),
+            )
+        con.commit()
 
     def test_retries_from_clean_boundary_after_concurrent_writer(self) -> None:
         holder = self._connect()
@@ -168,6 +199,113 @@ class OpenSessionContentionTest(unittest.TestCase):
             ).fetchone()[0]
         )
         self.assertFalse(con.in_transaction)
+
+    def test_real_headless_boot_prelude_retries_from_clean_boundary(self) -> None:
+        setup = self._connect()
+        self._seed_fresh_engine_skills(setup)
+
+        first_attempt_rolled_back = threading.Event()
+        contender = db_driver.connect(self.path)
+        contender.execute("PRAGMA busy_timeout=30")
+        self.addCleanup(contender.close)
+        proxy = _RollbackSignal(contender, first_attempt_rolled_back)
+        holder_ready = threading.Event()
+        holder_errors: list[BaseException] = []
+        outcome: list[tuple[str, int]] = []
+
+        def hold_concurrent_write() -> None:
+            holder = db_driver.connect(self.path)
+            holder.execute("PRAGMA busy_timeout=30")
+            try:
+                try:
+                    holder.execute("BEGIN IMMEDIATE")
+                    holder.execute(
+                        "UPDATE lock_probe SET value=1 WHERE probe_id=1"
+                    )
+                except BaseException as exc:
+                    holder_errors.append(exc)
+                    holder_ready.set()
+                    return
+                holder_ready.set()
+                if first_attempt_rolled_back.wait(2):
+                    holder.commit()
+                else:
+                    holder.rollback()
+            finally:
+                holder.close()
+
+        holder_thread: list[threading.Thread] = []
+        chosen = {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"}
+        fdefaults = {
+            "dev": {"default_harness": "claude", "models": {"claude": "sonnet"}}
+        }
+        analytics = mock.Mock()
+        analytics.sweep.return_value = {"inserted": 0, "updated": 0}
+        real_open_session = run.open_session
+
+        def pick_after_prelude(*_args):
+            thread = threading.Thread(target=hold_concurrent_write)
+            holder_thread.append(thread)
+            thread.start()
+            self.assertTrue(holder_ready.wait(2))
+            return chosen
+
+        def stop_after_session(*args, **kwargs):
+            outcome.append(real_open_session(*args, **kwargs))
+            raise _StopAfterSession
+
+        @contextmanager
+        def spinner(_label: str, *, enabled: bool):
+            self.assertFalse(enabled)
+            yield SimpleNamespace(label="")
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.dict(sys.modules, {"analytics": analytics}), \
+                mock.patch.object(
+                    run.sys, "argv",
+                    ["run.py", "--headless", "DEV1", "--harness", "claude"]), \
+                mock.patch.object(run, "open_db", return_value=proxy), \
+                mock.patch.object(
+                    run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "list_shells", return_value=[chosen]), \
+                mock.patch.object(run, "pick_shell", side_effect=pick_after_prelude), \
+                mock.patch.object(
+                    run.shell_liveness, "compute",
+                    return_value={"supported": False, "indeterminate": 0}), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(run, "load_adapter", return_value={}), \
+                mock.patch.object(run, "validate_headless_request"), \
+                mock.patch.object(run.style, "spinner", side_effect=spinner), \
+                mock.patch.object(
+                    run, "SESSION_OPEN_RETRY_DELAYS_S", (0.1,)), \
+                mock.patch.object(
+                    run, "open_session", side_effect=stop_after_session), \
+                self.assertRaises(_StopAfterSession):
+            run.main()
+
+        holder_thread[0].join(2)
+        self.assertFalse(holder_thread[0].is_alive())
+        self.assertEqual(holder_errors, [])
+        self.assertTrue(first_attempt_rolled_back.is_set())
+        self.assertEqual(proxy.rollback_count, 1)
+        self.assertEqual(outcome, [("0001", 1)])
+
+        verifier = self._connect()
+        archives = verifier.execute(
+            "SELECT shell_id, session_id, harness "
+            "FROM shell_memory_archives ORDER BY archive_id"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in archives],
+            [(1, "0001", "claude")],
+        )
+        self.assertEqual(
+            verifier.execute(
+                "SELECT active_archive_id FROM shells WHERE shell_id=1"
+            ).fetchone()[0],
+            1,
+        )
 
 
 class HeadlessSessionFailureTest(unittest.TestCase):

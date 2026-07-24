@@ -109,6 +109,14 @@ class RetireTest(unittest.TestCase):
         self.assertEqual(seed_skills.apply_retired(self.con), [],
                          "second apply must flip nothing")
 
+    def test_noop_apply_does_not_open_write_transaction(self):
+        self.assertFalse(self.con.in_transaction)
+        self.assertEqual(seed_skills.apply_retired(self.con), [])
+        self.assertFalse(
+            self.con.in_transaction,
+            "fresh skill retirement convergence must stay read-only",
+        )
+
     def test_unlisting_restores(self):
         self._retire_file(["test_authoring"])
         seed_skills.apply_retired(self.con)
