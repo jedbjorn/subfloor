@@ -212,6 +212,158 @@ if (lastScrolled.title !== "model-59" || lastScrolled.block !== "nearest") {
     assert result.returncode == 0, result.stderr
 
 
+PICKER_DOM = r"""
+class FakeClassList {
+  constructor() { this.names = new Set(); }
+  toggle(name, on) { if (on) this.names.add(name); else this.names.delete(name); }
+  remove(name) { this.names.delete(name); }
+  contains(name) { return this.names.has(name); }
+}
+// `children` is a live HTMLCollection in the browser: indexable and iterable,
+// but with NO array methods. Modelling it as a plain array lets code that calls
+// children.map/forEach pass here and silently no-op in the real UI, so this
+// fake withholds them on purpose.
+const collection = (nodes) => {
+  const c = { length: nodes.length,
+              [Symbol.iterator]: () => nodes[Symbol.iterator]() };
+  nodes.forEach((n, i) => { c[i] = n; });
+  return c;
+};
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag;
+    this.nodeType = 1;
+    this._kids = [];
+    this.classList = new FakeClassList();
+    this.isConnected = true;
+    this.value = "";
+    this._text = "";
+  }
+  get children() { return collection(this._kids); }
+  append(...nodes) { this._kids.push(...nodes); }
+  set textContent(value) {
+    this._text = value;
+    if (value === "") this._kids = [];
+  }
+  get textContent() {
+    return this._text + this._kids.map(
+      (c) => typeof c === "string" ? c : (c.textContent || "")).join("");
+  }
+  contains(node) { return this === node || this._kids.includes(node); }
+  scrollIntoView() {}
+  blur() {}
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: text }),
+  addEventListener() {},
+  removeEventListener() {},
+};
+const CAT = { stale: false, harnesses: { codex: { models: [
+  { id: "gpt-5.6-sol", name: "Sol", family: null, availability: "available" },
+  { id: "gpt-5.6-lun", name: "Lun", family: null, availability: "available" },
+] } } };
+const cardList = (picker) => picker.results.children[1];
+const invariant = (ok, message) => { if (!ok) throw new Error(message); };
+"""
+
+
+def run_picker_js(body):
+    el_helper = APP[APP.index("const el ="):APP.index("const esc =")]
+    result = subprocess.run(
+        ["node", "-e", el_helper + PICKER + PICKER_DOM +
+         "\n(async () => {\n" + body + "\n})().catch((e) => {"
+         "\n  console.error(e.stack || e); process.exit(1);\n});\n"],
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_hovering_a_model_card_never_replaces_the_node_being_clicked():
+    """The click-does-nothing bug. Hover moved the highlight by calling
+    paint(), which rebuilds every card — so the card under the cursor was
+    destroyed and replaced mid-gesture. mousedown landed on one node, mouseup
+    on its replacement, and with no common ancestor the browser never
+    synthesised a click. Only search-then-Enter could select a model.
+
+    Hover must move the highlight WITHOUT detaching a single card node."""
+    run_picker_js(r"""
+const picker = dmModelPicker("codex", CAT, { model: null }, async () => {});
+picker.input.onfocus();
+const before = [...cardList(picker).children];
+invariant(before.length === 3, `expected default + 2 models: ${before.length}`);
+
+// Hover each card in turn — the gesture a mouse makes crossing the list.
+for (let i = 0; i < before.length; i += 1) before[i].onmouseenter();
+
+const after = [...cardList(picker).children];
+invariant(after.length === before.length, "hover changed the option count");
+for (let i = 0; i < before.length; i += 1)
+  invariant(after[i] === before[i],
+    `hover replaced card ${i} — a real click would be swallowed mid-gesture`);
+""")
+
+
+def test_hover_still_moves_the_highlight_and_clicking_a_card_selects_it():
+    """Keeping the nodes alive is only half of it: hover must still visibly
+    highlight, and the click must actually reach save() and land on the row."""
+    run_picker_js(r"""
+const saved = [];
+const row = { model: null };
+const picker = dmModelPicker("codex", CAT, row,
+  async (v) => { saved.push(v); });
+picker.input.onfocus();
+const cards = cardList(picker).children;
+
+invariant(cards[0].classList.contains("dm-highlight"),
+  "the first option did not start highlighted");
+cards[2].onmouseenter();
+invariant(cards[2].classList.contains("dm-highlight") &&
+  !cards[0].classList.contains("dm-highlight"),
+  "hover did not move the highlight to the hovered card");
+invariant(cards[2].ariaSelected === "true" && cards[0].ariaSelected === "false",
+  "the highlight moved visually but aria-selected did not follow");
+
+await cards[2].onclick();
+invariant(saved.length === 1 && saved[0] === "gpt-5.6-lun",
+  `clicking a card did not save that model: ${JSON.stringify(saved)}`);
+invariant(row.model === "gpt-5.6-lun",
+  `the picked model never reached the row: ${row.model}`);
+
+// "Harness default" clears the override through the same click path.
+picker.input.onfocus();
+await cardList(picker).children[0].onclick();
+invariant(saved[1] === null && row.model === null,
+  `clicking Harness default did not clear the override: ${row.model}`);
+""")
+
+
+def test_arrow_keys_and_hover_share_one_in_place_highlight():
+    """Arrow keys repainted the whole list too. Same in-place move now — and
+    keyboard and mouse must agree on which option is active, or Enter selects
+    something other than what is highlighted."""
+    run_picker_js(r"""
+const saved = [];
+const picker = dmModelPicker("codex", CAT, { model: null },
+  async (v) => { saved.push(v); });
+picker.input.onfocus();
+const cards = [...cardList(picker).children];
+
+picker.input.onkeydown({ key: "ArrowDown", preventDefault() {} });
+invariant(cardList(picker).children[1] === cards[1],
+  "an arrow key rebuilt the list instead of moving the highlight");
+invariant(cards[1].classList.contains("dm-highlight"),
+  "ArrowDown did not highlight the next option");
+
+// Mouse takes over from the keyboard; Enter must follow the mouse.
+cards[2].onmouseenter();
+picker.input.onkeydown({ key: "Enter", preventDefault() {} });
+await new Promise((r) => setTimeout(r, 0));
+invariant(saved[0] === "gpt-5.6-lun",
+  `Enter selected an option other than the highlighted one: ${saved[0]}`);
+""")
+
+
 def test_browser_bootstrap_carries_no_capability_and_retries_once():
     """Spec #26: the browser signs itself in with same-origin provenance
     alone. The capability must not reappear in page code, the one silent
@@ -916,6 +1068,9 @@ invariant(Boolean(button(pane, "Recover")),
   "unreconciled/no-session route hid the server-listed recovery action");
 invariant(!requested.some((path) => path.includes("/sessions/")),
   `no-session route fetched invalid session detail: ${requested}`);
+// renderInterface above armed the rail poll; stop it the way leaving the tab
+// does, so this harness's event loop can drain and node can exit.
+ifStopRailPoll();
 """)
 
 
@@ -976,6 +1131,105 @@ def test_rail_routes_working_away_from_recovery_and_paints_it_amber():
     recovery_route = RENDER_INTERFACE[
         RENDER_INTERFACE.index('sel.availability === "lost"'):]
     assert '"working"' not in recovery_route.split("ifRecoveryPane")[0]
+
+
+RAIL_POLL_SETUP = r"""
+const shellRow = (shortname, availability, extra = {}) => ({
+  shell_id: shortname === "S3" ? 3 : 4, shortname,
+  display_name: "Shell " + shortname, availability,
+  session_id: availability === "occupied" ? 9 : null, ...extra });
+let served = [];
+const serveShells = (rows) => { served = rows; };
+apiIf = async (path) => path === "/interface/shells"
+  ? { shells: served }
+  : BASE_PREVIEW;
+const railOf = (root) => all(root, (n) => n.className === "if-rail")[0];
+const badges = (root) => all(railOf(root), (n) =>
+  String(n.className || "").includes("if-badge")).map((n) => n.textContent);
+"""
+
+
+def test_rail_poll_repaints_badges_without_rebuilding_the_pane():
+    """The badges must go live without the poll tearing down a live terminal.
+    A change anywhere else in the fleet repaints the rail only; the pane (and
+    with it the xterm attach, scrollback, and writer lease) is rebuilt solely
+    when the SELECTED shell's own availability moves."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+serveShells([shellRow("S3", "available"), shellRow("S4", "available")]);
+const root = new FakeElement("div");
+await renderInterface(root);
+invariant(badges(root).join(",") === "available,available",
+  `rail did not paint the served fleet: ${badges(root)}`);
+
+// From here the real renderInterface is replaced by a counter: any pane
+// rebuild is now observable.
+let rendered = 0;
+renderInterface = async () => { rendered += 1; };
+
+// 1. Another shell moves. The badge follows; the pane is untouched.
+serveShells([shellRow("S3", "available"), shellRow("S4", "occupied")]);
+await ifPollRail();
+invariant(badges(root).join(",") === "available,occupied",
+  `poll did not repaint a peer shell's badge: ${badges(root)}`);
+invariant(rendered === 0,
+  "a peer shell's badge change rebuilt the pane and would kill the terminal");
+
+// 2. Nothing moved. No repaint at all — an unconditional rebuild would drop
+//    focus from a rail button every tick.
+const railBefore = railOf(root).children[0];
+await ifPollRail();
+invariant(railOf(root).children[0] === railBefore,
+  "an unchanged poll still rebuilt the rail rows");
+invariant(rendered === 0, "an unchanged poll rebuilt the pane");
+
+// 3. The SELECTED shell moves. Now the pane is showing the wrong thing, so a
+//    full re-render is the correct — and only — response.
+serveShells([shellRow("S3", "occupied"), shellRow("S4", "occupied")]);
+await ifPollRail();
+invariant(rendered === 1,
+  "the selected shell changed availability and the pane was left stale");
+ifStopRailPoll();
+""")
+
+
+def test_rail_poll_leaves_a_busy_selected_session_attached():
+    """The regression that would hurt most: a shell the operator is typing in
+    stays `occupied` while its alert count or sprint label churns. That must
+    never re-render the pane — the terminal would be torn down mid-session."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+ifSelected = "S3";
+serveShells([shellRow("S3", "occupied", { alerts: 0 })]);
+const root = new FakeElement("div");
+await renderInterface(root);
+let rendered = 0;
+renderInterface = async () => { rendered += 1; };
+
+serveShells([shellRow("S3", "occupied", { alerts: 2, sprint_ref: "38" })]);
+await ifPollRail();
+invariant(rendered === 0,
+  "a still-occupied session was re-rendered — the live terminal would drop");
+invariant(badges(root).some((b) => b.includes("2")),
+  `the new alert count never reached the rail: ${badges(root)}`);
+ifStopRailPoll();
+""")
+
+
+def test_rail_poll_stops_when_the_operator_leaves_the_interface_tab():
+    """A timer that outlives the view keeps polling forever in the background."""
+    assert "ifStopRailPoll();" in APP[APP.index('if (tab !== "interface")'):
+                                      APP.index('if (tab !== "interface")') + 200]
+    # Every early return in renderInterface must leave no orphan timer.
+    head = RENDER_INTERFACE[RENDER_INTERFACE.index("async function renderInterface"):]
+    assert "ifStopRailPoll();" in head[:head.index("let shells;")]
+
+
+def test_empty_header_note_does_not_reserve_a_flex_row():
+    """The header's status note is empty almost always, but flex-basis:100%
+    still forced a second flex line and charged .if-head's 1rem row-gap for
+    it — dead padding under the toolbar. The composer's note keeps its
+    reserved line (it has min-height to stop a jump), so the rule is scoped."""
+    assert ".if-head > .if-note:empty { display: none; }" in CSS
+    assert ".if-composer .if-note" in CSS and "min-height: 1.2em" in CSS
 
 
 def test_recovery_partial_result_keeps_exact_remediation_until_refresh():
