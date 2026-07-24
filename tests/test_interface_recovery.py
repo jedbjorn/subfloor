@@ -666,6 +666,41 @@ class ExecuteTest(RecoveryCase):
         ).fetchone()[0], "ended")
         con.close()
 
+    def test_closure_failure_names_the_signal_it_cannot_unwind(self):
+        # The mirror of the post-commit rule, one step earlier. The rollback
+        # makes the durable half a clean no-op and says nothing about the half
+        # that is not undoable: the exact process has already been signalled
+        # and proven dead. A bare 500 there leaves the operator unable to tell
+        # "the recovery never started" from "your shell is gone and its rows
+        # still say it is running".
+        proc, ticks = self.child()
+        self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
+        with mock.patch.object(recovery, "_pane_present", return_value=True):
+            obj = self.preview(1)
+            with mock.patch.object(recovery, "_close_durable_state",
+                                   side_effect=RuntimeError("db boom")):
+                status, err = self.call(
+                    "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
+                    {"observation_id": obj["observation_id"], "mode": "force",
+                     "confirm_force": True})
+        self.assertEqual(status, 500, err)
+        self.assertEqual(err["error"]["code"], "recovery_closure_failed")
+        details = err["error"]["details"]
+        self.assertTrue(details["signaled"]["signaled"])
+        self.assertFalse(details["closed"])
+        self.assertFalse(details["discarded"])
+        self.assertIn("RuntimeError", details["error"])
+        self.assertIn("proven dead", err["error"]["message"])
+        # ...and both claims are true: the process really is gone, and the
+        # durable state really was left alone.
+        proc.wait(timeout=5)
+        self.assertEqual(recovery._proc_state(proc.pid, ticks), "dead")
+        con = self.db()
+        self.assertNotEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
+
     def test_orphan_recover_signals_then_closes(self):
         proc, ticks = self.child()
         sid = self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)

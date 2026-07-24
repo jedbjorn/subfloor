@@ -1980,9 +1980,31 @@ def execute(con, shell_id: int, body: dict,
             "SET acted_at=datetime('now') WHERE observation_id=?",
             (observation_id,))
         con.commit()
-    except Exception:
+    except Exception as exc:
+        # The rollback makes the DURABLE half a clean no-op — and says nothing
+        # about the half that cannot be rolled back. By here the exact process
+        # has been signalled and proven dead, so a bare 500 leaves the operator
+        # with a shell whose rows still read live and whose process is gone,
+        # and no way to tell that from a recovery that never started. Same rule
+        # as the post-commit paths, one step earlier: an irreversible action
+        # already performed is NAMED, whichever direction the failure goes
+        # (SC-128's category, taken to the whole sequence rather than to the
+        # side of the commit it was found on).
         con.rollback()
-        raise
+        raise RecoveryError(
+            500, "recovery_closure_failed",
+            "the durable closure failed and was rolled back — no session, "
+            "archive, alert or binding was changed, and NOTHING was reset or "
+            "cleaned. " + (
+                f"The exact process (PID {signal_result.get('pid')}) was "
+                "already signalled and proven dead (that cannot be unwound), "
+                "so the shell's rows still describe a process that is gone; "
+                "recover it again to close them."
+                if signal_result else
+                "No process was signalled. Recover again."),
+            {"observation_id": observation_id, "signaled": signal_result,
+             "closed": False, "discarded": False,
+             "error": f"{type(exc).__name__}: {str(exc)[:200]}"}) from exc
     # -- past the point of no return: NOTHING below may become a 500 --------
     # The durable state is committed and cannot be unwound, and for a discard
     # the operator's files are about to be — or by now already have been —
