@@ -33,6 +33,10 @@ class SupervisionFixture:
         self.docker_state.mkdir()
         shutil.copy2(ROOT / "sc", self.root / "sc")
         shutil.copy2(
+            ROOT / ".super-coder" / "scripts" / "artifact_policy.py",
+            self.scripts / "artifact_policy.py",
+        )
+        shutil.copy2(
             ROOT / ".super-coder" / "scripts" / "db_backup.py",
             self.scripts / "db_backup.py",
         )
