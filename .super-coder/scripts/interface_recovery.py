@@ -622,16 +622,23 @@ def _worktree_vs_head(worktree: str, hidden: list[str]) -> set[str]:
 
     A failure here RAISES rather than falling back to the hint-trusting diff:
     silently returning the incomplete set is exactly the defect, and req 24
-    fails closed for the destructive path on a gap.
+    fails closed for the destructive path on a gap. EVERY step raises the same
+    refusal, the copy's own creation included — a full or unwritable temp dir
+    and an exhausted fd table are gaps in the observation exactly like a failed
+    `update-index`, and an OSError escaping raw would leave the public path
+    answering a sanitized 500 instead of an indeterminate worktree (SC-133).
     """
     if not hidden:
         return set(_git_paths(worktree, "diff", "HEAD", "--name-only", "-z"))
     git_dir = _git_out(worktree, "rev-parse", "--absolute-git-dir").strip()
     # NEVER inside the worktree: a file there would itself enumerate as
     # untracked and land in the delete set being computed.
-    fd, copy = tempfile.mkstemp(prefix="sc-recovery-index-")
-    os.close(fd)
     try:
+        fd, copy = tempfile.mkstemp(prefix="sc-recovery-index-")
+    except OSError as exc:   # no temp space, no permission, fds exhausted
+        raise _GitEvidenceUnavailable(f"index copy: {exc.errno}") from exc
+    try:
+        os.close(fd)
         with open(os.path.join(git_dir, "index"), "rb") as src, \
                 open(copy, "wb") as dst:
             while chunk := src.read(1 << 20):

@@ -3342,6 +3342,28 @@ class WorktreeTest(RecoveryCase):
             wt, mock.patch.object(recovery.subprocess, "run",
                                   fail_update_index))
 
+    def test_temp_index_creation_failure_is_a_gap_not_a_500(self):
+        # SC-133. The unhiding needs a throwaway index, and CREATING it can
+        # fail for reasons that have nothing to do with git: a full or
+        # unwritable temp dir, an exhausted fd table. That OSError used to be
+        # raised outside the translation, so it escaped the observation
+        # entirely and the public endpoint answered a sanitized 500 — an
+        # operator told "internal error" learns nothing about their files,
+        # where "could not be observed completely" tells them the discard is
+        # declined and the shell can still be freed. Same gap, same refusal,
+        # whichever step could not run.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        self.hidden_dirty(wt, "clean.txt", "HIDDEN")
+
+        self.assert_gap_refuses_discard_but_frees_the_shell(
+            wt, mock.patch.object(
+                recovery.tempfile, "mkstemp",
+                side_effect=OSError(errno.ENOSPC, "No space left on device")))
+        # ...and the hidden file is untouched by the refusal, hint and all.
+        self.assertEqual((Path(wt) / "clean.txt").read_text(), "HIDDEN")
+        self.assertEqual(self.index_tag(wt, "clean.txt"), "h")
+
     # -- NOTHING after the durable commit may surface as a 500 (SC-128) -----
 
     def test_late_gate_failure_after_the_commit_reports_a_partial_discard(
