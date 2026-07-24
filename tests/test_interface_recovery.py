@@ -1325,6 +1325,31 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual((wt / "late.txt").read_text(),
                          "written after the preview")
 
+    def test_unborn_head_discard_actually_discards(self):
+        # ...and having let it past the unpushed gate, the discard must DO
+        # something: `reset --hard HEAD` is fatal where nothing has ever been
+        # committed, so the reset failed and the clean never ran — an
+        # authorised discard that silently left everything in place.
+        wt = Path(self.tmp.name) / "unborn-discard"
+        wt.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "feat/x", str(wt)],
+                       check=True, capture_output=True)
+        (wt / "staged.txt").write_text("staged")
+        subprocess.run(["git", "-C", str(wt), "add", "staged.txt"],
+                       check=True, capture_output=True)
+        (wt / "untracked.txt").write_text("new")
+        self.session_with_worktree(str(wt))
+        obj = self.preview(1)
+        status, result = self.post(obj, preserve_worktree=False,
+                                   discard_worktree=True,
+                                   confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["worktree"]["discarded"], result["worktree"])
+        self.assertEqual(result["worktree"]["completed"], ["reset", "clean"])
+        self.assertFalse((wt / "staged.txt").exists())
+        self.assertFalse((wt / "untracked.txt").exists())
+        self.assertTrue(wt.is_dir())   # the worktree itself is never deleted
+
     # -- freshness must hold at the DESTRUCTIVE COMMIT, not just at entry
     #    (SC-091) -----------------------------------------------------------
 
@@ -1378,7 +1403,7 @@ class WorktreeTest(RecoveryCase):
         # earlier check has already passed. The discard must not run on top of
         # it. Injecting from terminate_process_group reproduces exactly that.
         wt = self.make_git_worktree()
-        self.orphan_with_worktree(wt)
+        proc, _ticks = self.orphan_with_worktree(wt)
         late = Path(wt) / "late_during_shutdown.txt"
         real = recovery.terminate_process_group
 
@@ -1404,6 +1429,10 @@ class WorktreeTest(RecoveryCase):
         self.assertTrue((Path(wt) / "untracked.txt").exists())
         # ...and the refusal is honest about what it could NOT unwind: the
         # signal was sent and the durable closure committed before this point.
+        # It names the process it signalled — this half of the wording is only
+        # truthful because the no-signal half says the opposite (below).
+        self.assertIn(f"The exact process (PID {proc.pid}) was signalled",
+                      err["error"]["message"])
         details = err["error"]["details"]
         self.assertFalse(details["discarded"])
         self.assertTrue(details["closed"])
@@ -1433,6 +1462,128 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual(recovery._proc_state(proc.pid, ticks), "dead")
         self.assertEqual((Path(wt) / "tracked.txt").read_text(), "v1")
         self.assertFalse((Path(wt) / "untracked.txt").exists())
+
+    # -- the observation itself must not be TORN (SC-092) -------------------
+
+    def test_mode_change_during_the_gates_own_read_refuses_discard(self):
+        # SC-092: the observation was torn. _path_identity lstat'ed a path and
+        # THEN opened and read it, so a chmod landing in between produced an
+        # identity that was never true at any instant — the old mode against
+        # the current bytes. That identity compared EQUAL to the preview, so
+        # the last gate passed and reset/clean erased the change while the API
+        # returned 200. Injecting from os.open reproduces exactly that window;
+        # each observation is now self-consistent, so it refuses instead.
+        wt = self.make_git_worktree()
+        tracked = Path(wt) / "tracked.txt"
+        os.chmod(tracked, 0o640)
+        self.orphan_with_worktree(wt)
+        # Armed only once the signal has been sent, so the injection fires
+        # inside the LAST gate's read — the one window where a torn
+        # observation still ends in a discard.
+        armed: list[bool] = []
+        fired: list[bool] = []
+        real_term = recovery.terminate_process_group
+        real_open = recovery.os.open
+
+        def arming(pid, start_ticks, grace_s):
+            result = real_term(pid, start_ticks, grace_s)
+            armed.append(True)
+            return result
+
+        def chmod_inside_the_read(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if armed and not fired and str(path) == str(tracked):
+                os.chmod(tracked, 0o600)   # after the lstat, before the read
+                fired.append(True)
+            return fd
+
+        with mock.patch.object(recovery, "_pane_present", return_value=False):
+            obj = self.preview(1)
+            self.assertEqual(obj["classification"], "exact_idle_orphan")
+            with mock.patch.object(recovery, "terminate_process_group",
+                                   arming), \
+                    mock.patch.object(recovery.os, "open",
+                                      chmod_inside_the_read):
+                status, err = self.post(obj, preserve_worktree=False,
+                                        discard_worktree=True,
+                                        confirm_shortname="s1")
+        self.assertTrue(fired, "the injection never ran — repro is stale")
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        # The tightened mode, the dirty content and the untracked file all
+        # survive: nothing was reset, nothing was cleaned.
+        self.assertEqual(self.mode_of(tracked), 0o600)
+        self.assertEqual(tracked.read_text(), "dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
+
+    def test_worktree_that_will_not_hold_still_refuses(self):
+        # The other half of stability: when the tree keeps moving under the
+        # read, there is no true answer to give. Re-reading forever is not an
+        # option and approximating is the SC-092 defect — so it becomes a gap,
+        # and a gap refuses (SC-087) with nothing signalled, closed or removed.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        tracked = Path(wt) / "tracked.txt"
+        real_open = recovery.os.open
+        modes = [0o640, 0o600]
+
+        def never_settles(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if str(path) == str(tracked):
+                modes.append(modes.pop(0))
+                os.chmod(tracked, modes[0])
+            return fd
+
+        self.assert_gap_refuses(
+            wt, mock.patch.object(recovery.os, "open", never_settles))
+
+    # -- a refusal names what it actually did, in BOTH directions -----------
+
+    def test_no_signal_refusal_does_not_claim_a_signal(self):
+        # The last gate's refusal used to state that the exact process had been
+        # signalled — inherited boilerplate. A stale durable lock has no
+        # process to signal (details signaled=null), so that sentence was
+        # false: reporting a signal that never happened is the same defect as
+        # implying a clean no-op after having closed. With nothing to signal,
+        # the closure is the only thing between the two gates, so that is
+        # where the late write is injected.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        self.assertEqual(obj["classification"], "stale_durable_lock")
+        late = Path(wt) / "late_after_closure.txt"
+        real = recovery._close_durable_state
+
+        def writing(con, shell_id, evidence, end_reason):
+            changed = real(con, shell_id, evidence, end_reason)
+            late.write_text("written after the closure committed")
+            return changed
+
+        with mock.patch.object(recovery, "_close_durable_state", writing), \
+                mock.patch.object(recovery,
+                                  "terminate_process_group") as term:
+            status, err = self.post(obj, preserve_worktree=False,
+                                    discard_worktree=True,
+                                    confirm_shortname="s1")
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
+        term.assert_not_called()
+        message = err["error"]["message"]
+        self.assertIn("NO process was signalled", message)
+        self.assertNotIn("The exact process", message)
+        self.assertIsNone(err["error"]["details"]["signaled"])
+        # ...and what it DOES claim is true: the closure committed, and the
+        # files — the late write included — are untouched.
+        self.assertTrue(err["error"]["details"]["closed"])
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
+        self.assertEqual(late.read_text(), "written after the closure "
+                                           "committed")
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
 
     def test_discard_git_failure_reports_exactly_what_completed(self):
         # clean fails AFTER reset succeeded and the closure committed: the

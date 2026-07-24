@@ -22,9 +22,13 @@ One API-owned preview/execute workflow shared by browser and CLI:
   an indeterminate result. A confirmed discard re-reads the worktree ONE more
   time immediately before `reset --hard`/`clean -fd`, because a shell can
   write while it shuts down, i.e. after that fence has already passed; that
-  refusal deletes nothing but cannot unwind the signal or the closure. See
-  `_assert_worktree_unchanged` for the windows that remain open — a worktree
-  is not transactional and no claim of atomicity is made here.
+  refusal deletes nothing but cannot unwind the signal or the closure, and it
+  says which of the two actually happened. Every worktree observation is
+  STABLE — each path read self-consistently, the whole observation repeated
+  identically — so a write landing during a read cannot produce an answer that
+  was never true (SC-092). See `_assert_worktree_unchanged` for the ONE window
+  that remains open — a worktree is not transactional and no claim of
+  atomicity is made here.
 
 Signaling discipline (spec Shell Recovery): SIGTERM to the exact verified
 process group, the bounded existing grace period, SIGKILL only while the
@@ -57,6 +61,7 @@ websockets-dependent Interface runtime (spec Restricted Admin).
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -254,9 +259,110 @@ def _head_exists(worktree: str) -> bool:
     raise _GitEvidenceUnavailable(f"git rev-parse: exit {out.returncode}")
 
 
+def _stamp(st) -> tuple:
+    """The comparable identity of one inode-as-seen-at-a-path. Everything the
+    metadata prefix binds, PLUS device/inode so a path replaced by a rename is
+    a different answer — and NOT st_atime, which our own read moves (see
+    `_path_identity`). Used only to prove an observation held still; the digest
+    records `_meta`."""
+    return (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_uid,
+            st.st_gid, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            st.st_dev, st.st_ino)
+
+
+def _meta(st) -> str:
+    return (f"{stat.S_IFMT(st.st_mode):o}:{stat.S_IMODE(st.st_mode):04o}:"
+            f"{st.st_uid}:{st.st_gid}:{st.st_size}:{st.st_mtime_ns}:"
+            f"{st.st_ctime_ns}")
+
+
+# A torn observation is retried this many times before it becomes a gap.
+# Small on purpose: a path that will not hold still across three passes is a
+# tree still being written, and that is a refusal, not something to wait out.
+_STABILITY_TRIES = 3
+
+# errnos that mean "the entry changed under us", not "we cannot read it":
+# gone, replaced by a symlink, or a parent component replaced by a file.
+_TORN_ERRNOS = (errno.ENOENT, errno.ELOOP, errno.ENOTDIR)
+
+
+def _observe_path(path: str) -> str | None:
+    """ONE self-consistent attempt at `_path_identity`. Returns the identity,
+    or None when the path moved while it was being observed (the caller
+    retries, then fails closed).
+
+    Self-consistency is the whole point: metadata is read, the content behind
+    it is read, and the metadata is read AGAIN — via the OPEN FD (same inode,
+    whatever the path now names) and via the path (same inode still named) —
+    and the answer is returned only when every read agrees. Reading the two
+    halves separately is a torn read: a chmod landing between the lstat and
+    the open produced an identity that was never true at any instant — old
+    mode, new bytes — which then compared EQUAL to the preview and let the
+    discard erase the change (SC-092).
+    """
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as exc:
+        # Paths and contents never enter the payload — errno only.
+        raise _GitEvidenceUnavailable(f"lstat: errno {exc.errno}") from exc
+    stamp, meta, mode = _stamp(st), _meta(st), st.st_mode
+
+    if stat.S_ISLNK(mode):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            if exc.errno in _TORN_ERRNOS:
+                return None
+            raise _GitEvidenceUnavailable(
+                f"readlink: errno {exc.errno}") from exc
+        identity = f"link:{meta}:" + hashlib.sha256(
+            target.encode("utf-8", "surrogateescape")).hexdigest()
+    elif stat.S_ISDIR(mode):
+        identity = f"dir:{meta}"
+    elif not stat.S_ISREG(mode):
+        identity = f"special:{meta}"
+    else:
+        h = hashlib.sha256()
+        try:
+            # O_NOFOLLOW: the path was a regular file at lstat; if it became a
+            # symlink in between, refuse to read through it rather than hash
+            # whatever it now points at.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno in _TORN_ERRNOS:
+                return None
+            raise _GitEvidenceUnavailable(f"open: errno {exc.errno}") from exc
+        try:
+            if _stamp(os.fstat(fd)) != stamp:
+                return None          # already moved between lstat and open
+            while chunk := os.read(fd, 1 << 16):
+                h.update(chunk)
+            if _stamp(os.fstat(fd)) != stamp:
+                return None          # rewritten or re-permissioned as we read
+        except OSError as exc:
+            raise _GitEvidenceUnavailable(f"read: errno {exc.errno}") from exc
+        finally:
+            os.close(fd)
+        identity = f"file:{meta}:{h.hexdigest()}"
+
+    # ...and the path must still name that same inode: an fstat cannot see a
+    # rename landing a different file on the path we are reporting about.
+    try:
+        after = os.lstat(path)
+    except OSError:
+        return None
+    return identity if _stamp(after) == stamp else None
+
+
 def _path_identity(path: str) -> str:
     """Identity of one working-tree path: its TYPE and lstat metadata first,
     then what that type carries. Classified with lstat — NO-FOLLOW, always.
+
+    Observed self-consistently and retried while it tears; a path that will
+    not hold still becomes a GAP (`_GitEvidenceUnavailable`), which refuses the
+    recovery. See `_observe_path`.
 
     The metadata prefix binds every attribute a discard REWRITES: the type,
     the FULL permission bits, owner and group, size, and the mtime/ctime
@@ -286,42 +392,12 @@ def _path_identity(path: str) -> str:
     own read, so binding it would make the preview stale against itself and
     refuse every discard forever.
     """
-    try:
-        st = os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return "absent"
-    except OSError as exc:
-        # Paths and contents never enter the payload — errno only.
-        raise _GitEvidenceUnavailable(f"lstat: errno {exc.errno}") from exc
-    mode = st.st_mode
-    meta = (f"{stat.S_IFMT(mode):o}:{stat.S_IMODE(mode):04o}:{st.st_uid}:"
-            f"{st.st_gid}:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}")
-    if stat.S_ISLNK(mode):
-        try:
-            target = os.readlink(path)
-        except OSError as exc:
-            raise _GitEvidenceUnavailable(
-                f"readlink: errno {exc.errno}") from exc
-        return f"link:{meta}:" + hashlib.sha256(
-            target.encode("utf-8", "surrogateescape")).hexdigest()
-    if stat.S_ISDIR(mode):
-        return f"dir:{meta}"
-    if not stat.S_ISREG(mode):
-        return f"special:{meta}"
-    h = hashlib.sha256()
-    try:
-        # O_NOFOLLOW: the path was a regular file at lstat; if it became a
-        # symlink in between, refuse to read through it rather than hash
-        # whatever it now points at.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            while chunk := os.read(fd, 1 << 16):
-                h.update(chunk)
-        finally:
-            os.close(fd)
-    except OSError as exc:
-        raise _GitEvidenceUnavailable(f"read: errno {exc.errno}") from exc
-    return f"file:{meta}:{h.hexdigest()}"
+    for _ in range(_STABILITY_TRIES):
+        identity = _observe_path(path)
+        if identity is not None:
+            return identity
+    raise _GitEvidenceUnavailable(
+        "torn read: an entry kept changing while it was observed")
 
 
 def _change_digest(worktree: str, porcelain: list[str], head: bool) -> str:
@@ -366,16 +442,52 @@ def _change_digest(worktree: str, porcelain: list[str], head: bool) -> str:
     return h.hexdigest()
 
 
+def _observe_worktree(worktree: str) -> dict:
+    """ONE complete pass over the worktree facts. Every git read the fence
+    depends on happens here, so the whole answer can be repeated and compared —
+    the path SET is enumerated at a different instant from each path's identity,
+    and a pass is only trustworthy if the composite holds still."""
+    head = _head_exists(worktree)
+    branch = _git_out(worktree, "rev-parse", "--abbrev-ref", "HEAD") \
+        if head else _git_out(worktree, "branch", "--show-current")
+    porcelain = _git_out(worktree, "status", "--porcelain").splitlines()
+    untracked = sum(1 for ln in porcelain if ln.startswith("??"))
+    dirty = len(porcelain) - untracked
+    unpushed = int(_git_out(worktree, "rev-list", "HEAD", "--not",
+                            "--remotes", "--count").strip() or 0) \
+        if head else 0
+    return {"worktree": worktree, "branch": branch.strip(),
+            "dirty_tracked": dirty, "untracked": untracked,
+            "unpushed_commits": unpushed,
+            # WHICH paths changed and WHAT each one now IS — not just how
+            # many: equal-count churn (one file cleaned while another is
+            # dirtied), a rewrite of an already-listed path, a symlink
+            # retarget, a chmod, and a type transition all move the
+            # freshness fingerprint. Paths and contents stay out of the
+            # payload.
+            "change_digest": _change_digest(worktree, porcelain, head)}
+
+
 def _git_facts(worktree: str | None) -> dict | None:
     """Worktree facts for the freshness fence. Three outcomes, kept apart on
     purpose:
 
     - `None` — there is no repository to observe (no worktree, or no `.git`).
       Complete evidence: there is no git-managed state here to erase.
-    - a facts dict — the complete observation.
+    - a facts dict — the complete observation, STABLE: two consecutive passes
+      returned exactly the same answer.
     - `{"indeterminate": <reason>}` — a repository IS there and its evidence
-      could not be gathered whole. NOT "no facts": execute refuses on it, so
-      an unobservable worktree can never read as a safe one (SC-087).
+      could not be gathered whole, or it would not hold still. NOT "no facts":
+      execute refuses on it, so an unobservable worktree can never read as a
+      safe one (SC-087).
+
+    Stability is a correctness requirement, not politeness. A single pass reads
+    the path set at one instant and each path's identity at another, so a write
+    landing between them yields an answer that was never true as a whole — and
+    a torn answer can compare EQUAL to the preview and let a discard erase what
+    moved (SC-092). Requiring two consecutive identical passes means the answer
+    was true across a window, not merely at assorted instants inside one; a tree
+    that keeps moving is refused rather than approximated.
     """
     if not worktree:
         return None
@@ -383,25 +495,14 @@ def _git_facts(worktree: str | None) -> dict | None:
     if not (os.path.isdir(dotgit) or os.path.isfile(dotgit)):
         return None
     try:
-        head = _head_exists(worktree)
-        branch = _git_out(worktree, "rev-parse", "--abbrev-ref", "HEAD") \
-            if head else _git_out(worktree, "branch", "--show-current")
-        porcelain = _git_out(worktree, "status", "--porcelain").splitlines()
-        untracked = sum(1 for ln in porcelain if ln.startswith("??"))
-        dirty = len(porcelain) - untracked
-        unpushed = int(_git_out(worktree, "rev-list", "HEAD", "--not",
-                                "--remotes", "--count").strip() or 0) \
-            if head else 0
-        return {"worktree": worktree, "branch": branch.strip(),
-                "dirty_tracked": dirty, "untracked": untracked,
-                "unpushed_commits": unpushed,
-                # WHICH paths changed and WHAT each one now IS — not just how
-                # many: equal-count churn (one file cleaned while another is
-                # dirtied), a rewrite of an already-listed path, a symlink
-                # retarget, a chmod, and a type transition all move the
-                # freshness fingerprint. Paths and contents stay out of the
-                # payload.
-                "change_digest": _change_digest(worktree, porcelain, head)}
+        previous = None
+        for _ in range(_STABILITY_TRIES):
+            facts = _observe_worktree(worktree)
+            if facts == previous:
+                return facts
+            previous = facts
+        raise _GitEvidenceUnavailable(
+            "the worktree did not hold still across consecutive observations")
     except (_GitEvidenceUnavailable, ValueError) as exc:
         return {"indeterminate": str(exc)}
 
@@ -446,10 +547,18 @@ def _discard_worktree_files(worktree: str) -> dict:
     deletes the worktree, its branch, or ignored files. Runs AFTER the
     durable closure is committed, so a git failure here must never escape
     as a 500 that hides what happened: each step's outcome is recorded and
-    a failure returns exactly what completed and where it stopped."""
+    a failure returns exactly what completed and where it stopped.
+
+    `reset --hard` without an explicit `HEAD`: identical everywhere HEAD
+    resolves, and the only form that works on an UNBORN head — where naming
+    HEAD is fatal, which failed the reset and stopped before the clean, so a
+    discard the gates had authorised silently did nothing. Unborn, it empties
+    the index (nothing has ever been committed, so that IS the baseline) and
+    the clean then removes the untracked files.
+    """
     result: dict = {"worktree": worktree, "discarded": False,
                     "completed": [], "failed": None}
-    for step, args in (("reset", ["reset", "--hard", "HEAD"]),
+    for step, args in (("reset", ["reset", "--hard"]),
                        ("clean", ["clean", "-fd"])):
         try:
             out = subprocess.run(["git", "-C", worktree, *args],
@@ -912,35 +1021,57 @@ def _assert_worktree_unchanged(observation_id: str, stored: dict,
     of evidence a recovery must NOT change — and the only piece a discard
     destroys. So that is what is re-read here, immediately before the delete.
 
+    The read itself is stable: each path is observed self-consistently and the
+    whole observation must repeat identically before it counts (`_git_facts`),
+    so a write landing DURING this gate's own read no longer produces a torn
+    answer that compares equal to the preview (SC-092).
+
     NOT ATOMIC, and not claimed to be. A git worktree is not transactional:
     unlike a row, `verify` and `reset --hard && clean -fd` cannot be made
-    indivisible. Two windows remain and are irreducible at this layer:
+    indivisible. ONE window remains, and it is irreducible at this layer:
 
-      1. between this read and `git reset` actually opening a file — one
-         subprocess spawn, the smallest gap this ordering can reach;
-      2. anything writing DURING the reset/clean themselves.
+      everything written after the last observation completes — during the
+      `git reset`/`git clean` spawn, and during the reset and clean themselves
+      — is erased with no record that it existed. A file created after the
+      final `ls-files` is not in the digest, so it is not compared; it is
+      simply cleaned.
 
-    What bounds them is not a lock but the sequence: the exact process this
+    Why it cannot be closed: closing it needs the worktree frozen against all
+    writers for the duration of the delete, and the filesystem offers no such
+    lock — any process with the path can write, and `git clean` cannot be made
+    to fail on concurrent writes.
+
+    What bounds it is not a lock but the sequence: the exact process this
     recovery targeted was proven dead via /proc before we got here, so the
     writer this protects against is already gone. A DIFFERENT process writing
-    into the worktree was never inside the observation's scope, and no check
-    here can serialise against it.
+    into the worktree was never inside the observation's scope. Operator
+    remedy, and the only one: nothing else may be writing to the worktree while
+    a discard runs — if something is (an editor, a build, a second agent), stop
+    it first, or recover with the worktree preserved and clean up by hand.
 
-    The refusal is honest about what already happened: the signal was sent and
-    the durable closure committed, and neither can be unwound. Only the
-    escalation is refused — nothing is reset, nothing is cleaned.
+    The refusal is honest about what already happened — and about what did
+    NOT: it names the signal only when a signal was actually sent, because a
+    stale durable lock has no process to signal and reporting one anyway is
+    the same dishonesty in the opposite direction.
     """
     fresh = _volatile_git(_git_facts(worktree))
     if fresh == _volatile_git(stored.get("git")):
         return
+    if signal_result:
+        performed = (f"The exact process (PID {signal_result.get('pid')}) was "
+                     "signalled and the durable state was closed before this "
+                     "point")
+    else:
+        performed = ("NO process was signalled — there was none to signal, "
+                     "the durable lock was stale; the durable state was "
+                     "closed before this point")
     raise RecoveryError(
         409, "recovery_observation_stale",
         "the worktree changed after the freshness fence — the discard is "
-        "refused and NOTHING was reset or cleaned. The exact process was "
-        "signalled and the durable state closed before this point (that is "
-        "the recovery itself, and it cannot be unwound); the files are "
-        "untouched. Preview again to see the new state and confirm the "
-        "discard against it.",
+        f"refused and NOTHING was reset or cleaned. {performed} (that is the "
+        "recovery itself, and it cannot be unwound); the files are untouched. "
+        "Preview again to see the new state and confirm the discard against "
+        "it.",
         {"observation_id": observation_id, "worktree": worktree,
          "signaled": signal_result, "closed": True, "discarded": False})
 
