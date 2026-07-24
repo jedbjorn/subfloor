@@ -48,7 +48,7 @@ The web, and the network — in full, and these controls are release-critical:
 | A webpage on another origin scripting your Interface | Exact same-origin `Origin` **and** `Sec-Fetch-Site: same-origin` on bootstrap; `SameSite=Strict` cookie; `X-CSRF` on every mutation; CORS stays off |
 | Cross-site request forgery | `SameSite=Strict` + an anti-forgery token held only in page memory |
 | DNS rebinding | Exact `Host` allowlist (`127.0.0.1` / `localhost`), every route |
-| Accidental network exposure | Reachable from the host's loopback interface only — see [the exact guarantee](#the-bind-guarantee-exactly) |
+| Accidental network exposure | Loopback-only: off-sandbox the server exits unless the bind is loopback; in the sandbox it is an operator precondition, not something the process verifies — see [the exact guarantee](#the-bind-guarantee-exactly) |
 | Credential leakage from the browser | The browser is never given a credential to leak — see below |
 | Remote clients | No route in; reach it through your own secure transport (e.g. a tailnet) or not at all |
 
@@ -58,16 +58,17 @@ Because the browser session mints automatically, the *only* thing standing
 between a remote client and Interface authority is that the remote client
 cannot reach the port — a network client able to choose its own `Host` and
 `Origin` headers passes every other fence. So it is worth being precise about
-what enforces that, rather than restating "binds loopback only":
+what enforces that, rather than restating the headline:
 
 - **On your host** (`./sc serve`, the supervised stack): the server checks
   `SC_BIND` at startup and **exits** unless it is a loopback address. Setting
   `SC_BIND=0.0.0.0` does not widen the Interface; it stops it booting.
 - **Inside the sandbox container**: the bind *is* `0.0.0.0`, deliberately, so
-  docker can publish the port — and the boundary is the published mapping,
-  `-p 127.0.0.1:PORT:PORT`, which is loopback-only on the host whatever the
-  container binds. The in-process guard stands down there because refusing
-  would break `./sc launch` without removing any exposure.
+  docker can publish the port — and the boundary is `./sc launch`'s published
+  mapping, `-p 127.0.0.1:PORT:PORT`, which is loopback-only on the host
+  provided that is how the container was launched. The in-process guard stands
+  down there because refusing would break `./sc launch` without removing any
+  exposure.
 
 The exemption is granted on **observed** container evidence — a marker file a
 container runtime writes (`/.dockerenv`, `/run/.containerenv`), or PID 1's
@@ -78,18 +79,26 @@ so `SC_SANDBOX=1 SC_BIND=0.0.0.0` on a bare host opened a listener this page
 described as fenced. Where the boundary cannot be positively observed, the
 refusal applies.
 
-Two things that evidence does **not** prove, said plainly, because a guard
-claiming more than it verifies is the defect this replaced. It shows the bind
-lands in a container's network namespace; it cannot show what the host did
-with the port, since the publish mapping is host-side and invisible from
-inside without the docker socket. So a container run with `--network=host`, or
-one whose port is published wide, still passes. Both require launching the
-engine outside `./sc launch`'s mapping — neither is reachable by setting a
-variable, which is the whole distance travelled.
+What that evidence establishes, exactly, because a guard claiming more than it
+verifies is the defect this replaced: a container **filesystem and cgroup**
+context. That is **not** a distinct network namespace — `--network=host`
+shares the host's and passes every check. Nor can anything in here see what
+the host did with the port: the publish mapping is host-side and invisible
+without the docker socket.
 
-Net: reachable from the host's loopback interface only, enforced in-process
-off-sandbox and by docker's port mapping in it. Remote access is a separate
-authenticated boundary you put in front (e.g. a tailnet) — never a wider bind.
+So in the sandbox, loopback-only is a **precondition**, not a verified
+property: it holds provided the container was launched by `./sc launch`, which
+publishes to `127.0.0.1` and does not pass `--network=host`. Launch the engine
+some other way and the evidence check still passes with no loopback boundary
+behind it. That residual is real; what it costs is a deliberate launch outside
+`./sc launch`, where the variable this replaced cost an `export`. There is no
+namespace probe here on purpose — a check that failed open would be worse than
+an honest narrow one.
+
+Net: off-sandbox the guard verifies it, exiting unless the bind is loopback;
+in the sandbox it is loopback-only on the stated precondition above, which
+this process cannot confirm. Remote access is a separate authenticated
+boundary you put in front (e.g. a tailnet) — never a wider bind.
 
 Same-origin script execution is operator-equivalent here. The restrictive CSP,
 the vendored scripts, the sanitized rendered content, and the absence of any
@@ -177,7 +186,7 @@ privilege**:
 - The engine never invokes `sudo`. The only `sudo` in Subfloor is *printed
   advice* during one-time host setup (`./sc doctor`) for installing Docker
   itself — an OS package step you perform, not something the service does.
-- The published port is bound to `127.0.0.1` only.
+- The port `./sc launch` publishes is bound to `127.0.0.1` only.
 
 One caveat worth stating rather than hiding: on **rootful** Docker, membership
 in the `docker` group is effectively root-equivalent on the host. That is a

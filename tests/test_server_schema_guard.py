@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -188,13 +189,113 @@ class LoopbackBindGuardTest(unittest.TestCase):
     def test_container_keeps_the_wide_bind_docker_publishes(self):
         # The counterweight. `./sc launch` sets SC_BIND=0.0.0.0 in the
         # container ON PURPOSE so docker can publish the port; the boundary
-        # there is the `-p 127.0.0.1:PORT:PORT` mapping, loopback-only on the
-        # host whatever the container binds. Over-refusing here would make the
-        # sandbox unlaunchable while removing no exposure — and it must hold
-        # with SC_SANDBOX absent, since the evidence is now the filesystem's.
+        # there is its `-p 127.0.0.1:PORT:PORT` mapping — a precondition, not
+        # something this check verifies (see BoundaryClaimTest). Over-refusing
+        # here would make the sandbox unlaunchable while removing no exposure —
+        # and it must hold with SC_SANDBOX absent, since the evidence is now
+        # the filesystem's.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SC_SANDBOX", None)
             self._guard("0.0.0.0", container=True)
+
+
+class BoundaryClaimTest(unittest.TestCase):
+    """What we SAY the bind guard establishes, held to what it establishes
+    (conformance finding SC-154 — SC-149 one layer up).
+
+    SC-149 was a guard claiming more than it enforced. SC-154 was the same
+    defect one layer up: the code comment and the public trust-boundary page
+    honestly admitted that `--network=host` shares the host's namespace and
+    still passes, then concluded host-loopback-only anyway. Both statements
+    cannot be true, and it is the conclusion that was wrong — the summary
+    sentence had not inherited its own caveat.
+
+    So the pin is per SENTENCE, deliberately: a loopback-only claim must name
+    what makes it true where it makes it, because a caveat three paragraphs
+    away is exactly what failed here. These are prose assertions, and prose is
+    the artifact — the guarantee an operator acts on is the one they read.
+    """
+
+    TRUST_DOC = ENGINE / "docs" / "interface-trust-boundary.md"
+
+    # A sentence asserting the loopback guarantee, in either word order.
+    LOOPBACK_ONLY = re.compile(r"loopback[^.]*\bonly\b|\bonly\b[^.]*loopback",
+                               re.I)
+    # What may make that claim true, named in the same sentence: the in-process
+    # guard (which EXITS unless the bind is loopback) or the operator
+    # precondition the sandbox exemption rests on. "Enforced in-process and by
+    # docker's port mapping" is NOT one of these — it is the overclaim.
+    QUALIFIED = re.compile(r"precondition|assum\w+|unless|provided|"
+                           r"--network=host", re.I)
+    # The claim the evidence cannot support: that it demonstrates a network
+    # namespace. A marker file and a cgroup path show a container filesystem
+    # and cgroup context; `--network=host` has neither of its own.
+    NAMESPACE_CLAIM = re.compile(
+        r"(shows?|proves?|establish\w*|demonstrat\w*|means)[^.]*"
+        r"network namespace", re.I)
+    NAMESPACE_LIMIT = re.compile(r"\bnot\b[^.]*network namespace", re.I)
+
+    def sentences(self, text: str) -> list[str]:
+        """Prose split into sentences. Soft-wrapped lines fold together first
+        (or a claim and its qualifier land in different fragments purely
+        because the paragraph was rewrapped); a bullet, table row, or heading
+        starts a new block. A sentence ends at `. ` before a capital, so
+        `127.0.0.1` and `e.g.` do not split one."""
+        blocks: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                blocks.append("")
+            elif stripped[0] in "-*|#" or not blocks or not blocks[-1]:
+                blocks.append(stripped)
+            else:
+                blocks[-1] += " " + stripped
+        out: list[str] = []
+        for block in blocks:
+            out.extend(s for s in re.split(r"(?<=\.)\s+(?=[A-Z*`\"])", block)
+                       if s.strip())
+        return out
+
+    def prose(self):
+        """Every place the guarantee is stated: the operator-facing page and
+        the two docstrings a maintainer reads before touching the guard."""
+        return (("the trust-boundary doc", self.TRUST_DOC.read_text()),
+                ("in_container()", server.in_container.__doc__),
+                ("require_loopback_bind()",
+                 server.require_loopback_bind.__doc__))
+
+    def test_no_loopback_only_claim_stands_without_its_precondition(self):
+        for where, text in self.prose():
+            for sentence in self.sentences(text):
+                if not self.LOOPBACK_ONLY.search(sentence):
+                    continue
+                with self.subTest(where=where, sentence=sentence[:70]):
+                    self.assertRegex(
+                        sentence, self.QUALIFIED,
+                        f"{where}: this concludes loopback-only without "
+                        f"naming what makes it true — the in-process refusal "
+                        f"or the operator precondition:\n  {sentence}")
+
+    def test_nothing_claims_the_evidence_shows_a_network_namespace(self):
+        for where, text in self.prose():
+            for sentence in self.sentences(text):
+                with self.subTest(where=where, sentence=sentence[:70]):
+                    self.assertNotRegex(
+                        sentence, self.NAMESPACE_CLAIM,
+                        f"{where}: a marker file and a cgroup path do not "
+                        f"establish a network namespace — `--network=host` "
+                        f"passes both:\n  {sentence}")
+
+    def test_the_namespace_limit_is_stated_where_the_evidence_is(self):
+        # The negative above passes trivially on prose that says nothing at
+        # all; the limit has to be stated, not merely not-contradicted.
+        for where, text in self.prose()[:2]:
+            with self.subTest(where=where):
+                self.assertTrue(
+                    any(self.NAMESPACE_LIMIT.search(s)
+                        for s in self.sentences(text)),
+                    f"{where} never says the evidence is not a network "
+                    f"namespace")
 
 
 class LoopbackBindStartupWiringTest(unittest.TestCase):

@@ -69,9 +69,10 @@ TICKET_TTL_S = 60
 RESERVATION_TTL_S = 60
 IDEM_TTL_S = 24 * 3600
 BROWSER_SESSION_TTL_S = 24 * 3600      # inactivity deadline (spec #26)
-# How long a bootstrap Idempotency-Key stays replayable. Short by intent: it
+# How long a bootstrap Idempotency-Key stays REPLAYABLE. Short by intent: it
 # exists to absorb the retry of a lost 201 (spec #26 Session Lifecycle allows
-# exactly one), not to pin a credential for the session's whole 24 hours.
+# exactly one), not to pin a credential for the session's whole 24 hours. Past
+# it the key is refused, never re-minted — see `_sweep_bootstrap_replays()`.
 BOOTSTRAP_REPLAY_TTL_S = 300
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 # The same allowlist as bare hosts, for comparing against a parsed authority
@@ -83,8 +84,8 @@ _runtime = None          # bound by bind_runtime()
 # never the DB, a snapshot, or a log — so a service restart invalidates them
 # all, which is exactly the intended recovery path.
 _browser_sessions: dict = {}
-# Bootstrap idempotency replay records, same terms and same lock as the
-# sessions they shadow — live-process only, so a repeated key never reaches
+# Bootstrap idempotency replay records, same terms, same lock and same life as
+# the sessions they shadow — live-process only, so a repeated key never reaches
 # the durable DB (spec #26) and a restart forgets it with everything else.
 _browser_bootstraps: dict = {}
 _browser_lock = threading.Lock()
@@ -349,14 +350,25 @@ def _sweep_browser_sessions(now: float) -> None:
 
 
 def _sweep_bootstrap_replays(now: float) -> None:
-    """Drop expired bootstrap replay records. Same request-driven cleanup as
-    the sessions (spec #26: no scheduled model or harness poll), and bounded
-    by the number of successful mints in the last BOOTSTRAP_REPLAY_TTL_S
-    seconds — not by `_browser_sessions`, which a record outlives when
-    rotation revokes the session it names. Caller holds `_browser_lock`."""
-    for key in [k for k, rec in _browser_bootstraps.items()
-                if now - rec["created"] >= BOOTSTRAP_REPLAY_TTL_S]:
-        del _browser_bootstraps[key]
+    """Age out bootstrap replay records without letting expiry decay into a
+    second mint (spec #26 API Contract, conformance finding SC-153). Same
+    request-driven cleanup as the sessions (spec #26: no scheduled model or
+    harness poll). Caller holds `_browser_lock`.
+
+    A record dies with the session it minted: once that session is gone the
+    record can replay nothing, and a repeat of its key mints a session that is
+    the only live one — which is what the guarantee is about. While the session
+    IS live, the record outlives the replay window as a tombstone with its
+    credentials scrubbed: past the window the key is refused, never honoured as
+    a fresh request, so the window's edge cannot hand out a second live session
+    on a 300-second delay. That bounds the store by `_browser_sessions` — one
+    record per live mint, no growth class the sessions dict does not already
+    have."""
+    for key, rec in list(_browser_bootstraps.items()):
+        if rec["sid"] not in _browser_sessions:
+            del _browser_bootstraps[key]
+        elif now - rec["created"] >= BOOTSTRAP_REPLAY_TTL_S:
+            rec["csrf"] = rec["cookie"] = None
 
 
 # ------------------------------------------------------------------ idempotency
@@ -2367,8 +2379,8 @@ def _browser_session(headers, body):
     # forbids a browser session or its credentials ever reaching the durable
     # DB. So the replay store is live-process state on exactly the terms the
     # sessions themselves are — same lock, same request-driven sweep, gone on
-    # restart — and it holds one record per mint for a 288th of a session's
-    # life, so it is never the store that grows.
+    # restart — and it holds one record per LIVE session, so it is never the
+    # store that grows.
     #
     # The replayed "request" is the provenance the response is derived from
     # (proven scheme + Host); the route reads no body. A key seen with
@@ -2385,15 +2397,24 @@ def _browser_session(headers, body):
     with _browser_lock:
         _sweep_browser_sessions(now)
         _sweep_bootstrap_replays(now)
+        # The sweep above settled which records survive: one whose session is
+        # gone is deleted (replaying a revoked credential is idempotent and
+        # wrong, so that key falls through to a real mint — and the session it
+        # mints is then the only live one), and one past the replay window is
+        # left as a scrubbed tombstone.
         seen = _browser_bootstraps.get(key)
-        if seen is not None and seen["hash"] != canonical:
-            return _err(409, "idempotency_conflict",
-                        "Idempotency-Key reused from a different origin")
-        # Replay only while the session it names is still live. A recorded
-        # session that has since been revoked or expired would otherwise hand
-        # back a dead credential — an idempotent answer that is also a wrong
-        # one — so a stale record falls through to a fresh mint.
-        if seen is not None and seen["sid"] in _browser_sessions:
+        if seen is not None:
+            if seen["hash"] != canonical:
+                return _err(409, "idempotency_conflict",
+                            "Idempotency-Key reused from a different origin")
+            # Past the window the key is REFUSED, never re-minted (spec #26 API
+            # Contract, conformance finding SC-153): expiring into a fresh mint
+            # would hand the same key a second live session with different
+            # credentials — the SC-151 defect, arriving on a delay.
+            if seen["cookie"] is None:
+                return _err(409, "idempotency_conflict",
+                            "Idempotency-Key reused after its replay window — "
+                            "retry with a fresh key")
             return _json(201, {"csrf": seen["csrf"]},
                          headers=[("Set-Cookie", seen["cookie"])])
         # Rotation revokes: the session the caller presented dies in the same

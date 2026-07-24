@@ -2860,20 +2860,25 @@ def in_container() -> bool:
     container runtime — the cgroup-v1-shaped fallback for runtimes that write
     no marker. Both are artifacts of the runtime that built the sandbox.
 
-    What it PROVES: this process's bind lands in a container network
-    namespace, so `0.0.0.0` here is the container's wildcard, not the host's.
+    What it ESTABLISHES: a container filesystem and cgroup context — this
+    process runs inside something a container runtime built. That is NOT a
+    distinct network namespace. `--network=host` shares the host's namespace
+    and passes every check here, so `0.0.0.0` under this exemption is not
+    guaranteed to be the container's own wildcard.
 
-    What it does NOT prove, stated plainly because the finding this fixes was
-    a guard claiming more than it verified: it does not prove the host
-    published the port to loopback only. That mapping (`-p 127.0.0.1:PORT:PORT`,
-    `sc:1206-1207`) lives on the host side and is invisible from in here
-    without the docker socket. Two residual cases therefore pass this check
-    with no loopback boundary behind them — a container run with
-    `--network=host` (which shares the host's namespace), and a container
-    whose port is published wide. Both require someone to deliberately launch
-    the engine outside `./sc launch`'s mapping; neither is reachable by
-    setting an environment variable, which is the entire distance travelled
-    from the `SC_SANDBOX` check this replaces.
+    The loopback boundary therefore rests on an operator PRECONDITION, not on
+    a verified property: that the engine was launched by `./sc launch`, which
+    publishes `-p 127.0.0.1:PORT:PORT` (`sc:1206-1207`) and does not pass
+    `--network=host`. Nothing observable from in here can confirm it — the
+    publish mapping is host-side and invisible without the docker socket — and
+    a stated assumption is not a verified one. Deliberately do not add a
+    namespace probe to close that gap: a check that fails open would be worse
+    than an honest narrow one, and claiming more than is verified is the
+    defect this replaced (SC-149, then SC-154 one layer up).
+
+    What the check does buy: the exemption now costs a deliberate launch
+    outside `./sc launch`, where the `SC_SANDBOX` check it replaces cost an
+    `export`.
     """
     if any(os.path.exists(m) for m in _CONTAINER_MARKERS):
         return True
@@ -2895,9 +2900,10 @@ def require_loopback_bind(bind: str) -> None:
     The sandbox is the one legitimate non-loopback bind: `./sc launch` sets
     SC_BIND=0.0.0.0 (`sc:1198`) so docker can publish the port, and the
     boundary is the `-p 127.0.0.1:PORT:PORT` mapping (`sc:1206-1207`) —
-    loopback-only on the host regardless of the in-container bind. Refusing
-    0.0.0.0 unconditionally would make the sandbox unlaunchable while removing
-    no real exposure.
+    loopback-only on the host provided that is how the container was launched,
+    which is a precondition this process cannot check (see `in_container()`).
+    Refusing 0.0.0.0 unconditionally would make the sandbox unlaunchable while
+    removing no real exposure.
 
     That exception is gated on `in_container()`, NOT on SC_SANDBOX. The
     original amendment keyed it on the env var and conformance finding SC-149

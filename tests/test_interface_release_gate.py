@@ -485,6 +485,46 @@ class ReleaseGateTest(unittest.TestCase):
             {"Cookie": second[1]["Set-Cookie"].split(";")[0]})
         self.assertEqual(status, 200, body)
 
+    # -- SC-153: the window's edge refuses, it does not mint again -----------
+
+    def test_a_key_reused_past_the_replay_window_is_refused_not_reminted(self):
+        """The replay window is bounded on purpose, but expiring it into a
+        fresh mint reintroduced SC-151 on a 300-second delay: the same key,
+        the same provenance, a SECOND live session with different credentials.
+        A happy-path replay test cannot see this, which is why it survived a
+        review — so this one advances past the window and asserts a REFUSAL
+        (spec #26 API Contract: `409 idempotency_conflict` past the window).
+        """
+        first = self._boot("boot-window")
+        self.assertEqual(first[0], 201)
+        cookie = first[1]["Set-Cookie"].split(";")[0]
+        routes._browser_bootstraps["boot-window"]["created"] -= (
+            routes.BOOTSTRAP_REPLAY_TTL_S + 1)
+
+        status, headers, body = self._boot("boot-window")
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "idempotency_conflict")
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(
+            len(routes._browser_sessions), 1,
+            "the replay window expired into a second live session")
+        # The refusal is not a revocation either: the credential the client
+        # already holds keeps working, so the caller loses nothing by being
+        # told to use a fresh key.
+        status, _, body = self.http("GET", "/api/interface/shells",
+                                    {"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+
+    def test_the_replay_store_does_not_outlive_the_sessions_it_shadows(self):
+        # The counterweight to the tombstone: bounding the store is the reason
+        # the window exists at all, so a record whose session is gone must not
+        # linger. Expiry is what makes the refusal above affordable.
+        self._boot("boot-bounded")
+        self.assertIn("boot-bounded", routes._browser_bootstraps)
+        routes._browser_sessions.clear()          # what a revoke/expiry does
+        self._boot("boot-other")
+        self.assertNotIn("boot-bounded", routes._browser_bootstraps)
+
     def test_a_replayed_bootstrap_never_reaches_the_durable_db(self):
         # Spec #26: browser sessions and their credentials are live-process
         # state only. The general `_idempotent()` path would have persisted
