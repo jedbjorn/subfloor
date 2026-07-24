@@ -1200,14 +1200,22 @@ class WorktreeTest(RecoveryCase):
 
     # -- incomplete evidence REFUSES, it never degrades (SC-087) -----------
 
-    def assert_gap_refuses(self, wt, patcher=None):
-        """A gap in the evidence must refuse at execute.
+    def assert_gap_refuses_discard_but_frees_the_shell(self, wt, patcher=None):
+        """A gap in the worktree evidence must refuse the DISCARD at execute —
+        and must NOT hold the shell hostage.
 
         The danger is precisely that a gap is DETERMINISTIC: the same
         undecodable output or unreadable entry yields the same absent facts at
-        preview and at execute, so it fingerprints EQUAL and rides through as
+        preview and at execute, so it compares EQUAL and would ride through as
         'nothing changed'. Both the preview and the execute run under the
         patch here for exactly that reason.
+
+        The gap gates the DISCARD and nothing else (SC-106). A plain recovery
+        touches no file, so unreadable files tell it nothing — and refusing it
+        left a shell whose lock was already proven absent stranded, which
+        inverts what a recovery is for. So this asserts BOTH halves: the
+        discard refuses, and the same broken worktree still frees the shell
+        with every file untouched.
         """
         with patcher or contextlib.nullcontext():
             obj = self.preview(1)
@@ -1221,23 +1229,85 @@ class WorktreeTest(RecoveryCase):
                 status, err = self.post(obj, preserve_worktree=False,
                                         discard_worktree=True,
                                         confirm_shortname="s1")
-                # Fail closed for the WHOLE execute, not just the discard: a
-                # closure the operator decided on unobservable evidence is the
-                # same defect one blast radius smaller. (Fresh idempotency
-                # key — a different body under the old one is a conflict.)
-                plain_status, plain_err = self.call(
+                self.assertEqual(status, 409, err)
+                self.assertEqual(err["error"]["code"],
+                                 "recovery_observation_stale")
+                self.assert_nothing_discarded(wt)   # not even a closure
+                # ...and now the core path, on the same broken worktree.
+                # (Fresh idempotency key — a different body under the old one
+                # is a conflict.)
+                plain_status, plain = self.call(
                     "POST", "/api/interface/shells/1/recovery",
                     (OP, "Idempotency-Key: k-2"),
                     {"observation_id": obj["observation_id"],
                      "mode": "recover"})
-        self.assertEqual(status, 409, err)
-        self.assertEqual(err["error"]["code"], "recovery_observation_stale")
-        self.assertEqual(plain_status, 409, plain_err)
-        self.assertEqual(plain_err["error"]["code"],
-                         "recovery_observation_stale")
-        disc.assert_not_called()   # no reset, no clean
-        term.assert_not_called()   # no signal
-        self.assert_nothing_discarded(wt)
+        self.assertEqual(plain_status, 200, plain)
+        self.assertEqual(plain["availability"], "available")
+        self.assertEqual(plain["worktree"], {"preserved": True})
+        self.assertTrue(plain["closed"]["session"]["session_id"])
+        disc.assert_not_called()   # nothing removed, nothing restored
+        term.assert_not_called()   # a stale lock has no process to signal
+        # the lock is gone AND every file is exactly where it was
+        con = self.db()
+        try:
+            self.assertEqual(con.execute(
+                "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+            ).fetchone()[0], "ended")
+        finally:
+            con.close()
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
+
+    def test_corrupt_git_still_unstrands_an_absence_proved_lock(self):
+        # SC-106, the core objective end to end: a stale durable lock with no
+        # process identity — absence already proven — and a repository that
+        # cannot be read at all. Eight cycles of hardening the OPTIONAL discard
+        # had made worktree evidence a precondition of the closure itself, so
+        # a corrupt `.git` left this shell reported busy forever with no file
+        # operation ever requested. Unstranding is priority one; the files are
+        # protected by not touching them, not by refusing to help.
+        wt = self.make_git_worktree()
+        (Path(wt) / ".git" / "HEAD").write_text("not a ref\n")
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        self.assertEqual(obj["classification"], "stale_durable_lock")
+        self.assertIn("recover", obj["legal_actions"])
+        self.assertIn("indeterminate", obj["evidence"]["git"])
+
+        status, result = self.post(obj)          # the default: preserve
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(result["worktree"], {"preserved": True})
+        self.assertIsNone(result["signaled"])    # nothing to signal
+        # the lock is actually gone — not merely reported closed
+        con = self.db()
+        try:
+            self.assertEqual(con.execute(
+                "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+            ).fetchone()[0], "ended")
+        finally:
+            con.close()
+        # and every file survived, dirty and untracked alike
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assertEqual((Path(wt) / "untracked.txt").read_text(), "new")
+
+    def test_worktree_change_after_preview_does_not_block_plain_recovery(self):
+        # The milder half of the same coupling: the shell keeps writing while
+        # it is stranded, so its worktree moves between preview and execute.
+        # Nothing is being destroyed, so that must not refuse — while the
+        # process/pane and durable evidence still gate every recovery.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        late = Path(wt) / "written_while_stranded.txt"
+        late.write_text("the shell was still writing")
+        (Path(wt) / "tracked.txt").write_text("and editing")
+
+        status, result = self.post(obj)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["availability"], "available")
+        self.assertEqual(late.read_text(), "the shell was still writing")
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "and editing")
 
     def test_non_utf8_path_is_observed_not_degraded(self):
         # A valid non-UTF-8 filename is worktree STATE, not a failure. Reading
@@ -1271,7 +1341,7 @@ class WorktreeTest(RecoveryCase):
                 raise recovery._GitEvidenceUnavailable("git status: exit 128")
             return real(worktree, *args, **kwargs)
 
-        self.assert_gap_refuses(
+        self.assert_gap_refuses_discard_but_frees_the_shell(
             wt, mock.patch.object(recovery, "_git_out", failing))
 
     def test_git_timeout_refuses(self):
@@ -1284,7 +1354,7 @@ class WorktreeTest(RecoveryCase):
                 raise subprocess.TimeoutExpired(cmd, 30)
             return real(cmd, *args, **kwargs)
 
-        self.assert_gap_refuses(
+        self.assert_gap_refuses_discard_but_frees_the_shell(
             wt, mock.patch.object(recovery.subprocess, "run", timing_out))
 
     def test_unreadable_entry_refuses(self):
@@ -1297,7 +1367,7 @@ class WorktreeTest(RecoveryCase):
                 raise PermissionError(13, "permission denied")
             return real(path, *args, **kwargs)
 
-        self.assert_gap_refuses(
+        self.assert_gap_refuses_discard_but_frees_the_shell(
             wt, mock.patch.object(recovery.os, "lstat", denied))
 
     def test_corrupt_repository_refuses(self):
@@ -1307,7 +1377,7 @@ class WorktreeTest(RecoveryCase):
         wt = self.make_git_worktree()
         self.session_with_worktree(wt)
         (Path(wt) / ".git" / "HEAD").write_text("not-a-ref\n")
-        self.assert_gap_refuses(wt)
+        self.assert_gap_refuses_discard_but_frees_the_shell(wt)
 
     def test_unborn_head_is_complete_evidence_not_a_gap(self):
         # A repo with no commits is fully observable — nothing to diff
@@ -1545,7 +1615,7 @@ class WorktreeTest(RecoveryCase):
                 os.chmod(tracked, modes[0])
             return fd
 
-        self.assert_gap_refuses(
+        self.assert_gap_refuses_discard_but_frees_the_shell(
             wt, mock.patch.object(recovery.os, "open", never_settles))
 
     # -- the discard is bounded by the OBSERVATION, not by the tree (SC-100) --

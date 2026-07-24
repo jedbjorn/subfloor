@@ -1122,17 +1122,24 @@ def _volatile_git(git: dict | None) -> dict | None:
 
 
 def _volatile_evidence(evidence: dict) -> dict:
-    """The safety-relevant facts that live OUTSIDE the database: the exact
-    process identity and its liveness, pane/tmux membership, and the working
-    tree a discard would erase. The preview showed these to the operator, so
-    the operator's decision is only valid while they still hold — a changed
-    pid_state, a vanished pane, or a file written after the preview must
-    force a fresh preview, not ride the old one into a signal or a
-    `git clean`."""
+    """The safety-relevant facts that live OUTSIDE the database and govern
+    EVERY recovery: the exact process identity and its liveness, and pane/tmux
+    membership. The preview showed these to the operator, so the decision is
+    only valid while they still hold — a changed pid_state or a vanished pane
+    must force a fresh preview rather than ride the old one into a signal.
+
+    The WORKTREE is deliberately not here (SC-106). It governs the optional
+    discard escalation and nothing else, so it is compared separately, only
+    when a discard was asked for (`_assert_fresh`) and again at the destructive
+    gate (`_assert_worktree_unchanged`). Binding it here instead coupled plain
+    recovery — which touches no file at all — to the readability of a worktree
+    the operator asked us to LEAVE ALONE, and left a shell whose lock was
+    PROVEN absent stranded because a file had moved or `.git` was corrupt.
+    Failing closed is right for destruction; for availability it is the bug.
+    """
     process = evidence.get("process") or {}
     return {"process": {k: process.get(k) for k in _VOLATILE_PROCESS_KEYS},
-            "tmux": evidence.get("tmux"),
-            "git": _volatile_git(evidence.get("git"))}
+            "tmux": evidence.get("tmux")}
 
 
 def _fingerprint(con, shell_id: int, evidence: dict) -> str:
@@ -1223,37 +1230,66 @@ def _load_observation(con, shell_id: int, observation_id: str):
 
 
 def _assert_no_gap(observation_id: str, evidence: dict, when: str) -> None:
-    """Fail closed on incomplete evidence. A gap is deterministic — the same
-    unreadable path or undecodable git output yields the same absent facts at
-    preview and at execute — so it would fingerprint EQUAL and ride through as
-    "nothing changed" while the work behind it was rewritten (SC-087). Absence
-    of evidence is never evidence of safety."""
+    """Fail closed on incomplete worktree evidence — for a DISCARD only.
+
+    A gap is deterministic — the same unreadable path or undecodable git output
+    yields the same absent facts at preview and at execute — so it would
+    compare EQUAL and ride through as "nothing changed" while the work behind
+    it was rewritten (SC-087). Absence of evidence is never evidence of safety
+    when something is about to be destroyed.
+
+    It is not evidence of danger either. Callers must not reach here for a
+    plain recovery: that touches no file, so an unreadable worktree tells it
+    nothing, and refusing on one strands a shell whose lock is proven absent
+    (SC-106).
+    """
     reason = (evidence.get("git") or {}).get("indeterminate")
     if not reason:
         return
     raise RecoveryError(
         409, "recovery_observation_stale",
         f"the worktree could not be observed completely at {when} ({reason}) "
-        "— recovery refused before any signal, closure or file removal; "
-        "repair the repository and preview again",
+        "— the DISCARD is refused before any signal, closure or file removal. "
+        "Recover without discard_worktree to free the shell and leave every "
+        "file untouched, or repair the repository and preview again",
         {"observation_id": observation_id, "detail": reason})
 
 
 def _assert_fresh(con, shell_id: int, observation_id: str, stored: dict,
-                  fingerprint: str, default_worktree: str | None) -> None:
-    """Re-gather the whole evidence picture (a pure read) and refuse unless it
-    still matches the preview. Nothing has been signalled, closed or removed
-    when this runs — it is the last precondition, deliberately placed after
-    every other one so the check-then-act gap is as small as the sequence can
-    make it (SC-091)."""
+                  fingerprint: str, default_worktree: str | None, *,
+                  discard: bool) -> None:
+    """Re-gather the evidence (a pure read) and refuse unless what this
+    recovery actually depends on still matches the preview. Nothing has been
+    signalled, closed or removed when this runs — it is the last precondition,
+    deliberately placed after every other one so the check-then-act gap is as
+    small as the sequence can make it (SC-091).
+
+    Two tiers, and keeping them apart is the point (SC-106). The durable rows
+    and the process/pane identity gate EVERY recovery: they are what a signal
+    and a closure act on. The WORKTREE gates only the discard — it is the one
+    thing a discard destroys and the one thing a plain recovery never touches.
+    Checking it for both meant a corrupt `.git` or a moved file refused to free
+    a shell whose lock was already proven absent, which is the opposite of what
+    a recovery is for.
+    """
     fresh_evidence = gather(con, shell_id, default_worktree)
-    _assert_no_gap(observation_id, fresh_evidence, "now")
     if fingerprint != _fingerprint(con, shell_id, fresh_evidence):
         raise RecoveryError(
             409, "recovery_observation_stale",
-            "the shell's state changed since the preview — its durable rows, "
-            "process/pane identity or worktree contents no longer match what "
-            "the preview showed; preview again",
+            "the shell's state changed since the preview — its durable rows or "
+            "its process/pane identity no longer match what the preview "
+            "showed; preview again",
+            {"observation_id": observation_id})
+    if not discard:
+        return
+    _assert_no_gap(observation_id, fresh_evidence, "now")
+    if _volatile_git(fresh_evidence.get("git")) \
+            != _volatile_git(stored.get("git")):
+        raise RecoveryError(
+            409, "recovery_observation_stale",
+            "the worktree changed since the preview — the discard is refused "
+            "before any signal, closure or file removal; preview again to see "
+            "the new state and confirm the discard against it",
             {"observation_id": observation_id})
 
 
@@ -1442,10 +1478,14 @@ def execute(con, shell_id: int, body: dict,
     classification, legal_actions, evidence, fingerprint = _load_observation(
         con, shell_id, observation_id)
     # The stored half of the fail-closed check needs no live read, so it runs
-    # first: an observation that could not be gathered WHOLE is unusable no
-    # matter what the live gates below would say, and the operator needs that
-    # reason, not whichever live git call the same broken repo trips next.
-    _assert_no_gap(observation_id, evidence, "the preview")
+    # first: an observation whose WORKTREE could not be gathered whole cannot
+    # authorise a discard no matter what the live gates below would say, and
+    # the operator needs that reason rather than whichever live git call the
+    # same broken repo trips next. Only for a discard, though — a recovery that
+    # touches no file has no business asking whether the files were readable
+    # (SC-106).
+    if discard:
+        _assert_no_gap(observation_id, evidence, "the preview")
 
     if mode == "recover" and "recover" not in legal_actions:
         raise RecoveryError(
@@ -1499,7 +1539,7 @@ def execute(con, shell_id: int, body: dict,
     # preconditions ran was deleted by the clean (SC-091). A refusal from here
     # performs NO signal, NO closure, NO reset and NO clean.
     _assert_fresh(con, shell_id, observation_id, evidence, fingerprint,
-                  default_worktree)
+                  default_worktree, discard=discard)
 
     # -- signal (exact process-group, re-verified at signal time) ----------
     proc = evidence["process"]
