@@ -502,6 +502,46 @@ def _entry_identity(worktree: str, rel: str, index: dict[str, str]) -> str:
             + index.get(rel, _INDEX_ABSENT))
 
 
+def _enumerate(worktree: str, head: bool) -> tuple[set, set, set]:
+    """`(tracked, untracked_files, untracked_dirs)` — the entries a discard
+    would have to undo, as of now.
+
+    Factored out because this predicate is applied TWICE to the same worktree
+    and the two uses must never drift: once to build the plan (what the
+    operator is shown, and what bounds the destruction), and once after the
+    discard to decide whether it actually worked. "Undone" is then defined as
+    "this same enumeration no longer names it" — the contract itself, not a
+    proxy standing in for it (SC-129).
+    """
+    def paths(*args) -> list[str]:
+        # -z: paths verbatim, no C-quoting to unescape.
+        return [p for p in _git_out(worktree, *args, timeout=30).split("\0")
+                if p]
+
+    listed = set(paths("ls-files", "-o", "--exclude-standard", "-z"))
+    untracked_dirs = {p for p in
+                      paths("ls-files", "-o", "--directory",
+                            "--exclude-standard", "-z") if p.endswith("/")}
+    # A trailing slash in the FILE listing is a nested repository — git names
+    # it once and never descends. It is a directory: unlinking it would fail
+    # the whole discard, and `clean -fd` leaves it alone too.
+    untracked_dirs |= {p for p in listed if p.endswith("/")}
+    untracked_files = {p for p in listed if not p.endswith("/")}
+    if not head:
+        return set(paths("ls-files", "-z")), untracked_files, untracked_dirs
+    # BOTH diffs, because neither alone is the set. `diff HEAD` compares HEAD
+    # to the WORKING TREE, so a path staged and then deleted (`AD`) reads as
+    # no change — absent in HEAD, absent on disk — while the index still holds
+    # its blob. It was therefore in no delete set and no preview, survived the
+    # discard, and `discarded=true` was returned over staged work still
+    # sitting in the index. `reset --hard`, the operation this replaces, threw
+    # that entry away; found by asking the SC-129 question of the enumeration
+    # itself rather than of the check that reads it.
+    tracked = set(paths("diff", "HEAD", "--name-only", "-z"))
+    tracked |= set(paths("diff", "--cached", "HEAD", "--name-only", "-z"))
+    return tracked, untracked_files, untracked_dirs
+
+
 def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     """WHAT a discard would destroy, named entry by entry: the exact SET of
     worktree entries, each entry's identity, and the digest over the whole
@@ -534,8 +574,10 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     - untracked DIRECTORIES in their own right (`--directory`, trailing `/`),
       empty ones included: `clean -fd` removes a directory that a file listing
       never names;
-    - born HEAD -> every path differing from HEAD (`diff HEAD`): staged,
-      unstaged and deletions, one row each;
+    - born HEAD -> every path differing from HEAD in the working tree OR in
+      the index (`diff HEAD` and `diff --cached HEAD`): staged, unstaged and
+      deletions, one row each. Both, because a path staged and then deleted
+      differs from HEAD only in the index — see `_enumerate`;
     - unborn HEAD -> every INDEX entry (`ls-files`). Nothing has been
       committed, so a discard drops the whole index and the files with it —
       and `ls-files -o` cannot see a staged path, which left staged work
@@ -544,43 +586,27 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     Ignored files stay out: `clean -fd` without -x does not touch them, so
     they are not state the confirmation is about.
     """
-    def paths(*args) -> list[str]:
-        # -z: paths verbatim, no C-quoting to unescape.
-        return [p for p in _git_out(worktree, *args, timeout=30).split("\0")
-                if p]
-
-    listed = set(paths("ls-files", "-o", "--exclude-standard", "-z"))
-    untracked_dirs = {p for p in
-                      paths("ls-files", "-o", "--directory",
-                            "--exclude-standard", "-z") if p.endswith("/")}
-    # A trailing slash in the FILE listing is a nested repository — git names
-    # it once and never descends. It is a directory: unlinking it would fail
-    # the whole discard, and `clean -fd` leaves it alone too.
-    untracked_dirs |= {p for p in listed if p.endswith("/")}
-    untracked_files = {p for p in listed if not p.endswith("/")}
-    tracked = set(paths("diff", "HEAD", "--name-only", "-z")) if head \
-        else set(paths("ls-files", "-z"))
+    tracked, untracked_files, untracked_dirs = _enumerate(worktree, head)
     index = _index_identities(worktree)
 
     h = hashlib.sha256()
     for line in sorted(porcelain):
         h.update(line.encode("utf-8", "surrogateescape") + b"\n")
-    identities, index_of, fs_of = {}, {}, {}
+    identities, index_of = {}, {}
     for rel in sorted(tracked | untracked_files | untracked_dirs):
         index_of[rel] = index.get(rel, _INDEX_ABSENT)
-        fs_of[rel] = _path_identity(os.path.join(worktree, rel))
-        identities[rel] = fs_of[rel] + "\0" + index_of[rel]
+        identities[rel] = (_path_identity(os.path.join(worktree, rel)) + "\0"
+                           + index_of[rel])
         h.update(rel.encode("utf-8", "surrogateescape") + b"\0"
                  + identities[rel].encode() + b"\0")
-    # The two halves are kept separately as well as composed, because the
-    # discard has to re-verify each one ALONE at a point where the other has
-    # legitimately moved: the index just before the destructive call, when the
-    # removal may already have unlinked the file (SC-124), and the filesystem
-    # just after it, when the restore has already rewritten the index (SC-127).
+    # The INDEX half is kept separately as well as composed, because the
+    # discard has to re-verify it ALONE at a point where the filesystem half
+    # has legitimately moved: immediately before the destructive call, when the
+    # removal may already have unlinked the file (SC-124).
     return {"head": head, "tracked": sorted(tracked),
             "untracked_files": sorted(untracked_files),
             "untracked_dirs": sorted(untracked_dirs),
-            "identities": identities, "index": index_of, "fs": fs_of,
+            "identities": identities, "index": index_of,
             "digest": h.hexdigest()}
 
 
@@ -787,46 +813,57 @@ def _unrestored(worktree: str, plan: dict, restored: list[str]) -> list[str]:
     """Of the entries the restore reported success for, the ones it did NOT
     actually undo. Never raises.
 
-    An exit code is not an outcome. `git restore` can exit 0 having silently
-    skipped a path: with a SYMLINK standing in for one of its parent
-    directories it refuses to write through the link, updates the index, and
-    leaves the working file exactly as it was (SC-127, reproduced). The safety
-    property holds — nothing outside the worktree is touched, which is what
-    SC-105 asked for — and that is precisely what hid this: the result claimed
-    `discarded=true` over a dirty file still sitting there. Decision #45 ranks
-    that misreporting with destruction, so the outcome is VERIFIED.
+    An exit code is not an outcome. `git restore` can exit 0 without having
+    put the entry where it promised, and the result then claims `discarded`
+    over work still sitting on disk — misreporting, which decision #45 ranks
+    with destruction. So the outcome is VERIFIED rather than inferred.
 
-    What makes the check exact: every enumerated tracked entry differs from
-    HEAD by construction, and a restore that ran makes it equal HEAD — a
-    different entity, and in any case a rewritten one, so its identity cannot
-    still be the one the operator was shown. An entry whose filesystem
-    identity is byte-identical to the consented one was therefore not touched.
-    The INDEX cannot answer this: the skipped restore updated it (reproduced),
-    so the index reads discarded while the work is still on disk.
+    Verified against the CONTRACT, and that distinction is the whole of
+    SC-129. The first version of this check asked whether the entry had
+    changed from the identity the operator consented to — a PROXY: the
+    contract implies it, so the right answer satisfies it, but so does a
+    restore that writes some THIRD state, which is neither the old content nor
+    HEAD. It passed and the discard was reported complete. (Same shape as
+    F7's SC-121 one unit over: asserting a floor the correct implementation
+    also clears.)
+
+    The contract is "this entry is no longer one a discard would have to
+    undo", so that is what is asked — by re-running the enumeration that
+    DEFINED the set (`_enumerate`) and requiring the entry to be absent from
+    it. Nothing is restated in a second form that could drift: a third state
+    still differs from HEAD and is named; a staged-new path whose file
+    survived its de-staging is named as untracked; an entry the restore left
+    alone is named exactly as it was at plan time.
+
+    That enumeration reads the worktree half of a flagged entry THROUGH the
+    index — `git diff` trusts skip-worktree and assume-unchanged and will not
+    look at the file — so an entry still carrying a durable bit here cannot be
+    verified by it and is reported kept. Reachable enumerated entries do not
+    hit this: a bit only exists on an index entry, and an index entry the plan
+    holds differs from HEAD, so the restore rewrites it and drops the bit with
+    it (reproduced). An entry whose bit survived is one where something other
+    than that happened, which is not a state to report success from.
 
     Unreadable now -> unverifiable, and an unverifiable outcome is never
     reported as a success.
 
-    On an unborn HEAD there is nothing to restore TO — the removal loop
-    already unlinked these files and `git rm --cached` drops the entry — so
-    what is checked there is that the index no longer holds it.
+    On an unborn HEAD the same enumeration is the same contract: the entry
+    must be gone from the index (`ls-files`) and gone from disk, where it
+    would otherwise reappear in the untracked listing.
     """
-    if not plan["head"]:
-        try:
-            index = _index_identities(worktree)
-        except _GitEvidenceUnavailable:
-            return sorted(restored)
-        return sorted(rel for rel in restored if rel in index)
-    stale = []
-    for rel in restored:
-        try:
-            now = _path_identity(os.path.join(worktree, rel))
-        except _GitEvidenceUnavailable:
-            stale.append(rel)
-        else:
-            if now == plan["fs"][rel]:
-                stale.append(rel)
-    return sorted(stale)
+    if not restored:
+        return []
+    try:
+        tracked, untracked_files, untracked_dirs = _enumerate(worktree,
+                                                              plan["head"])
+        index = _index_identities(worktree)
+    except _GitEvidenceUnavailable:
+        return sorted(restored)
+    still = tracked | untracked_files | untracked_dirs
+    return sorted(
+        rel for rel in restored
+        if rel in still
+        or _index_flags(index.get(rel, _INDEX_ABSENT)) != "--")
 
 
 _INDEX_FLAG_OPTS = {"S": "--skip-worktree", "A": "--assume-unchanged"}
@@ -873,6 +910,15 @@ def _restore_index_flags(worktree: str, plan: dict,
         return sorted(want)
     return sorted(rel for rel, flags in want.items()
                   if _index_flags(after.get(rel, _INDEX_ABSENT)) != flags)
+
+
+def _discard_result(worktree: str) -> dict:
+    """The shape EVERY discard outcome is reported in, whether the sequence
+    ran to the end, stopped at a named step, or never started because the gate
+    ahead of it broke. One builder so those cannot drift into three answers to
+    the same question."""
+    return {"worktree": worktree, "discarded": False, "completed": [],
+            "failed": None, "kept": [], "kept_count": 0, "flags_lost": []}
 
 
 def _discard_worktree_files(worktree: str, plan: dict) -> dict:
@@ -927,9 +973,7 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
     part-filled result rather than raising, and an unexpected failure is NAMED
     in `failed` rather than swallowed.
     """
-    result: dict = {"worktree": worktree, "discarded": False,
-                    "completed": [], "failed": None,
-                    "kept": [], "kept_count": 0, "flags_lost": []}
+    result = _discard_result(worktree)
     try:
         _discard_steps(worktree, plan, result)
     except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
@@ -1101,12 +1145,17 @@ def _discard_steps(worktree: str, plan: dict, result: dict) -> None:
                 "error": out.stderr.decode("utf-8", "replace").strip()[-200:]}
             return
     result["completed"].append("restore")
-    # The restore's exit code says it ran, not that it worked (SC-127). Verify
-    # each entry actually moved before any of it is reported as discarded.
+    # The restore's exit code says it ran, not that it worked (SC-127), and
+    # "it moved" is not the promise either (SC-129). Verify each entry against
+    # the contract before any of it is reported as discarded.
     skipped = _unrestored(worktree, plan, restore)
     for rel in skipped:
         keep(rel)
-    restore = [rel for rel in restore if rel not in set(skipped)]
+    # Every entry the restore RAN OVER gets its bits put back, including the
+    # ones just reported kept: the command clears them whether or not it went
+    # on to do what it promised, and an entry reported as spared whose durable
+    # bit was silently dropped is spared in name only (SC-125's rule, applied
+    # to the set the command touched rather than the set it satisfied).
     result["flags_lost"] = _restore_index_flags(worktree, plan, restore)
     # A surviving DIRECTORY does not make the discard incomplete. It stands
     # because it holds something outside the delete set — an ignored file, a
@@ -1751,6 +1800,61 @@ def _close_durable_state(con, shell_id: int, evidence: dict,
     return changed
 
 
+def _abandon_runtime(abandon, evidence: dict) -> dict | None:
+    """Drop the live runtime generation now that the durable state is closed.
+    `None` when there was nothing to abandon.
+
+    Best-effort by design — the closure is already committed and a runtime
+    that will not let go is not something to fail a recovery over — but
+    REPORTED, which it was not. A swallowed failure here is post-commit
+    misreporting in the one shape that never produces a 500: the response says
+    the shell is available while a generation may still be attached to it, and
+    the operator has nothing to act on. Same rule as everywhere else in this
+    unit — handle it where something can be done about it, and name it either
+    way (SC-128).
+    """
+    if abandon is None or not evidence["live_session"] \
+            or not evidence["session"]:
+        return None
+    try:
+        abandon(evidence["session"]["session_id"])
+    except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
+        return {"abandoned": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return {"abandoned": True}
+
+
+def _discard_after_closure(observation_id: str, evidence: dict, worktree: str,
+                           signal_result) -> dict:
+    """The late gate AND the discard, under one result-producing boundary.
+
+    `_discard_worktree_files` promises never to raise (SC-126), and that
+    promise was read as covering the post-commit path. It covered the sequence
+    inside it: `_assert_worktree_unchanged` runs after the same durable commit,
+    can throw for reasons that are not its refusal — an unreadable worktree,
+    a git that will not spawn — and threw straight past the structure into a
+    500 with the session already ended (SC-128).
+
+    So the boundary belongs at the seam between "the durable state is closed"
+    and "the files are dealt with", not around one of the two helpers on the
+    far side of it. The gate's own `RecoveryError` still leaves: it is the
+    honest refusal, and states both the closure it performed and that nothing
+    was discarded. Anything else becomes a discard result naming the step that
+    broke, which at this point is all the operator can act on.
+    """
+    try:
+        plan = _assert_worktree_unchanged(observation_id, evidence, worktree,
+                                          signal_result)
+    except RecoveryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — post-commit: report, never raise
+        result = _discard_result(worktree)
+        result["failed"] = {"step": "worktree_gate",
+                            "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        return result
+    return _discard_worktree_files(worktree, plan)
+
+
 def execute(con, shell_id: int, body: dict,
             default_worktree: str | None,
             grace_s: float = GRACEFUL_TERMINATE_S,
@@ -1879,27 +1983,31 @@ def execute(con, shell_id: int, body: dict,
     except Exception:
         con.rollback()
         raise
-    if abandon is not None and evidence["live_session"] and evidence["session"]:
-        try:
-            abandon(evidence["session"]["session_id"])
-        except Exception:  # noqa: BLE001, S110 — runtime cleanup is
-            pass         # best-effort; durable state is already closed
-
-    discarded = None
+    # -- past the point of no return: NOTHING below may become a 500 --------
+    # The durable state is committed and cannot be unwound, and for a discard
+    # the operator's files are about to be — or by now already have been —
+    # touched. An exception escaping from here reaches the route as an opaque
+    # internal error whose body says which of those happened: nothing. That is
+    # the worst report there is, and decision #45 ranks it with the
+    # destruction itself. SC-126 gave that guarantee to the discard sequence;
+    # SC-128 was the identical defect one call EARLIER, in the late gate,
+    # which sat outside the structure built for it. So the boundary is drawn
+    # around the whole tail rather than around another helper: the response is
+    # assembled HERE, out of values already in hand, and every step after it
+    # only fills one of its fields in. Three things can still go wrong past
+    # this line and each returns rather than raises — the runtime abandon, the
+    # late gate, and the discard — the single exception being the gate's own
+    # refusal, which is not opaque: it names the closure it performed and that
+    # nothing was discarded.
+    result = {"shell_id": shell_id, "shortname": shortname,
+              "classification": classification, "mode": mode,
+              "signaled": signal_result,
+              "closed": changed,
+              "worktree": {"preserved": True},
+              "unread_messages": evidence["unread_messages"],
+              "availability": "available"}
+    changed["runtime"] = _abandon_runtime(abandon, evidence)
     if discard:
-        assert worktree is not None  # proven by the discard gate above
-        # Re-read the worktree immediately before the delete: the shell may
-        # have written during its own SIGTERM shutdown, after the fence above
-        # passed. The gate hands back the enumerated set that read confirmed,
-        # and the discard is bounded by it — see both docstrings.
-        plan = _assert_worktree_unchanged(observation_id, evidence, worktree,
-                                          signal_result)
-        discarded = _discard_worktree_files(worktree, plan)
-
-    return {"shell_id": shell_id, "shortname": shortname,
-            "classification": classification, "mode": mode,
-            "signaled": signal_result,
-            "closed": changed,
-            "worktree": discarded or {"preserved": True},
-            "unread_messages": evidence["unread_messages"],
-            "availability": "available"}
+        result["worktree"] = _discard_after_closure(
+            observation_id, evidence, worktree, signal_result)
+    return result

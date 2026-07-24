@@ -631,6 +631,40 @@ class ExecuteTest(RecoveryCase):
             (sid,)).fetchone()[0], "ended")
         con.close()
         self.assertIn(sid, self.runtime.abandoned)
+        self.assertEqual(result["closed"]["runtime"], {"abandoned": True})
+
+    def test_runtime_abandon_failure_is_reported_not_swallowed(self):
+        # The post-commit path that never reaches a 500, and was silent
+        # instead. Dropping the runtime generation is best-effort by design —
+        # the durable closure is already committed and a runtime that will not
+        # let go is not something to fail a recovery over — but the response
+        # said only that the shell was available, while a generation may still
+        # be attached to it. Handled where something can be done about it, and
+        # named either way (SC-128).
+        proc, ticks = self.child()
+        self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
+
+        async def refusing(session_id):
+            raise RuntimeError("the runtime will not let go")
+
+        with mock.patch.object(recovery, "_pane_present", return_value=True):
+            obj = self.preview(1)
+            with mock.patch.object(self.runtime, "abandon", refusing):
+                status, result = self.call(
+                    "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
+                    {"observation_id": obj["observation_id"], "mode": "force",
+                     "confirm_force": True})
+        self.assertEqual(status, 200, result)
+        self.assertFalse(result["closed"]["runtime"]["abandoned"])
+        self.assertIn("RuntimeError", result["closed"]["runtime"]["error"])
+        # ...and the closure it could not unwind is still reported as done
+        self.assertEqual(result["availability"], "available")
+        proc.wait(timeout=5)
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
 
     def test_orphan_recover_signals_then_closes(self):
         proc, ticks = self.child()
@@ -2666,6 +2700,215 @@ class WorktreeTest(RecoveryCase):
         self.assertFalse(result["worktree"]["discarded"])
         self.assertEqual(result["worktree"]["completed"], ["remove"])
         self.assertEqual(result["worktree"]["failed"]["step"], "restore")
+
+    # -- the outcome is checked against the CONTRACT, not a proxy (SC-129) --
+    # "Verified undone" was verified by asking whether the entry still held
+    # the identity the operator was shown. The contract implies that, so the
+    # right answer satisfies it — and so does a restore that writes some THIRD
+    # state, which is neither the consented content nor HEAD. The check now
+    # re-runs the enumeration that DEFINED the delete set and requires the
+    # entry to be absent from it, which is the contract itself.
+
+    def third_state_restore(self, wt: str, rel: str, text: str, *,
+                            stage: bool = False):
+        """A `git restore` replaced by one that exits 0 having put `rel` in a
+        state that is neither what the operator consented to discarding nor
+        HEAD. `stage=True` also does the INDEX half for real, so only the
+        worktree half is wrong."""
+        real_run = subprocess.run
+
+        def stub(args, **kw):
+            if "restore" not in args:
+                return real_run(args, **kw)
+            if stage:
+                real_run(["git", "-C", wt, "restore", "--source=HEAD",
+                          "--staged", "--", rel], capture_output=True,
+                         check=True)
+            (Path(wt) / rel).write_text(text)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+        return stub
+
+    def test_restore_that_writes_a_third_state_is_not_claimed_discarded(self):
+        # SC-129 itself. The entry changed, so the old check passed it and the
+        # discard was reported complete over content that was never committed
+        # and never consented to — the operator is told their work is gone AND
+        # that the tree is at HEAD, and neither is true.
+        wt = self.make_git_worktree()
+        plan = self.plan(wt)
+        with mock.patch.object(
+                recovery.subprocess, "run",
+                self.third_state_restore(wt, "tracked.txt", "NEITHER")):
+            result = recovery._discard_worktree_files(wt, plan)
+        # the proxy is SATISFIED — not the consented state, and it moved...
+        self.assertNotIn((Path(wt) / "tracked.txt").read_text(),
+                         ("dirty", "v1"))
+        # ...and the contract is not: the entry still differs from HEAD.
+        self.assertIn("tracked.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+        self.assertIsNone(result["failed"])
+
+    def test_destaged_file_left_in_the_worktree_is_not_claimed_discarded(self):
+        # The same hole one entity over. A staged-NEW path is undone by
+        # leaving the index AND the worktree; drop the index entry, rewrite
+        # the file and the proxy sees a changed entry and reports it
+        # discarded, while the file sits there as untracked work. The
+        # enumeration names it exactly as it would have at plan time.
+        wt = self.make_git_worktree()
+        (Path(wt) / "added.txt").write_text("new")
+        self.git_run(wt, "add", "--", "added.txt")
+        plan = self.plan(wt)
+        real_run = subprocess.run
+
+        def destage_only(args, **kw):
+            if "restore" not in args:
+                return real_run(args, **kw)
+            real_run(["git", "-C", wt, "rm", "--cached", "--quiet", "--",
+                      "added.txt"], capture_output=True, check=True)
+            (Path(wt) / "added.txt").write_text("NEITHER")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with mock.patch.object(recovery.subprocess, "run", destage_only):
+            result = recovery._discard_worktree_files(wt, plan)
+        self.assertEqual((Path(wt) / "added.txt").read_text(), "NEITHER")
+        self.assertIn("added.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+
+    def test_staged_then_deleted_path_is_enumerated_and_discarded(self):
+        # The same question asked of the ENUMERATION rather than of the check
+        # that reads it. `git add` then `rm` leaves a blob in the index and
+        # nothing on disk, so `git diff HEAD` — HEAD against the WORKING TREE
+        # — sees no change at all: the entry was in no preview and no delete
+        # set, survived the discard, and `discarded=true` was returned over
+        # staged work the operator believed they had thrown away. `reset
+        # --hard`, the operation this replaces, destroyed it.
+        wt = self.make_git_worktree()
+        (Path(wt) / "added.txt").write_text("staged then deleted")
+        self.git_run(wt, "add", "--", "added.txt")
+        (Path(wt) / "added.txt").unlink()
+        self.assertIn("AD added.txt", self.porcelain(wt))
+        self.assertEqual(self.git_run(wt, "diff", "HEAD", "--name-only",
+                                      "--", "added.txt"), "",
+                         "the worktree diff names it — this case no longer "
+                         "isolates the index-only difference")
+        plan = self.plan(wt)
+        self.assertIn("added.txt", plan["tracked"])
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertTrue(result["discarded"], result)
+        self.assertEqual(result["kept"], [])
+        self.assertEqual(self.git_run(wt, "ls-files", "--", "added.txt"), "")
+
+    def test_unborn_entry_left_on_disk_is_not_claimed_discarded(self):
+        # On an unborn HEAD "undone" means gone from the index AND gone from
+        # disk, and only the first half was checked — `git rm --cached`
+        # succeeds either way, so a file the removal loop failed to unlink was
+        # reported discarded while standing there as untracked work. One
+        # enumeration answers both halves.
+        wt = Path(self.tmp.name) / "unborn-third-state"
+        wt.mkdir()
+        self.git_run(str(wt), "init", "-q", "-b", "feat/x", ".")
+        (wt / "staged.txt").write_text("staged")
+        self.git_run(str(wt), "add", "--", "staged.txt")
+        plan = self.plan(str(wt))
+        self.assertIn("staged.txt", plan["tracked"])
+
+        def unlink_nothing(_name, **_kw):
+            return None
+
+        with mock.patch.object(recovery.os, "unlink", unlink_nothing):
+            result = recovery._discard_worktree_files(str(wt), plan)
+        self.assertEqual(self.git_run(str(wt), "ls-files"), "")  # index: gone
+        self.assertTrue((wt / "staged.txt").exists())            # disk: not
+        self.assertIn("staged.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+
+    def test_entry_still_flagged_after_the_restore_is_not_verified(self):
+        # The enumeration reads a flagged entry's worktree half THROUGH the
+        # index — `git diff` trusts skip-worktree and will not look at the
+        # file — so an entry still carrying the bit here cannot be verified by
+        # it. Forced: the index half is done for real (so the entry no longer
+        # differs from HEAD there) while the worktree is left in a third state
+        # and the bit left standing, which is the one shape the enumeration
+        # cannot see.
+        wt = self.make_git_worktree()
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.git_run(wt, "update-index", "--skip-worktree", "--",
+                     "tracked.txt")
+        plan = self.plan(wt)
+        with mock.patch.object(
+                recovery.subprocess, "run",
+                self.third_state_restore(wt, "tracked.txt", "NEITHER",
+                                         stage=True)):
+            result = recovery._discard_worktree_files(wt, plan)
+        # the premise, reproduced rather than argued: git reports nothing.
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "S")
+        self.assertEqual(self.git_run(wt, "diff", "HEAD", "--name-only"), "")
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "NEITHER")
+        self.assertIn("tracked.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+
+    def test_kept_entry_keeps_the_durable_flags_the_restore_cleared(self):
+        # `restore --staged` clears the bits whether or not it goes on to do
+        # what it promised, and they were only put back for the entries that
+        # verified. An entry reported as SPARED whose durable bit was silently
+        # dropped is spared in name only — the flags follow the set the
+        # command ran over, not the set it satisfied.
+        wt = self.make_git_worktree()
+        self.stage_only(wt, "tracked.txt", "staged-only")
+        self.git_run(wt, "update-index", "--skip-worktree", "--",
+                     "tracked.txt")
+        plan = self.plan(wt)
+        real_run = subprocess.run
+
+        def restore_then_redirty(args, **kw):
+            out = real_run(args, **kw)
+            if "restore" in args:
+                (Path(wt) / "tracked.txt").write_text("NEITHER")
+            return out
+
+        with mock.patch.object(recovery.subprocess, "run",
+                               restore_then_redirty):
+            result = recovery._discard_worktree_files(wt, plan)
+        self.assertIn("tracked.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+        self.assertEqual(result["flags_lost"], [])
+        self.assertEqual(self.index_tag(wt, "tracked.txt"), "S")
+
+    # -- NOTHING after the durable commit may surface as a 500 (SC-128) -----
+
+    def test_late_gate_failure_after_the_commit_reports_a_partial_discard(
+            self):
+        # SC-128. The guarantee was built INSIDE the discard sequence, and the
+        # late gate runs after the same commit and outside it: anything it
+        # threw that was not its own refusal reached the operator as an opaque
+        # internal error, with the session already ended and nothing said
+        # about their files. Caught twice now by the path just outside the
+        # structure, so the boundary is at the seam — everything past the
+        # commit returns a result naming what happened.
+        wt = self.make_git_worktree()
+        self.session_with_worktree(wt)
+        obj = self.preview(1)
+        with mock.patch.object(recovery, "_assert_worktree_unchanged",
+                               side_effect=RuntimeError("gate boom")):
+            status, result = self.post(obj, preserve_worktree=False,
+                                       discard_worktree=True,
+                                       confirm_shortname="s1")
+        self.assertEqual(status, 200, result)
+        self.assertFalse(result["worktree"]["discarded"])
+        self.assertEqual(result["worktree"]["completed"], [])
+        self.assertEqual(result["worktree"]["failed"]["step"],
+                         "worktree_gate")
+        self.assertIn("RuntimeError", result["worktree"]["failed"]["error"])
+        # ...and every other claim in that response is true: the gate ran
+        # before anything destructive, so the files are untouched, and the
+        # closure it could not unwind is still reported as done.
+        self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
+        self.assertTrue((Path(wt) / "untracked.txt").exists())
+        self.assertEqual(result["availability"], "available")
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE shell_id=1"
+        ).fetchone()[0], "ended")
+        con.close()
 
 
 # ------------------------------------------------------------------ CLI parity
