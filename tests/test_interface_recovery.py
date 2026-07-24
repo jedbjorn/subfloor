@@ -2081,6 +2081,10 @@ class WorktreeTest(RecoveryCase):
         self.git_run(wt, "config", "submodule.recurse", "true")
         # work committed INSIDE the submodule — the host's gitlink now differs
         inner = str(Path(wt) / "sm")
+        # its own repo, so its own identity: a clone inherits neither the
+        # host worktree's config nor a global one CI does not have.
+        self.git_run(inner, "config", "user.email", "t@t")
+        self.git_run(inner, "config", "user.name", "t")
         (Path(inner) / "local.txt").write_text("work only the submodule holds")
         self.git_run(inner, "add", "-A")
         self.git_run(inner, "commit", "-qm", "inner work")
