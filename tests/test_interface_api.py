@@ -818,6 +818,83 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertIn("ticket", body)
 
+    def test_browser_composer_is_server_projected_and_writer_scoped(self):
+        sid = self.occupy()
+        status, _, detail = self.call(
+            "GET", f"/api/interface/sessions/{sid}", (OP,))
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(detail["browser_composer"], "clean")
+        self.assertIn("send_input", detail["legal_actions"])
+
+        dirty = {
+            "session_id": sid, "client_id": "web-1", "state": "dirty",
+        }
+        status, _, body = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-no-writer"), dirty)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "not_the_writer")
+
+        status, _, lease = self.acquire_lease(sid)
+        self.assertEqual(status, 201, lease)
+        status, _, body = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-dirty"), dirty)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {
+            "session_id": sid, "browser_composer": "dirty",
+        })
+        # Exact retry replays without changing the state.
+        retry_status, _, retry = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-dirty"), dirty)
+        self.assertEqual((retry_status, retry), (status, body))
+
+        status, _, rejected = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-wrong-writer"),
+            {"session_id": sid, "client_id": "web-2", "state": "clean"})
+        self.assertEqual(status, 409, rejected)
+        self.assertEqual(rejected["error"]["code"], "not_the_writer")
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            state = con.execute(
+                "SELECT browser_composer FROM interface_input_state "
+                "WHERE session_id=?", (sid,)).fetchone()[0]
+        self.assertEqual(state, "dirty",
+                         "a non-writer must not clear the wake gate")
+
+        status, _, body = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-clean"),
+            {"session_id": sid, "client_id": "web-1", "state": "clean"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["browser_composer"], "clean")
+        status, _, released = self.call(
+            "DELETE", f"/api/interface/writer-leases/{lease['lease_id']}",
+            (OP, "Idempotency-Key: draft-release"),
+            {"lease_token": lease["lease_token"]})
+        self.assertEqual(status, 204, released)
+        # A retry is identified before mutable writer state is revalidated:
+        # replay the original response, but never reapply the old dirty state.
+        status, _, replay_after_release = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-dirty"), dirty)
+        self.assertEqual((status, replay_after_release), (200, {
+            "session_id": sid, "browser_composer": "dirty",
+        }))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            state = con.execute(
+                "SELECT browser_composer FROM interface_input_state "
+                "WHERE session_id=?", (sid,)).fetchone()[0]
+        self.assertEqual(state, "clean",
+                         "an idempotent replay must not reapply stale state")
+        status, _, invalid = self.call(
+            "POST", "/api/interface/browser-composer",
+            (OP, "Idempotency-Key: draft-invalid"),
+            {"session_id": sid, "client_id": "web-1", "state": "unknown"})
+        self.assertEqual(status, 422, invalid)
+        self.assertEqual(invalid["error"]["code"], "validation")
+
     def test_extra_segment_writer_release_does_not_revoke_lease(self):
         sid = self.occupy()
         status, _, lease = self.acquire_lease(sid)

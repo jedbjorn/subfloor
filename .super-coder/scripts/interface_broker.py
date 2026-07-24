@@ -304,6 +304,44 @@ def certify_clean(con, session_id: int, client_id: str, client_seq: int) -> None
                     "certified_at": _now(con)})
 
 
+def set_browser_composer(con, session_id: int, client_id: str,
+                         state: str) -> None:
+    """Set the current writer's metadata-only browser draft state.
+
+    Browser draft bytes never cross this boundary. The separate column is
+    deliberate: clearing a browser textarea must not certify the harness/tmux
+    composer clean. BEGIN IMMEDIATE serializes this state with the planner wake
+    gate so whichever action commits first is observed by the other.
+    """
+    if state not in ("clean", "dirty"):
+        raise BrokerError(f"invalid browser composer state {state!r}")
+    began = _begin_immediate(con)
+    try:
+        sess = _session(con, session_id)
+        if sess[3] != "occupied":
+            raise BrokerError(
+                f"session {session_id} is {sess[3]}, not occupied")
+        lease = current_writer(con, session_id)
+        if lease is None or lease[1] != client_id:
+            raise BrokerError(
+                "browser composer state rides the current writer lease")
+        row = con.execute(
+            "SELECT browser_composer FROM interface_input_state "
+            "WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            raise BrokerError(f"session {session_id} has no input state row")
+        if row[0] != state:
+            con.execute(
+                "UPDATE interface_input_state SET browser_composer=?, "
+                "updated_at=datetime('now') WHERE session_id=?",
+                (state, session_id))
+        con.commit()
+    except Exception:
+        if began and con.in_transaction:
+            con.rollback()
+        raise
+
+
 def reconcile_input(con, session_id: int, outcome: str) -> None:
     """Explicit operator reconciliation of a delivery_unknown park.
 
@@ -900,8 +938,9 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     fire), a live occupied session (an ended session gate-fails with an
     ALERT and the batch stays queued for a future generation — End chat
     deliberately does not release the sprint binding, so this gate must
-    never crash on it), idle lifecycle, clean
-    composer, quiet >= quiet_s since the last accepted human input AND since
+    never crash on it), idle lifecycle, clean harness/tmux composer, clean
+    metadata-only browser composer, quiet >= quiet_s since the last accepted
+    human input AND since
     REAL provider readiness (flag #49: the provider session_start stamp, NOT
     the pre-exec occupied_at — a >3s claude/codex boot must not submit into
     an unpainted TUI) AND since the last service restart (a fresh full
@@ -1001,8 +1040,8 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             con.commit()
             return {"submitted": False, "reason": "session ended"}
         istate = con.execute(
-            "SELECT composer, pending_seq, forwarded_seq, last_human_input_at "
-            "FROM interface_input_state WHERE session_id=?",
+            "SELECT composer, browser_composer, pending_seq, forwarded_seq, "
+            "last_human_input_at FROM interface_input_state WHERE session_id=?",
             (sess[0],)).fetchone()
 
         def gate_fail(reason, **extra):
@@ -1015,7 +1054,9 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
                 f"session not occupied+idle ({sess[1]}/{sess[2]})")
         if istate[0] != "clean":
             return gate_fail(f"composer is {istate[0]}")
-        if istate[1] is not None:
+        if istate[1] != "clean":
+            return gate_fail(f"browser composer is {istate[1]}")
+        if istate[2] is not None:
             return gate_fail("a human frame is pending")
         cap = interface_hooks.capability(sess[6], sess[7])
         if not cap["mandatory_ok"]:
@@ -1044,7 +1085,7 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         # never the pre-exec occupied_at), session start, and the last
         # service restart (startup_reconcile revokes every lease with reason
         # 'service_restart'; that stamp is the restart time).
-        baseline = max(t for t in (istate[3], sess[3], sess[4], sess[5])
+        baseline = max(t for t in (istate[4], sess[3], sess[4], sess[5])
                        if t is not None)
         restart_at = con.execute(
             "SELECT MAX(revoked_at) FROM interface_writer_leases "
@@ -1059,7 +1100,7 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             return gate_fail(f"quiet {quiet:.2f}s < {quiet_s}s",
                              retry_after=quiet_s - quiet)
 
-        fence = istate[2] + 1
+        fence = istate[3] + 1
         interface_state.transition(
             con, "wake_batch", batch_id, "submitting",
             extra_sets={"input_seq_fence": fence})

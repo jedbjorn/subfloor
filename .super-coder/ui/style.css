@@ -19,6 +19,7 @@
 body {
   margin: 0; background: var(--bg); color: var(--ink);
   font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  min-height: 100dvh; display: flex; flex-direction: column;
 }
 /* thin scrollbars — on EVERY scrollable element, never the browser default.
    The `*` selector (not html) catches textareas/pres/popovers that don't
@@ -33,7 +34,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { box-shadow: 
 header {
   display: flex; align-items: center; gap: 1.5rem; height: 52px; padding: 0 1.2rem;
   border-bottom: 1px solid var(--line); position: sticky; top: 0;
-  background: var(--bg); z-index: 5;
+  background: var(--bg); z-index: 5; flex: 0 0 52px;
 }
 h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: .2px; flex: 1 1 0; }
 h1 span { color: var(--dim); font-weight: 400; }
@@ -60,7 +61,7 @@ nav button.active::after {
   padding: .35rem .7rem; border-radius: var(--r); cursor: pointer; font: inherit;
 }
 #snapshot:hover { border-color: var(--accent); }
-main { padding: 1.2rem; }
+main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
 /* One shared content width for every page — no per-tab jumps. */
 /* minmax(0,1fr): grid items default to min-width:auto, so any nowrap line
    (e.g. a skill row's one-line description) would force the track — and the
@@ -68,6 +69,11 @@ main { padding: 1.2rem; }
 .view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
 #view-interface { max-width: calc(230px + 1rem + 1300px); }
+body.interface-view { height: 100dvh; overflow-y: auto; }
+body.interface-view main {
+  flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;
+}
+body.interface-view #view-interface { flex: 1 1 auto; min-height: 0; }
 
 /* ── Tight card rhythm (Skills / Roadmap / Docs / Flags) ────────────────────
    Stacked card panels on these tabs sit a small 5px apart. Section headers
@@ -683,8 +689,13 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   pointer-events: none; white-space: nowrap; box-shadow: var(--menu-shadow); }
 
 /* ── Interface tab ── */
-.if-wrap { display: flex; gap: 1rem; align-items: flex-start; }
-.if-rail { flex: 0 0 230px; display: flex; flex-direction: column; gap: 5px; }
+.if-wrap {
+  display: flex; gap: 1rem; align-items: stretch; min-height: 0; height: 100%;
+}
+.if-rail {
+  flex: 0 0 230px; display: flex; flex-direction: column; gap: 5px;
+  min-height: 0; overflow-y: auto;
+}
 .if-row {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
   padding: .5rem .7rem; cursor: pointer; color: var(--ink); font: inherit; text-align: left;
@@ -699,7 +710,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-badge.bad { color: #d45a5a; border-color: #d45a5a; }
 .if-pane {
   flex: 1 1 auto; min-width: 0; width: 100%; max-width: 1300px;
-  display: flex; flex-direction: column; gap: .5rem;
+  display: flex; flex-direction: column; gap: .5rem; min-height: 0;
 }
 .if-head {
   display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
@@ -713,10 +724,19 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-term {
   background: #000; border: 1px solid var(--line); border-radius: var(--r);
   padding: 6px; width: 100%; max-width: 1300px;
-  height: clamp(260px, calc(100dvh - 140px), 850px);
-  max-height: 850px; min-height: 260px; overflow: hidden;
+  flex: 1 1 500px; min-height: 500px; overflow: hidden;
 }
 .if-term .xterm { height: 100%; }
+.if-composer {
+  flex: 0 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: .4rem .5rem; align-items: end;
+}
+.if-composer textarea {
+  min-height: 42px; resize: none; overflow-y: hidden;
+  font: 14px/1.4 ui-monospace, monospace;
+}
+.if-composer .act { margin: 0; min-height: 42px; }
+.if-composer .if-note { grid-column: 1 / -1; min-height: 1.2em; }
 .if-newchat .act { margin-top: .8rem; }
 .if-newchat .muted { margin-top: .5rem; }
 .if-newchat .dm-row { margin-top: .6rem; grid-template-columns: 100px minmax(10rem, 26rem) 1fr;
@@ -737,8 +757,9 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   width: 100%; max-height: 12rem; overflow-y: auto; margin-top: .5rem;
   color: var(--dim); font: 11px/1.55 ui-monospace, monospace;
 }
-/* Mobile: the rail collapses into a shell picker above the terminal; the
-   terminal keeps a stable minimum height and the header stays above it. */
+/* Mobile: the rail collapses into a shell picker above the terminal. The same
+   500px terminal floor applies; below that budget the page, not a guessed
+   terminal viewport, becomes the scroll surface. */
 .if-picker { display: none; }
 @media (max-width: 760px) {
   .if-wrap { flex-direction: column; }
@@ -747,5 +768,4 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
     border: 1px solid var(--line); border-radius: var(--r); color: var(--ink);
     font: inherit; padding: .45rem .6rem; }
   .if-pane { width: 100%; }
-  .if-term { height: clamp(240px, 55dvh, 850px); min-height: 240px; }
 }

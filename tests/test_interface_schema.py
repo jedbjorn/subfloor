@@ -153,6 +153,21 @@ class InterfaceSchemaTest(unittest.TestCase):
             "(session_id, shell_id, generation, client_id, token_hash) "
             "VALUES (?,1,1,'c2','h2')", (sid,))
 
+    def test_browser_composer_defaults_clean_and_rejects_unknown_states(self):
+        sid = self._session(occupancy="occupied")
+        self.con.execute(
+            "INSERT INTO interface_input_state "
+            "(session_id, shell_id, generation, composer) "
+            "VALUES (?,1,1,'clean')", (sid,))
+        state = self.con.execute(
+            "SELECT browser_composer FROM interface_input_state "
+            "WHERE session_id=?", (sid,)).fetchone()[0]
+        self.assertEqual(state, "clean")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE interface_input_state SET browser_composer='unknown' "
+                "WHERE session_id=?", (sid,))
+
     def test_one_live_batch_per_binding(self):
         bid = self._binding()
         self.con.execute(
