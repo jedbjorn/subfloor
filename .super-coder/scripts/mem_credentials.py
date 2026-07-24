@@ -11,7 +11,9 @@ discovers the unique Admin artifact instead of dying unwired (see
 
 Properties the spec pins:
 
-- mode 0600, parent dir 0700, regular files owned by the service user;
+- mode 0600, parent dir 0700, regular files owned by the service user —
+  written as a fresh temp inode and renamed into place, so a symlink at the
+  artifact path is replaced, never followed;
 - refreshed on every boot — an api_key rotation (startup backfill or rebuild
   re-key) is picked up the next time the service starts;
 - never snapshotted or rendered: `.super-coder/run/` is gitignored and the
@@ -25,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -58,14 +61,25 @@ def provision(db_path: str, api_base: str, run_dir: Path = RUN_DIR) -> list[str]
             "token": api_key,
         })
         path = run_dir / f"{shortname}.json"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Never open the artifact path for writing: a symlink planted there
+        # would be followed and its target truncated and overwritten with a
+        # bearer token. Write a freshly created regular file (mkstemp is
+        # O_EXCL) and rename it over the name — rename replaces the link
+        # itself, never what the link points at. This also repairs a previously
+        # weakened artifact: every boot writes a new inode.
+        fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=f".{shortname}.", suffix=".tmp")
         try:
-            os.write(fd, payload.encode())
-        finally:
-            os.close(fd)
-        # O_CREAT's mode only applies at creation — chmod unconditionally so a
-        # previously weakened artifact is repaired, never left readable.
-        os.chmod(path, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                # mkstemp's own 0600 is an open() mode — the process umask
+                # still subtracts from it, so a permissive umask would hand
+                # out a mode-000 (unreadable) credential. Pin the mode on the
+                # descriptor instead: exactly 0600, whatever the umask is.
+                os.fchmod(fh.fileno(), 0o600)
+                fh.write(payload.encode())
+            os.replace(tmp, path)
+        except OSError:
+            os.unlink(tmp)
+            raise
     for stale in run_dir.glob("*.json"):
         if stale.stem not in live:
             stale.unlink()

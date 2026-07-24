@@ -15,7 +15,10 @@ SC_MEM_AS=<shortname> when several Admin identities exist.
 
 A missing, unreadable, or insecurely permissioned artifact refuses on stderr
 with the supported service action (`./sc restart` / `make dos-r`, which
-re-provisions it at boot). The trust-boundary check itself lives in
+re-provisions it at boot), and the two classes carry distinct nonzero exit
+statuses: 1 = nothing to read (service not running / no artifact), 2 = an
+artifact is there but unsafe (symlink, wrong owner, group/world bits). stdout
+stays empty either way. The trust-boundary check itself lives in
 mem.py:_discover_runtime_credential — this command reuses it rather than
 duplicating security logic. (Named operator_token.py, not token.py: the
 stdlib `token` module would shadow an `import token`.)
@@ -32,7 +35,9 @@ _USAGE = ("usage: ./sc token — print the browser sign-in operator token (an "
           "operator capability: the Admin runtime credential from the "
           "owner-only artifact .super-coder/run/mem/<shortname>.json) to "
           "stdout, and nothing else. The value itself never appears in help, "
-          "logs, or command arguments.")
+          "logs, or command arguments. Refusals go to stderr with distinct "
+          "exit statuses: 1 = service not running / no artifact, 2 = unsafe "
+          "artifact (symlink, wrong owner, group/world-readable).")
 
 
 def main(argv: "list[str] | None" = None) -> int:
