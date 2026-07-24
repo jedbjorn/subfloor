@@ -112,7 +112,17 @@ def _read_stat(pid: int) -> tuple[int, str]:
 def _proc_state(pid: int, start_ticks: int) -> str:
     """Exact-identity liveness: 'alive' (pid present, ticks match, not a
     zombie), 'dead' (pid gone, recycled, or reaped), 'unreadable' (present
-    but /proc refuses us — fail closed, never 'dead')."""
+    but /proc will not give us a usable answer — fail closed, never 'dead').
+
+    'Unreadable' covers a refused read AND an unusable one. A short or
+    malformed `/proc/<pid>/stat` — the file is a live snapshot and can be read
+    mid-teardown — makes `_read_stat` raise ValueError or IndexError, which
+    escaped every caller: this one is called from inside the signalling
+    sequence, where an escape after SIGTERM became an opaque 500 over an
+    already-delivered signal (SC-131). Answering 'unreadable' here is both the
+    honest reading and the fail-closed one, and it is fixed at the definition
+    so no caller has to guard it separately.
+    """
     try:
         ticks, state = _read_stat(pid)
     except FileNotFoundError:
@@ -120,6 +130,8 @@ def _proc_state(pid: int, start_ticks: int) -> str:
     except (PermissionError, ProcessLookupError):
         return "unreadable"
     except OSError:
+        return "unreadable"
+    except (ValueError, IndexError):
         return "unreadable"
     if ticks != start_ticks:
         return "dead"  # recycled pid: a different process, not ours
@@ -168,7 +180,26 @@ def terminate_process_group(pid: int, start_ticks: int,
     indeterminate — the caller maps that to a refusal, never a closure.
     `dead` is True ONLY on /proc-proven absence: a signal is not proof of
     death, and 'unreadable' or a SIGKILL survivor (D-state) leaves the
-    caller to refuse closure with a named next action."""
+    caller to refuse closure with a named next action.
+
+    ALWAYS returns a result; never raises. The delivery of the first signal is
+    a seam exactly like the durable commit: before it, a failure is a refusal
+    and nothing has happened; after it, an irreversible act has been performed
+    and an exception escaping to the route as an opaque 500 tells the operator
+    neither that their process was signalled nor that nothing was closed
+    (SC-131). So the boundary sits AT the seam, and the failure modes are
+    enumerated by where they fall relative to it rather than by which of them
+    a probe has already found:
+
+    - before delivery — a stale identity, an unreadable process group, and a
+      SIGTERM that cannot be delivered at all (EPERM on a group we may not
+      signal, ESRCH on one that died since the identity check). All report
+      `signaled: False`, which the caller maps to a refusal;
+    - after delivery — everything else, whatever it is. The grace poll, the
+      identity re-check, the SIGKILL itself and its poll all run under one
+      boundary that returns `signaled: True` with the phase it broke in, so
+      the caller can state what was done to the process and what was not.
+    """
     state = _proc_state(pid, start_ticks)
     if state != "alive":
         return {"signaled": False, "dead": False, "reason": "indeterminate",
@@ -178,39 +209,61 @@ def terminate_process_group(pid: int, start_ticks: int,
     except OSError:
         return {"signaled": False, "dead": False, "reason": "indeterminate",
                 "detail": "process group unreadable at signal time"}
-    os.killpg(pgid, signal.SIGTERM)
-    state = _wait_dead(pid, start_ticks, grace_s)
-    if state == "dead":
-        return {"signaled": True, "dead": True, "escalated": False,
-                "pid": pid, "pgid": pgid}
-    if state == "unreadable":
-        return {"signaled": True, "dead": False, "escalated": False,
-                "pid": pid, "pgid": pgid, "reason": "absence_unproven",
-                "detail": "SIGTERM sent but /proc turned unreadable during "
-                          "the grace — absence not proven"}
-    # Grace expired with the process alive. Re-verify the EXACT identity
-    # before SIGKILL — the window is long enough for exit + PID reuse, and
-    # the rule is never signal an uncertain process.
-    state = _proc_state(pid, start_ticks)
-    if state != "alive":
-        return {"signaled": True, "dead": state == "dead",
-                "escalated": False, "pid": pid, "pgid": pgid,
-                "note": "identity changed during grace — no SIGKILL sent"}
     try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        return {"signaled": True, "dead": False, "escalated": False,
-                "pid": pid, "pgid": pgid,
-                "note": "process exited during grace — no SIGKILL sent"}
-    os.killpg(pgid, signal.SIGKILL)
-    state = _wait_dead(pid, start_ticks, grace_s)
-    if state == "dead":
-        return {"signaled": True, "dead": True, "escalated": True,
-                "pid": pid, "pgid": pgid}
-    return {"signaled": True, "dead": False, "escalated": True,
-            "pid": pid, "pgid": pgid, "reason": "absence_unproven",
-            "detail": f"process state {state} after SIGKILL — absence not "
-                      "proven (an unkillable D-state process survives)"}
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError as exc:
+        # Nothing was delivered, so this is a refusal like the two above and
+        # not a partial act — the distinction the caller acts on.
+        return {"signaled": False, "dead": False, "reason": "indeterminate",
+                "detail": f"SIGTERM could not be delivered to PGID {pgid}: "
+                          f"{type(exc).__name__}: {str(exc)[:200]}"}
+    # -- the signal is delivered: NOTHING below may raise -------------------
+    phase, escalated = "grace_wait", False
+    try:
+        state = _wait_dead(pid, start_ticks, grace_s)
+        if state == "dead":
+            return {"signaled": True, "dead": True, "escalated": False,
+                    "pid": pid, "pgid": pgid}
+        if state == "unreadable":
+            return {"signaled": True, "dead": False, "escalated": False,
+                    "pid": pid, "pgid": pgid, "reason": "absence_unproven",
+                    "detail": "SIGTERM sent but /proc turned unreadable "
+                              "during the grace — absence not proven"}
+        # Grace expired with the process alive. Re-verify the EXACT identity
+        # before SIGKILL — the window is long enough for exit + PID reuse, and
+        # the rule is never signal an uncertain process.
+        phase = "escalation_recheck"
+        state = _proc_state(pid, start_ticks)
+        if state != "alive":
+            return {"signaled": True, "dead": state == "dead",
+                    "escalated": False, "pid": pid, "pgid": pgid,
+                    "note": "identity changed during grace — no SIGKILL sent"}
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            return {"signaled": True, "dead": False, "escalated": False,
+                    "pid": pid, "pgid": pgid,
+                    "note": "process exited during grace — no SIGKILL sent"}
+        phase = "sigkill"
+        os.killpg(pgid, signal.SIGKILL)
+        escalated, phase = True, "kill_wait"
+        state = _wait_dead(pid, start_ticks, grace_s)
+        if state == "dead":
+            return {"signaled": True, "dead": True, "escalated": True,
+                    "pid": pid, "pgid": pgid}
+        return {"signaled": True, "dead": False, "escalated": True,
+                "pid": pid, "pgid": pgid, "reason": "absence_unproven",
+                "detail": f"process state {state} after SIGKILL — absence not "
+                          "proven (an unkillable D-state process survives)"}
+    except Exception as exc:  # noqa: BLE001 — post-signal: report, never raise
+        return {"signaled": True, "dead": False, "escalated": escalated,
+                "pid": pid, "pgid": pgid, "reason": "signal_failed",
+                "phase": phase,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "detail": f"SIGTERM was delivered to PGID {pgid} and cannot "
+                          f"be unwound; the sequence then failed in {phase} "
+                          f"({type(exc).__name__}: {str(exc)[:200]}) — "
+                          "absence not proven"}
 
 
 # ------------------------------------------------------------------ git facts
@@ -502,16 +555,30 @@ def _entry_identity(worktree: str, rel: str, index: dict[str, str]) -> str:
             + index.get(rel, _INDEX_ABSENT))
 
 
-def _enumerate(worktree: str, head: bool) -> tuple[set, set, set]:
-    """`(tracked, untracked_files, untracked_dirs)` — the entries a discard
-    would have to undo, as of now.
+def _enumerate(worktree: str, head: bool) -> tuple[set, set, set, set]:
+    """`(tracked, index_only, untracked_files, untracked_dirs)` — the entries a
+    discard would have to undo, as of now, classified by what undoing one does.
 
-    Factored out because this predicate is applied TWICE to the same worktree
-    and the two uses must never drift: once to build the plan (what the
-    operator is shown, and what bounds the destruction), and once after the
-    discard to decide whether it actually worked. "Undone" is then defined as
-    "this same enumeration no longer names it" — the contract itself, not a
-    proxy standing in for it (SC-129).
+    THE definition of the destructive set, and the only one. It has three
+    consumers and states itself to none of them: the plan the operator
+    confirms and the destruction it bounds (`_discard_plan`), the check that
+    decides whether the discard actually worked (`_unrestored`), and the
+    preview the operator reads (`evidence_projection`, through
+    `_observe_worktree`). Each restatement was a place the contract could
+    drift from itself, and each one drifted: the verification asked a proxy
+    question (SC-129), and the preview counted porcelain lines instead —
+    which is why it described a staged blob's destruction in the same words as
+    an ordinary file deletion (SC-130).
+
+    `index_only` is a SUBSET of `tracked`, and it is the class the operator
+    cannot otherwise see: the entry's content lives in the index and the
+    working tree does not show it, so nothing on disk changes appearance when
+    the discard destroys it. On a born HEAD that is exactly "differs from HEAD
+    in the index while the working tree agrees with HEAD" — the `AD` staged-
+    then-deleted path, and equally a staged edit whose file was written back
+    to HEAD's content. On an unborn HEAD, where there is no HEAD to agree
+    with, it is an index entry with no file on disk at all: the same class,
+    reached by the same reasoning rather than by the one case a probe found.
     """
     def paths(*args) -> list[str]:
         # -z: paths verbatim, no C-quoting to unescape.
@@ -528,7 +595,10 @@ def _enumerate(worktree: str, head: bool) -> tuple[set, set, set]:
     untracked_dirs |= {p for p in listed if p.endswith("/")}
     untracked_files = {p for p in listed if not p.endswith("/")}
     if not head:
-        return set(paths("ls-files", "-z")), untracked_files, untracked_dirs
+        tracked = set(paths("ls-files", "-z"))
+        index_only = {rel for rel in tracked
+                      if not os.path.lexists(os.path.join(worktree, rel))}
+        return tracked, index_only, untracked_files, untracked_dirs
     # BOTH diffs, because neither alone is the set. `diff HEAD` compares HEAD
     # to the WORKING TREE, so a path staged and then deleted (`AD`) reads as
     # no change — absent in HEAD, absent on disk — while the index still holds
@@ -537,9 +607,10 @@ def _enumerate(worktree: str, head: bool) -> tuple[set, set, set]:
     # sitting in the index. `reset --hard`, the operation this replaces, threw
     # that entry away; found by asking the SC-129 question of the enumeration
     # itself rather than of the check that reads it.
-    tracked = set(paths("diff", "HEAD", "--name-only", "-z"))
-    tracked |= set(paths("diff", "--cached", "HEAD", "--name-only", "-z"))
-    return tracked, untracked_files, untracked_dirs
+    in_worktree = set(paths("diff", "HEAD", "--name-only", "-z"))
+    in_index = set(paths("diff", "--cached", "HEAD", "--name-only", "-z"))
+    return in_worktree | in_index, in_index - in_worktree, \
+        untracked_files, untracked_dirs
 
 
 def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
@@ -586,7 +657,8 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     Ignored files stay out: `clean -fd` without -x does not touch them, so
     they are not state the confirmation is about.
     """
-    tracked, untracked_files, untracked_dirs = _enumerate(worktree, head)
+    tracked, index_only, untracked_files, untracked_dirs = _enumerate(
+        worktree, head)
     index = _index_identities(worktree)
 
     h = hashlib.sha256()
@@ -604,6 +676,7 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     # has legitimately moved: immediately before the destructive call, when the
     # removal may already have unlinked the file (SC-124).
     return {"head": head, "tracked": sorted(tracked),
+            "index_only": sorted(index_only),
             "untracked_files": sorted(untracked_files),
             "untracked_dirs": sorted(untracked_dirs),
             "identities": identities, "index": index_of,
@@ -620,14 +693,22 @@ def _observe_worktree(worktree: str) -> tuple[dict, dict]:
     branch = _git_out(worktree, "rev-parse", "--abbrev-ref", "HEAD") \
         if head else _git_out(worktree, "branch", "--show-current")
     porcelain = _git_out(worktree, "status", "--porcelain").splitlines()
-    untracked = sum(1 for ln in porcelain if ln.startswith("??"))
-    dirty = len(porcelain) - untracked
     unpushed = int(_git_out(worktree, "rev-list", "HEAD", "--not",
                             "--remotes", "--count").strip() or 0) \
         if head else 0
     plan = _discard_plan(worktree, porcelain, head)
+    # COUNTED OFF THE PLAN, never off porcelain. What the operator is shown
+    # has to be generated by the same thing that decides what happens, or the
+    # two can describe different worlds — and did: porcelain renders an `AD`
+    # staged-then-deleted path as one dirty line, indistinguishable from an
+    # ordinary deletion, while the plan destroys a staged blob nothing on disk
+    # shows (SC-130). Porcelain stays an INPUT to the digest, where its
+    # coarseness is harmless; it is no longer a second statement of the set.
     return {"worktree": worktree, "branch": branch.strip(),
-            "dirty_tracked": dirty, "untracked": untracked,
+            "dirty_tracked": len(plan["tracked"]),
+            "index_only": len(plan["index_only"]),
+            "untracked": len(plan["untracked_files"]),
+            "untracked_dirs": len(plan["untracked_dirs"]),
             "unpushed_commits": unpushed,
             # WHICH paths changed and WHAT each one now IS — not just how
             # many: equal-count churn (one file cleaned while another is
@@ -854,8 +935,8 @@ def _unrestored(worktree: str, plan: dict, restored: list[str]) -> list[str]:
     if not restored:
         return []
     try:
-        tracked, untracked_files, untracked_dirs = _enumerate(worktree,
-                                                              plan["head"])
+        tracked, _index_only, untracked_files, untracked_dirs = _enumerate(
+            worktree, plan["head"])
         index = _index_identities(worktree)
     except _GitEvidenceUnavailable:
         return sorted(restored)
@@ -1425,11 +1506,26 @@ def evidence_projection(evidence: dict, classification: str,
     elif git:
         tracked = git.get("dirty_tracked")
         untracked = git.get("untracked")
-        if isinstance(tracked, int) and isinstance(untracked, int):
-            cleanliness = "clean" if tracked == 0 and untracked == 0 \
-                else "not clean"
+        untracked_dirs = git.get("untracked_dirs")
+        index_only = git.get("index_only")
+        if all(isinstance(n, int)
+               for n in (tracked, untracked, untracked_dirs, index_only)):
+            cleanliness = "clean" if not (tracked or untracked
+                                          or untracked_dirs) else "not clean"
+            # The enumerated entries are rendered BY EFFECT, because the
+            # operator's consent is what makes destroying them legitimate and
+            # they cannot consent to what they cannot see. An index-only entry
+            # is the class with no appearance on disk at all — it read as an
+            # ordinary dirty file, so a discard destroying staged work looked
+            # byte-identical to one deleting a file the operator could see
+            # (SC-130). Named here, in the one projection both clients render.
+            staged = (f" ({index_only} of them staged-only: content held in "
+                      "the git index that the working tree does not show — a "
+                      "discard destroys it)") if index_only else ""
             worktree_value = (
-                f"{cleanliness} · {tracked} tracked · {untracked} untracked · "
+                f"{cleanliness} · {tracked} tracked{staged} · "
+                f"{untracked} untracked file(s) · "
+                f"{untracked_dirs} untracked dir(s) · "
                 f"{git.get('unpushed_commits', '—')} unpushed commit(s) · "
                 f"branch {git.get('branch') or '—'} · "
                 f"{git.get('worktree') or 'worktree path unavailable'}")
@@ -1460,8 +1556,9 @@ def evidence_projection(evidence: dict, classification: str,
 
 _VOLATILE_PROCESS_KEYS = ("pane_id", "pane_pid", "pane_start_ticks",
                           "pane_present", "pid_state", "pgid")
-_VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "untracked",
-                      "unpushed_commits", "change_digest", "indeterminate")
+_VOLATILE_GIT_KEYS = ("worktree", "branch", "dirty_tracked", "index_only",
+                      "untracked", "untracked_dirs", "unpushed_commits",
+                      "change_digest", "indeterminate")
 
 
 def _volatile_git(git: dict | None) -> dict | None:
@@ -1960,14 +2057,32 @@ def execute(con, shell_id: int, body: dict,
                 "sent, no state closed; preview again",
                 {"detail": signal_result.get("detail")})
         if not signal_result.get("dead"):
+            # Two ways to reach here and the operator acts on them
+            # differently: the process outlived the signals, or the sequence
+            # itself broke after delivering one. Both are refusals — nothing
+            # closed, nothing discarded — and both say so rather than letting
+            # the second escape as an opaque 500 over an irreversible
+            # signal (SC-131).
+            failed = signal_result.get("reason") == "signal_failed"
             raise RecoveryError(
                 409, "recovery_absence_unproven",
-                "a signal was sent but /proc never proved the process gone "
-                "— durable closure refused (closure only on proven "
-                "absence). Next action: preview again; if the process "
-                "persists, inspect /proc/"
-                f"{proc['pane_pid']} and resolve it at the OS level first",
-                {"pid": proc["pane_pid"],
+                ("a signal was delivered and the termination sequence then "
+                 f"failed in {signal_result.get('phase')} "
+                 f"({signal_result.get('error')}) — absence never proven, so "
+                 "no session, archive, alert or binding was closed and "
+                 "nothing was reset or cleaned. "
+                 if failed else
+                 "a signal was sent but /proc never proved the process gone "
+                 "— durable closure refused (closure only on proven "
+                 "absence). ") +
+                "Next action: preview again; if the process persists, "
+                f"inspect /proc/{proc['pane_pid']} and resolve it at the OS "
+                "level first",
+                {"pid": proc["pane_pid"], "signaled": True,
+                 "escalated": signal_result.get("escalated"),
+                 "phase": signal_result.get("phase"),
+                 "error": signal_result.get("error"),
+                 "closed": False, "discarded": False,
                  "detail": signal_result.get("detail")})
 
     # -- atomic durable closure on proven absence ---------------------------

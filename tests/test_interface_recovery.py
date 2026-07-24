@@ -428,6 +428,87 @@ class ProcessGroupSignalTest(unittest.TestCase):
         self.assertFalse(result["dead"])
         self.assertEqual(result["reason"], "absence_unproven")
 
+    # -- SC-131: the seam is the FIRST DELIVERED SIGNAL --------------------
+    # Every failure mode is placed by which side of that seam it falls on,
+    # and each side has one contract. Before it: nothing happened, so it is a
+    # refusal (`signaled` False). After it: something irreversible happened,
+    # so the result says so instead of escaping as an opaque 500.
+
+    def test_sigkill_raising_after_sigterm_still_names_the_sent_signal(self):
+        # REV2's exact probe: SIGTERM lands, the grace expires with the
+        # process alive, and the SIGKILL call raises. Before the boundary
+        # this left the route with a bare PermissionError, so the operator
+        # was told nothing at all about a process that HAD been signalled.
+        proc, ticks = self.child(ignore_sigterm=True)
+        real = os.killpg
+        calls = []
+
+        def killpg(pgid, sig):
+            calls.append(sig)
+            if sig == signal.SIGKILL:
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            return real(pgid, sig)
+
+        with mock.patch.object(recovery.os, "killpg", killpg):
+            result = recovery.terminate_process_group(proc.pid, ticks,
+                                                      grace_s=0.3)
+        self.assertEqual(calls, [signal.SIGTERM, signal.SIGKILL])
+        self.assertTrue(result["signaled"])          # and it cannot be unwound
+        self.assertFalse(result["dead"])             # never claim absence
+        self.assertFalse(result["escalated"])        # SIGKILL never delivered
+        self.assertEqual(result["reason"], "signal_failed")
+        self.assertEqual(result["phase"], "sigkill")
+        self.assertIn("PermissionError", result["error"])
+        self.assertIn(str(proc.pid), result["detail"])
+
+    def test_undeliverable_sigterm_is_a_refusal_not_a_partial_act(self):
+        # The other side of the seam: nothing was delivered, so this must
+        # read exactly like an identity mismatch — signaled False, which the
+        # caller maps to a refusal that closes nothing.
+        proc, ticks = self.child()
+
+        def killpg(pgid, sig):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+        with mock.patch.object(recovery.os, "killpg", killpg):
+            result = recovery.terminate_process_group(proc.pid, ticks,
+                                                      grace_s=0.2)
+        self.assertFalse(result["signaled"])
+        self.assertFalse(result["dead"])
+        self.assertEqual(result["reason"], "indeterminate")
+        self.assertIn("PermissionError", result["detail"])
+        # The process is untouched — the refusal was truthful.
+        self.assertEqual(recovery._proc_state(proc.pid, ticks), "alive")
+
+    def test_grace_poll_failure_after_sigterm_is_reported_not_raised(self):
+        # Not the probe's instance: the boundary covers the whole post-signal
+        # sequence, so a failure in the grace poll reports the same contract
+        # as one in the SIGKILL call.
+        proc, ticks = self.child()
+        with mock.patch.object(recovery, "_wait_dead",
+                               side_effect=OSError("proc vanished")):
+            result = recovery.terminate_process_group(proc.pid, ticks,
+                                                      grace_s=0.2)
+        self.assertTrue(result["signaled"])
+        self.assertFalse(result["dead"])
+        self.assertFalse(result["escalated"])
+        self.assertEqual(result["reason"], "signal_failed")
+        self.assertEqual(result["phase"], "grace_wait")
+        self.assertIn("OSError", result["error"])
+
+    def test_malformed_proc_stat_reads_unreadable_never_dead(self):
+        # /proc/<pid>/stat is a live snapshot and can be read truncated. That
+        # made _read_stat raise ValueError/IndexError straight through every
+        # caller — including the post-signal poll. Fixed at the definition:
+        # an unusable answer is 'unreadable', which is fail-closed.
+        # No ')' at all; truncated before field 22; field 22 unparseable.
+        for text in ("", "1 (sh) S", "1 (sh) S " + "0 " * 18 + "notanint"):
+            with self.subTest(text=text), \
+                    mock.patch("builtins.open",
+                               mock.mock_open(read_data=text)):
+                self.assertEqual(recovery._proc_state(1234, 999),
+                                 "unreadable")
+
     def test_no_signal_on_identity_mismatch(self):
         proc, ticks = self.child()
         # Wrong ticks = a recycled pid is NOT our process — never signaled.
@@ -795,6 +876,48 @@ class ExecuteTest(RecoveryCase):
         self.assertEqual(status, 409)
         self.assertEqual(err["error"]["code"], "recovery_absence_unproven")
         self.assertIn("preview again", err["error"]["message"])
+        con = self.db()
+        self.assertEqual(con.execute(
+            "SELECT occupancy FROM interface_sessions WHERE session_id=?",
+            (sid,)).fetchone()[0], "occupied")
+        con.close()
+
+    def test_broken_signal_sequence_answers_with_what_it_did(self):
+        # SC-131 at the API boundary. The sequence delivered SIGTERM and then
+        # broke; the response must name the irreversible half AND the two
+        # things that did not happen, rather than emitting an opaque 500 that
+        # is indistinguishable from a recovery which never started.
+        proc, ticks = self.child()
+        sid = self.make_session(1, pane_pid=proc.pid, pane_ticks=ticks)
+        real = os.killpg
+
+        def killpg(pgid, sig):
+            if sig == signal.SIGKILL:
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            return real(pgid, sig)
+
+        with mock.patch.object(recovery, "_pane_present", return_value=False):
+            obj = self.preview(1)
+            self.assertEqual(obj["classification"], "exact_idle_orphan")
+            with mock.patch.object(recovery, "_proc_state",
+                                   return_value="alive"), \
+                    mock.patch.object(recovery.os, "killpg", killpg):
+                status, err = self.call(
+                    "POST", "/api/interface/shells/1/recovery", (OP, IDEM),
+                    {"observation_id": obj["observation_id"],
+                     "mode": "recover"})
+        # A refusal, NOT a 500 — the durable state is untouched and says so.
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "recovery_absence_unproven")
+        details = err["error"]["details"]
+        self.assertIs(details["signaled"], True)
+        self.assertIs(details["closed"], False)
+        self.assertIs(details["discarded"], False)
+        self.assertEqual(details["phase"], "sigkill")
+        self.assertIn("PermissionError", details["error"])
+        message = err["error"]["message"]
+        self.assertIn("sigkill", message)
+        self.assertIn("nothing was reset or cleaned", message)
         con = self.db()
         self.assertEqual(con.execute(
             "SELECT occupancy FROM interface_sessions WHERE session_id=?",
@@ -2831,6 +2954,101 @@ class WorktreeTest(RecoveryCase):
         self.assertTrue(result["discarded"], result)
         self.assertEqual(result["kept"], [])
         self.assertEqual(self.git_run(wt, "ls-files", "--", "added.txt"), "")
+
+    # -- SC-130: the preview is DERIVED from the enumeration ---------------
+
+    def projected_worktree(self, wt: str) -> str:
+        """The canonical worktree row both clients render, for `wt`."""
+        rows = recovery.evidence_projection(
+            {"shell": {}, "process": {}, "git": recovery._git_facts(wt)},
+            "exact_idle_orphan", ["recover"])
+        return next(row["value"] for row in rows if row["key"] == "worktree")
+
+    def test_index_only_entry_is_previewed_unlike_a_plain_deletion(self):
+        # The ratification condition. Widening the blast radius to the `AD`
+        # path is legitimate only because enumerated means previewed means
+        # consented — so if the operator cannot SEE that a staged blob will
+        # go, the consent is fictional and the widening does not stand.
+        #
+        # It was invisible because the preview was a THIRD STATEMENT of the
+        # plan: it counted porcelain lines instead of deriving from the set
+        # the destruction is built from, and porcelain renders both of these
+        # as exactly one dirty tracked line.
+        deleted = self.make_git_worktree()
+        (Path(deleted) / "tracked.txt").unlink()
+        (Path(deleted) / "untracked.txt").unlink()
+
+        staged = self.make_git_worktree()
+        (Path(staged) / "added.txt").write_text("staged then deleted")
+        self.git_run(staged, "add", "--", "added.txt")
+        (Path(staged) / "added.txt").unlink()
+        (Path(staged) / "tracked.txt").write_text("v1")   # back to HEAD
+        (Path(staged) / "untracked.txt").unlink()
+
+        # The premise, reproduced rather than argued: to porcelain — the old
+        # source of these counts — the two worktrees are the same shape.
+        self.assertEqual(len(self.porcelain(deleted).splitlines()), 1)
+        self.assertEqual(len(self.porcelain(staged).splitlines()), 1)
+        self.assertIn("AD added.txt", self.porcelain(staged))
+        self.assertIn(" D tracked.txt", self.porcelain(deleted))
+
+        deleted_row = self.projected_worktree(deleted)
+        staged_row = self.projected_worktree(staged)
+        self.assertNotEqual(
+            deleted_row, staged_row,
+            "a discard destroying an index-only staged blob still reads "
+            "byte-identically to one deleting a file on disk")
+        # The exact negative: an ordinary deletion must not acquire the
+        # staged-content wording, or the distinction says nothing.
+        self.assertNotIn("staged-only", deleted_row)
+        self.assertIn("1 tracked", deleted_row)
+        # And the index-only entry is named for what it actually is.
+        self.assertIn("1 of them staged-only", staged_row)
+        self.assertIn("the working tree does not show", staged_row)
+        self.assertIn("a discard destroys it", staged_row)
+
+    def test_preview_counts_come_from_the_enumeration_not_porcelain(self):
+        # One definition, three consumers. An untracked DIRECTORY is the case
+        # where the two sources visibly disagree: porcelain collapses it to a
+        # single `?? dir/` line, while the enumeration — which is what the
+        # discard acts on — names each file inside it plus the directory.
+        wt = self.make_git_worktree()
+        (Path(wt) / "untracked.txt").unlink()
+        (Path(wt) / "tracked.txt").write_text("v1")      # back to HEAD
+        nested = Path(wt) / "scratch"
+        nested.mkdir()
+        (nested / "a.txt").write_text("a")
+        (nested / "b.txt").write_text("b")
+        self.assertEqual(self.porcelain(wt).splitlines(), ["?? scratch/"])
+
+        plan = self.plan(wt)
+        self.assertEqual(sorted(plan["untracked_files"]),
+                         ["scratch/a.txt", "scratch/b.txt"])
+        self.assertEqual(plan["untracked_dirs"], ["scratch/"])
+        row = self.projected_worktree(wt)
+        self.assertIn("2 untracked file(s)", row)
+        self.assertIn("1 untracked dir(s)", row)
+
+    def test_unborn_staged_then_deleted_entry_is_index_only_too(self):
+        # The same CLASS one step out, tested where no bug has visited: with
+        # no HEAD to differ from, an index entry is invisible on disk exactly
+        # when there is no file. The born-HEAD case is the one that was
+        # reported; this one follows from the rule and would otherwise ship
+        # rendering a destroyed staged blob as an ordinary dirty entry.
+        wt = Path(self.tmp.name) / "unborn-index-only"
+        wt.mkdir()
+        self.git_run(str(wt), "init", "-q", "-b", "feat/x", ".")
+        (wt / "gone.txt").write_text("staged then deleted")
+        (wt / "kept.txt").write_text("staged and present")
+        self.git_run(str(wt), "add", "--", "gone.txt", "kept.txt")
+        (wt / "gone.txt").unlink()
+
+        plan = self.plan(str(wt))
+        self.assertEqual(sorted(plan["tracked"]), ["gone.txt", "kept.txt"])
+        self.assertEqual(plan["index_only"], ["gone.txt"])
+        row = self.projected_worktree(str(wt))
+        self.assertIn("2 tracked", row)
+        self.assertIn("1 of them staged-only", row)
 
     def test_unborn_entry_left_on_disk_is_not_claimed_discarded(self):
         # On an unborn HEAD "undone" means gone from the index AND gone from

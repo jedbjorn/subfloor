@@ -64,7 +64,8 @@ BASE_PREVIEW = {
         "unread_messages": 2,
         "git": {
             "worktree": "/x/s3", "branch": "fix/x", "dirty_tracked": 1,
-            "untracked": 2, "unpushed_commits": 0,
+            "index_only": 0, "untracked": 2, "untracked_dirs": 0,
+            "unpushed_commits": 0,
         },
     },
 }
@@ -436,7 +437,8 @@ for (const test of cases) {
     "tmux evidence missing from diagnostics");
   invariant(host.textContent.includes("2 · left unread"),
     "unread-message evidence missing from diagnostics");
-  invariant(host.textContent.includes("not clean · 1 tracked · 2 untracked"),
+  invariant(host.textContent.includes(
+    "not clean · 1 tracked · 2 untracked file(s) · 0 untracked dir(s)"),
     "worktree cleanliness missing from diagnostics");
   invariant(host.textContent.includes("branch fix/x"),
     "git branch missing from diagnostics");
@@ -485,6 +487,108 @@ console.log(JSON.stringify(rendered));
         for row in BASE_PREVIEW["evidence_projection"]
     ]
     assert browser_rows == cli_rows == expected
+
+
+def _worktree_row_in_both_clients(preview):
+    """The canonical worktree row as each client actually renders it."""
+    browser = json.loads(run_recovery_js(
+        "const PREVIEW = " + json.dumps(preview) + r""";
+confirm = () => false;
+prompt = () => null;
+apiIf = async () => PREVIEW;
+const host = new FakeElement("div");
+ifRecoveryControls(host, { shell_id: 3, shortname: "S3" }, {});
+await button(host, "Preview recovery").onclick();
+const row = all(host, (node) => node.recoveryEvidenceKey === "worktree")[0];
+invariant(row, "the browser dropped the canonical worktree row entirely");
+console.log(JSON.stringify(row.recoveryEvidenceValue));
+"""))
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        ic._print_recovery_preview(preview)
+    label = next(row["label"] for row in preview["evidence_projection"]
+                 if row["key"] == "worktree")
+    cli = next(line.strip().split(": ", 1)[1]
+               for line in captured.getvalue().splitlines()
+               if line.strip().startswith(f"{label}: "))
+    return browser, cli
+
+
+def test_index_only_discard_is_visible_and_identical_in_both_clients():
+    """SC-130: enumerated means previewed means consented — in BOTH clients.
+
+    A staged blob with no file on disk is destroyed by a discard while
+    nothing on the filesystem changes appearance, so the preview is the only
+    place an operator can learn it will go. Either client rendering that fact
+    less clearly than the other would consent to more than it displays, which
+    is precisely what the shared projection exists to prevent.
+    """
+    def preview_with(**git):
+        evidence = json.loads(json.dumps(BASE_PREVIEW["evidence"]))
+        evidence["git"].update(git)
+        preview = {**BASE_PREVIEW, "evidence": evidence}
+        preview["evidence_projection"] = recovery.evidence_projection(
+            evidence, preview["classification"], preview["legal_actions"])
+        return preview
+
+    staged_browser, staged_cli = _worktree_row_in_both_clients(
+        preview_with(dirty_tracked=2, index_only=1))
+    plain_browser, plain_cli = _worktree_row_in_both_clients(
+        preview_with(dirty_tracked=2, index_only=0))
+
+    assert staged_browser == staged_cli, (staged_browser, staged_cli)
+    assert plain_browser == plain_cli, (plain_browser, plain_cli)
+    # The exact negative: the same entry count must NOT read the same way
+    # once one of those entries is index-only.
+    assert staged_browser != plain_browser
+    assert "1 of them staged-only" in staged_browser
+    assert "the working tree does not show" in staged_browser
+    assert "staged-only" not in plain_browser
+
+
+def test_browser_renders_the_runtime_that_would_not_release_the_generation():
+    # The CLI branch was asserted and the browser branch was not, so a
+    # browser-only regression would have survived the tests that were added
+    # with it — the recovery succeeds either way, which is exactly what makes
+    # a silently dropped follow-up easy to miss.
+    run_recovery_js(r"""
+let rendered = 0;
+confirm = () => true;
+prompt = () => null;
+renderInterface = async () => { rendered += 1; };
+apiIf = async (path, method = "GET") => {
+  if (method === "GET") return BASE_PREVIEW;
+  return {
+    shell_id: 3, shortname: "S3",
+    classification: "exact_idle_orphan", mode: "recover",
+    signaled: null,
+    closed: {
+      session: {
+        session_id: 9, end_reason: "operator_recovery", already_ended: false,
+      },
+      archive: { archive_id: 12, closed: true },
+      binding: null,
+      alerts_resolved: 0,
+      parked: [],
+      runtime: { abandoned: false, error: "RuntimeError: bridge is down" },
+    },
+    worktree: { preserved: true },
+    unread_messages: 2,
+    availability: "available",
+  };
+};
+const host = new FakeElement("div");
+ifRecoveryControls(host, { shell_id: 3, shortname: "S3" }, {});
+await button(host, "Preview recovery").onclick();
+await button(host, "Recover").onclick();
+invariant(host.textContent.includes(
+  "The runtime would not release the session generation"),
+  `runtime-abandon failure not rendered: ${host.textContent}`);
+invariant(host.textContent.includes("RuntimeError: bridge is down"),
+  `runtime-abandon error detail not rendered: ${host.textContent}`);
+invariant(host.textContent.includes("Durable state IS closed"),
+  "the browser did not separate the closed durable state from the runtime");
+""")
 
 
 def test_recovery_preview_execute_happy_path_uses_opaque_observation():
