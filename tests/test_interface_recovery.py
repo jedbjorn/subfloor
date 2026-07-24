@@ -799,12 +799,21 @@ class ExecuteTest(RecoveryCase):
 
 class WorktreeTest(RecoveryCase):
 
-    def make_git_worktree(self, *, unpushed: bool = False) -> str:
+    def make_git_worktree(self, *, unpushed: bool = False,
+                          links: bool = False) -> str:
         """A real git repo standing in for the shell worktree, with a bare
         origin so 'unpushed' is exact: one pushed commit, one dirty tracked
         change, one untracked file (+ one local-only commit when unpushed).
         `clean.txt` is committed and left clean so a test can dirty it AFTER
-        the preview."""
+        the preview.
+
+        `links=True` adds the entity-identity fixture: `a/b/c.txt` all hold
+        the SAME bytes and `dirty_target.txt` holds the same bytes as dirty
+        `tracked.txt`, so every post-preview mutation below can be made
+        without the *resolved* content ever changing — a digest that reads
+        through a link, or ignores type, cannot tell the states apart.
+        Pre-dirtied: `tlink` (tracked symlink, retargeted a->b), `ulink`
+        (untracked symlink -> b), `ufile.txt` (untracked regular file)."""
         origin = Path(self.tmp.name) / "origin.git"
         subprocess.run(["git", "init", "-q", "--bare", str(origin)],
                        check=True, capture_output=True)
@@ -820,6 +829,11 @@ class WorktreeTest(RecoveryCase):
         git("remote", "add", "origin", str(origin))
         (wt / "tracked.txt").write_text("v1")
         (wt / "clean.txt").write_text("c1")
+        if links:
+            for name in ("a.txt", "b.txt", "c.txt"):
+                (wt / name).write_text("same")
+            (wt / "dirty_target.txt").write_text("dirty")
+            (wt / "tlink").symlink_to("a.txt")
         git("add", ".")
         git("commit", "-qm", "base")
         git("push", "-q", "-u", "origin", "feat/x")
@@ -828,6 +842,11 @@ class WorktreeTest(RecoveryCase):
             git("commit", "-qam", "local only")
         (wt / "tracked.txt").write_text("dirty")
         (wt / "untracked.txt").write_text("new")
+        if links:
+            (wt / "tlink").unlink()
+            (wt / "tlink").symlink_to("b.txt")     # tracked, now dirty
+            (wt / "ulink").symlink_to("b.txt")     # untracked symlink
+            (wt / "ufile.txt").write_text("dirty")  # untracked regular file
         return str(wt)
 
     def session_with_worktree(self, wt: str) -> int:
@@ -945,15 +964,22 @@ class WorktreeTest(RecoveryCase):
                               capture_output=True, text=True,
                               check=True).stdout
 
-    def assert_content_edit_refuses(self, wt, rel: str, text: str):
-        """Rewrite `rel` AFTER the preview without touching the path list, then
-        confirm the discard: the fence must refuse before anything runs."""
+    def assert_mutation_refuses(self, wt, mutate, *,
+                                porcelain_stable: bool = True):
+        """Mutate the worktree AFTER the preview, then confirm the discard:
+        the fence must refuse before anything runs.
+
+        `porcelain_stable` pins the regression that makes the case worth
+        testing — the status lines stay byte-identical, so any digest built
+        from them alone still reads fresh while the work underneath moved.
+        Set it False only where git's own line set already reflects the
+        change (a TRACKED typechange reports ' T'); the refusal is still
+        required, it just is not the line set that is being trusted."""
         obj = self.preview(1)
         before = self.porcelain(wt)
-        (Path(wt) / rel).write_text(text)
-        # The regression this pins: the status lines are byte-identical, so a
-        # path-list digest reads fresh while the content changed.
-        self.assertEqual(self.porcelain(wt), before)
+        mutate()
+        if porcelain_stable:
+            self.assertEqual(self.porcelain(wt), before)
         with mock.patch.object(
                 recovery, "_discard_worktree_files",
                 return_value={"worktree": wt, "discarded": True,
@@ -968,7 +994,6 @@ class WorktreeTest(RecoveryCase):
         self.assertEqual(err["error"]["code"], "recovery_observation_stale")
         disc.assert_not_called()   # no reset, no clean
         term.assert_not_called()   # no signal
-        self.assertEqual((Path(wt) / rel).read_text(), text)
         con = self.db()
         try:  # no closure
             self.assertEqual(con.execute(
@@ -976,6 +1001,26 @@ class WorktreeTest(RecoveryCase):
             ).fetchone()[0], "reserved")
         finally:
             con.close()
+
+    def assert_content_edit_refuses(self, wt, rel: str, text: str):
+        """Rewrite `rel` after the preview, path list untouched."""
+        self.assert_mutation_refuses(
+            wt, lambda: (Path(wt) / rel).write_text(text))
+        self.assertEqual((Path(wt) / rel).read_text(), text)
+
+    def retarget(self, wt, rel: str, target: str):
+        """Repoint an existing symlink — the link's own identity changes, the
+        bytes it resolves to do not."""
+        link = Path(wt) / rel
+        self.assertTrue(link.is_symlink())
+        resolved_before = link.read_text()
+
+        def mutate():
+            link.unlink()
+            link.symlink_to(target)
+        self.assert_mutation_refuses(wt, mutate)
+        self.assertEqual(os.readlink(link), target)
+        self.assertEqual(link.read_text(), resolved_before)  # content equal
 
     def test_tracked_content_edit_after_preview_refuses_discard(self):
         # Same already-dirty tracked path, new contents: SC-086 — the operator
@@ -998,6 +1043,72 @@ class WorktreeTest(RecoveryCase):
         self.session_with_worktree(wt)
         self.assertEqual((Path(wt) / "tracked.txt").read_text(), "dirty")
         self.assert_content_edit_refuses(wt, "tracked.txt", "drity")
+
+    # -- entity identity: link vs target, and type transitions (SC-086) ----
+    # Every case below leaves the *resolved* bytes identical, so a digest
+    # that reads through a link or ignores an entity's type reads fresh.
+
+    def test_tracked_symlink_retarget_after_preview_refuses_discard(self):
+        # An already-dirty tracked symlink repointed b.txt -> c.txt. Both
+        # targets hold "same", so hashing what the link resolves to cannot
+        # see it; git reports ' M tlink' either way. Only the link's own
+        # target string moved — and a discard would reset it.
+        wt = self.make_git_worktree(links=True)
+        self.session_with_worktree(wt)
+        self.retarget(wt, "tlink", "c.txt")
+
+    def test_untracked_symlink_retarget_after_preview_refuses_discard(self):
+        # Same defect on an untracked link: '?? ulink' is fixed, the
+        # resolved bytes are equal, and a discard would clean it away.
+        wt = self.make_git_worktree(links=True)
+        self.session_with_worktree(wt)
+        self.retarget(wt, "ulink", "c.txt")
+
+    def test_untracked_file_becoming_symlink_refuses_discard(self):
+        # Regular file -> symlink resolving to identical bytes. Untracked, so
+        # porcelain shows '?? ufile.txt' before and after: git's line set
+        # cannot distinguish the types at all — only the digest's type
+        # prefix can.
+        wt = self.make_git_worktree(links=True)
+        self.session_with_worktree(wt)
+        path = Path(wt) / "ufile.txt"
+        self.assertEqual(path.read_text(), "dirty")
+
+        def mutate():
+            path.unlink()
+            path.symlink_to("dirty_target.txt")
+        self.assert_mutation_refuses(wt, mutate)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(path.read_text(), "dirty")  # content equal
+
+    def test_untracked_symlink_becoming_file_refuses_discard(self):
+        # The reverse transition, same invariant.
+        wt = self.make_git_worktree(links=True)
+        self.session_with_worktree(wt)
+        path = Path(wt) / "ulink"
+        self.assertEqual(path.read_text(), "same")
+
+        def mutate():
+            path.unlink()
+            path.write_text("same")
+        self.assert_mutation_refuses(wt, mutate)
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(path.read_text(), "same")
+
+    def test_tracked_file_becoming_symlink_refuses_discard(self):
+        # Tracked typechange: git DOES move the line (' M' -> ' T'), so the
+        # line set already fences this one — pinned anyway so the refusal
+        # survives a future digest that stops reading porcelain.
+        wt = self.make_git_worktree(links=True)
+        self.session_with_worktree(wt)
+        path = Path(wt) / "tracked.txt"
+
+        def mutate():
+            path.unlink()
+            path.symlink_to("dirty_target.txt")
+        self.assert_mutation_refuses(wt, mutate, porcelain_stable=False)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(path.read_text(), "dirty")
 
     def test_equal_count_churn_after_preview_refuses_discard(self):
         # One file cleaned, another dirtied: dirty_tracked/untracked counts

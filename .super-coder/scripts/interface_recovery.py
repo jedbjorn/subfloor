@@ -45,6 +45,7 @@ import json
 import os
 import secrets
 import signal
+import stat
 import subprocess
 import time
 
@@ -187,30 +188,74 @@ def terminate_process_group(pid: int, start_ticks: int,
 
 # ------------------------------------------------------------------ git facts
 
-def _hash_file(path: str) -> str:
-    """Content identity of one working-tree file — its bytes, never its mtime
-    or size: a same-size overwrite must move the hash. An unreadable file
-    yields a marker, which is itself a change (fail toward stale, never
-    toward 'unchanged')."""
+def _path_identity(path: str) -> str:
+    """Identity of one working-tree path: its TYPE first, then what that type
+    carries. Classified with lstat — NO-FOLLOW, always.
+
+    - regular file -> its bytes (never mtime or size: a same-size overwrite
+      must move the hash) plus the executable bit, the one mode bit git
+      records and a confirmed discard therefore restores.
+    - symlink -> the readlink TARGET STRING itself. Never the bytes behind
+      it: resolving would miss a retarget onto a byte-identical file, and it
+      would let the digest wander outside the worktree entirely. Link and
+      target are distinct entities and stay distinguished.
+    - directory / fifo / socket / device -> the type alone.
+    - absent or unreadable -> a marker, itself a change.
+
+    The type prefix is what makes a transition (regular <-> symlink,
+    file <-> directory) move the identity even when the visible content
+    matches. Every branch fails toward stale, never toward "unchanged".
+    """
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return f"absent:{exc.errno}"
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            return f"link-unreadable:{exc.errno}"
+        return "link:" + hashlib.sha256(
+            target.encode("utf-8", "surrogateescape")).hexdigest()
+    if stat.S_ISDIR(mode):
+        return "dir:"
+    if not stat.S_ISREG(mode):
+        return f"special:{stat.S_IFMT(mode):o}"
     h = hashlib.sha256()
     try:
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 16), b""):
+        # O_NOFOLLOW: the path was a regular file at lstat; if it became a
+        # symlink in between, refuse to read through it rather than hash
+        # whatever it now points at.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            while chunk := os.read(fd, 1 << 16):
                 h.update(chunk)
+        finally:
+            os.close(fd)
     except OSError as exc:
         return f"unreadable:{exc.errno}"
-    return h.hexdigest()
+    return f"file:{'x' if mode & stat.S_IXUSR else '-'}:{h.hexdigest()}"
 
 
 def _change_digest(worktree: str, porcelain: list[str]) -> str:
-    """Fingerprint of what a discard would erase, bound to file CONTENT.
+    """Fingerprint of what a discard would erase.
 
-    A porcelain line stays byte-identical when the contents of an
-    already-dirty tracked path or an already-listed untracked file are
-    rewritten, so a digest over the line set alone reads fresh while the work
-    underneath it changed — and the confirmed discard then resets and cleans
-    post-preview work. So every path that differs from HEAD and every
-    untracked file is hashed by its bytes on top of the line set.
+    INVARIANT: this digest MUST change if ANY safety-relevant aspect of the
+    worktree state a discard would destroy has changed since the preview.
+    Porcelain lines are far coarser than that — they stay byte-identical
+    while the work underneath them is rewritten, retargeted, or changes type
+    — so the line set is only the outer layer. Held against the invariant,
+    the state a discard destroys is: the SET of affected paths (the lines),
+    and for each path its ENTITY IDENTITY (`_path_identity`) — regular-file
+    bytes, symlink target string, or bare type, so that a content rewrite, a
+    same-size overwrite, a link retarget, and a type transition each move the
+    digest.
+
+    Excluded deliberately: mode bits beyond the executable bit. Git records
+    only that bit, so it is the only one `git checkout`/`git clean` can
+    destroy or restore; a chmod 644->640 survives the discard untouched and
+    is not state the operator's confirmation was about.
     """
     def paths(*args) -> list[str]:
         # -z: paths verbatim, no C-quoting to unescape.
@@ -228,7 +273,8 @@ def _change_digest(worktree: str, porcelain: list[str]) -> str:
                       | set(paths("ls-files", "-o", "--exclude-standard",
                                   "-z"))):
         h.update(rel.encode() + b"\0"
-                 + _hash_file(os.path.join(worktree, rel)).encode() + b"\0")
+                 + _path_identity(os.path.join(worktree, rel)).encode()
+                 + b"\0")
     return h.hexdigest()
 
 
@@ -259,11 +305,11 @@ def _git_facts(worktree: str | None) -> dict | None:
         return {"worktree": worktree, "branch": branch,
                 "dirty_tracked": dirty, "untracked": untracked,
                 "unpushed_commits": unpushed,
-                # WHICH paths changed and WHAT is in them — not just how many:
-                # equal-count churn (one file cleaned while another is
-                # dirtied) and a content rewrite of an already-listed path
-                # both move the freshness fingerprint. Paths and contents
-                # themselves stay out of the payload.
+                # WHICH paths changed and WHAT each one now IS — not just how
+                # many: equal-count churn (one file cleaned while another is
+                # dirtied), a rewrite of an already-listed path, a symlink
+                # retarget, and a type transition all move the freshness
+                # fingerprint. Paths and contents stay out of the payload.
                 "change_digest": _change_digest(worktree, porcelain)}
     except Exception:  # noqa: BLE001 — advisory facts degrade to "none"
         return None
