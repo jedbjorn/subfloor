@@ -61,6 +61,9 @@ nav button.active::after {
   padding: .35rem .7rem; border-radius: var(--r); cursor: pointer; font: inherit;
 }
 #snapshot:hover { border-color: var(--accent); }
+#publish:disabled {
+  opacity: .45; cursor: not-allowed; filter: grayscale(1);
+}
 main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
 /* One shared content width for every page — no per-tab jumps. */
 /* minmax(0,1fr): grid items default to min-width:auto, so any nowrap line
