@@ -2394,6 +2394,19 @@ function ifRecoveryResult(result) {
       `completed [${completed}], failed at ${worktree.failed.step || "unknown"} ` +
       `(${worktree.failed.error || "unknown error"}). Durable closure is ` +
       "committed; finish the discard remediation manually."));
+  } else if (worktree.kept_count) {
+    // Not a failure: these are left intact by design. "Preserved" (nothing
+    // touched) would be as false here as a bare "discarded" — so name them
+    // and say plainly why they can be there.
+    const kept = worktree.kept || [];
+    const more = worktree.kept_count - kept.length;
+    body.append(el("div", { className: "if-note" },
+      `Worktree ${worktree.worktree || ""} changes discarded, except ` +
+      `${worktree.kept_count} entr${worktree.kept_count === 1 ? "y" : "ies"} ` +
+      `left intact: ${kept.join(", ")}` +
+      (more > 0 ? ` (+${more} more)` : "") +
+      " — changed after the confirmation, or a directory still holding " +
+      "entries the discard was not allowed to remove."));
   } else if (worktree.discarded) {
     body.append(el("div", { className: "if-note" },
       `Worktree ${worktree.worktree || ""} changes discarded.`));
