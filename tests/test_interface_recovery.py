@@ -1692,6 +1692,54 @@ class WorktreeTest(RecoveryCase):
         # a surviving DIRECTORY is reported, but every consented FILE is gone
         self.assertTrue(result["discarded"], result)
 
+    def test_symlinked_ancestor_cannot_redirect_the_delete_outside(self):
+        # SC-105: O_NOFOLLOW on the FINAL component says nothing about the
+        # ancestors. Move `d` out of the worktree and drop a symlink to it at
+        # `d`, and `d/u.txt` still stats as the very same inode the plan
+        # recorded — so the identity check passes and a path-based unlink
+        # follows the symlink and deletes the file at its new home OUTSIDE the
+        # worktree, while the result reports discarded=true. Resolving each
+        # component with O_NOFOLLOW refuses instead of redirecting.
+        wt = self.make_git_worktree()
+        (Path(wt) / "d").mkdir()
+        (Path(wt) / "d" / "u.txt").write_text("moved out of the worktree")
+        plan = self.plan(wt)
+        self.assertIn("d/u.txt", plan["untracked_files"])
+        outside = Path(self.tmp.name) / "moved-away"
+        (Path(wt) / "d").rename(outside)              # same inodes, new home
+        (Path(wt) / "d").symlink_to(outside)
+        result = recovery._discard_worktree_files(wt, plan)
+        self.assertIsNone(result["failed"], result)
+        self.assertEqual((outside / "u.txt").read_text(),
+                         "moved out of the worktree")
+        self.assertIn("d/u.txt", result["kept"])
+        self.assertFalse(result["discarded"])
+        # the rest of the confirmed set still went
+        self.assertFalse((Path(wt) / "untracked.txt").exists())
+
+    def test_symlinked_ancestor_cannot_redirect_the_restore_outside(self):
+        # The same trap on the other seam. git refuses to write through a
+        # symlinked leading path — measured, not assumed, because the restore
+        # is the one destructive step this module does not perform itself.
+        wt = self.make_git_worktree()
+
+        def git(*args):
+            subprocess.run(["git", "-C", wt, *args], check=True,
+                           capture_output=True)
+
+        (Path(wt) / "dir").mkdir()
+        (Path(wt) / "dir" / "node").write_text("committed")
+        git("add", "dir/node")
+        git("commit", "-qm", "node")
+        (Path(wt) / "dir" / "node").write_text("dirty")
+        plan = self.plan(wt)
+        self.assertIn("dir/node", plan["tracked"])
+        outside = Path(self.tmp.name) / "moved-dir"
+        (Path(wt) / "dir").rename(outside)
+        (Path(wt) / "dir").symlink_to(outside)
+        recovery._discard_worktree_files(wt, plan)
+        self.assertEqual((outside / "node").read_text(), "dirty")
+
     def test_nothing_outside_the_plan_survives_adversarial_shapes(self):
         """The boundary claim, tested the way the closure claim is: build every
         shape that could let the discard reach outside the enumerated set, run
@@ -1987,7 +2035,7 @@ class WorktreeTest(RecoveryCase):
         self.session_with_worktree(wt)
         obj = self.preview(1)
 
-        def denied(_path):
+        def denied(_name, **_kw):
             raise OSError(errno.EACCES, "denied")
 
         with mock.patch.object(recovery.os, "unlink", side_effect=denied):

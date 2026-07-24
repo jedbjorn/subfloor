@@ -66,7 +66,6 @@ websockets-dependent Interface runtime (spec Restricted Admin).
 """
 from __future__ import annotations
 
-import contextlib
 import errno
 import hashlib
 import json
@@ -600,6 +599,35 @@ def _unpushed_count(worktree: str) -> int:
         raise refuse("rev-list --count gave a non-numeric answer") from exc
 
 
+def _open_parent(worktree: str, rel: str) -> int:
+    """A directory fd for `rel`'s parent, walked from the worktree root ONE
+    COMPONENT AT A TIME with O_NOFOLLOW. Raises OSError if any component is a
+    symlink or has stopped being a directory. Caller closes the fd.
+
+    Every destructive call resolves through this instead of through a joined
+    path, because O_NOFOLLOW on the final component says nothing about the
+    ANCESTORS (SC-105): move `d` out of the worktree and drop a symlink to it
+    at `d`, and `d/u.txt` still stats as the very same inode the observation
+    recorded — the identity check passes, and a path-based `unlink` follows the
+    symlink and deletes the file at its new home OUTSIDE the worktree. A
+    recovery may only ever destroy inside the exact worktree it was confirmed
+    against, so an ancestor that moved is a refusal, never a redirect.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    fd = os.open(worktree, flags)
+    try:
+        for part in os.path.dirname(rel).split("/"):
+            if not part or part == ".":
+                continue
+            nxt = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _is_dir(path: str) -> bool:
     """A REAL directory at this path — lstat, so a symlink to one is not it.
     `git restore` replaces a symlink outright; only a directory makes it
@@ -635,8 +663,16 @@ def _prune_dirs(worktree: str, plan: dict) -> list[str]:
             prunable.add(parent)
             parent = os.path.dirname(parent)
     for rel in sorted(prunable, key=len, reverse=True):  # deepest first
-        with contextlib.suppress(OSError):
-            os.rmdir(os.path.join(worktree, rel))
+        try:
+            fd = _open_parent(worktree, rel)
+        except OSError:
+            continue                    # moved or symlinked ancestor: leave it
+        try:
+            os.rmdir(os.path.basename(rel), dir_fd=fd)
+        except OSError:
+            pass                        # not empty, or gone: both fine
+        finally:
+            os.close(fd)
     return [rel for rel in plan["untracked_dirs"]
             if os.path.lexists(os.path.join(worktree, rel.rstrip("/")))]
 
@@ -719,13 +755,24 @@ def _discard_worktree_files(worktree: str, plan: dict) -> dict:
             keep(rel)
             continue
         try:
-            os.unlink(os.path.join(worktree, rel))
+            fd = _open_parent(worktree, rel)
+        except OSError:
+            # An ancestor is no longer the directory it was, or is now a
+            # symlink. The entry may still stat as the observed inode through
+            # it — that is exactly the trap — so refuse and report rather than
+            # delete whatever is on the other side (SC-105).
+            keep(rel)
+            continue
+        try:
+            os.unlink(os.path.basename(rel), dir_fd=fd)
         except FileNotFoundError:
             pass
         except OSError as exc:
             result["failed"] = {"step": "remove",
                                 "error": f"{rel[-120:]}: errno {exc.errno}"}
             return result
+        finally:
+            os.close(fd)
         removed.append(rel)
     for rel in _prune_dirs(worktree, plan):
         keep(rel, is_file=False)
