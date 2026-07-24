@@ -553,7 +553,7 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
             in options
         )
         assert (
-            "Code-02 · DEV4 · codex · GPT 5.6 SOL · occupied"
+            "Code-02 · DEV4 · codex · GPT 5.6 SOL (launched) · occupied"
             in options
         )
         assert page.locator(".if-composer-actions button").all_inner_texts() == [
