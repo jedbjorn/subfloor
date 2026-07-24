@@ -694,14 +694,26 @@ def cmd_recover(args) -> int:
         print(f"→ parked ambiguous binding {parked['binding_id']}: "
               f"{parked['next_action']}")
     wt = result.get("worktree") or {}
-    if wt.get("discarded"):
-        print(f"→ worktree {wt['worktree']} changes discarded")
-    elif wt.get("failed"):
+    if wt.get("failed"):
         done = ", ".join(wt.get("completed") or []) or "nothing"
         print(f"→ worktree discard INCOMPLETE in {wt['worktree']}: completed "
               f"[{done}], failed at {wt['failed']['step']} "
               f"({wt['failed'].get('error', 'unknown error')}) — the closure "
               "is committed; finish the discard by hand", file=sys.stderr)
+    elif wt.get("kept_count"):
+        # Not a failure: these are left intact by design. Saying "preserved"
+        # (the nothing-was-touched line) would be false, and so would a bare
+        # "discarded" — so name them and say plainly why they can be there.
+        count = wt["kept_count"]
+        named = ", ".join(wt.get("kept") or [])
+        more = count - len(wt.get("kept") or [])
+        print(f"→ worktree {wt['worktree']} changes discarded, EXCEPT "
+              f"{count} entr{'y' if count == 1 else 'ies'} left intact: "
+              f"{named}" + (f" (+{more} more)" if more else "")
+              + " — changed after the confirmation, or a directory still "
+              "holding entries the discard was not allowed to remove")
+    elif wt.get("discarded"):
+        print(f"→ worktree {wt['worktree']} changes discarded")
     else:
         print("→ worktree preserved")
     print(f"→ {shortname} is {result.get('availability')}")
