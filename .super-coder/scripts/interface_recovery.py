@@ -74,6 +74,7 @@ import secrets
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 
 import interface_broker
@@ -277,7 +278,8 @@ class _GitEvidenceUnavailable(Exception):
     """
 
 
-def _git_out(worktree: str, *args, timeout: int = 15) -> str:
+def _git_out(worktree: str, *args, timeout: int = 15,
+             index_file: str | None = None) -> str:
     """Git stdout, decoded losslessly; any failure raises.
 
     surrogateescape, NEVER strict: a valid non-UTF-8 filename is real working
@@ -286,11 +288,16 @@ def _git_out(worktree: str, *args, timeout: int = 15) -> str:
     distinct in the digest and hand os.* calls back the original bytes.
     Non-zero exit, timeout and spawn failure all become a refusal, never a
     partial answer.
+
+    `index_file` points git at a DIFFERENT index for this one call. Only
+    `_enumerate` uses it, and only ever at a throwaway copy — see there.
     """
     try:
         out = subprocess.run(["git", "-C", worktree, *args],
                              capture_output=True, timeout=timeout,
-                             check=False)
+                             check=False,
+                             env={**os.environ, "GIT_INDEX_FILE": index_file}
+                             if index_file else None)
     except Exception as exc:  # spawn failure / timeout: a gap, not a fact
         raise _GitEvidenceUnavailable(
             f"git {args[0]}: {type(exc).__name__}") from exc
@@ -473,6 +480,23 @@ def _index_flags(identity: str) -> str:
     return identity.rsplit(" ", 1)[-1] if " " in identity else "--"
 
 
+def _hides_worktree(flags: str) -> bool:
+    """True when these durable flags stop git comparing the path's working
+    file to HEAD in a way `_enumerate` CANNOT undo.
+
+    Only skip-worktree does. It is the one bit that survives the unhiding in
+    `_worktree_vs_head`, so it is also the one bit that leaves an entry
+    genuinely unverifiable — which is what `_unrestored` needs to know.
+    """
+    return "S" in flags
+
+
+def _unhideable(flags: str) -> bool:
+    """True for assume-unchanged with no skip-worktree over it — the class
+    `_worktree_vs_head` clears on its throwaway copy so the entry is seen."""
+    return "A" in flags and not _hides_worktree(flags)
+
+
 def _index_identities(worktree: str) -> dict[str, str]:
     """What the INDEX holds, per path: mode, object id, merge stage, and the
     durable per-entry FLAGS.
@@ -555,7 +579,91 @@ def _entry_identity(worktree: str, rel: str, index: dict[str, str]) -> str:
             + index.get(rel, _INDEX_ABSENT))
 
 
-def _enumerate(worktree: str, head: bool) -> tuple[set, set, set, set]:
+def _git_paths(worktree: str, *args, index_file: str | None = None) -> list[str]:
+    """A `-z` git listing as paths — verbatim, no C-quoting to unescape."""
+    return [p for p in _git_out(worktree, *args, timeout=30,
+                                index_file=index_file).split("\0") if p]
+
+
+def _worktree_vs_head(worktree: str, hidden: list[str]) -> set[str]:
+    """Every path whose WORKING FILE differs from HEAD — including the ones the
+    index has been told to stop looking at.
+
+    `assume-unchanged` is a promise the OPERATOR makes to git, not a fact about
+    the file. Git stops stat'ing the entry, and every worktree comparison built
+    on it — `diff HEAD`, `status`, porcelain — then calls the path clean
+    whatever its bytes are. `reset --hard`, the operation this discard stands
+    in for, does NOT honour that promise: it overwrites the modified file and
+    recreates the deleted one (both reproduced). So an enumeration that trusts
+    the hint under-discards against the very operation it replaces, shows the
+    operator a clean preview of work that is really there, and then reports
+    `discarded=true` over their surviving bytes — false consent and a false
+    outcome, which decision #45 ranks with destruction (SC-132).
+
+    The hint is therefore cleared on a THROWAWAY COPY of the index and the SAME
+    `git diff` is asked against that. The operator's own index is never written:
+    the bits are standing instructions about a path, not state the discard was
+    confirmed to change (SC-125's rule, one layer earlier). This is not a second
+    statement of the predicate — it is the one predicate, asked of an index that
+    will answer it.
+
+    `skip-worktree` is deliberately NOT cleared, and that exclusion is what the
+    audit CONCLUDED rather than something it overlooked. Four reproductions:
+    it dominates assume-unchanged (an entry carrying both is untouched),
+    `reset --hard` leaves such an entry alone, `git restore` refuses the
+    pathspec outright, and clearing it would re-materialise a sparse checkout's
+    deliberately absent files. The entry is outside the blast radius of the
+    operation being replaced, so enumerating it would promise a destruction
+    that cannot be performed — the opposite error, equally a false report.
+
+    Rejected alternative: `update-index --really-refresh`, which ignores the
+    hint without clearing it. It finds only paths that still EXIST — it missed
+    a hidden path deleted from the worktree, which `reset --hard` restores.
+
+    A failure here RAISES rather than falling back to the hint-trusting diff:
+    silently returning the incomplete set is exactly the defect, and req 24
+    fails closed for the destructive path on a gap.
+    """
+    if not hidden:
+        return set(_git_paths(worktree, "diff", "HEAD", "--name-only", "-z"))
+    git_dir = _git_out(worktree, "rev-parse", "--absolute-git-dir").strip()
+    # NEVER inside the worktree: a file there would itself enumerate as
+    # untracked and land in the delete set being computed.
+    fd, copy = tempfile.mkstemp(prefix="sc-recovery-index-")
+    os.close(fd)
+    try:
+        with open(os.path.join(git_dir, "index"), "rb") as src, \
+                open(copy, "wb") as dst:
+            while chunk := src.read(1 << 20):
+                dst.write(chunk)
+        try:
+            out = subprocess.run(
+                ["git", "-C", worktree, "update-index", "-z",
+                 "--no-assume-unchanged", "--stdin"],
+                input=b"".join(rel.encode("utf-8", "surrogateescape") + b"\0"
+                               for rel in hidden),
+                capture_output=True, timeout=30, check=False,
+                env={**os.environ, "GIT_INDEX_FILE": copy})
+        except Exception as exc:  # spawn failure / timeout: a gap, not a fact
+            raise _GitEvidenceUnavailable(
+                f"git update-index: {type(exc).__name__}") from exc
+        if out.returncode != 0:
+            raise _GitEvidenceUnavailable(
+                f"git update-index: exit {out.returncode}")
+        return set(_git_paths(worktree, "diff", "HEAD", "--name-only", "-z",
+                              index_file=copy))
+    except OSError as exc:
+        raise _GitEvidenceUnavailable(f"index copy: {exc.errno}") from exc
+    finally:
+        try:
+            os.unlink(copy)
+        except OSError:
+            pass  # a temp file we could not remove is not a fact about the
+                  # operator's worktree, and must not mask the real answer
+
+
+def _enumerate(worktree: str, head: bool,
+               index: dict[str, str]) -> tuple[set, set, set, set]:
     """`(tracked, index_only, untracked_files, untracked_dirs)` — the entries a
     discard would have to undo, as of now, classified by what undoing one does.
 
@@ -581,9 +689,7 @@ def _enumerate(worktree: str, head: bool) -> tuple[set, set, set, set]:
     reached by the same reasoning rather than by the one case a probe found.
     """
     def paths(*args) -> list[str]:
-        # -z: paths verbatim, no C-quoting to unescape.
-        return [p for p in _git_out(worktree, *args, timeout=30).split("\0")
-                if p]
+        return _git_paths(worktree, *args)
 
     listed = set(paths("ls-files", "-o", "--exclude-standard", "-z"))
     untracked_dirs = {p for p in
@@ -607,7 +713,14 @@ def _enumerate(worktree: str, head: bool) -> tuple[set, set, set, set]:
     # sitting in the index. `reset --hard`, the operation this replaces, threw
     # that entry away; found by asking the SC-129 question of the enumeration
     # itself rather than of the check that reads it.
-    in_worktree = set(paths("diff", "HEAD", "--name-only", "-z"))
+    # The worktree half is asked of an index that will ANSWER it: an entry the
+    # operator marked assume-unchanged is hidden from `diff HEAD` while its
+    # bytes really differ, and `reset --hard` destroys it regardless (SC-132).
+    # The index half needs no such care — it never consults the working file,
+    # so no worktree-suppressing bit can hide a staged difference from it.
+    in_worktree = _worktree_vs_head(
+        worktree, sorted(rel for rel, identity in index.items()
+                         if _unhideable(_index_flags(identity))))
     in_index = set(paths("diff", "--cached", "HEAD", "--name-only", "-z"))
     return in_worktree | in_index, in_index - in_worktree, \
         untracked_files, untracked_dirs
@@ -657,9 +770,9 @@ def _discard_plan(worktree: str, porcelain: list[str], head: bool) -> dict:
     Ignored files stay out: `clean -fd` without -x does not touch them, so
     they are not state the confirmation is about.
     """
-    tracked, index_only, untracked_files, untracked_dirs = _enumerate(
-        worktree, head)
     index = _index_identities(worktree)
+    tracked, index_only, untracked_files, untracked_dirs = _enumerate(
+        worktree, head, index)
 
     h = hashlib.sha256()
     for line in sorted(porcelain):
@@ -916,14 +1029,21 @@ def _unrestored(worktree: str, plan: dict, restored: list[str]) -> list[str]:
     survived its de-staging is named as untracked; an entry the restore left
     alone is named exactly as it was at plan time.
 
-    That enumeration reads the worktree half of a flagged entry THROUGH the
-    index — `git diff` trusts skip-worktree and assume-unchanged and will not
-    look at the file — so an entry still carrying a durable bit here cannot be
-    verified by it and is reported kept. Reachable enumerated entries do not
-    hit this: a bit only exists on an index entry, and an index entry the plan
-    holds differs from HEAD, so the restore rewrites it and drops the bit with
-    it (reproduced). An entry whose bit survived is one where something other
-    than that happened, which is not a state to report success from.
+    An entry the enumeration CANNOT see is reported kept rather than assumed
+    discarded, and exactly one durable bit still hides one: skip-worktree
+    (`_hides_worktree`). `git diff` will not look at such a file, and
+    `_worktree_vs_head` deliberately leaves that bit alone, so the contract
+    cannot be asked about the entry at all — and an unanswerable question is
+    never answered with success.
+
+    assume-unchanged USED to be counted here too, and that became wrong the
+    moment `_worktree_vs_head` started clearing it (SC-132): the restore puts
+    such an entry back to HEAD correctly and LEAVES THE BIT STANDING —
+    reproduced with the exact destructive command — so treating the surviving
+    bit as unverifiable reported `kept` over work that had in fact been
+    discarded. That is the same misreport this function exists to prevent,
+    merely inverted, so the guard asks the enumeration's real blind spot
+    instead of "is any bit set".
 
     Unreadable now -> unverifiable, and an unverifiable outcome is never
     reported as a success.
@@ -935,16 +1055,16 @@ def _unrestored(worktree: str, plan: dict, restored: list[str]) -> list[str]:
     if not restored:
         return []
     try:
-        tracked, _index_only, untracked_files, untracked_dirs = _enumerate(
-            worktree, plan["head"])
         index = _index_identities(worktree)
+        tracked, _index_only, untracked_files, untracked_dirs = _enumerate(
+            worktree, plan["head"], index)
     except _GitEvidenceUnavailable:
         return sorted(restored)
     still = tracked | untracked_files | untracked_dirs
     return sorted(
         rel for rel in restored
         if rel in still
-        or _index_flags(index.get(rel, _INDEX_ABSENT)) != "--")
+        or _hides_worktree(_index_flags(index.get(rel, _INDEX_ABSENT))))
 
 
 _INDEX_FLAG_OPTS = {"S": "--skip-worktree", "A": "--assume-unchanged"}
