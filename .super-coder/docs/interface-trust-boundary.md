@@ -48,9 +48,33 @@ The web, and the network — in full, and these controls are release-critical:
 | A webpage on another origin scripting your Interface | Exact same-origin `Origin` **and** `Sec-Fetch-Site: same-origin` on bootstrap; `SameSite=Strict` cookie; `X-CSRF` on every mutation; CORS stays off |
 | Cross-site request forgery | `SameSite=Strict` + an anti-forgery token held only in page memory |
 | DNS rebinding | Exact `Host` allowlist (`127.0.0.1` / `localhost`), every route |
-| Accidental network exposure | The service binds loopback only; a non-loopback bind refuses to start |
+| Accidental network exposure | Reachable from the host's loopback interface only — see [the exact guarantee](#the-bind-guarantee-exactly) |
 | Credential leakage from the browser | The browser is never given a credential to leak — see below |
 | Remote clients | No route in; reach it through your own secure transport (e.g. a tailnet) or not at all |
+
+### The bind guarantee, exactly
+
+Because the browser session mints automatically, the *only* thing standing
+between a remote client and Interface authority is that the remote client
+cannot reach the port — a network client able to choose its own `Host` and
+`Origin` headers passes every other fence. So it is worth being precise about
+what enforces that, rather than restating "binds loopback only":
+
+- **On your host** (`./sc serve`, the supervised stack): the server checks
+  `SC_BIND` at startup and **exits** unless it is a loopback address. Setting
+  `SC_BIND=0.0.0.0` does not widen the Interface; it stops it booting.
+- **Inside the sandbox container**: the bind *is* `0.0.0.0`, deliberately, so
+  docker can publish the port — and the boundary is the published mapping,
+  `-p 127.0.0.1:PORT:PORT`, which is loopback-only on the host whatever the
+  container binds. The in-process guard stands down there (it detects
+  `SC_SANDBOX`) because refusing would break `./sc launch` without removing
+  any exposure.
+
+Net: reachable from the host's loopback interface only, enforced in-process
+off-sandbox and by docker's port mapping in it. Neither path exposes the
+Interface to the network, and neither claims more than it does. Remote access
+is a separate authenticated boundary you put in front (e.g. a tailnet) — never
+a wider bind.
 
 Same-origin script execution is operator-equivalent here. The restrictive CSP,
 the vendored scripts, the sanitized rendered content, and the absence of any
@@ -98,7 +122,10 @@ rendered state, or a log.
   server deletes the session and answers `401 browser_session_expired`.
 - **Rotation revokes.** Every bootstrap mints a new identifier and a new
   anti-forgery token, and destroys the session the caller presented in the
-  same step.
+  same step. A request still in flight under the revoked identifier is
+  re-checked at dispatch and answered `401` rather than completing — the one
+  exception being a handler already executing, which finishes under the
+  authority it started with.
 - **A service restart invalidates every session.** That is the normal recovery
   path, not a fault.
 - **One silent retry.** On the first `401` the UI bootstraps once and retries

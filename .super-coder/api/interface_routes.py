@@ -141,11 +141,12 @@ def _parse_headers(headers_raw: str):
 
 class _Actor:
     def __init__(self, kind: str, scope: str, csrf_ok: bool,
-                 shell_id: "int | None" = None):
+                 shell_id: "int | None" = None, sid: str = ""):
         self.kind = kind          # "operator" | "browser" | "shell"
         self.scope = scope        # idempotency actor_scope
         self.csrf_ok = csrf_ok    # mutation authority for browser actors
         self.shell_id = shell_id  # set for kind="shell" (the planner's token)
+        self.sid = sid            # set for kind="browser" (re-checked at commit)
 
 
 def _host_ok(headers) -> bool:
@@ -215,13 +216,49 @@ def _resolve_actor(headers) -> "_Actor | None":
             sess = _browser_sessions.get(sid)
             if sess is None:
                 return None
-            # Successful authenticated use advances the inactivity deadline
-            # (spec #26 Session Lifecycle).
-            sess["last_seen"] = now
             csrf = sess["csrf"]
+        # NB: the inactivity deadline is NOT advanced here. Resolving a cookie
+        # is not yet "successful authenticated use" (spec #26 Session
+        # Lifecycle) — the anti-forgery, provenance, and scope fences below
+        # can still reject this request, and a rejected request must not keep
+        # a session alive. `_commit_browser_use` does it once those pass.
         return _Actor("browser", f"browser:{sid[:16]}",
-                      (headers.get("X-CSRF") or "") == csrf)
+                      (headers.get("X-CSRF") or "") == csrf, sid=sid)
     return None
+
+
+def _commit_browser_use(sid: str) -> bool:
+    """Authorize a browser request at the point of dispatch, in one critical
+    section, and advance its inactivity deadline.
+
+    Two findings share this function because they are the same window. The
+    fences run against a session resolved earlier in the request, and
+    `_browser_lock` is released in between — so a bootstrap arriving
+    concurrently can revoke that session (rotation removes the presented sid)
+    after the request was authorized but before its handler runs any side
+    effect. Re-checking membership here, immediately before dispatch, is what
+    makes spec #26's "atomically replaces" true against in-flight requests:
+    a revoked identifier cannot reach a handler.
+
+    The alternative — holding `_browser_lock` across dispatch — was rejected:
+    handlers do blocking sqlite and subprocess work, so it would serialize
+    every Interface request behind the slowest one. The residual window is
+    therefore revocation landing DURING a handler's own execution, which is
+    not interrupted; that request completes under the authority it held when
+    it started. Stated rather than papered over.
+
+    Returns False when the session is gone (rotated away, expired, or lost to
+    a restart) — the caller answers 401 and the UI recovers.
+    """
+    now = time.time()
+    with _browser_lock:
+        _sweep_browser_sessions(now)
+        sess = _browser_sessions.get(sid)
+        if sess is None:
+            return False
+        # Only successful authenticated use advances the deadline (spec #26).
+        sess["last_seen"] = now
+        return True
 
 
 def _cookie_session_id(headers) -> str:
@@ -2344,6 +2381,13 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
         if not _mutation_site_ok(headers):
             return _err(403, "not_same_origin",
                         "cross-site mutation rejected")
+    # Every fence above has passed, and nothing below this line rejects on
+    # authority — so this is the one point where the request is known to be
+    # successful authenticated use. Re-check the session against a concurrent
+    # rotation and advance its deadline in the same critical section.
+    if actor.kind == "browser" and not _commit_browser_use(actor.sid):
+        return _err(401, "browser_session_expired",
+                    "browser session expired — bootstrap a new one")
 
     try:
         if p == "/api/interface/shells" and method == "GET":

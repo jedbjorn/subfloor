@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Startup refusal for a materialized-engine / unmigrated-DB half floor."""
+"""Startup refusals: a materialized-engine / unmigrated-DB half floor, and a
+non-loopback bind (spec #26)."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -81,6 +83,44 @@ class ServerSchemaGuardTest(unittest.TestCase):
                 con.close()
 
             server.require_current_schema(db_path, MIGRATIONS)
+
+
+class LoopbackBindGuardTest(unittest.TestCase):
+    """Spec #26 Failure Modes: a non-loopback bind refuses to start.
+
+    This is the fence behind the automatic browser bootstrap: a session mints
+    for any caller that can present an allowed `Host` and a same-origin
+    `Origin`, both of which a remote client chooses freely. Unreachability is
+    therefore the control, and it has to be enforced rather than assumed.
+    """
+
+    def test_host_refuses_a_non_loopback_bind(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SC_SANDBOX", None)
+            for bind in ("0.0.0.0", "", "::", "192.168.1.10",
+                         "10.0.0.5", "example.com"):
+                with self.subTest(bind=bind):
+                    with self.assertRaises(SystemExit) as caught:
+                        server.require_loopback_bind(bind)
+                    self.assertIn("loopback", str(caught.exception))
+
+    def test_host_accepts_loopback_binds(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SC_SANDBOX", None)
+            for bind in ("127.0.0.1", "localhost", "LocalHost", "::1",
+                         "[::1]", "127.0.0.53"):
+                with self.subTest(bind=bind):
+                    server.require_loopback_bind(bind)
+
+    def test_sandbox_keeps_the_wide_bind_docker_publishes(self):
+        # `./sc launch` sets SC_BIND=0.0.0.0 in the container ON PURPOSE so
+        # docker can publish the port; the boundary there is the
+        # `-p 127.0.0.1:PORT:PORT` mapping, which is loopback-only on the
+        # host whatever the container binds. Refusing here would make the
+        # sandbox unlaunchable while removing no exposure — so the guard
+        # stands down, and only here.
+        with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}):
+            server.require_loopback_bind("0.0.0.0")
 
 
 if __name__ == "__main__":

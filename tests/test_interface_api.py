@@ -491,6 +491,88 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertGreater(routes._browser_sessions[sid]["last_seen"], stale)
 
+    def test_rejected_calls_do_not_advance_the_deadline(self):
+        """Spec #26: ONLY successful authenticated use advances the
+        inactivity deadline. A call that a fence rejected is not use — so a
+        session cannot be kept alive indefinitely by traffic that never
+        authenticates, including traffic a hostile page can cause."""
+        cookie, csrf = self._browser()
+        sid = cookie.split("=", 1)[1]
+        stale = time.time() - routes.BROWSER_SESSION_TTL_S + 60
+        rejected = (
+            ("cookie-only mutation", (f"Cookie: {cookie}",
+                                      "Idempotency-Key: d1")),
+            ("malformed anti-forgery token",
+             (f"Cookie: {cookie}", "X-CSRF: not-the-token",
+              "Idempotency-Key: d2")),
+            ("cross-site mutation",
+             (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+              "Origin: http://evil.example.com",
+              "Sec-Fetch-Site: cross-site", "Idempotency-Key: d3")),
+        )
+        for label, header_lines in rejected:
+            with self.subTest(label):
+                routes._browser_sessions[sid]["last_seen"] = stale
+                status, _, _ = self.call("POST", "/api/interface/sessions",
+                                         header_lines, {"shell_id": 1})
+                self.assertEqual(status, 403)
+                self.assertEqual(
+                    routes._browser_sessions[sid]["last_seen"], stale,
+                    f"{label} refreshed the inactivity deadline")
+
+    def test_rotation_revokes_a_request_already_in_flight(self):
+        """Spec #26 Bootstrap Flow 4: a bootstrap atomically REPLACES the
+        session named by the presented cookie. Sequential revocation is
+        already covered above; what this pins is the concurrent case, which
+        is where the claim was previously false.
+
+        The interleaving is forced deterministically rather than raced: the
+        rotation is driven from inside the fence that runs after the old
+        cookie resolved to an actor and before dispatch — exactly the window
+        a concurrent bootstrap would land in. The in-flight request must be
+        answered 401 and must NOT reach its handler."""
+        cookie, csrf = self._browser()
+        first = cookie.split("=", 1)[1]
+        rotated = []
+        real_site_ok = routes._mutation_site_ok
+
+        def rotate_then_check(headers):
+            # Runs once, after _resolve_actor accepted the old cookie.
+            if not rotated:
+                status, hdrs_, _ = self._bootstrap(f"Cookie: {cookie}",
+                                                   key="b-inflight")
+                assert status == 201
+                rotated.append(hdrs_["Set-Cookie"].split(";")[0])
+            return real_site_ok(headers)
+
+        def count_sessions():
+            con = sqlite3.connect(self.db_path)
+            try:
+                return con.execute(
+                    "SELECT COUNT(*) FROM interface_sessions").fetchone()[0]
+            finally:
+                con.close()
+
+        before = count_sessions()
+        with mock.patch.object(routes, "_mutation_site_ok",
+                               rotate_then_check):
+            status, _, body = self.call(
+                "POST", "/api/interface/sessions",
+                (f"Cookie: {cookie}", f"X-CSRF: {csrf}",
+                 "Idempotency-Key: c-inflight"), {"shell_id": 1})
+        self.assertEqual(status, 401, body)
+        self.assertEqual(body["error"]["code"], "browser_session_expired")
+        # The handler never ran: revocation beat the side effect, not just
+        # the response code.
+        self.assertEqual(count_sessions(), before,
+                         "a revoked session still created a chat")
+        self.assertNotIn(first, routes._browser_sessions)
+        # The replacement minted in that same window is the live one.
+        new_cookie = rotated[0]
+        status, _, _ = self.call("GET", "/api/interface/shells",
+                                 (f"Cookie: {new_cookie}",))
+        self.assertEqual(status, 200)
+
     def test_browser_sessions_are_live_process_state_only(self):
         """A restart wipes them — which is exactly the contract the UI's one
         silent re-bootstrap relies on, and why they never touch the DB."""

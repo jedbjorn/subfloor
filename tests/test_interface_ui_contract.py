@@ -214,9 +214,10 @@ if (lastScrolled.title !== "model-59" || lastScrolled.block !== "nearest") {
 
 def test_browser_bootstrap_carries_no_capability_and_retries_once():
     """Spec #26: the browser signs itself in with same-origin provenance
-    alone. The capability must not reappear in page code, and the one silent
+    alone. The capability must not reappear in page code, the one silent
     recovery must reuse the original idempotency key so a retry cannot
-    duplicate a mutation."""
+    duplicate a mutation, and recovery fires on 401 ONLY — a 403 fence must
+    fail closed rather than be answered with a fresh token."""
     assert "operator.token" not in BOOTSTRAP
     assert "Authorization" not in BOOTSTRAP
     assert "prompt(" not in BOOTSTRAP
@@ -284,6 +285,24 @@ const invariant = (cond, msg) => { if (!cond) throw new Error(msg); };
   try { await apiIf("/interface/shells"); } catch (e) { raised = e; }
   invariant(raised && raised.code === "browser_session_expired", "second 401 did not surface");
   invariant(calls.length === 3, `retry looped: ${calls.length} calls`);
+
+  // 3b. A 403 is a fence that fired, NOT a recovery signal: fail closed.
+  //     Re-bootstrapping here would answer a rejected anti-forgery token with
+  //     a freshly minted valid one, turning the CSRF gate into a retry — the
+  //     exact negative case spec #26's release gate names. One call, no
+  //     bootstrap, error surfaced.
+  for (const code of ["csrf", "not_same_origin"]) {
+    calls.length = 0;
+    ifCsrf = "tok-live";
+    plan = [{ status: 403, body: { error: { code } } }];
+    raised = null;
+    try { await apiIf("/interface/sessions", "POST", { shell_id: 1 }); } catch (e) { raised = e; }
+    invariant(raised && raised.code === code, `403 ${code} did not surface`);
+    invariant(calls.length === 1, `403 ${code} was retried: ${calls.length} calls`);
+    invariant(calls[0].url !== "/api/interface/browser-sessions",
+      `403 ${code} triggered a re-bootstrap`);
+    invariant(ifCsrf === "tok-live", `403 ${code} discarded the live token`);
+  }
 
   // 4. No cookies, no session — and no fallback to a pasted credential.
   calls.length = 0;

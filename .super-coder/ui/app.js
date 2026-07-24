@@ -2132,10 +2132,16 @@ async function ifBootstrap() {
   ifCsrf = data.csrf;
 }
 // api() twin for /api/interface/* — same-origin credentials + X-CSRF. One
-// silent re-bootstrap + retry on 401/403 (the session expired, or the server
-// restarted). The Idempotency-Key is minted once per CALL, never per attempt,
-// so that retry replays the original mutation instead of running a second
-// one — recovery must not be able to duplicate a mutation (spec #26).
+// silent re-bootstrap + retry on the first 401 ONLY: 401 is the spec's
+// recovery signal (the session expired, was rotated away, or the server
+// restarted). A 403 is a fence that fired — a malformed anti-forgery token, a
+// cross-site mutation, a disallowed Host — and those must fail closed and
+// surface, because re-bootstrapping on 403 would hand the caller a fresh
+// valid token and turn the CSRF gate into a retry (spec #26 Session
+// Lifecycle: "On the first 401"). The Idempotency-Key is minted once per
+// CALL, never per attempt, so that retry replays the original mutation
+// instead of running a second one — recovery must not be able to duplicate a
+// mutation (spec #26).
 async function apiIf(path, method = "GET", body, idemKey) {
   const key = method === "GET" ? undefined : (idemKey || crypto.randomUUID());
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -2147,7 +2153,7 @@ async function apiIf(path, method = "GET", body, idemKey) {
       method, credentials: "same-origin", headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if ((r.status === 401 || r.status === 403) && attempt === 0) { ifCsrf = null; continue; }
+    if (r.status === 401 && attempt === 0) { ifCsrf = null; continue; }
     const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
     if (!r.ok) throw ifError(r, data);
     return data;
