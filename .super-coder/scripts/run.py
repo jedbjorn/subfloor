@@ -42,6 +42,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -69,6 +70,7 @@ import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness
 ADAPTERS = ENGINE / "adapters"
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
+SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
 
 
 def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
@@ -748,15 +750,17 @@ def session_provider(harness: str, model: "str | None") -> "str | None":
     return model_catalog.HARNESS_PROVIDER.get(harness)
 
 
-def open_session(con, shell_id: int,
-                 lifecycle: "dict | None" = None) -> tuple[str, int]:
-    """`lifecycle` carries the launch telemetry persisted onto the archive row
-    (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
-    NOT written here: run.py execs the harness, so no code runs at exit; the
-    analytics sweep backfills it from harness session data."""
-    life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            **(lifecycle or {})}
-    life_cols = ["started_at", "harness", "provider", "model", "sprint_ref"]
+class SessionOpenError(RuntimeError):
+    """A bounded session-open refusal that is safe to show to the operator."""
+
+
+def _is_db_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _write_session(con, shell_id: int, life: dict,
+                   life_cols: list[str]) -> tuple[str, int]:
     # Reuse the active session if it was opened but never used (e.g. install
     # opened session 0001, or a prior launch did no work) — avoids phantom empty
     # sessions and the incidental first-snapshot diff. The reused stub becomes
@@ -781,7 +785,6 @@ def open_session(con, shell_id: int,
                 f"UPDATE shell_memory_archives SET {', '.join(c + '=?' for c in life_cols)} "
                 "WHERE archive_id=?",
                 [life.get(c) for c in life_cols] + [row["archive_id"]])
-            con.commit()
             return row["session_id"], row["archive_id"]
 
     last = con.execute(
@@ -801,8 +804,57 @@ def open_session(con, shell_id: int,
     archive_id = cur.lastrowid
     con.execute("UPDATE shells SET active_archive_id=? WHERE shell_id=?",
                 (archive_id, shell_id))
-    con.commit()
     return session_id, archive_id
+
+
+def open_session(con, shell_id: int,
+                 lifecycle: "dict | None" = None) -> tuple[str, int]:
+    """Atomically open a lifecycle archive, with bounded lock retries.
+
+    `lifecycle` carries the launch telemetry persisted onto the archive row
+    (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
+    NOT written here: run.py execs the harness, so no code runs at exit; the
+    analytics sweep backfills it from harness session data.
+
+    Launch connections enter with no transaction. BEGIN IMMEDIATE obtains the
+    writer reservation before the read/allocate/write sequence, so a retry
+    always restarts from fresh state and can never leave a half-open archive.
+    shell_factory calls inside its own write transaction; preserve its existing
+    transaction and commit contract rather than nesting BEGIN.
+    """
+    life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **(lifecycle or {})}
+    life_cols = ["started_at", "harness", "provider", "model", "sprint_ref"]
+    delays = SESSION_OPEN_RETRY_DELAYS_S if not con.in_transaction else ()
+    attempts = len(delays) + 1
+
+    for attempt in range(attempts):
+        try:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            result = _write_session(con, shell_id, life, life_cols)
+            con.commit()
+            return result
+        except db_driver.OperationalError as exc:
+            con.rollback()
+            if not _is_db_busy(exc):
+                raise
+            if attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            wait_ms = con.execute("PRAGMA busy_timeout").fetchone()[0]
+            raise SessionOpenError(
+                f"engine DB remained busy across {attempts} bounded "
+                f"session-open attempt(s) (up to {wait_ms} ms each); no session "
+                "or archive was created. Retry after the concurrent engine write "
+                "finishes; if this persists, inspect the engine API/worker logs "
+                "for a long-running DB writer."
+            ) from exc
+        except Exception:
+            con.rollback()
+            raise
+
+    raise AssertionError("unreachable")
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -937,12 +989,16 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         except Exception:
             pass
 
-    session_id, archive_id = open_session(con, shell_id, lifecycle={
-        "harness": harness,
-        "provider": session_provider(harness, session_model),
-        "model": session_model,
-        "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
-    })
+    try:
+        session_id, archive_id = open_session(con, shell_id, lifecycle={
+            "harness": harness,
+            "provider": session_provider(harness, session_model),
+            "model": session_model,
+            "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+        })
+    except SessionOpenError as exc:
+        con.close()
+        raise LaunchError(str(exc)) from exc
 
     full = con.execute(
         "SELECT shell_id, display_name, shortname, partner, role, mandate, "
@@ -1257,12 +1313,17 @@ def main() -> None:
         # The model this launch will actually route (headless resolves via flags →
         # flavor default; interactive routes the flavor default). None = the harness
         # picks its own — recorded as NULL, honest about what we know at boot.
-        session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
-            "harness": harness,
-            "provider": session_provider(harness, session_model),
-            "model": session_model,
-            "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
-        })
+        try:
+            session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
+                "harness": harness,
+                "provider": session_provider(harness, session_model),
+                "model": session_model,
+                "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+            })
+        except SessionOpenError as exc:
+            con.close()
+            prefix = "sc run" if headless else "session launch"
+            sys.exit(f"{prefix}: {exc}")
 
         full = con.execute(
             "SELECT shell_id, display_name, shortname, partner, role, mandate, "
