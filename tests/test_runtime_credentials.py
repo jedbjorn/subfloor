@@ -30,6 +30,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -71,6 +72,24 @@ def refuse(fn):
                 return 1, exc.code
             return exc.code, err.getvalue()
     raise AssertionError("expected a refusal, got a clean return")
+
+
+@contextlib.contextmanager
+def deadline(seconds=5):
+    """Fail the test if the body blocks longer than `seconds`.
+
+    Discovery classifies the artifact before opening it precisely so a FIFO at
+    the artifact path cannot wedge the caller. A regression there hangs
+    forever; this turns that into a failure instead of a stuck suite."""
+    def _expired(signum, frame):
+        raise AssertionError(f"blocked for more than {seconds}s")
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def build_shells_db(path: Path) -> None:
@@ -124,6 +143,24 @@ class ProvisionTest(unittest.TestCase):
         self.assertEqual(mode, 0o600)
         dmode = stat.S_IMODE(self.run_dir.stat().st_mode)
         self.assertEqual(dmode, 0o700)
+
+    def test_mode_is_exactly_0600_under_any_umask(self):
+        """The credential's mode is pinned, not inherited from the process.
+
+        mkstemp asks for 0600 through open(), so the umask still subtracts
+        from it: under 0o077 the result happens to be right, under 0o777 the
+        service would hand every Admin seat a mode-000 artifact its own
+        discovery then refuses. The mode must be exactly 0600 either way."""
+        original = os.umask(0o022)
+        self.addCleanup(os.umask, original)
+        for mask in (0o000, 0o022, 0o077, 0o777):
+            with self.subTest(umask=oct(mask)):
+                os.umask(mask)
+                self.provision()
+                artifact = self.run_dir / "ADM1.json"
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(self.run_dir.stat().st_mode), 0o700)
+                artifact.unlink()   # next round writes a fresh inode
 
     def test_reprovision_repairs_weakened_permissions(self):
         self.provision()
@@ -292,6 +329,32 @@ class DiscoveryTest(unittest.TestCase):
         self.assertEqual(mem.SC_API_TOKEN, "")
         self.assertEqual(outside.read_text(), before)  # target untouched
 
+    def test_fifo_artifact_is_refused_without_blocking(self):
+        """A FIFO planted at the artifact name is a denial-of-service on
+        discovery, not just a bad file: opening it blocks until someone writes,
+        and O_NOFOLLOW does nothing about that. It must be classified as unsafe
+        without ever being opened — bounded, exit 2, nothing adopted."""
+        os.mkfifo(self.cred_dir / "TC.json", 0o600)
+        with deadline():
+            code, err = refuse(self.run_which)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("not a regular file", err)
+        self.assertIn("restart", err)
+        self.assertIsNone(mem._DISCOVERED_FROM)
+        self.assertEqual(mem.SC_API_TOKEN, "")
+
+    def test_wrong_owner_artifact_is_unsafe_not_unavailable(self):
+        """An artifact owned by someone else is outside the trust boundary
+        (exit 2) — and it must be classified as such by ownership, not by
+        whether open() happens to fail EACCES first (which would report the
+        'nothing to read' class instead)."""
+        self.write_artifact("TC", TOKEN)
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+            code, err = refuse(self.run_which)
+        self.assertEqual(code, mem.EXIT_UNSAFE)
+        self.assertIn("owned by another user", err)
+        self.assertIsNone(mem._DISCOVERED_FROM)
+
     def test_dangling_symlink_is_refused_not_reported_missing(self):
         (self.cred_dir / "TC.json").symlink_to(self.cred_dir / "gone.json")
         code, err = refuse(self.run_which)
@@ -444,7 +507,7 @@ class TokenCommandTest(unittest.TestCase):
         env.pop("SC_MEM_AS", None)
         return subprocess.run(
             [sys.executable, str(ENGINE / "scripts" / "operator_token.py")],
-            capture_output=True, text=True, env=env)
+            capture_output=True, text=True, env=env, timeout=30)
 
     def test_script_end_to_end(self):
         """Real interpreter, real artifact: stdout is the token and only the
@@ -474,6 +537,16 @@ class TokenCommandTest(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertIn("owner-only", proc.stderr)
         self.assertNotIn(TOKEN, proc.stderr)
+
+    def test_script_fifo_artifact_refuses_bounded(self):
+        """The FIFO case, in a real process: `./sc token` must exit 2 promptly
+        with empty stdout. A regression blocks in open() forever, which the
+        subprocess timeout turns into a failure rather than a hung CI job."""
+        os.mkfifo(self.cred_dir / "TC.json", 0o600)
+        proc = self.run_script()
+        self.assertEqual(proc.returncode, mem.EXIT_UNSAFE)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("not a regular file", proc.stderr)
 
     def test_script_symlinked_artifact_refuses_without_printing(self):
         outside = Path(tempfile.mkdtemp()) / "planted.json"

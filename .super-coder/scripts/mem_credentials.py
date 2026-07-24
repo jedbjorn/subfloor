@@ -63,13 +63,18 @@ def provision(db_path: str, api_base: str, run_dir: Path = RUN_DIR) -> list[str]
         path = run_dir / f"{shortname}.json"
         # Never open the artifact path for writing: a symlink planted there
         # would be followed and its target truncated and overwritten with a
-        # bearer token. Write a freshly created 0600 regular file (mkstemp is
-        # O_EXCL and ignores the umask) and rename it over the name — rename
-        # replaces the link itself, never what the link points at. This also
-        # repairs a previously weakened artifact: every boot writes a new inode.
+        # bearer token. Write a freshly created regular file (mkstemp is
+        # O_EXCL) and rename it over the name — rename replaces the link
+        # itself, never what the link points at. This also repairs a previously
+        # weakened artifact: every boot writes a new inode.
         fd, tmp = tempfile.mkstemp(dir=run_dir, prefix=f".{shortname}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as fh:
+                # mkstemp's own 0600 is an open() mode — the process umask
+                # still subtracts from it, so a permissive umask would hand
+                # out a mode-000 (unreadable) credential. Pin the mode on the
+                # descriptor instead: exactly 0600, whatever the umask is.
+                os.fchmod(fh.fileno(), 0o600)
                 fh.write(payload.encode())
             os.replace(tmp, path)
         except OSError:

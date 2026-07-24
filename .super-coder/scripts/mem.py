@@ -126,35 +126,63 @@ def _read_all(fd: int) -> bytes:
         chunks.append(chunk)
 
 
+def _unsafe_reason(st: os.stat_result) -> "str | None":
+    """The local trust boundary as a predicate on a stat result: a real file,
+    owned by this user, with no group/world permission bits (the service writes
+    0600 under a 0700 dir). Returns why it fails, or None when it passes."""
+    if stat.S_ISLNK(st.st_mode):
+        return "a symbolic link"
+    if not stat.S_ISREG(st.st_mode):
+        return "not a regular file"
+    if st.st_uid != os.geteuid():
+        return f"owned by another user (uid {st.st_uid})"
+    if st.st_mode & 0o077:
+        return f"not owner-only (mode {oct(stat.S_IMODE(st.st_mode))})"
+    return None
+
+
+def _refuse_unsafe(path: Path, reason: str) -> "NoReturn":  # noqa: F821
+    die(f"runtime credential {path} is {reason} — the trust boundary covers "
+        "only an owner-only regular file; remove what is there and let the "
+        "supervised service re-provision it with mode 0600 at boot "
+        "(`./sc restart` / `make dos-r`).", EXIT_UNSAFE)
+
+
 def _load_runtime_credential(path: Path) -> None:
     """Trust-boundary check, then adopt the artifact's bearer token + base.
 
-    Accepted only under the existing local trust boundary: a regular file,
-    owned by this user, with no group/world permission bits (the service
-    writes 0600 under a 0700 dir). Anything weaker is refused, not used.
+    Classified twice, deliberately. lstat first, because opening the path is
+    not a free observation: a FIFO planted at the artifact name blocks open()
+    forever — O_NOFOLLOW does not help, it only refuses symlinks — and a
+    wrong-owner artifact fails open() with EACCES, which is a trust-boundary
+    refusal (exit 2), not a "nothing to read" (exit 1). lstat answers both
+    without opening anything.
 
-    The check is on the opened inode, never on the path: O_NOFOLLOW refuses a
-    symlink outright (a same-user link could otherwise point discovery at a
-    file that passes the checks), and fstat + read on that one descriptor
-    leaves no window to swap the path between checking and using it."""
+    lstat is a path check, so it cannot be the authority: fstat on the opened
+    descriptor re-runs the same predicate, and the read comes off that same
+    descriptor — no window to swap the path between checking and using it.
+    O_NOFOLLOW closes the symlink half of that race, O_NONBLOCK the blocking
+    half."""
     global SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        pre = os.lstat(path)
+    except OSError as exc:
+        die(f"runtime credential {path} is unreadable ({exc}) — restart the "
+            "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
+    reason = _unsafe_reason(pre)
+    if reason:
+        _refuse_unsafe(path, reason)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
-            die(f"runtime credential {path} is a symbolic link — the trust "
-                "boundary covers only a real owner-only file; remove the link "
-                "and let the supervised service re-provision it "
-                "(`./sc restart` / `make dos-r`).", EXIT_UNSAFE)
+            _refuse_unsafe(path, "a symbolic link")
         die(f"runtime credential {path} is unreadable ({exc}) — restart the "
             "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
-            die(f"runtime credential {path} is not an owner-only regular file "
-                f"(mode {oct(stat.S_IMODE(st.st_mode))}) — the supervised service "
-                "re-provisions it with mode 0600 at boot: `./sc restart` / `make dos-r`.",
-                EXIT_UNSAFE)
+        reason = _unsafe_reason(os.fstat(fd))   # the authoritative check
+        if reason:
+            _refuse_unsafe(path, reason)
         try:
             data = json.loads(_read_all(fd))
             token, base = data["token"], data["api_base"]
