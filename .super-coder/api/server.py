@@ -2255,13 +2255,6 @@ class Handler(BaseHTTPRequestHandler):
             if existing is not None:
                 return self._send(200, {"watch_id": existing["watch_id"],
                                         "existing": True, "daemon": daemon})
-            unscoped = None
-            if sprint_doc_id is not None:
-                unscoped = con.execute(
-                    "SELECT watch_id FROM watched_prs "
-                    "WHERE repo=? AND pr_number=? AND shell_id=? "
-                    "AND closed_at IS NULL AND sprint_doc_id IS NULL",
-                    (repo, pr, target)).fetchone()
             # Registration baseline (spec: an immediate GitHub read, normalized
             # and stored BEFORE arming; a failed baseline creates no armed
             # watch and returns a retryable sanitized error). The gh call
@@ -2271,6 +2264,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {"error":
                     f"baseline read failed (retryable): {err}",
                     "retryable": True, "daemon": daemon})
+            # The baseline is an external read and cannot hold a DB writer
+            # reservation. Revalidate scope after it, under the same
+            # transaction that arms or rebinds the watch, so sprint closure
+            # cannot land between the ACTIVE decision and its write.
+            con.execute("BEGIN IMMEDIATE")
+            if not pr_poller.is_active_sprint(con, sprint_doc_id):
+                con.rollback()
+                return self._send(409, {"error":
+                    f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
+                    "SPRINT doc — watches arm only to active sprints"})
+            existing = con.execute(
+                "SELECT watch_id FROM watched_prs "
+                "WHERE repo=? AND pr_number=? AND shell_id=? "
+                "AND closed_at IS NULL AND sprint_doc_id=?",
+                (repo, pr, target, sprint_doc_id)).fetchone()
+            if existing is not None:
+                con.rollback()
+                return self._send(200, {"watch_id": existing["watch_id"],
+                                        "existing": True, "daemon": daemon})
+            unscoped = con.execute(
+                "SELECT watch_id FROM watched_prs "
+                "WHERE repo=? AND pr_number=? AND shell_id=? "
+                "AND closed_at IS NULL AND sprint_doc_id IS NULL",
+                (repo, pr, target)).fetchone()
             if unscoped is not None:
                 con.execute(
                     "UPDATE watched_prs SET sprint_doc_id=?, last_seen=? "

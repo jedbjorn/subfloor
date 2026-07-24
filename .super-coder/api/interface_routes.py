@@ -1625,7 +1625,8 @@ def _sprint_alerts(actor, query: dict):
     """GET /api/interface/sprint-alerts — the operator's window into wake
     failures (spec Data Model planner_alerts; deduplicated while open).
     Default lists OPEN alerts; include_resolved=1 adds the audit history.
-    A shell actor sees only alerts tied to its own sessions or bindings."""
+    A shell actor sees only alerts tied to its own sessions, bindings, or
+    watches. Watch alerts remain visible without a current Interface session."""
     session_id = _qint(query, "session_id")
     binding_id = _qint(query, "binding_id")
     planner = _qint(query, "planner_shell_id")
@@ -1678,7 +1679,10 @@ def _sprint_alerts(actor, query: dict):
         finally:
             con.close()
         if current is None:
-            conds.append("1=0")
+            # Session/binding alerts require a current generation by default,
+            # but a dormant watch may be the reason no planner session exists.
+            # Keep that repair signal owner-visible without a live session.
+            conds.append("a.watch_id IS NOT NULL")
         else:
             generation = current[0]
     if generation is not None:

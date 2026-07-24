@@ -485,6 +485,39 @@ class ApiTest(unittest.TestCase):
         self.assertIn('"state": "OPEN"', row["last_seen"])
         self.assertIn('"sha": "abc1234def"', row["last_seen"])
 
+    def test_registration_refuses_scope_closed_during_baseline(self):
+        con = sqlite3.connect(self.db)
+        seed_sprint_doc(con, 101)
+        con.close()
+        real = pr_poller.baseline_read
+
+        def close_scope(repo, pr):
+            con = sqlite3.connect(self.db)
+            try:
+                con.execute(
+                    "UPDATE documents SET body="
+                    "'# SPRINT: T\nstatus: CLOSED\n' WHERE document_id=101")
+                con.commit()
+            finally:
+                con.close()
+            return ({"state": "OPEN", "sha": "closed-during-baseline",
+                     "checks": "PENDING", "reviews": 0,
+                     "review_state": None}, None)
+
+        pr_poller.baseline_read = close_scope
+        try:
+            with self.assertRaises(SystemExit) as denied:
+                watch.main(
+                    ["pr", "own/repo", "22", "--sprint", "101"])
+        finally:
+            pr_poller.baseline_read = real
+
+        self.assertIn("HTTP 409", str(denied.exception))
+        self.assertIn("not an ACTIVE, unfrozen SPRINT doc",
+                      str(denied.exception))
+        self.assertEqual(
+            self.q("SELECT 1 FROM watched_prs WHERE pr_number=22"), [])
+
     def test_scoped_registration_rebinds_legacy_and_resolves_alert(self):
         con = sqlite3.connect(self.db)
         watch_id = con.execute(
@@ -511,6 +544,53 @@ class ApiTest(unittest.TestCase):
             "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
             watch_id)[0]
         self.assertIsNotNone(alert["resolved_at"])
+
+    def test_legacy_rebind_refuses_scope_closed_during_baseline(self):
+        con = sqlite3.connect(self.db)
+        seed_sprint_doc(con, 102)
+        watch_id = con.execute(
+            "INSERT INTO watched_prs "
+            "(repo, pr_number, shell_id, last_seen) "
+            "VALUES ('own/repo', 23, 1, '{\"state\":\"OPEN\"}')").lastrowid
+        con.execute(
+            "INSERT INTO planner_alerts "
+            "(watch_id, severity, reason, dedupe_key) VALUES "
+            "(?, 'critical', 'pr_watch_unscoped', ?)",
+            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+        con.commit()
+        con.close()
+        real = pr_poller.baseline_read
+
+        def freeze_scope(repo, pr):
+            con = sqlite3.connect(self.db)
+            try:
+                con.execute(
+                    "UPDATE documents SET frozen=1 WHERE document_id=102")
+                con.commit()
+            finally:
+                con.close()
+            return ({"state": "OPEN", "sha": "frozen-during-baseline",
+                     "checks": "SUCCESS", "reviews": 1,
+                     "review_state": "APPROVED"}, None)
+
+        pr_poller.baseline_read = freeze_scope
+        try:
+            with self.assertRaises(SystemExit) as denied:
+                watch.main(
+                    ["pr", "own/repo", "23", "--sprint", "102"])
+        finally:
+            pr_poller.baseline_read = real
+
+        self.assertIn("HTTP 409", str(denied.exception))
+        row = self.q(
+            "SELECT sprint_doc_id, last_seen FROM watched_prs "
+            "WHERE watch_id=?", watch_id)[0]
+        self.assertIsNone(row["sprint_doc_id"])
+        self.assertEqual(row["last_seen"], '{"state":"OPEN"}')
+        alert = self.q(
+            "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
+            watch_id)[0]
+        self.assertIsNone(alert["resolved_at"])
 
     def test_list_shows_live_watches(self):
         watch.main(["pr", "own/repo", "17", "--sprint", "100"])

@@ -319,6 +319,13 @@ class SprintOpsRoutesTest(unittest.TestCase):
 
     def test_unscoped_watch_alert_is_visible_only_to_its_owner(self):
         con = sqlite3.connect(self.db_path)
+        con.execute("DELETE FROM interface_input_state")
+        con.execute("DELETE FROM interface_sessions")
+        self.assertEqual(
+            con.execute(
+                "SELECT COUNT(*) FROM interface_sessions "
+                "WHERE shell_id=1 AND occupancy <> 'ended'").fetchone()[0],
+            0)
         watch_id = con.execute(
             "INSERT INTO watched_prs (repo, pr_number, shell_id) "
             "VALUES ('o/r', 7, 1)").lastrowid
