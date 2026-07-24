@@ -2177,6 +2177,7 @@ function ifDetach() {
   if (!a) return;
   ifAttach = null;
   clearInterval(a.heartbeat);
+  ifClearComposerAckTimer(a);
   a.resizeObs?.disconnect();
   try { a.ws?.close(); } catch { /* already closed */ }
   a.term?.dispose();
@@ -2237,8 +2238,13 @@ async function renderInterface(root) {
         s.shortname + (s.harness ? " · " + s.harness : "") + occupiedModel));
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
+    const mobileModel = s.availability === "occupied"
+      ? " · " + ifModelLabel(s.model_route)
+      : "";
     const opt = el("option", { value: s.shortname },
-      `${s.display_name || s.shortname} · ${s.shortname} · ${s.availability}`);
+      `${s.display_name || s.shortname} · ${s.shortname}` +
+      `${s.harness ? " · " + s.harness : ""}${mobileModel}` +
+      ` · ${s.availability}`);
     if (s.shortname === ifSelected) opt.selected = true;
     picker.append(opt);
   }
@@ -3013,7 +3019,8 @@ async function ifSessionPane(pane, sel) {
     browserComposerWanted: st.browserComposer, browserComposerError: "",
     browserComposerSyncing: false, browserComposerVersion: 0,
     browserComposerChain: Promise.resolve(),
-    composerSubmitLatched: false,
+    composerSubmitLatched: false, composerLatchedValue: null,
+    composerAckTimer: null, composerAckTimeoutMs: null,
     sprintPanelVersion: 0,
     composerProjectionPending: false, composerProjectionVersion: 0,
     composerProjectionSync: Promise.resolve() };
@@ -3131,6 +3138,18 @@ function ifSizeComposer(input) {
   input.style.height = Math.max(42, input.scrollHeight || 42) + "px";
 }
 
+const IF_COMPOSER_ACK_TIMEOUT_MS = 15000;
+
+function ifClearComposerLatch(a) {
+  a.composerSubmitLatched = false;
+  a.composerLatchedValue = null;
+}
+
+function ifClearComposerAckTimer(a) {
+  if (a.composerAckTimer != null) clearTimeout(a.composerAckTimer);
+  a.composerAckTimer = null;
+}
+
 function ifComposerWritable(a) {
   return a.legalActions.has("send_input") &&
     a.role === "writer" && a.st.writer === "active" && !a.halted &&
@@ -3161,9 +3180,12 @@ function ifPaintComposer(a) {
   const hasMessage = Boolean(a.composerInput.value.trim());
   // Do not let a new draft appear while a clean transition is in flight:
   // that would briefly project clean server-side while the box is non-empty.
-  // Dirty transitions need not freeze typing because every later character
-  // remains covered by the already-requested dirty state.
+  // Dirty transitions normally need not freeze typing because every later
+  // character remains covered by the already-requested dirty state. Once a
+  // submit is accepted locally, though, its exact draft is fenced and the box
+  // freezes until that one draft is queued.
   a.composerInput.disabled = !writable || pending ||
+    a.composerSubmitLatched ||
     (a.browserComposerSyncing && a.browserComposerWanted === "clean");
   const dirtyReady = a.browserComposerState === "dirty";
   const dirtySyncing = a.browserComposerSyncing &&
@@ -3203,7 +3225,7 @@ function ifRefreshComposerProjection(a) {
     a.legalActions = new Set(
       Array.isArray(session.legal_actions) ? session.legal_actions : []);
     a.stateReason = session.state_reason || "";
-    if (!a.legalActions.has("send_input")) a.composerSubmitLatched = false;
+    if (!a.legalActions.has("send_input")) ifClearComposerLatch(a);
   }).catch((e) => {
     if (ifAttach !== a || version !== a.composerProjectionVersion) return;
     a.legalActions.delete("send_input");
@@ -3236,12 +3258,12 @@ function ifSyncBrowserComposer(a, state) {
   }).catch((e) => {
     if (ifAttach === a) {
       a.browserComposerError = e.message;
-      a.composerSubmitLatched = false;
+      ifClearComposerLatch(a);
     }
   }).finally(() => {
     if (ifAttach !== a || version !== a.browserComposerVersion) return;
     a.browserComposerSyncing = false;
-    if (a.browserComposerError) a.composerSubmitLatched = false;
+    if (a.browserComposerError) ifClearComposerLatch(a);
     else if (a.composerSubmitLatched && a.browserComposerState === "dirty")
       ifComposerSend(a);
     a.paint();
@@ -3249,20 +3271,24 @@ function ifSyncBrowserComposer(a, state) {
 }
 
 function ifComposerSend(a) {
-  const value = a.composerInput.value;
-  if (!value.trim() || !ifComposerWritable(a) ||
+  const value = a.composerSubmitLatched
+    ? a.composerLatchedValue
+    : a.composerInput.value;
+  if (typeof value !== "string" || !value.trim() || !ifComposerWritable(a) ||
       a.composerPendingSeq != null || a.browserComposerError)
     return;
   if (a.browserComposerSyncing || a.browserComposerState !== "dirty" ||
       a.awaiting || a.outBuf) {
     if (a.browserComposerWanted === "dirty" ||
         a.browserComposerState === "dirty") {
-      a.composerSubmitLatched = true;
+      if (!a.composerSubmitLatched) {
+        a.composerSubmitLatched = true;
+        a.composerLatchedValue = value;
+      }
       a.paint();
     }
     return;
   }
-  a.composerSubmitLatched = false;
   // xterm emits carriage return for Enter. Reuse that exact byte convention
   // after the composed text so the existing broker submits the message.
   const seq = ifSendInput(a, value + "\r");
@@ -3271,7 +3297,19 @@ function ifComposerSend(a) {
     a.paint();
     return;
   }
+  ifClearComposerLatch(a);
   a.composerPendingSeq = seq;
+  ifClearComposerAckTimer(a);
+  a.composerAckTimer = setTimeout(() => {
+    if (ifAttach !== a || a.composerPendingSeq !== seq) return;
+    a.composerAckTimer = null;
+    a.composerPendingSeq = null;
+    a.awaiting = false;
+    a.halted = true;
+    a.st.note = "message acknowledgement timed out — delivery is unknown; " +
+      "the draft was retained. Inspect the terminal, then reattach before retrying";
+    a.paint();
+  }, a.composerAckTimeoutMs || IF_COMPOSER_ACK_TIMEOUT_MS);
   a.paint();
 }
 
@@ -3324,17 +3362,21 @@ async function ifEndChat(a, sel, pane, btn) {
   let r;
   try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: false }); }
   catch (e) {
-    // not_occupied: the generation is unreconciled, so there is no verified
-    // identity left to terminate. That is not a failure the operator can act
-    // on from here — it is the recovery path, which the server may now list a
-    // legal action for. Detach and re-render onto it (decision #49) instead
-    // of leaving a terminal error on a shell that can be unstranded.
-    if (e.status === 409 && e.code === "not_occupied") {
+    const reason = e.body && e.body.reason;
+    const needsRecovery = e.status === 409 && (
+      e.code === "not_occupied" || e.code === "identity_unverified" ||
+      reason === "identity_mismatch" || reason === "not_running");
+    if (needsRecovery) {
+      // The selected pane is stale: the server has already projected this
+      // session into a state that termination cannot safely signal. Drop the
+      // dead stream before refreshing so the lost/unreconciled shell reaches
+      // the server-authorized recovery preview instead of retaining a false
+      // occupied attachment and an inert End-chat error.
       ifDetach();
       if (root) return renderInterface(root);
       return;
     }
-    if (e.status === 409 && e.body && e.body.reason) r = e.body;
+    if (e.status === 409 && reason) r = e.body;
     else { a.st.note = "end chat failed: " + e.message; a.paint(); return; }
   }
   if (!r.terminated && r.reason === "identity_mismatch") {
@@ -3413,7 +3455,8 @@ function ifOpenStream(a, ticket) {
     if (ifAttach !== a) return;
     if (a.composerPendingSeq != null || a.composerSubmitLatched) {
       a.composerPendingSeq = null;
-      a.composerSubmitLatched = false;
+      ifClearComposerLatch(a);
+      ifClearComposerAckTimer(a);
       a.awaiting = false;
       a.halted = true;
       a.st.note = "stream closed before the message acknowledgement — " +
@@ -3483,7 +3526,8 @@ function ifRevoked(a) {
   a.role = "viewer"; a.leaseId = null; a.leaseToken = null;
   a.awaiting = false; a.halted = false; a.outBuf = "";
   a.composerPendingSeq = null;
-  a.composerSubmitLatched = false;
+  ifClearComposerLatch(a);
+  ifClearComposerAckTimer(a);
   a.st.writer = "held";
   a.st.writerReason = "Control was taken by another client.";
   a.st.note = "control was taken by another client — you are now read-only (Take-over to reclaim)";
@@ -3496,6 +3540,7 @@ function ifControl(a, m) {
         a.awaiting = false;
         a.lastAck = m.seq;
         if (m.seq === a.composerPendingSeq) {
+          ifClearComposerAckTimer(a);
           a.composerPendingSeq = null;
           a.composerInput.value = "";
           ifSizeComposer(a.composerInput);
@@ -3508,8 +3553,11 @@ function ifControl(a, m) {
       break;
     case "input_reject":
       a.awaiting = false;
-      if (m.seq === a.composerPendingSeq) a.composerPendingSeq = null;
-      a.composerSubmitLatched = false;
+      if (m.seq === a.composerPendingSeq) {
+        ifClearComposerAckTimer(a);
+        a.composerPendingSeq = null;
+      }
+      ifClearComposerLatch(a);
       // writer_revoked = a takeover revoked our lease; the runtime learns of
       // it at the next keystroke and rejects the frame. Same flip as a
       // writer-state revoke — not a halt.
@@ -3533,7 +3581,7 @@ function ifControl(a, m) {
       if (m.lifecycle != null && m.lifecycle !== a.st.lifecycle) {
         a.st.lifecycle = m.lifecycle;
         if (!IF_ATTACHABLE_LIFECYCLES.has(m.lifecycle))
-          a.composerSubmitLatched = false;
+          ifClearComposerLatch(a);
         ifRefreshComposerProjection(a);
       }
       if (m.composer != null) a.st.composer = m.composer;

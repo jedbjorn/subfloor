@@ -33,6 +33,15 @@ SHELL = {
     "model_route": "gpt-5.6-terra",
     "alerts": 2,
 }
+OTHER_SHELL = {
+    **SHELL,
+    "shell_id": 4,
+    "shortname": "DEV4",
+    "display_name": "Code-02",
+    "session_id": 8,
+    "model_route": "gpt-5.6-sol",
+    "alerts": 0,
+}
 SESSION = {
     "session_id": 7,
     "generation": 1,
@@ -81,6 +90,42 @@ CAPABILITY = {
     "reason": "optional_hook_missing",
     "meaning": "Optional hook detail is unavailable.",
     "dismissible": False,
+}
+BINDING = {
+    "binding_id": 44,
+    "sprint_doc_id": 31,
+    "planner_shell_id": 3,
+    "session_id": 7,
+    "generation": 1,
+    "armed_at": "2026-07-24 08:00:00",
+    "released_at": None,
+    "release_reason": None,
+    "sprint": {
+        "document_id": 31,
+        "title": "Interface corrective hardening",
+        "frozen": False,
+        "active": True,
+    },
+    "wake_state": "parked",
+    "items": {"queued": 2, "quarantined": 1},
+    "current_batch": {"batch_id": 91, "state": "queued"},
+    "last_batch": {
+        "batch_id": 90,
+        "state": "delivery_unknown",
+        "items": {"parked": 1},
+    },
+    "park": {
+        "batch_id": 90,
+        "input_park": True,
+        "reason": "wake_batch_delivery_unknown",
+    },
+    "quarantined": [{
+        "item_id": 93,
+        "message_id": 1390,
+        "error": "survived 3 wake turns",
+        "completed_wakes": 3,
+    }],
+    "retry": {"applicable": True, "needs_outcome": True},
 }
 
 
@@ -136,7 +181,7 @@ def _mock_api(route) -> None:
     if path == "/interface/browser-sessions":
         return _json(route, {"csrf": "rendered-fixture"})
     if path == "/interface/shells":
-        return _json(route, {"shells": [SHELL]})
+        return _json(route, {"shells": [SHELL, OTHER_SHELL]})
     if path == "/interface/sessions/7":
         return _json(route, SESSION)
     if path == "/interface/writer-leases":
@@ -150,7 +195,7 @@ def _mock_api(route) -> None:
         body = request.post_data_json or {}
         return _json(route, {"browser_composer": body.get("state", "clean")})
     if path.startswith("/interface/sprint-bindings"):
-        return _json(route, {"bindings": []})
+        return _json(route, {"bindings": [BINDING]})
     if path.startswith("/interface/sprint-alerts"):
         if "include_resolved=1" in path:
             history = [
@@ -229,14 +274,17 @@ window.Terminal = RenderedTerminal;
 """
 
 
-def _open_interface(browser, ui_url: str, *, height: int, width: int = 1600):
+def _open_interface(
+    browser, ui_url: str, *, height: int, width: int = 1600,
+    api_handler=_mock_api,
+):
     context = browser.new_context(viewport={"width": width, "height": height})
     page = context.new_page()
     page.add_init_script(INIT_SCRIPT)
     page.route("**/vendor/xterm/xterm.js", lambda route: route.fulfill(
         status=200, content_type="application/javascript", body=""
     ))
-    page.route("**/api/**", _mock_api)
+    page.route("**/api/**", api_handler)
     page.goto(f"{ui_url}/#interface/DEV3", wait_until="networkidle")
     page.locator(".if-term .xterm").wait_for()
     page.wait_for_function("window.__wsResizeFrames.length > 0")
@@ -395,9 +443,9 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
     desktop, page = _open_interface(browser, ui_url, height=1100)
     try:
         page.get_by_text("Alerts (2)", exact=True).wait_for()
-        assert "DEV3 · codex · GPT 5.6 TERRA" in page.locator(
-            ".if-row-sub"
-        ).inner_text()
+        rail_models = page.locator(".if-row-sub").all_inner_texts()
+        assert "DEV3 · codex · GPT 5.6 TERRA" in rail_models
+        assert "DEV4 · codex · GPT 5.6 SOL" in rail_models
         assert page.locator(".if-alerts").get_attribute("class").endswith(
             "critical"
         )
@@ -409,6 +457,19 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         assert "model GPT 5.6 TERRA" in details.inner_text()
         assert "session #7 · arc #172" in details.inner_text()
         assert "wake armed" in details.inner_text()
+        assert "sprint #31 Interface corrective hardening · ACTIVE" in (
+            details.inner_text()
+        )
+        assert "last outcome #90 delivery_unknown · parked:1" in (
+            details.inner_text()
+        )
+        assert "PARKED: wake_batch_delivery_unknown" in details.inner_text()
+        assert page.get_by_role(
+            "button", name="Retry — input landed"
+        ).is_visible()
+        assert page.get_by_role(
+            "button", name="Retry — input lost"
+        ).is_visible()
 
         page.get_by_text("Alerts (2)", exact=True).click()
         alerts = page.locator(".if-alerts")
@@ -480,6 +541,15 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         assert geometry["paneRight"] <= geometry["viewport"]
         assert geometry["headerScrollWidth"] > geometry["headerClientWidth"]
         assert geometry["headerOverflowX"] == "auto"
+        options = page.locator(".if-picker option").all_inner_texts()
+        assert (
+            "Code-01 · DEV3 · codex · GPT 5.6 TERRA · occupied"
+            in options
+        )
+        assert (
+            "Code-02 · DEV4 · codex · GPT 5.6 SOL · occupied"
+            in options
+        )
         assert page.locator(".if-composer-actions button").all_inner_texts() == [
             "Send",
             "End chat",
@@ -492,7 +562,7 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         mobile.close()
 
 
-def test_enter_sends_one_frame_and_missing_ack_retains_draft(
+def test_enter_sends_one_frame_and_open_silent_stream_retains_draft(
     browser, ui_url
 ):
     context, page = _open_interface(browser, ui_url, height=1000)
@@ -503,6 +573,7 @@ def test_enter_sends_one_frame_and_missing_ack_retains_draft(
         page.wait_for_function(
             "() => !document.querySelector('.if-composer-actions button').disabled"
         )
+        page.evaluate("ifAttach.composerAckTimeoutMs = 40")
 
         composer.press("Enter")
         page.wait_for_function("window.__inputFrames.length === 1")
@@ -511,11 +582,124 @@ def test_enter_sends_one_frame_and_missing_ack_retains_draft(
         assert payload == "one composed turn\r"
         assert composer.input_value() == "one composed turn"
 
-        page.evaluate("window.__lastWs.onclose()")
+        page.locator(".if-composer .if-note").filter(
+            has_text="message acknowledgement timed out"
+        ).wait_for()
         assert composer.input_value() == "one composed turn"
-        assert "draft was retained" in page.locator(
+        assert "delivery is unknown" in page.locator(
             ".if-composer .if-note"
         ).inner_text()
         assert page.evaluate("window.__inputFrames.length") == 1
+        assert page.evaluate("window.__lastWs.readyState") == 1
+        assert page.evaluate("ifAttach.halted") is True
+    finally:
+        context.close()
+
+
+def test_not_occupied_end_chat_detaches_into_preserving_recovery(
+    browser, ui_url
+):
+    state: dict[str, object] = {"lost": False, "recovery_body": None}
+    preview = {
+        "observation_id": "obs-not-occupied",
+        "expires_in_s": 120,
+        "classification": "stale_durable_lock",
+        "legal_actions": ["recover"],
+        "evidence": {
+            "shell": {"shell_id": 3, "shortname": "DEV3"},
+            "session": {
+                "session_id": 7,
+                "generation": 1,
+                "occupancy": "unreconciled",
+                "lifecycle": "lost",
+            },
+        },
+        "evidence_projection": [
+            {
+                "key": "classification",
+                "label": "classification",
+                "value": "stale_durable_lock",
+            },
+            {
+                "key": "session",
+                "label": "session",
+                "value": "session #7 · generation 1 · unreconciled/lost",
+            },
+            {
+                "key": "process",
+                "label": "process",
+                "value": "PID absent · pane gone",
+            },
+            {
+                "key": "worktree",
+                "label": "worktree",
+                "value": "not clean · preserve by default",
+            },
+        ],
+    }
+
+    def recovery_api(route) -> None:
+        request = route.request
+        path = request.url.split("/api", 1)[-1]
+        if path == "/interface/termination-requests":
+            state["lost"] = True
+            return _json(route, {
+                "error": {
+                    "code": "not_occupied",
+                    "message": "session 7 is unreconciled — termination "
+                    "needs a verified identity",
+                },
+            }, status=409)
+        if path == "/interface/shells":
+            shell = {
+                **SHELL,
+                "availability": "lost" if state["lost"] else "occupied",
+            }
+            return _json(route, {"shells": [shell]})
+        if path == "/interface/shells/3/recovery":
+            if request.method == "GET":
+                return _json(route, preview)
+            state["recovery_body"] = request.post_data_json
+            return _json(route, {
+                "shell_id": 3,
+                "shortname": "DEV3",
+                "classification": "stale_durable_lock",
+                "mode": "recover",
+                "availability": "available",
+                "closed": {"alerts_resolved": 1, "parked": []},
+                "worktree": {"preserved": True},
+                "unread_messages": 0,
+            })
+        return _mock_api(route)
+
+    context, page = _open_interface(
+        browser, ui_url, height=1000, api_handler=recovery_api
+    )
+    page.on("dialog", lambda dialog: dialog.accept())
+    try:
+        page.get_by_role("button", name="End chat").click()
+        preview_button = page.get_by_role("button", name="Preview recovery")
+        preview_button.wait_for()
+        assert page.evaluate("window.__lastWs.readyState") == 3
+        assert page.locator(".if-term").count() == 0
+
+        preview_button.click()
+        recover = page.get_by_role("button", name="Recover", exact=True)
+        recover.wait_for()
+        discard = page.get_by_text(
+            "Discard worktree changes", exact=False
+        ).locator("input")
+        assert discard.is_checked() is False
+
+        recover.click()
+        page.get_by_text("Recovery result", exact=True).wait_for()
+        assert state["recovery_body"] == {
+            "observation_id": "obs-not-occupied",
+            "mode": "recover",
+            "preserve_worktree": True,
+        }
+        assert "Worktree preserved" in page.locator(
+            ".if-recovery-result"
+        ).inner_text()
     finally:
         context.close()

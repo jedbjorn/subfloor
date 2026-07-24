@@ -337,6 +337,18 @@ a.paint();
   a.composerSend.onclick();
   invariant(prevented && frames.length === 0 && a.composerSubmitLatched,
     "send during dirty-state sync was not latched exactly once");
+  invariant(a.composerInput.disabled,
+    "the accepted draft stayed editable while dirty state was syncing");
+  const tryUserEdit = (value) => {
+    if (!a.composerInput.disabled) {
+      a.composerInput.value = value;
+      a.composerInput.oninput();
+    }
+  };
+  tryUserEdit("mutated after Enter");
+  tryUserEdit("");
+  invariant(a.composerInput.value === "hello\nworld",
+    "mutation or clear replaced the first accepted draft");
   await a.browserComposerChain;
   invariant(apiCalls.length === 1 &&
     apiCalls[0].path === "/interface/browser-composer" &&
@@ -416,6 +428,56 @@ a.paint();
         ["node", "-e", script], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "term.onData((d) => ifSendInput(a, d))" in APP
+
+
+def test_end_chat_not_running_transition_detaches_and_renders_recovery():
+    script = END_CHAT + r"""
+let detached = 0;
+let rendered = 0;
+let response;
+globalThis.confirm = () => true;
+function ifDetach() { detached += 1; }
+async function renderInterface(root) {
+  if (root !== view) throw new Error("End chat refreshed the wrong view");
+  rendered += 1;
+}
+async function apiIf() { throw response; }
+const view = {};
+const pane = { closest: (selector) => selector === ".view" ? view : null };
+const a = {
+  sessionId: 7,
+  st: { note: "" },
+  paint() { throw new Error("a recovery transition painted stale state"); },
+};
+const sel = { shortname: "DEV3", display_name: "Code-01" };
+
+async function exercise(error, label) {
+  response = error;
+  detached = 0;
+  rendered = 0;
+  await ifEndChat(a, sel, pane, { disabled: false });
+  if (detached !== 1 || rendered !== 1) {
+    throw new Error(`${label} kept the dead attachment: ` +
+      `${JSON.stringify({ detached, rendered })}`);
+  }
+}
+
+(async () => {
+  const becameUnreconciled = new Error("not running");
+  becameUnreconciled.status = 409;
+  becameUnreconciled.body = {
+    terminated: false,
+    reason: "not_running",
+  };
+  await exercise(becameUnreconciled, "not_running transition");
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_recovery_renders_only_server_listed_actions_and_full_diagnostics():

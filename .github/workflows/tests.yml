@@ -3,8 +3,9 @@ name: tests
 # The PR gate: the full engine suite + the headless end-to-end proof, on every
 # PR and every push to main. GitHub-hosted BY DESIGN — this repo is public, and
 # a self-hosted runner on a public repo lets any fork PR execute code on the
-# host (the same host that carries the substrates). The suite is hermetic
-# (stdlib + pytest, no docker, no network), so ubuntu-latest covers it free.
+# host (the same host that carries the substrates). The core suite is hermetic;
+# explicit browser/terminal acceptance jobs install only their pinned test
+# dependencies. Ubuntu-hosted runners keep every PR path isolated.
 # Anything that ever genuinely needs house hardware belongs in a separate
 # push-to-main-only workflow, never a PR-triggered one.
 
@@ -58,6 +59,37 @@ jobs:
           path: artifacts/interface-ui/
           if-no-files-found: error
           retention-days: 14
+
+  # Req 26's acceptance is a real terminal turn, not a byte-shape assertion.
+  # Install the tmux + headless-xterm dependencies explicitly so the exact
+  # composer proof cannot silently skip on a nominally green PR.
+  interface-tmux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install real-terminal test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          python -m pip install pytest
+          npm install --prefix .super-coder/shadow --no-save \
+            --package-lock=false @xterm/headless@6.0.0
+      - name: Prove one composed acceptance starts one real turn
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "tests")
+          from test_interface_runtime import HAS_SHADOW_STACK
+          assert HAS_SHADOW_STACK, "real-tmux test dependencies unavailable"
+          PY
+          pytest -q \
+            tests/test_interface_wake_tmux.py::WakeTmuxE2ETest::test_composed_text_and_submit_start_one_real_turn
 
   # The end-to-end proof `./sc verify` runs: rebuild the DB from committed text
   # (schema + migrations + content.sql), flat-render, then a render-only boot —
