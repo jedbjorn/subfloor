@@ -27,9 +27,11 @@ Run:
 """
 from __future__ import annotations
 
+import queue
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -611,6 +613,96 @@ class CloseSessionMatrixTest(unittest.TestCase):
             "SELECT ended_at, end_reason FROM interface_sessions "
             "WHERE session_id=?", (sid,)).fetchone()
         self.assertEqual(first, second)
+
+    def test_terminal_alert_write_serializes_with_concurrent_close(self):
+        """SC-080: _alert must lock before its terminal-state read.
+
+        Hold an uncommitted closure on one connection while the runtime alert
+        starts on another. Without pre-read serialization, the alert reads the
+        old active row, closure commits, and the stale branch inserts a new
+        open alert on the ended session. With BEGIN IMMEDIATE first, the alert
+        waits, re-reads the committed terminal row, and writes resolved audit.
+        """
+        sid = self._make("occupied", "idle")
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA busy_timeout=5000")
+        self.con.execute("BEGIN IMMEDIATE")
+        interface_broker.close_session(self.con, sid, "operator_end")
+
+        stages = queue.Queue()
+        errors = []
+        alert_con = sqlite3.connect(
+            self.db, timeout=5, check_same_thread=False)
+        alert_con.execute("PRAGMA journal_mode=WAL")
+        alert_con.execute("PRAGMA busy_timeout=5000")
+
+        class ObservedCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchone(self):
+                row = self.cursor.fetchone()
+                stages.put("terminal-read")
+                return row
+
+        class ObservedConnection:
+            @property
+            def in_transaction(self):
+                return alert_con.in_transaction
+
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE":
+                    stages.put("begin-immediate")
+                cursor = alert_con.execute(sql, parameters)
+                if sql.startswith(
+                        "SELECT occupancy, lifecycle, ended_at "):
+                    return ObservedCursor(cursor)
+                return cursor
+
+        def write_alert():
+            try:
+                interface_broker._alert(
+                    ObservedConnection(), severity="warning",
+                    reason="interface_continuity_broken", session_id=sid)
+                alert_con.commit()
+            except Exception as exc:  # surfaced on the test thread below
+                errors.append(exc)
+            finally:
+                alert_con.close()
+
+        worker = threading.Thread(target=write_alert)
+        worker.start()
+        try:
+            first_stage = stages.get(timeout=5)
+        finally:
+            self.con.commit()
+            worker.join(10)
+
+        self.assertFalse(worker.is_alive(), "alert writer stayed blocked")
+        if errors:
+            raise errors[0]
+        self.assertEqual(
+            first_stage, "begin-immediate",
+            "the alert must take the write lock before reading session state")
+        ended_at = self.con.execute(
+            "SELECT ended_at FROM interface_sessions WHERE session_id=?",
+            (sid,)).fetchone()[0]
+        alerts = self.con.execute(
+            "SELECT session_id, severity, reason, resolved_at "
+            "FROM planner_alerts "
+            "WHERE session_id=? AND reason='interface_continuity_broken'",
+            (sid,)).fetchall()
+        self.assertEqual(
+            alerts,
+            [(sid, "warning", "interface_continuity_broken", ended_at)],
+            "the late event remains as exactly one resolved audit row")
+        open_count = self.con.execute(
+            "SELECT COUNT(*) FROM planner_alerts "
+            "WHERE session_id=? AND resolved_at IS NULL",
+            (sid,)).fetchone()[0]
+        self.assertEqual(
+            open_count, 0,
+            "no actionable alert may land on the closed session")
 
     def test_close_converges_legacy_partial_row(self):
         """SC-065: a pre-convergence closure (the old spawn-failure path)

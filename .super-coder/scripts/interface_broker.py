@@ -74,9 +74,16 @@ def _session(con, session_id: int):
 
 def _alert(con, *, severity: str, reason: str, session_id=None,
            binding_id=None, message_id=None) -> None:
-    """Raise an alert, deduplicated while open (partial unique index)."""
+    """Raise an alert, deduplicated while open (partial unique index).
+
+    A session-scoped alert takes the write lock before reading terminal state.
+    That makes the read + write atomic with durable closure: closure either
+    lands first and this row is resolved audit, or lands second and resolves
+    the row itself. The caller still owns the surrounding transaction.
+    """
     dedupe = f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}|{reason}"
     if session_id is not None:
+        _begin_immediate(con)
         session = con.execute(
             "SELECT occupancy, lifecycle, ended_at "
             "FROM interface_sessions WHERE session_id=?",
