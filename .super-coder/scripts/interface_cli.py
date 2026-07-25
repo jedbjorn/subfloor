@@ -21,7 +21,10 @@ supervised-runtime remediation; it never falls back).
     ./sc interface enter [<shell>]                 the `sc enter` flow: New chat
                                                    for an available shell
                                                    (normal harness picker),
-                                                   reattach an occupied one
+                                                   reattach an occupied one,
+                                                   wait out a starting one; a
+                                                   held writer lease asks
+                                                   (take / read-only / quit)
 
 The attach client speaks sc-term.v1 (api/interface_ws.py) — the same session
 stream and writer lease as the browser, with the full client-side protocol
@@ -793,6 +796,23 @@ def _picker_status(shell: dict) -> str:
     return paint(availability)
 
 
+# What picking a row will DO. The state column says what the shell IS; an
+# operator recovering a live chat from the CLI needs the consequence before
+# pressing a number, not after. Derived from the rail row ALONE — writer-lease
+# detail is per-session and would cost one extra request per occupied shell
+# just to paint a column, so a held lease surfaces at attach time as an
+# explicit prompt (_enter_held) instead of here.
+_PICKER_ACTIONS = {
+    "available": "new chat",
+    "occupied": "reattach",
+    "starting": "wait, attach",
+}
+
+
+def _picker_action(shell: dict) -> str:
+    return _PICKER_ACTIONS.get(shell.get("availability") or "", "blocked")
+
+
 def _picker_default(shell: dict) -> str:
     harness = shell.get("default_harness")
     if not harness:
@@ -820,10 +840,10 @@ def _render_shell_picker(shells: list[dict]) -> list[dict]:
     full = columns >= 78
     print(style.bold("\nShells"))
     if full:
-        default_width = max(12, min(30, columns - 61))
+        default_width = max(12, min(30, columns - 62))
         print(style.dim(
-            f"{'#':>3}  {'Name':<18}{'Shortname':<13}{'State':<15}"
-            f"{'Default (harness · model)':<{default_width}}"
+            f"{'#':>3}  {'Name':<18}{'Shortname':<13}{'State':<13}"
+            f"{'Action':<13}{'Default (harness · model)':<{default_width}}"
         ))
     current = object()
     for number, shell in enumerate(ordered, 1):
@@ -841,7 +861,8 @@ def _render_shell_picker(shells: list[dict]) -> list[dict]:
                 f"{style.dim(f'{number:>3}')}  "
                 f"{style.bold(display)}"
                 f"{_fit(shortname, 12):<13}"
-                f"{status}{' ' * max(1, 15 - state_width)}"
+                f"{status}{' ' * max(1, 13 - state_width)}"
+                f"{_fit(_picker_action(shell), 12):<13}"
                 f"{style.dim(_fit(default, default_width))}"
             )
             continue
@@ -856,7 +877,8 @@ def _render_shell_picker(shells: list[dict]) -> list[dict]:
             print(f"{number:>3} {_fit(shortname, max(1, columns - 4))}")
             print(f"     {_picker_status(shell)}")
         detail = " · ".join(
-            str(part) for part in (shell.get("display_name"), default) if part
+            str(part) for part in
+            (_picker_action(shell), shell.get("display_name"), default) if part
         )
         if detail:
             for line in textwrap.wrap(
@@ -884,7 +906,12 @@ def _pick_shell(shells: list[dict], requested: str | None) -> dict:
     if not shells:
         die("no shells")
     if not sys.stdin.isatty():
-        return shells[0]
+        # Silently entering the FIRST shell off a TTY is a footgun, not a
+        # default: with no picker to see, an unattended caller started a
+        # session on whichever shell sorted first.
+        die("no shell named and stdin is not a terminal — the picker needs a "
+            "TTY. Name one (`sc enter-<shortname>`), or use the scriptable "
+            "`sc interface start <shell>`.", EXIT_USAGE)
     ordered = _render_shell_picker(shells)
     while True:
         try:
@@ -920,6 +947,53 @@ def _wait_occupied(session_id: int, timeout: float = OCCUPIED_WAIT_S) -> dict:
         "attach when occupied: `sc interface attach <shell>`")
 
 
+def _enter_held(shell: dict, session_id: int) -> int:
+    """The held-writer fork of `enter`. The house rule is that a takeover is
+    never SILENT — a live browser writer must not be yanked out from under
+    whoever is using it — NOT that `enter` must dead-end. On a TTY an explicit
+    keystroke is exactly the consent that rule asks for, and it keeps recovery
+    in ONE command when the holder is a browser tab that died with the GUI
+    (the runtime's liveness sweep frees such a lease eventually; this is the
+    window before it does). Off a TTY there is nobody to ask, so the
+    non-interactive fallback stays read-only + the exact follow-up command."""
+    short = shell.get("shortname")
+    holder = _writer_holder(session_id)
+    if not sys.stdin.isatty():
+        print(f"→ writer lease held{holder} — attaching READ-ONLY "
+              f"(`sc interface take-control {short}` to take the writer "
+              "role)", file=sys.stderr)
+        return _attach(session_id, "viewer")
+    print(f"\n→ writer lease held{holder} — {short} is already being driven "
+          "by another client.", file=sys.stderr)
+    while True:
+        try:
+            choice = input("  [t] take control  [v] read-only  [q] quit: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            die("selection cancelled")
+        choice = choice.strip().lower()
+        if choice in ("q", "quit"):
+            die("selection cancelled")
+        if choice in ("v", "view"):
+            return _attach(session_id, "viewer")
+        if choice in ("t", "take"):
+            return _attach_writer(shell, session_id, takeover=True)
+        print("  invalid choice")
+
+
+def _enter_writer(shell: dict, session_id: int) -> int:
+    """`enter`'s attach: the writer role when the lease is free, the explicit
+    fork above when it is held."""
+    try:
+        lease = _acquire_lease(session_id, takeover=False)
+    except ApiError as exc:
+        if exc.status != 409 or exc.code != "writer_held":
+            _print_api_error(exc)
+            raise SystemExit(EXIT_REFUSED) from exc
+        return _enter_held(shell, session_id)
+    return _attach(session_id, "writer", lease)
+
+
 def cmd_enter(args) -> int:
     """`sc enter`: resolve the Interface API, then New chat for an available
     shell or reattach the occupied generation. Never provider-resume, never
@@ -936,23 +1010,20 @@ def cmd_enter(args) -> int:
               f"(generation {resp.get('generation')}, harness "
               f"{resp.get('harness') or harness or 'default'})…")
         _wait_occupied(session_id)
-        return _attach_writer(shell, session_id, takeover=False)
+        return _enter_writer(shell, session_id)
     if avail == "occupied":
-        session_id = shell["session_id"]
-        try:
-            lease = _acquire_lease(session_id, takeover=False)
-        except ApiError as exc:
-            if exc.status != 409 or exc.code != "writer_held":
-                _print_api_error(exc)
-                raise SystemExit(EXIT_REFUSED) from exc
-            print(f"→ writer lease held{_writer_holder(session_id)} — "
-                  "attaching READ-ONLY (`sc interface take-control "
-                  f"{short}` to take the writer role)", file=sys.stderr)
-            return _attach(session_id, "viewer")
-        return _attach(session_id, "writer", lease)
+        return _enter_writer(shell, shell["session_id"])
     if avail == "starting":
-        die(f"{short} is starting (a reservation is booting) — retry in a "
-            f"moment, or cancel with `sc interface stop {short}`")
+        # A booting reservation is a wait, not a refusal — the same wait the
+        # available path already does after starting one itself.
+        session_id = shell.get("session_id")
+        if session_id is None:
+            die(f"{short} is starting but carries no session yet — retry in a "
+                f"moment, or cancel with `sc interface stop {short}`")
+        print(f"→ {short} is starting (session {session_id}) — waiting for it "
+              "to become attachable…")
+        _wait_occupied(session_id)
+        return _enter_writer(shell, session_id)
     die(f"{short} is {avail} — New chat is blocked. "
         f"`sc interface status {short}` shows the session; "
         f"`sc interface reconcile {short}` revalidates it.")
