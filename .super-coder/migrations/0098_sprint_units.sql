@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS sprint_units (
     -- The units this one waits on, as the board writes them ("U1,U3"). A join
     -- table would buy graph traversal that nothing in this service performs.
     depends_on        TEXT,
+    -- The merge-surface annotation the markdown board carries in the SAME cell
+    -- as the dependency — "owns migration 0098; schema.sql + scripts/sprint.py",
+    -- "shares SKILL.md with U8 — MUST rebase onto merged U2". It is load-bearing
+    -- prose, not decoration: the merge protocol turns on whether a unit's head
+    -- can stand or must rebase, and that is the only place the answer is
+    -- written. Storing the comma list alone would make this table hold LESS than
+    -- the markdown it replaces — a lossy migration rather than a fix. Free text
+    -- deliberately: nothing parses it, a planner writes it for a human to read,
+    -- and `sc sprint board` renders it beside depends_on in one cell.
+    overlap           TEXT,
     branch            TEXT,
     pr_number         INTEGER,
     assigned_at       TEXT,

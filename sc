@@ -1510,8 +1510,8 @@ super-coder — forkable shell substrate
   ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
                              intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
   ./sc sprint unit <cmd>   the sprint board, as a record: add declares a unit (--sprint/--seq/--title, plus
-                             --dev/--reviewer/--depends-on/--branch/--pr; an existing seq is a 409, never an
-                             upsert); set edits those fields but NOT state; state <s> moves one unit alone
+                             --dev/--reviewer/--depends-on/--overlap/--branch/--pr; an existing seq is a 409,
+                             never an upsert); set edits those fields but NOT state; state <s> moves one unit alone
                              (pending|working|in_review|blocked|merged|cancelled) and restamps
                              state_changed_at only when the state actually changes; list reads it.
                              WRITES are the planner's: the shell bound to that sprint, or — when no binding

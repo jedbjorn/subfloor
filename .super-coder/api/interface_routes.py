@@ -2257,6 +2257,7 @@ def _retry_binding(actor, headers, body, binding_id: int):
 _UNIT_FIELDS = {
     "unit_title": "unit_title",
     "depends_on": "depends_on",
+    "overlap": "overlap",
     "branch": "branch",
     "pr_number": "pr_number",
 }
@@ -2341,8 +2342,9 @@ class _BadShell(Exception):
 
 _UNIT_COLS = (
     "unit_id", "sprint_doc_id", "seq", "unit_title", "dev_shell_id",
-    "reviewer_shell_id", "state", "depends_on", "branch", "pr_number",
-    "assigned_at", "state_changed_at", "updated_at", "updated_by_shell_id")
+    "reviewer_shell_id", "state", "depends_on", "overlap", "branch",
+    "pr_number", "assigned_at", "state_changed_at", "updated_at",
+    "updated_by_shell_id")
 
 
 def _unit_projection(con, unit_id: int) -> dict:
@@ -2421,13 +2423,13 @@ def _add_sprint_unit(actor, headers, body):
                 cur = con.execute(
                     "INSERT INTO sprint_units "
                     "(sprint_doc_id, seq, unit_title, dev_shell_id, "
-                    " reviewer_shell_id, state, depends_on, branch, "
+                    " reviewer_shell_id, state, depends_on, overlap, branch, "
                     " pr_number, assigned_at, updated_by_shell_id) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (doc_id, seq, title, roles["dev_shell_id"],
                      roles["reviewer_shell_id"], state,
-                     body.get("depends_on"), body.get("branch"),
-                     body.get("pr_number"),
+                     body.get("depends_on"), body.get("overlap"),
+                     body.get("branch"), body.get("pr_number"),
                      _now(con) if any(roles.values()) else None,
                      actor.shell_id))
             except db_driver.IntegrityError:

@@ -153,6 +153,8 @@ def _unit_body(args, *, creating: bool) -> dict:
             body[name] = _role(getattr(args, name))
     if args.depends_on is not None:
         body["depends_on"] = _field(args.depends_on)
+    if args.overlap is not None:
+        body["overlap"] = _field(args.overlap)
     if args.branch is not None:
         body["branch"] = _field(args.branch)
     if args.pr is not None:
@@ -160,12 +162,24 @@ def _unit_body(args, *, creating: bool) -> dict:
     return body
 
 
+def _depends_cell(u: dict) -> str:
+    """The board's "depends on" cell — the machine-readable dependency and the
+    human-readable merge-surface annotation share it, exactly as the markdown
+    board writes it today ("— · owns migration 0098; schema.sql"). Two columns,
+    one cell: the annotation is how a dev knows whether its head can stand or
+    must rebase, so dropping it from the render would lose what the record was
+    widened to keep."""
+    dep = u.get("depends_on") or "—"
+    return f"{dep} · {u['overlap']}" if u.get("overlap") else dep
+
+
 def _print_unit(u: dict) -> None:
     roles = (f"dev={u.get('dev_shortname') or '—'} "
              f"rev={u.get('reviewer_shortname') or '—'}")
     extra = " ".join(
         p for p in (
-            f"depends={u['depends_on']}" if u.get("depends_on") else "",
+            f"depends={_depends_cell(u)}"
+            if (u.get("depends_on") or u.get("overlap")) else "",
             f"branch={u['branch']}" if u.get("branch") else "",
             f"pr=#{u['pr_number']}" if u.get("pr_number") else "")
         if p)
@@ -240,7 +254,7 @@ def cmd_board(args) -> int:
                   seq=u["seq"], title=u["unit_title"],
                   dev=u.get("dev_shortname") or "—",
                   rev=u.get("reviewer_shortname") or "—",
-                  dep=u.get("depends_on") or "—",
+                  dep=_depends_cell(u),
                   branch=u.get("branch") or "—",
                   pr=f"#{u['pr_number']}" if u.get("pr_number") else "—",
                   state=u["state"]))
@@ -378,6 +392,11 @@ def main(argv: "list[str] | None" = None) -> int:
                                  "unit ('none' to clear the slot)")
         sp.add_argument("--depends-on", dest="depends_on", default=None,
                         help="units this one waits on, e.g. U1,U3 "
+                             "('none' to clear)")
+        sp.add_argument("--overlap", default=None,
+                        help="the merge-surface annotation sharing the "
+                             "'depends on' cell, e.g. 'shares schema.sql with "
+                             "U5 — MUST rebase onto merged U2' "
                              "('none' to clear)")
         sp.add_argument("--branch", default=None, help="('none' to clear)")
         sp.add_argument("--pr", type=int, default=None,

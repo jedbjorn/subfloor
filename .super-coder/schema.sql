@@ -568,6 +568,7 @@ CREATE TABLE sprint_units (
                       CHECK (state IN ('pending','working','in_review',
                                        'blocked','merged','cancelled')),
     depends_on        TEXT,               -- "U1,U3" as the board writes it
+    overlap           TEXT,               -- the merge-surface annotation sharing that cell ("shares X with U8 — MUST rebase"); load-bearing prose, rendered beside depends_on
     branch            TEXT,
     pr_number         INTEGER,
     assigned_at       TEXT,

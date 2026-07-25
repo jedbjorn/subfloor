@@ -390,6 +390,36 @@ class BoardRecordTest(unittest.TestCase):
             con.close()
         self.assertEqual(body, DOC_BODY)
 
+    def test_the_merge_surface_annotation_survives_and_renders(self):
+        """The markdown board's "depends on" cell carries prose beside the
+        dependency — "shares SKILL.md with U8 — MUST rebase onto merged U2" —
+        and the merge protocol turns on it. A record storing only the comma
+        list would hold LESS than the markdown it replaces, which makes this
+        unit a lossy migration rather than a fix."""
+        note = "shares schema.sql + scripts/sprint.py with U5 — MUST rebase"
+        self.add(seq="U5", unit_title="alerts + delivery", depends_on="U4",
+                 overlap=note)
+        self.assertEqual(self.row("U5")["overlap"], note)
+        _s, out = self.call("GET", "/api/sprint-units?sprint_doc_id=1", (OP,))
+        buf = io.StringIO()
+        with mock.patch.object(sprint_cli, "_api", return_value=out), \
+                redirect_stdout(buf):
+            sprint_cli.cmd_board(mock.Mock(sprint=1))
+        self.assertIn(f"| U4 · {note} |", buf.getvalue())
+
+    def test_an_annotation_without_a_dependency_still_renders(self):
+        """Wave 1's units depend on nothing and carry the annotation anyway —
+        doc 59's own U1 row reads "— · owns migration 0098". An empty
+        dependency must not swallow the note."""
+        self.add(seq="U1", overlap="owns migration 0098; schema.sql")
+        _s, out = self.call("GET", "/api/sprint-units?sprint_doc_id=1", (OP,))
+        buf = io.StringIO()
+        with mock.patch.object(sprint_cli, "_api", return_value=out), \
+                redirect_stdout(buf):
+            sprint_cli.cmd_board(mock.Mock(sprint=1))
+        self.assertIn("| — · owns migration 0098; schema.sql |",
+                      buf.getvalue())
+
     def test_rendered_board_reports_the_record_including_the_reviewer(self):
         """`sc sprint board` is a projection of the record. It renders what
         the record says — both roles — not what a document body remembers."""
