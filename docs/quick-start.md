@@ -36,7 +36,8 @@ What that buys you in practice:
 - **Parallel work without clobbering.** Every shell gets its own git worktree;
   a branch-guard keeps everyone off `main`; merging stays yours.
 - **A localhost Review GUI** for reading and steering it all — shells,
-  roadmap, flags, docs, analytics.
+  roadmap, flags, docs, analytics — including an **Interface** tab that puts
+  each shell's live terminal in the browser.
 - **Sprints** — a declared multi-shell mode where devs and reviewers run the
   handoffs themselves on an event loop, with zero scheduled polling.
 
@@ -73,13 +74,20 @@ Five steps, from an existing git repo to a booted shell:
 
 ## First boot
 
-`./sc enter` — authenticate, pick a shell, pick a harness (the picker
-pre-selects each flavor's default model), and you're in a session, talking to
-your **planner** in your own repo.
+`./sc enter` — pick a shell, pick a harness (the picker pre-selects each
+flavor's default model), and you're in a session, talking to your **planner**
+in your own repo. That session lives in a tmux pane the engine owns, so it
+keeps running if you close the terminal.
 
-- **Open the Review GUI.** `./sc launch` printed its URL; the Shells tab is
-  the landing view — each shell's role, mandate, current state, and identity.
-  The other tabs, the roadmap views, and the token analytics:
+- **Or start it in the browser.** The GUI's **Interface** tab lists every
+  shell; **New chat** on an available one boots it, and selecting a busy one
+  attaches to its live terminal. Browser and `./sc enter` are two clients of
+  the *same* session — attach, detach, hand the keyboard over:
+  [*Interface*](README.md#interface).
+- **Open the Review GUI.** `./sc launch` printed its URL (`./sc url` reprints
+  it once the harness TUI has painted over the boot summary); the Shells tab
+  is the landing view — each shell's role, mandate, current state, and
+  identity. The other tabs, the roadmap views, and the token analytics:
   [*Review GUI*](README.md#review-gui).
 - **Meet the team.** The installer seeded a planner (your primary), two devs,
   a reviewer, the admin that owns `main`, and the cartographer that owns the
@@ -95,7 +103,8 @@ your **planner** in your own repo.
 ## The daily loop
 
 The rhythm a fork settles into — you move between seats with
-`./sc enter-<shortname>`, and every step is owned by a flavor:
+`./sc enter-<shortname>` (or by clicking a shell in the Interface tab), and
+every step is owned by a flavor:
 
 1. The **cartographer** keeps the repo map fresh; working shells read it
    instead of grepping blind.
