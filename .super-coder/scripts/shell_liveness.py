@@ -15,7 +15,8 @@ staleness window. Reporting only, by design — like git_hygiene.py, it surfaces
 state and never mutates.
 
 Mechanism (Linux): scan /proc/<pid>/{comm,cwd}. A process whose comm is one of the
-fork's harness binaries (adapters/*/adapter.json `launch[0]`) and whose cwd is
+fork's harness comm values (adapters/*/adapter.json `launch[0]`,
+`headless.launch[0]`, and `comm_aliases` — see harness_binaries) and whose cwd is
 under THIS repo is a live shell session:
   • cwd == repo root            → the admin itself (the one shell that boots in
                                   root, not a worktree)
@@ -29,7 +30,10 @@ is positively present, the gate is about OTHER shells.
 
 Permissions: /proc/<pid>/cwd is readable only for same-user processes. A harness
 owned by another OS user is counted but unreadable → `indeterminate`. When
-`indeterminate > 0` the admin must NOT assume all-clear — surface instead.
+`indeterminate > 0` the admin must NOT assume all-clear — surface instead. A
+ZOMBIE harness is excluded before that question is asked: it kept its comm but
+has already exited, so counting it would pin `indeterminate` — and with it the
+cleanup gate — on a process that is gone.
 
 Orphans: closing a terminal window does not reliably kill the harness on every
 host — the session survives, holds its shell's one-session slot, and blocks
@@ -37,6 +41,10 @@ every headless boot of that shell until someone kills it by hand. Each process
 is therefore classified (`orphaned`): 'tty-gone' (had a controlling terminal;
 the pty vanished — the window closed under it), 'detached' (no controlling
 TTY and reparented to init — its spawning session is gone), or None (normal).
+"Vanished" is asked in the PROCESS's mount namespace (/proc/<pid>/root<tty>),
+never the scanner's: a container-hosted session's pty lives in the container's
+devpts, so testing the bare path from the host answers about a different device
+and turns live work into a false orphan.
 Classification is reporting only — an orphan may still be mid-work (a merge,
 a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
 operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
@@ -67,9 +75,22 @@ _FALLBACK_BINS = {"claude", "codex", "opencode", "vibe", "kimi"}
 
 
 def harness_binaries() -> set[str]:
-    """The fork's harness launch binaries, from adapters/*/adapter.json `launch[0]`.
-    /proc/<pid>/comm is truncated to 15 chars — harness names are short, but we
-    truncate the expected set to match so a long name would still compare."""
+    """The comm values a live harness of this fork can present, from
+    adapters/*/adapter.json: `launch[0]`, `headless.launch[0]`, and the optional
+    `comm_aliases` list.
+
+    Why aliases: comm is the RUNTIME name, which a harness may set for itself
+    (PR_SET_NAME) rather than inherit from its launch binary. `kimi` execs
+    /usr/local/bin/kimi and then renames itself `kimi-code`, so matching launch
+    names alone made a live kimi worker invisible — and an invisible worker
+    projects as "available", the wrong failure direction for a badge whose job
+    is to stop the operator double-booking a shell.
+
+    /proc/<pid>/comm is truncated to 15 chars, so the expected set is truncated
+    to match: a longer declared alias still compares against what the kernel
+    actually reports. Duplicate aliases across adapters are harmless — this is a
+    set. An adapter dir with no adapter.json contributes nothing, leaving the
+    fallback set as the floor exactly as before."""
     bins: set[str] = set()
     if ADAPTERS.is_dir():
         for d in ADAPTERS.iterdir():
@@ -77,11 +98,17 @@ def harness_binaries() -> set[str]:
             if not cfg.is_file():
                 continue
             try:
-                launch = json.loads(cfg.read_text()).get("launch") or []
+                spec = json.loads(cfg.read_text())
             except (json.JSONDecodeError, OSError):
                 continue
-            if launch:
-                bins.add(Path(launch[0]).name)
+            launches = [spec.get("launch") or [],
+                        (spec.get("headless") or {}).get("launch") or []]
+            for launch in launches:
+                if launch:
+                    bins.add(Path(launch[0]).name)
+            for alias in spec.get("comm_aliases") or []:
+                if alias:
+                    bins.add(Path(alias).name)
     bins |= _FALLBACK_BINS
     return {b[:15] for b in bins}
 
@@ -111,6 +138,20 @@ def _ppid(pid: int) -> int | None:
         return None
 
 
+def _is_zombie(pid: int) -> bool:
+    """Has this process already exited, waiting only on a reaper?
+
+    A zombie keeps its comm — so a finished `claude`/`kimi-code` worker still
+    LOOKS like a harness — but it holds no worktree, runs no code, and its cwd
+    link is empty. Counted, it lands in `indeterminate` and pins
+    `safe_to_clean_all` False forever on the word of a process that ended. The
+    unreadable-cwd honesty gap this scan does own is about LIVE processes; a
+    zombie is not that case. Container PID 1 is often not a reaper (here it is
+    the engine server), so these accumulate and never clear on their own."""
+    rest = _stat_fields(pid)
+    return bool(rest) and rest[0] == "Z"
+
+
 def _tty_nr(pid: int) -> int | None:
     rest = _stat_fields(pid)
     try:
@@ -135,6 +176,43 @@ def _tty_fd(pid: int) -> str | None:
     return None
 
 
+def _tty_exists(pid: int, tty_fd: "str | None") -> "bool | None":
+    """Does this process's terminal device still exist — asked in the process's
+    OWN mount namespace, via /proc/<pid>/root<tty_fd>.
+
+    Testing the bare path instead asks the SCANNER's namespace, which is a
+    different question whenever the two disagree. A post-TMUX session holds a pty
+    from the container's devpts; scanned from the host, `/dev/pts/3` names the
+    HOST's pts 3 — a device that is absent, or worse, belongs to some unrelated
+    terminal. The live session then read as `tty-gone`, the rail projected
+    `unreconciled` with a recovery affordance instead of `working`, and the
+    scan's own advice invited killing work in progress — the exact inversion
+    decision #45 exists to prevent.
+
+    None when the answer cannot be obtained (no tty_fd, or /proc/<pid>/root is
+    unreadable — a foreign user, or the process exited mid-scan). The caller
+    turns that into no verdict: never call an orphan on missing data.
+
+    Deliberately os.stat and not os.path.exists: exists() folds PermissionError
+    into False, so an unreadable namespace would come back as "the pty is gone"
+    — a confident orphan verdict derived from our own lack of access. Only a
+    FileNotFoundError, reached THROUGH a root we could stat, means gone."""
+    if not tty_fd:
+        return None
+    root = PROC / str(pid) / "root"
+    try:
+        os.stat(root)                    # can we see this pid's namespace at all?
+    except OSError:
+        return None                      # foreign user, or the process is gone
+    try:
+        os.stat(root / tty_fd.lstrip("/"))
+    except FileNotFoundError:
+        return False                     # the device really is not there
+    except OSError:
+        return None                      # unreadable → no verdict, not an orphan
+    return True
+
+
 def classify_orphan(tty_nr: "int | None", ppid: "int | None",
                     tty_fd: "str | None",
                     tty_exists: "bool | None" = None) -> "str | None":
@@ -148,6 +226,12 @@ def classify_orphan(tty_nr: "int | None", ppid: "int | None",
                   ppid==1 is the discriminator.
     None        — attached and normal, or not enough signal to say otherwise
                   (conservative: never call an orphan on missing data).
+
+    `tty_exists` is supplied by the caller (see _tty_exists) because only the
+    caller knows the pid, and the question is namespace-scoped to that pid.
+    Unknown (None) is therefore a real answer here — no verdict — not an
+    invitation to go and test the path in whatever namespace we happen to
+    occupy, which is the bug this signature now forecloses.
     """
     if tty_nr is None:
         return None
@@ -158,8 +242,16 @@ def classify_orphan(tty_nr: "int | None", ppid: "int | None",
     if tty_fd.endswith(" (deleted)"):
         return "tty-gone"
     if tty_exists is None:
-        tty_exists = os.path.exists(tty_fd)
+        return None
     return None if tty_exists else "tty-gone"
+
+
+def _orphan_verdict(pid: int) -> "str | None":
+    """One process's orphan state, reading every input from /proc for that pid.
+    The seam that keeps classify_orphan pure and namespace-blind."""
+    tty_fd = _tty_fd(pid)
+    return classify_orphan(_tty_nr(pid), _ppid(pid), tty_fd,
+                           _tty_exists(pid, tty_fd))
 
 
 def _self_harness_pid(harness_pids: set[int]) -> int | None:
@@ -213,10 +305,13 @@ def compute() -> dict:
         if not entry.name.isdigit():
             continue
         comm = _read(entry / "comm").strip()
-        if comm and comm in bins:
-            pid = int(entry.name)
-            harness_pids.add(pid)
-            raw.append((pid, comm))
+        if not comm or comm not in bins:
+            continue
+        pid = int(entry.name)
+        if _is_zombie(pid):
+            continue                 # already exited — holds no shell, no slot
+        harness_pids.add(pid)
+        raw.append((pid, comm))
 
     self_pid = _self_harness_pid(harness_pids)
 
@@ -254,7 +349,7 @@ def compute() -> dict:
             "display_name": (labels.get(shortname or "", {}).get("display_name")),
             "is_self": pid == self_pid,
             "orphaned": (None if pid == self_pid
-                         else classify_orphan(_tty_nr(pid), _ppid(pid), _tty_fd(pid))),
+                         else _orphan_verdict(pid)),
         })
 
     active_other = sorted(worktree_sessions)
