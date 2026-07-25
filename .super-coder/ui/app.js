@@ -3133,9 +3133,11 @@ async function ifSessionPane(pane, sel) {
     wake: sess.wake_state || "disarmed",
     archive: sess.archive_id ?? null,
     since: sess.occupied_at || sess.created_at || null,
+    title: sess.title || null,      // minted once, from the first composer send
     note: "",
   };
   const headEl = el("div", { className: "if-head" });
+  const identityEl = el("div", { className: "if-identity" });
   const sessionDetailsEl = el("div", { className: "if-diag" });
   const sprintDetailsEl = el("div", { className: "if-diag" });
   const detailsEl = el("details", { className: "if-disclosure if-details" },
@@ -3148,14 +3150,14 @@ async function ifSessionPane(pane, sel) {
   const sessionActionsEl = el("div", { className: "if-inline-actions" });
   const sprintActionsEl = el("div", { className: "if-inline-actions" });
   const statusNoteEl = el("div", { className: "if-note" });
-  headEl.append(detailsEl, alertsEl, sessionActionsEl, sprintActionsEl,
-    statusNoteEl);
+  headEl.append(identityEl, detailsEl, alertsEl, sessionActionsEl,
+    sprintActionsEl, statusNoteEl);
   const termEl = el("div", { className: "if-term" });
   const composerEl = el("div", { className: "if-composer" });
   const a = { sessionId, shortname: sel.shortname, st, headEl, termEl,
     composerEl, pane, sel, sessionDetailsEl, sprintDetailsEl, detailsEl,
     alertsEl, alertsSummary, alertsBody, sessionActionsEl, sprintActionsEl,
-    statusNoteEl,
+    statusNoteEl, identityEl,
     legalActions: new Set(
       Array.isArray(sess.legal_actions) ? sess.legal_actions : []),
     stateReason: sess.state_reason || "",
@@ -3164,7 +3166,8 @@ async function ifSessionPane(pane, sel) {
     heartbeat: 0, resizeObs: null, paint: null,
     composerInput: null, composerSend: null, composerEnd: null,
     composerNote: null,
-    composerPendingSeq: null, browserComposerState: st.browserComposer,
+    composerPendingSeq: null, composerPendingText: null,
+    browserComposerState: st.browserComposer,
     browserComposerWanted: st.browserComposer, browserComposerError: "",
     browserComposerSyncing: false, browserComposerVersion: 0,
     browserComposerChain: Promise.resolve(),
@@ -3238,6 +3241,13 @@ function ifAge(ts) {
 function ifPaintHeader(a, sel, pane) {
   const st = a.st;
   const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(st.lifecycle);
+  // Whose session this is, on the left of the header (spec #43 U4). A chat
+  // with no title yet — nothing sent from the composer — renders the segment
+  // without one rather than reserving an empty slot for it.
+  const identity = [sel.display_name, sel.shortname, st.title]
+    .filter(Boolean).join(" · ");
+  a.identityEl.textContent = identity;
+  a.identityEl.title = identity;
   const stat = (k, v, title) => el("span",
     title ? { className: "if-stat", title } : { className: "if-stat" },
     k + " ", el("b", {}, String(v)));
@@ -3452,6 +3462,7 @@ function ifComposerSend(a) {
   }
   ifClearComposerLatch(a);
   a.composerPendingSeq = seq;
+  a.composerPendingText = value;   // the title is minted from it on the ack
   ifClearComposerAckTimer(a);
   a.composerAckTimer = setTimeout(() => {
     if (ifAttach !== a || a.composerPendingSeq !== seq) return;
@@ -3464,6 +3475,45 @@ function ifComposerSend(a) {
     a.paint();
   }, a.composerAckTimeoutMs || IF_COMPOSER_ACK_TIMEOUT_MS);
   a.paint();
+}
+
+const IF_TITLE_MAX = 60;
+
+// Array.from before the cap: String.slice counts UTF-16 code units, so an
+// astral character straddling the 60th unit would be cut into a lone
+// surrogate — which sqlite3 refuses to encode server-side, 500ing a mint that
+// then retries the same first line forever. Python's [:60] counts code points,
+// so this is also what makes the two caps agree.
+function ifDeriveTitle(text) {
+  return typeof text === "string"
+    ? Array.from(text.trim().split("\n")[0].trim())
+      .slice(0, IF_TITLE_MAX).join("") : "";
+}
+
+// The CLIENT mints the chat title, not the input broker. Composer sends and
+// raw terminal keystrokes are indistinguishable on the wire — term.onData
+// forwards every keystroke through the same ifSendInput frames — so a
+// broker-side rule would title a chat with whatever single character the
+// operator typed into the terminal first, and would have to read bytes the
+// broker is deliberately blind to (decision #16). This fires on the first
+// successful composer send's own input_ack, which is the only place the two
+// are distinguishable. The server's UPDATE is set-if-unset, so a replayed ack
+// or a second client racing the same first message is a no-op there too.
+//
+// A failed mint is swallowed on purpose: the title is cosmetic and must never
+// disturb the send path or paint an alarming note. It self-heals — the guard
+// below re-fires on the NEXT message for as long as the title is unset.
+async function ifMintTitle(a, text) {
+  if (a.st.title) return;
+  const title = ifDeriveTitle(text);
+  if (!title) return;
+  try {
+    const r = await apiIf(`/interface/sessions/${a.sessionId}/title`, "POST",
+                          { title });
+    if (ifAttach !== a) return;      // operator moved on mid-flight
+    a.st.title = r.title || null;
+    a.paint();
+  } catch { /* cosmetic — retried by the next send while the title is unset */ }
 }
 
 function ifBuildComposer(a) {
@@ -3715,6 +3765,8 @@ function ifControl(a, m) {
         if (m.seq === a.composerPendingSeq) {
           ifClearComposerAckTimer(a);
           a.composerPendingSeq = null;
+          ifMintTitle(a, a.composerPendingText);
+          a.composerPendingText = null;
           a.composerInput.value = "";
           ifSizeComposer(a.composerInput);
           ifSyncBrowserComposer(a, "clean");
@@ -3787,11 +3839,26 @@ async function load(tab) {
   const [sel, fn] = VIEWS[tab];
   try { await fn($(sel)); } catch (e) { $(sel).replaceChildren(el("div", { className: "card" }, "error: " + e.message)); }
 }
+// The tab title names the view and the fork (spec #43 U4), replacing a static
+// per-fork string that named neither: an Interface tab with a shell selected
+// reads "<SHORTNAME> · <fork>", every other tab "<tab name> · <fork>". <fork>
+// is the repo root basename, read from the same /health field the header
+// breadcrumb renders, so the two can never disagree. It stays empty until
+// /health answers — the title then omits the fork rather than naming one we
+// have not confirmed.
+let forkName = "";
+function setDocumentTitle(tab) {
+  const label = (tab === "interface" && ifSelected) ? ifSelected
+    : (document.querySelector(`nav button[data-tab="${tab}"]`)?.textContent
+       || tab);
+  document.title = forkName ? `${label} · ${forkName}` : label;
+}
 function show(tab) {
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") { ifDetach(); ifStopRailPoll(); }   // leaving drops stream + lease + poll
+  setDocumentTitle(tab);
   load(tab);
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
@@ -3870,6 +3937,7 @@ $("#publish").onclick = async (e) => {
   try {
     const h = await api("/health");
     $("#repo").textContent = h.repo;
+    forkName = h.repo || "";
     configureArtifactActions(h);
     setStatus(localArtifactMode ? "local artifacts · port " + h.port : "port " + h.port);
   }

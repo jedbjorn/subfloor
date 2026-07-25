@@ -2221,6 +2221,145 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "worktree_provision_failed")
         self.assertIn("LaunchError", body["error"]["message"])
 
+    # -- chat title + launch effort (spec #43 U4) ------------------------------
+
+    def title(self, session_id, text, key="k-title"):
+        return self.call(
+            "POST", f"/api/interface/sessions/{session_id}/title",
+            (OP, f"Idempotency-Key: {key}"), {"title": text})
+
+    def stored_title(self, session_id):
+        con = sqlite3.connect(self.db_path)
+        try:
+            return con.execute(
+                "SELECT title FROM interface_sessions WHERE session_id=?",
+                (session_id,)).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_title_is_minted_once_and_never_overwritten(self):
+        """Set-if-unset is the whole contract: the title records what OPENED
+        the chat. A second send — or a replayed ack, or a second client
+        racing the same first message — must leave the first one standing."""
+        sid = self.occupy()
+        status, _, body = self.title(sid, "deploy the migration")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["title"], "deploy the migration")
+        self.assertTrue(body["minted"])
+
+        status, _, body = self.title(sid, "something else entirely",
+                                     key="k-title-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["title"], "deploy the migration")
+        self.assertFalse(body["minted"])
+        self.assertEqual(self.stored_title(sid), "deploy the migration")
+
+    def test_title_takes_the_first_line_only(self):
+        """The first-line rule and the 60-char cap are SEPARATE properties.
+        A long first line truncates to the same 60 chars whether or not the
+        rest of the message was folded in, so a cap test cannot witness this
+        one — it needs a first line short enough that the remainder would
+        show up if it leaked."""
+        sid = self.occupy()
+        status, _, body = self.title(
+            sid, "ship it\nand then a good deal more context\nand more")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["title"], "ship it")
+        self.assertEqual(self.stored_title(sid), "ship it")
+
+    def test_title_skips_leading_blank_lines_and_caps_at_sixty(self):
+        sid = self.occupy()
+        long_first_line = "x" * 80
+        status, _, body = self.title(
+            sid, f"  \n{long_first_line}\nsecond line\n")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["title"], "x" * 60)
+        self.assertEqual(self.stored_title(sid), "x" * 60)
+
+    def test_title_cap_is_enforced_server_side_not_trusted_from_the_client(self):
+        """The 60-char bound is a privacy bound (the ONE sanctioned exception
+        to the broker's content-blindness), so it is enforced where the write
+        happens — a caller that sends more does not get more persisted."""
+        sid = self.occupy()
+        self.title(sid, "y" * 5000)
+        self.assertEqual(len(self.stored_title(sid)), 60)
+
+    def test_title_without_a_derivable_first_line_is_refused(self):
+        sid = self.occupy()
+        for raw in ("", "   ", "\n\n  \n"):
+            status, _, body = self.title(sid, raw, key=f"k-blank-{raw!r}")
+            self.assertEqual(status, 422, raw)
+            self.assertEqual(body["error"]["code"], "validation")
+        self.assertIsNone(self.stored_title(sid))
+
+    def test_title_non_string_is_refused(self):
+        sid = self.occupy()
+        status, _, body = self.call(
+            "POST", f"/api/interface/sessions/{sid}/title",
+            (OP, "Idempotency-Key: k-nonstr"), {"title": 42})
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "validation")
+
+    def test_title_on_unknown_session_is_404(self):
+        status, _, body = self.title(9999, "hello")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "no_such_session")
+
+    def test_title_is_exposed_on_the_session_and_shell_payloads(self):
+        sid = self.occupy()
+        status, _, body = self.call("GET", f"/api/interface/sessions/{sid}",
+                                    (OP,))
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["title"])
+
+        self.title(sid, "first message here")
+        _, _, body = self.call("GET", f"/api/interface/sessions/{sid}", (OP,))
+        self.assertEqual(body["title"], "first message here")
+        _, _, shells = self.call("GET", "/api/interface/shells", (OP,))
+        row = next(s for s in shells["shells"] if s["session_id"] == sid)
+        self.assertEqual(row["title"], "first message here")
+
+    def test_launch_effort_is_persisted_and_exposed(self):
+        """U7's +Chat reuses the launch TRIPLE. Effort used to ride only in
+        the transient launch token, so a relaunch reusing "the same model"
+        silently dropped it — the column is what makes the triple durable."""
+        status, _, body = self.create_session(effort="high")
+        self.assertEqual(status, 201)
+        sid = body["session_id"]
+        _, _, session = self.call("GET", f"/api/interface/sessions/{sid}",
+                                  (OP,))
+        self.assertEqual(session["launch_effort"], "high")
+        _, _, shells = self.call("GET", "/api/interface/shells", (OP,))
+        row = next(s for s in shells["shells"] if s["session_id"] == sid)
+        self.assertEqual(row["launch_effort"], "high")
+
+    def test_launch_effort_matches_the_token_and_defaults_to_null(self):
+        """No effort named → NULL on the row and null in the token, so +Chat
+        sends no effort and the harness default applies."""
+        status, _, body = self.create_session()
+        self.assertEqual(status, 201)
+        sid = body["session_id"]
+        _, _, session = self.call("GET", f"/api/interface/sessions/{sid}",
+                                  (OP,))
+        self.assertIsNone(session["launch_effort"])
+        token = json.loads(
+            (routes.RUN_DIR / f"launch-{sid}.json").read_text())
+        self.assertIsNone(token["effort"])
+
+        status, _, body = self.create_session(shell_id=2, key="k-eff",
+                                              effort="low")
+        sid2 = body["session_id"]
+        token2 = json.loads(
+            (routes.RUN_DIR / f"launch-{sid2}.json").read_text())
+        self.assertEqual(token2["effort"], "low")
+        con = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(con.execute(
+                "SELECT launch_effort FROM interface_sessions "
+                "WHERE session_id=?", (sid2,)).fetchone()[0], "low")
+        finally:
+            con.close()
+
 
 if __name__ == "__main__":
     unittest.main()

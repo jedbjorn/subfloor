@@ -741,6 +741,21 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-alerts.warning summary { color: var(--warn); border-color: var(--warn); }
 .if-alerts.critical summary { color: #d45a5a; border-color: #d45a5a; }
 .if-alerts-body { color: var(--ink); }
+/* Who this pane is — "<display name> · <SHORTNAME> · <chat title>" on the
+   header's left. It truncates instead of pushing the controls onto a second
+   header line — but .if-head wraps (the note and an open disclosure claim
+   their own line through flex-basis:100%), and a wrapping flex container
+   breaks the line on an item's CONTENT width before it will shrink that item,
+   so min-width:0 alone never got the chance to engage. A zero flex-basis
+   keeps the segment out of the line-breaking decision entirely; it then grows
+   into whatever room the controls leave, capped at its own content width so a
+   short identity sits exactly where it always did, and ellipsis-truncates
+   once there is no room left (min-width:0 is what lets it shrink that far). */
+.if-identity {
+  flex: 1 1 0; max-width: max-content; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--ink); font-size: .85rem;
+}
 .if-inline-actions { display: flex; align-items: center; gap: .4rem; }
 .if-stat { color: var(--dim); font-size: .8rem; }
 .if-stat b { color: var(--ink); font-weight: 600; }
@@ -752,14 +767,21 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
    has something to say lays out exactly as before. Scoped to .if-head so the
    composer's note keeps its reserved min-height line (no jump on first note). */
 .if-head > .if-note:empty { display: none; }
+/* The card's own 6px bottom padding plus the pane's 8px row-gap stacked 14px
+   of dead chrome between the last terminal row and the composer — measured in
+   the browser, and exactly the "14px less" the QAQC annotation asks for. Both
+   go: the terminal's bottom edge now sits on the composer. Top and side
+   padding are unchanged, so the row estimate below subtracts 6px of vertical
+   padding rather than 12. */
 .if-term {
   background: #000; border: 1px solid var(--line); border-radius: var(--r);
-  padding: 6px; width: 100%; max-width: 1300px;
+  padding: 6px 6px 0; width: 100%; max-width: 1300px;
   flex: 1 1 500px; min-height: 500px; overflow: hidden;
 }
 /* The grid is measured against this wrapper, so it must carry no padding or
    border of its own — it is exactly the card's content box. */
 .if-term > .if-term-fit { height: 100%; width: 100%; }
+.if-term + .if-composer { margin-top: -.5rem; }
 .if-term .xterm { height: 100%; }
 .if-composer {
   flex: 0 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto;

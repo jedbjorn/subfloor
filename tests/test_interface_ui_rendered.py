@@ -344,7 +344,15 @@ def _layout(page) -> dict[str, object]:
           const nonTermHeight = children
             .filter((child) => child !== termElement)
             .reduce((height, child) => height + child.getBoundingClientRect().height, 0);
-          const gap = parseFloat(getComputedStyle(pane).rowGap);
+          // Spacing is MEASURED between consecutive children rather than
+          // derived from rowGap × (n-1): the terminal's bottom boundary
+          // cancels the pane gap (spec #43 U4 removed the 14px of dead chrome
+          // under the last row), so a uniform-gap model now under-counts the
+          // height the terminal is entitled to fill.
+          const rects = children.map((child) => child.getBoundingClientRect());
+          let spacing = 0;
+          for (let i = 1; i < rects.length; i += 1)
+            spacing += rects[i].top - rects[i - 1].bottom;
           const docHeight = Math.max(
             document.documentElement.scrollHeight,
             document.body.scrollHeight
@@ -355,9 +363,7 @@ def _layout(page) -> dict[str, object]:
             pageScrolls: docHeight > window.innerHeight + 1,
             termHeight: term.height,
             availableTermHeight:
-              pane.getBoundingClientRect().height -
-              nonTermHeight -
-              gap * Math.max(children.length - 1, 0),
+              pane.getBoundingClientRect().height - nonTermHeight - spacing,
             composerHeight: composer.height,
           };
         }"""
@@ -959,6 +965,111 @@ def test_terminal_grid_refits_and_reports_the_measured_size_to_tmux(
         # number — the resize path this unit deliberately left unchanged.
         assert page.evaluate("window.__wsResizeFrames.at(-1).rows") == (
             after["rowCount"]
+        )
+    finally:
+        context.close()
+
+
+def test_terminal_bottom_edge_carries_no_dead_chrome(browser, ui_url):
+    """Spec #43 U4's padding line, measured rather than eyeballed: the card's
+    own 6px bottom padding plus the pane's 8px row-gap put 14px of dead space
+    between the last terminal row and the composer. Only the card's 1px border
+    may remain — this is the number the QAQC annotation asked to reclaim.
+    """
+    context, page = _open_interface(browser, ui_url, height=1000)
+    try:
+        measured = page.evaluate(
+            """() => {
+              const term = document.querySelector(".if-term");
+              const xterm = document.querySelector(".if-term .xterm");
+              const composer = document.querySelector(".if-composer");
+              return {
+                underLastRow: composer.getBoundingClientRect().top -
+                              xterm.getBoundingClientRect().bottom,
+                padBottom: getComputedStyle(term).paddingBottom,
+                padTop: getComputedStyle(term).paddingTop,
+              };
+            }"""
+        )
+        assert measured["padBottom"] == "0px"
+        # The top/side padding is deliberately kept — only the bottom went.
+        assert measured["padTop"] == "6px"
+        assert measured["underLastRow"] <= 2, (
+            f"{measured['underLastRow']}px of chrome still sits between the "
+            "last terminal row and the composer"
+        )
+    finally:
+        context.close()
+
+
+HEADER_LINES = """() => {
+  const head = document.querySelector(".if-head");
+  const identity = document.querySelector(".if-identity");
+  const box = identity.getBoundingClientRect();
+  // .if-head centres its items, so a shared flex line is a shared centre —
+  // the tops differ whenever a button is taller than the identity text.
+  const controls = Array.from(head.children)
+    .filter((child) => child !== identity)
+    .map((child) => child.getBoundingClientRect())
+    .filter((rect) => rect.height > 0);
+  const centre = (rect) => Math.round(rect.top + rect.height / 2);
+  // The identity holds a bare text node, so a Range over its contents measures
+  // the TEXT — unclipped by the segment's overflow, and independent of the box
+  // sized around it. The distance to the controls cannot see the segment
+  // overgrow its content: the controls are the next flex items along, so they
+  // travel with it and the 16px between them never moves.
+  const range = document.createRange();
+  range.selectNodeContents(identity);
+  return {
+    lines: new Set([box, ...controls].map(centre)).size,
+    truncated: identity.scrollWidth > identity.clientWidth,
+    boxWidth: box.width,
+    textWidth: range.getBoundingClientRect().width,
+  };
+}"""
+
+
+def test_long_identity_truncates_without_wrapping_the_header(browser, ui_url):
+    """Spec #43 U4: the identity segment "stays one line at any width" and the
+    action controls "keep their placement" (SC-156). .if-head wraps, and a
+    wrapping flex container breaks the line on an item's content width before
+    it shrinks that item — so a segment sized by its content dropped the
+    controls onto a second header line and never reached its own ellipsis.
+    Narrow viewport + a title at the 60-char cap forces the choice.
+    """
+    titled = {**SESSION, "title": "Wire the watcher daemon into the planner "
+                                  "inbox before freeze"}
+    assert len(titled["title"]) == 60
+
+    def titled_api(route) -> None:
+        if route.request.url.split("/api", 1)[-1] == "/interface/sessions/7":
+            return _json(route, titled)
+        return _mock_api(route)
+
+    context, page = _open_interface(
+        browser, ui_url, height=1000, width=700, api_handler=titled_api
+    )
+    try:
+        narrow = page.evaluate(HEADER_LINES)
+        assert narrow["lines"] == 1, (
+            f"the header laid out on {narrow['lines']} lines: the identity "
+            "wrapped the controls instead of truncating"
+        )
+        assert narrow["truncated"], (
+            "the identity fits at 700px — widen the fixture title, this test "
+            "is not measuring anything"
+        )
+
+        # ...and it is capped at its content width, so a segment with room to
+        # spare does not grow and shove the controls to the far right.
+        page.set_viewport_size({"width": 1600, "height": 1000})
+        wide = page.evaluate(HEADER_LINES)
+        assert wide["lines"] == 1
+        assert not wide["truncated"]
+        assert wide["boxWidth"] - wide["textWidth"] <= 1, (
+            f"a {wide['boxWidth']:.0f}px segment around "
+            f"{wide['textWidth']:.0f}px of text — it grew past its content and "
+            "shoved the controls to the far right"
         )
     finally:
         context.close()
