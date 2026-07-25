@@ -1,0 +1,28 @@
+{
+  "subscriptionType": "max",
+  "limits": [
+    {
+      "kind": "session",
+      "percent": 22,
+      "resets_at": "2026-07-25T21:00:00+00:00",
+      "severity": "normal"
+    },
+    {
+      "kind": "weekly_all",
+      "percent": 41,
+      "resets_at": "2026-07-28T09:00:00Z",
+      "severity": "normal"
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": 63,
+      "resets_at": "2026-07-28T09:00:00Z",
+      "severity": "normal",
+      "scope": {
+        "model": {
+          "display_name": "Claude Opus 5"
+        }
+      }
+    }
+  ]
+}

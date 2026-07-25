@@ -1,0 +1,26 @@
+{
+  "user": {
+    "userId": "placeholder-user-0001"
+  },
+  "membership": {
+    "level": "LEVEL_ADVANCED"
+  },
+  "usage": {
+    "used": 128000,
+    "limit": 500000,
+    "remaining": 372000,
+    "resetTime": "2026-07-31T00:00:00Z"
+  },
+  "limits": [
+    {
+      "window": {
+        "duration": 300,
+        "timeUnit": "MINUTE"
+      },
+      "used": 42,
+      "limit": 200,
+      "remaining": 158,
+      "resetTime": "2026-07-25T20:00:00Z"
+    }
+  ]
+}
