@@ -86,6 +86,7 @@ import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin ru
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
+from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
@@ -789,6 +790,163 @@ def get_analytics_filters(con) -> dict:
         "JOIN shells s ON s.shell_id=u.shell_id ORDER BY s.shortname"))
     return {"harnesses": distinct("harness"), "providers": distinct("provider"),
             "models": distinct("model"), "shells": shells}
+
+
+# ── Account analytics — harness quota (spec doc #49) ─────────────────────────
+# Token analytics answers *what did we spend*; this answers *how much is left*.
+# It calls quota_probes.dispatch.probe_all ONCE and owns nothing that call does:
+# concurrency, the 5s per-probe timeout and one-provider-failure containment all
+# live in the dispatcher, because containment is only checkable from the probe
+# package. A second timeout layer here would be a bug, not defence in depth.
+#
+# The route is `accounts`, never `usage`: /api/analytics/usage already means
+# token spend on this tab, and a second meaning on that word is a defect waiting
+# to happen.
+
+QUOTA_TTL_SECONDS = 60      # toggling the two sections must not hammer three
+                            # third-party endpoints; the refresh button bypasses it
+QUOTA_ACTIVITY_DAYS = 7     # the panel's only filter — a filter, never a delete
+
+# The TTL's clock: the last probe ATTEMPT, in this process — never the newest
+# captured_at. A probe that identifies nobody (no credential file → `na`, or a
+# provider erroring before it can name an account) writes NO rows, so a DB clock
+# never advances and every arrival would re-probe, breaking the spec's own
+# "toggling sections twice inside a minute performs one probe" in exactly the
+# degraded case. The attempt is recorded whether or not it identifies anybody.
+#
+# Living in process, it RESETS ON A SERVER RESTART — the spec declares that
+# ("a restart storm re-probes") and it is load-bearing, not merely tolerated:
+# `providers` below dies with the same process, so the first arrival after a
+# restart MUST probe or the response would carry an EMPTY per-provider status
+# list, and the panel could not tell "nothing configured" from "every probe
+# failed". Mixing a DB clock back in would reopen exactly that window. The claim
+# is taken under the lock and before the probe runs, so two simultaneous
+# arrivals collapse to one probe rather than racing to fire two.
+_QUOTA_LOCK = threading.Lock()
+_QUOTA_PROBE: dict = {"at": None, "providers": []}
+
+# The conflict target is the EXPRESSION, character for character as migration
+# 0096 declares the index: SQLite matches an upsert target against the index
+# expression, not against a column list. Naming plain `scope` here raises "ON
+# CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" — so a
+# mismatch fails loud instead of silently duplicating the panel's account-wide
+# rows (session, weekly and five_hour are ALL scope-NULL) on every single probe.
+_QUOTA_WINDOW_UPSERT = """
+INSERT INTO harness_quota_window
+    (account_pk, window_kind, scope, used_percent, used, limit_value,
+     resets_at, captured_at, status, probe_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_pk, window_kind, COALESCE(scope, '')) DO UPDATE SET
+    used_percent=excluded.used_percent, used=excluded.used,
+    limit_value=excluded.limit_value, resets_at=excluded.resets_at,
+    captured_at=excluded.captured_at, status=excluded.status,
+    probe_version=excluded.probe_version
+"""
+
+
+def _quota_claim(force: bool) -> bool:
+    """True when THIS caller should probe. `force` is the refresh button."""
+    now = datetime.now(timezone.utc).timestamp()
+    with _QUOTA_LOCK:
+        last = _QUOTA_PROBE["at"]
+        if not force and last and now - last < QUOTA_TTL_SECONDS:
+            return False
+        _QUOTA_PROBE["at"] = now
+        return True
+
+
+def _quota_upsert(con, accounts: list[dict]) -> int:
+    """Land one probe_all result. Returns the window rows written.
+
+    An account carrying no account_ref writes NO registry row: that is a
+    provider with no credential file (`na` — the absence of a limit is not a
+    limit of zero) or one that failed before it could name anyone. Such a row
+    could never be matched again, and it has no card to render."""
+    named = [a for a in accounts if a.get("account_ref")]
+    for provider in dict.fromkeys(a["provider"] for a in named):
+        # A credential file resolves to exactly one account, so the provider's
+        # other rows stop being current the moment this probe names one.
+        # Cleared BEFORE the upsert writes its answer — doing it inside the
+        # upsert would leave a switched-away account still flagged current.
+        con.execute("UPDATE harness_quota_account SET is_current=0 WHERE provider=?",
+                    (provider,))
+    written = 0
+    for acct in named:
+        seen = acct["captured_at"]
+        # first_seen is deliberately absent from the SET list: an account that
+        # went quiet and came back keeps its original first_seen rather than
+        # minting a duplicate identity.
+        con.execute(
+            "INSERT INTO harness_quota_account "
+            "(provider, account_ref, account_label, plan, first_seen, last_seen, is_current) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(provider, account_ref) DO UPDATE SET "
+            "account_label=excluded.account_label, plan=excluded.plan, "
+            "last_seen=excluded.last_seen, is_current=excluded.is_current",
+            (acct["provider"], acct["account_ref"], acct.get("account_label"),
+             acct.get("plan"), seen, seen, 1 if acct.get("is_current") else 0))
+        pk = con.execute(
+            "SELECT account_pk FROM harness_quota_account WHERE provider=? AND account_ref=?",
+            (acct["provider"], acct["account_ref"])).fetchone()[0]
+        # An account with no windows (`unauth`, or an error after identification)
+        # writes none, so the last known values stand with their own age — the
+        # card reports staleness rather than a measured zero.
+        for w in acct.get("windows") or []:
+            con.execute(_QUOTA_WINDOW_UPSERT, (
+                pk, w["window_kind"], w.get("scope"), w.get("used_percent"),
+                w.get("used"), w.get("limit_value"), w.get("resets_at"),
+                w.get("captured_at") or seen, w.get("status") or "ok",
+                w.get("probe_version")))
+            written += 1
+    return written
+
+
+def probe_quota_accounts(con) -> dict:
+    """Probe every provider and land the result. One call to probe_all; the
+    dispatcher never raises, so a dead provider costs its own card and nothing
+    else."""
+    notes: list[str] = []
+    accounts = quota_dispatch.probe_all(notes.append)
+    written = _quota_upsert(con, accounts)
+    con.commit()
+    # Per-provider status, including the providers that produced no registry row
+    # at all: without it "no accounts" is indistinguishable from "every probe
+    # failed", and the panel cannot tell the operator which one it is.
+    providers = [{"provider": a["provider"], "status": a.get("status"),
+                  "detail": a.get("detail")} for a in accounts]
+    with _QUOTA_LOCK:
+        _QUOTA_PROBE["providers"] = providers
+    return {"providers": providers, "windows_written": written, "notes": notes}
+
+
+def get_analytics_accounts(con, force: bool = False) -> dict:
+    """Registry + windows for the account panel, probing first when the last
+    probe ATTEMPT has aged past the TTL. `force` is POST /probe — the refresh
+    button."""
+    probe = probe_quota_accounts(con) if _quota_claim(force) else None
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=QUOTA_ACTIVITY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # The 7-day window, plus the account the credential file resolves to NOW.
+    # That account renders even when its last_seen has aged (a failed probe
+    # leaves it un-advanced), because the spec requires the current account
+    # rather than an empty page. Everything else outside the window stops
+    # rendering WITHOUT being deleted — switching back restores it intact.
+    accounts = rows(con.execute(
+        "SELECT * FROM harness_quota_account WHERE last_seen >= ? OR is_current=1 "
+        "ORDER BY provider, is_current DESC, last_seen DESC", (cutoff,)))
+    by_pk: dict = {}
+    for w in rows(con.execute(
+            "SELECT * FROM harness_quota_window "
+            "ORDER BY account_pk, window_kind, scope")):
+        by_pk.setdefault(w.pop("account_pk"), []).append(w)
+    for a in accounts:
+        a["windows"] = by_pk.get(a["account_pk"], [])
+    return {"accounts": accounts,
+            "activity_days": QUOTA_ACTIVITY_DAYS,
+            "ttl_seconds": QUOTA_TTL_SECONDS,
+            "probed": probe is not None,
+            "providers": (probe or {}).get("providers") or list(_QUOTA_PROBE["providers"]),
+            "notes": (probe or {}).get("notes") or []}
 
 
 # ── Mutations ─────────────────────────────────────────────────────────────────
@@ -2630,6 +2788,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_analytics_usage(con, q))
             if path == "/api/analytics/filters":
                 return self._send(200, get_analytics_filters(con))
+            if path == "/api/analytics/accounts":
+                # Arrival at #analytics-accounts. Probes only when the newest
+                # capture is older than the TTL — never at boot, never on a
+                # timer, never from the Token Analytics section.
+                return self._send(200, get_analytics_accounts(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
             if path == "/api/vm":
@@ -2710,6 +2873,9 @@ class Handler(BaseHTTPRequestHandler):
                 # GUI Analytics tab load — incremental, so steady-state is
                 # cheap; sweep opens its own connection.
                 return self._send(200, analytics.sweep(quiet=True))
+            if path == "/api/analytics/accounts/probe":
+                # The refresh button — always re-probes, TTL or not.
+                return self._send(200, get_analytics_accounts(con, force=True))
             if path == "/api/snapshot":
                 try:
                     with _CONTENT_WRITE_LOCK:
