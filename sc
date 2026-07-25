@@ -226,16 +226,37 @@ _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
     -name "$1" -type f -print
 }
 
+# Is the repo .venv's tooling runnable BY THE INTERPRETER THAT RESOLVES HERE?
+# Existence is not runnability. A .venv is bind-mounted into the sandbox from
+# the host, and `python -m venv` records its interpreter as an UNVERSIONED
+# symlink (.venv/bin/python3 -> /usr/bin/python3). That path exists in both
+# places and resolves to a DIFFERENT minor version in each whenever the host's
+# python3 and the image's python3 disagree. The venv's packages live in
+# lib/python<X.Y>/site-packages for the host's X.Y, so under the image's
+# interpreter every .venv/bin/* shim is still present and executable and
+# imports NOTHING — `ModuleNotFoundError: No module named '_pytest'`, which
+# reads as a broken tool or a failing suite rather than as the version skew it
+# is. Probe the interpreter against its own site-packages before trusting the
+# shims. (The launch-time py_mount passthrough solves this properly for a venv
+# built from an out-of-tree interpreter under $HOME; it deliberately declines
+# to shadow /usr, so a system-python venv lands here instead.)
+_sc_venv_runnable() {
+  venv="$here/.venv"
+  [ -x "$venv/bin/python" ] || return 1
+  vv="$("$venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || return 1
+  [ -n "$vv" ] && [ -d "$venv/lib/python$vv/site-packages" ]
+}
+
 # Resolve a dev-kit tool (ruff / mypy): the fork's .venv copy wins (its pins +
-# config), else the image/PATH copy (baked into the sandbox for exactly this
-# case), else fail with the honest fix. A host-managed .venv (pinned out-of-tree
-# interpreter mounted by launch) is pip-skipped in the sandbox BY DESIGN, so
-# "run ./sc deps first" was a closed loop there — the tool was unobtainable from
-# inside the box (dos-arch QAQC-02). Say what is actually wrong and where the
-# fix runs instead.
+# config) WHEN IT RUNS HERE, else the image/PATH copy (baked into the sandbox
+# for exactly this case), else fail with the honest fix. A host-managed .venv
+# (pinned out-of-tree interpreter mounted by launch) is pip-skipped in the
+# sandbox BY DESIGN, so "run ./sc deps first" was a closed loop there — the
+# tool was unobtainable from inside the box (dos-arch QAQC-02). Say what is
+# actually wrong and where the fix runs instead.
 _sc_devtool() {  # $1 = tool name → prints the executable path, or fails
   venv="$here/.venv"
-  if [ -x "$venv/bin/$1" ]; then printf '%s\n' "$venv/bin/$1"; return 0; fi
+  if [ -x "$venv/bin/$1" ] && _sc_venv_runnable; then printf '%s\n' "$venv/bin/$1"; return 0; fi
   if command -v "$1" >/dev/null 2>&1; then command -v "$1"; return 0; fi
   hostmanaged=""
   if [ -n "${SC_SANDBOX:-}" ] && [ -e "$venv/bin/python" ]; then
@@ -244,7 +265,11 @@ _sc_devtool() {  # $1 = tool name → prints the executable path, or fails
       *) hostmanaged=1 ;;                   # pinned host interpreter — pip skipped here
     esac
   fi
-  if [ -n "$hostmanaged" ]; then
+  if [ -x "$venv/bin/$1" ] && ! _sc_venv_runnable; then
+    # Present but unimportable: name the skew, not a phantom missing package.
+    echo "✗ $1: $venv/bin/$1 exists but its interpreter cannot import it — this .venv was built by a different python minor than the one resolving here ($("$venv/bin/python" -V 2>&1), packages under $(ls -d "$venv"/lib/python* 2>/dev/null | tr '\n' ' '))." >&2
+    echo "  Fix: \`./sc build\` to bake $1 into the image as the PATH fallback — or on the HOST rebuild .venv from an interpreter launch can mount (a uv-managed one under \$HOME), which carries the SAME binary into the sandbox." >&2
+  elif [ -n "$hostmanaged" ]; then
     echo "✗ $1: unavailable, and this .venv is host-managed (pinned out-of-tree interpreter) — in-sandbox pip is skipped by design, so \`./sc deps\` cannot provision it here." >&2
     echo "  Fix on the HOST: install $1 into the pinned venv (e.g. uv pip install $1) — or \`./sc build\` to refresh the sandbox image, which bakes $1 as the PATH fallback." >&2
   else
@@ -394,10 +419,25 @@ sc_test() {
     echo "→ test: $venv/bin/pytest missing — provisioning first (./sc deps)"
     sc_deps || echo "→ test: provisioning incomplete — continuing" >&2
   fi
+  # Which pytest can we actually RUN? The .venv copy wins (fork pins + config)
+  # only when its interpreter can import it — see _sc_venv_runnable. Running a
+  # present-but-unimportable shim anyway fails the ENTIRE suite with
+  # ModuleNotFoundError, which reads as a real test failure and sends whoever
+  # sees it hunting a bug that is not there. The image bakes pytest as the
+  # fallback for exactly this case; it is a real pytest, not the stdlib
+  # downgrade the branch below guards against, so a fork's own missing deps
+  # still fail loudly rather than passing green.
+  pytest_bin=""
+  if [ -x "$venv/bin/pytest" ] && _sc_venv_runnable; then
+    pytest_bin="$venv/bin/pytest"
+  elif command -v pytest >/dev/null 2>&1; then
+    pytest_bin="$(command -v pytest)"
+    [ -x "$venv/bin/pytest" ] && echo "→ test: $venv/bin/pytest is not importable by its interpreter ($("$venv/bin/python" -V 2>&1)) — using $pytest_bin" >&2
+  fi
   rc=0
-  if [ -x "$venv/bin/pytest" ]; then
-    echo "→ test: $venv/bin/pytest"
-    ( cd "$here" && "$venv/bin/pytest" "$@" )
+  if [ -n "$pytest_bin" ]; then
+    echo "→ test: $pytest_bin"
+    ( cd "$here" && "$pytest_bin" "$@" )
     prc=$?
     if [ "$prc" -eq 5 ] && [ $# -eq 0 ]; then
       # pytest exit 5 = collected nothing. On a bare `./sc test` in a fork with
@@ -415,7 +455,7 @@ sc_test() {
     # pytest must not be green-washed through stdlib unittest — fail loud with the
     # fix. Only a fork with no pytest config keeps the legacy stdlib fallback.
     if _sc_wants_pytest; then
-      echo "✗ test: pytest required (pytest config present) but unavailable in $venv — run ./sc deps to provision it" >&2
+      echo "✗ test: pytest required (pytest config present) but unavailable — neither $venv nor PATH has a runnable copy; run ./sc deps to provision it (or ./sc build to bake the image fallback)" >&2
       rc=1
     else
       echo "→ test: python3 -m unittest discover (stdlib)"
