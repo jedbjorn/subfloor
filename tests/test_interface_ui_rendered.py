@@ -1082,39 +1082,32 @@ def test_terminal_bottom_edge_carries_no_dead_chrome(browser, ui_url):
 
 HEADER_LINES = """() => {
   const head = document.querySelector(".if-head");
+  const data = document.querySelector(".if-head-data");
+  const context = document.querySelector(".if-work-context");
   const identity = document.querySelector(".if-identity");
-  const box = identity.getBoundingClientRect();
-  // .if-head centres its items, so a shared flex line is a shared centre —
-  // the tops differ whenever a button is taller than the identity text.
+  const dataBox = data.getBoundingClientRect();
+  const headBox = head.getBoundingClientRect();
   const controls = Array.from(head.children)
-    .filter((child) => child !== identity)
+    .filter((child) => child !== data)
     .map((child) => child.getBoundingClientRect())
     .filter((rect) => rect.height > 0);
   const centre = (rect) => Math.round(rect.top + rect.height / 2);
-  // The identity holds a bare text node, so a Range over its contents measures
-  // the TEXT — unclipped by the segment's overflow, and independent of the box
-  // sized around it. The distance to the controls cannot see the segment
-  // overgrow its content: the controls are the next flex items along, so they
-  // travel with it and the 16px between them never moves.
-  const range = document.createRange();
-  range.selectNodeContents(identity);
   return {
-    lines: new Set([box, ...controls].map(centre)).size,
-    truncated: identity.scrollWidth > identity.clientWidth,
-    boxWidth: box.width,
-    textWidth: range.getBoundingClientRect().width,
+    lines: new Set([dataBox, ...controls].map(centre)).size,
+    truncated: context.scrollWidth > context.clientWidth,
+    controlsRight: Math.max(...controls.map((rect) => rect.right)),
+    dataLeft: dataBox.left,
+    rightInset: headBox.right - dataBox.right,
+    context: context.textContent,
+    badge: document.querySelector(".if-work-badge").textContent,
+    identity: identity.textContent,
   };
 }"""
 
 
-def test_long_identity_truncates_without_wrapping_the_header(browser, ui_url):
-    """Spec #43 U4: the identity segment "stays one line at any width" and the
-    action controls "keep their placement" (SC-156). .if-head wraps, and a
-    wrapping flex container breaks the line on an item's content width before
-    it shrinks that item — so a segment sized by its content dropped the
-    controls onto a second header line and never reached its own ellipsis.
-    Narrow viewport + a title at the 60-char cap forces the choice.
-    """
+def test_header_keeps_controls_left_and_work_data_right(browser, ui_url):
+    """A long work subject truncates inside the right data zone; it never moves
+    the controls or the shell identity onto a second line."""
     titled = {**SESSION, "title": "Wire the watcher daemon into the planner "
                                   "inbox before freeze"}
     assert len(titled["title"]) == 60
@@ -1134,21 +1127,24 @@ def test_long_identity_truncates_without_wrapping_the_header(browser, ui_url):
             "wrapped the controls instead of truncating"
         )
         assert narrow["truncated"], (
-            "the identity fits at 700px — widen the fixture title, this test "
+            "the work context fits at 700px — widen the fixture title, this test "
             "is not measuring anything"
         )
+        assert narrow["controlsRight"] <= narrow["dataLeft"], (
+            "right-side data crossed over the left-side controls"
+        )
+        assert narrow["rightInset"] <= 14
+        assert narrow["badge"] == "Sprint 31"
+        assert narrow["identity"] == "Code-01 | DEV3"
+        assert narrow["context"].startswith("Interface corrective hardening · ")
 
-        # ...and it is capped at its content width, so a segment with room to
-        # spare does not grow and shove the controls to the far right.
+        # With room to spare the same hierarchy remains one line, right aligned.
         page.set_viewport_size({"width": 1600, "height": 1000})
         wide = page.evaluate(HEADER_LINES)
         assert wide["lines"] == 1
         assert not wide["truncated"]
-        assert wide["boxWidth"] - wide["textWidth"] <= 1, (
-            f"a {wide['boxWidth']:.0f}px segment around "
-            f"{wide['textWidth']:.0f}px of text — it grew past its content and "
-            "shoved the controls to the far right"
-        )
+        assert wide["controlsRight"] <= wide["dataLeft"]
+        assert wide["rightInset"] <= 14
     finally:
         context.close()
 
