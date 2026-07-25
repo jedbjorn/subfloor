@@ -58,6 +58,12 @@
 /.sc-state/map.db-shm
 /.sc-state/db_backups/
 
+# Local DB safety backups (pre-migration snapshots) and the cross-shell
+# scratch/handoff dir — local-only artifacts, never tracked. A few ancient
+# backups predate this rule and stay tracked; gitignore doesn't affect them.
+/db_backups/
+/shared/
+
 # Python / tooling
 __pycache__/
 *.pyc
