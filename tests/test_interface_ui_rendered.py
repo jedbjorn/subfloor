@@ -52,6 +52,10 @@ SESSION = {
     "identity_verified": True,
     "harness": "codex",
     "model_route": "gpt-5.6-terra",
+    # The third leg of the launch triple (#43 U4's column, #43 U7's consumer).
+    # Present here so +Chat's relaunch can be asserted against a real payload
+    # rather than against a hand-set client field.
+    "launch_effort": "high",
     "lifecycle": "idle",
     "composer": "clean",
     "browser_composer": "clean",
@@ -531,10 +535,13 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         ).count() == 1
 
         actions = page.locator(".if-composer-actions")
+        # Spec #43 U7: Send is gone (Enter is the sole submit, with a static
+        # hint), End is the red text-only rename, +Chat is the new action.
         assert actions.locator("button").all_inner_texts() == [
-            "Send",
-            "End chat",
+            "End",
+            "+Chat",
         ]
+        assert page.locator(".if-composer-hint").inner_text() == "enter to send"
         boxes = actions.locator("button").evaluate_all(
             """(buttons) => buttons.map((button) => {
               const box = button.getBoundingClientRect();
@@ -546,11 +553,16 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         page.evaluate(
             "ifControl(ifAttach, { type: 'lifecycle', lifecycle: 'ended' })"
         )
-        assert page.get_by_role("button", name="End chat").is_hidden()
+        # SC-167: both actions terminate the session, so an ended pane hides
+        # both. +Chat used to survive here, offering to end a chat that was
+        # already over.
+        assert page.get_by_role("button", name="End", exact=True).is_hidden()
+        assert page.get_by_role("button", name="+Chat", exact=True).is_hidden()
         page.evaluate(
             "ifControl(ifAttach, { type: 'lifecycle', lifecycle: 'idle' })"
         )
-        assert page.get_by_role("button", name="End chat").is_visible()
+        assert page.get_by_role("button", name="End", exact=True).is_visible()
+        assert page.get_by_role("button", name="+Chat", exact=True).is_visible()
         page.screenshot(
             path=str(_artifact(tmp_path, "interface-details-desktop.png")),
             full_page=True,
@@ -602,8 +614,8 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
             in options
         )
         assert page.locator(".if-composer-actions button").all_inner_texts() == [
-            "Send",
-            "End chat",
+            "End",
+            "+Chat",
         ]
         page.screenshot(
             path=str(_artifact(tmp_path, "interface-details-mobile.png")),
@@ -613,6 +625,68 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         mobile.close()
 
 
+def test_new_chat_relaunches_the_same_launch_triple_from_the_session_payload(
+    browser, ui_url
+):
+    """+Chat's acceptance, end to end in the real browser: the relaunch POST
+    carries the ENDED session's harness, model route and effort.
+
+    This exists because the node-driven chain tests set ``st.launchEffort``
+    themselves, so they pin what the chain does with the triple but not that the
+    triple is READ from the session payload at all — a mutation nulling that
+    wiring left every one of them green. Here the effort's only source is
+    SESSION["launch_effort"] served by the mock API, so the wiring is on the
+    path being tested.
+    """
+    state = {"started": None, "terminated": None, "ended": False}
+
+    def relaunch_api(route) -> None:
+        request = route.request
+        path = request.url.split("/api", 1)[-1]
+        if path == "/interface/termination-requests":
+            state["terminated"] = request.post_data_json
+            state["ended"] = True
+            return _json(route, {"terminated": True})
+        if path == "/interface/sessions" and request.method == "POST":
+            state["started"] = request.post_data_json
+            return _json(route, {"session_id": 9}, status=201)
+        if path == "/interface/shells" and state["ended"]:
+            return _json(route, {"shells": [{**SHELL, "availability": "starting",
+                                             "session_id": None}]})
+        return _mock_api(route)
+
+    context, page = _open_interface(
+        browser, ui_url, height=1000, api_handler=relaunch_api
+    )
+    dialogs: list[str] = []
+
+    def accept(dialog):
+        dialogs.append(dialog.message)
+        dialog.accept()
+
+    page.on("dialog", accept)
+    try:
+        page.get_by_role("button", name="+Chat", exact=True).click()
+        # The chain ends in a re-render onto the starting pane, so the occupied
+        # composer going away is the signal that both POSTs have been made.
+        page.wait_for_function("() => !document.querySelector('.if-composer')")
+        assert state["terminated"] == {"session_id": 7, "force": False}
+        # The launch triple, reused verbatim — effort included.
+        assert state["started"] == {
+            "shell_id": 3,
+            "harness": "codex",
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+        }, state["started"]
+        # One confirm, naming both effects and the route being reused.
+        assert len(dialogs) == 1, dialogs
+        assert "End session #7" in dialogs[0]
+        assert "GPT 5.6 TERRA" in dialogs[0]
+        assert "discarded" in dialogs[0]
+    finally:
+        context.close()
+
+
 def test_enter_sends_one_frame_and_open_silent_stream_retains_draft(
     browser, ui_url
 ):
@@ -620,9 +694,13 @@ def test_enter_sends_one_frame_and_open_silent_stream_retains_draft(
     try:
         composer = page.locator(".if-composer-input")
         composer.fill("one composed turn")
-        page.get_by_role("button", name="Send").wait_for(state="visible")
+        page.locator(".if-composer-hint").wait_for(state="visible")
+        # There is no Send button to watch for readiness any more (U7), so wait
+        # on the condition its disabled state actually encoded: the draft's
+        # dirty transition has landed, so Enter yields SENT and not QUEUED.
         page.wait_for_function(
-            "() => !document.querySelector('.if-composer-actions button').disabled"
+            "() => ifAttach && ifAttach.browserComposerState === 'dirty'"
+            " && !ifAttach.browserComposerSyncing"
         )
         page.evaluate("ifAttach.composerAckTimeoutMs = 40")
 
@@ -728,7 +806,7 @@ def test_not_occupied_end_chat_detaches_into_preserving_recovery(
     )
     page.on("dialog", lambda dialog: dialog.accept())
     try:
-        page.get_by_role("button", name="End chat").click()
+        page.get_by_role("button", name="End", exact=True).click()
         preview_button = page.get_by_role("button", name="Preview recovery")
         preview_button.wait_for()
         assert page.evaluate("window.__lastWs.readyState") == 3

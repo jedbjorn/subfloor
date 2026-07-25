@@ -615,7 +615,12 @@ a.paint();
   a.composerInput.onkeydown({
     key: "Enter", shiftKey: false, preventDefault() { prevented = true; },
   });
-  a.composerSend.onclick();
+  // Enter is the SOLE submit affordance (spec #43 U7 removed the Send button),
+  // so the convergence property is now two Enters, not Enter plus a click:
+  // a second attempt must join the existing latch rather than open a new one.
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, preventDefault() { prevented = true; },
+  });
   invariant(prevented && frames.length === 0 && a.composerSubmitLatched,
     "send during dirty-state sync was not latched exactly once");
   invariant(a.composerInput.disabled,
@@ -636,7 +641,7 @@ a.paint();
     apiCalls[0].body.state === "dirty",
     `draft state did not reach the server: ${JSON.stringify(apiCalls)}`);
   invariant(prevented && frames.length === 1,
-    "latched Enter and Send did not converge on exactly one broker frame");
+    "two latched Enters did not converge on exactly one broker frame");
   const payload = new TextDecoder().decode(frames[0].subarray(9));
   invariant(payload === "hello\nworld\r",
     `composer bytes bypassed terminal Enter semantics: ${JSON.stringify(payload)}`);
@@ -671,9 +676,11 @@ a.paint();
   a.composerInput.value = "retain on reject";
   a.composerInput.oninput();
   await a.browserComposerChain;
-  a.composerSend.onclick();
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, preventDefault() {},
+  });
   invariant(frames.length === 2 && a.composerPendingSeq === 5,
-    "visible Send did not use the same broker path");
+    "an unlatched Enter did not use the same broker path");
   ifControl(a, { type: "input_reject", seq: 5, reason: "stale_generation" });
   invariant(a.composerInput.value === "retain on reject" &&
     a.composerPendingSeq === null &&
@@ -735,13 +742,21 @@ async function renderInterface(root) {
   if (root !== view) throw new Error("End chat refreshed the wrong view");
   rendered += 1;
 }
-async function apiIf() { throw response; }
+// Ordering, not a blanket ban: End paints ONCE before it calls the API, to put
+// its busy guard up. What must never happen is a paint AFTER the transition —
+// that one writes stale state onto a pane already re-rendered into recovery.
+let terminating = false;
+async function apiIf() { terminating = true; throw response; }
 const view = {};
 const pane = { closest: (selector) => selector === ".view" ? view : null };
 const a = {
   sessionId: 7,
   st: { note: "" },
-  paint() { throw new Error("a recovery transition painted stale state"); },
+  painted: 0,
+  paint() {
+    if (terminating) throw new Error("a recovery transition painted stale state");
+    this.painted += 1;
+  },
 };
 const sel = { shortname: "DEV3", display_name: "Code-01" };
 
@@ -749,7 +764,13 @@ async function exercise(error, label) {
   response = error;
   detached = 0;
   rendered = 0;
-  await ifEndChat(a, sel, pane, { disabled: false });
+  terminating = false;
+  a.painted = 0;
+  await ifEndChat(a, sel, pane);
+  if (a.painted !== 1) {
+    throw new Error(`${label} did not raise the busy guard exactly once: ` +
+      `${a.painted}`);
+  }
   if (detached !== 1 || rendered !== 1) {
     throw new Error(`${label} kept the dead attachment: ` +
       `${JSON.stringify({ detached, rendered })}`);
@@ -1319,6 +1340,15 @@ def test_empty_header_note_does_not_reserve_a_flex_row():
     assert ".if-composer .if-note" in CSS and "min-height: 1.2em" in CSS
 
 
+def test_static_submit_hint_has_a_styled_hook():
+    """#43 U7 replaced the Send button with a static "enter to send" hint, so
+    the class the markup emits and the class the stylesheet dresses must be the
+    same one. Cheap text assertion by necessity — the rendered suite is what
+    proves it is actually visible and dim; this catches the rename that would
+    ship an unstyled hint while every node-driven test stayed green."""
+    assert ".if-composer .if-composer-hint {" in CSS
+
+
 def test_recovery_partial_result_keeps_exact_remediation_until_refresh():
     run_recovery_js(r"""
 let rendered = 0;
@@ -1519,7 +1549,7 @@ confirm = () => true;
     throw fail(409, "not_occupied",
       "session 4 is unreconciled — termination needs a verified identity");
   };
-  await ifEndChat(a, { shortname: "S3" }, new FakeElement("div"), null);
+  await ifEndChat(a, { shortname: "S3" }, new FakeElement("div"));
   invariant(detached === 1, `unreconciled End chat did not detach: ${detached}`);
   invariant(rendered === 1,
     `unreconciled End chat did not re-render onto recovery: ${rendered}`);
@@ -1528,11 +1558,12 @@ confirm = () => true;
 
   const b = attach();
   apiIf = async () => { throw fail(500, "internal", "boom"); };
-  await ifEndChat(b, { shortname: "S3" }, new FakeElement("div"), null);
+  await ifEndChat(b, { shortname: "S3" }, new FakeElement("div"));
   invariant(detached === 1 && rendered === 1,
     "an unrelated failure was swallowed as a recovery re-render");
-  invariant(b.st.note.includes("end chat failed") && b.painted === 1,
-    `unrelated failure was not reported: ${b.st.note}`);
+  // Two paints: End's busy guard going on, then the release carrying the note.
+  invariant(b.st.note.includes("end chat failed") && b.painted === 2,
+    `unrelated failure was not reported: ${b.st.note} (painted ${b.painted})`);
 })().catch((error) => {
   console.error(error.stack || error);
   process.exit(1);

@@ -797,6 +797,14 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   color: #ef7777; border-color: #a74444; background: rgba(167,68,68,.08);
 }
 .if-composer .if-end-chat:hover { border-color: #ef7777; }
+/* Static submit hint: Enter is the sole submit affordance, so the composer must
+   say so somewhere. Dim and small on purpose — it is a label, not a status. The
+   note below it owns every gate state (U2), and two surfaces that can disagree
+   is the defect that contract exists to prevent. */
+.if-composer .if-composer-hint {
+  grid-column: 1; justify-self: end; align-self: center;
+  color: var(--dim); font-size: .72rem;
+}
 .if-composer .if-note { grid-column: 1 / -1; min-height: 1.2em; }
 .if-newchat .act { margin-top: .8rem; }
 .if-newchat .muted { margin-top: .5rem; }

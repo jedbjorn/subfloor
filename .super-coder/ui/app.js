@@ -3172,6 +3172,10 @@ async function ifSessionPane(pane, sel) {
   const st = {
     harness: sess.harness || sel.harness || "—",
     modelRoute: sess.model_route || null,    // the route it was LAUNCHED with
+    // The third leg of the launch TRIPLE, for +Chat to reuse verbatim. NULL is
+    // a real value here (pre-migration rows, and launches that named no
+    // effort) and must stay NULL: it means "harness default", not "unknown".
+    launchEffort: sess.launch_effort ?? null,
     lifecycle: sess.lifecycle || "—",
     composer: sess.composer || "unknown",
     browserComposer: sess.browser_composer || "clean",
@@ -3212,8 +3216,8 @@ async function ifSessionPane(pane, sel) {
     ws: null, term: null, leaseId: null, leaseToken: null, role: "viewer",
     seq: 1, inflight: 0, lastAck: 0, outBuf: "", awaiting: false, halted: false,
     heartbeat: 0, resizeObs: null, paint: null,
-    composerInput: null, composerSend: null, composerEnd: null,
-    composerNote: null,
+    composerInput: null, composerEnd: null, composerNewChat: null,
+    composerNote: null, composerActionsBusy: false,
     composerPendingSeq: null, composerPendingText: null,
     browserComposerState: st.browserComposer,
     browserComposerWanted: st.browserComposer, browserComposerError: "",
@@ -3337,10 +3341,6 @@ function ifPaintHeader(a, sel, pane) {
     actions.push(cert);
   }
   a.sessionActionsEl.replaceChildren(...actions);
-  if (a.composerEnd) {
-    a.composerEnd.hidden = !controlsActive;
-    a.composerEnd.disabled = !controlsActive;
-  }
   a.statusNoteEl.textContent = st.note;
 }
 
@@ -3427,7 +3427,6 @@ function ifPaintComposer(a) {
   if (!a.composerInput) return;
   const writable = ifComposerWritable(a);
   const pending = a.composerPendingSeq != null;
-  const hasMessage = Boolean(a.composerInput.value.trim());
   // Do not let a new draft appear while a clean transition is in flight:
   // that would briefly project clean server-side while the box is non-empty.
   // Dirty transitions normally need not freeze typing because every later
@@ -3437,12 +3436,18 @@ function ifPaintComposer(a) {
   a.composerInput.disabled = !writable || pending ||
     a.composerSubmitLatched ||
     (a.browserComposerSyncing && a.browserComposerWanted === "clean");
-  const dirtyReady = a.browserComposerState === "dirty";
-  const dirtySyncing = a.browserComposerSyncing &&
-    a.browserComposerWanted === "dirty";
-  a.composerSend.disabled = !writable || pending || a.awaiting ||
-    Boolean(a.outBuf) || !hasMessage || Boolean(a.browserComposerError) ||
-    (!dirtyReady && !dirtySyncing);
+  // Both actions terminate the session, so both are gated the same way and
+  // from ONE place: an inactive lifecycle hides and disables them (nothing to
+  // end, and +Chat's own chain begins with an End), and a chain in flight
+  // holds them for its whole duration — the spec's double-activation guard.
+  // Splitting these two writers across header and composer paint is what let
+  // +Chat outlive the lifecycle gate the End button already respected.
+  const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(a.st.lifecycle);
+  for (const button of [a.composerEnd, a.composerNewChat]) {
+    if (!button) continue;
+    button.hidden = !controlsActive;
+    button.disabled = !controlsActive || a.composerActionsBusy;
+  }
   // One note, sourced from the one table. A BLOCKED row is a live condition
   // and always explains itself; a QUEUED row only speaks once a submit is
   // actually latched (mid-typing draft sync is not a queued message).
@@ -3622,18 +3627,21 @@ async function ifMintTitle(a, text) {
   } catch { /* cosmetic — retried by the next send while the title is unset */ }
 }
 
+// The Send button is deliberately absent (U7): Enter already submits, and U2's
+// note is the ONE state surface. The hint below is STATIC for that reason — a
+// hint that tracked gate state would be a second surface disagreeing with the
+// note, which is the defect U2 existed to delete. Shift+Enter still newlines.
 function ifBuildComposer(a) {
   const input = el("textarea", {
     className: "if-composer-input", rows: 1,
     placeholder: "Message this session…",
     ariaLabel: "Message composer",
   });
-  const send = el("button", {
-    className: "act primary", type: "button", textContent: "Send",
+  const hint = el("div", {
+    className: "if-composer-hint", textContent: "enter to send",
   });
   const note = el("div", { className: "if-note" });
   a.composerInput = input;
-  a.composerSend = send;
   a.composerNote = note;
   input.oninput = () => {
     ifSizeComposer(input);
@@ -3646,15 +3654,20 @@ function ifBuildComposer(a) {
     event.preventDefault();
     ifComposerSend(a);
   };
-  send.onclick = () => ifComposerSend(a);
   const end = el("button", {
-    className: "act bad if-end-chat", type: "button", textContent: "End chat",
+    className: "act bad if-end-chat", type: "button", textContent: "End",
     title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout",
   });
-  end.onclick = () => ifEndChat(a, a.sel, a.pane, end);
+  end.onclick = () => ifEndChat(a, a.sel, a.pane);
   a.composerEnd = end;
-  const actions = el("div", { className: "if-composer-actions" }, send, end);
-  a.composerEl.append(input, actions, note);
+  const fresh = el("button", {
+    className: "act if-new-chat", type: "button", textContent: "+Chat",
+    title: "end this chat and start a fresh one on the same shell, same harness · model · effort",
+  });
+  fresh.onclick = () => ifNewChatSameRoute(a, a.sel, a.pane);
+  a.composerNewChat = fresh;
+  const actions = el("div", { className: "if-composer-actions" }, end, fresh);
+  a.composerEl.append(input, actions, hint, note);
   ifSizeComposer(input);
 }
 
@@ -3664,10 +3677,18 @@ function ifBuildComposer(a) {
 // prompt names the exact PID/generation from its response. The shell returns
 // to available only when the API says terminated; identity_mismatch fails
 // closed into unreconciled/lost, so we re-render onto the recovery pane.
-async function ifEndChat(a, sel, pane, btn) {
-  if (!confirm(`End chat with ${sel.display_name || sel.shortname}? This terminates session #${a.sessionId}.`)) return;
-  if (btn) btn.disabled = true;
-  const root = pane.closest(".view");
+// The graceful-first sequence itself, shared by End and +Chat. It is factored
+// out rather than copied because the spec's requirement for +Chat is that it
+// "lands on the recovery pane exactly as End does" — one path makes that true
+// by construction, where two copies would only be true until they drifted.
+// Returns exactly one outcome, and RECOVERY IS TERMINAL: the caller is told
+// only that the chain must stop, never given a reason to continue.
+//
+//   terminated — the session is down; a caller may proceed
+//   recovery   — recovery-shaped; already re-rendered, caller must NOT proceed
+//   declined   — the operator declined the force kill
+//   failed     — anything else; `note` is the operator-facing text
+async function ifTerminateSession(a, root) {
   let r;
   try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: false }); }
   catch (e) {
@@ -3682,29 +3703,123 @@ async function ifEndChat(a, sel, pane, btn) {
       // the server-authorized recovery preview instead of retaining a false
       // occupied attachment and an inert End-chat error.
       ifDetach();
-      if (root) return renderInterface(root);
-      return;
+      if (root) await renderInterface(root);
+      return { kind: "recovery" };
     }
     if (e.status === 409 && reason) r = e.body;
-    else { a.st.note = "end chat failed: " + e.message; a.paint(); return; }
+    else return { kind: "failed", note: "end chat failed: " + e.message };
   }
   if (!r.terminated && r.reason === "identity_mismatch") {
-    if (root) return renderInterface(root);
-    return;
+    if (root) await renderInterface(root);
+    return { kind: "recovery" };
   }
   if (!r.terminated && r.reason === "graceful_timeout") {
     if (!confirm(`Graceful stop timed out. Force-kill PID ${r.pid} (generation ${r.generation})?`)) {
-      a.st.note = "graceful stop timed out — End chat again to retry, or confirm the force kill.";
-      a.paint();
-      return;
+      return { kind: "declined",
+               note: "graceful stop timed out — End again to retry, or confirm the force kill." };
     }
     try { r = await apiIf("/interface/termination-requests", "POST", { session_id: a.sessionId, force: true }); }
-    catch (e) { a.st.note = "force kill failed: " + e.message; a.paint(); return; }
+    catch (e) { return { kind: "failed", note: "force kill failed: " + e.message }; }
   }
-  if (r.terminated) {
+  if (r.terminated) return { kind: "terminated" };
+  return { kind: "failed", note: "not terminated: " + (r.reason || "?") };
+}
+
+// End holds the SAME busy flag +Chat does, rather than disabling its own button
+// directly. Two reasons, both of which were live defects: a direct
+// `btn.disabled` is a second writer of state ifPaintComposer owns, so any
+// repaint mid-chain (a ws lifecycle frame is enough) re-enabled End; and +Chat
+// stayed clickable for the whole of an End, which is the double-activation the
+// guard exists to prevent — +Chat's chain opens with a termination of its own.
+async function ifEndChat(a, sel, pane) {
+  if (!confirm(`End chat with ${sel.display_name || sel.shortname}? This terminates session #${a.sessionId}.`)) return;
+  a.composerActionsBusy = true;
+  a.paint();
+  const root = pane.closest(".view");
+  const out = await ifTerminateSession(a, root);
+  if (out.kind === "recovery") return;      // already on the recovery pane
+  if (out.kind === "terminated") {
     ifDetach();
     if (root) renderInterface(root);
-  } else { a.st.note = "not terminated: " + (r.reason || "?"); a.paint(); }
+    return;
+  }
+  // The only leg that stays on this pane, so the only one that must release:
+  // recovery and terminated have both re-rendered it away.
+  a.st.note = out.note;
+  a.composerActionsBusy = false;
+  a.paint();
+}
+
+// +Chat: end this chat and start a fresh one on the SAME shell with the SAME
+// LAUNCH TRIPLE — harness, model route, effort — reused verbatim from the
+// session being ended, NULLs included (a harness-default launch relaunches as
+// harness default). Deliberately the LAUNCH route and not the live model, per
+// decision #55: the engine relaunches only what it can truthfully claim.
+//
+// FAIL-CLOSED is this chain's load-bearing property. A new session is started
+// on exactly one condition — an explicit `terminated` from the shared
+// termination path. Recovery-shaped, declined and failed outcomes all stop,
+// because auto-starting over an unreconciled shell is precisely the thing this
+// must never do; that is why the start POST hangs off a single equality test
+// and not off "no error so far".
+async function ifNewChatSameRoute(a, sel, pane) {
+  // Read the triple BEFORE anything can re-render `a` out from under us.
+  const harness = a.st.harness;
+  const model = a.st.modelRoute;
+  const effort = a.st.launchEffort;
+  if (!confirm(`End session #${a.sessionId} and start a new chat with ` +
+               `${harness} · ${ifModelLabel(model)}? ` +
+               "Any unsent draft is discarded.")) return;
+  a.composerActionsBusy = true;
+  a.paint();
+  const root = pane.closest(".view");
+  const out = await ifTerminateSession(a, root);
+  if (out.kind !== "terminated") {
+    if (out.kind !== "recovery") a.st.note = out.note;
+    a.composerActionsBusy = false;
+    a.paint();
+    return;
+  }
+  ifDetach();
+  const body = { shell_id: sel.shell_id };
+  // NULLs are omitted, not sent as null: an absent field is how the API spells
+  // "harness default", which is what a NULL launch leg meant in the first place.
+  if (harness && harness !== "—") body.harness = harness;
+  if (model) body.model = model;
+  if (effort) body.effort = effort;
+  // One retry, and only for the occupancy race the spec names: the shell we
+  // just emptied can still read as occupied for a moment. Every other failure
+  // is surfaced as the server phrased it and the shell is left to the normal
+  // New-chat path — never retried, never downgraded to a different launch.
+  //
+  // The bound is TWO STATEMENTS rather than a loop, deliberately. A loop is the
+  // shape that lets "retry once" drift, and a retry loop whose guard is later
+  // widened does not merely misbehave — it spins the tab forever against a
+  // shell that stays occupied. (That is not hypothetical: the first draft of
+  // this was a loop, and the mutation that widened its guard hung the suite
+  // instead of failing it.) Written this way, unbounded retry is not
+  // expressible, so it needs no test to stay impossible.
+  let failure = await ifStartSession(body);
+  if (failure && failure.status === 409 && failure.code === "shell_occupied") {
+    await new Promise((done) => setTimeout(done, 2000));
+    failure = await ifStartSession(body);
+  }
+  if (failure)
+    toast("new chat not started — " +
+          (failure.code ? failure.code + ": " : "") + failure.message);
+  // 201 → the starting pane; 202 (ambiguous spawn) → the server projects the
+  // recovery pane; a failure → the available pane's normal New-chat path. All
+  // three are the same re-render, exactly as New chat does it.
+  if (root) await renderInterface(root);
+}
+
+// The start POST with its error returned rather than thrown, so the caller's
+// retry bound can read as two statements instead of a loop.
+async function ifStartSession(body) {
+  try {
+    await apiIf("/interface/sessions", "POST", body);
+    return null;
+  } catch (e) { return e; }
 }
 
 // Take-over: fresh lease with takeover:true (new idempotency key — different
