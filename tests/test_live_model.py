@@ -217,6 +217,22 @@ class SyntheticRecords(ProbeCase):
         self.assertEqual(models[-1], "<synthetic>", models[-3:])
         self.assertIn("claude-sonnet-5", models)
 
+    def test_no_acceptance_fixture_rests_on_a_synthetic_transition(self):
+        """REV2's L1 on the 44-U0 scout (sprint 45): the scout's "60 mid-switch
+        sessions" count only reaches 60 if `<synthetic>` is counted as a
+        distinct model, so a switch fixture drawn from that pool could be a
+        `<synthetic>` transition rather than a real operator switch — a test
+        that looks like it proves switching while proving the placeholder bug.
+
+        These fixtures come from deliberate capture runs, not that pool, so
+        they are clean by construction. This asserts it rather than assuming
+        it, and keeps it true if a fixture is ever re-captured.
+        """
+        for worktree in (CLAUDE_SINGLE, CLAUDE_AB, CLAUDE_BACK, CLAUDE_SUB):
+            with self.subTest(worktree=worktree):
+                self.assertNotIn("<synthetic>",
+                                 _claude_models(worktree, raw=True))
+
     def test_placeholder_rule_is_the_shape_not_the_one_value(self):
         for value in ("<synthetic>", "<error>", "", "   ", None):
             self.assertTrue(live_model.placeholder(value), value)
@@ -232,6 +248,32 @@ class Verdicts(ProbeCase):
                 r = live_model.probe(harness, CLAUDE_BACK)
                 self.assertEqual(r["verdict"], "unsupported")
                 self.assertIsNone(r["last_model"])
+
+    def test_codex_stays_unsupported_even_with_a_real_rollout_present(self):
+        """`unsupported` is a claim about the FORMAT, not about absence.
+
+        codex's rollouts DO carry an explicit per-turn model
+        (`turn_context.payload.model`), so the tempting bug is to read it and
+        call codex supported. It is not: nothing in the format distinguishes a
+        subagent turn from a main one (651 rollouts, zero agent-attribution
+        keys), and doc 44 requires unsupported over sometimes-wrong. This pins
+        that the verdict holds with a REAL codex rollout sitting on disk,
+        naming the very worktree being probed — the fixture PLN1 kept in scope
+        against the flag #174 revisit.
+        """
+        rollout = (FIXTURES / "codex/sessions/2026/07/25"
+                   / "rollout-2026-07-25T11-18-45-019f98ff-c0b0-7b02-b91d-e3a7b66eb2ca.jsonl")
+        head = json.loads(rollout.read_text().splitlines()[0])
+        worktree = head["payload"]["cwd"]
+        models = [json.loads(ln)["payload"]["model"]
+                  for ln in rollout.read_text().splitlines()
+                  if json.loads(ln).get("type") == "turn_context"]
+        self.assertEqual(models, ["gpt-5.5"])  # a real, explicit model id
+
+        r = live_model.probe("codex", worktree)
+        self.assertEqual(r["verdict"], "unsupported")
+        self.assertIsNone(r["last_model"])
+        self.assertIsNone(r["source"])
 
     def test_no_transcript_yet_is_none(self):
         r = self.probe("claude", "/tmp/lm-capture/never-ran")
@@ -310,6 +352,41 @@ class Robustness(ProbeCase):
         second = live_model.probe("claude", CLAUDE_BACK, log=seen.append)
         self.assertEqual(second["verdict"], "none")
         self.assertEqual(len(seen), 1, seen)
+
+    def test_opencode_prefers_the_parent_when_a_child_session_is_newer(self):
+        """The `parent_id IS NULL` guard on SESSION selection.
+
+        In every real capture the parent session updates AFTER its child — the
+        subagent returns and then the main thread answers — so no captured
+        fixture can make the newest session be a subagent's, and dropping the
+        guard leaves the whole suite green. The hazard is still real: a
+        subagent that outlives its parent's last message (parent interrupted,
+        long-running child) inverts that order, and the probe would then report
+        the subagent's model as the session's.
+
+        So this perturbs a COPY of the real fixture — only `time_updated`, the
+        one field that decides the race — rather than asserting against a
+        hand-authored database. Same category as the truncation case above: a
+        real fixture placed in a real state the captures could not be made to
+        reach on demand.
+        """
+        db = self.tmp / "opencode.db"
+        shutil.copy(FIXTURES / "opencode" / "opencode.db", db)
+        con = sqlite3.connect(db)
+        with con:
+            parent, updated = con.execute(
+                "SELECT id, time_updated FROM session "
+                "WHERE directory=? AND parent_id IS NULL", (OC_SUB,)).fetchone()
+            changed = con.execute(
+                "UPDATE session SET time_updated=? "
+                "WHERE parent_id=?", (updated + 5000, parent)).rowcount
+        con.close()
+        self.assertEqual(changed, 1, "fixture must hold exactly one child session")
+        p_opencode.DB = db
+
+        r = self.probe("opencode", OC_SUB)
+        self.assertEqual(r["last_model"], "qwen3.5:397b")
+        self.assertTrue(r["source"].endswith(f"#{parent}"), r["source"])
 
     def test_a_missing_data_dir_is_none(self):
         p_claude.DATA_DIR = self.tmp / "does-not-exist"

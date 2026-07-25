@@ -76,15 +76,28 @@ fixtures must keep their original directory names — including claude's lossy
 (`-tmp-lm-capture-claude` is a prefix of three others) are themselves under
 test.
 
-## Not captured: codex, vibe
-
-Both ship `unsupported`, so neither has fixtures.
+## codex and vibe — `unsupported`
 
 - **vibe** records the model once per session (`meta.json` `config.active_model`)
-  and never per message — it cannot express a switch.
+  and never per message — it cannot express a switch. No fixture.
 - **codex** records `turn_context.payload.model` per turn, which would be
   enough, but nothing in its rollouts distinguishes a subagent turn from a main
   one (651 rollouts inspected, zero agent-attribution keys), and the account
   was out of credits, so no capture run could settle it. Per spec doc 44's own
   rule a harness that cannot make the distinction is `unsupported` rather than
-  sometimes-wrong.
+  sometimes-wrong. Tracked as flag #174 for a revisit after the billing window.
+
+```
+codex/sessions/2026/07/25/rollout-2026-07-25T11-18-45-019f98ff-….jsonl
+```
+
+This one IS kept, at PLN1's direction. It is the rollout codex wrote during the
+U1 capture attempt that died on the usage limit: real bytes, `session_meta` +
+one `turn_context` carrying the explicit model `gpt-5.5`, and no assistant
+output — a genuine "no answer yet" specimen in codex's shape.
+
+It is not decoration. `test_codex_stays_unsupported_even_with_a_real_rollout_present`
+uses it to pin the thing most likely to go wrong at the revisit: codex has a
+perfectly readable model id sitting right there, and `unsupported` must hold
+anyway, because the verdict is a claim about main-vs-subagent attribution and
+not about whether a model id can be found.
