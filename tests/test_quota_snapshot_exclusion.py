@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """Asserts the quota tables never reach a freshly rendered content.sql.
 
-content.sql is git-tracked. `harness_quota_account.account_label` holds the
-operator's FULL email address — decision #67 withdrew the earlier redaction
-because the address never reaches the repository, which makes snapshot
-exclusion the ONLY thing keeping that true. So the guarantee is asserted here
-rather than assumed from `PER_INSTANCE_TABLES`.
+content.sql is git-tracked, and these are probe-rebuildable caches that do not
+belong in the repository — decision #65's ordinary hygiene, which was always
+reason enough. So the guarantee is asserted here rather than assumed from
+`PER_INSTANCE_TABLES`.
+
+THE RATIONALE CHANGED UNDER THIS TEST AND THE TEST DID NOT MOVE. Decision #67
+had made exclusion LOAD-BEARING: account_label held the operator's full email,
+so exclusion was the only thing between that address and the repository.
+Migration 0097 dropped the column, which retires that rationale AT ITS SOURCE
+— there is no address to leak because none is ever collected.
+
+It would then be easy to argue this test is now redundant. It is not, and it
+is kept at full strength deliberately: a test deleted because "the risk went
+away" is how the risk comes back, and the reason to exclude a rebuildable
+cache from a tracked file never depended on what the cache happened to hold.
 
 The distinction matters. A test that asserts `"harness_quota_account" not in
 snapshot.PER_INSTANCE_TABLES` is just the allowlist read twice: it stays green
@@ -44,11 +54,13 @@ import snapshot  # noqa: E402
 
 QUOTA_TABLES = ("harness_quota_account", "harness_quota_window")
 
-# Full address on purpose: this is the exact value decision #67 accepted into
-# the DB, so it is the exact value that must not appear in a tracked file.
-SENTINEL_EMAIL = "operator.sentinel@must-never-reach-git.test"
-SENTINEL_REF = "acct_sentinel_0123456789"
-SENTINEL_PLAN = "sentinel_plan"
+# account_ref is the ONLY free-text column the registry has left, so it is the
+# only place a sentinel can go — and an EMAIL-SHAPED one is used on purpose.
+# A real account_ref is provider-issued and never an address; writing one that
+# looks like an address is the strongest remaining probe of the renderer,
+# because it fails the same way a genuine leak would. It keeps this suite
+# grepping for CONTENT and not merely for a table name.
+SENTINEL_REF = "operator.sentinel@must-never-reach-git.test"
 
 
 def build_engine_db(path: Path) -> None:
@@ -65,11 +77,8 @@ def build_engine_db(path: Path) -> None:
         "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
         "VALUES (1, 'TC', 'tc', 'test', 'sp', 1, 0, 1, 1)")
     con.execute(
-        "INSERT INTO harness_quota_account (account_pk, provider, account_ref, "
-        "account_label, plan, first_seen, last_seen, is_current) "
-        "VALUES (1, 'openai', ?, ?, ?, '2026-07-25T00:00:00Z', "
-        "'2026-07-25T00:00:00Z', 1)",
-        (SENTINEL_REF, SENTINEL_EMAIL, SENTINEL_PLAN))
+        "INSERT INTO harness_quota_account (account_pk, provider, account_ref) "
+        "VALUES (1, 'openai', ?)", (SENTINEL_REF,))
     con.execute(
         "INSERT INTO harness_quota_window (account_pk, window_kind, scope, "
         "used_percent, captured_at, status, probe_version) "
@@ -118,13 +127,33 @@ class QuotaSnapshotExclusionTest(unittest.TestCase):
                 f"{table} was serialized into content.sql — it holds operator "
                 "account state and content.sql is git-tracked")
 
-    def test_operator_email_absent_from_content_sql(self):
-        """The value, not just the table name. Catches the table reaching the
-        file under an alias, a join, or a future per-column dumper."""
-        self.assertNotIn(SENTINEL_EMAIL, self.rendered)
-        self.assertNotIn(SENTINEL_EMAIL.split("@", 1)[0], self.rendered)
+    def test_registry_content_absent_from_content_sql(self):
+        """The VALUE, not just the table name. Catches the table reaching the
+        file under an alias, a join, or a future per-column dumper — none of
+        which a table-name grep would see."""
         self.assertNotIn(SENTINEL_REF, self.rendered)
-        self.assertNotIn(SENTINEL_PLAN, self.rendered)
+        self.assertNotIn(SENTINEL_REF.split("@", 1)[0], self.rendered)
+
+    def test_no_column_survives_that_could_hold_an_operator_label(self):
+        """The other half of the guarantee, and the half that is now structural.
+
+        Exclusion stops the table reaching a tracked file; THIS stops the value
+        existing at all. After 0097 the registry has one free-text column
+        (account_ref, provider-issued), so there is nowhere for an address to
+        be written even if a future probe tried.
+
+        The positive control is account_ref itself: it is asserted present
+        through the same read that reports the rest absent, so a PRAGMA
+        returning nothing cannot pass this as a clean bill of health."""
+        con = sqlite3.connect(self.db)
+        try:
+            cols = {r[1] for r in
+                    con.execute("PRAGMA table_info(harness_quota_account)")}
+        finally:
+            con.close()
+        self.assertIn("account_ref", cols)
+        self.assertNotIn("account_label", cols)
+        self.assertNotIn("plan", cols)
 
     def test_rows_are_present_in_the_db_that_was_rendered(self):
         """The exclusion must be the renderer's doing, not an empty table. If a

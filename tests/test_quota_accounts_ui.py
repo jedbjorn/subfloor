@@ -1,12 +1,12 @@
-"""Account Analytics UI (spec #49 U4): toggle, router, cards, thresholds.
+"""Provider Quota UI (spec #57, superseding #49): toggle, router, cards, thresholds.
 
 Driven through node against the REAL app.js regions with a minimal DOM — the
 same idiom as the interface UI contract suite — rather than grepping the source
 for strings. A string assertion passes against a function nobody calls; these
 render the section and read what came out.
 
-The unit's value rests on two properties, and both are about not lying about a
-number, so both are asked in both directions:
+The unit's value rests on three properties, and all three are about not lying,
+so all three are asked in both directions:
 
   * COLOUR IS COMPUTED FROM used_percent ALONE. Asserting "96% is red" leaves a
     reading of a provider's own severity field entirely free, so every colour
@@ -17,10 +17,21 @@ number, so both are asked in both directions:
     0%-wide bar free to be drawn under the label, which is the failure mode the
     spec names: a meter reads as measured. So every n/a test asserts the text
     AND the absence of a fill element.
+  * THE CARD MAKES NO CLAIM ABOUT THE OPERATOR'S SESSION. This is what spec #57
+    replaced the per-account panel WITH, so it is asserted as a property of the
+    rendered output rather than trusted to the absence of the old code: no
+    label, no account id, no plan, no sign-in language, and — the mirror leg
+    that matters most — a degraded probe still shows its last-known figures
+    WITH their age, rather than blanking the card or passing them off as fresh.
 
-The per-provider status list gets the same treatment: `na` and an empty accounts
-array are asserted to render differently, because collapsing them is precisely
-what the status list exists to prevent.
+WHAT THIS SUITE STOPPED PINNING, AND WHY IT IS NOT A GAP. The 7-day activity
+window, the is_current exemption, muted rendering, the disabled refresh button
+and the full-email label all had tests here and all are gone. They were not
+weakened — the mechanisms were REMOVED (decision #75, migration 0097), and a
+test for a mechanism that no longer exists is the "comment describing a
+mechanism that no longer exists" defect wearing a different hat. What replaces
+them is the property they were each approximating: every provider renders a
+card, and no card says anything about who is signed in.
 """
 
 from __future__ import annotations
@@ -41,7 +52,7 @@ EL = APP[APP.index("const el ="):APP.index("const esc =")]
 # fmt / microlabel / statRow — sliced, not restated, so a card's meta row is
 # rendered by the app's own helper.
 HELPERS = APP[APP.index("const fmt = (n)"):APP.index("// On/off switch")]
-ACCOUNTS = APP[APP.index("// ── Account Analytics"):APP.index("// ── Interface tab")]
+QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Interface tab")]
 _ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[_ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach', _ROUTER_AT)]
@@ -55,7 +66,7 @@ def iso(**delta) -> str:
 
 
 def window(kind="weekly", pct=10.0, **over) -> dict:
-    """One harness_quota_window row as GET /api/analytics/accounts sends it."""
+    """One harness_quota_window row as GET /api/analytics/quota sends it."""
     row = {"window_pk": 1, "window_kind": kind, "scope": None, "used_percent": pct,
            "used": None, "limit_value": None, "resets_at": iso(hours=3),
            "captured_at": iso(minutes=-2), "status": "ok", "probe_version": "1"}
@@ -63,23 +74,32 @@ def window(kind="weekly", pct=10.0, **over) -> dict:
     return row
 
 
-def account(provider="anthropic", **over) -> dict:
-    row = {"account_pk": 1, "provider": provider, "account_ref": "ref-1",
-           "account_label": "jed@person.com", "plan": "max",
-           "first_seen": iso(days=-30), "last_seen": iso(minutes=-2),
-           "is_current": 1, "windows": [window()]}
-    row.update(over)
-    return row
+_UNSET = object()
 
 
-def payload(accounts=None, providers=None, **over) -> dict:
-    d = {"accounts": [account()] if accounts is None else accounts,
-         "activity_days": 7, "ttl_seconds": 60, "probed": True,
-         "providers": ([{"provider": "anthropic", "status": "ok", "detail": None}]
-                       if providers is None else providers),
-         "notes": []}
+def provider(name="anthropic", status="ok", detail=None, captured_at=_UNSET,
+             windows=None) -> dict:
+    """One entry of the response's `providers` array — the whole response shape
+    now. There is no accounts array and no identity of any kind in it.
+
+    `captured_at` takes a SENTINEL default rather than None, because a null
+    captured_at is the never-probed card — a real and distinct state the tests
+    below have to be able to ask for."""
+    return {"provider": name, "status": status, "detail": detail,
+            "captured_at": iso(minutes=-2) if captured_at is _UNSET else captured_at,
+            "windows": [window()] if windows is None else windows}
+
+
+def payload(providers=None, **over) -> dict:
+    d = {"providers": [provider()] if providers is None else providers,
+         "ttl_seconds": 60, "probed": True, "notes": []}
     d.update(over)
     return d
+
+
+def all_three(**over) -> list:
+    """The real shape of a live response: every provider always present."""
+    return [provider(name, **over) for name in ("anthropic", "openai", "moonshot")]
 
 
 HARNESS = r"""
@@ -113,7 +133,7 @@ async function api(path, method = "GET", body) {
   return PAYLOAD;
 }
 function toast(msg) { toasts.push(String(msg)); }
-// The token section is stubbed so "arriving at accounts never sweeps" is
+// The token section is stubbed so "arriving at quota never sweeps" is
 // observable: a real one would fire /analytics/sweep into the same recorder.
 async function anTokenSection(root) {
   tokenSectionRuns += 1;
@@ -144,7 +164,7 @@ function root() { return new FakeElement("div"); }
 
 def run_js(body: str, data: dict | None = None) -> dict:
     script = ("const PAYLOAD = " + json.dumps(data or payload()) + ";\n"
-              + EL + HELPERS + HARNESS + ACCOUNTS + ROUTER
+              + EL + HELPERS + HARNESS + QUOTA + ROUTER
               + "\n(async () => {\n" + body + "\n})().catch((e) => {"
               " console.error(e.stack || e); process.exit(1); });\n")
     proc = subprocess.run(["node", "-e", script], text=True, capture_output=True)
@@ -154,26 +174,41 @@ def run_js(body: str, data: dict | None = None) -> dict:
 
 # ── router + toggle ──────────────────────────────────────────────────────────
 
-def test_accounts_hash_routes_to_the_analytics_tab_as_a_sub_view():
-    """#analytics-accounts is a URL, and `analytics` stays the active nav tab —
+def test_quota_hash_routes_to_the_analytics_tab_as_a_sub_view():
+    """#analytics-quota is a URL, and `analytics` stays the active nav tab —
     the #roadmap / #roadmap-flow convention. Both halves matter: routing to a
     tab of its own would lose the toggle, and not routing at all would fall
     through to the default view."""
     r = run_js("""
       const seen = [];
-      for (const hash of ["#analytics-accounts", "#analytics", "#analytics-accounts"]) {
+      for (const hash of ["#analytics-quota", "#analytics", "#analytics-quota"]) {
         location.hash = hash; routeFromHash();
         seen.push({ view: anView, tab: shown[shown.length - 1] });
       }
       location.hash = "#roadmap-flow"; routeFromHash();
       out({ seen, roadmapTab: shown[shown.length - 1], roadmapView, viewAfter: anView });
     """)
-    assert r["seen"] == [{"view": "accounts", "tab": "analytics"},
+    assert r["seen"] == [{"view": "quota", "tab": "analytics"},
                          {"view": "tokens", "tab": "analytics"},
-                         {"view": "accounts", "tab": "analytics"}]
+                         {"view": "quota", "tab": "analytics"}]
     # The new branch must not swallow the roadmap sub-view it was modelled on.
     assert r["roadmapTab"] == "roadmap" and r["roadmapView"] == "flow"
-    assert r["viewAfter"] == "accounts"
+    assert r["viewAfter"] == "quota"
+
+
+def test_the_old_accounts_hash_has_no_alias_and_falls_through():
+    """R3: NO COMPATIBILITY ALIAS. #analytics-accounts named a per-account panel
+    this spec deletes, and aliasing it would itself be a route naming a
+    mechanism that no longer exists — the precise defect class being removed.
+
+    It must not silently resolve to the quota view; it falls through to Token
+    Analytics like any other unrecognized analytics hash."""
+    r = run_js("""
+      location.hash = "#analytics-accounts"; routeFromHash();
+      out({ view: anView, tab: shown[shown.length - 1] });
+    """)
+    assert r["view"] == "tokens"
+    assert r["tab"] == "analytics"
 
 
 def test_unknown_hash_still_falls_through_to_the_default_view():
@@ -187,39 +222,40 @@ def test_unknown_hash_still_falls_through_to_the_default_view():
 def test_toggle_navigates_by_hash_so_the_sub_view_is_deep_linkable():
     """Clicking must set the hash, not re-render in place: a toggle that
     re-renders directly leaves the URL behind and the section stops surviving a
-    reload — which is one of the spec's verification checkboxes."""
+    reload — which is one of the spec's verification checkboxes, and it stands
+    against the NEW hash."""
     r = run_js("""
       const a = root(); anView = "tokens"; await renderAnalytics(a);
       const chips = buttons(a).filter((b) => cls(b).includes("chip"));
       const labels = texts(chips);
       const active = texts(chips.filter((b) => cls(b).includes("on")));
       chips[1].onclick();
-      const afterAccounts = location.hash;
-      const b = root(); anView = "accounts"; await renderAnalytics(b);
+      const afterQuota = location.hash;
+      const b = root(); anView = "quota"; await renderAnalytics(b);
       const chips2 = buttons(b).filter((x) => cls(x).includes("chip"));
       const active2 = texts(chips2.filter((x) => cls(x).includes("on")));
       chips2[0].onclick();
-      out({ labels, active, active2, afterAccounts, afterTokens: location.hash });
+      out({ labels, active, active2, afterQuota, afterTokens: location.hash });
     """)
-    assert r["labels"] == ["Token Analytics", "Account Analytics"]
-    assert r["active"] == ["Token Analytics"] and r["active2"] == ["Account Analytics"]
-    assert r["afterAccounts"] == "analytics-accounts"
+    assert r["labels"] == ["Token Analytics", "Provider Quota"]
+    assert r["active"] == ["Token Analytics"] and r["active2"] == ["Provider Quota"]
+    assert r["afterQuota"] == "analytics-quota"
     assert r["afterTokens"] == "analytics"
 
 
 def test_each_section_fires_only_its_own_work_on_arrival():
-    """The token sweep and the account probe both fire on entry. Arriving at one
+    """The token sweep and the quota probe both fire on entry. Arriving at one
     must not run the other: reading token spend would otherwise cost three
     third-party calls, and the probe is specified to fire ONLY here."""
     r = run_js("""
-      anView = "accounts"; await renderAnalytics(root());
-      const onAccounts = { calls: calls.map((c) => c.path + " " + c.method), token: tokenSectionRuns };
+      anView = "quota"; await renderAnalytics(root());
+      const onQuota = { calls: calls.map((c) => c.path + " " + c.method), token: tokenSectionRuns };
       calls = []; tokenSectionRuns = 0;
       anView = "tokens"; await renderAnalytics(root());
-      out({ onAccounts, onTokens: { calls: calls.map((c) => c.path + " " + c.method),
-                                    token: tokenSectionRuns } });
+      out({ onQuota, onTokens: { calls: calls.map((c) => c.path + " " + c.method),
+                                 token: tokenSectionRuns } });
     """)
-    assert r["onAccounts"] == {"calls": ["/analytics/accounts GET"], "token": 0}
+    assert r["onQuota"] == {"calls": ["/analytics/quota GET"], "token": 0}
     assert r["onTokens"] == {"calls": ["/analytics/sweep POST"], "token": 1}
 
 
@@ -228,16 +264,16 @@ def test_arrival_probes_once_and_never_forces_the_ttl():
     has aged out. A client that also POSTs would defeat the TTL outright and
     make "toggling twice inside a minute performs one probe" false."""
     r = run_js("""
-      await anAccountSection(root());
+      await anQuotaSection(root());
       out({ calls: calls.map((c) => c.path + " " + c.method) });
     """)
-    assert r["calls"] == ["/analytics/accounts GET"]
+    assert r["calls"] == ["/analytics/quota GET"]
 
 
 def test_section_reports_a_failed_read_instead_of_rendering_an_empty_panel():
     r = run_js("""
       apiFail = "HTTP 500";
-      const r0 = root(); await anAccountSection(r0);
+      const r0 = root(); await anQuotaSection(r0);
       out({ text: r0.textContent });
     """)
     assert "error: HTTP 500" in r["text"]
@@ -253,12 +289,12 @@ THRESHOLD_CASES = [(0.0, ""), (79.9, ""), (80.0, "amber"), (94.9, "amber"),
 def test_meter_colour_is_threshold_driven(pct, expected):
     r = run_js("""
       const r0 = root();
-      anDrawAccounts(r0, PAYLOAD);
+      anDrawQuota(r0, PAYLOAD);
       const pctNode = byClass(r0, "an-win-pct")[0];
       const fill = byClass(r0, "an-meter-fill")[0];
       out({ pctClasses: cls(pctNode), fillClasses: cls(fill), width: fill.style.width,
             text: pctNode.textContent });
-    """, payload(accounts=[account(windows=[window(pct=pct)])]))
+    """, payload([provider(windows=[window(pct=pct)])]))
     tone = [c for c in r["pctClasses"] if c in ("amber", "red")]
     assert tone == ([expected] if expected else [])
     assert [c for c in r["fillClasses"] if c in ("amber", "red")] == ([expected] if expected else [])
@@ -272,14 +308,12 @@ def test_provider_status_never_decides_colour():
     render red. Colouring off the provider's own vocabulary is exactly what the
     spec forbids — anthropic says severity=normal at 22%, openai says
     limit_reached at 100%, moonshot says nothing."""
-    data = payload(
-        accounts=[account(provider="openai", account_pk=1, windows=[window(pct=22.0)]),
-                  account(provider="anthropic", account_pk=2, account_ref="ref-2",
-                          windows=[window(pct=96.0)])],
-        providers=[{"provider": "openai", "status": "error", "detail": "HTTP 429"},
-                   {"provider": "anthropic", "status": "ok", "detail": None}])
+    data = payload([
+        provider("openai", status="error", detail="HTTP 429",
+                 windows=[window(pct=22.0)]),
+        provider("anthropic", status="ok", windows=[window(pct=96.0)])])
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ tones: byClass(r0, "an-win-pct").map((n) => cls(n).filter((c) => c !== "an-win-pct")),
             texts: texts(byClass(r0, "an-win-pct")) });
     """, data)
@@ -295,12 +329,12 @@ def test_null_percent_reads_na_and_draws_no_bar():
     label itself must carry NO threshold colour, because an absent number is not
     a comfortable one."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       const pctNode = byClass(r0, "an-win-pct")[0];
       out({ text: texts(byClass(r0, "an-win-pct")), fills: byClass(r0, "an-meter-fill").length,
             meters: byClass(r0, "an-meter").length,
             tone: cls(pctNode).filter((c) => c !== "an-win-pct") });
-    """, payload(accounts=[account(windows=[window(pct=None)])]))
+    """, payload([provider(windows=[window(pct=None)])]))
     assert r["text"] == ["n/a"]
     assert r["fills"] == 0
     assert r["tone"] == []
@@ -312,14 +346,12 @@ def test_moonshot_all_null_row_renders_as_na_rather_than_zero_or_nothing():
     none — asymmetric but truthful (U2's reviewer). It must neither be filtered
     out nor drawn as 0%."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ rows: byClass(r0, "an-win").length, pct: texts(byClass(r0, "an-win-pct")),
             fills: byClass(r0, "an-meter-fill").length, name: texts(byClass(r0, "an-win-name")) });
-    """, payload(
-        accounts=[account(provider="moonshot", account_label="usr-9",
-                          windows=[window(kind="weekly", pct=None, used=None,
-                                          limit_value=None, resets_at=None)])],
-        providers=[{"provider": "moonshot", "status": "ok", "detail": None}]))
+    """, payload([provider("moonshot", windows=[
+        window(kind="weekly", pct=None, used=None, limit_value=None,
+               resets_at=None)])]))
     assert r["rows"] == 1 and r["pct"] == ["n/a"] and r["fills"] == 0
     assert r["name"] == ["Weekly"]
 
@@ -328,222 +360,172 @@ def test_zero_limit_renders_na_not_a_division():
     """limit_value = 0 arrives with used_percent NULL (the probe never
     back-computes). The counts still show, so the operator sees WHY it is n/a."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ pct: texts(byClass(r0, "an-win-pct")), fills: byClass(r0, "an-meter-fill").length,
             body: r0.textContent });
-    """, payload(accounts=[account(windows=[window(pct=None, used=0, limit_value=0)])]))
+    """, payload([provider(windows=[window(pct=None, used=0, limit_value=0)])]))
     assert r["pct"] == ["n/a"] and r["fills"] == 0
     assert "0 / 0" in r["body"]
 
 
 def test_a_real_zero_percent_still_draws_a_measured_zero():
     """The mirror of the n/a rule, so the fix cannot be "never draw a bar": a
-    provider that genuinely measured 0% renders 0%, not n/a."""
+    provider that genuinely measured 0% renders 0%, not n/a.
+
+    This is the UI half of moonshot's untouched five-hour window, which really
+    does read 0 used against a limit of 100 — a measured zero, not a failure."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ pct: texts(byClass(r0, "an-win-pct")), width: byClass(r0, "an-meter-fill")[0].style.width });
-    """, payload(accounts=[account(windows=[window(pct=0.0, used=0, limit_value=500)])]))
+    """, payload([provider(windows=[window(pct=0.0, used=0, limit_value=500)])]))
     assert r["pct"] == ["0%"] and r["width"] == "0%"
 
 
-# ── per-provider status list ─────────────────────────────────────────────────
+# ── one card per provider, never hidden ──────────────────────────────────────
 
-def test_na_provider_with_no_registry_row_renders_no_card_at_all():
-    """A missing credential file is not a limit of zero — and with nothing in the
-    registry for that provider there is nothing to show, so it is no card.
-    Asserted against a payload where another provider IS configured, so "renders
-    nothing" cannot pass by the whole section being empty.
+def test_every_provider_renders_a_card_including_the_unconfigured_ones():
+    """Nothing is filtered out, and that is the rule the old panel broke.
 
-    The narrow case: no registry row. When a row DOES exist the card survives —
-    the two tests below are the other half, and neither is safe alone."""
+    Hiding a card is how a panel stops lying and starts saying nothing: the
+    operator cannot tell "not configured" from "not readable" from a card that
+    is not there. Asserted with two of three providers unusable, so a section
+    that renders only what it has data for fails here."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ groups: texts(byClass(r0, "an-prov-head")), cards: byClass(r0, "an-acct").length,
-            body: r0.textContent });
-    """, payload(
-        accounts=[account(provider="anthropic")],
-        providers=[{"provider": "anthropic", "status": "ok", "detail": None},
-                   {"provider": "openai", "status": "na", "detail": None},
-                   {"provider": "moonshot", "status": "na", "detail": None}]))
-    assert r["groups"] == ["Claudeanthropic"]
-    assert r["cards"] == 1
-    assert "Codex" not in r["body"] and "Kimi" not in r["body"]
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ cards: byClass(r0, "an-acct").length,
+            heads: byClass(r0, "an-acct-head").map((n) => n.textContent) });
+    """, payload([
+        provider("anthropic", windows=[window(pct=40.0)]),
+        provider("openai", status="na", captured_at=None, windows=[]),
+        provider("moonshot", status="unauth", captured_at=None, windows=[])]))
+    assert r["cards"] == 3
+    assert [h.split("anthropic")[0].split("openai")[0].split("moonshot")[0]
+            for h in r["heads"]] == ["Claude", "Codex", "Kimi"]
 
 
-def test_na_provider_keeps_its_registry_card_muted_with_refresh_disabled():
-    """The credential file is removed WITHOUT switching accounts (spec 49, "the
-    registry and the status list can disagree"). The row keeps is_current, and
-    is_current is exempt from the 7-day filter, so this card would otherwise
-    render forever — unmuted, looking live, with a refresh that provably cannot
-    change it, while the same response reports the provider `na`.
-
-    Both failure directions are asserted here, because they are each other's
-    cure: filtering the card out (direction 1) throws away the last account this
-    host saw, and rendering it live (direction 2) is the button-that-lies shape
-    this unit already refused on the Codex exception. Passing needs the card to
-    EXIST and to be visibly last-known."""
+def test_never_probed_and_idle_say_different_things():
+    """Both render zero windows, and collapsing them loses the operator's next
+    move. A provider that has never returned anything has nothing to show; one
+    that returned an intact envelope carrying zero windows is genuinely idle,
+    and that IS its reading."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      const cards = byClass(r0, "an-acct");
-      const btn = buttons(cards[0]).filter((b) => cls(b).includes("act"))[0];
-      out({ cards: cards.length, groups: texts(byClass(r0, "an-prov-head")),
-            muted: cls(cards[0]).includes("an-muted"),
-            disabled: btn.disabled, title: btn.title, onclick: btn.onclick !== null,
-            pct: texts(byClass(cards[0], "an-win-pct")), body: cards[0].textContent });
-    """, payload(
-        accounts=[account(is_current=1,
-                          windows=[window(pct=61.0, captured_at=iso(hours=-3))])],
-        providers=[{"provider": "anthropic", "status": "na", "detail": None}]))
-    # direction 1 — the registry row survives the status disagreeing with it.
-    assert r["cards"] == 1 and r["groups"] == ["Claudeanthropic"]
-    assert r["pct"] == ["61%"]          # last known values kept, not blanked
-    # direction 2 — and it does not present as live.
-    assert r["muted"] is True
-    assert r["disabled"] is True and r["onclick"] is False
-    assert "credential file" in r["title"]
-    assert "snapshot 3h ago" in r["body"]
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ bodies: byClass(r0, "an-acct").map((c) => c.textContent) });
+    """, payload([provider("anthropic", captured_at=None, windows=[]),
+                  provider("openai", windows=[])]))
+    never, idle = r["bodies"]
+    assert "no reading yet" in never
+    assert "no windows reported" in idle
+    assert never != idle
 
 
-def test_na_is_reported_as_observed_not_inferred_as_a_sign_out():
-    """`na` means the engine could not read a credential file — which is a
-    different fact from an account the operator switched away from, and from a
-    token the provider rejected. Rendering all three with one string would be an
-    inference about WHY, and the operator may simply be mid-login.
+def test_no_card_makes_any_claim_about_the_operator():
+    """THE PROPERTY THIS WHOLE SPEC EXISTS FOR, asserted on rendered output.
 
-    Asserted by rendering all three and comparing, so reusing one wording for
-    another fails: an assertion that `na` merely "says something" would pass
-    against exactly the collapse this pins."""
-    def body(accounts, providers):
-        return run_js("""
-          const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-          out({ body: byClass(r0, "an-acct")[0].textContent });
-        """, payload(accounts=accounts, providers=providers))["body"]
-
-    na = body([account(is_current=1)],
-              [{"provider": "anthropic", "status": "na", "detail": None}])
-    unauth = body([account(is_current=1)],
-                  [{"provider": "anthropic", "status": "unauth", "detail": "expired"}])
-    switched = body([account(is_current=0, last_seen=iso(days=-2))],
-                    [{"provider": "anthropic", "status": "ok", "detail": None}])
-
-    assert "no readable credential file" in na
-    assert "not signed in" not in na and "signed out" not in na
-    assert na != unauth and na != switched
-
-
-def test_error_before_identification_still_renders_a_card_with_its_status():
-    """The case the accounts array cannot express: the probe failed before it
-    could name anybody, so there is no registry row. Silence here would read as
-    "fine" — the spec requires a card carrying the HTTP status."""
+    Both defects that shipped were false CLAIMS, not wrong numbers: a 403
+    rendered "signed out — last known" while the operator was actively using
+    Codex (#196), and a lapsed 15-minute Kimi token rendered "no account
+    identified" (#197). The response is fed identity-shaped fields it must
+    ignore — a positive control proving the sweep would notice them."""
+    leaky = provider("anthropic", status="unauth", detail="expired",
+                     windows=[window(pct=61.0)])
+    leaky["account_label"] = "operator@example.com"
+    leaky["plan"] = "max"
+    leaky["account_ref"] = "uuid-secret"
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ cards: byClass(r0, "an-acct").length, body: r0.textContent });
-    """, payload(accounts=[], providers=[
-        {"provider": "openai", "status": "error", "detail": "HTTP 503"}]))
-    assert r["cards"] == 1
-    assert "HTTP 503" in r["body"] and "Codex" in r["body"]
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ body: r0.textContent });
+    """, payload([leaky]))
+    body = r["body"]
+    for claim in ("signed out", "not signed in", "no account identified",
+                  "operator@example.com", "@", "uuid-secret", "max"):
+        assert claim not in body, f"the card claimed {claim!r}"
+    # ...and the reading still rendered, or the sweep proves nothing.
+    assert "61%" in body
 
 
-def test_nothing_configured_and_no_probe_yet_say_different_things():
-    """Both arrive as an empty accounts array. Collapsing them is what the
-    per-provider status list exists to prevent."""
-    all_na = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD); out({ body: r0.textContent });
-    """, payload(accounts=[], providers=[
-        {"provider": p, "status": "na", "detail": None}
-        for p in ("anthropic", "openai", "moonshot")]))
-    never = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD); out({ body: r0.textContent });
-    """, payload(accounts=[], providers=[]))
-    assert "No harness credentials found" in all_na["body"]
-    assert "No probe has run yet" in never["body"]
-    assert all_na["body"] != never["body"]
+def test_a_degraded_probe_keeps_its_figures_and_stamps_them_with_their_age():
+    """THE EMPTY-STATE RULE WITH BOTH MIRROR LEGS. A lapsed Kimi token is the
+    common case, not an error, and the operator's most useful information in
+    that moment is where they stood 20 minutes ago.
 
-
-def test_unauth_keeps_last_known_values_muted_with_their_age():
-    """Expiry is reported, not repaired: the numbers stay, the emphasis goes,
-    and the age says how old they are."""
+    Leg 1 — it must not BLANK the card: the figures are still there.
+    Leg 2 — it must not present them AS FRESH: the age is rendered from the
+    reading's own captured_at, so a three-hour-old reading says so."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       const card = byClass(r0, "an-acct")[0];
-      out({ muted: cls(card).includes("an-muted"), pct: texts(byClass(card, "an-win-pct")),
-            body: card.textContent });
-    """, payload(
-        accounts=[account(windows=[window(pct=61.0, captured_at=iso(hours=-3))])],
-        providers=[{"provider": "anthropic", "status": "unauth", "detail": "expired"}]))
-    assert r["muted"] is True
-    assert r["pct"] == ["61%"]
-    assert "signed out — last known" in r["body"]
-    assert "snapshot 3h ago" in r["body"]
+      out({ pct: texts(byClass(card, "an-win-pct")), body: card.textContent });
+    """, payload([provider("anthropic", status="unauth", detail="expired",
+                           captured_at=iso(hours=-3),
+                           windows=[window(pct=61.0)])]))
+    assert r["pct"] == ["61%"]                      # leg 1: not blanked
+    assert "as of 3h ago" in r["body"]              # leg 2: not passed off as fresh
+    assert "token not usable" in r["body"]          # the probe's state, not the operator's
 
 
-# ── the non-current account ──────────────────────────────────────────────────
-
-def test_non_current_account_is_muted_and_cannot_be_refreshed():
-    """Its token is gone, so the probe route cannot re-read it. The button is
-    disabled AND carries the reason — a disabled control with no explanation is
-    its own small lie."""
+def test_the_age_is_never_omitted_when_there_is_a_reading():
+    """The age is the only thing keeping a stale card honest, so its presence is
+    pinned for a FRESH card too — a section that rendered the age only when it
+    judged a reading old would be deciding what counts as stale, which is the
+    operator's call."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ fresh: byClass(r0, "an-acct")[0].textContent,
+            none: byClass(r0, "an-acct")[1].textContent });
+    """, payload([provider("anthropic", captured_at=iso(minutes=-2)),
+                  provider("openai", captured_at=None, windows=[])]))
+    assert "as of" in r["fresh"]
+    # ...but a card with no reading has no age to state, and must not invent one.
+    assert "as of" not in r["none"]
+
+
+def test_refresh_is_always_available_even_on_a_degraded_card():
+    """The old panel disabled this button whenever it judged a probe could not
+    succeed — a judgement made from the registry's idea of who was signed in,
+    and wrong in exactly the case the operator most wants the button: a lapsed
+    Kimi token that a re-probe fixes the moment they boot the harness."""
+    r = run_js("""
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       const cards = byClass(r0, "an-acct");
-      const btn = (c) => buttons(c).filter((b) => cls(b).includes("act"))[0];
-      out({ order: byClass(r0, "an-acct-label").map((n) => n.textContent),
-            muted: cards.map((c) => cls(c).includes("an-muted")),
-            disabled: cards.map((c) => btn(c).disabled),
-            titles: cards.map((c) => btn(c).title),
-            notes: cards.map((c) => c.textContent.includes("not signed in")) });
-    """, payload(
-        # The current account's label sorts LAST alphabetically on purpose: with
-        # labels that happen to sort into API order, "the UI preserves the API's
-        # current-first order" is asserted by a fixture that cannot tell the
-        # difference. Caught by mutation M20, which was inert until this changed.
-        accounts=[account(account_pk=1, account_label="zed@person.com", is_current=1),
-                  account(account_pk=2, account_ref="ref-old", account_label="abe@person.com",
-                          is_current=0, last_seen=iso(days=-2))],
-        providers=[{"provider": "anthropic", "status": "ok", "detail": None}]))
-    assert r["order"] == ["zed@person.com", "abe@person.com"]  # API order preserved
-    assert r["muted"] == [False, True]
-    assert r["disabled"] == [False, True]
-    assert r["titles"][0] == "" and "cannot be re-probed" in r["titles"][1]
-    assert r["notes"] == [False, True]
+      const btn = (c) => buttons(c).filter((b) => b.textContent.startsWith("refresh"))[0];
+      out({ disabled: cards.map((c) => btn(c).disabled),
+            wired: cards.map((c) => btn(c).onclick !== null) });
+    """, payload([provider("anthropic", status="unauth", captured_at=iso(hours=-3)),
+                  provider("moonshot", status="na", captured_at=None, windows=[])]))
+    assert r["disabled"] == [False, False]
+    assert r["wired"] == [True, True]
 
 
-def test_non_current_codex_is_disabled_too_because_no_rollout_refresh_exists():
-    """Declared deviation, pinned so it cannot drift silently either way. The
-    spec grants Codex an exception — a non-current OpenAI account refreshed from
-    its rollout files — but no unit implements a rollout reader, so the only
-    action available is the global re-probe, which provably cannot change this
-    card. Enabling it would ship a button that lies. If a rollout path ever
-    lands, this test is the thing that must be changed on purpose."""
+def test_each_card_links_out_to_its_own_providers_usage_page():
+    """The link is part of the design, not a convenience: the ruling that
+    retired account identity rests on the provider's own page being one click
+    away for anything this panel deliberately stops showing."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      const card = byClass(r0, "an-acct")[0];
-      const btn = buttons(card).filter((b) => cls(b).includes("act"))[0];
-      out({ disabled: btn.disabled, title: btn.title });
-    """, payload(
-        accounts=[account(provider="openai", is_current=0, account_label="old@codex.com",
-                          last_seen=iso(days=-1))],
-        providers=[{"provider": "openai", "status": "ok", "detail": None}]))
-    assert r["disabled"] is True
-    assert "cannot be re-probed" in r["title"]
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ hrefs: all(r0, (n) => n.tagName === "a").map((n) => n.href) });
+    """, payload(all_three()))
+    assert r["hrefs"] == ["https://claude.ai/settings/usage",
+                          "https://chatgpt.com/codex/settings/usage",
+                          "https://www.kimi.com/code"]
 
 
 def test_refresh_forces_a_probe_and_redraws_from_its_response():
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       const card = byClass(r0, "an-acct")[0];
-      const btn = buttons(card).filter((b) => cls(b).includes("act"))[0];
+      const btn = buttons(card).filter((b) => b.textContent.startsWith("refresh ⟳"))[0];
       await btn.onclick();
       out({ calls: calls.map((c) => c.path + " " + c.method),
             cards: byClass(r0, "an-acct").length, toasts });
     """)
-    assert r["calls"] == ["/analytics/accounts/probe POST"]
+    assert r["calls"] == ["/analytics/quota/probe POST"]
     assert r["cards"] == 1 and r["toasts"] == []
 
 
 def test_a_failed_refresh_reports_and_re_enables_rather_than_wedging():
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       const btn = buttons(r0).filter((b) => b.textContent.startsWith("refresh all"))[0];
       apiFail = "boom";
       await btn.onclick();
@@ -554,29 +536,15 @@ def test_a_failed_refresh_reports_and_re_enables_rather_than_wedging():
     assert r["label"] == "refresh all ⟳"
 
 
-# ── the seven-day window ─────────────────────────────────────────────────────
-
-def test_every_account_stale_renders_the_current_one_with_a_note():
-    """Never an empty page. The API exempts is_current from the filter so the row
-    arrives; the UI's job is to say why the page is thin instead of letting it
-    read as the whole truth about the week."""
+def test_an_empty_providers_array_says_so_rather_than_rendering_nothing():
+    """Only reachable if the API returns no entries at all — which it cannot,
+    since it builds from the PROVIDERS constant. Kept because "cannot happen"
+    is a claim about another layer, and a blank panel would be the worst way to
+    discover that claim had stopped being true."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ note: texts(byClass(r0, "an-note")), cards: byClass(r0, "an-acct").length });
-    """, payload(accounts=[account(last_seen=iso(days=-30))]))
-    assert r["cards"] == 1
-    assert r["note"] and "showing the current account only" in r["note"][0]
-    assert "7 days" in r["note"][0]
-
-
-def test_a_fresh_account_carries_no_stale_note():
-    """The other direction — a note on every page is a note nobody reads."""
-    r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ note: byClass(r0, "an-note").length });
-    """, payload(accounts=[account(last_seen=iso(days=-30)), account(
-        account_pk=2, account_ref="ref-2", last_seen=iso(hours=-1))]))
-    assert r["note"] == 0
+      const r0 = root(); anDrawQuota(r0, PAYLOAD); out({ body: r0.textContent });
+    """, payload([]))
+    assert "No probe has run yet" in r["body"]
 
 
 # ── window rows ──────────────────────────────────────────────────────────────
@@ -585,25 +553,40 @@ def test_unrecognized_window_renders_under_its_raw_kind_and_duration():
     """The probe stores a window it could not map rather than dropping it,
     precisely so the panel can show it. Dropping it here would waste that."""
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ names: texts(byClass(r0, "an-win-name")), rows: byClass(r0, "an-win").length });
-    """, payload(accounts=[account(windows=[
+    """, payload([provider(windows=[
         window(kind="weekly", pct=40.0),
-        window(kind="1209600 SECOND", pct=12.0, scope="1209600s"),
+        window(kind="unknown", pct=12.0, scope="1209600s"),
         window(kind="weekly_scoped", pct=5.0, scope="claude-opus-5"),
         window(kind="session", pct=88.0),
         window(kind="five_hour", pct=3.0)])]))
     # Known kinds in their own order, unrecognized last — never dropped.
     assert r["names"] == ["Session", "5-hour", "Weekly", "Weekly · scoped · claude-opus-5",
-                          "1209600 SECOND · 1209600s"]
+                          "unknown · 1209600s"]
     assert r["rows"] == 5
+
+
+def test_no_container_repr_ever_reaches_a_rendered_card():
+    """The UI end of the container-repr class. The probe is what formats a raw
+    duration, but `scope` is passed through to the card verbatim, so the rule
+    is pinned on BOTH sides of that seam — a defect that reached the database
+    reached the card by the same route."""
+    r = run_js("""
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ names: texts(byClass(r0, "an-win-name")), body: r0.textContent });
+    """, payload([provider(windows=[
+        window(kind="unknown", pct=12.0, scope="unrecognized window")])]))
+    assert r["names"] == ["unknown · unrecognized window"]
+    for bad in ("{", "}", "[", "]", "'duration'", "timeUnit"):
+        assert bad not in r["body"], f"a container repr reached the card: {bad}"
 
 
 def test_reset_renders_as_a_countdown_and_never_as_negative_time():
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ body: r0.textContent });
-    """, payload(accounts=[account(windows=[
+    """, payload([provider(windows=[
         window(kind="session", pct=1.0, resets_at=iso(hours=2, minutes=30)),
         window(kind="weekly", pct=2.0, resets_at=iso(hours=-5)),
         window(kind="short", pct=3.0, resets_at=None)])]))
@@ -612,41 +595,12 @@ def test_reset_renders_as_a_countdown_and_never_as_negative_time():
     assert "-" not in r["body"].split("resets")[2].split("status")[0]
 
 
-def test_an_account_with_no_windows_says_so_rather_than_rendering_blank():
+def test_providers_render_in_the_dispatchers_order():
     r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ body: r0.textContent, wins: byClass(r0, "an-win").length });
-    """, payload(accounts=[account(windows=[])]))
-    assert r["wins"] == 0
-    assert "no windows reported" in r["body"]
-
-
-def test_providers_render_in_the_dispatchers_order_with_their_accounts():
-    r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ groups: byClass(r0, "an-prov-head").map((n) => n.textContent),
-            labels: byClass(r0, "an-acct-label").map((n) => n.textContent) });
-    """, payload(
-        accounts=[account(provider="anthropic", account_pk=1, account_label="a@x.com"),
-                  account(provider="openai", account_pk=2, account_ref="r2", account_label="o@x.com"),
-                  account(provider="moonshot", account_pk=3, account_ref="r3", account_label="usr-3")],
-        providers=[{"provider": p, "status": "ok", "detail": None}
-                   for p in ("anthropic", "openai", "moonshot")]))
-    assert r["groups"] == ["Claudeanthropic", "Codexopenai", "Kimimoonshot"]
-    assert r["labels"] == ["a@x.com", "o@x.com", "usr-3"]
-
-
-def test_the_full_account_label_is_rendered_unredacted():
-    """Decision #67: the label is stored and shown in full. Two accounts sharing
-    a local part are indistinguishable truncated, which is the one case this
-    panel exists to show."""
-    r = run_js("""
-      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-      out({ labels: byClass(r0, "an-acct-label").map((n) => n.textContent) });
-    """, payload(accounts=[
-        account(account_pk=1, account_label="jed@gmail.com"),
-        account(account_pk=2, account_ref="r2", account_label="jed@work.com", is_current=0)]))
-    assert r["labels"] == ["jed@gmail.com", "jed@work.com"]
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      out({ pills: texts(byClass(r0, "pill")) });
+    """, payload(all_three()))
+    assert r["pills"] == ["anthropic", "openai", "moonshot"]
 
 
 # ── styles the thresholds depend on ──────────────────────────────────────────
@@ -655,6 +609,13 @@ def test_threshold_classes_have_distinct_styling():
     """The colour rule is only real if the classes differ visibly. Asserted here
     because the JS tests can only see class names."""
     for sel in (".an-win-pct.amber", ".an-win-pct.red",
-                ".an-meter-fill.amber", ".an-meter-fill.red",
-                ".an-acct.an-muted", ".an-acct-foot .act:disabled"):
+                ".an-meter-fill.amber", ".an-meter-fill.red"):
         assert sel in CSS, f"{sel} is not styled"
+
+
+def test_the_muted_card_style_is_gone_not_merely_unused():
+    """Removed, not left inert. Dimming marked a card as "not the current
+    account", a distinction a provider-level panel does not have — and a rule
+    left in the stylesheet is the CSS form of a comment describing a mechanism
+    that no longer exists."""
+    assert "an-muted" not in CSS
