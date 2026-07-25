@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import (account, as_percent, get_json, iso_from_epoch, kind_for_seconds,
-               now_iso, read_json, status_for_http, window)
+from . import (account, as_percent, drift, get_json, iso_from_epoch,
+               kind_for_seconds, now_iso, read_json, response_detail,
+               status_for_http, window)
 
 HARNESS_PROVIDER = "openai"
 PROBE_VERSION = "1"
@@ -49,9 +50,7 @@ def _window_row(entry, captured_at: str, log, scope=None,
                   captured_at=captured_at, probe_version=PROBE_VERSION)
 
 
-def _windows(payload: dict, captured_at: str, log) -> list[dict]:
-    rate_limit = payload.get("rate_limit")
-    rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+def _windows(rate_limit: dict, payload: dict, captured_at: str, log) -> list[dict]:
     rows = []
     for key in ("primary_window", "secondary_window"):
         row = _window_row(rate_limit.get(key), captured_at, log)
@@ -93,9 +92,9 @@ def probe(log, timeout) -> list[dict]:
     code, payload = get_json(URL, headers, timeout)
     ref = str(file_account_id) if file_account_id else None
     if code != 200 or not isinstance(payload, dict):
-        detail = f"HTTP {code}" if code else f"unreachable: {payload}"
-        return result(status=status_for_http(code), detail=detail,
-                      account_ref=ref, account_label=ref)
+        return result(status=status_for_http(code), account_ref=ref,
+                      account_label=ref,
+                      detail=response_detail(code, payload, HARNESS_PROVIDER, log))
 
     ref = str(payload.get("account_id") or file_account_id or "") or None
     if not ref:
@@ -103,7 +102,14 @@ def probe(log, timeout) -> list[dict]:
             "payload — this account cannot be identified")
         return result(status="error", detail="no account identifier")
 
-    return result(account_ref=ref,
-                  account_label=payload.get("email") or ref,
-                  plan=payload.get("plan_type"),
-                  windows=_windows(payload, captured_at, log))
+    common = dict(account_ref=ref, account_label=payload.get("email") or ref)
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        # The envelope, not its contents: `rate_limit: {}` is an account with
+        # no window to report and stays `ok`; no `rate_limit` at all is the
+        # response having changed shape under us.
+        return result(status="error", **common, detail=drift(
+            HARNESS_PROVIDER, "no rate_limit{} in the usage payload", log))
+
+    return result(plan=payload.get("plan_type"), **common,
+                  windows=_windows(rate_limit, payload, captured_at, log))

@@ -26,8 +26,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import (account, as_percent, get_json, is_expired, norm_iso, now_iso,
-               read_json, status_for_http, window)
+from . import (account, as_percent, drift, get_json, is_expired, norm_iso,
+               now_iso, read_json, response_detail, status_for_http, window)
 
 HARNESS_PROVIDER = "anthropic"
 PROBE_VERSION = "1"
@@ -121,16 +121,15 @@ def probe(log, timeout) -> list[dict]:
         "Accept": "application/json",
     }, timeout)
     if code != 200 or not isinstance(payload, dict):
-        detail = f"HTTP {code}" if code else f"unreachable: {payload}"
-        if code == 200:
-            detail = "response was not a JSON object"
-            log(f"{HARNESS_PROVIDER}: shape drift — {detail}")
-        return result(status=status_for_http(code), detail=detail, **common)
+        return result(status=status_for_http(code), **common,
+                      detail=response_detail(code, payload, HARNESS_PROVIDER, log))
 
     limits = payload.get("limits")
     if not isinstance(limits, list):
-        log(f"{HARNESS_PROVIDER}: shape drift — no limits[] in the usage payload")
-        return result(status="error", detail="no limits[] in response", **common)
+        # The envelope, not its length: `limits: []` is an account with no
+        # window to report and stays `ok`.
+        return result(status="error", **common, detail=drift(
+            HARNESS_PROVIDER, "no limits[] in the usage payload", log))
 
     return result(plan=payload.get("subscriptionType"),
                   windows=_windows(limits, captured_at, log), **common)

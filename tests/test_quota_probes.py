@@ -241,6 +241,15 @@ class AnthropicProbeTest(ProbeCase):
         self.assertTrue(any("shape drift" in n for n in self.notes),
                         f"drift must be loud; log was {self.notes}")
 
+    def test_an_empty_limits_list_is_data_not_drift(self):
+        """The other half of the rule above: `limits: []` is a well-formed
+        envelope reporting no window — a real answer, kept `ok`."""
+        acct, _ = self.probe(payload={"subscriptionType": "max", "limits": []})
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual(acct["windows"], [])
+        self.assertEqual([n for n in self.notes if "drift" in n], [],
+                         "an idle account must not be reported as drift")
+
     def test_unknown_limit_kind_is_kept_not_dropped(self):
         acct, _ = self.probe(payload={"limits": [
             {"kind": "monthly_all", "percent": 5, "resets_at": None}]})
@@ -297,6 +306,37 @@ class OpenAIProbeTest(ProbeCase):
         self.assertEqual(w["window_kind"], "unknown")
         self.assertEqual(w["scope"], "7200s", "the duration must survive")
         self.assertEqual(w["used_percent"], 9.0)
+
+    def test_lost_envelope_is_drift_not_a_measured_zero(self):
+        """A 200 that no longer carries `rate_limit` at all. Parsing it as
+        zero windows would render a healthy card with nothing on it —
+        indistinguishable from an account that genuinely has no window."""
+        acct, _ = self.probe(payload={"account_id": "acct_placeholder_0001",
+                                      "email": "placeholder@example.com",
+                                      "plan_type": "prolite"})
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [])
+        self.assertEqual(acct["account_ref"], "acct_placeholder_0001",
+                         "a drifted card still keys to its account")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
+    def test_an_empty_envelope_is_data_not_drift(self):
+        """`rate_limit: {}` — the structure is intact and reports no window.
+        Calling THAT drift would cry wolf at an idle account and train the
+        operator to ignore the error state, which is the worse failure."""
+        acct, _ = self.probe(payload={"account_id": "acct_placeholder_0001",
+                                      "rate_limit": {}})
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual(acct["windows"], [])
+        self.assertEqual([n for n in self.notes if "drift" in n], [])
+
+    def test_a_200_that_is_not_a_json_object_says_so(self):
+        acct, _ = self.probe(payload=["not", "an", "object"])
+        self.assertEqual(acct["status"], "error")
+        self.assertIn("not a JSON object", acct["detail"],
+                      "'HTTP 200' as a failure detail tells the operator nothing")
+        self.assertTrue(any("shape drift" in n for n in self.notes))
 
     def test_absent_credential_file_is_na_not_zero(self):
         self.codex_auth.unlink()
@@ -359,6 +399,47 @@ class MoonshotProbeTest(ProbeCase):
         odd = [w for w in acct["windows"] if w["window_kind"] == "unknown"]
         self.assertEqual(len(odd), 1)
         self.assertIn("FORTNIGHT", str(odd[0]["scope"]))
+
+    def test_lost_usage_block_is_drift_not_a_measured_zero(self):
+        """`usage` is the account-wide block every payload carries — an
+        account with nothing spent reports `used: 0`, it does not drop the
+        key. Its absence is the shape having changed, not an empty account."""
+        payload = fixture("moonshot_usages.json")
+        del payload["usage"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [])
+        self.assertEqual(acct["account_ref"], "placeholder-user-0001",
+                         "a drifted card still keys to its account")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
+    def test_an_absent_limits_list_is_data_not_drift(self):
+        """The asymmetry, pinned: `limits` is a collection, so absent is a
+        plan with no metered sub-window and the weekly figure still stands."""
+        payload = fixture("moonshot_usages.json")
+        del payload["limits"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "ok")
+        w = self.one(acct["windows"])
+        self.assertEqual((w["window_kind"], w["used"]), ("weekly", 128000))
+        self.assertEqual([n for n in self.notes if "drift" in n], [])
+
+    def test_a_limits_key_that_is_not_a_list_is_drift(self):
+        """No legitimate-empty reading exists for the wrong TYPE under a key
+        the normalizer iterates."""
+        payload = fixture("moonshot_usages.json")
+        payload["limits"] = {"weekly": {"used": 1}}
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [])
+        self.assertTrue(any("shape drift" in n for n in self.notes))
+
+    def test_a_200_that_is_not_a_json_object_says_so(self):
+        acct, _ = self.probe(payload="<html>maintenance</html>")
+        self.assertEqual(acct["status"], "error")
+        self.assertIn("not a JSON object", acct["detail"])
+        self.assertTrue(any("shape drift" in n for n in self.notes))
 
     def test_expired_token_is_reported_never_used(self):
         self.write(self.kimi_creds, {"access_token": TOKEN,
@@ -458,7 +539,6 @@ class DispatchTest(ProbeCase):
         self.assertIn("unavailable", rows[1]["detail"])
 
     def test_every_provider_is_probed_in_a_stable_order(self):
-        self.endpoints = None  # not needed; probes run against real modules
         self.endpoint(p_anthropic, 200, fixture("anthropic_usage.json"))
         self.endpoint(p_openai, 200, fixture("openai_usage.json"))
         self.endpoint(p_moonshot, 200, fixture("moonshot_usages.json"))

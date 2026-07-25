@@ -38,6 +38,13 @@ Invariants every provider module upholds, each checkable from the code:
   * Expiry is reported, not repaired: an expired access token yields
     `unauth`, and no request is made with it.
   * No credential file means `na`, not `0%`.
+  * Drift is judged at the ENVELOPE, never at the window count. The keys the
+    normalizer reads are present and of the expected type -> parse them, and
+    an envelope carrying no windows is a legitimate `ok`. The envelope is
+    absent or the wrong shape -> `error` with no rows (see `drift`). The two
+    states are different and must not collapse: reporting drift as a measured
+    zero hides a broken probe behind a healthy card, and reporting an idle
+    account as drift teaches the operator to ignore the error state.
 """
 from __future__ import annotations
 
@@ -226,6 +233,29 @@ def window(*, window_kind: "str | None", probe_version: str, captured_at: str,
         "resets_at": resets_at, "captured_at": captured_at,
         "status": status, "probe_version": probe_version,
     }
+
+
+def drift(provider: str, what: str, log) -> str:
+    """Log a shape drift loudly and return it as the account's `detail`.
+
+    Drift is the response having lost the STRUCTURE the normalizer reads —
+    never the count of windows inside it. A well-formed envelope carrying no
+    windows is a real answer (a fresh account, a plan with no metered limit)
+    and stays `ok` with zero windows; a missing or wrong-typed envelope is
+    `error` with no rows, because a drifted probe must never report a zero as
+    if it had been measured (spec #49, Overview + Edge Cases)."""
+    log(f"{provider}: shape drift — {what}")
+    return what
+
+
+def response_detail(code: int, payload, provider: str, log) -> str:
+    """`detail` for a response the normalizer never gets to read: the HTTP
+    status, the transport's reason when the request never landed, or — for a
+    200 whose body is not a JSON object at all — shape drift, said plainly
+    rather than as a bare 'HTTP 200'."""
+    if code == 200:
+        return drift(provider, "response was not a JSON object", log)
+    return f"HTTP {code}" if code else f"unreachable: {payload}"
 
 
 def status_for_http(code: int) -> str:

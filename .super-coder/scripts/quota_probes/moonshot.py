@@ -13,9 +13,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import (TIME_UNIT_SECONDS, account, as_count, get_json, is_expired,
-               kind_for_seconds, norm_iso, now_iso, percent_from, read_json,
-               status_for_http, window)
+from . import (TIME_UNIT_SECONDS, account, as_count, drift, get_json,
+               is_expired, kind_for_seconds, norm_iso, now_iso, percent_from,
+               read_json, response_detail, status_for_http, window)
 
 HARNESS_PROVIDER = "moonshot"
 PROBE_VERSION = "1"
@@ -45,6 +45,25 @@ def _counts_window(entry: dict, captured_at: str, kind, scope) -> dict:
                   captured_at=captured_at, probe_version=PROBE_VERSION)
 
 
+def _drift(payload: dict) -> "str | None":
+    """What the normalizer cannot find, or None when the envelope is intact.
+
+    The two keys are not symmetrical, and collapsing them would be the bug.
+    `usage` is a BLOCK — the account-wide weekly figure every payload carries;
+    an account with nothing spent reports `used: 0`, it does not drop the key,
+    so its absence is the shape having changed. `limits` is a COLLECTION —
+    absent or `[]` is a real answer (a plan with no metered sub-window), and
+    calling that drift would cry wolf at an idle account. A `limits` that is
+    present but not a list has no such reading: that is drift.
+    """
+    if not isinstance(payload.get("usage"), dict):
+        return "no usage{} in the usages payload"
+    limits = payload.get("limits")
+    if limits is not None and not isinstance(limits, list):
+        return f"limits is {type(limits).__name__}, not a list"
+    return None
+
+
 def _windows(payload: dict, captured_at: str, log) -> list[dict]:
     rows = []
     usage = payload.get("usage")
@@ -52,8 +71,7 @@ def _windows(payload: dict, captured_at: str, log) -> list[dict]:
         # Pinned by spec #49's Normalization table: the top-level usage block
         # carries no window spec, and it is the account-wide weekly figure.
         rows.append(_counts_window(usage, captured_at, "weekly", None))
-    limits = payload.get("limits")
-    for entry in limits if isinstance(limits, list) else []:
+    for entry in payload.get("limits") or []:
         if not isinstance(entry, dict):
             continue
         seconds = _window_seconds(entry.get("window"))
@@ -88,8 +106,8 @@ def probe(log, timeout) -> list[dict]:
         "Authorization": f"Bearer {token}", "Accept": "application/json",
     }, timeout)
     if code != 200 or not isinstance(payload, dict):
-        detail = f"HTTP {code}" if code else f"unreachable: {payload}"
-        return result(status=status_for_http(code), detail=detail)
+        return result(status=status_for_http(code),
+                      detail=response_detail(code, payload, HARNESS_PROVIDER, log))
 
     user_id = ((payload.get("user") or {}) if isinstance(payload.get("user"), dict)
                else {}).get("userId")
@@ -99,7 +117,13 @@ def probe(log, timeout) -> list[dict]:
             "account cannot be identified")
         return result(status="error", detail="no account identifier")
 
+    common = dict(account_ref=ref, account_label=ref)
+    missing = _drift(payload)
+    if missing:
+        return result(status="error", **common,
+                      detail=drift(HARNESS_PROVIDER, missing, log))
+
     membership = payload.get("membership")
     plan = membership.get("level") if isinstance(membership, dict) else None
-    return result(account_ref=ref, account_label=ref, plan=plan,
+    return result(plan=plan, **common,
                   windows=_windows(payload, captured_at, log))

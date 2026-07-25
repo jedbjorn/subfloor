@@ -93,8 +93,8 @@ MUTATIONS = [
         name="token-reaches-a-returned-row",
         property="no returned row carries a token",
         path=MOONSHOT,
-        old="    return result(account_ref=ref, account_label=ref, plan=plan,",
-        new="    return result(account_ref=ref, account_label=token, plan=plan,",
+        old="    common = dict(account_ref=ref, account_label=ref)",
+        new="    common = dict(account_ref=ref, account_label=token)",
     ),
     # ── Invariant: read-only on credentials ──────────────────────────────────
     Mutation(
@@ -199,10 +199,50 @@ MUTATIONS = [
         property="a drifted response is an error, never a partial write",
         path=ANTHROPIC,
         old='    limits = payload.get("limits")\n'
-            "    if not isinstance(limits, list):\n"
-            '        log(f"{HARNESS_PROVIDER}: shape drift — no limits[] in the usage payload")\n'
-            '        return result(status="error", detail="no limits[] in response", **common)',
-        new='    limits = payload.get("limits") or []',
+            "    if not isinstance(limits, list):",
+        new='    limits = payload.get("limits") or []\n'
+            "    if False:",
+    ),
+    # ── Drift vs legitimately-empty: the two must not collapse ───────────────
+    # Each provider gets the round trip in BOTH directions — a probe that
+    # swallows a lost envelope as zero windows, and a probe that cries drift
+    # at an intact envelope reporting none. Only the pair pins the boundary;
+    # either alone is satisfied by a probe that gets the other case wrong.
+    Mutation(
+        name="openai-lost-envelope-parsed-as-zero",
+        property="a 200 with no rate_limit{} is error, not an ok reading zero",
+        path=OPENAI,
+        old="    if not isinstance(rate_limit, dict):",
+        new="    rate_limit = rate_limit if isinstance(rate_limit, dict) else {}\n"
+            "    if False:",
+    ),
+    Mutation(
+        name="openai-empty-envelope-cried-as-drift",
+        property="an intact rate_limit{} reporting no window stays ok",
+        path=OPENAI,
+        old="    if not isinstance(rate_limit, dict):",
+        new="    if not rate_limit or not isinstance(rate_limit, dict):",
+    ),
+    Mutation(
+        name="moonshot-lost-usage-parsed-as-zero",
+        property="a 200 with no usage{} is error, not an ok reading zero",
+        path=MOONSHOT,
+        old='    if not isinstance(payload.get("usage"), dict):',
+        new="    if False:",
+    ),
+    Mutation(
+        name="moonshot-absent-limits-cried-as-drift",
+        property="an absent `limits` collection is data, never a false alarm",
+        path=MOONSHOT,
+        old="    if limits is not None and not isinstance(limits, list):",
+        new="    if not isinstance(limits, list):",
+    ),
+    Mutation(
+        name="unreadable-200-reported-as-http-200",
+        property="a 200 that is not a JSON object says so, not 'HTTP 200'",
+        path=INIT,
+        old='        return drift(provider, "response was not a JSON object", log)',
+        new='        return f"HTTP {code}"',
     ),
 ]
 
