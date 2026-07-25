@@ -2254,7 +2254,20 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertFalse(body["minted"])
         self.assertEqual(self.stored_title(sid), "deploy the migration")
 
-    def test_title_takes_the_first_line_and_caps_at_sixty(self):
+    def test_title_takes_the_first_line_only(self):
+        """The first-line rule and the 60-char cap are SEPARATE properties.
+        A long first line truncates to the same 60 chars whether or not the
+        rest of the message was folded in, so a cap test cannot witness this
+        one — it needs a first line short enough that the remainder would
+        show up if it leaked."""
+        sid = self.occupy()
+        status, _, body = self.title(
+            sid, "ship it\nand then a good deal more context\nand more")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["title"], "ship it")
+        self.assertEqual(self.stored_title(sid), "ship it")
+
+    def test_title_skips_leading_blank_lines_and_caps_at_sixty(self):
         sid = self.occupy()
         long_first_line = "x" * 80
         status, _, body = self.title(
