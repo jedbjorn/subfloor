@@ -108,6 +108,11 @@ class FakeHTTP:
     def add(self, method, path, payload):
         self.routes[(method, path)] = payload
 
+    def add_each(self, method, path, outcomes):
+        """One outcome per call, in order — for a route whose SECOND answer
+        differs from its first (a refused lease, then the takeover)."""
+        self.routes[(method, path)] = list(outcomes)
+
     def __call__(self, req):
         path = req.full_url.replace(ic.API_BASE, "")
         self.calls.append({
@@ -117,6 +122,8 @@ class FakeHTTP:
             "body": json.loads(req.data) if req.data else None,
         })
         outcome = self.routes[(req.method, path)]
+        if isinstance(outcome, list):
+            outcome = outcome.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return FakeResp(outcome)
@@ -427,10 +434,13 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertEqual(self.http.find("POST", "/api/interface/sessions"), [])
         self.assertEqual(self.stream.call_args[0][1], "writer")
 
-    def test_enter_occupied_lease_held_falls_back_readonly(self):
+    def test_enter_held_lease_off_a_tty_falls_back_readonly(self):
+        """No operator to ask — the non-interactive fallback stays read-only
+        and names the exact follow-up command."""
         self.http.add("POST", "/api/interface/writer-leases",
                       http_error(409, "writer_held", "writer held by web-1"))
-        rc, _, err = self.run_cli(["enter", "s2"])
+        with mock.patch.object(ic.sys.stdin, "isatty", return_value=False):
+            rc, _, err = self.run_cli(["enter", "s2"])
         self.assertEqual(rc, 0)
         self.assertIn("READ-ONLY", err)
         self.assertIn("take-control", err)
@@ -438,25 +448,84 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertEqual(ticket["body"]["role"], "viewer")
         self.assertEqual(self.stream.call_args[0][1], "viewer")
 
-    def test_enter_starting_or_lost_refuses(self):
-        starting = json.loads(json.dumps(SHELLS))
-        starting["shells"][2].update(
-            availability="starting", lifecycle="starting")
-        self.http.add("GET", "/api/interface/shells", starting)
-        rc, _, err = self.run_cli(["enter", "s3"])
+    def _held_lease_prompt(self, answers):
+        """`enter` on s2 with the lease held, answering the TTY prompt."""
+        self.http.add("POST", "/api/interface/writer-leases",
+                      http_error(409, "writer_held", "writer held by web-1"))
+        with mock.patch.object(ic.sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", side_effect=answers):
+            return self.run_cli(["enter", "s2"])
+
+    def test_enter_held_lease_takes_over_only_on_an_explicit_keystroke(self):
+        # The takeover request is a SECOND lease POST — the first (takeover
+        # false) is what refused. Never silent: it exists only because the
+        # operator typed `t`.
+        self.http.add_each("POST", "/api/interface/writer-leases", [
+            http_error(409, "writer_held", "writer held by web-1"),
+            {"lease_id": 6, "lease_token": "lt-2", "next_input_seq": 5},
+        ])
+        with mock.patch.object(ic.sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", side_effect=["t"]):
+            rc, _, err = self.run_cli(["enter", "s2"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [c["body"]["takeover"]
+             for c in self.http.find("POST", "/api/interface/writer-leases")],
+            [False, True])
+        self.assertIn("web-1", err)
+        self.assertEqual(self.stream.call_args[0][1], "writer")
+
+    def test_enter_held_lease_read_only_choice_never_takes_over(self):
+        rc, _, _ = self._held_lease_prompt(["v"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [c["body"]["takeover"]
+             for c in self.http.find("POST", "/api/interface/writer-leases")],
+            [False],
+            "the read-only choice must not request a takeover",
+        )
+        self.assertEqual(self.stream.call_args[0][1], "viewer")
+
+    def test_enter_held_lease_quit_attaches_nothing(self):
+        rc, _, err = self._held_lease_prompt(["q"])
         self.assertEqual(rc, 1)
-        self.assertIn("stop S3", err)
-        self.assertNotIn("interface view", err)
+        self.assertIn("cancelled", err)
         self.assertEqual(self.http.find("POST", "/api/interface/stream-tickets"),
                          [])
         self.stream.assert_not_called()
 
-        self.http.add("GET", "/api/interface/shells", SHELLS)
+    def test_enter_held_lease_reprompts_an_unrecognised_answer(self):
+        rc, _, _ = self._held_lease_prompt(["x", "", "v"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.stream.call_args[0][1], "viewer")
+
+    def test_enter_starting_waits_then_attaches(self):
+        """A booting reservation is a wait, not a refusal."""
+        starting = json.loads(json.dumps(SHELLS))
+        starting["shells"][2].update(
+            availability="starting", lifecycle="starting")
+        self.http.add("GET", "/api/interface/shells", starting)
+        self.http.add("POST", "/api/interface/writer-leases",
+                      {"lease_id": 6, "lease_token": "lt-2",
+                       "next_input_seq": 5})
+        with mock.patch.object(ic, "_wait_occupied",
+                               return_value={"occupancy": "occupied"}) as wait:
+            rc, out, _ = self.run_cli(["enter", "s3"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(wait.call_args[0][0], 9)
+        self.assertIn("waiting", out)
+        # It reattaches the EXISTING reservation; it never starts a second one.
+        self.assertEqual(self.http.find("POST", "/api/interface/sessions"), [])
+        self.assertEqual(self.stream.call_args[0][1], "writer")
+
+    def test_enter_lost_still_refuses(self):
         rc, _, err = self.run_cli(["enter", "s3"])
         self.assertEqual(rc, 1)
         self.assertIn("lost", err)
         self.assertIn("reconcile", err)
         self.assertEqual(self.http.find("POST", "/api/interface/sessions"), [])
+        self.assertEqual(self.http.find("POST", "/api/interface/stream-tickets"),
+                         [])
         self.stream.assert_not_called()
 
     def test_harness_default_comes_from_api_projection_without_db_read(self):
@@ -497,20 +566,56 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertEqual(
             out.getvalue(),
             "\nShells\n"
-            "  #  Name              Shortname    State          "
+            "  #  Name              Shortname    State        Action       "
             "Default (harness · model)     \n"
             "\n"
             "dev\n"
-            "  1  Builder           DEV1         available      "
+            "  1  Builder           DEV1         available    new chat     "
             "codex · gpt-5.6-sol\n"
             "\n"
             "reviewer\n"
-            "  2  Reviewer          REV1         lost           "
+            "  2  Reviewer          REV1         lost         blocked      "
             "claude · opus\n"
             "\n"
             "(bespoke)\n"
-            "  3  A bespoke shell … CUSTOM-LONG… unknown        \n",
+            "  3  A bespoke shell … CUSTOM-LONG… unknown      blocked      \n",
         )
+
+    def test_picker_states_the_consequence_of_each_row(self):
+        """The state column says what a shell IS; Action says what picking it
+        DOES — the difference an operator needs before pressing a number."""
+        shells = [
+            {"shell_id": n, "shortname": f"S{n}", "display_name": f"D{n}",
+             "flavor": "dev", "availability": avail,
+             "default_harness": None, "default_model": None}
+            for n, avail in enumerate(
+                ["available", "occupied", "starting", "working", "lost",
+                 "unreconciled", "error"], 1)
+        ]
+        self.assertEqual(
+            [ic._picker_action(s) for s in shells],
+            ["new chat", "reattach", "wait, attach",
+             "blocked", "blocked", "blocked", "blocked"],
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(ic.shutil, "get_terminal_size",
+                                  return_value=ic.os.terminal_size((100, 24))):
+            ic._render_shell_picker(shells)
+        self.assertIn("occupied     reattach", out.getvalue())
+        self.assertIn("working      blocked", out.getvalue())
+
+    def test_picker_off_a_tty_refuses_instead_of_entering_the_first_shell(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch.object(ic.sys.stdin, "isatty", return_value=False), \
+                self.assertRaises(SystemExit) as raised:
+            ic._pick_shell(SHELLS["shells"], None)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("not a terminal", err.getvalue())
+        self.assertIn("interface start", err.getvalue())
+        self.assertEqual(out.getvalue(), "",
+                         "a refusal must not paint a picker nobody can answer")
 
     def test_grouped_picker_is_readable_in_a_narrow_terminal(self):
         shell = {
@@ -534,7 +639,13 @@ class InterfaceCliTest(unittest.TestCase):
         self.assertLessEqual(max(map(len, lines)), 36)
         self.assertIn("EXTRAORDINARI…", out.getvalue())
         self.assertIn("starting", out.getvalue())
-        self.assertIn("codex · gpt-5.6-sol", out.getvalue())
+        # The detail line wraps at this width — assert the CONTENT survives,
+        # not where the wrap lands, so the column set can grow without
+        # pinning the layout.
+        unwrapped = " ".join(out.getvalue().split())
+        self.assertIn("wait, attach", unwrapped)
+        self.assertIn("A very long display name", unwrapped)
+        self.assertIn("codex · gpt-5.6-sol", unwrapped)
 
     def test_grouped_picker_can_be_cancelled_without_an_action(self):
         out, err = io.StringIO(), io.StringIO()
