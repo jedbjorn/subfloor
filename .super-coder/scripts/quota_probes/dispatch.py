@@ -34,7 +34,12 @@ def _run(name: str, log, timeout: float) -> list[dict]:
     try:
         return list(mod.probe(log, timeout))
     except Exception as e:  # plugin stance: loud, never fatal to the sweep
-        log(f"quota_probes: {name} probe failed: {e!r}")
+        # TYPE only, never the message — matching what `_error` already puts in
+        # `detail`. Any exception's message can carry a token (an HTTP library
+        # that renders the request headers, or http.client's own "Invalid
+        # header value <token>"), and these notes are echoed into the API
+        # response by the caller. The type cannot carry one. Flag #195.
+        log(f"quota_probes: {name} probe failed: {type(e).__name__}")
         return [_error(name, f"probe raised {type(e).__name__}")]
 
 

@@ -203,6 +203,19 @@ def get_json(url: str, headers: dict, timeout: float) -> "tuple[int, object]":
         return e.code, None
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return 0, str(getattr(e, "reason", e))
+    except ValueError as e:
+        # A token carrying a character illegal in an HTTP header — a trailing
+        # newline from a hand-copied or truncated credential file is the
+        # everyday case. `http.client.putheader` raises ValueError whose
+        # message IS the header value, i.e. the token; letting it escape put
+        # that token into whatever logged the exception (spec #49 gate line
+        # "no token in any log line, API response, or DB row"; flag #195).
+        # Caught HERE rather than only scrubbed at the log, so the reason the
+        # probe failed is still reported: a bare `error` with no diagnosis
+        # trades a leak for a mystery. The value never appears — naming the
+        # exception type would re-admit it, since `str(e)` is the token.
+        del e
+        return 0, "invalid request header (check the credential file)"
 
 
 def account(*, provider: str, probe_version: str, captured_at: str,

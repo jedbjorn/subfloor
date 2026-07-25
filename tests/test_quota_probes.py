@@ -565,7 +565,19 @@ class DispatchTest(ProbeCase):
         self.assertIn("RuntimeError", rows["openai"]["detail"])
         self.assertEqual(rows["anthropic"]["status"], "ok")
         self.assertEqual(rows["moonshot"]["status"], "ok")
-        self.assertTrue(any("provider exploded" in n for n in self.notes))
+        # Loud, and loud about the right thing. This asserted the exception's
+        # MESSAGE ("provider exploded") until flag #195: an exception message
+        # can carry the request headers, and these notes are echoed into the
+        # API response — so the message was the leak, not the diagnosis. The
+        # property the assertion was for (containment is logged, never
+        # swallowed) is unchanged; it is pinned on the provider and the type,
+        # which cannot carry a token. tests/test_quota_gate.py holds the
+        # sweep that proves the message is gone from every surface.
+        self.assertTrue(any("openai" in n and "RuntimeError" in n
+                            for n in self.notes),
+                        "the contained failure was swallowed silently")
+        self.assertFalse(any("provider exploded" in n for n in self.notes),
+                         "the exception message reached a log line")
 
     def test_a_hung_provider_costs_the_timeout_not_the_request(self):
         self.endpoint(p_anthropic, 200, fixture("anthropic_usage.json"))
