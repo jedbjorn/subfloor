@@ -23,6 +23,7 @@ Run:
 """
 from __future__ import annotations
 
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -36,6 +37,19 @@ SECRET = "SECRET-OUTSIDE-THE-VENDOR-ROOT\n"
 
 
 class VendoredAssetTest(ServedAssetTestCase):
+
+    def raw(self, method, path):
+        """Everything the server actually wrote, headers and all. The
+        transport closes the connection per response, so EOF is the end."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+            s.sendall(f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      "Connection: close\r\n\r\n".encode())
+            chunks = []
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
 
     def setUp(self):
         super().setUp()
@@ -83,6 +97,16 @@ class VendoredAssetTest(ServedAssetTestCase):
                 self.assertEqual(status, 404)
                 self.assertNotIn(b"SECRET", body,
                                  f"{path} answered 404 and served the file anyway")
+
+    def test_a_percent_encoded_name_is_decoded_before_it_is_resolved(self):
+        """The other half of decode-then-contain, and the half a traversal
+        battery cannot see: with the decode removed every `..` spelling still
+        404s (on a path that simply does not exist), so only a legitimate
+        encoded name shows whether decoding happens at all."""
+        (self.vendor / "space name.js").write_text("encoded\n")
+        status, _, body = self.get("/vendor/space%20name.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"encoded\n")
 
     def test_a_symlink_out_of_the_tree_is_bounded_like_dot_dot(self):
         """Resolution precedes the bound check, which is the only ordering
@@ -205,10 +229,22 @@ class VendoredAssetTest(ServedAssetTestCase):
     def test_a_vendored_asset_answers_head_with_headers_and_no_body(self):
         """Without this the probe in ui/app.js reads 405 for every HEALTHY
         script and reports a floor that cannot serve the build — the exact
-        dishonest message the other half of this unit removes."""
+        dishonest message the other half of this unit removes.
+
+        The empty body is read off a RAW socket, because http.client declines
+        to read a body after a HEAD whatever the server sent: asserting on the
+        parsed response proves the client's manners, not the server's. (Made
+        the mutation that writes the body anyway go green, which is how this
+        apparatus got replaced.)
+        """
         get_status, get_headers, get_body = self.get("/vendor/xterm/xterm.js")
         status, headers, body = self.request("HEAD", "/vendor/xterm/xterm.js")
         self.assertEqual((get_status, status), (200, 200))
+        raw = self.raw("HEAD", "/vendor/xterm/xterm.js")
+        head, _, after_headers = raw.partition(b"\r\n\r\n")
+        self.assertEqual(after_headers, b"",
+                         "HEAD sent a body after its headers")
+        self.assertIn(b"Content-Length: %d" % len(get_body), head)
         self.assertEqual(body, b"")
         self.assertEqual(headers.get("Content-Length"), str(len(get_body)))
         self.assertEqual(headers.get("Content-Type"),

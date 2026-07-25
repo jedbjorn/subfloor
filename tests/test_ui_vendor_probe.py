@@ -36,6 +36,7 @@ ENGINE = ROOT / ".super-coder"
 APP = (ENGINE / "ui" / "app.js").read_text()
 INDEX = (ENGINE / "ui" / "index.html").read_text()
 EL = APP[APP.index("const el ="):APP.index("const esc =")]
+DETACH = APP[APP.index("function ifDetach()"):APP.index("window.addEventListener(\"pagehide\"")]
 VENDOR = APP[APP.index("// The terminal globals are undefined in two"):
              APP.index("function ifSendInput")]
 
@@ -244,10 +245,16 @@ class VendorProbeTest(unittest.TestCase):
           "reported a fault after recovering: " + a.st.note);
         """)
 
-    def test_a_probe_landing_after_the_operator_moved_on_repaints_nothing(self):
-        """The attach can end while the HEADs are in flight. A finding about
-        the session you left must never overwrite the one you are looking
-        at."""
+    def test_a_probe_landing_after_the_operator_moved_on_does_nothing(self):
+        """The attach can end while the HEADs are in flight, and what the dead
+        attachment must not do is CONTINUE — no repaint of a pane nobody is
+        looking at, and above all no next attempt queued against it.
+
+        Split from the throwing case below on purpose: the guard before the
+        paint and the guard after the await are independently sufficient for a
+        note, so a single test kept BOTH mutations green. The retry is what
+        only the post-await guard prevents.
+        """
         run_js(r"""
         const held = [];
         respond = () => new Promise((resolve) => held.push(resolve));
@@ -259,14 +266,53 @@ class VendorProbeTest(unittest.TestCase):
         // The operator selects another shell: a newer attachment is current.
         const current = attach();
         current.st.note = "attached";
-        held.forEach((resolve) => resolve({ status: 404 }));
-        await sleep(200);
+        held.forEach((resolve) => resolve({ status: 200 }));
+        await sleep(80);
+        invariant(stale.vendorRetry === null,
+          "a probe queued another attempt against an attachment already gone");
         invariant(stale.st.note === staleNote,
           "a probe repainted an attachment that was already gone: " + stale.st.note);
         invariant(stale.notes.length === staleNotes, "repainted the stale pane");
         invariant(current.st.note === "attached",
           "the stale probe overwrote the live pane: " + current.st.note);
-        invariant(stale.vendorRetry === null, "the dead attach scheduled a retry");
+        """)
+
+    def test_a_probe_that_throws_after_the_operator_moved_on_repaints_nothing(self):
+        """The failure path reaches the note without passing the post-await
+        check, so this is the one the paint's own guard has to catch."""
+        run_js(r"""
+        let reject;
+        respond = () => new Promise((_, no) => { reject = no; });
+        const stale = attach();
+        ifOpenStream(stale, "ticket-1");
+        await sleep(50);
+        const staleNote = stale.st.note;
+        const current = attach();
+        current.st.note = "attached";
+        reject(new Error("Failed to fetch"));
+        await sleep(150);
+        invariant(stale.st.note === staleNote,
+          "a failed probe repainted an attachment already gone: " + stale.st.note);
+        invariant(current.st.note === "attached",
+          "the stale probe overwrote the live pane: " + current.st.note);
+        """)
+
+    def test_a_queued_attempt_dies_with_the_attachment(self):
+        """The attach can also end BETWEEN attempts, with the timer already
+        armed — spec #48's "cancelled on detach". The armed callback is the
+        last thing standing between a dropped pane and a stream opened against
+        a session the operator left."""
+        run_js(r"""
+        const a = attach();
+        ifOpenStream(a, "ticket-1");
+        await sleep(80);
+        invariant(a.vendorRetry !== null, "no attempt was queued to cancel");
+        const probed = probes.length;
+        ifAttach = null;                    // the operator navigates away
+        await sleep(500);                   // past two retry intervals
+        invariant(probes.length === probed,
+          "a detached attachment kept probing: " + probes.length + " > " + probed);
+        invariant(sockets.length === 0, "opened a stream for a dead attachment");
         """)
 
     def test_a_probe_that_throws_names_the_error_and_claims_nothing_else(self):
@@ -305,6 +351,14 @@ class VendorEnumerationTest(unittest.TestCase):
         self.assertGreaterEqual(len(vendored), 2, srcs)
         self.assertIn("/vendor/xterm/xterm.js", vendored)
         self.assertIn("/vendor/xterm/addon-fit.js", vendored)
+
+    def test_detach_clears_a_queued_attempt(self):
+        """Belt to the armed callback's braces: teardown drops the timer the
+        way it drops the heartbeat, so nothing is left pending on a pane the
+        operator closed. Asserted against the source because ifDetach's other
+        work (lease DELETE, terminal dispose) is out of this harness's
+        reach."""
+        self.assertIn("clearTimeout(a.vendorRetry)", DETACH)
 
     def test_the_old_remedy_is_gone_from_the_shell(self):
         """It said `refresh the page` for a route-table miss no refresh can
