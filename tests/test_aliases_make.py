@@ -85,6 +85,19 @@ def make(*args: str) -> subprocess.CompletedProcess[str]:
 
 @unittest.skipUnless(shutil.which("make"), "GNU Make is not installed")
 class MakeAliasContractTest(unittest.TestCase):
+    def test_retired_dos_token_alias_stays_gone(self):
+        """`dos-token` existed for one job: paste the sign-in credential into
+        the browser by hand. The browser attaches its own now, so the alias is
+        retired — and a retired alias needs a test, or the next person adding a
+        maintenance target restores it from muscle memory. `./sc token` itself
+        stays: it is still the recovery path when the automatic attach cannot
+        run, so this pins the ALIAS being gone, never the capability."""
+        result = make("-n", "dos-token")
+        self.assertNotEqual(result.returncode, 0,
+                            "dos-token still resolves as a make target")
+        self.assertNotIn("dos-token", make("dos-help").stdout)
+        self.assertNotIn("dos-token", make("dos-h").stdout)
+
     def test_documented_targets_delegate_exactly_to_sc(self):
         cases = [
             (("dos-enter",), "./sc enter"),
@@ -139,7 +152,6 @@ class MakeAliasContractTest(unittest.TestCase):
             (("dos-install",), "./sc install"),
             (("dos-setup",), "./sc install"),
             (("dos-rollback",), "./sc rollback"),
-            (("dos-token",), "./sc token"),
             (("dos-update-harnesses",), "./sc update-harnesses"),
             (("dos-feature", "ARGS=enable pg"), "./sc feature enable pg"),
             (("dos-feat",), "./sc feature"),
@@ -181,17 +193,10 @@ class MakeAliasContractTest(unittest.TestCase):
             result.stderr,
         )
 
-    def test_full_help_covers_token_dispatch_and_operator_groups(self):
+    def test_full_help_covers_operator_groups(self):
         result = make("dos-help")
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = result.stdout
-        self.assertEqual(
-            help_text.count(
-                "dos-token                   print the browser sign-in token "
-                "(stdout only)"
-            ),
-            1,
-        )
         for heading in ("HOT", "INTERFACE", "MODELS + SPRINT", "MAINTENANCE"):
             self.assertIn(heading, help_text)
         for target in (
@@ -211,7 +216,6 @@ class MakeAliasContractTest(unittest.TestCase):
             "dos-watch",
             "dos-job",
             "dos-setup",
-            "dos-token",
             "dos-url",
             "dos ARGS='<cmd>'",
         ):
