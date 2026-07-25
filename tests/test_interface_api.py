@@ -341,6 +341,39 @@ class InterfaceApiTest(unittest.TestCase):
             if "model" in k and not k.startswith("default_"))
         self.assertEqual(set(session_model_keys), {"model_route"})
 
+    def test_interface_json_is_never_served_cacheable(self):
+        """Freshness (spec #43 U3, gate follow-up): these responses carried no
+        cache directives at all, and no directives is not don't-cache — a
+        browser MAY heuristically reuse a response that has neither a
+        validator nor a directive, so the rail poll's 5s freshness rested on
+        browsers declining to do so.
+
+        Swept across a spread of routes rather than the two the ruling named:
+        the header is set at the single constructor every Interface response
+        is built by, and that is the claim worth pinning — a per-route header
+        would drift the moment a route is added. The bootstrap case also
+        proves a route supplying its OWN headers (Set-Cookie) does not
+        displace it.
+        """
+        session_id = self.occupy()
+        cases = (
+            ("shells listing", lambda: self.call(
+                "GET", "/api/interface/shells", (OP,)), 200),
+            ("session payload", lambda: self.call(
+                "GET", f"/api/interface/sessions/{session_id}", (OP,)), 200),
+            ("browser bootstrap (route sets its own headers)",
+             lambda: self._bootstrap(key="b-nostore"), 201),
+            ("unauthorized", lambda: self.call(
+                "GET", "/api/interface/shells"), 401),
+            ("unknown route", lambda: self.call(
+                "GET", "/api/interface/nope", (OP,)), 404),
+        )
+        for label, call, expected in cases:
+            with self.subTest(case=label):
+                status, headers, body = call()
+                self.assertEqual(status, expected, body)
+                self.assertEqual(headers.get("Cache-Control"), "no-store")
+
     def _bootstrap(self, *extra, key="b-mint"):
         return self.call(
             "POST", "/api/interface/browser-sessions",

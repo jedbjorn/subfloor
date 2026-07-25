@@ -117,7 +117,23 @@ class FakeElement {
 globalThis.document = {
   createElement: (tag) => new FakeElement(tag),
   createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
+  hidden: false,
+  _listeners: new Map(),
+  addEventListener(type, fn) {
+    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+    this._listeners.get(type).add(fn);
+  },
+  removeEventListener(type, fn) {
+    this._listeners.get(type)?.delete(fn);
+  },
 };
+// Deliver an event the way the browser would, then let the handler's async
+// work settle: the visibility handler starts a poll it does not await, so a
+// bare dispatch returns before any repaint could have happened.
+async function fire(type) {
+  for (const fn of [...(document._listeners.get(type) || [])]) fn();
+  for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
+}
 function all(root, predicate, found = []) {
   if (predicate(root)) found.push(root);
   for (const child of root.children || []) {
@@ -1211,6 +1227,64 @@ invariant(rendered === 0,
 invariant(badges(root).some((b) => b.includes("2")),
   `the new alert count never reached the rail: ${badges(root)}`);
 ifStopRailPoll();
+""")
+
+
+def test_rail_catches_up_immediately_when_the_tab_becomes_visible():
+    """Hidden ticks are skipped, so everything that moved while the operator
+    was in another tab is invisible until the next tick — up to a full
+    interval of confidently-wrong badges on a surface whose whole job is to
+    say who is busy. Returning to the tab must repaint at once (spec #43 U3)."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+serveShells([shellRow("S3", "available"), shellRow("S4", "available")]);
+const root = new FakeElement("div");
+await renderInterface(root);
+
+// The operator switches away; the fleet moves with nobody watching.
+document.hidden = true;
+serveShells([shellRow("S3", "available"), shellRow("S4", "occupied")]);
+await ifPollRail();
+invariant(badges(root).join(",") === "available,available",
+  `a hidden tab polled anyway: ${badges(root)}`);
+await fire("visibilitychange");
+invariant(badges(root).join(",") === "available,available",
+  `a visibility event with the tab STILL hidden polled: ${badges(root)}`);
+
+// ...and comes back. The badge is correct now, not up to IF_POLL_MS later.
+document.hidden = false;
+await fire("visibilitychange");
+invariant(badges(root).join(",") === "available,occupied",
+  `returning to the tab left the rail stale: ${badges(root)}`);
+ifStopRailPoll();
+""")
+
+
+def test_the_visibility_listener_dies_with_the_poll_it_belongs_to():
+    """The listener is poll-scoped: a stopped poll that still holds a live
+    document listener fires against a detached rail forever, and every
+    re-render would stack another one."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+serveShells([shellRow("S3", "available"), shellRow("S4", "available")]);
+const root = new FakeElement("div");
+await renderInterface(root);
+invariant(document._listeners.get("visibilitychange").size === 1,
+  "the poll registered no visibility listener");
+
+// A re-render replaces the poll; it must not leave the old listener behind.
+// (Registering the stable ifPollRail reference makes this true by the DOM's
+// own de-duplication — the pin is against reintroducing a per-poll closure
+// without a matching teardown, which is how this leaks.)
+await renderInterface(root);
+invariant(document._listeners.get("visibilitychange").size === 1,
+  "a re-render stacked a second visibility listener");
+
+ifStopRailPoll();
+invariant(document._listeners.get("visibilitychange").size === 0,
+  "the stopped poll left its visibility listener attached");
+serveShells([shellRow("S3", "available"), shellRow("S4", "occupied")]);
+await fire("visibilitychange");
+invariant(badges(root).join(",") === "available,available",
+  `a stopped poll still repainted on visibility: ${badges(root)}`);
 """)
 
 

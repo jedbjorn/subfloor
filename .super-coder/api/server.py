@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import hashlib
 import http.client
 import io
 import ipaddress
@@ -1424,6 +1425,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.end_headers()
 
+    def _not_modified(self, headers: dict):
+        """304: the validators and cache directives, no body (RFC 9110 15.4.5)."""
+        self.send_response(304)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def _if_none_match(self, etag: str) -> bool:
+        """Does the client already hold this exact representation?
+
+        Weak comparison, as RFC 9110 13.1.2 requires for If-None-Match: the
+        `W/` prefix never affects the match, and the header carries a LIST —
+        matching only a whole-header equality would 200 every browser that
+        sends more than one tag.
+        """
+        raw = self.headers.get("If-None-Match", "")
+        if not raw:
+            return False
+        candidates = [c.strip() for c in raw.split(",")]
+        if "*" in candidates:
+            return True
+        return any(c.removeprefix("W/") == etag for c in candidates)
+
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
@@ -2393,10 +2417,25 @@ class Handler(BaseHTTPRequestHandler):
             f = UI_DIR / fname
             if not f.exists():
                 return self._send(404, "not built", "text/plain")
+            text = f.read_text()
+            # Freshness (spec #43 U3): `no-cache` means revalidate, not
+            # don't-store — every navigation asks, and the ETag answers 304
+            # from the client's own copy when nothing changed. Without this a
+            # heuristically-cached app.js survived an engine update until the
+            # operator hard-refreshed, which is what issue 3 actually was.
+            # Content-derived, so a rebuild that produces identical bytes
+            # still revalidates cheaply.
+            headers = {
+                "Cache-Control": "no-cache",
+                "ETag": '"%s"' % hashlib.sha256(text.encode()).hexdigest()[:32],
+            }
             # Restrictive CSP on the app shell (spec #20 Security): vendored
             # scripts/styles + same-origin connections only, no inline script.
-            headers = {"Content-Security-Policy": _CSP} if fname == "index.html" else None
-            return self._send(200, f.read_text(), ctype, headers=headers)
+            if fname == "index.html":
+                headers["Content-Security-Policy"] = _CSP
+            if self._if_none_match(headers["ETag"]):
+                return self._not_modified(headers)
+            return self._send(200, text, ctype, headers=headers)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
         if path == "/_sc/watches":

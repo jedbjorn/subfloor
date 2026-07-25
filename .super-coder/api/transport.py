@@ -33,7 +33,7 @@ MAX_BODY = 8 * 1024 * 1024
 
 _PHRASES = {
     200: "200 OK", 201: "201 Created", 202: "202 Accepted",
-    204: "204 No Content", 302: "302 Found",
+    204: "204 No Content", 302: "302 Found", 304: "304 Not Modified",
     400: "400 Bad Request", 401: "401 Unauthorized", 403: "403 Forbidden",
     404: "404 Not Found", 405: "405 Method Not Allowed",
     409: "409 Conflict", 413: "413 Payload Too Large",
@@ -143,7 +143,10 @@ class Transport:
         names = {k.lower() for k, _ in headers}
         for k, v in headers:
             lines.append(f"{k}: {v}")
-        if "content-length" not in names:
+        # 204 and 304 carry no content and no framing for content that isn't
+        # there — a Content-Length on a 304 describes the cached
+        # representation, not this response, so don't invent one.
+        if "content-length" not in names and status not in (204, 304):
             lines.append(f"Content-Length: {len(body)}")
         lines.append("Connection: close")
         head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
