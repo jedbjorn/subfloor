@@ -431,6 +431,26 @@ loop, and the only role the inbox watcher (`./sc watch inbox`, claude-only)
 fully serves. Any harness *works* in the planner seat — wake latency and
 ergonomics degrade, correctness doesn't.
 
+### Keeping harnesses (and therefore models) current
+
+A new model arrives in a new harness **CLI release** — so a shell can only reach
+the models its CLI knows about. The CLIs are baked into the sandbox image (creds
+are mounted, binaries never are: a darwin binary is fatal in a linux container,
+and vibe's entry point carries an absolute shebang into a host interpreter), and
+docker caches those layers indefinitely. `SC_HARNESS_EPOCH` is their expiry:
+`./sc update` and `./sc update-harnesses` roll it, and the next image build
+reinstalls every harness at latest.
+
+```
+./sc harness-status      # what the sandbox actually runs + is a rebuild owed
+./sc update-harnesses    # roll the epoch + rebuild (then ./sc restart to run it)
+```
+
+If a model that exists is not offered to a shell, start there — it is nearly
+always the CLI build, not the picker or the account. Full runbook, including the
+multi-fork case and why the regression was invisible:
+[`.super-coder/docs/harness-freshness.md`](../.super-coder/docs/harness-freshness.md).
+
 ## Shells & worktrees
 
 > [!class2]
