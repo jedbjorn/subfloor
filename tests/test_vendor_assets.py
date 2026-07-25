@@ -33,7 +33,10 @@ sys.path.insert(0, str(TESTS))
 
 from test_ui_freshness import ServedAssetTestCase  # noqa: E402
 
-SECRET = "SECRET-OUTSIDE-THE-VENDOR-ROOT\n"
+# The bytes containment must never hand back. Named for what it is — a
+# canary, not a credential: CodeQL reads a fixture called SECRET as stored
+# sensitive data and files a high-severity alert against the test.
+CANARY = "CANARY-OUTSIDE-THE-VENDOR-ROOT\n"
 
 
 class VendoredAssetTest(ServedAssetTestCase):
@@ -56,10 +59,9 @@ class VendoredAssetTest(ServedAssetTestCase):
         self.vendor = self.ui / "vendor"
         (self.vendor / "xterm").mkdir(parents=True)
         (self.vendor / "xterm" / "xterm.js").write_text("globalThis.Terminal = 1;\n")
-        # The bytes containment must never hand back. Inside UI_DIR but above
-        # the vendor root, which is the reach the old frozen table denied by
-        # having no route at all.
-        (self.ui / "secret.js").write_text(SECRET)
+        # Inside UI_DIR but above the vendor root — the reach the old frozen
+        # table denied by having no route at all.
+        (self.ui / "offlimits.js").write_text(CANARY)
 
     # -- the incident itself --------------------------------------------------
 
@@ -86,16 +88,16 @@ class VendoredAssetTest(ServedAssetTestCase):
     def test_traversal_is_contained_and_no_variant_leaks_a_byte(self):
         """Decoding has to happen BEFORE containment: `%2e%2e` is the spelling
         that survives a check applied to the raw path."""
-        for path in ("/vendor/../secret.js",
-                     "/vendor/%2e%2e/secret.js",
-                     "/vendor/xterm/../../secret.js",
-                     "/vendor/xterm/%2e%2e/%2e%2e/secret.js",
-                     "/vendor/..%2fsecret.js",
-                     "/vendor/./../secret.js"):
+        for path in ("/vendor/../offlimits.js",
+                     "/vendor/%2e%2e/offlimits.js",
+                     "/vendor/xterm/../../offlimits.js",
+                     "/vendor/xterm/%2e%2e/%2e%2e/offlimits.js",
+                     "/vendor/..%2fofflimits.js",
+                     "/vendor/./../offlimits.js"):
             with self.subTest(path=path):
                 status, _, body = self.get(path)
                 self.assertEqual(status, 404)
-                self.assertNotIn(b"SECRET", body,
+                self.assertNotIn(b"CANARY", body,
                                  f"{path} answered 404 and served the file anyway")
 
     def test_a_percent_encoded_name_is_decoded_before_it_is_resolved(self):
@@ -113,18 +115,18 @@ class VendoredAssetTest(ServedAssetTestCase):
         that catches this — a symlink's own path is squeaky clean."""
         outside = Path(self.tmp.name) / "outside"
         outside.mkdir()
-        (outside / "escape.js").write_text(SECRET)
+        (outside / "escape.js").write_text(CANARY)
         (self.vendor / "escape.js").symlink_to(outside / "escape.js")
         status, _, body = self.get("/vendor/escape.js")
         self.assertEqual(status, 404)
-        self.assertNotIn(b"SECRET", body)
+        self.assertNotIn(b"CANARY", body)
 
     def test_an_absolute_path_does_not_escape_the_join(self):
         """`root / "/etc/hosts"` is `/etc/hosts` in pathlib — the join itself
         is an escape hatch, so the bound check is what has to catch it."""
-        status, _, body = self.get("/vendor//" + str(self.ui / "secret.js"))
+        status, _, body = self.get("/vendor//" + str(self.ui / "offlimits.js"))
         self.assertEqual(status, 404)
-        self.assertNotIn(b"SECRET", body)
+        self.assertNotIn(b"CANARY", body)
 
     # -- the allowlist --------------------------------------------------------
 
@@ -194,7 +196,7 @@ class VendoredAssetTest(ServedAssetTestCase):
         (self.vendor / "planted.py").write_text("x\n")
         cases = {
             "/vendor/planted.py": b"suffix not allowlisted",
-            "/vendor/../secret.js": b"outside the vendor root",
+            "/vendor/../offlimits.js": b"outside the vendor root",
             "/vendor/xterm/missing.js": b"no such file",
         }
         for path, reason in cases.items():
