@@ -115,12 +115,17 @@ RUN pip install --no-cache-dir "playwright==1.60.0" \
  && playwright install --with-deps chromium \
  && chmod -R a+rX /opt/ms-playwright
 
-# Dev-kit fallback tools. `./sc lint` / `./sc typecheck` prefer the fork's .venv
-# copy (its pins + config), but a host-managed .venv (pinned out-of-tree
-# interpreter mounted by launch) is pip-skipped in the sandbox — so bake the
-# PATH fallback here or the tools are unobtainable from inside the box
-# (dos-arch QAQC-02). _sc_devtool in ./sc resolves .venv → PATH in that order.
-RUN pip install --no-cache-dir ruff mypy
+# Dev-kit fallback tools. `./sc lint` / `./sc typecheck` / `./sc test` prefer
+# the fork's .venv copy (its pins + config), but a host-managed .venv (pinned
+# out-of-tree interpreter mounted by launch) is pip-skipped in the sandbox, and
+# a .venv built by a python minor that differs from the one resolving in here
+# is present-but-unimportable — so bake the PATH fallback here or the tools are
+# unobtainable from inside the box (dos-arch QAQC-02). _sc_devtool and sc_test
+# in ./sc resolve .venv → PATH in that order, gated on _sc_venv_runnable.
+# pytest belongs in this set: sc_test's fallback lands on it, and it was
+# previously present in the running image only by accident (pip-installed, in
+# no Dockerfile layer), so a clean rebuild would have taken it away.
+RUN pip install --no-cache-dir ruff mypy pytest
 
 # Durable bare `sc` on PATH for EVERY harness. run.py prepends the repo root to
 # PATH at exec, but that only survives into a harness that hands its env verbatim

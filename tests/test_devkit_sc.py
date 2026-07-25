@@ -84,6 +84,103 @@ class ImageFallbackTest(unittest.TestCase):
                          "the sandbox image must bake ruff + mypy — the PATH "
                          "fallback for host-managed-.venv forks")
 
+    def test_image_bakes_pytest(self):
+        """sc_test's fallback lands on the PATH pytest. It sat in the running
+        image by accident (pip-installed, in no layer), so a clean rebuild
+        would have removed the thing the fallback depends on."""
+        self.assertRegex(DOCKERFILE, r"pip install[^\n]*pytest",
+                         "the sandbox image must bake pytest — sc_test falls "
+                         "back to it when the .venv is not runnable here")
+
+
+def _extract(fn: str) -> str:
+    """One sh function body out of `sc`, for a live run in a scratch tree."""
+    m = re.search(fn + r"\(\) \{.*?\n\}", SC, re.S)
+    assert m, f"{fn} not found in sc"
+    return m.group(0)
+
+
+class VenvRunnableTest(unittest.TestCase):
+    """A bind-mounted .venv records its interpreter as an UNVERSIONED symlink,
+    so the same path resolves to a different python minor on the host and in
+    the sandbox. The shims then exist, are executable, and import nothing.
+    `-x` cannot see that; _sc_venv_runnable must."""
+
+    def _probe(self, interpreter_version: str, packages_for: str | None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv = root / ".venv"
+            (venv / "bin").mkdir(parents=True)
+            # A stand-in interpreter: the probe only asks it its version.
+            python = venv / "bin" / "python"
+            python.write_text(f"#!/bin/sh\necho {interpreter_version}\n")
+            python.chmod(0o755)
+            if packages_for:
+                (venv / "lib" / f"python{packages_for}"
+                 / "site-packages").mkdir(parents=True)
+            script = (f'here="{root}"\n{_extract("_sc_venv_runnable")}\n'
+                      "_sc_venv_runnable && echo RUNNABLE || echo NOT\n")
+            return subprocess.run(["sh", "-c", script], capture_output=True,
+                                  text=True).stdout.strip()
+
+    def test_matching_interpreter_and_site_packages_is_runnable(self):
+        self.assertEqual(self._probe("3.12", "3.12"), "RUNNABLE")
+
+    def test_minor_version_skew_is_not_runnable(self):
+        """The live defect: venv built by host py3.14, resolved here as py3.13.
+        Every .venv/bin/* shim is -x and every import fails."""
+        self.assertEqual(self._probe("3.13", "3.14"), "NOT")
+
+    def test_missing_interpreter_is_not_runnable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (f'here="{tmp}"\n{_extract("_sc_venv_runnable")}\n'
+                      "_sc_venv_runnable && echo RUNNABLE || echo NOT\n")
+            out = subprocess.run(["sh", "-c", script], capture_output=True,
+                                 text=True).stdout.strip()
+        self.assertEqual(out, "NOT")
+
+
+class VenvRunnabilityGateTest(unittest.TestCase):
+    """Both tool-resolution paths must consult the probe. Existence checks
+    alone put an unimportable shim ahead of a working PATH copy — for sc_test
+    that fails the ENTIRE suite with ModuleNotFoundError, which reads as a
+    real test failure."""
+
+    def test_devtool_gates_the_venv_copy_on_runnability(self):
+        # Anchor on the line that RETURNS the venv copy, not on the body: the
+        # probe is also named in the error branch, so a body-wide assertIn
+        # passes vacuously when the gate itself is stripped.
+        body = _extract("_sc_devtool")
+        gate = [ln for ln in body.splitlines()
+                if "printf" in ln and '"$venv/bin/$1"' in ln]
+        self.assertEqual(len(gate), 1, "expected one venv-resolution line")
+        self.assertIn("_sc_venv_runnable", gate[0],
+                      "the venv copy is returned without probing that it runs")
+        # It must still WIN when it does run — fork pins + config ride it.
+        self.assertLess(body.index('"$venv/bin/$1"'), body.index("command -v"))
+
+    def test_sc_test_gates_the_venv_pytest_on_runnability(self):
+        body = _extract("sc_test")
+        self.assertLess(body.index('pytest_bin="$venv/bin/pytest"'),
+                        body.index("command -v pytest"),
+                        "the .venv pytest must be preferred when runnable and "
+                        "only then fall through to the baked PATH copy")
+
+    def test_sc_test_never_runs_an_unprobed_venv_pytest(self):
+        """The regression this closes: `[ -x $venv/bin/pytest ]` deciding on
+        its own what to EXECUTE. Existence may still gate the self-heal
+        (provision when absent) and a diagnostic line — only execution is
+        pinned, and it must go through the probed resolution."""
+        body = _extract("sc_test")
+        self.assertIn('"$pytest_bin" "$@"', body)
+        self.assertNotIn('"$venv/bin/pytest" "$@"', body,
+                         "the suite must run the PROBED pytest, never the raw "
+                         "venv path")
+        # Every selection of the venv copy is guarded by the probe.
+        for m in re.finditer(r'pytest_bin="\$venv/bin/pytest"', body):
+            self.assertIn("_sc_venv_runnable", body[max(0, m.start() - 200):m.start()],
+                          "the venv pytest was selected without the probe")
+
 
 class DepsHostManagedVerifyTest(unittest.TestCase):
     """#314/#324/#339 — the sandbox pip-skip must never green-lie: declared
