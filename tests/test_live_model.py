@@ -23,11 +23,13 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,10 +38,18 @@ FIXTURES = ROOT / "tests" / "fixtures" / "live_model"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
+import interface_broker  # noqa: E402  (the writer of `last_human_input_at`)
 import live_model  # noqa: E402
 from live_model import claude as p_claude  # noqa: E402
 from live_model import kimi as p_kimi  # noqa: E402
 from live_model import opencode as p_opencode  # noqa: E402
+
+# The two timestamp forms that meet in `probe(active_since=…)`. They are NOT
+# mutually orderable as strings — `'T'` (0x54) sorts above `' '` (0x20) — so a
+# same-day engine timestamp compares as EARLIER than any observation of that
+# day. That is SC-165, and it is why nothing here compares raw strings.
+BROKER_TS = "%Y-%m-%d %H:%M:%S"    # interface_broker._now() = SELECT datetime('now')
+HARNESS_TS = "%Y-%m-%dT%H:%M:%SZ"  # norm_iso's canonical form = every observed_at
 
 # The cwds the capture runs actually ran in — the fixtures record these paths
 # internally (claude per-record `cwd`, kimi state.json `workDir`, opencode
@@ -60,6 +70,14 @@ OC_SINGLE = "/tmp/lm-capture/oc-single"
 OC_AB = "/tmp/lm-capture/oc-ab"
 OC_BACK = "/tmp/lm-capture/oc-back"
 OC_SUB = "/tmp/lm-capture/oc-sub"
+
+# The second capture round (REV2 SC-166): TWO sessions of one worktree, the
+# production shape every previous fixture is missing — each of those holds a
+# single session, so "which session is the current one" was answered by
+# default rather than by the code under test.
+CLAUDE_TWO = "/tmp/lm-capture2/claude-two"
+KIMI_TWO = "/tmp/lm-capture2/kimi-two"
+OC_TWO = "/tmp/lm-capture2/oc-two"
 
 
 class ProbeCase(unittest.TestCase):
@@ -280,11 +298,48 @@ class Verdicts(ProbeCase):
         self.assertEqual(r["verdict"], "none")
         self.assertIsNone(r["last_model"])
 
+
+class Freshness(ProbeCase):
+    """`stale` — and the format `active_since` actually arrives in (SC-165).
+
+    Every value the probe compares against comes from the ENGINE, not from a
+    harness: the Interface writes `last_human_input_at` through
+    `interface_broker._now()`. So the timestamps here are built by SHIFTING a
+    real observation and rendering it in the writer's own form — not by naming
+    a far-future instant, which no run of this feature can produce and which
+    passes on nothing but the year digits.
+
+    Shifting rather than reading the clock is also what keeps these tests
+    honest tomorrow: an `active_since` of "now" is on a later calendar DATE
+    than the fixtures from the day after capture, and a date difference is the
+    one case the broken string compare got right by accident.
+    """
+
+    def observation(self, worktree=CLAUDE_BACK):
+        """A real observed_at from a real fixture — the thing being aged."""
+        r = self.probe("claude", worktree)
+        self.assertEqual(r["verdict"], "ok")
+        self.assertIsNotNone(r["live_model_at"])
+        return r["live_model_at"]
+
+    def test_the_engine_writes_last_human_input_at_in_sqlite_datetime_form(self):
+        """The premise every test in this class is built on, asserted against
+        the writer itself: if the broker ever moves to ISO-Z, this goes red and
+        says so, instead of the stale tests quietly testing nothing."""
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        written = interface_broker._now(con)
+        datetime.strptime(written, BROKER_TS)  # exact parse: space, no Z
+        self.assertNotIn("T", written)
+        self.assertNotIn("Z", written)
+        with self.assertRaises(ValueError):
+            datetime.strptime(written, HARNESS_TS)
+
     def test_activity_after_the_observation_projects_stale(self):
         fresh = self.probe("claude", CLAUDE_BACK)
-        self.assertEqual(fresh["verdict"], "ok")
         later = self.probe("claude", CLAUDE_BACK,
-                           active_since="2099-01-01T00:00:00Z")
+                           active_since=_shift(fresh["live_model_at"], 60,
+                                               BROKER_TS))
         self.assertEqual(later["verdict"], "stale")
         # stale still REPORTS the reading — the consumer needs it to decide,
         # and the value is not wrong, only possibly overtaken.
@@ -292,8 +347,29 @@ class Verdicts(ProbeCase):
 
     def test_activity_before_the_observation_stays_ok(self):
         r = self.probe("claude", CLAUDE_BACK,
-                       active_since="2000-01-01T00:00:00Z")
+                       active_since=_shift(self.observation(), -60, BROKER_TS))
         self.assertEqual(r["verdict"], "ok")
+
+    def test_the_same_instant_in_either_form_gets_the_same_verdict(self):
+        """The defect itself. One instant, one minute after the observation,
+        written the two ways the two sides of this comparison write it: the
+        verdict is a fact about time and must not depend on which."""
+        observed = self.observation()
+        verdicts = {fmt: self.probe("claude", CLAUDE_BACK,
+                                    active_since=_shift(observed, 60, fmt))
+                    ["verdict"] for fmt in (BROKER_TS, HARNESS_TS)}
+        self.assertEqual(verdicts[BROKER_TS], verdicts[HARNESS_TS], verdicts)
+        self.assertEqual(verdicts[BROKER_TS], "stale")
+
+    def test_an_unreadable_active_since_asserts_no_freshness(self):
+        """Absent and unparseable are the same answer — `ok` without a
+        freshness claim. Comparing against a value we cannot place in time
+        would be a verdict invented from noise."""
+        for since in (None, "", "not a timestamp", "yesterday"):
+            with self.subTest(active_since=since):
+                self.assertEqual(
+                    self.probe("claude", CLAUDE_BACK,
+                               active_since=since)["verdict"], "ok")
 
 
 class Robustness(ProbeCase):
@@ -429,6 +505,91 @@ class WorktreeIsolation(ProbeCase):
                             self.probe("opencode", OC_BACK)["last_model"])
 
 
+class CurrentSessionSelection(ProbeCase):
+    """Several sessions in ONE worktree — the probe must answer with the
+    CURRENT one (REV2 SC-166).
+
+    Every other fixture holds exactly one session per worktree, so the
+    selection step could not be wrong: inverting newest-first in all three
+    probes at once left the whole suite green. In production it is the normal
+    case — a project dir accumulates one transcript per boot (8 in this
+    shell's own) — and a regression there reports a DEAD session's model as
+    the live one.
+
+    claude and kimi select on file mtime, which git does not carry: a fresh
+    checkout stamps every fixture file at checkout time, so the ordering under
+    test would be whatever the runner's filesystem produced. These tests
+    therefore copy the real transcripts and set the mtimes themselves, and
+    assert the answer FOLLOWS the mtime by running both orders — the same
+    category as the opencode `time_updated` perturbation below: real bytes,
+    placed in a state the capture cannot be asked for on demand. opencode
+    keeps its ordering field inside the database, so its fixture needs no
+    such help.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_claude_answers_with_the_newest_transcript_of_the_worktree(self):
+        sessions = _claude_session_models(CLAUDE_TWO)
+        src = FIXTURES / "claude" / "projects" / p_claude._encode(CLAUDE_TWO)
+        proj = self.tmp / "projects" / src.name
+        shutil.copytree(src, proj)
+        p_claude.DATA_DIR = self.tmp / "projects"
+
+        for newest, expected in sessions.items():
+            with self.subTest(newest=newest.name):
+                _stamp_newest(proj / newest.name,
+                              [proj / p.name for p in sessions])
+                r = self.probe("claude", CLAUDE_TWO)
+                self.assertEqual(r["last_model"], expected)
+                self.assertTrue(r["source"].endswith(newest.name), r["source"])
+
+    def test_kimi_answers_with_the_newest_session_of_the_workdir(self):
+        sessions = _kimi_session_models(KIMI_TWO)
+        src = FIXTURES / "kimi" / "sessions"
+        base = self.tmp / "sessions"
+        shutil.copytree(src, base)
+        p_kimi.DATA_DIR = base
+
+        wires = {sess: base / sess.relative_to(src) / "agents/main/wire.jsonl"
+                 for sess in sessions}
+        for sess, expected in sessions.items():
+            with self.subTest(newest=sess.name):
+                _stamp_newest(wires[sess], list(wires.values()))
+                r = self.probe("kimi", KIMI_TWO)
+                self.assertEqual(r["last_model"], expected)
+                self.assertEqual(r["source"], str(wires[sess]))
+
+    def test_opencode_answers_with_the_newest_session_of_the_directory(self):
+        sessions = _opencode_session_models(OC_TWO)  # oldest -> newest
+        newest_id, expected = sessions[-1]
+        r = self.probe("opencode", OC_TWO)
+        self.assertEqual(r["last_model"], expected)
+        self.assertTrue(r["source"].endswith(f"#{newest_id}"), r["source"])
+
+    def test_every_two_session_fixture_really_holds_a_discriminating_pair(self):
+        """The premise: >1 session recorded against ONE worktree, and the
+        newest answering a DIFFERENT model from the others. Without the second
+        half the assertions above would hold for a probe that picks any
+        session at all."""
+        claude = list(_claude_session_models(CLAUDE_TWO).values())
+        kimi = list(_kimi_session_models(KIMI_TWO).values())
+        opencode = _opencode_session_models(OC_TWO)  # (id, model), oldest first
+        for label, models in (("claude", claude), ("kimi", kimi)):
+            with self.subTest(harness=label):
+                # mtime decides which of these is current and the tests above
+                # try BOTH, so every one of them must be discriminating.
+                self.assertGreaterEqual(len(models), 2, models)
+                self.assertEqual(len(set(models)), len(models), models)
+        answered = [m for _, m in opencode if m]
+        self.assertGreaterEqual(len(answered), 2, opencode)
+        self.assertIsNotNone(opencode[-1][1], opencode)
+        self.assertNotIn(opencode[-1][1], answered[:-1], opencode)
+
+
 class Caching(ProbeCase):
     def test_repeat_calls_inside_the_ttl_do_not_re_read_disk(self):
         calls = []
@@ -458,11 +619,12 @@ class Caching(ProbeCase):
         independently of the transcript. Caching the reading must not freeze
         the verdict computed from it."""
         live_model.cache_clear()
-        self.assertEqual(
-            live_model.probe("claude", CLAUDE_BACK)["verdict"], "ok")
+        first = live_model.probe("claude", CLAUDE_BACK)
+        self.assertEqual(first["verdict"], "ok")
         self.assertEqual(
             live_model.probe("claude", CLAUDE_BACK,
-                             active_since="2099-01-01T00:00:00Z")["verdict"],
+                             active_since=_shift(first["live_model_at"], 60,
+                                                 BROKER_TS))["verdict"],
             "stale")
 
 
@@ -488,8 +650,14 @@ class RouteProjection(ProbeCase):
         self.assertIsNotNone(got["live_model_at"])
 
     def test_last_human_input_drives_the_stale_verdict(self):
+        """End to end on the REAL column contents: `last_human_input_at` holds
+        what `interface_broker._now()` writes (`Freshness` pins that form), one
+        minute after this observation — the everyday case a rail poll sees, not
+        a year no session can be in."""
+        observed = self.routes._live_model(
+            self.con, "claude", None, worktree=CLAUDE_BACK)["live_model_at"]
         self.con.execute("INSERT INTO interface_input_state VALUES (7, ?)",
-                         ("2099-01-01T00:00:00Z",))
+                         (_shift(observed, 60, BROKER_TS),))
         got = self.routes._live_model(self.con, "claude", 7,
                                       worktree=CLAUDE_BACK)
         self.assertEqual(got["live_model_verdict"], "stale")
@@ -507,10 +675,89 @@ class RouteProjection(ProbeCase):
         self.assertEqual(got["live_model_verdict"], "none")
 
 
+# ----------------------------------------------------------------- helpers
+
+def _shift(observed_at, seconds, fmt):
+    """A real observation, moved `seconds` and rendered in `fmt`.
+
+    The two forms are the point: an instant is one fact, and which side of the
+    seam writes it must not change the verdict it produces.
+    """
+    dt = datetime.strptime(observed_at, HARNESS_TS) + timedelta(seconds=seconds)
+    return dt.strftime(fmt)
+
+
+def _stamp_newest(newest, paths, *, gap_s=600):
+    """Make `newest` the most recently modified of `paths`.
+
+    Selection-by-mtime cannot be asserted on checked-out fixtures at all: git
+    records content, never mtimes, so a fresh clone stamps every file at
+    checkout time and the ordering is the runner's, not the fixture's. The
+    tests own the field they are testing.
+    """
+    base = 1_800_000_000
+    for path in paths:
+        os.utime(path, (base, base if path == newest else base - gap_s))
+
+
 # ----------------------------------------------------------------- fixture readers
 # Deliberately independent of the probe: these re-derive each fixture's model
 # sequence straight from the bytes, so a bug in the probe cannot make the
 # fixture-premise assertions agree with it.
+
+def _claude_session_models(worktree):
+    """{transcript path: its last explicit model} for one project dir."""
+    proj = FIXTURES / "claude" / "projects" / p_claude._encode(worktree)
+    out = {}
+    for path in sorted(proj.glob("*.jsonl")):
+        models = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            model = (rec.get("message") or {}).get("model")
+            if model and not live_model.placeholder(model):
+                models.append(model)
+        if models:
+            out[path] = models[-1]
+    return out
+
+
+def _kimi_session_models(worktree):
+    """{session dir: its last explicit model} for one workDir."""
+    out = {}
+    for state_path in sorted((FIXTURES / "kimi" / "sessions").glob(
+            "wd_*/session_*/state.json")):
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("workDir") != worktree:
+            continue
+        models = _kimi_models(worktree, session=state_path.parent.name)
+        if models:
+            out[state_path.parent] = models[-1]
+    return out
+
+
+def _opencode_session_models(worktree):
+    """[(session id, last explicit model | None)] for one directory,
+    OLDEST-updated first — the ordering the probe has to get right."""
+    con = sqlite3.connect(
+        f"file:{FIXTURES / 'opencode' / 'opencode.db'}?mode=ro", uri=True)
+    try:
+        out = []
+        for sid, in con.execute(
+                "SELECT id FROM session WHERE directory=? AND parent_id IS NULL "
+                "ORDER BY time_updated ASC, id ASC", (worktree,)):
+            row = con.execute(
+                "SELECT json_extract(data,'$.modelID') FROM message "
+                "WHERE session_id=? AND json_extract(data,'$.role')='assistant' "
+                "AND json_extract(data,'$.modelID') IS NOT NULL "
+                "ORDER BY time_created DESC, id DESC LIMIT 1", (sid,)).fetchone()
+            out.append((sid, row[0] if row else None))
+    finally:
+        con.close()
+    return out
+
 
 def _claude_models(worktree, subagents=False, raw=False):
     proj = (FIXTURES / "claude" / "projects" / p_claude._encode(worktree))
@@ -529,12 +776,14 @@ def _claude_models(worktree, subagents=False, raw=False):
     return out
 
 
-def _kimi_models(worktree, agent="main"):
+def _kimi_models(worktree, agent="main", session=None):
     base = FIXTURES / "kimi" / "sessions"
     out = []
-    for state_path in base.glob("wd_*/session_*/state.json"):
+    for state_path in sorted(base.glob("wd_*/session_*/state.json")):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("workDir") != worktree:
+            continue
+        if session is not None and state_path.parent.name != session:
             continue
         wire = state_path.parent / "agents" / agent / "wire.jsonl"
         if not wire.exists():

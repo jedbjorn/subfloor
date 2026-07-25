@@ -25,6 +25,50 @@ opencode  opencode run -m ollama-cloud/gpt-oss:120b "…"
           then opencode run -c -m ollama-cloud/qwen3.5:397b "…"
 ```
 
+### The second round — two sessions in one worktree (`lm-capture2`)
+
+Captured 2026-07-25 for REV2's SC-166. Same recipe **without** the resume flag,
+so the second run opens a NEW session in the SAME working directory instead of
+continuing the first:
+
+```
+claude    claude -p "…ALPHA" --model haiku       then  claude -p "…BETA" --model sonnet
+kimi      kimi -m kimi-code/k3 -p "…ALPHA"       then  kimi -m kimi-code/kimi-for-coding -p "…BETA"
+opencode  opencode run -m ollama-cloud/gpt-oss:120b "…ALPHA"
+          then opencode run -m ollama-cloud/qwen3.5:397b "…BETA"
+```
+
+| Path | Worktree recorded inside | Sessions |
+|---|---|---|
+| `claude/projects/-tmp-lm-capture2-claude-two/` | `/tmp/lm-capture2/claude-two` | haiku (older), sonnet (newer) |
+| `kimi/sessions/wd_kimi-two_80615298d352/` | `/tmp/lm-capture2/kimi-two` | k3 (older), kimi-for-coding (newer) |
+| `opencode/opencode.db`, `directory=/tmp/lm-capture2/oc-two` | `/tmp/lm-capture2/oc-two` | gpt-oss:120b (older), qwen3.5:397b (newer) |
+
+Every earlier fixture holds exactly ONE session per worktree, so "which of a
+worktree's sessions is the current one" was answered by having no alternative.
+Inverting newest-first selection in all three probes at once left the suite
+green (REV2's M9). In production the multi-session dir is the normal case — one
+transcript per boot, 8 in this shell's own project dir — and a regression there
+reports a DEAD session's model as the live one.
+
+The opencode pair was written by opencode itself into a COPY of this same
+fixture database (isolated `XDG_DATA_HOME`, its `auth.json` copied in), which is
+how the file grew rather than gained a sibling. Its `oc-two` directory holds
+four root sessions, not two: the first two runs failed with an auth error
+before the credentials were in place, and each still opened a session row. They
+carry no assistant message and are the older ones. That is what the harness
+wrote, so that is what is committed.
+
+**mtime is not fixture content.** claude and kimi select the current session by
+file mtime, and git records content, never mtimes — a fresh checkout stamps
+every file at checkout time, so the ordering these fixtures exist to exercise
+does not survive a clone. `CurrentSessionSelection` therefore copies the
+transcripts and sets the mtimes itself, asserting the answer FOLLOWS the mtime
+in BOTH directions. Same category as the opencode `time_updated` perturbation
+in `Robustness`: real bytes, placed in a state a capture cannot be asked for on
+demand. opencode needs none of this — its ordering field lives inside the
+database.
+
 ## What each fixture is for
 
 | Path | Worktree recorded inside | Case | Model sequence |

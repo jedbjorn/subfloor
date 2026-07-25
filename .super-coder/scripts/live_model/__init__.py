@@ -152,12 +152,24 @@ def cache_clear() -> None:
 def probe(harness, worktree, active_since=None, log=None) -> dict:
     """The live model for one shell's session.
 
-    active_since  ISO-UTC of the session's last known activity from the
-                  ENGINE's side (the Interface's `last_human_input_at`). A
-                  transcript observation older than that means the operator has
-                  acted since the last thing we can see, so the reading may
-                  already be wrong -> `stale`, and the consumer falls back to
-                  the launch label. Absent -> freshness is not asserted.
+    active_since  The session's last known activity from the ENGINE's side
+                  (the Interface's `last_human_input_at`). A transcript
+                  observation older than that means the operator has acted
+                  since the last thing we can see, so the reading may already
+                  be wrong -> `stale`, and the consumer falls back to the
+                  launch label. Absent or unparseable -> freshness is not
+                  asserted.
+
+                  It arrives in the ENGINE's timestamp form, not a harness's:
+                  `interface_broker._now()` is `SELECT datetime('now')`, which
+                  writes `YYYY-MM-DD HH:MM:SS` — space-separated, no `Z` —
+                  while `observed_at` is `norm_iso`'s `…THH:MM:SSZ`. Comparing
+                  those two as strings is not a time comparison at all: `'T'`
+                  sorts above `' '`, so a same-day activity AFTER the
+                  observation compares as earlier and `stale` can never fire on
+                  the one timescale a 5s-poll badge lives on. Both sides go
+                  through `norm_iso` before any comparison; it accepts both
+                  forms and returns the one canonical form (REV2 SC-165).
 
     Always returns the full shape; the verdict is what keeps the claim honest:
 
@@ -178,7 +190,8 @@ def probe(harness, worktree, active_since=None, log=None) -> dict:
     if not result or not result.get("model"):
         return {**blank, "verdict": "none"}
     observed_at = result.get("observed_at")
-    stale = bool(active_since and observed_at and observed_at < active_since)
+    since = norm_iso(active_since)
+    stale = bool(since and observed_at and observed_at < since)
     return {"last_model": result["model"], "live_model_at": observed_at,
             "source": result.get("source"),
             "verdict": "stale" if stale else "ok"}

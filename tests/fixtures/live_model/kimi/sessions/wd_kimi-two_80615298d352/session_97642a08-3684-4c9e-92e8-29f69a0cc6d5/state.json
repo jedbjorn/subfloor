@@ -1,0 +1,16 @@
+{
+  "createdAt": "2026-07-25T12:25:23.520Z",
+  "updatedAt": "2026-07-25T12:25:23.555Z",
+  "title": "Reply with exactly one word: BETA",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "/home/j3d1/.kimi-code/sessions/wd_kimi-two_80615298d352/session_97642a08-3684-4c9e-92e8-29f69a0cc6d5/agents/main",
+      "type": "main",
+      "parentAgentId": null
+    }
+  },
+  "custom": {},
+  "workDir": "/tmp/lm-capture2/kimi-two",
+  "lastPrompt": "Reply with exactly one word: BETA"
+}
