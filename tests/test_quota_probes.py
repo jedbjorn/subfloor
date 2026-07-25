@@ -335,17 +335,25 @@ class OpenAIProbeTest(ProbeCase):
         """The same rule moonshot's `limits` obeys: no legitimate-empty
         reading exists for the wrong TYPE under a key the normalizer
         iterates. Skipping it silently reports `ok` while every scoped
-        window vanishes — the failure shape SC-167 was blocked for."""
-        payload = fixture("openai_usage.json")
-        payload["rate_limit"]["additional_rate_limits"] = {"premium": {
-            "used_percent": 3.0}}
-        acct, _ = self.probe(payload=payload)
-        self.assertEqual(acct["status"], "error")
-        self.assertEqual(acct["windows"], [],
-                         "no partial rows — the two intact windows must not "
-                         "ship as if they were the whole reading")
-        self.assertTrue(any("shape drift" in n for n in self.notes),
-                        f"drift must be loud; log was {self.notes}")
+        window vanishes — the failure shape SC-167 was blocked for.
+
+        Both an iterable wrong type and a non-iterable one: the drift check
+        is the only thing standing between them and the loop in `_windows`,
+        and only the non-iterable case can tell a working check from a probe
+        that survives on the loop crashing instead."""
+        for value in ({"premium": {"used_percent": 3.0}}, 5):
+            with self.subTest(additional_rate_limits=value):
+                self.notes.clear()
+                payload = fixture("openai_usage.json")
+                payload["rate_limit"]["additional_rate_limits"] = value
+                acct, _ = self.probe(payload=payload)
+                self.assertEqual(acct["status"], "error")
+                self.assertEqual(acct["windows"], [],
+                                 "no partial rows — the two intact windows "
+                                 "must not ship as if they were the whole "
+                                 "reading")
+                self.assertTrue(any("shape drift" in n for n in self.notes),
+                                f"drift must be loud; log was {self.notes}")
 
     def test_an_absent_or_empty_additional_rate_limits_is_data_not_drift(self):
         """The other direction, which the guard must not over-fire on: a plan

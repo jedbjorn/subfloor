@@ -75,6 +75,14 @@ def _windows(rate_limit: dict, payload: dict, captured_at: str, log) -> list[dic
             rows.append(row)
     extra = rate_limit.get("additional_rate_limits") \
         or payload.get("additional_rate_limits") or []
+    # Unreachable-as-false in intact code: `_drift` rejects every
+    # present-but-non-list before this runs, and a falsy wrong type coalesces
+    # to []. RETAINED DELIBERATELY — mutation leg
+    # `openai-wrong-typed-collection-swallowed` disables that drift check, and
+    # this guard is what makes the probe then degrade to the historical defect
+    # (scoped windows silently skipped, status `ok`) instead of raising on a
+    # non-iterable. Delete it and the leg still reds, but via TypeError — red
+    # for the wrong reason, no longer testing the failure shape it names.
     if isinstance(extra, list):
         for entry in extra:
             row = _window_row(entry, captured_at, log,
