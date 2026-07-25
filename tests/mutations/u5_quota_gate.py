@@ -155,8 +155,8 @@ MUTATIONS = [
         name="a-failed-provider-renders-no-card",
         property="a timed-out provider says so rather than going quiet",
         path=APP,
-        old='    if (groups.has(name) || statusOf.get(name)?.status === "na") continue;',
-        new='    if (groups.has(name) || statusOf.get(name)?.status !== "ok") continue;',
+        old='    if (statusOf.get(name)?.status === "na" && !known.has(name)) continue;',
+        new='    if (statusOf.get(name)?.status !== "ok") continue;',
     ),
 ]
 
