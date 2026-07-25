@@ -1717,12 +1717,15 @@ def test_header_identity_segment_is_composed_and_styled_to_truncate():
 
 def test_terminal_card_carries_no_dead_chrome_below_the_last_row():
     """The QAQC annotation's 14px: the card's own bottom padding plus the
-    pane's row-gap. Both must be gone, and the row estimate must subtract the
-    padding that actually remains — leaving it at 12 would silently hand back
-    6px of the space this unit reclaimed."""
-    term = CSS[CSS.index(".if-term {"):CSS.index(".if-term .xterm")]
+    pane's row-gap. Both must be gone.
+
+    This test also used to pin the row estimate's `(h - 6)` divisor — the
+    padding term this unit's change made correct. U6 (#590) landed first and
+    deleted the estimate outright in favour of the renderer's measured cell,
+    so there is no divisor left to pin: the grid now re-measures against
+    whatever padding these rules leave, and U6's own tests own that property.
+    """
+    term = CSS[CSS.index(".if-term {"):CSS.index(".if-term > .if-term-fit")]
     assert "padding: 6px 6px 0;" in term
     assert "padding: 6px;" not in term
     assert ".if-term + .if-composer { margin-top: -.5rem; }" in CSS
-    assert "Math.floor((h - 6) / 17)" in APP
-    assert "Math.floor((h - 12) / 17)" not in APP
