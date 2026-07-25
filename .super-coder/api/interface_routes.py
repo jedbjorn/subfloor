@@ -555,12 +555,13 @@ def _availability(con, shell_id: int, snap) -> dict:
     active_session = interface_state.active_session_sql("s")
     row = con.execute(
         "SELECT s.session_id, s.generation, s.occupancy, s.lifecycle, "
-        "s.harness, s.model_route "
+        "s.harness, s.model_route, s.title, s.launch_effort "
         "FROM interface_sessions s WHERE s.shell_id=? "
         f"AND {active_session} ORDER BY s.session_id DESC LIMIT 1",
         (shell_id,)).fetchone()
     if row is not None:
-        session_id, generation, occupancy, lifecycle, harness, model_route = row
+        (session_id, generation, occupancy, lifecycle, harness, model_route,
+         title, launch_effort) = row
         client = _client_state(con, session_id)
         if occupancy == "reserved":
             availability = "starting"
@@ -579,6 +580,7 @@ def _availability(con, shell_id: int, snap) -> dict:
                 "generation": generation,
                 "lifecycle": lifecycle, "harness": harness,
                 "model_route": model_route,
+                "title": title, "launch_effort": launch_effort,
                 "composer": composer[0] if composer else None,
                 "alerts": _alert_count(con, session_id),
                 **_NO_SPRINT, **client}
@@ -590,10 +592,12 @@ def _availability(con, shell_id: int, snap) -> dict:
         return {"availability": "working" if working else "unreconciled",
                 "session_id": None,
                 "lifecycle": None, "harness": None, "composer": None,
-                "model_route": None, "alerts": 0,
+                "model_route": None, "title": None, "launch_effort": None,
+                "alerts": 0,
                 **(_sprint_context(con, shell_id) if working else _NO_SPRINT)}
     return {"availability": "available", "session_id": None,
             "lifecycle": None, "harness": None, "model_route": None,
+            "title": None, "launch_effort": None,
             "composer": None, "alerts": 0, **_NO_SPRINT}
 
 
@@ -797,13 +801,18 @@ def _create_session(actor, headers, body):
                 "(shell_id, generation, hook_token_hash) VALUES (?,?,?)",
                 (shell_id, gen_no,
                  hashlib.sha256(hook_token.encode()).hexdigest()))
+            # launch_effort completes the launch TRIPLE on the row. Until now
+            # effort rode only in the transient launch-<id>.json token, so a
+            # relaunch that reused "the same model" silently dropped it —
+            # U7's +Chat is the consumer. Unset stays NULL → harness default.
+            effort = body.get("effort") or None
             cur = con.execute(
                 "INSERT INTO interface_sessions "
-                "(shell_id, generation, harness, model_route, worktree, "
-                " occupancy, lifecycle, reservation_expires_at) "
-                "VALUES (?,?,?,?,?, 'reserved', 'starting', "
+                "(shell_id, generation, harness, model_route, launch_effort, "
+                " worktree, occupancy, lifecycle, reservation_expires_at) "
+                "VALUES (?,?,?,?,?,?, 'reserved', 'starting', "
                 "        datetime('now', ?))",
-                (shell_id, gen_no, harness, model,
+                (shell_id, gen_no, harness, model, effort,
                  worktree, f"+{RESERVATION_TTL_S} seconds"))
             session_id = cur.lastrowid
             con.execute(
@@ -819,7 +828,7 @@ def _create_session(actor, headers, body):
                 "api_port": ports_mod.resolve().get("port", 8800),
                 "worktree": worktree,
                 "harness": harness, "model": model,
-                "effort": body.get("effort")}))
+                "effort": effort}))
             os.chmod(token_path, 0o600)
             try:
                 identity = _runtime.call(_runtime.spawn(
@@ -940,7 +949,8 @@ def _get_session(session_id: int):
         row = con.execute(
             "SELECT session_id, shell_id, generation, archive_id, harness, "
             "model_route, worktree, occupancy, lifecycle, created_at, "
-            "occupied_at, ended_at, end_reason, error_detail "
+            "occupied_at, ended_at, end_reason, error_detail, "
+            "title, launch_effort "
             "FROM interface_sessions WHERE session_id=?",
             (session_id,)).fetchone()
         if row is None:
@@ -962,6 +972,10 @@ def _get_session(session_id: int):
             "created_at": row[9], "occupied_at": row[10],
             "ended_at": row[11], "end_reason": row[12],
             "error_detail": row[13],
+            # The launch route's third field (U7's +Chat reuses the triple)
+            # and the chat title — both describe how the session STARTED,
+            # never what the harness is running now (decision #55).
+            "title": row[14], "launch_effort": row[15],
             "composer": istate[0] if istate else None,
             "browser_composer": istate[1] if istate else None,
             "delivery": istate[2] if istate else None,
@@ -1191,6 +1205,59 @@ def _set_browser_composer(actor, headers, body):
 
         return _idempotent(
             con, actor, "browser_composer.set", headers, body, produce)
+    finally:
+        con.close()
+
+
+TITLE_MAX = 60
+
+
+def _derive_title(raw: str) -> str:
+    """First line of a composer message, capped — the spec's title rule.
+
+    Applied server-side as well as client-side deliberately: the cap is a
+    privacy bound, not a formatting preference (spec #43 U4 names this column
+    the one sanctioned exception to the broker's content-blindness), so it is
+    enforced where the write happens rather than trusted from the caller.
+    """
+    return raw.strip().splitlines()[0].strip()[:TITLE_MAX] if raw.strip() else ""
+
+
+def _set_title(actor, headers, body, session_id: int):
+    """Mint a session's chat title ONCE, from its first composer message.
+
+    Set-if-unset in a single UPDATE, so a replayed or concurrent send is a
+    no-op rather than a rewrite: the title records what opened the chat and
+    never tracks it. Deliberately NOT behind the writer lease — a read-only
+    viewer cannot reach this path anyway (it fires on the sender's own
+    input_ack), and gating it would make the mint fail exactly when a
+    take-over raced the first message.
+    """
+    raw = body.get("title")
+    if not isinstance(raw, str):
+        return _err(422, "validation", "title (string) is required")
+    title = _derive_title(raw)
+    if not title:
+        return _err(422, "validation",
+                    "title has no non-empty first line to derive from")
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT title FROM interface_sessions WHERE session_id=?",
+            (session_id,)).fetchone()
+        if row is None:
+            return _err(404, "no_such_session",
+                        f"interface session {session_id} not found")
+        con.execute(
+            "UPDATE interface_sessions SET title=? "
+            "WHERE session_id=? AND title IS NULL",
+            (title, session_id))
+        con.commit()
+        current = con.execute(
+            "SELECT title FROM interface_sessions WHERE session_id=?",
+            (session_id,)).fetchone()[0]
+        return _json(200, {"session_id": session_id, "title": current,
+                           "minted": current == title and row[0] is None})
     finally:
         con.close()
 
@@ -2543,6 +2610,10 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
                 p, "api", "interface", "sessions", None) \
                 and method == "GET":
             return _get_session(_path_id(p))
+        if _route_shape(
+                p, "api", "interface", "sessions", None, "title") \
+                and method == "POST":
+            return _set_title(actor, headers, data, _path_id(p, -2))
         if p == "/api/interface/stream-tickets" and method == "POST":
             return _mint_ticket(actor, headers, data)
         if p == "/api/interface/writer-leases" and method == "POST":
