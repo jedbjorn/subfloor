@@ -1700,7 +1700,13 @@ def test_title_is_not_added_to_the_rail_signature():
     assert "s.launch_effort" not in sig
 
 
-def test_header_identity_segment_truncates_instead_of_wrapping():
+def test_header_identity_segment_is_composed_and_styled_to_truncate():
+    """Composition and the truncation styling only. Whether the header ACTUALLY
+    stays one line is a layout fact no CSS-text assertion can witness — this
+    file once asserted all three properties below while a long title still
+    wrapped the controls onto a second line (SC-156). That property is pinned
+    in a real browser by test_interface_ui_rendered's header-line test.
+    """
     assert 'el("div", { className: "if-identity" })' in APP
     assert "[sel.display_name, sel.shortname, st.title]" in APP
     identity = CSS[CSS.index(".if-identity {"):CSS.index(".if-inline-actions")]
