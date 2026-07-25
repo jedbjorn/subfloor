@@ -2206,6 +2206,22 @@ const IF_BADGE = { available: "ok", starting: "warn", occupied: "accent",
 const IF_ATTACHABLE_LIFECYCLES = new Set(
   ["starting", "idle", "busy", "approval", "user_input"]);
 
+// Shell type order for every list the Interface renders (FnB request,
+// shared/order.png): the fleet reads as a roster grouped by what a shell IS,
+// not by the order its rows happened to be created in. The type is `flavor`,
+// which the shells payload already carries — `role` is free-text identity and
+// is not it.
+const IF_TYPE_ORDER = ["cartographer", "admin", "planner", "dev",
+  "reviewer", "devops"];
+// Bespoke shells sort last, after every known type. indexOf answers -1 to
+// null, undefined and an unrecognised string alike, which is the bucket: the
+// fork's own CC carries flavor null, a fork that invents a type carries a
+// string this engine has never heard of, and neither outranks a devops.
+function ifTypeRank(s) {
+  const i = IF_TYPE_ORDER.indexOf(s.flavor);
+  return i < 0 ? IF_TYPE_ORDER.length : i;
+}
+
 function ifModelLabel(route) {
   if (!route) return "HARNESS DEFAULT";
   return String(route).replace(/[-_]+/g, " ").trim().toUpperCase();
@@ -2320,7 +2336,11 @@ async function renderInterface(root) {
 function ifBuildRail(rail, picker, shells) {
   rail.replaceChildren();
   picker.replaceChildren(el("option", { value: "" }, "select a shell…"));
-  for (const s of shells) {
+  // Sort a COPY, never the caller's array: the same payload is the poll's
+  // signature input and renderInterface's selection lookup, and both read the
+  // server's order. Array#sort is stable, so within one type the server's
+  // ORDER BY shell_id survives — grouping is the only thing that moves.
+  for (const s of [...shells].sort((a, b) => ifTypeRank(a) - ifTypeRank(b))) {
     // Projection happens SERVER-side (_availability): reserved+starting →
     // starting, occupied+(idle|busy|approval|user_input) → occupied,
     // unreconciled+(lost|error) → lost|error. The rail renders it verbatim;
