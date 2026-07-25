@@ -223,10 +223,12 @@ in the thread while the chain waits.
 **7. Merge on green + clean, file your unit report, hand off.** All
 checks green + reviewer declared review-clean + boundary above satisfied.
 
-**If `main` moved since your review, rebase first — and your verdict may not
-carry.** Your reviewer's verdict is bound to the exact SHA it judged. After
-rebasing onto current `main`, confirm checks green on the REBASED head and
-report that SHA. Then report, per file:
+**If `main` moved since your review, check the intersection before you rebase.**
+Your reviewer's verdict is bound to the exact SHA it judged, but `main` moving is
+not by itself a reason to redo anything. Compare what merged since against YOUR
+unit's files: empty intersection -> your head stands and the verdict holds; report
+the evidence and merge. Overlapping -> rebase onto current `main`, confirm checks
+green on the REBASED head, report that SHA, and then report, per file:
 
 - whether your **own contribution is diff-identical** — compare
   `diff(old-base..old-head)` against `diff(new-base..new-head)` over your `+/-`
@@ -299,14 +301,21 @@ scope); this overlay changes only pace and severity:
    is next-in-queue work; a waiting review stalls the chain exactly like
    red CI. Keep a `SPRINT doc=<id> reviewing=<seq,seq,…>` line in
    `current_state`. No trackers, no scheduled polls.
-2. **Check the head is worth reviewing, BEFORE you spend the pass.** Confirm
-   the PR head is the exact SHA you were asked for, that it has not been
-   superseded, and that current `main` is an ancestor of it
-   (`git merge-base --is-ancestor <main> <head>`). Refuse an unrequested,
-   force-pushed-away, or non-CI head and say so in a `result` row instead of
-   reviewing it anyway — a verdict on a doomed SHA is a wasted cycle, and green
-   checks on a stale base prove nothing about what will merge. Two holds on this
-   basis in one sprint each saved a full pass.
+2. **Check the head is worth reviewing, BEFORE you spend the pass.** Confirm the
+   PR head is the exact SHA you were asked for and has not been superseded or
+   force-pushed away. Refuse an unrequested or non-CI head and say so in a
+   `result` row instead of reviewing it anyway — a verdict on a doomed SHA is a
+   wasted cycle.
+
+   `main` not being an ancestor (`git merge-base --is-ancestor <main> <head>`) is
+   a **signal, not a refusal**. Check whether the merges that landed since touch
+   any of THIS PR's files. Empty intersection -> the head is still reviewable and
+   its CI still reflects what will land; review it. Overlapping -> refuse and
+   require the rebase, because the green is then against a base that no longer
+   exists in the files that matter. Same reasoning as the dev-side carry-over
+   rule: test what actually affects this unit, not whether anything moved at all —
+   an absolute ancestor check fires on every unrelated merge and costs a cycle
+   each time.
 3. **Run the mutation yourself.** When a unit's value rests on one property — an
    ordering, a currency claim, a fail-closed gate — break it in the source,
    watch the test go red, revert, watch it pass. A reported round trip is not a
