@@ -3293,10 +3293,6 @@ function ifPaintHeader(a, sel, pane) {
     actions.push(cert);
   }
   a.sessionActionsEl.replaceChildren(...actions);
-  if (a.composerEnd) {
-    a.composerEnd.hidden = !controlsActive;
-    a.composerEnd.disabled = !controlsActive;
-  }
   a.statusNoteEl.textContent = st.note;
 }
 
@@ -3392,10 +3388,18 @@ function ifPaintComposer(a) {
   a.composerInput.disabled = !writable || pending ||
     a.composerSubmitLatched ||
     (a.browserComposerSyncing && a.browserComposerWanted === "clean");
-  // Both actions terminate the session, so both are held for the whole
-  // duration of an End or a +Chat chain — the spec's double-activation guard.
-  if (a.composerEnd) a.composerEnd.disabled = a.composerActionsBusy;
-  if (a.composerNewChat) a.composerNewChat.disabled = a.composerActionsBusy;
+  // Both actions terminate the session, so both are gated the same way and
+  // from ONE place: an inactive lifecycle hides and disables them (nothing to
+  // end, and +Chat's own chain begins with an End), and a chain in flight
+  // holds them for its whole duration — the spec's double-activation guard.
+  // Splitting these two writers across header and composer paint is what let
+  // +Chat outlive the lifecycle gate the End button already respected.
+  const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(a.st.lifecycle);
+  for (const button of [a.composerEnd, a.composerNewChat]) {
+    if (!button) continue;
+    button.hidden = !controlsActive;
+    button.disabled = !controlsActive || a.composerActionsBusy;
+  }
   // One note, sourced from the one table. A BLOCKED row is a live condition
   // and always explains itself; a QUEUED row only speaks once a submit is
   // actually latched (mid-typing draft sync is not a queued message).
@@ -3606,7 +3610,7 @@ function ifBuildComposer(a) {
     className: "act bad if-end-chat", type: "button", textContent: "End",
     title: "explicit, confirmed — graceful first; force unlocks only after a graceful timeout",
   });
-  end.onclick = () => ifEndChat(a, a.sel, a.pane, end);
+  end.onclick = () => ifEndChat(a, a.sel, a.pane);
   a.composerEnd = end;
   const fresh = el("button", {
     className: "act if-new-chat", type: "button", textContent: "+Chat",
@@ -3673,9 +3677,16 @@ async function ifTerminateSession(a, root) {
   return { kind: "failed", note: "not terminated: " + (r.reason || "?") };
 }
 
-async function ifEndChat(a, sel, pane, btn) {
+// End holds the SAME busy flag +Chat does, rather than disabling its own button
+// directly. Two reasons, both of which were live defects: a direct
+// `btn.disabled` is a second writer of state ifPaintComposer owns, so any
+// repaint mid-chain (a ws lifecycle frame is enough) re-enabled End; and +Chat
+// stayed clickable for the whole of an End, which is the double-activation the
+// guard exists to prevent — +Chat's chain opens with a termination of its own.
+async function ifEndChat(a, sel, pane) {
   if (!confirm(`End chat with ${sel.display_name || sel.shortname}? This terminates session #${a.sessionId}.`)) return;
-  if (btn) btn.disabled = true;
+  a.composerActionsBusy = true;
+  a.paint();
   const root = pane.closest(".view");
   const out = await ifTerminateSession(a, root);
   if (out.kind === "recovery") return;      // already on the recovery pane
@@ -3684,7 +3695,10 @@ async function ifEndChat(a, sel, pane, btn) {
     if (root) renderInterface(root);
     return;
   }
+  // The only leg that stays on this pane, so the only one that must release:
+  // recovery and terminated have both re-rendered it away.
   a.st.note = out.note;
+  a.composerActionsBusy = false;
   a.paint();
 }
 

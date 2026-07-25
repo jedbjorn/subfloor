@@ -553,11 +553,16 @@ def test_compact_details_alerts_and_actions_render_on_desktop_and_mobile(
         page.evaluate(
             "ifControl(ifAttach, { type: 'lifecycle', lifecycle: 'ended' })"
         )
+        # SC-167: both actions terminate the session, so an ended pane hides
+        # both. +Chat used to survive here, offering to end a chat that was
+        # already over.
         assert page.get_by_role("button", name="End", exact=True).is_hidden()
+        assert page.get_by_role("button", name="+Chat", exact=True).is_hidden()
         page.evaluate(
             "ifControl(ifAttach, { type: 'lifecycle', lifecycle: 'idle' })"
         )
         assert page.get_by_role("button", name="End", exact=True).is_visible()
+        assert page.get_by_role("button", name="+Chat", exact=True).is_visible()
         page.screenshot(
             path=str(_artifact(tmp_path, "interface-details-desktop.png")),
             full_page=True,

@@ -742,13 +742,21 @@ async function renderInterface(root) {
   if (root !== view) throw new Error("End chat refreshed the wrong view");
   rendered += 1;
 }
-async function apiIf() { throw response; }
+// Ordering, not a blanket ban: End paints ONCE before it calls the API, to put
+// its busy guard up. What must never happen is a paint AFTER the transition —
+// that one writes stale state onto a pane already re-rendered into recovery.
+let terminating = false;
+async function apiIf() { terminating = true; throw response; }
 const view = {};
 const pane = { closest: (selector) => selector === ".view" ? view : null };
 const a = {
   sessionId: 7,
   st: { note: "" },
-  paint() { throw new Error("a recovery transition painted stale state"); },
+  painted: 0,
+  paint() {
+    if (terminating) throw new Error("a recovery transition painted stale state");
+    this.painted += 1;
+  },
 };
 const sel = { shortname: "DEV3", display_name: "Code-01" };
 
@@ -756,7 +764,13 @@ async function exercise(error, label) {
   response = error;
   detached = 0;
   rendered = 0;
-  await ifEndChat(a, sel, pane, { disabled: false });
+  terminating = false;
+  a.painted = 0;
+  await ifEndChat(a, sel, pane);
+  if (a.painted !== 1) {
+    throw new Error(`${label} did not raise the busy guard exactly once: ` +
+      `${a.painted}`);
+  }
   if (detached !== 1 || rendered !== 1) {
     throw new Error(`${label} kept the dead attachment: ` +
       `${JSON.stringify({ detached, rendered })}`);
@@ -1535,7 +1549,7 @@ confirm = () => true;
     throw fail(409, "not_occupied",
       "session 4 is unreconciled — termination needs a verified identity");
   };
-  await ifEndChat(a, { shortname: "S3" }, new FakeElement("div"), null);
+  await ifEndChat(a, { shortname: "S3" }, new FakeElement("div"));
   invariant(detached === 1, `unreconciled End chat did not detach: ${detached}`);
   invariant(rendered === 1,
     `unreconciled End chat did not re-render onto recovery: ${rendered}`);
@@ -1544,11 +1558,12 @@ confirm = () => true;
 
   const b = attach();
   apiIf = async () => { throw fail(500, "internal", "boom"); };
-  await ifEndChat(b, { shortname: "S3" }, new FakeElement("div"), null);
+  await ifEndChat(b, { shortname: "S3" }, new FakeElement("div"));
   invariant(detached === 1 && rendered === 1,
     "an unrelated failure was swallowed as a recovery re-render");
-  invariant(b.st.note.includes("end chat failed") && b.painted === 1,
-    `unrelated failure was not reported: ${b.st.note}`);
+  // Two paints: End's busy guard going on, then the release carrying the note.
+  invariant(b.st.note.includes("end chat failed") && b.painted === 2,
+    `unrelated failure was not reported: ${b.st.note} (painted ${b.painted})`);
 })().catch((error) => {
   console.error(error.stack || error);
   process.exit(1);

@@ -25,6 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 
 EL = APP[APP.index("const el ="):APP.index("const esc =")]
+# Sliced, not restated: the lifecycle gate the composer buttons obey has to be
+# the app's own set, or a test would keep passing against a stale copy of it.
+LIFECYCLES = APP[APP.index("const IF_ATTACHABLE_LIFECYCLES"):
+                 APP.index("function ifModelLabel")]
 MODEL_LABEL = APP[APP.index("function ifModelLabel"):
                   APP.index("// What the surface may say")]
 COMPOSER = APP[APP.index("function ifSizeComposer"):APP.index("// End chat")]
@@ -133,14 +137,14 @@ def test_occupied_composer_has_no_send_button_and_a_static_hint():
     surface able to contradict it. Pinned as two properties — the hint never
     changes, AND the note demonstrably does (otherwise an inert composer would
     satisfy the first assertion by doing nothing at all)."""
-    script = EL + FAKE_DOM + r"""
+    script = EL + LIFECYCLES + FAKE_DOM + r"""
 let synced = [];
 function ifSyncBrowserComposer(a, state) { synced.push(state); }
 """ + COMPOSER + r"""
 const a = {
   composerEl: new FakeElement("div"),
   sel: {}, pane: new FakeElement("div"),
-  st: { note: "" },
+  st: { note: "", lifecycle: "idle" },
   awaiting: false, halted: false, outBuf: "", role: "writer",
   legalActions: new Set(["send_input"]),
   stateReason: "",
@@ -208,6 +212,71 @@ invariant(hintTexts.size === 1 && hintTexts.has("enter to send"),
   `the hint tracked gate state: ${JSON.stringify([...hintTexts])}`);
 invariant(notes.size > 1,
   `the note never moved, so hint-invariance proves nothing: ${JSON.stringify([...notes])}`);
+"""
+    run_node(script)
+
+
+def test_both_composer_actions_share_one_lifecycle_and_busy_gate():
+    """SC-167: +Chat used to outlive the lifecycle gate End obeyed, because the
+    two halves of that state had two writers in two paint functions. Both
+    buttons terminate the session — +Chat's own chain begins with an End — so
+    both are asserted through both gates, and against EACH other: an inactive
+    lifecycle hides and disables them, an in-flight chain disables them while
+    they stay visible, and a live lifecycle restores them. Painting is what is
+    exercised, not the flag: the chain tests pin the flag, and it was the paint
+    half that shipped unpinned."""
+    script = EL + LIFECYCLES + FAKE_DOM + r"""
+function ifSyncBrowserComposer() {}
+""" + COMPOSER + r"""
+const a = {
+  composerEl: new FakeElement("div"),
+  sel: {}, pane: new FakeElement("div"),
+  st: { note: "", lifecycle: "idle" },
+  awaiting: false, halted: false, outBuf: "", role: "writer",
+  legalActions: new Set(["send_input"]),
+  stateReason: "",
+  composerPendingSeq: null, composerSubmitLatched: false,
+  browserComposerState: "clean", browserComposerWanted: "clean",
+  browserComposerSyncing: false, browserComposerError: "",
+  composerActionsBusy: false,
+  paint() {},
+};
+ifBuildComposer(a);
+const both = () => [
+  { name: "End", el: a.composerEnd },
+  { name: "+Chat", el: a.composerNewChat },
+];
+const check = (expect, why) => {
+  for (const { name, el } of both()) {
+    invariant(el.hidden === expect.hidden,
+      `${name} hidden=${el.hidden}, expected ${expect.hidden} ${why}`);
+    invariant(el.disabled === expect.disabled,
+      `${name} disabled=${el.disabled}, expected ${expect.disabled} ${why}`);
+  }
+};
+
+ifPaintComposer(a);
+check({ hidden: false, disabled: false }, "on a live lifecycle");
+
+// Every non-attachable lifecycle, not just one: the gate is the app's set, and
+// `ended` alone would leave `lost` / `error` free to regress.
+for (const lifecycle of ["ended", "lost", "error", "unreconciled", "available"]) {
+  a.st.lifecycle = lifecycle;
+  ifPaintComposer(a);
+  check({ hidden: true, disabled: true }, `on lifecycle ${lifecycle}`);
+}
+
+// A chain in flight holds BOTH buttons — and leaves them visible, because the
+// operator has to see the action they already pressed.
+a.st.lifecycle = "busy";
+a.composerActionsBusy = true;
+ifPaintComposer(a);
+check({ hidden: false, disabled: true }, "while a chain is in flight");
+
+// The gate releases; neither button is left stuck off.
+a.composerActionsBusy = false;
+ifPaintComposer(a);
+check({ hidden: false, disabled: false }, "after the chain finished");
 """
     run_node(script)
 
@@ -455,21 +524,33 @@ def test_declining_the_chain_confirm_touches_nothing():
 def test_end_chat_keeps_its_own_contract_through_the_shared_path():
     """End's flow is unchanged by U7 (text-only). It now shares the termination
     sequence with +Chat, so assert End still detaches and re-renders on success
-    and still reports an unrelated failure rather than swallowing it."""
+    and still reports an unrelated failure rather than swallowing it.
+
+    It also shares the busy flag, so the guard is asserted the way +Chat's is —
+    held at call time, and RELEASED on the one leg that stays on this pane. A
+    guard that never releases is the same bug in the other direction: an End
+    that failed for an unrelated reason would leave both actions dead."""
     run_node(chain_script(r"""
   const a = attach();
   confirm = () => true;
   apiIf = recorder(() => ({ terminated: true }), a);
-  await ifEndChat(a, SEL, pane(), null);
+  await ifEndChat(a, SEL, pane());
   invariant(detached === 1 && rendered === 1 && starts().length === 0,
     `End did not terminate cleanly: ${detached}/${rendered}`);
+  // The guard covers End's chain too, so +Chat cannot be fired underneath it.
+  invariant(calls.every((c) => c.busy === true),
+    "End left the composer actions live for the duration of its own chain");
 
   reset();
   const b = attach();
   apiIf = recorder(() => { throw fail(500, "internal", "boom"); }, b);
-  await ifEndChat(b, SEL, pane(), null);
+  await ifEndChat(b, SEL, pane());
   invariant(detached === 0 && rendered === 0,
     "an unrelated failure was treated as recovery");
-  invariant(b.st.note.includes("end chat failed") && b.painted === 1,
+  invariant(b.st.note.includes("end chat failed"),
     `End swallowed an unrelated failure: ${b.st.note}`);
+  // Two paints: the guard going on, and the release that also shows the note.
+  invariant(b.composerActionsBusy === false && b.painted === 2,
+    `a failed End did not release the actions onto the pane: ` +
+    `busy=${b.composerActionsBusy} painted=${b.painted}`);
 """))

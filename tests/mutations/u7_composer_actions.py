@@ -23,6 +23,7 @@ Exit 0 = every mutation reproduced red->revert->green.
 from __future__ import annotations
 
 import argparse
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -254,12 +255,57 @@ MUTATIONS = [
         new="  const actions = el(\"div\", { className: \"if-composer-actions\" }, end);",
     ),
     # ── Double activation ────────────────────────────────────────────────────
+    # Both chains raise the same guard, so the anchors carry the confirm line
+    # above them: a bare `composerActionsBusy = true` now matches twice, and the
+    # driver's exactly-one-anchor check would (correctly) call itself stale.
     Mutation(
         name="actions-not-disabled-during-chain",
-        property="both actions are held for the chain's whole duration",
+        property="both actions are held for the +Chat chain's whole duration",
         path=APP,
-        old="  a.composerActionsBusy = true;\n  a.paint();",
-        new="  a.paint();",
+        old='               "Any unsent draft is discarded.")) return;\n'
+            "  a.composerActionsBusy = true;\n  a.paint();",
+        new='               "Any unsent draft is discarded.")) return;\n'
+            "  a.paint();",
+    ),
+    Mutation(
+        name="end-chain-leaves-new-chat-clickable",
+        property="End raises the same guard, so +Chat cannot fire underneath it",
+        path=APP,
+        old="This terminates session #${a.sessionId}.`)) return;\n"
+            "  a.composerActionsBusy = true;\n  a.paint();",
+        new="This terminates session #${a.sessionId}.`)) return;\n"
+            "  a.paint();",
+    ),
+    Mutation(
+        name="failed-end-never-releases-the-guard",
+        property="the one leg that stays on the pane releases both actions",
+        path=APP,
+        old="  a.st.note = out.note;\n  a.composerActionsBusy = false;\n  a.paint();\n}",
+        new="  a.st.note = out.note;\n  a.paint();\n}",
+    ),
+    # ── The lifecycle gate both actions obey (SC-167, flag #184) ─────────────
+    # The defect was the gate applying to End alone, so it is mutated per half:
+    # dropping either one, or the button it reaches, has to redden on its own.
+    Mutation(
+        name="new-chat-escapes-the-lifecycle-gate",
+        property="+Chat is gated by the lifecycle exactly as End is",
+        path=APP,
+        old="  for (const button of [a.composerEnd, a.composerNewChat]) {",
+        new="  for (const button of [a.composerEnd]) {",
+    ),
+    Mutation(
+        name="terminated-pane-still-offers-its-actions",
+        property="an inactive lifecycle hides both actions",
+        path=APP,
+        old="    button.hidden = !controlsActive;",
+        new="    button.hidden = false;",
+    ),
+    Mutation(
+        name="busy-flag-never-reaches-the-buttons",
+        property="paint applies the busy flag, not just the chain that sets it",
+        path=APP,
+        old="    button.disabled = !controlsActive || a.composerActionsBusy;",
+        new="    button.disabled = !controlsActive;",
     ),
     # ── End's own contract, which U7 must not disturb ────────────────────────
     Mutation(
@@ -310,7 +356,16 @@ def apply(mutation: Mutation) -> str:
     return original
 
 
+# Ctrl-C already unwinds through the revert; SIGTERM did not, and killing the
+# driver from an outer timeout left app.js MUTATED in the worktree — which then
+# reads as a source-level defect rather than as an interrupted run. Turning the
+# signal into an exception makes the `finally` that reverts actually run.
+def _die(signum, frame):
+    raise SystemExit(f"interrupted by signal {signum}")
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _die)
     parser = argparse.ArgumentParser()
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--only", default=None,
@@ -344,6 +399,8 @@ def main() -> int:
                   end="", flush=True)
         finally:
             m.path.write_text(original)     # restored even on Ctrl-C / SIGTERM
+                                            # (see _die, which makes SIGTERM
+                                            #  unwind rather than kill)
         green, _ = run_suites()
         print("-> revert -> " + ("green" if green else "STILL RED"))
         # A hang is not an acceptable red: the suite never demonstrated the
