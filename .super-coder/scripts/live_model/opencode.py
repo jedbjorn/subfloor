@@ -22,7 +22,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from . import iso_utc, placeholder
+from . import iso_utc, note, placeholder
 
 HARNESS = "opencode"
 DB = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode/opencode.db"
@@ -35,7 +35,8 @@ def read(worktree) -> "dict | None":
         return None
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        note(HARNESS, f"cannot open {db}: {type(e).__name__}: {e}")
         return None
     try:
         # The CURRENT session for this worktree — newest main-thread session,
@@ -54,7 +55,8 @@ def read(worktree) -> "dict | None":
             "AND json_extract(data,'$.role')='assistant' "
             "AND json_extract(data,'$.modelID') IS NOT NULL "
             "ORDER BY time_created DESC, id DESC LIMIT 1", (sess[0],)).fetchone()
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        note(HARNESS, f"cannot read {db}: {type(e).__name__}: {e}")
         return None
     finally:
         con.close()

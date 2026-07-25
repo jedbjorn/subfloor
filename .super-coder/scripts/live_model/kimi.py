@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import iso_utc, placeholder
+from . import iso_utc, note, placeholder
 
 HARNESS = "kimi"
 DATA_DIR = Path.home() / ".kimi-code/sessions"
@@ -32,7 +32,8 @@ def _last_model(wire: Path) -> "dict | None":
     """The last `llm.request` on this wire carrying an explicit alias."""
     try:
         lines = wire.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+    except OSError as e:
+        note(HARNESS, f"unreadable wire {wire}: {type(e).__name__}: {e}")
         return None
     for line in reversed(lines):
         if not line.strip():
@@ -62,14 +63,20 @@ def read(worktree) -> "dict | None":
         try:
             state = json.loads((sess / "state.json").read_text(
                 encoding="utf-8", errors="replace"))
-        except (OSError, json.JSONDecodeError, ValueError):
+        except OSError as e:
+            note(HARNESS, f"unreadable state {sess}: {type(e).__name__}: {e}")
             continue
+        except (json.JSONDecodeError, ValueError):
+            continue  # malformed, not unreadable — the spec's skip-and-walk-on
         if not isinstance(state, dict) or state.get("workDir") != worktree:
             continue
         wire = sess / "agents" / "main" / "wire.jsonl"  # main thread ONLY
         try:
             mtime = wire.stat().st_mtime
-        except OSError:
+        except FileNotFoundError:
+            continue  # a session with no main wire yet — nothing to report
+        except OSError as e:
+            note(HARNESS, f"unreadable wire {wire}: {type(e).__name__}: {e}")
             continue
         key = (mtime, str(sess))
         if best is None or key > best[0]:
