@@ -139,9 +139,9 @@ MUTATIONS = [
         name="every-arrival-probes",
         property="the TTL absorbs a section toggle",
         path=SERVER,
-        old="            if seen and now - max(seen) < QUOTA_TTL_SECONDS:\n"
-            "                return False",
-        new="            if False:\n                return False",
+        old="        if not force and last and now - last < QUOTA_TTL_SECONDS:\n"
+            "            return False",
+        new="        if False:\n            return False",
     ),
     Mutation(
         name="arrival-forces-the-ttl",
