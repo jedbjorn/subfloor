@@ -1,4 +1,4 @@
--- 0094 — OOTB launch defaults: Opus 5 primary, Terra + Kimi K3 secondary,
+-- 0095 — OOTB launch defaults: Opus 5 primary, Terra + Kimi K3 secondary,
 -- every flavor (FnB directive, 2026-07-25; supersedes the per-flavor tuning
 -- of 0019/0024/0045/0070, including fable-primary for planner/reviewer).
 --

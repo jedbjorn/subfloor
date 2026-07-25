@@ -1,4 +1,4 @@
--- 0093 — forward-reseed cartographer: description ADEQUACY, not just presence.
+-- 0094 — forward-reseed cartographer: description ADEQUACY, not just presence.
 -- A full remap surfaced ~2/3 of dr_filepath descs as auto-authored filler of
 -- the shape "Engine database migration: 0042_x.sql" — non-NULL, so the
 -- NULL-only worklist never surfaced them, and they said nothing the path
