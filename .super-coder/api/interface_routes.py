@@ -2248,6 +2248,302 @@ def _retry_binding(actor, headers, body, binding_id: int):
         con.close()
 
 
+# ------------------------------------------------------- the board as a record
+
+# The board's columns as the planner edits them, minus `state` — which is
+# deliberately NOT here (see _patch_sprint_unit). Keyed by request field name,
+# valued by column name; the two differ for the role columns because a request
+# names a shell, not a shell_id.
+_UNIT_FIELDS = {
+    "unit_title": "unit_title",
+    "depends_on": "depends_on",
+    "branch": "branch",
+    "pr_number": "pr_number",
+}
+_UNIT_ROLES = {"dev": "dev_shell_id", "reviewer": "reviewer_shell_id"}
+_UNIT_STATES = ("pending", "working", "in_review", "blocked", "merged",
+                "cancelled")
+
+
+def _board_writer(con, sprint_doc_id: int) -> "int | None":
+    """The one shell allowed to move this sprint's board: the planner bound to
+    it. ONE definition — the alert delivery in U5 resolves the same question
+    and must call this rather than restate it.
+
+    The spec's rule reads "the binding's planner_shell_id, else the sprint
+    doc's author". The second clause is not implementable as written:
+    `documents` carries no author column at all (schema.sql:204), so there is
+    nothing to fall back TO. An unbound sprint therefore falls back to flavor
+    instead — see _may_write_board.
+    """
+    row = con.execute(
+        "SELECT planner_shell_id FROM sprint_planner_bindings "
+        "WHERE sprint_doc_id=? AND released_at IS NULL "
+        "ORDER BY binding_id DESC LIMIT 1", (sprint_doc_id,)).fetchone()
+    return row[0] if row is not None else None
+
+
+def _may_write_board(con, actor, sprint_doc_id: int):
+    """Devs and reviewers never write the board (FnB directive). This is not a
+    permission detail — a worker that could mark its own unit done would make
+    the board agree with reality BY CONSTRUCTION, and the reconciler's whole
+    value is the disagreement. Returns an error tuple, or None to allow."""
+    if actor.kind != "shell":
+        return None                       # the operator owns everything
+    bound = _board_writer(con, sprint_doc_id)
+    if bound is not None:
+        if actor.shell_id == bound:
+            return None
+        return _err(403, "not_the_planner",
+                    f"sprint {sprint_doc_id} is bound to planner shell "
+                    f"{bound} — only it writes this board; workers work and "
+                    "message, and the planner moves the board")
+    flavor = con.execute(
+        "SELECT flavor FROM shells WHERE shell_id=?",
+        (actor.shell_id,)).fetchone()
+    if flavor is not None and flavor[0] == "planner":
+        return None
+    return _err(403, "not_the_planner",
+                f"sprint {sprint_doc_id} has no armed binding and shell "
+                f"{actor.shell_id} is not a planner — only a planner writes "
+                "the board")
+
+
+def _resolve_shell(con, value):
+    """A role slot from a request: a shell_id, a shortname, or None to clear.
+    Raises _BadShell so a typo'd shortname is a 422 and never a silently
+    unassigned role — an empty role column is a state the reconciler reads as
+    "nobody is expected here"."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise _BadShell(f"not a shell reference: {value!r}")
+    if isinstance(value, int):
+        row = con.execute(
+            "SELECT shell_id FROM shells WHERE shell_id=? "
+            "AND COALESCE(is_deleted,0)=0", (value,)).fetchone()
+        if row is None:
+            raise _BadShell(f"no such shell: {value}")
+        return row[0]
+    if isinstance(value, str) and value.strip():
+        row = con.execute(
+            "SELECT shell_id FROM shells WHERE shortname=? COLLATE NOCASE "
+            "AND COALESCE(is_deleted,0)=0", (value.strip(),)).fetchone()
+        if row is None:
+            raise _BadShell(f"no such shell: {value.strip()!r}")
+        return row[0]
+    raise _BadShell(f"not a shell reference: {value!r}")
+
+
+class _BadShell(Exception):
+    pass
+
+
+_UNIT_COLS = (
+    "unit_id", "sprint_doc_id", "seq", "unit_title", "dev_shell_id",
+    "reviewer_shell_id", "state", "depends_on", "branch", "pr_number",
+    "assigned_at", "state_changed_at", "updated_at", "updated_by_shell_id")
+
+
+def _unit_projection(con, unit_id: int) -> dict:
+    row = con.execute(
+        f"SELECT {', '.join(_UNIT_COLS)} FROM sprint_units WHERE unit_id=?",
+        (unit_id,)).fetchone()
+    unit = dict(zip(_UNIT_COLS, row))
+    for role, col in _UNIT_ROLES.items():
+        name = None
+        if unit[col] is not None:
+            r = con.execute("SELECT shortname FROM shells WHERE shell_id=?",
+                            (unit[col],)).fetchone()
+            name = r[0] if r else None
+        unit[f"{role}_shortname"] = name
+    return unit
+
+
+def _sprint_units(actor, query: dict):
+    """GET /api/sprint-units?sprint_doc_id=N — the board, read. Every
+    participant reads it (it is the board they work from); only the planner
+    writes it."""
+    doc_id = _qint(query, "sprint_doc_id")
+    sql = "SELECT unit_id FROM sprint_units"
+    params = []
+    if doc_id is not None:
+        sql += " WHERE sprint_doc_id=?"
+        params.append(doc_id)
+    sql += " ORDER BY sprint_doc_id, seq"
+    con = _db()
+    try:
+        units = [_unit_projection(con, r[0])
+                 for r in con.execute(sql, params).fetchall()]
+        return _json(200, {"units": units})
+    finally:
+        con.close()
+
+
+def _add_sprint_unit(actor, headers, body):
+    """POST /api/sprint-units — declare one unit on a sprint's board.
+
+    Deliberately NOT an upsert, and its counterpart PATCH is deliberately not
+    a create: the natural key is (sprint_doc_id, seq) typed by hand, so a
+    typo'd seq on an edit must fail rather than mint a phantom unit that the
+    reconciler then expects a shell to be working on.
+    """
+    doc_id = body.get("sprint_doc_id")
+    seq = (body.get("seq") or "").strip() if isinstance(
+        body.get("seq"), str) else body.get("seq")
+    title = (body.get("unit_title") or "").strip()
+    if not isinstance(doc_id, int) or not isinstance(seq, str) or not seq \
+            or not title:
+        return _err(422, "validation",
+                    "sprint_doc_id (int), seq (non-empty str, e.g. 'U1'), "
+                    "unit_title (non-empty str) required")
+    state = body.get("state", "pending")
+    if state not in _UNIT_STATES:
+        return _err(422, "validation",
+                    f"state must be one of {', '.join(_UNIT_STATES)}")
+    con = _db()
+    try:
+        refusal = _may_write_board(con, actor, doc_id)
+        if refusal is not None:
+            return refusal
+
+        def produce():
+            if con.execute("SELECT 1 FROM documents WHERE document_id=?",
+                           (doc_id,)).fetchone() is None:
+                return 404, _err_obj("no_such_sprint",
+                                     f"no document {doc_id} to hold a board")
+            try:
+                roles = {col: _resolve_shell(con, body.get(role))
+                         for role, col in _UNIT_ROLES.items()}
+            except _BadShell as exc:
+                return 422, _err_obj("no_such_shell", str(exc))
+            try:
+                cur = con.execute(
+                    "INSERT INTO sprint_units "
+                    "(sprint_doc_id, seq, unit_title, dev_shell_id, "
+                    " reviewer_shell_id, state, depends_on, branch, "
+                    " pr_number, assigned_at, updated_by_shell_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (doc_id, seq, title, roles["dev_shell_id"],
+                     roles["reviewer_shell_id"], state,
+                     body.get("depends_on"), body.get("branch"),
+                     body.get("pr_number"),
+                     _now(con) if any(roles.values()) else None,
+                     actor.shell_id))
+            except db_driver.IntegrityError:
+                return 409, _err_obj(
+                    "unit_exists",
+                    f"sprint {doc_id} already has unit {seq} — edit it with "
+                    "PATCH rather than declaring it twice")
+            con.commit()
+            _log(f"sprint board: doc={doc_id} unit={seq} declared "
+                 f"by={actor.scope}")
+            return 201, _unit_projection(con, cur.lastrowid)
+
+        return _idempotent(con, actor, "sprint_unit_add", headers, body,
+                           produce)
+    finally:
+        con.close()
+
+
+def _now(con) -> str:
+    return con.execute("SELECT datetime('now')").fetchone()[0]
+
+
+def _patch_sprint_unit(actor, headers, body):
+    """PATCH /api/sprint-units — move one unit, addressed by its natural key
+    (sprint_doc_id, seq) in the body rather than a surrogate id in the path.
+    The planner types the key it reads off the board; resolving seq→unit_id
+    in the client would cost a second round trip that another planner edit
+    can interleave with.
+
+    A `state` move may not ride along with field edits. State is the only
+    column the reconciler derives ROLE EXPECTATION from, so it gets its own
+    call and `state_changed_at` gets exactly one writer — a planner can never
+    move what a worker is expected to be doing as a side effect of fixing a
+    branch name. `sc sprint unit state` is that call; the refusal here is
+    what makes the CLI's separation a property rather than a convention.
+    """
+    doc_id = body.get("sprint_doc_id")
+    seq = body.get("seq")
+    if not isinstance(doc_id, int) or not isinstance(seq, str) \
+            or not seq.strip():
+        return _err(422, "validation",
+                    "sprint_doc_id (int) and seq (str) address the unit")
+    seq = seq.strip()
+    edits = {f: body[f] for f in _UNIT_FIELDS if f in body}
+    roles = {r: body[r] for r in _UNIT_ROLES if r in body}
+    state = body.get("state")
+    if state is not None and (edits or roles):
+        return _err(422, "state_moves_alone",
+                    "a state move takes no other edits — move the state in "
+                    "its own call so state_changed_at has one writer")
+    if state is not None and state not in _UNIT_STATES:
+        return _err(422, "validation",
+                    f"state must be one of {', '.join(_UNIT_STATES)}")
+    if state is None and not edits and not roles:
+        return _err(422, "validation", "no fields to change")
+    if "unit_title" in edits and not (edits["unit_title"] or "").strip():
+        return _err(422, "validation", "unit_title cannot be cleared")
+    con = _db()
+    try:
+        refusal = _may_write_board(con, actor, doc_id)
+        if refusal is not None:
+            return refusal
+
+        def produce():
+            row = con.execute(
+                "SELECT unit_id, state, dev_shell_id, reviewer_shell_id "
+                "FROM sprint_units WHERE sprint_doc_id=? AND seq=?",
+                (doc_id, seq)).fetchone()
+            if row is None:
+                return 404, _err_obj(
+                    "no_such_unit",
+                    f"sprint {doc_id} has no unit {seq!r} — declare it with "
+                    "POST; an edit never creates one")
+            unit_id, was_state, was_dev, was_rev = row
+            sets, params = [], []
+            if state is not None:
+                sets.append("state=?")
+                params.append(state)
+                if state != was_state:
+                    # Only a REAL move restamps the clock. The no-progress
+                    # window resets on state change, so a re-assert of the
+                    # same state must not silently grant a stalled worker
+                    # another full window.
+                    sets.append("state_changed_at=datetime('now')")
+            try:
+                resolved = {_UNIT_ROLES[r]: _resolve_shell(con, v)
+                            for r, v in roles.items()}
+            except _BadShell as exc:
+                return 422, _err_obj("no_such_shell", str(exc))
+            for col, val in resolved.items():
+                sets.append(f"{col}=?")
+                params.append(val)
+            was = {"dev_shell_id": was_dev, "reviewer_shell_id": was_rev}
+            if any(was[c] != v for c, v in resolved.items()):
+                sets.append("assigned_at=datetime('now')")
+            for field, col in _UNIT_FIELDS.items():
+                if field in edits:
+                    sets.append(f"{col}=?")
+                    params.append(edits[field])
+            sets.append("updated_at=datetime('now')")
+            sets.append("updated_by_shell_id=?")
+            params.append(actor.shell_id)
+            con.execute(
+                f"UPDATE sprint_units SET {', '.join(sets)} WHERE unit_id=?",
+                (*params, unit_id))
+            con.commit()
+            _log(f"sprint board: doc={doc_id} unit={seq} moved "
+                 f"by={actor.scope} ({'state ' + state if state else 'fields'})")
+            return 200, _unit_projection(con, unit_id)
+
+        return _idempotent(con, actor, "sprint_unit_patch", headers, body,
+                           produce)
+    finally:
+        con.close()
+
+
 # ---------------------------------------------------------- action receipts
 
 def _begin_receipt(actor, headers, body):
@@ -2625,13 +2921,17 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     # Shell actors (the planner's own API token) reach ONLY the sprint-wake
     # surfaces — bindings + wake ops + action receipts — never
     # session/writer/stop.
+    # sprint-units is in this set for READS by every participant — the board is
+    # what they work from. Its WRITES are fenced a second time, per sprint, in
+    # _may_write_board: reaching the route is not authority to move the board.
     if actor.kind == "shell" and not (
             p.startswith("/api/interface/sprint-bindings")
             or p.startswith("/api/interface/sprint-alerts")
+            or p.startswith("/api/sprint-units")
             or p.startswith("/api/planner-action-receipts")):
         return _err(403, "shell_scope",
                     "a shell token may call only sprint-binding, "
-                    "sprint-alert, and action-receipt routes")
+                    "sprint-alert, sprint-unit, and action-receipt routes")
     if method in ("POST", "DELETE", "PATCH", "PUT"):
         if not actor.csrf_ok:
             return _err(403, "csrf", "browser mutations need the session's "
@@ -2701,6 +3001,12 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
                 p, "api", "interface", "sprint-bindings", None) \
                 and method == "DELETE":
             return _release_binding(actor, headers, data, _path_id(p))
+        if p == "/api/sprint-units" and method == "GET":
+            return _sprint_units(actor, query)
+        if p == "/api/sprint-units" and method == "POST":
+            return _add_sprint_unit(actor, headers, data)
+        if p == "/api/sprint-units" and method == "PATCH":
+            return _patch_sprint_unit(actor, headers, data)
         if p == "/api/planner-action-receipts" and method == "POST":
             return _begin_receipt(actor, headers, data)
         if _route_shape(

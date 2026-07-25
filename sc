@@ -1509,6 +1509,16 @@ super-coder — forkable shell substrate
                              own credential, so pasting a token by hand is no longer the everyday sign-in
   ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
                              intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
+  ./sc sprint unit <cmd>   the sprint board, as a record: add declares a unit (--sprint/--seq/--title, plus
+                             --dev/--reviewer/--depends-on/--branch/--pr; an existing seq is a 409, never an
+                             upsert); set edits those fields but NOT state; state <s> moves one unit alone
+                             (pending|working|in_review|blocked|merged|cancelled) and restamps
+                             state_changed_at only when the state actually changes; list reads it.
+                             WRITES are the planner's: the shell bound to that sprint, or — when no binding
+                             is armed — any shell of planner flavor; every other shell is refused 403 and
+                             reads freely. 'none' clears a role or field (--pr -1)
+  ./sc sprint board        render the unit table from the record and print it (--sprint <doc-id>) — a VIEW,
+                             never written back into the document body; the doc keeps its prose
   ./sc sprint status       wake status per binding: armed/released, sprint ACTIVE/frozen, batch state,
                              last outcome, park/quarantine reason (--sprint <doc-id>, --all incl. released)
   ./sc sprint alerts       open wake alerts — session-loss, retries-exhausted, quarantine, unmanaged-writer
