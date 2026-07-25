@@ -158,6 +158,14 @@ MUTATIONS = [
         '    return;',
     ),
     (
+        "M23 a 405 from a floor with no HEAD route is softened into a load "
+        "race, so the one honest reading of an old floor is lost (PLN1's "
+        "ratification of result #1873 asked for this to be pinned)",
+        UI_SUITE, "old_floor", APP,
+        '  const failed = probes.filter((p) => p.status !== 200);',
+        '  const failed = probes.filter((p) => p.status !== 200 && p.status !== 405);',
+    ),
+    (
         "M14 the probe reports only the first failed script",
         UI_SUITE, "every_failed_script", APP,
         '      failed.map((p) => p.src + " returned " + p.status).join(", ") +',

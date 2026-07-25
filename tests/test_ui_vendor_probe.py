@@ -203,6 +203,30 @@ class VendorProbeTest(unittest.TestCase):
           "only part of the failure was reported: " + note);
         """)
 
+    def test_an_old_floor_that_cannot_answer_the_probe_is_reported_honestly(self):
+        """The degradation this design has to survive (PLN1's ruling on
+        result #1873): the probe runs in a browser talking to whatever server
+        is RUNNING, and a server predating this unit has no HEAD route for
+        /vendor/ — it answers 405 for scripts it serves perfectly over GET.
+
+        The report is still true there, which is the whole point: a floor that
+        405s the probe IS older than the page that made it, and the remedy it
+        names — restart the floor — is exactly the one that fixes it. Nothing
+        here may soften a 405 into "still loading".
+        """
+        run_js(r"""
+        respond = async () => ({ status: 405 });   // a floor without do_HEAD
+        const a = attach();
+        ifOpenStream(a, "ticket-1");
+        const note = await settle(a, /returned/);
+        invariant(note.includes("/vendor/xterm/xterm.js returned 405"),
+          "an old floor's 405 was not reported: " + note);
+        invariant(/older than this page/.test(note) && /restart/.test(note),
+          "the note did not point at the floor: " + note);
+        invariant(!/refresh/i.test(note), "prescribed a refresh: " + note);
+        invariant(rounds() === 1, "retried against a floor that cannot answer");
+        """)
+
     def test_a_script_that_serves_but_defines_nothing_terminates_within_the_bound(self):
         """A corrupt or empty vendor file is 200 forever, so the retry has to
         end by itself. An unbounded retry is the same lie in another costume:
