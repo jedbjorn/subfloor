@@ -18,8 +18,14 @@ Contract — every provider module exposes:
 
 Each returned dict is one ACCOUNT, carrying its own windows:
 
-    provider, account_ref, account_label, plan, is_current, status,
-    detail, probe_version, captured_at, windows[]
+    provider, account_ref, plan, status, detail, probe_version,
+    captured_at, windows[]
+
+`account_ref` is an INTERNAL KEY and nothing else: it is what lets a repeated
+probe update a row instead of minting a duplicate. It is a provider-issued
+identifier, it is never an email, and it is never rendered — the panel shows
+one card per PROVIDER and says nothing about who is signed in (decision #75).
+No probe in this package collects an operator label of any kind.
 
 `status` is `ok` / `unauth` / `na` / `error` and is the account's own — one
 provider's failure never touches another's (see dispatch.probe_all). A
@@ -137,6 +143,28 @@ def kind_for_seconds(seconds: "float | None") -> "str | None":
     return None
 
 
+def duration_label(seconds) -> str:
+    """Operator-visible text for a window duration we could not map to a kind.
+
+    A CONTAINER IS NEVER INTERPOLATED INTO OPERATOR-VISIBLE TEXT, and this
+    function is where that rule is enforced for every provider. moonshot's
+    fallback used to read `str(raw)` with `raw` the window dict, which put
+    `{'duration': 300, 'timeUnit': 'TIME_UNIT_MINUTE'}` on the card AND
+    persisted it to harness_quota_window.scope (flag #198). openai's read
+    `f"{seconds}s"` straight from the payload, which would do the same thing
+    the day that key nests.
+
+    A repr is not a label. Anything that will not coerce to a number is
+    reported as unrecognized rather than rendered — the row is still kept, so
+    a window we cannot name is visible rather than dropped, which is what spec
+    #49 asks for. It lives here, not in the module that shipped the defect,
+    because it is a class and not a typo."""
+    try:
+        return f"{int(float(seconds))}s"
+    except (TypeError, ValueError):
+        return "unrecognized window"
+
+
 def percent_from(used, limit) -> "float | None":
     """Absolute counts → percent. A zero (or absent) limit yields None, never
     a division by zero and never a 0%. A percent is NEVER back-computed into a
@@ -219,13 +247,15 @@ def get_json(url: str, headers: dict, timeout: float) -> "tuple[int, object]":
 
 
 def account(*, provider: str, probe_version: str, captured_at: str,
-            account_ref=None, account_label=None, plan=None, is_current=1,
-            status="ok", detail=None, windows=None) -> dict:
+            account_ref=None, plan=None, status="ok", detail=None,
+            windows=None) -> dict:
+    """One account's reading. There is no `account_label` and no `is_current`:
+    the first was the operator's identity and is not collected at all any more,
+    and the second existed only to tell one account's card from another's,
+    which a provider-level panel never has to do (decision #75)."""
     return {
-        "provider": provider, "account_ref": account_ref,
-        "account_label": account_label, "plan": plan,
-        "is_current": 1 if is_current else 0, "status": status,
-        "detail": detail, "probe_version": probe_version,
+        "provider": provider, "account_ref": account_ref, "plan": plan,
+        "status": status, "detail": detail, "probe_version": probe_version,
         "captured_at": captured_at, "windows": list(windows or []),
     }
 
@@ -268,13 +298,28 @@ def response_detail(code: int, payload, provider: str, log) -> str:
     rather than as a bare 'HTTP 200'."""
     if code == 200:
         return drift(provider, "response was not a JSON object", log)
+    if code == 403:
+        # Named rather than left as a bare status, because the whole point of
+        # flag #196 is that "HTTP 403" was read as an auth verdict by the layer
+        # above and rendered as a claim about the operator. Say what it is.
+        return ("HTTP 403 — the endpoint rejected this request as an "
+                "unrecognized client, not as a bad credential")
     return f"HTTP {code}" if code else f"unreachable: {payload}"
 
 
 def status_for_http(code: int) -> str:
-    """HTTP status → account status. 401/403 is the provider telling us the
-    token is dead: report it as `unauth` and leave the last known values
-    standing. Everything else non-200 is `error` — never a measured zero."""
-    if code in (401, 403):
-        return "unauth"
-    return "error"
+    """HTTP status → account status.
+
+    401 is the provider's AUTH VERDICT — the token is dead — and is the only
+    code that yields `unauth`.
+
+    403 IS NOT AN AUTH VERDICT, and mapping it to one shipped a defect. These
+    endpoints are private CLI endpoints: they answer 403, with an HTML anti-bot
+    page rather than a JSON auth error, to any request they do not recognize as
+    their own client. Under the old mapping that rendered as "signed out — last
+    known" while the operator was signed in and actively using the harness
+    (flag #196). A 403 is `error` with a diagnosis, so a probe the endpoint has
+    started refusing is visibly broken rather than quietly blamed on the
+    operator's session. Everything else non-200 is `error` too — never a
+    measured zero."""
+    return "unauth" if code == 401 else "error"

@@ -702,18 +702,19 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-view .chip:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
 .an-acct-bar { display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; }
 .an-acct-bar .act { margin-left: auto; }
-.an-note { color: var(--warn); font-size: .85rem; margin-bottom: .5rem; }
-.an-prov { margin-bottom: .8rem; }
-.an-prov-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
-.an-prov-head h2 { margin: 0; font-size: 1rem; }
 .an-acct { margin-bottom: .5rem; }
-/* A signed-out or unauth card keeps its numbers and loses its emphasis: the
-   values are real, they are simply not now. Recessed, never hidden. */
-.an-acct.an-muted { opacity: .62; }
+/* No muted variant. Dimming marked a card as "not the current account", a
+   distinction a provider-level panel does not have — and a degraded card's
+   numbers are exactly as real as a fresh one's. The AGE in the footer is what
+   separates them, so the age carries that job alone. */
 .an-acct-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
-.an-acct-label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+.an-acct-head h2 { margin: 0; font-size: 1rem; }
 .an-acct-foot { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; }
-.an-acct-foot .act { margin-left: auto; }
+/* The controls travel as a group so the pair sits right whether or not the age
+   is there to push them — a card with no reading yet has no age, and the
+   buttons must not drift to the left when it doesn't. */
+.an-acct-actions { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
+.an-acct-foot a.act { text-decoration: none; }
 .an-acct-foot .act:disabled { opacity: .45; cursor: not-allowed; }
 .an-win { margin: .45rem 0; }
 .an-win-head { display: flex; align-items: baseline; gap: .5rem; font-size: .85rem; }

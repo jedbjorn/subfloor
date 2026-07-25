@@ -3,24 +3,29 @@
 Two files, and only the first is the credential file:
 
   ~/.claude/.credentials.json   claudeAiOauth.accessToken + expiresAt — the
-                                token, read and never written.
-  ~/.claude.json                oauthAccount.accountUuid — the account
-                                identifier.
+                                token, read and never written. Also
+                                subscriptionType, which is where `plan` lives.
+  ~/.claude.json                oauthAccount.accountUuid — the internal key.
 
 Spec #49 and decisions #65/#67 both said `account_ref` comes from "the
 credential file's account uuid". It is NOT there: that file holds only
 accessToken / refreshToken / expiresAt / refreshTokenExpiresAt / scopes /
 subscriptionType / rateLimitTier. The uuid lives in ~/.claude.json under
-`oauthAccount`, which also carries `emailAddress` in full — so decision #67's
-premise that neither Anthropic nor Moonshot returns an email, true of the
-usage RESPONSE, is false at the file level. Both gaps were reported to the
-planner before this module was written and ruled on in decision #69: the
-label is the full email, the uuid stays the ref, and reading two files here
-is ratified rather than scope creep.
+`oauthAccount`.
 
-The usage payload itself returns no account identifier at all, which is why
-the uuid is load-bearing. Whether it survives a re-login is unverified —
-confirming it needs an operator re-login (flag against feature 17).
+That file ALSO carries `emailAddress` in full, and this module used to read
+it: decision #69 made the card's label the operator's full address. Decision
+#75 dropped account identity entirely, so the address is not read here any
+more and the uuid is only ever an upsert key. The payload carries no
+identifier of any kind — verified against a live capture, whose top-level keys
+are five_hour / seven_day* / extra_usage / limits / spend /
+member_dashboard_available and nothing else.
+
+`plan` comes from the CREDENTIAL FILE, not the payload: `subscriptionType` is
+a key of that file, and the usage response has never carried it. Reading it
+from the payload — which this module did until the live capture — returned
+None for every account, silently, because the fixture had been transcribed
+with the field invented at the payload's top level.
 """
 from __future__ import annotations
 
@@ -43,25 +48,20 @@ KIND_MAP = {"session": "session", "weekly_all": "weekly",
             "weekly_scoped": "weekly_scoped"}
 
 
-def _identity(log) -> "tuple[str | None, str | None]":
-    """(account uuid, full email) — both from ~/.claude.json's oauthAccount,
-    which is the only place either exists. The usage response carries neither."""
+def _account_uuid(log) -> "str | None":
+    """The account uuid from ~/.claude.json's oauthAccount — the only place it
+    exists, since the usage response carries no identifier at all.
+
+    `emailAddress` sits in this same block and is deliberately NOT read. It was
+    the card's label under decision #69; decision #75 dropped identity, so the
+    address is no longer collected, stored, or rendered, and the uuid is only
+    ever an upsert key."""
     profile = read_json(PROFILE, log, HARNESS_PROVIDER)
     oauth = (profile or {}).get("oauthAccount")
     if not isinstance(oauth, dict):
-        return None, None
-    uuid, email = oauth.get("accountUuid"), oauth.get("emailAddress")
-    return (str(uuid) if uuid else None), (str(email) if email else None)
-
-
-def _label(uuid: str, email: "str | None") -> str:
-    """The full email, falling back to the uuid's first 8 only when the profile
-    carries no address (decision #69). A card reading 'a3f2b1c8' beside an
-    OpenAI card reading a full address does not tell the operator which account
-    they are looking at, and the address is safe to store for the same reason
-    OpenAI's already is: the engine DB is gitignored and both tables are
-    excluded from content.sql (decision #67)."""
-    return email or uuid[:8]
+        return None
+    uuid = oauth.get("accountUuid")
+    return str(uuid) if uuid else None
 
 
 def _windows(limits, captured_at: str, log) -> list[dict]:
@@ -100,16 +100,16 @@ def probe(log, timeout) -> list[dict]:
     if not token:
         # No credential file (or no token in it): this host has no Claude
         # subscription session. Absence of a limit is not a limit of zero.
-        return result(status="na", is_current=0)
+        return result(status="na")
 
-    uuid, email = _identity(log)
+    uuid = _account_uuid(log)
     if not uuid:
         log(f"{HARNESS_PROVIDER}: no oauthAccount.accountUuid in {PROFILE} — "
-            "the usage payload carries no account id, so this account cannot "
-            "be identified")
+            "the usage payload carries no account id, so this reading cannot "
+            "be keyed to a row")
         return result(status="error", detail="no account identifier")
 
-    common = dict(account_ref=uuid, account_label=_label(uuid, email))
+    common = dict(account_ref=uuid)
     if is_expired((oauth or {}).get("expiresAt")):
         # Reported, not repaired: refreshing out-of-band rotates the refresh
         # token and can break the operator's own login.
@@ -131,5 +131,6 @@ def probe(log, timeout) -> list[dict]:
         return result(status="error", **common, detail=drift(
             HARNESS_PROVIDER, "no limits[] in the usage payload", log))
 
-    return result(plan=payload.get("subscriptionType"),
+    # From the CREDENTIAL FILE, not the payload — see the module docstring.
+    return result(plan=(oauth or {}).get("subscriptionType"),
                   windows=_windows(limits, captured_at, log), **common)

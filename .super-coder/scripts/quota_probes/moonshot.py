@@ -13,23 +13,35 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import (TIME_UNIT_SECONDS, account, as_count, drift, get_json,
-               is_expired, kind_for_seconds, norm_iso, now_iso, percent_from,
-               read_json, response_detail, status_for_http, window)
+from . import (TIME_UNIT_SECONDS, account, as_count, drift, duration_label,
+               get_json, is_expired, kind_for_seconds, norm_iso, now_iso,
+               percent_from, read_json, response_detail, status_for_http,
+               window)
 
 HARNESS_PROVIDER = "moonshot"
-PROBE_VERSION = "1"
+PROBE_VERSION = "2"
 
 CREDENTIALS = Path.home() / ".kimi-code/credentials/kimi-code.json"
 URL = "https://api.kimi.com/coding/v1/usages"
 
 
 def _window_seconds(spec) -> "float | None":
-    """`{"duration": 300, "timeUnit": "MINUTE"}` → 18000. An unknown time unit
-    yields None and the window keeps its raw duration in scope."""
+    """`{"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"}` → 18000. An unknown
+    time unit yields None and the window is kept under its own row.
+
+    THE ENUM ARRIVES PREFIXED. Spec #49's field table recorded the unit bare
+    (`MINUTE`) and the shipped map was keyed that way, so every live window
+    missed the lookup — including this one, where 300 minutes is 18000 seconds,
+    i.e. `five_hour`, a kind the vocabulary already carries. A recognizable
+    window was filed as unrecognized and rendered as a dict repr.
+
+    The prefix is STRIPPED rather than both spellings enumerated: a second
+    vocabulary is a second thing to keep in sync with a provider we do not
+    control, and the bare form still resolves for free."""
     if not isinstance(spec, dict):
         return None
-    unit = TIME_UNIT_SECONDS.get(str(spec.get("timeUnit") or "").upper())
+    unit_name = str(spec.get("timeUnit") or "").upper().removeprefix("TIME_UNIT_")
+    unit = TIME_UNIT_SECONDS.get(unit_name)
     try:
         duration = float(spec.get("duration"))
     except (TypeError, ValueError):
@@ -38,10 +50,27 @@ def _window_seconds(spec) -> "float | None":
 
 
 def _counts_window(entry: dict, captured_at: str, kind, scope) -> dict:
-    used, limit = as_count(entry.get("used")), as_count(entry.get("limit"))
+    """One row of counts, from either shape this payload uses.
+
+    The top-level `usage` block carries used / limit / remaining directly. A
+    `limits[]` entry nests them one level down under `detail` AND CARRIES NO
+    `used` KEY AT ALL — it gives limit and remaining, so used is derived. The
+    shipped reader looked only at entry level, found nothing, and rendered a
+    structurally empty row as though the account were idle (flag #198).
+
+    One reader for both, because both shapes are in the same payload: unwrap
+    `detail` when it is there, else read the entry itself."""
+    detail = entry.get("detail")
+    source = detail if isinstance(detail, dict) else entry
+    limit = as_count(source.get("limit"))
+    used = as_count(source.get("used"))
+    if used is None:
+        remaining = as_count(source.get("remaining"))
+        if limit is not None and remaining is not None:
+            used = limit - remaining
     return window(window_kind=kind, scope=scope, used=used, limit_value=limit,
                   used_percent=percent_from(used, limit),
-                  resets_at=norm_iso(entry.get("resetTime")),
+                  resets_at=norm_iso(source.get("resetTime")),
                   captured_at=captured_at, probe_version=PROBE_VERSION)
 
 
@@ -78,10 +107,12 @@ def _windows(payload: dict, captured_at: str, log) -> list[dict]:
         kind = kind_for_seconds(seconds)
         scope = entry.get("name") or entry.get("scope")
         if kind is None:
-            raw = entry.get("window")
-            log(f"{HARNESS_PROVIDER}: unrecognized window {raw!r} — kept under "
-                "its own row")
-            duration = f"{int(seconds)}s" if seconds else str(raw)
+            # The LOG may carry the raw window — it is a diagnostic and never
+            # reaches the operator. `scope` may not: it renders on the card and
+            # is persisted. Hence duration_label, which cannot emit a repr.
+            log(f"{HARNESS_PROVIDER}: unrecognized window "
+                f"{entry.get('window')!r} — kept under its own row")
+            duration = duration_label(seconds)
             scope = f"{scope} {duration}" if scope else duration
         rows.append(_counts_window(entry, captured_at, kind, scope))
     return rows
@@ -97,7 +128,7 @@ def probe(log, timeout) -> list[dict]:
     creds = read_json(CREDENTIALS, log, HARNESS_PROVIDER)
     token = (creds or {}).get("access_token")
     if not token:
-        return result(status="na", is_current=0)
+        return result(status="na")
     if is_expired((creds or {}).get("expires_at")):
         # Reported, not repaired — this package never refreshes a token.
         return result(status="unauth", detail="access token expired")
@@ -117,13 +148,17 @@ def probe(log, timeout) -> list[dict]:
             "account cannot be identified")
         return result(status="error", detail="no account identifier")
 
-    common = dict(account_ref=ref, account_label=ref)
+    common = dict(account_ref=ref)
     missing = _drift(payload)
     if missing:
         return result(status="error", **common,
                       detail=drift(HARNESS_PROVIDER, missing, log))
 
-    membership = payload.get("membership")
+    # Nested under `user`, not at the top level — spec #49's field table said
+    # otherwise and `plan` was NULL for every moonshot account as a result,
+    # while LEVEL_ADVANCED sat in the payload the whole time (flag #198).
+    user = payload.get("user")
+    membership = user.get("membership") if isinstance(user, dict) else None
     plan = membership.get("level") if isinstance(membership, dict) else None
     return result(plan=plan, **common,
                   windows=_windows(payload, captured_at, log))

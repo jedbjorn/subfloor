@@ -1709,7 +1709,7 @@ let anSessions = [];      // accumulated cards across "More" pages
 let anNextBefore = null;  // cursor for the next page (null = no older rows)
 let anDaysLoaded = 0;     // window size loaded so far (7 per page)
 let anClass = null;  // selected stat card; null = combined (all classes summed)
-let anView = "tokens";    // 'tokens' | 'accounts' — sub-view, carried in the hash
+let anView = "tokens";    // 'tokens' | 'quota' — sub-view, carried in the hash
 
 const AN_CLASSES = [
   ["input_tokens", "Input"], ["output_tokens", "Output"],
@@ -2106,36 +2106,45 @@ async function anTokenSection(root) {
   }
 }
 
-// ── Account Analytics — harness quota (spec doc #49) ──────────────────────────
+// ── Provider Quota — harness quota (spec doc #57, superseding #49) ────────────
 // Token Analytics answers *what did we spend*; this answers *how much is left*.
-// One card per account, grouped by provider, current accounts first.
+// ONE CARD PER PROVIDER, showing that provider's most recent reading and the
+// age of the reading. Nothing about who is signed in — decision #75.
 //
-// Two rules carry the whole section, and both are about not lying:
+// Three rules carry the whole section, and all three are about not lying:
 //
 // 1. COLOUR IS THRESHOLD-DRIVEN AND PROVIDER-BLIND. It is computed from
 //    used_percent alone, never from a provider's own severity field: anthropic
 //    sends severity=normal at 22%, openai limit_reached=true at 100%, moonshot
 //    nothing at all. Three vocabularies would be three colour rules on one page.
 // 2. A MISSING NUMBER IS NEVER DRAWN AS A ZERO. used_percent NULL renders
-//    "n/a" with no bar — a provider reporting counts against limit_value 0, a
-//    moonshot all-null weekly row, a window whose percent could not be derived.
-//    A 0% meter reads as measured, and "we did not get a number" is not 0%.
+//    "n/a" with no bar — a window whose percent could not be derived, or a
+//    provider that reports counts against limit_value 0. A 0% meter reads as
+//    measured, and "we did not get a number" is not 0%.
+// 3. THE CARD NEVER MAKES A CLAIM ABOUT THE OPERATOR'S SESSION. It has no
+//    label, no account id, no plan and no sign-in language, so the two defects
+//    that shipped as false claims — a 403 rendered "signed out — last known"
+//    while the operator was actively using Codex (#196), and a lapsed 15-minute
+//    Kimi token rendered "no account identified" (#197) — cannot be expressed
+//    here at all. A failed probe leaves the last-known figures standing with
+//    their age, and says nothing else.
 //
-// Provider state comes from the response's per-provider status list, NEVER
-// inferred from the accounts array: an empty array is both "nothing configured"
-// and "every probe failed", and those render differently (na with no registry
-// row = no card, error = a card carrying the HTTP status).
-//
-// 3. WHERE THE REGISTRY AND THE STATUS LIST DISAGREE, THE STATUS GOVERNS WHAT
-//    IS SEEN AND THE REGISTRY KEEPS WHAT IS KNOWN. The registry says what was
-//    true as of the last successful probe; the status says what is true now.
-//    Remove a credential file without switching accounts and the row keeps
-//    is_current — which is exempt from the 7-day filter — so the card would
-//    render forever, unmuted and live-looking, while the same response reports
-//    that provider `na`. The card is muted and its refresh disabled instead;
-//    the row is never filtered out and never mutated, because clearing
-//    is_current on a transiently unreadable file would demote a real account.
+// The per-provider status still comes from the response's status field, never
+// inferred from whether windows arrived: no windows is both "nothing
+// configured" and "the probe failed", and the operator has to be able to tell
+// those apart.
 const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kimi" };
+// Where the operator goes to manage the account itself. This panel deliberately
+// stops at "how much is left" — the FnB's ruling that retired account identity
+// rests on the provider's own page being one click away, so the link is part of
+// the design and not a convenience. Each URL is taken from the harness CLI's own
+// binary rather than guessed; Kimi's ships no usage page, so its product page is
+// the closest honest destination.
+const AN_PROVIDER_USAGE_URL = {
+  anthropic: "https://claude.ai/settings/usage",
+  openai: "https://chatgpt.com/codex/settings/usage",
+  moonshot: "https://www.kimi.com/code",
+};
 // Display order for a card's windows. Unrecognized kinds sort last rather than
 // being dropped — the probe stores a window it could not map under its raw
 // duration precisely so the panel still shows it.
@@ -2180,14 +2189,6 @@ function anAge(iso) {
   const ms = Date.now() - t;
   return ms <= 0 ? "just now" : anDuration(ms) + " ago";
 }
-// The card's own age: the newest capture across its windows, falling back to
-// last_seen for an account that has none (unauth, or an error after it was
-// identified). Every card renders an age — that is what makes a stale number
-// readable as stale instead of current.
-function anCardAge(acct) {
-  const caps = (acct.windows || []).map((w) => w.captured_at).filter(Boolean).sort();
-  return caps.length ? caps[caps.length - 1] : acct.last_seen;
-}
 
 function anWindowRow(w) {
   const pct = w.used_percent;
@@ -2216,134 +2217,93 @@ function anWindowRow(w) {
   return row;
 }
 
-function anAccountCard(acct, prov, onRefresh) {
-  const current = !!acct.is_current;
-  const status = prov ? prov.status : null;
-  // unauth is the current account with a dead token: last known values, muted,
-  // with their age — the same treatment a signed-out account gets, for the same
-  // reason (the numbers are real, they are just not now). `na` joins them from
-  // a third direction: the row still says is_current, but the credential file
-  // it named is not readable now, so the numbers are equally last-known.
-  const muted = !current || status === "unauth" || status === "na";
-  const card = el("div", { className: "card an-acct" + (muted ? " an-muted" : "") });
+// The status line a card carries under its heading. It describes THE PROBE, never
+// the operator: `unauth` says the token we hold is not usable, which is a fact
+// about a credential file, and stops there. The words "signed out" and "no
+// account identified" are gone from this section on purpose — both were
+// rendered while the operator was signed in and working (#196, #197).
+const AN_STATUS_NOTE = {
+  na: "no readable credential file",
+  unauth: "token not usable — refreshes when you next use this harness",
+  error: "probe failed",
+};
 
+function anProviderCard(prov, onRefresh) {
+  const status = prov.status;
+  const card = el("div", { className: "card an-acct" });
+
+  // No muted styling and no dimming, for any status. Muting existed to mark a
+  // card as "not the current account", a distinction a provider-level panel
+  // does not have — and a dimmed card reads as a lesser truth, when in fact the
+  // numbers on a degraded card are exactly as real as the ones on a fresh card.
+  // The AGE is what distinguishes them, and it is right there in the footer.
   const head = el("div", { className: "an-acct-head" });
-  head.append(el("span", { className: "an-acct-label" }, acct.account_label || acct.account_ref));
-  if (acct.plan) head.append(el("span", { className: "pill" }, acct.plan));
-  if (!current) head.append(el("span", { className: "pill" }, "not signed in"));
-  // What was OBSERVED, not what it implies. "not signed in" would be an
-  // inference about why the file is gone — the operator may be mid-login, or
-  // the file may simply be unreadable — and the engine did not see a sign-out.
-  else if (status === "na") head.append(el("span", { className: "pill warn" },
-    "no readable credential file — last known"));
-  else if (status === "unauth") head.append(el("span", { className: "pill warn" }, "signed out — last known"));
-  else if (status === "error") head.append(el("span", { className: "pill warn" },
-    "error" + (prov.detail ? " · " + prov.detail : "")));
+  head.append(el("h2", {}, AN_PROVIDER_LABEL[prov.provider] || prov.provider));
+  head.append(el("span", { className: "pill" }, prov.provider));
+  if (status && status !== "ok") {
+    const note = AN_STATUS_NOTE[status] || status;
+    head.append(el("span", { className: "pill warn" },
+      note + (prov.detail ? " · " + prov.detail : "")));
+  }
   card.append(head);
 
-  const wins = [...(acct.windows || [])].sort((a, b) => anWindowRank(a) - anWindowRank(b));
-  if (!wins.length) card.append(el("div", { className: "muted" }, "no windows reported"));
+  const wins = [...(prov.windows || [])].sort((a, b) => anWindowRank(a) - anWindowRank(b));
+  // "No reading yet" is not the same sentence as "no windows reported", and the
+  // difference is the operator's next move. A provider that has never returned
+  // anything has nothing to show; one that returned an intact envelope carrying
+  // zero windows is genuinely idle and that IS its reading.
+  if (!wins.length)
+    card.append(el("div", { className: "muted" },
+      prov.captured_at ? "no windows reported" : "no reading yet"));
   for (const w of wins) card.append(anWindowRow(w));
 
   const foot = el("div", { className: "an-acct-foot" });
-  foot.append(el("span", { className: "muted" }, "snapshot " + anAge(anCardAge(acct))));
+  // THE AGE IS NEVER OMITTED AND NEVER SOFTENED. It is the whole of the
+  // empty-state rule: a probe that cannot get fresh numbers leaves the last
+  // known ones standing, and the only thing that keeps that honest is saying
+  // how old they are. A card with no age would present stale figures as fresh.
+  if (prov.captured_at)
+    foot.append(el("span", { className: "muted" }, "as of " + anAge(prov.captured_at)));
+  const actions = el("div", { className: "an-acct-actions" });
+  const usageUrl = AN_PROVIDER_USAGE_URL[prov.provider];
+  if (usageUrl)
+    actions.append(el("a", { className: "act", textContent: "usage page ↗",
+      href: usageUrl, target: "_blank", rel: "noopener noreferrer" }));
   const refresh = el("button", { className: "act", type: "button", textContent: "refresh ⟳" });
-  // A non-current account cannot be re-probed: its token is gone, and the probe
-  // route re-reads whatever the credential files resolve to NOW. The spec grants
-  // Codex an exception — a non-current OpenAI account refreshed from its rollout
-  // files — but no unit implements a rollout reader (verified against U3's head:
-  // zero `rollout` references in quota_probes/ or the routes), so an enabled
-  // button here would fire a probe that provably cannot change this card. A
-  // control that lies is worse than a capability that is missing; declared to
-  // the planner pre-build rather than left to be found.
-  if (!current) {
-    refresh.disabled = true;
-    refresh.title = "signed out — this account's token is gone, so it cannot be re-probed";
-  } else if (status === "na") {
-    // Same inert-button shape, reached from the status side rather than the
-    // registry side: there is no credential file to read, so a probe fired
-    // from here provably cannot change this card either.
-    refresh.disabled = true;
-    refresh.title = "no readable credential file — a probe cannot reach this account now";
-  } else {
-    refresh.onclick = () => onRefresh(refresh);
-  }
-  foot.append(refresh);
+  // Always enabled. The old section disabled this button whenever it judged a
+  // probe could not succeed — but that judgement was made from the registry's
+  // idea of who was signed in, and it was wrong in exactly the case the
+  // operator most wants the button: a lapsed Kimi token that a re-probe fixes
+  // the moment they boot the harness.
+  refresh.onclick = () => onRefresh(refresh);
+  actions.append(refresh);
+  foot.append(actions);
   card.append(foot);
   return card;
 }
 
-// A provider that produced no registry row at all still gets a card when it
-// failed: `error` before the probe could name an account is exactly the case
-// the accounts array cannot express, and silence there would read as "fine".
-function anProviderCard(prov) {
-  const card = el("div", { className: "card an-acct an-muted" });
-  card.append(el("div", { className: "an-acct-head" },
-    el("span", { className: "an-acct-label" }, "no account identified"),
-    el("span", { className: "pill warn" },
-      (prov.status || "error") + (prov.detail ? " · " + prov.detail : ""))));
-  return card;
-}
-
-function anDrawAccounts(root, d) {
+function anDrawQuota(root, d) {
   root.replaceChildren();
-  const accounts = d.accounts || [];
   const providers = d.providers || [];
 
   const head = el("div", { className: "an-acct-bar" });
-  head.append(el("span", { className: "muted" },
-    `accounts active in the last ${d.activity_days || 7} days`));
+  head.append(el("span", { className: "muted" }, "most recent reading per provider"));
   const probeAll = el("button", { className: "act", type: "button", textContent: "refresh all ⟳" });
   probeAll.onclick = () => anProbeNow(root, probeAll);
   head.append(probeAll);
   root.append(head);
 
-  // Provider order follows the status list (the dispatcher's own order), then
-  // any provider present only in the registry.
-  //
-  // `na` — no credential file readable now — is dropped ONLY when the registry
-  // has nothing for it: the absence of a limit is not a limit of zero, so a
-  // provider this host has never seen gets no card. When a registry row DOES
-  // exist the card stays and renders muted (see anAccountCard): the status
-  // governs how the row is drawn, never whether the row is believed. Filtering
-  // it out would throw away the last account this host actually saw.
-  const statusOf = new Map(providers.map((p) => [p.provider, p]));
-  const known = new Set(accounts.map((a) => a.provider));
-  const groups = new Map();
-  for (const name of [...providers.map((p) => p.provider), ...accounts.map((a) => a.provider)]) {
-    if (groups.has(name)) continue;
-    if (statusOf.get(name)?.status === "na" && !known.has(name)) continue;
-    groups.set(name, { name, prov: statusOf.get(name) || null, accounts: [] });
-  }
-  for (const a of accounts) groups.get(a.provider)?.accounts.push(a);
-
-  if (!groups.size) {
-    root.append(el("div", { className: "card muted" }, providers.length
-      ? "No harness credentials found — nothing to probe."
-      : "No probe has run yet."));
+  if (!providers.length) {
+    root.append(el("div", { className: "card muted" }, "No probe has run yet."));
     return;
   }
 
-  // The API exempts is_current from the 7-day filter so the section is never
-  // empty. Say why the page is thin instead of letting it look like the whole
-  // truth about the last week.
-  const cutoff = Date.now() - (d.activity_days || 7) * 864e5;
-  const fresh = (a) => new Date(a.last_seen).getTime() >= cutoff;
-  if (accounts.length && !accounts.some(fresh))
-    root.append(el("div", { className: "an-note" }, `No account has been seen in the last `
-      + `${d.activity_days || 7} days — showing the current account only.`));
-
-  for (const g of groups.values()) {
-    const sec = el("div", { className: "an-prov" });
-    sec.append(el("div", { className: "an-prov-head" },
-      el("h2", {}, AN_PROVIDER_LABEL[g.name] || g.name),
-      el("span", { className: "pill" }, g.name)));
-    if (g.accounts.length)
-      for (const a of g.accounts) sec.append(anAccountCard(a, g.prov, (btn) => anProbeNow(root, btn)));
-    else
-      sec.append(anProviderCard(g.prov || { status: "error" }));
-    root.append(sec);
-  }
+  // EVERY provider gets a card, including one with no credential file and one
+  // that has never been probed. Nothing is filtered out: hiding a card is how a
+  // panel stops lying and starts saying nothing, and the operator cannot tell
+  // "not configured" from "not readable" from a card that is not there.
+  for (const prov of providers)
+    root.append(anProviderCard(prov, (btn) => anProbeNow(root, btn)));
 }
 
 // The refresh button — POSTs the probe route, which bypasses the 60s TTL. The
@@ -2354,7 +2314,7 @@ async function anProbeNow(root, btn) {
   btn.disabled = true;
   btn.textContent = "probing…";
   try {
-    anDrawAccounts(root, await api("/analytics/accounts/probe", "POST"));
+    anDrawQuota(root, await api("/analytics/quota/probe", "POST"));
   } catch (e) {
     toast("probe error: " + e.message);
     btn.disabled = false;
@@ -2365,10 +2325,10 @@ async function anProbeNow(root, btn) {
 // GET is the arrival probe: the route probes for itself when its last attempt
 // has aged past the TTL, so the section fires exactly one probe per minute of
 // toggling and the client asks for nothing extra.
-async function anAccountSection(root) {
-  root.replaceChildren(el("div", { className: "muted" }, "probing accounts…"));
+async function anQuotaSection(root) {
+  root.replaceChildren(el("div", { className: "muted" }, "probing providers…"));
   try {
-    anDrawAccounts(root, await api("/analytics/accounts"));
+    anDrawQuota(root, await api("/analytics/quota"));
   } catch (e) {
     root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
   }
@@ -2376,8 +2336,13 @@ async function anAccountSection(root) {
 
 // The Analytics tab carries its sub-view in the hash, the convention the
 // roadmap tab already uses for #roadmap / #roadmap-flow: #analytics = Token
-// Analytics, #analytics-accounts = Account Analytics. Both keep `analytics` as
-// the active nav tab; routeFromHash sets anView and re-renders.
+// Analytics, #analytics-quota = Provider Quota. Both keep `analytics` as the
+// active nav tab; routeFromHash sets anView and re-renders.
+//
+// The hash moved with the section's name. #analytics-accounts described a
+// per-account panel that no longer exists, and an operator who lands on a URL
+// naming a surface they cannot find is exactly the confusion the rename exists
+// to prevent — the old hash simply falls through to Token Analytics.
 //
 // Each section renders into its OWN node, so its replaceChildren() cannot wipe
 // the toggle above it — and so arriving at one section never runs the other's
@@ -2385,15 +2350,15 @@ async function anAccountSection(root) {
 // both would mean three third-party calls every time someone reads their spend.
 async function renderAnalytics(root) {
   const seg = el("div", { className: "filters seg an-view" });
-  for (const [mode, label] of [["tokens", "Token Analytics"], ["accounts", "Account Analytics"]]) {
+  for (const [mode, label] of [["tokens", "Token Analytics"], ["quota", "Provider Quota"]]) {
     const b = el("button", { className: "chip" + (anView === mode ? " on" : ""),
       type: "button", textContent: label });
-    b.onclick = () => { location.hash = mode === "accounts" ? "analytics-accounts" : "analytics"; };
+    b.onclick = () => { location.hash = mode === "quota" ? "analytics-quota" : "analytics"; };
     seg.append(b);
   }
   const body = el("div", {});
   root.replaceChildren(el("div", { className: "an-head" }, seg), body);
-  return anView === "accounts" ? anAccountSection(body) : anTokenSection(body);
+  return anView === "quota" ? anQuotaSection(body) : anTokenSection(body);
 }
 
 // ── Interface tab (sprint 25 seq 5) ───────────────────────────────────────────
@@ -4518,7 +4483,7 @@ function show(tab) {
 // put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
 // hash; hashchange drives show — back/forward and deep links work too. The
 // roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
-// The analytics tab does the same: #analytics (token) | #analytics-accounts.
+// The analytics tab does the same: #analytics (token) | #analytics-quota.
 // The interface tab carries its selected shell: #interface | #interface/DEV3.
 function routeFromHash() {
   const raw = location.hash.slice(1);
@@ -4528,7 +4493,7 @@ function routeFromHash() {
     return;
   }
   if (raw === "analytics" || raw.startsWith("analytics-")) {
-    anView = raw === "analytics-accounts" ? "accounts" : "tokens";
+    anView = raw === "analytics-quota" ? "quota" : "tokens";
     show("analytics");
     return;
   }

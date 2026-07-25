@@ -1,28 +1,95 @@
 {
-  "subscriptionType": "max",
+  "five_hour": {
+    "utilization": 47.0,
+    "resets_at": "2026-07-25T23:10:00.911881+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 36.0,
+    "resets_at": "2026-08-01T06:00:00.911899+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_cowork": null,
+  "seven_day_omelette": null,
+  "tangelo": null,
+  "iguana_necktie": null,
+  "omelette_promotional": null,
+  "nimbus_quill": null,
+  "cinder_cove": null,
+  "amber_ladder": null,
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null,
+    "currency": null,
+    "decimal_places": null,
+    "disabled_reason": null,
+    "user_disabled": true,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": true,
+    "daily": null,
+    "weekly": null
+  },
   "limits": [
     {
       "kind": "session",
-      "percent": 22,
-      "resets_at": "2026-07-25T21:00:00+00:00",
-      "severity": "normal"
+      "group": "session",
+      "percent": 47,
+      "severity": "normal",
+      "resets_at": "2026-07-25T23:10:00.911881+00:00",
+      "scope": null,
+      "is_active": true
     },
     {
       "kind": "weekly_all",
-      "percent": 41,
-      "resets_at": "2026-07-28T09:00:00Z",
-      "severity": "normal"
+      "group": "weekly",
+      "percent": 36,
+      "severity": "normal",
+      "resets_at": "2026-08-01T06:00:00.911899+00:00",
+      "scope": null,
+      "is_active": false
     },
     {
       "kind": "weekly_scoped",
-      "percent": 63,
-      "resets_at": "2026-07-28T09:00:00Z",
+      "group": "weekly",
+      "percent": 47,
       "severity": "normal",
+      "resets_at": "2026-08-01T05:59:59.912113+00:00",
       "scope": {
         "model": {
-          "display_name": "Claude Opus 5"
-        }
-      }
+          "id": null,
+          "display_name": "Fable"
+        },
+        "surface": null
+      },
+      "is_active": false
     }
-  ]
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 0,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "limit": null,
+    "percent": 0,
+    "severity": "normal",
+    "enabled": false,
+    "disabled_reason": null,
+    "cap": null,
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits. [Learn more](https://support.claude.com/articles/12429409)",
+    "can_purchase_credits": false,
+    "can_toggle": false
+  },
+  "member_dashboard_available": false
 }

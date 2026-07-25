@@ -792,20 +792,21 @@ def get_analytics_filters(con) -> dict:
             "models": distinct("model"), "shells": shells}
 
 
-# ── Account analytics — harness quota (spec doc #49) ─────────────────────────
+# ── Provider quota (spec doc #57, superseding #49's account panel) ───────────
 # Token analytics answers *what did we spend*; this answers *how much is left*.
 # It calls quota_probes.dispatch.probe_all ONCE and owns nothing that call does:
 # concurrency, the 5s per-probe timeout and one-provider-failure containment all
 # live in the dispatcher, because containment is only checkable from the probe
 # package. A second timeout layer here would be a bug, not defence in depth.
 #
-# The route is `accounts`, never `usage`: /api/analytics/usage already means
-# token spend on this tab, and a second meaning on that word is a defect waiting
-# to happen.
+# The route is `quota`, never `usage` and no longer `accounts`. /analytics/usage
+# already means token spend on this tab, and a second meaning on that word is a
+# defect waiting to happen; `accounts` named the thing this response stopped
+# carrying when decision #75 dropped account identity, and a path that describes
+# a response's old shape misleads exactly the reader who trusts it.
 
 QUOTA_TTL_SECONDS = 60      # toggling the two sections must not hammer three
                             # third-party endpoints; the refresh button bypasses it
-QUOTA_ACTIVITY_DAYS = 7     # the panel's only filter — a filter, never a delete
 
 # The TTL's clock: the last probe ATTEMPT, in this process — never the newest
 # captured_at. A probe that identifies nobody (no credential file → `na`, or a
@@ -861,15 +862,14 @@ def _quota_upsert(con, accounts: list[dict]) -> int:
     An account carrying no account_ref writes NO registry row: that is a
     provider with no credential file (`na` — the absence of a limit is not a
     limit of zero) or one that failed before it could name anyone. Such a row
-    could never be matched again, and it has no card to render."""
+    could never be matched again, and it holds no reading to show.
+
+    There is no is_current pre-clear any more, and no is_current at all: it
+    existed to mark which of a provider's rows the credential file resolves to
+    NOW, which only mattered while cards were per-account. The panel shows the
+    newest reading per provider (see `_latest_readings`), so the question has
+    no reader left (decision #75, migration 0097)."""
     named = [a for a in accounts if a.get("account_ref")]
-    for provider in dict.fromkeys(a["provider"] for a in named):
-        # A credential file resolves to exactly one account, so the provider's
-        # other rows stop being current the moment this probe names one.
-        # Cleared BEFORE the upsert writes its answer — doing it inside the
-        # upsert would leave a switched-away account still flagged current.
-        con.execute("UPDATE harness_quota_account SET is_current=0 WHERE provider=?",
-                    (provider,))
     written = 0
     for acct in named:
         seen = acct["captured_at"]
@@ -878,13 +878,11 @@ def _quota_upsert(con, accounts: list[dict]) -> int:
         # minting a duplicate identity.
         con.execute(
             "INSERT INTO harness_quota_account "
-            "(provider, account_ref, account_label, plan, first_seen, last_seen, is_current) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "(provider, account_ref, plan, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(provider, account_ref) DO UPDATE SET "
-            "account_label=excluded.account_label, plan=excluded.plan, "
-            "last_seen=excluded.last_seen, is_current=excluded.is_current",
-            (acct["provider"], acct["account_ref"], acct.get("account_label"),
-             acct.get("plan"), seen, seen, 1 if acct.get("is_current") else 0))
+            "plan=excluded.plan, last_seen=excluded.last_seen",
+            (acct["provider"], acct["account_ref"], acct.get("plan"), seen, seen))
         pk = con.execute(
             "SELECT account_pk FROM harness_quota_account WHERE provider=? AND account_ref=?",
             (acct["provider"], acct["account_ref"])).fetchone()[0]
@@ -919,33 +917,72 @@ def probe_quota_accounts(con) -> dict:
     return {"providers": providers, "windows_written": written, "notes": notes}
 
 
-def get_analytics_accounts(con, force: bool = False) -> dict:
-    """Registry + windows for the account panel, probing first when the last
-    probe ATTEMPT has aged past the TTL. `force` is POST /probe — the refresh
-    button."""
-    probe = probe_quota_accounts(con) if _quota_claim(force) else None
-    cutoff = (datetime.now(timezone.utc)
-              - timedelta(days=QUOTA_ACTIVITY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # The 7-day window, plus the account the credential file resolves to NOW.
-    # That account renders even when its last_seen has aged (a failed probe
-    # leaves it un-advanced), because the spec requires the current account
-    # rather than an empty page. Everything else outside the window stops
-    # rendering WITHOUT being deleted — switching back restores it intact.
-    accounts = rows(con.execute(
-        "SELECT * FROM harness_quota_account WHERE last_seen >= ? OR is_current=1 "
-        "ORDER BY provider, is_current DESC, last_seen DESC", (cutoff,)))
-    by_pk: dict = {}
+def _latest_readings(con) -> dict:
+    """provider -> {captured_at, windows[]}: the most recent reading each
+    provider has produced, whichever account produced it.
+
+    KEYED ON THE WINDOW'S captured_at, NOT the registry row's last_seen, and
+    that is load-bearing rather than a detail. A row with no windows has no
+    reading, so it cannot outrank one that has numbers — which is what makes
+    the stale registry rows flag #196 minted from a guessed account_ref both
+    unable to win and impossible to see, without a data migration to hunt them
+    down. It is also literally what spec #57 asks for: the most recent reading
+    by captured_at, regardless of which account produced it.
+
+    Multiple accounts for one provider are not disambiguated. Under a
+    provider-level panel "which account am I looking at" is not a question the
+    surface answers, and decision #68's multi-account problem dissolves with
+    it."""
+    groups: dict = {}
     for w in rows(con.execute(
-            "SELECT * FROM harness_quota_window "
-            "ORDER BY account_pk, window_kind, scope")):
-        by_pk.setdefault(w.pop("account_pk"), []).append(w)
-    for a in accounts:
-        a["windows"] = by_pk.get(a["account_pk"], [])
-    return {"accounts": accounts,
-            "activity_days": QUOTA_ACTIVITY_DAYS,
+            "SELECT a.provider AS provider, w.* FROM harness_quota_window w "
+            "JOIN harness_quota_account a ON a.account_pk = w.account_pk "
+            "ORDER BY w.window_kind, w.scope")):
+        groups.setdefault((w.pop("provider"), w.pop("account_pk")), []).append(w)
+    latest: dict = {}
+    for (provider, _pk), windows in groups.items():
+        captured_at = max(w["captured_at"] for w in windows)
+        if provider not in latest or captured_at > latest[provider]["captured_at"]:
+            latest[provider] = {"captured_at": captured_at, "windows": windows}
+    return latest
+
+
+def get_analytics_quota(con, force: bool = False) -> dict:
+    """One entry per provider — its windows, the age of the reading, and its
+    status — probing first when the last probe ATTEMPT has aged past the TTL.
+    `force` is POST /probe, the refresh button.
+
+    NOTHING IN THIS RESPONSE IDENTIFIES THE OPERATOR: no label, no email, no
+    account ref, no plan, no sign-in state (decision #75). account_ref stays in
+    the DB as the upsert key and stops there.
+
+    The entry list is built from the probe package's PROVIDERS, not from
+    whatever the status list or the registry happens to hold. A provider that
+    has never been probed must still render a card reading "no reading yet" —
+    the operator has to be able to tell "not configured" from "not readable",
+    and a list built from observed rows cannot express the first."""
+    probe = probe_quota_accounts(con) if _quota_claim(force) else None
+    latest = _latest_readings(con)
+    # The per-provider status list KEEPS ITS MEANING and its source: it is what
+    # distinguishes "nothing configured" from "the probe failed", and dropping
+    # identity does not merge those two.
+    status = {p["provider"]: p for p in
+              ((probe or {}).get("providers") or list(_QUOTA_PROBE["providers"]))}
+    providers = []
+    for name in quota_dispatch.PROVIDERS:
+        reading = latest.get(name) or {}
+        providers.append({
+            "provider": name,
+            "status": status.get(name, {}).get("status"),
+            "detail": status.get(name, {}).get("detail"),
+            # The age of the numbers on the card, and it is never omitted: it
+            # is the only thing that tells a stale reading from a fresh one.
+            "captured_at": reading.get("captured_at"),
+            "windows": reading.get("windows") or [],
+        })
+    return {"providers": providers,
             "ttl_seconds": QUOTA_TTL_SECONDS,
             "probed": probe is not None,
-            "providers": (probe or {}).get("providers") or list(_QUOTA_PROBE["providers"]),
             "notes": (probe or {}).get("notes") or []}
 
 
@@ -2788,12 +2825,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_analytics_usage(con, q))
             if path == "/api/analytics/filters":
                 return self._send(200, get_analytics_filters(con))
-            if path == "/api/analytics/accounts":
-                # Arrival at #analytics-accounts. Probes only when this
-                # process's last probe ATTEMPT is older than the TTL — never
-                # at boot, never on a timer, never from the Token Analytics
-                # section.
-                return self._send(200, get_analytics_accounts(con))
+            if path == "/api/analytics/quota":
+                # Arrival at #analytics-quota. Probes only when this process's
+                # last probe ATTEMPT is older than the TTL — never at boot,
+                # never on a timer, never from the Token Analytics section.
+                return self._send(200, get_analytics_quota(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
             if path == "/api/vm":
@@ -2874,9 +2910,9 @@ class Handler(BaseHTTPRequestHandler):
                 # GUI Analytics tab load — incremental, so steady-state is
                 # cheap; sweep opens its own connection.
                 return self._send(200, analytics.sweep(quiet=True))
-            if path == "/api/analytics/accounts/probe":
+            if path == "/api/analytics/quota/probe":
                 # The refresh button — always re-probes, TTL or not.
-                return self._send(200, get_analytics_accounts(con, force=True))
+                return self._send(200, get_analytics_quota(con, force=True))
             if path == "/api/snapshot":
                 try:
                     with _CONTENT_WRITE_LOCK:
