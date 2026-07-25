@@ -615,7 +615,12 @@ a.paint();
   a.composerInput.onkeydown({
     key: "Enter", shiftKey: false, preventDefault() { prevented = true; },
   });
-  a.composerSend.onclick();
+  // Enter is the SOLE submit affordance (spec #43 U7 removed the Send button),
+  // so the convergence property is now two Enters, not Enter plus a click:
+  // a second attempt must join the existing latch rather than open a new one.
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, preventDefault() { prevented = true; },
+  });
   invariant(prevented && frames.length === 0 && a.composerSubmitLatched,
     "send during dirty-state sync was not latched exactly once");
   invariant(a.composerInput.disabled,
@@ -636,7 +641,7 @@ a.paint();
     apiCalls[0].body.state === "dirty",
     `draft state did not reach the server: ${JSON.stringify(apiCalls)}`);
   invariant(prevented && frames.length === 1,
-    "latched Enter and Send did not converge on exactly one broker frame");
+    "two latched Enters did not converge on exactly one broker frame");
   const payload = new TextDecoder().decode(frames[0].subarray(9));
   invariant(payload === "hello\nworld\r",
     `composer bytes bypassed terminal Enter semantics: ${JSON.stringify(payload)}`);
@@ -671,9 +676,11 @@ a.paint();
   a.composerInput.value = "retain on reject";
   a.composerInput.oninput();
   await a.browserComposerChain;
-  a.composerSend.onclick();
+  a.composerInput.onkeydown({
+    key: "Enter", shiftKey: false, preventDefault() {},
+  });
   invariant(frames.length === 2 && a.composerPendingSeq === 5,
-    "visible Send did not use the same broker path");
+    "an unlatched Enter did not use the same broker path");
   ifControl(a, { type: "input_reject", seq: 5, reason: "stale_generation" });
   invariant(a.composerInput.value === "retain on reject" &&
     a.composerPendingSeq === null &&
@@ -1317,6 +1324,15 @@ def test_empty_header_note_does_not_reserve_a_flex_row():
     reserved line (it has min-height to stop a jump), so the rule is scoped."""
     assert ".if-head > .if-note:empty { display: none; }" in CSS
     assert ".if-composer .if-note" in CSS and "min-height: 1.2em" in CSS
+
+
+def test_static_submit_hint_has_a_styled_hook():
+    """#43 U7 replaced the Send button with a static "enter to send" hint, so
+    the class the markup emits and the class the stylesheet dresses must be the
+    same one. Cheap text assertion by necessity — the rendered suite is what
+    proves it is actually visible and dim; this catches the rename that would
+    ship an unstyled hint while every node-driven test stayed green."""
+    assert ".if-composer .if-composer-hint {" in CSS
 
 
 def test_recovery_partial_result_keeps_exact_remediation_until_refresh():
