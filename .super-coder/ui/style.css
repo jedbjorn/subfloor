@@ -691,6 +691,42 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   border-radius: 6px; padding: .25rem .5rem; font-size: .78rem;
   pointer-events: none; white-space: nowrap; box-shadow: var(--menu-shadow); }
 
+/* ── Account Analytics: sub-view toggle, account cards, quota meters ──
+   Colour here is threshold-driven and provider-blind (spec #49): one amber and
+   one red, both keyed off used_percent, never off a provider's own severity
+   field. A window with no percent gets NEITHER class and draws no bar — an
+   absent number must not read as a comfortable one. */
+.an-head { display: flex; justify-content: flex-end; margin-bottom: .6rem; }
+.an-view .chip { border-radius: 0; }
+.an-view .chip:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
+.an-view .chip:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
+.an-acct-bar { display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; }
+.an-acct-bar .act { margin-left: auto; }
+.an-note { color: var(--warn); font-size: .85rem; margin-bottom: .5rem; }
+.an-prov { margin-bottom: .8rem; }
+.an-prov-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
+.an-prov-head h2 { margin: 0; font-size: 1rem; }
+.an-acct { margin-bottom: .5rem; }
+/* A signed-out or unauth card keeps its numbers and loses its emphasis: the
+   values are real, they are simply not now. Recessed, never hidden. */
+.an-acct.an-muted { opacity: .62; }
+.an-acct-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
+.an-acct-label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+.an-acct-foot { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; }
+.an-acct-foot .act { margin-left: auto; }
+.an-acct-foot .act:disabled { opacity: .45; cursor: not-allowed; }
+.an-win { margin: .45rem 0; }
+.an-win-head { display: flex; align-items: baseline; gap: .5rem; font-size: .85rem; }
+.an-win-name { color: var(--dim); }
+.an-win-pct { margin-left: auto; font-weight: 600; color: var(--ink); }
+.an-win-pct.amber { color: var(--warn); }
+.an-win-pct.red { color: #d45a5a; }
+.an-meter { height: 6px; border-radius: 99px; background: var(--panel2);
+  border: 1px solid var(--line-soft); overflow: hidden; margin: .2rem 0; }
+.an-meter-fill { height: 100%; background: var(--accent); border-radius: 99px; }
+.an-meter-fill.amber { background: var(--warn); }
+.an-meter-fill.red { background: #d45a5a; }
+
 /* ── Interface tab ── */
 .if-wrap {
   display: flex; gap: 1rem; align-items: stretch; min-height: 0; height: 100%;
