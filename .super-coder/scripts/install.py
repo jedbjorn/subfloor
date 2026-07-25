@@ -214,6 +214,66 @@ def _harness_installed(name: str) -> bool:
     return bool(shutil.which(name)) or HARNESS_BIN.get(name, Path("/nonexistent")).exists()
 
 
+# ── Harness epoch (sandbox harness freshness) ────────────────────────────────
+# The functions above install harnesses on THIS machine's $HOME. That is the
+# right thing on the no-docker path, where the host IS the runtime — and a no-op
+# for shells on the docker path, where the harness binaries are baked into the
+# `super-coder-sandbox` image and the container mounts only creds (~/.claude,
+# ~/.codex, …), never binaries. Binaries cannot be mounted in: they are host-ABI
+# artifacts (a darwin binary is fatal in a linux container, vibe's entry point
+# carries an absolute shebang into a host uv interpreter, glibc baselines differ
+# across the distros we support), which is why the Dockerfile bakes them.
+#
+# Baking froze them: docker serves the installer RUNs from layer cache forever,
+# so `./sc launch|restart` — which DO run `docker build` — could never make a
+# harness newer, and `docker rm -f` on every launch discards any in-container
+# update. A claude one release behind Opus 5 therefore stayed one release behind
+# through an update, a harness update, and a restart.
+#
+# The epoch is that layer's expiry. `./sc update` and `./sc update-harnesses`
+# roll it to today; `./sc build` passes it as SC_HARNESS_EPOCH; the Dockerfile
+# references it inside both harness RUNs, so a changed value re-runs the
+# installers (which resolve "latest" themselves — the epoch is an expiry, never
+# a version pin).
+#
+# MACHINE-scoped, not per-repo: every fork on a host shares the image tag, so
+# the harness layer is a machine fact and a per-repo file would let one fork
+# roll an epoch its neighbours never see. Because the value is a DATE, two forks
+# updating the same day produce the same build arg and the second cache-hits.
+# The path follows the engine's existing host-state idiom (XDG_CONFIG_HOME).
+HARNESS_EPOCH_UNSET = "0"  # the Dockerfile's default — "never rolled here"
+
+
+def harness_epoch_path() -> Path:
+    """Where the rolled epoch is stored. SC_HARNESS_EPOCH_FILE overrides (tests)."""
+    override = os.environ.get("SC_HARNESS_EPOCH_FILE")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "super-coder" / "harness-epoch"
+
+
+def harness_epoch() -> str:
+    """The stored epoch, or "0" when never rolled — so an untouched machine
+    builds exactly the image an un-instrumented build would have produced."""
+    try:
+        value = harness_epoch_path().read_text().strip()
+    except OSError:
+        return HARNESS_EPOCH_UNSET
+    return value or HARNESS_EPOCH_UNSET
+
+
+def roll_harness_epoch() -> str:
+    """Expire the image's harness layers as of today, and return the value.
+    Idempotent within a day: rolling twice writes the same string, so a second
+    fork's build on the same day still cache-hits instead of re-downloading."""
+    value = date.today().isoformat()
+    path = harness_epoch_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value + "\n")
+    return value
+
+
 # ── Harness install progress ─────────────────────────────────────────────────
 # A real %-bar isn't possible: the work is third-party installer scripts
 # (curl | bash) whose duration + byte counts we don't know. Instead, run each
@@ -554,8 +614,19 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness", "--update-harnesses", "--check-docker"}
+    own = {"--force", "--skip-harness-install", "--ensure-harness", "--update-harnesses",
+           "--check-docker", "--harness-epoch", "--roll-harness-epoch"}
     fork_args = [a for a in argv if a not in own]
+
+    # Standalone, machine-readable: the sandbox harness epoch. `sc` shells out to
+    # these rather than reimplementing the file format, so there is one owner of
+    # it. Bare values on stdout — no step banner — because callers capture them.
+    if "--harness-epoch" in argv:
+        print(harness_epoch())
+        return 0
+    if "--roll-harness-epoch" in argv:
+        print(roll_harness_epoch())
+        return 0
 
     # Standalone: force-update all harness CLIs to latest and exit.
     if "--update-harnesses" in argv:

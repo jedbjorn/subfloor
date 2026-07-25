@@ -459,6 +459,30 @@ def regrant() -> int:
         con.close()
 
 
+def expire_sandbox_harnesses() -> str | None:
+    """Expire the harness CLIs baked into the sandbox image; return the epoch.
+
+    `ensure_harnesses()` installs into THIS machine's $HOME, which is the whole
+    runtime on the no-docker path and none of it on the docker path: the sandbox
+    mounts creds, never binaries, so the CLIs shells actually run are the ones
+    baked into the image — behind a docker layer cache with no expiry of its own.
+    An update therefore used to lay a new engine floor on top of harness CLIs
+    frozen at whenever the image was first built, with no command able to move
+    them (a claude one release short of Opus 5 survived exactly that).
+
+    Rolling the epoch expires those layers for the next build. Nothing downloads
+    here: the rebuild rides the relaunch an update already requires, so the
+    sandbox comes back current in the bounce the new floor needs anyway.
+
+    Returns None when docker is absent — the roll is harmless (there is no image
+    to expire) but announcing it would describe a runtime this host does not have.
+    """
+    epoch = install_mod.roll_harness_epoch()
+    if install_mod.docker_status().get("state") == "absent":
+        return None
+    return epoch
+
+
 def main(argv: list[str]) -> int:
     no_fetch = "--no-fetch" in argv
     force = "--force" in argv
@@ -534,6 +558,13 @@ def main(argv: list[str]) -> int:
     # Auth/login stays manual; this only ensures the CLI binary is present.
     print("→ ensure harnesses installed (claude + opencode + codex + vibe + kimi)")
     install_mod.ensure_harnesses()
+
+    # …and that covers the HOST only — see expire_sandbox_harnesses() for the
+    # half of the fleet ensure_harnesses() cannot reach.
+    epoch = expire_sandbox_harnesses()
+    if epoch:
+        print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
+        print("  they reinstall on the next image build — `./sc restart` / `make dos-r`")
 
     migrate_or_rebuild(live_preflight_done=True)
 
