@@ -18,7 +18,7 @@ Contract — every provider module exposes:
 
 Each returned dict is one ACCOUNT, carrying its own windows:
 
-    provider, account_ref, plan, status, detail, probe_version,
+    provider, account_ref, status, detail, probe_version,
     captured_at, windows[]
 
 `account_ref` is an INTERNAL KEY and nothing else: it is what lets a repeated
@@ -247,14 +247,21 @@ def get_json(url: str, headers: dict, timeout: float) -> "tuple[int, object]":
 
 
 def account(*, provider: str, probe_version: str, captured_at: str,
-            account_ref=None, plan=None, status="ok", detail=None,
+            account_ref=None, status="ok", detail=None,
             windows=None) -> dict:
-    """One account's reading. There is no `account_label` and no `is_current`:
-    the first was the operator's identity and is not collected at all any more,
-    and the second existed only to tell one account's card from another's,
-    which a provider-level panel never has to do (decision #75)."""
+    """One account's reading. There is no `account_label`, no `is_current` and
+    no `plan`: the first was the operator's identity and is not collected at
+    all any more, the second existed only to tell one account's card from
+    another's, and the third described WHICH ACCOUNT — the question a
+    provider-level panel stops asking (decision #75, migration 0097).
+
+    `plan` is worth a line because it was the one that looked harmless. It is
+    not identity in the way an email is, and each probe could read it
+    correctly — but nothing displays it and nothing returns it, so every read
+    was feeding a column no one queried. Two of the three were reading it from
+    the wrong place, undetected, for exactly that reason."""
     return {
-        "provider": provider, "account_ref": account_ref, "plan": plan,
+        "provider": provider, "account_ref": account_ref,
         "status": status, "detail": detail, "probe_version": probe_version,
         "captured_at": captured_at, "windows": list(windows or []),
     }

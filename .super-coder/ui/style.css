@@ -691,7 +691,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   border-radius: 6px; padding: .25rem .5rem; font-size: .78rem;
   pointer-events: none; white-space: nowrap; box-shadow: var(--menu-shadow); }
 
-/* ── Account Analytics: sub-view toggle, account cards, quota meters ──
+/* ── Provider Quota: sub-view toggle, provider cards, quota meters ──
    Colour here is threshold-driven and provider-blind (spec #49): one amber and
    one red, both keyed off used_percent, never off a provider's own severity
    field. A window with no percent gets NEITHER class and draws no bar — an

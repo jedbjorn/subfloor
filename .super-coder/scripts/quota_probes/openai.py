@@ -60,7 +60,17 @@ def _client_version() -> "str | None":
 
 
 def _window_row(entry, captured_at: str, log, scope=None) -> "dict | None":
-    """One rate-limit window, from a block carrying its own duration."""
+    """One rate-limit window, from a block carrying its own duration.
+
+    THERE IS NO `fallback_kind` ANY MORE, and its removal is the quiet half of
+    the nested-window fix. The scoped row used to be labelled `weekly` by a
+    fallback rather than by its duration — and it was RIGHT BY ACCIDENT: the
+    reader looked for the duration at entry level, found nothing, and the live
+    window happened to be 604800. A five-hour scoped window would have been
+    labelled weekly just as confidently. Now the duration is read from the
+    block that actually carries it, so the kind is derived; a block that
+    genuinely exposes no duration lands as `unknown` under a formatted
+    duration, which is a visible non-answer instead of a plausible wrong one."""
     if not isinstance(entry, dict):
         return None
     seconds = entry.get("limit_window_seconds")
@@ -218,5 +228,5 @@ def probe(log, timeout) -> list[dict]:
         return result(status="error", **common,
                       detail=drift(HARNESS_PROVIDER, missing, log))
 
-    return result(plan=payload.get("plan_type"), **common,
+    return result(**common,
                   windows=_windows(rate_limit, payload, captured_at, log))

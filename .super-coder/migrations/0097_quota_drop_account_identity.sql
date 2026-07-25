@@ -50,33 +50,64 @@
 -- committed screenshot needing a scrubbed label. With no label rendered there
 -- is nothing in that shot to scrub.
 --
--- ── is_current goes too: no reader AND no writer ─────────────────────────────
+-- ── EVERY OTHER COLUMN GOES TOO: each one answered "WHICH ACCOUNT" ───────────
 --
--- is_current existed to tell one account's card from another's — which account
--- the credential file resolves to NOW — and it had exactly two readers: the
--- API's exemption from the 7-day activity filter, and the UI's muted rendering
--- of a non-current account. Spec 57 removes both, along with the 7-day filter
--- itself and the upsert's pre-clear that maintained the column. A provider-level
--- panel shows the newest reading per provider and never has to answer "which
--- account", so nothing is left that could read it and nothing is left that
--- writes it. A column with neither is a question for the next person.
+-- The registry is left as (account_pk, provider, account_ref) and nothing else.
+-- Each dropped column had its own reason, and they converge on one:
 --
--- idx_hqa_last_seen goes with it: it existed solely to drive the 7-day filter.
--- The COLUMN last_seen stays — the writer still maintains it, and it is the
--- provenance of account_ref, which decision #75 explicitly keeps as an internal
--- upsert key so a repeated probe updates a row instead of duplicating it.
--- account_ref is provider-issued, is never an email, and is never rendered.
+-- is_current told one account's card from another's — which account the
+-- credential file resolves to NOW. Exactly two readers: the API's exemption
+-- from the 7-day activity filter, and the UI's muted rendering of a
+-- non-current account. Spec 57 removes both, plus the 7-day filter itself and
+-- the upsert's pre-clear that maintained the column. Nothing reads it and
+-- nothing writes it; a column with neither is a question for the next person.
 --
--- `plan` also stays. It is not identity (max / prolite / LEVEL_ADVANCED), it is
--- absent from the API response and from the card, and spec 57's verification
--- gate pins where each probe must read it from — which a dropped column could
--- not satisfy. Two of the three were reading it from the wrong place.
+-- first_seen and last_seen lost their last reader to a BUILD DECISION, which is
+-- why they were not in this migration's first draft. Selecting the newest
+-- reading per provider needs an ordering key, and last_seen looks like it. But
+-- the panel selects on the WINDOW's captured_at instead — a row with no windows
+-- then has no reading and cannot outrank one with numbers, which is both what
+-- the spec literally asks for and what makes flag #196's stale guessed-ref rows
+-- unable to win and impossible to see, with no data migration to hunt them
+-- down. That choice removes last_seen's only reader; first_seen never had a
+-- stronger one.
+--
+-- plan is the one that looked harmless enough to keep: not identity in the way
+-- an email is (max / prolite / LEVEL_ADVANCED), and each probe could read it
+-- correctly. But decision #75 displays no plan and the API returns none, so
+-- every read fed a column no one queried — which is precisely why TWO OF THE
+-- THREE PROBES WERE READING IT FROM THE WRONG PLACE, undetected: moonshot from
+-- the top level instead of user.membership, anthropic from a payload key the
+-- wire has never sent. A column nothing queries cannot report that it is wrong.
+--
+-- An earlier draft of spec 57 kept a verification item requiring plan to be
+-- read from user.membership.level. That item was carried over from the defect
+-- list written BEFORE the simplification ruling and contradicted the ruling
+-- itself; it is withdrawn, and the column goes with it.
+--
+-- ── WHY "cheap provenance" DOES NOT SAVE ANY OF THEM ─────────────────────────
+--
+-- The instinct to keep a timestamp because it costs nothing is the one this
+-- migration deliberately refuses. THESE TABLES ARE PROBE-REBUILDABLE CACHES:
+-- provenance that a single probe regenerates is not provenance. If first_seen
+-- is wanted later it is added deliberately and refills on the next probe.
+--
+-- The table is NOT collapsed. account_ref earns its keep as the upsert key that
+-- stops a repeated probe duplicating rows; it is provider-issued, is never an
+-- email, and is never rendered.
+--
+-- idx_hqa_last_seen goes because it existed solely to drive the 7-day filter,
+-- and because SQLite refuses to drop an indexed column — hence the order below:
+-- the index first, then the column it indexed.
 
 BEGIN;
 
+DROP INDEX IF EXISTS idx_hqa_last_seen;
+
 ALTER TABLE harness_quota_account DROP COLUMN account_label;
 ALTER TABLE harness_quota_account DROP COLUMN is_current;
-
-DROP INDEX IF EXISTS idx_hqa_last_seen;
+ALTER TABLE harness_quota_account DROP COLUMN plan;
+ALTER TABLE harness_quota_account DROP COLUMN first_seen;
+ALTER TABLE harness_quota_account DROP COLUMN last_seen;
 
 COMMIT;

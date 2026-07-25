@@ -154,11 +154,4 @@ def probe(log, timeout) -> list[dict]:
         return result(status="error", **common,
                       detail=drift(HARNESS_PROVIDER, missing, log))
 
-    # Nested under `user`, not at the top level — spec #49's field table said
-    # otherwise and `plan` was NULL for every moonshot account as a result,
-    # while LEVEL_ADVANCED sat in the payload the whole time (flag #198).
-    user = payload.get("user")
-    membership = user.get("membership") if isinstance(user, dict) else None
-    plan = membership.get("level") if isinstance(membership, dict) else None
-    return result(plan=plan, **common,
-                  windows=_windows(payload, captured_at, log))
+    return result(**common, windows=_windows(payload, captured_at, log))

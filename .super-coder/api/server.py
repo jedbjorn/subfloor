@@ -864,25 +864,26 @@ def _quota_upsert(con, accounts: list[dict]) -> int:
     limit of zero) or one that failed before it could name anyone. Such a row
     could never be matched again, and it holds no reading to show.
 
-    There is no is_current pre-clear any more, and no is_current at all: it
-    existed to mark which of a provider's rows the credential file resolves to
-    NOW, which only mattered while cards were per-account. The panel shows the
-    newest reading per provider (see `_latest_readings`), so the question has
-    no reader left (decision #75, migration 0097)."""
+    THE REGISTRY ROW IS NOW NOTHING BUT A KEY — (account_pk, provider,
+    account_ref) — so the upsert has nothing to update and DOES NOTHING on
+    conflict. Everything it used to carry described WHICH ACCOUNT, which is the
+    question a provider-level panel stops asking: account_label and is_current
+    went with the cards that read them, plan is displayed nowhere and returned
+    nowhere, and first_seen/last_seen lost their last reader when the newest
+    reading came to be selected by the WINDOW's captured_at (see
+    `_latest_readings`) rather than by the row's last_seen.
+
+    Keeping them as cheap provenance would have been the wrong instinct:
+    THESE TABLES ARE PROBE-REBUILDABLE CACHES, and provenance a single probe
+    regenerates is not provenance (decision #75, migration 0097)."""
     named = [a for a in accounts if a.get("account_ref")]
     written = 0
     for acct in named:
         seen = acct["captured_at"]
-        # first_seen is deliberately absent from the SET list: an account that
-        # went quiet and came back keeps its original first_seen rather than
-        # minting a duplicate identity.
         con.execute(
-            "INSERT INTO harness_quota_account "
-            "(provider, account_ref, plan, first_seen, last_seen) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(provider, account_ref) DO UPDATE SET "
-            "plan=excluded.plan, last_seen=excluded.last_seen",
-            (acct["provider"], acct["account_ref"], acct.get("plan"), seen, seen))
+            "INSERT INTO harness_quota_account (provider, account_ref) "
+            "VALUES (?, ?) ON CONFLICT(provider, account_ref) DO NOTHING",
+            (acct["provider"], acct["account_ref"]))
         pk = con.execute(
             "SELECT account_pk FROM harness_quota_account WHERE provider=? AND account_ref=?",
             (acct["provider"], acct["account_ref"])).fetchone()[0]

@@ -3,8 +3,7 @@
 Two files, and only the first is the credential file:
 
   ~/.claude/.credentials.json   claudeAiOauth.accessToken + expiresAt — the
-                                token, read and never written. Also
-                                subscriptionType, which is where `plan` lives.
+                                token, read and never written.
   ~/.claude.json                oauthAccount.accountUuid — the internal key.
 
 Spec #49 and decisions #65/#67 both said `account_ref` comes from "the
@@ -21,11 +20,18 @@ identifier of any kind — verified against a live capture, whose top-level keys
 are five_hour / seven_day* / extra_usage / limits / spend /
 member_dashboard_available and nothing else.
 
-`plan` comes from the CREDENTIAL FILE, not the payload: `subscriptionType` is
-a key of that file, and the usage response has never carried it. Reading it
-from the payload — which this module did until the live capture — returned
-None for every account, silently, because the fixture had been transcribed
-with the field invented at the payload's top level.
+NO `plan` IS COLLECTED HERE, and the reason it is worth a note is what finding
+it produced. This module used to read `payload.subscriptionType` — a key the
+usage response has never carried. It returned None for every account,
+silently, forever, because the fixture had been TRANSCRIBED with that field
+invented at the payload's top level, so the test agreed with the bug. The real
+value was in the credential file all along.
+
+The read is gone rather than corrected: decision #75 displays no plan and the
+API returns none, so the column was dropped (migration 0097) and a correct
+read would still have been feeding nothing. Recorded because the same
+read-at-the-wrong-level defect turned up in all three providers, every one of
+them invisible for this identical reason.
 """
 from __future__ import annotations
 
@@ -131,6 +137,4 @@ def probe(log, timeout) -> list[dict]:
         return result(status="error", **common, detail=drift(
             HARNESS_PROVIDER, "no limits[] in the usage payload", log))
 
-    # From the CREDENTIAL FILE, not the payload — see the module docstring.
-    return result(plan=(oauth or {}).get("subscriptionType"),
-                  windows=_windows(limits, captured_at, log), **common)
+    return result(windows=_windows(limits, captured_at, log), **common)
