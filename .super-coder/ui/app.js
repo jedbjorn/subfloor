@@ -3303,6 +3303,64 @@ function ifSizeComposer(input) {
 
 const IF_COMPOSER_ACK_TIMEOUT_MS = 15000;
 
+// The composer send contract (spec 43 U2), as a table rather than as prose
+// spread over branches. Rows are evaluated top-down and the FIRST match is
+// the outcome of pressing Enter on a non-empty draft, so exactly one row
+// always matches: a silent no-op cannot exist by construction. Each row
+// carries BOTH halves of the contract — the outcome and the note the
+// operator sees — because it is the pairing that kept drifting when the two
+// lived in different functions.
+//
+//   BLOCKED — this Enter does nothing beyond explaining itself.
+//   QUEUED  — the draft is latched and flushes on the gate-clearing
+//             transition (see ifFlushLatchedSubmit).
+//   SENT    — the frame goes to the broker now.
+//
+// `gate: true` marks the five conditions that make the composer read-only;
+// ifComposerWritable is derived from them so the disabled state and the
+// note can never disagree about why input is refused.
+const IF_COMPOSER_MATRIX = [
+  { id: "ack-pending", outcome: "BLOCKED",
+    when: (a) => a.composerPendingSeq != null,
+    note: () => "Sending through the generation-fenced input broker…" },
+  { id: "draft-error", outcome: "BLOCKED",
+    when: (a) => Boolean(a.browserComposerError),
+    note: (a) => "Draft safety sync failed; sending is disabled: " +
+      a.browserComposerError },
+  { id: "authority-refresh", outcome: "BLOCKED", gate: true,
+    when: (a) => a.composerProjectionPending,
+    note: () => "Read-only while server input authority refreshes." },
+  { id: "input-illegal", outcome: "BLOCKED", gate: true,
+    when: (a) => !a.legalActions.has("send_input"),
+    note: (a) => a.stateReason ||
+      "Read-only — the server does not list input as legal." },
+  { id: "halted", outcome: "BLOCKED", gate: true,
+    when: (a) => a.halted,
+    note: (a) => a.st.note || "Input halted — reattach before sending." },
+  { id: "no-lease", outcome: "BLOCKED", gate: true,
+    when: (a) => a.role !== "writer" || a.st.writer !== "active",
+    note: (a) => a.st.writerReason ||
+      "Read-only — this client does not hold the server writer lease." },
+  { id: "stream-down", outcome: "BLOCKED", gate: true,
+    when: (a) => !a.ws || a.ws.readyState !== WebSocket.OPEN,
+    note: () => "Connecting to the generation-fenced input broker…" },
+  { id: "draft-syncing", outcome: "QUEUED",
+    when: (a) => a.browserComposerSyncing || a.browserComposerState !== "dirty",
+    note: () => "queued — draft syncing" },
+  { id: "terminal-busy", outcome: "QUEUED",
+    when: (a) => a.awaiting || Boolean(a.outBuf),
+    note: () => "queued — waiting for terminal" },
+  // SENT carries no note of its own: the send assigns composerPendingSeq
+  // synchronously, so the very next paint matches "ack-pending" above and
+  // shows the pending note until input_ack — which is the spec's visible
+  // signal for this row. A second copy of that string here would be dead.
+  { id: "open", outcome: "SENT", when: () => true },
+];
+
+function ifComposerGate(a) {
+  return IF_COMPOSER_MATRIX.find((row) => row.when(a));
+}
+
 function ifClearComposerLatch(a) {
   a.composerSubmitLatched = false;
   a.composerLatchedValue = null;
@@ -3314,26 +3372,7 @@ function ifClearComposerAckTimer(a) {
 }
 
 function ifComposerWritable(a) {
-  return a.legalActions.has("send_input") &&
-    a.role === "writer" && a.st.writer === "active" && !a.halted &&
-    a.ws && a.ws.readyState === WebSocket.OPEN &&
-    !a.composerProjectionPending;
-}
-
-function ifComposerDisabledReason(a) {
-  if (a.composerProjectionPending)
-    return "Read-only while server input authority refreshes.";
-  if (!a.legalActions.has("send_input"))
-    return a.stateReason ||
-      "Read-only — the server does not list input as legal.";
-  if (a.halted)
-    return a.st.note || "Input halted — reattach before sending.";
-  if (a.role !== "writer" || a.st.writer !== "active")
-    return a.st.writerReason ||
-      "Read-only — this client does not hold the server writer lease.";
-  if (!a.ws || a.ws.readyState !== WebSocket.OPEN)
-    return "Connecting to the generation-fenced input broker…";
-  return "";
+  return !IF_COMPOSER_MATRIX.some((row) => row.gate && row.when(a));
 }
 
 function ifPaintComposer(a) {
@@ -3356,25 +3395,23 @@ function ifPaintComposer(a) {
   a.composerSend.disabled = !writable || pending || a.awaiting ||
     Boolean(a.outBuf) || !hasMessage || Boolean(a.browserComposerError) ||
     (!dirtyReady && !dirtySyncing);
-  if (pending) {
-    a.composerNote.textContent =
-      "Sending through the generation-fenced input broker…";
-  } else if (a.composerSubmitLatched) {
-    a.composerNote.textContent =
-      "Send queued once; waiting for broker readiness…";
-  } else if (a.browserComposerError) {
-    a.composerNote.textContent =
-      "Draft safety sync failed; sending is disabled: " +
-      a.browserComposerError;
-  } else {
-    const disabled = ifComposerDisabledReason(a);
-    if (disabled) a.composerNote.textContent = disabled;
-    else if (!a.composerInput.value && a.browserComposerState === "dirty")
-      a.composerNote.textContent =
-        "A prior browser draft is still marked composing; edit then clear " +
-        "this box to release the planner wake gate.";
-    else a.composerNote.textContent = "";
-  }
+  // One note, sourced from the one table. A BLOCKED row is a live condition
+  // and always explains itself; a QUEUED row only speaks once a submit is
+  // actually latched (mid-typing draft sync is not a queued message).
+  const row = ifComposerGate(a);
+  let text = "";
+  if (row.outcome === "BLOCKED") text = row.note(a);
+  else if (row.outcome === "QUEUED" && a.composerSubmitLatched)
+    text = row.note(a);
+  // A blocked composer that is ALSO holding a queued message must say so:
+  // the box is frozen by the latch, and the blocked reason alone reads as
+  // "your message is gone".
+  if (text && row.outcome === "BLOCKED" && a.composerSubmitLatched)
+    text += " Your queued message is still held.";
+  if (!text && !a.composerInput.value && a.browserComposerState === "dirty")
+    text = "A prior browser draft is still marked composing; edit then clear " +
+      "this box to release the planner wake gate.";
+  a.composerNote.textContent = text;
 }
 
 function ifRefreshComposerProjection(a) {
@@ -3388,7 +3425,6 @@ function ifRefreshComposerProjection(a) {
     a.legalActions = new Set(
       Array.isArray(session.legal_actions) ? session.legal_actions : []);
     a.stateReason = session.state_reason || "";
-    if (!a.legalActions.has("send_input")) ifClearComposerLatch(a);
   }).catch((e) => {
     if (ifAttach !== a || version !== a.composerProjectionVersion) return;
     a.legalActions.delete("send_input");
@@ -3396,6 +3432,12 @@ function ifRefreshComposerProjection(a) {
   }).finally(() => {
     if (ifAttach !== a || version !== a.composerProjectionVersion) return;
     a.composerProjectionPending = false;
+    // Gate-clearing transition: the refresh used to DESTROY a latched submit
+    // whenever send_input came back illegal, and never re-drove one when it
+    // came back legal — so a queued message either vanished or stalled
+    // forever. The latch now outlives the refresh and flushes here; a session
+    // that is genuinely over drops it via the lifecycle handler instead.
+    ifFlushLatchedSubmit(a);
     a.paint();
   });
 }
@@ -3427,29 +3469,45 @@ function ifSyncBrowserComposer(a, state) {
     if (ifAttach !== a || version !== a.browserComposerVersion) return;
     a.browserComposerSyncing = false;
     if (a.browserComposerError) ifClearComposerLatch(a);
-    else if (a.composerSubmitLatched && a.browserComposerState === "dirty")
-      ifComposerSend(a);
+    else ifFlushLatchedSubmit(a);   // gate-clearing: draft-sync completion
     a.paint();
   });
+}
+
+// A latched submit is a promise to send. Every transition that opens a gate
+// re-drives it through the matrix — otherwise the message sits queued behind
+// a gate that already cleared, which is the field bug this unit exists to
+// kill. Re-entering ifComposerSend (rather than sending directly) keeps the
+// contract single-sourced: a still-blocked latch just repaints its reason.
+function ifFlushLatchedSubmit(a) {
+  if (a.composerSubmitLatched) ifComposerSend(a);
 }
 
 function ifComposerSend(a) {
   const value = a.composerSubmitLatched
     ? a.composerLatchedValue
     : a.composerInput.value;
-  if (typeof value !== "string" || !value.trim() || !ifComposerWritable(a) ||
-      a.composerPendingSeq != null || a.browserComposerError)
+  // An empty draft is not a submit; the contract covers non-empty drafts.
+  if (typeof value !== "string" || !value.trim()) return;
+  const row = ifComposerGate(a);
+  if (row.outcome === "BLOCKED") {
+    a.paint();   // every outcome paints: BLOCKED explains itself, never silence
     return;
-  if (a.browserComposerSyncing || a.browserComposerState !== "dirty" ||
-      a.awaiting || a.outBuf) {
-    if (a.browserComposerWanted === "dirty" ||
-        a.browserComposerState === "dirty") {
-      if (!a.composerSubmitLatched) {
-        a.composerSubmitLatched = true;
-        a.composerLatchedValue = value;
-      }
-      a.paint();
+  }
+  if (row.outcome === "QUEUED") {
+    if (!a.composerSubmitLatched) {
+      a.composerSubmitLatched = true;
+      a.composerLatchedValue = value;
     }
+    // A queued submit only flushes when a gate-clearing transition arrives.
+    // If the draft was never announced dirty, nothing is in flight to
+    // complete and the latch would wait forever — this is exactly the fully
+    // silent path (neither dirty nor dirty-wanted used to return with no
+    // latch and no note). Start the sync that will clear the gate.
+    if (row.id === "draft-syncing" && !a.browserComposerSyncing &&
+        a.browserComposerWanted !== "dirty")
+      ifSyncBrowserComposer(a, "dirty");
+    a.paint();
     return;
   }
   // xterm emits carriage return for Enter. Reuse that exact byte convention
@@ -3666,8 +3724,12 @@ function ifOpenStream(a, ticket) {
     else if (b[0] === 0x04) { a.term.reset(); a.term.write(b.subarray(1)); }
   };
   ws.onclose = () => {
-    if (ifAttach !== a) return;
-    if (a.composerPendingSeq != null || a.composerSubmitLatched) {
+    // A socket we deliberately replaced (take-over re-opens the stream on the
+    // same attachment) is not a drop: its late close event must not clobber
+    // the generation that succeeded it.
+    if (ifAttach !== a || a.ws !== ws) return;
+    if (a.composerPendingSeq != null) {
+      // A frame was already on the wire — delivery is unknown, so halt.
       a.composerPendingSeq = null;
       ifClearComposerLatch(a);
       ifClearComposerAckTimer(a);
@@ -3675,6 +3737,11 @@ function ifOpenStream(a, ticket) {
       a.halted = true;
       a.st.note = "stream closed before the message acknowledgement — " +
         "the draft was retained; inspect the terminal before retrying";
+    } else if (a.composerSubmitLatched) {
+      // A queued submit never left the browser: there is no delivery
+      // ambiguity to halt over. It stays queued and flushes on reconnect.
+      a.st.note = "stream closed — your queued message is still held; " +
+        "reattach to send it";
     } else {
       a.st.note = "stream closed — reselect the shell to reattach";
     }
@@ -3709,6 +3776,10 @@ function ifOpenStream(a, ticket) {
   ws.onopen = () => {
     fit();
     ifSendResize(a, term.rows, term.cols);
+    // Gate-clearing transition: the stream is back. Reconnect and
+    // writer-lease regain both arrive here — a take-over resets the lease
+    // then re-opens the stream, so this open IS the regain event.
+    ifFlushLatchedSubmit(a);
     a.paint();
   };
   fit();
@@ -3772,7 +3843,7 @@ function ifControl(a, m) {
           ifSyncBrowserComposer(a, "clean");
         }
         ifFlush(a);
-        if (a.composerSubmitLatched) ifComposerSend(a);
+        ifFlushLatchedSubmit(a);   // gate-clearing: echo drain
         a.paint();
       }
       break;
