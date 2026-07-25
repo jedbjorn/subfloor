@@ -250,8 +250,8 @@ class InterfaceApiTest(unittest.TestCase):
                 "display_name": "S1",
                 "flavor": "dev",
                 "availability": "available",
-                "default_harness": "codex",
-                "default_model": "gpt-5.6-sol",
+                "default_harness": "claude",
+                "default_model": "opus",
                 "model_route": None,
             },
         )
