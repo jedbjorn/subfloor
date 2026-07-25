@@ -807,13 +807,20 @@ QUOTA_TTL_SECONDS = 60      # toggling the two sections must not hammer three
                             # third-party endpoints; the refresh button bypasses it
 QUOTA_ACTIVITY_DAYS = 7     # the panel's only filter — a filter, never a delete
 
-# The TTL's clock. The spec derives it from "the newest captured_at", which is
-# right whenever a probe wrote a row — but a probe that identifies nobody (no
-# credential file → `na`, or a provider erroring before it can name an account)
-# writes NO rows, so that clock never advances and every arrival would re-probe,
-# breaking the spec's own "toggling sections twice inside a minute performs one
-# probe" in exactly the degraded case. Recording the ATTEMPT closes that. The
-# claim is taken under the lock and before the probe runs, so two simultaneous
+# The TTL's clock: the last probe ATTEMPT, in this process — never the newest
+# captured_at. A probe that identifies nobody (no credential file → `na`, or a
+# provider erroring before it can name an account) writes NO rows, so a DB clock
+# never advances and every arrival would re-probe, breaking the spec's own
+# "toggling sections twice inside a minute performs one probe" in exactly the
+# degraded case. The attempt is recorded whether or not it identifies anybody.
+#
+# Living in process, it RESETS ON A SERVER RESTART — the spec declares that
+# ("a restart storm re-probes") and it is load-bearing, not merely tolerated:
+# `providers` below dies with the same process, so the first arrival after a
+# restart MUST probe or the response would carry an EMPTY per-provider status
+# list, and the panel could not tell "nothing configured" from "every probe
+# failed". Mixing a DB clock back in would reopen exactly that window. The claim
+# is taken under the lock and before the probe runs, so two simultaneous
 # arrivals collapse to one probe rather than racing to fire two.
 _QUOTA_LOCK = threading.Lock()
 _QUOTA_PROBE: dict = {"at": None, "providers": []}
@@ -837,28 +844,13 @@ ON CONFLICT(account_pk, window_kind, COALESCE(scope, '')) DO UPDATE SET
 """
 
 
-def _iso_epoch(ts: "str | None") -> "float | None":
-    """ISO UTC → epoch seconds. Unparseable input is None, never a fake time —
-    a garbage captured_at must not be able to hold the TTL open."""
-    if not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
-
-
-def _quota_claim(force: bool, newest: "str | None") -> bool:
+def _quota_claim(force: bool) -> bool:
     """True when THIS caller should probe. `force` is the refresh button."""
     now = datetime.now(timezone.utc).timestamp()
     with _QUOTA_LOCK:
-        if not force:
-            seen = [t for t in (_QUOTA_PROBE["at"], _iso_epoch(newest)) if t]
-            if seen and now - max(seen) < QUOTA_TTL_SECONDS:
-                return False
+        last = _QUOTA_PROBE["at"]
+        if not force and last and now - last < QUOTA_TTL_SECONDS:
+            return False
         _QUOTA_PROBE["at"] = now
         return True
 
@@ -928,10 +920,10 @@ def probe_quota_accounts(con) -> dict:
 
 
 def get_analytics_accounts(con, force: bool = False) -> dict:
-    """Registry + windows for the account panel, probing first when the newest
-    capture has aged past the TTL. `force` is POST /probe — the refresh button."""
-    newest = con.execute("SELECT MAX(captured_at) FROM harness_quota_window").fetchone()[0]
-    probe = probe_quota_accounts(con) if _quota_claim(force, newest) else None
+    """Registry + windows for the account panel, probing first when the last
+    probe ATTEMPT has aged past the TTL. `force` is POST /probe — the refresh
+    button."""
+    probe = probe_quota_accounts(con) if _quota_claim(force) else None
     cutoff = (datetime.now(timezone.utc)
               - timedelta(days=QUOTA_ACTIVITY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     # The 7-day window, plus the account the credential file resolves to NOW.

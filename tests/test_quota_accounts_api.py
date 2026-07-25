@@ -234,13 +234,33 @@ class QuotaTtlTest(QuotaBase):
             server.get_analytics_accounts(self.con)
         self.assertEqual(1, len(self.calls))
 
-    def test_an_aged_capture_probes_again(self):
-        with self.stub([acct(windows=[win(captured_at=iso(minutes_ago=5))])]):
+    def test_an_aged_attempt_probes_again(self):
+        # The clock is the ATTEMPT, so age the attempt — not the capture.
+        with self.stub([acct(windows=[win()])]):
             server.get_analytics_accounts(self.con)
-            server._QUOTA_PROBE["at"] = None      # only the DB clock is left
+            server._QUOTA_PROBE["at"] -= server.QUOTA_TTL_SECONDS + 1
             out = server.get_analytics_accounts(self.con)
         self.assertEqual(2, len(self.calls))
         self.assertTrue(out["probed"])
+
+    def test_a_restart_inside_the_ttl_probes_and_refills_the_status_list(self):
+        # The attempt clock lives in the process and dies with it. A restart
+        # within 60s of a probe that DID write rows must therefore probe again:
+        # _QUOTA_PROBE["providers"] died with the same process, so a clock that
+        # survived in the DB would serve an EMPTY per-provider status list and
+        # hand the panel the "nothing configured vs. every probe failed"
+        # ambiguity that list exists to remove.
+        fresh = [acct(windows=[win(captured_at=iso())])]
+        with self.stub(fresh):
+            server.get_analytics_accounts(self.con)
+            self.assertTrue(self.q("SELECT 1 FROM harness_quota_window"),
+                            "positive control: the first probe must have "
+                            "written a window row for the DB clock to read")
+            server._QUOTA_PROBE.update({"at": None, "providers": []})  # restart
+            out = server.get_analytics_accounts(self.con)
+        self.assertEqual(2, len(self.calls))
+        self.assertTrue(out["probed"])
+        self.assertEqual(["anthropic"], [p["provider"] for p in out["providers"]])
 
     def test_force_bypasses_a_fresh_ttl(self):
         with self.stub([acct(windows=[win()])]):

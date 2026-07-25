@@ -13,11 +13,14 @@ an adjacent one entirely free — the upsert's conflict target and its
 first_seen-preservation are different guarantees in the same statement, and so
 are the 7-day filter and the is_current exemption in the same WHERE clause.
 
-Deliberately included, because it is the one place this unit departs from the
-spec's literal mechanism: `ttl-db-clock-only` restores the spec's
-captured_at-only TTL. It must redden exactly ONE test — the degraded case where
-a probe writes no rows at all — which is what makes the departure load-bearing
-rather than decoration.
+Deliberately included, because it is the property most likely to be "restored"
+by a well-meaning later reader: `ttl-hybrid-db-clock-restored` puts the DB's
+newest captured_at back into the claim alongside the in-process attempt. The
+ratified clock is the ATTEMPT, in this process, alone — a hybrid survives a
+restart and then serves a response whose per-provider status list is EMPTY,
+because that cache died with the process. Reintroducing it must redden, or the
+next person reintroduces it and the suite stays green (it did: the hybrid
+shipped once and no test noticed).
 
 Usage:
     python3 tests/mutations/u3_quota_api.py           # all mutations
@@ -49,6 +52,10 @@ class Mutation:
     path: Path
     old: str
     new: str
+    # Extra (old, new) edits applied with the same exactly-one-anchor rule. A
+    # property whose removal spanned several sites has to be restored at ALL of
+    # them — a half-restored clock is a different mutation than the one named.
+    also: tuple[tuple[str, str], ...] = ()
 
 
 MUTATIONS = [
@@ -116,23 +123,54 @@ MUTATIONS = [
         name="ttl-never-suppresses",
         property="a second arrival inside 60s does not re-probe",
         path=SERVER,
-        old="            if seen and now - max(seen) < QUOTA_TTL_SECONDS:\n"
-            "                return False",
-        new="            pass",
+        old="        if not force and last and now - last < QUOTA_TTL_SECONDS:\n"
+            "            return False",
+        new="        pass",
     ),
     Mutation(
-        name="ttl-db-clock-only",
-        property="the TTL still holds when the probe wrote NO rows (the departure)",
+        name="ttl-hybrid-db-clock-restored",
+        property="the clock is the in-process ATTEMPT alone — no DB captured_at",
         path=SERVER,
-        old='            seen = [t for t in (_QUOTA_PROBE["at"], _iso_epoch(newest)) if t]',
-        new="            seen = [t for t in (_iso_epoch(newest),) if t]",
+        old='def _quota_claim(force: bool) -> bool:\n'
+            '    """True when THIS caller should probe. `force` is the refresh button."""\n'
+            "    now = datetime.now(timezone.utc).timestamp()\n"
+            "    with _QUOTA_LOCK:\n"
+            "        last = _QUOTA_PROBE[\"at\"]\n"
+            "        if not force and last and now - last < QUOTA_TTL_SECONDS:\n"
+            "            return False",
+        new='def _iso_epoch(ts: "str | None") -> "float | None":\n'
+            "    if not ts:\n"
+            "        return None\n"
+            "    try:\n"
+            '        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))\n'
+            "    except (ValueError, TypeError):\n"
+            "        return None\n"
+            "    if dt.tzinfo is None:\n"
+            "        dt = dt.replace(tzinfo=timezone.utc)\n"
+            "    return dt.timestamp()\n"
+            "\n"
+            "\n"
+            'def _quota_claim(force: bool, newest: "str | None" = None) -> bool:\n'
+            '    """True when THIS caller should probe. `force` is the refresh button."""\n'
+            "    now = datetime.now(timezone.utc).timestamp()\n"
+            "    with _QUOTA_LOCK:\n"
+            "        seen = [t for t in (_QUOTA_PROBE[\"at\"], _iso_epoch(newest)) if t]\n"
+            "        if not force and seen and now - max(seen) < QUOTA_TTL_SECONDS:\n"
+            "            return False",
+        # The caller has to feed the restored clock, or `newest` stays None and
+        # the mutation is a no-op that passes for the wrong reason.
+        also=(
+            ("    probe = probe_quota_accounts(con) if _quota_claim(force) else None",
+             '    newest = con.execute("SELECT MAX(captured_at) FROM harness_quota_window").fetchone()[0]\n'
+             "    probe = probe_quota_accounts(con) if _quota_claim(force, newest) else None"),
+        ),
     ),
     Mutation(
         name="force-ignored",
         property="the refresh button ALWAYS bypasses the TTL",
         path=SERVER,
-        old="        if not force:",
-        new="        if True:",
+        old="        if not force and last and now - last < QUOTA_TTL_SECONDS:",
+        new="        if last and now - last < QUOTA_TTL_SECONDS:",
     ),
     Mutation(
         name="route-owns-a-timeout",
@@ -209,12 +247,15 @@ def run_suites() -> tuple[bool, bool]:
 
 def apply(mutation: Mutation) -> str:
     original = mutation.path.read_text()
-    count = original.count(mutation.old)
-    if count != 1:
-        raise SystemExit(
-            f"{mutation.name}: anchor matched {count} times in "
-            f"{mutation.path.name}, expected exactly 1 — the driver is stale")
-    mutation.path.write_text(original.replace(mutation.old, mutation.new))
+    text = original
+    for old, new in ((mutation.old, mutation.new), *mutation.also):
+        count = text.count(old)
+        if count != 1:
+            raise SystemExit(
+                f"{mutation.name}: anchor matched {count} times in "
+                f"{mutation.path.name}, expected exactly 1 — the driver is stale")
+        text = text.replace(old, new)
+    mutation.path.write_text(text)
     return original
 
 
