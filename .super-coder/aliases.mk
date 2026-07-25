@@ -27,7 +27,7 @@
 #
 #   LONG-ONLY: Interface status/start/view/attach/take-control/stop/reconcile/
 #              recover; models; sprint/watch/job; build/logs/serve/health/ports;
-#              verify/map/render/snapshot/deps/install/rollback/token/
+#              verify/map/render/snapshot/deps/install/rollback/
 #              update-harnesses/harness-status/feature/eject
 #              passthrough: make dos ARGS=health
 #
@@ -35,7 +35,7 @@ SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-url dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
-        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-token dos-status \
+        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-status \
         dos-start dos-view dos-attach dos-take dos-take-control dos-stop \
         dos-reconcile dos-recover dos-models dos-model-refresh dos-model-list \
         dos-model-resolve dos-sprint dos-watch dos-job dos-setup dos
@@ -99,9 +99,6 @@ dos-deps:             ; $(SC) deps $(ARGS)
 dos-install:          ; $(SC) install
 dos-setup: dos-install
 dos-rollback:         ; $(SC) rollback
-# Browser sign-in operator token — prints ONLY the owner-only runtime
-# credential to stdout (never rotates, never logs); exact alias of ./sc token.
-dos-token:            ; $(SC) token
 dos-update-harnesses: ; $(SC) update-harnesses
 # What the shells' harness CLIs actually are, in the sandbox — and whether the
 # image owes a harness rebuild. The picker shows model ALIASES, never the CLI
@@ -190,7 +187,6 @@ dos-help:
 	@echo "                                (rolls the harness epoch + rebuilds; dos-r to run them)"
 	@echo "    dos-harness-status          harness CLI versions in the sandbox + is a harness rebuild owed"
 	@echo "    dos-feat / dos-feature      list/enable/disable opt-in features"
-	@echo "    dos-token                   print the browser sign-in token (stdout only)"
 	@echo "    dos-eject                   ONE-WAY: own the engine"
 	@echo ""
 	@echo "    dos ARGS='<cmd>'            generic ./sc passthrough"

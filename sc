@@ -1465,7 +1465,8 @@ super-coder — forkable shell substrate
                              credential from the owner-only artifact .super-coder/run/mem/<shortname>.json, mode 0600)
                              — stdout carries ONLY the token, for paste into the browser sign-in prompt. Never
                              rotates; a missing/unreadable/insecure artifact refuses on stderr with the service
-                             action (`./sc restart` / `make dos-r`). Alias: make dos-token
+                             action (`./sc restart` / `make dos-r`). A recovery path — the browser attaches its
+                             own credential, so pasting a token by hand is no longer the everyday sign-in
   ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
                              intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
   ./sc sprint status       wake status per binding: armed/released, sprint ACTIVE/frozen, batch state,

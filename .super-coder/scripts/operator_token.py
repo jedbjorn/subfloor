@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Print the browser sign-in operator token (spec doc #30 req 23).
 
-`./sc token` (exact alias `make dos-token`) prints the current Admin runtime
-credential — the token a browser operator pastes into the sign-in prompt — and
-ONLY that token, on stdout. It never rotates the credential, never puts it in
+`./sc token` prints the current Admin runtime credential — the token a browser
+operator pastes into the sign-in prompt — and ONLY that token, on stdout. It is
+now a recovery path rather than the everyday one: the browser attaches its own
+credential, so the paste-it-by-hand flow (and its `make dos-token` alias) is no
+longer part of normal sign-in. It never rotates the credential, never puts it in
 command arguments, and never writes it to a log.
 
 The source of truth is the owner-only runtime artifact the supervised API
