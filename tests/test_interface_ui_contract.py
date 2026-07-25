@@ -651,8 +651,17 @@ a.paint();
     "acknowledged composer draft was not cleared");
   invariant(!a.composerInput.disabled,
     "composer stayed disabled after the clean transition was acknowledged");
-  invariant(apiCalls.length === 2 && apiCalls[1].body.state === "clean",
+  const composerCalls = apiCalls.filter(
+    (c) => c.path === "/interface/browser-composer");
+  invariant(composerCalls.length === 2 && composerCalls[1].body.state === "clean",
     "acknowledged send did not release browser composing state");
+  // The same ack mints the chat title from that message's first line
+  // (spec #43 U4) — a separate route, so it must not be mistaken for, or
+  // displace, the browser-composer transitions asserted above.
+  const titleCalls = apiCalls.filter(
+    (c) => c.path === "/interface/sessions/7/title");
+  invariant(titleCalls.length === 1 && titleCalls[0].body.title === "hello",
+    `title was not minted from the acknowledged send: ${JSON.stringify(apiCalls)}`);
 
   a.halted = false;
   a.composerInput.value = "retain on reject";
@@ -1528,3 +1537,177 @@ confirm = () => true;
     result = subprocess.run(
         ["node", "-e", script], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+# ── Identity, titles, padding (spec #43 U4) ─────────────────────────────────
+
+TITLE_MINT = APP[APP.index("const IF_TITLE_MAX"):
+                 APP.index("function ifBuildComposer")]
+DOC_TITLE = APP[APP.index("let forkName ="):APP.index("function show(tab)")]
+
+
+def test_chat_title_is_minted_client_side_once_from_the_first_composer_send():
+    """The mint is the CLIENT's because the broker cannot tell a composer
+    send from a raw keystroke. Guard the properties that make it safe: it
+    fires once, derives the first line under the cap, and a failure neither
+    throws into the ack path nor pins the title so a later send can retry.
+    """
+    script = TITLE_MINT + r"""
+function invariant(ok, message) { if (!ok) throw new Error(message); }
+const calls = [];
+let nextError = null;
+globalThis.apiIf = async (path, method, body) => {
+  calls.push({ path, method, body });
+  if (nextError) throw nextError;
+  return { title: body.title };
+};
+const makeAttach = (title) => {
+  const a = { sessionId: 7, st: { title }, painted: 0 };
+  a.paint = () => { a.painted += 1; };
+  return a;
+};
+
+(async () => {
+  invariant(ifDeriveTitle("  hello world  \nsecond") === "hello world",
+    "the title must be the trimmed FIRST line");
+  invariant(ifDeriveTitle("\n\nlate first line") === "late first line",
+    "leading blank lines must not produce an empty title");
+  invariant(ifDeriveTitle("z".repeat(200)).length === 60,
+    "the 60-char cap must hold");
+  invariant(ifDeriveTitle("   ") === "" && ifDeriveTitle(undefined) === "",
+    "whitespace-only and non-string input derive nothing");
+
+  let a = makeAttach(null);
+  globalThis.ifAttach = a;
+  await ifMintTitle(a, "deploy the migration\nrest of the message");
+  invariant(calls.length === 1, `expected one mint call, got ${calls.length}`);
+  invariant(calls[0].path === "/interface/sessions/7/title" &&
+    calls[0].method === "POST", `wrong mint route: ${JSON.stringify(calls[0])}`);
+  invariant(calls[0].body.title === "deploy the migration",
+    `wrong minted title: ${calls[0].body.title}`);
+  invariant(a.st.title === "deploy the migration" && a.painted === 1,
+    "the sender's own header must update locally at mint time");
+
+  await ifMintTitle(a, "a totally different second message");
+  invariant(calls.length === 1,
+    "a session that already has a title must never call the mint again");
+
+  a = makeAttach(null);
+  globalThis.ifAttach = a;
+  await ifMintTitle(a, "   \n  ");
+  invariant(calls.length === 1,
+    "a message with no derivable first line must not be sent to the server");
+  invariant(a.st.title === null, "a blank message must not pin a title");
+
+  nextError = new Error("network down");
+  await ifMintTitle(a, "first attempt");
+  invariant(calls.length === 2, "a failing mint must still have been tried");
+  invariant(a.st.title === null,
+    "a failed mint must leave the title unset so the next send retries");
+  nextError = null;
+  await ifMintTitle(a, "second attempt");
+  invariant(a.st.title === "second attempt",
+    "the mint must self-heal on the next message");
+
+  const stale = makeAttach(null);
+  globalThis.ifAttach = makeAttach(null);   // operator moved to another pane
+  await ifMintTitle(stale, "landed too late");
+  invariant(stale.st.title === null && stale.painted === 0,
+    "a mint that resolves after the operator moved on must not paint");
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_failed_title_mint_never_blocks_the_ack_path():
+    """ifMintTitle is called from the input_ack handler, which also clears
+    the composer and flushes output. Awaiting it there would stall that
+    handler behind a slow or failing title call."""
+    assert "ifMintTitle(a, a.composerPendingText);" in APP
+    ack = APP[APP.index('case "input_ack":'):APP.index('case "input_reject":')]
+    assert "ifMintTitle" in ack
+    assert "await ifMintTitle" not in ack, (
+        "the ack handler must not await the mint — a slow or failing title "
+        "call would stall clearing the composer and flushing output")
+
+
+def test_tab_titles_name_the_view_and_the_fork():
+    script = DOC_TITLE + r"""
+function invariant(ok, message) { if (!ok) throw new Error(message); }
+const NAV = { interface: "Interface", roadmap: "Roadmap", shells: "Shells" };
+globalThis.document = {
+  title: "",
+  querySelector: (sel) => {
+    const tab = sel.match(/data-tab="([^"]+)"/)[1];
+    return NAV[tab] ? { textContent: NAV[tab] } : null;
+  },
+};
+globalThis.ifSelected = null;
+
+forkName = "super-coder";
+setDocumentTitle("roadmap");
+invariant(document.title === "Roadmap · super-coder", document.title);
+setDocumentTitle("interface");
+invariant(document.title === "Interface · super-coder", document.title);
+ifSelected = "DEV4";
+setDocumentTitle("interface");
+invariant(document.title === "DEV4 · super-coder", document.title);
+setDocumentTitle("shells");
+invariant(document.title === "Shells · super-coder",
+  "a selected shell must not leak into another tab's title: " + document.title);
+
+// /health has not answered (or failed): name the view, never guess a fork.
+forkName = "";
+setDocumentTitle("interface");
+invariant(document.title === "DEV4", document.title);
+
+// An unknown tab still yields a title rather than "undefined".
+forkName = "super-coder";
+ifSelected = null;
+setDocumentTitle("mystery");
+invariant(document.title === "mystery · super-coder", document.title);
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "subfloor — review" not in APP
+    assert "setDocumentTitle(tab);" in APP
+
+
+def test_title_is_not_added_to_the_rail_signature():
+    """ifRailSig is a field WHITELIST driving the 5s repaint. The rail does
+    not display chat titles this round, so adding the field would repaint the
+    rail on every first message for nothing — and re-render the pane (dropping
+    the xterm attach and writer lease) whenever the selected shell's changed.
+    """
+    sig = APP[APP.index("function ifRailSig"):
+              APP.index("function ifStopRailPoll")]
+    assert "s.title" not in sig        # s.sprint_title is a different field
+    assert "s.launch_effort" not in sig
+
+
+def test_header_identity_segment_truncates_instead_of_wrapping():
+    assert 'el("div", { className: "if-identity" })' in APP
+    assert "[sel.display_name, sel.shortname, st.title]" in APP
+    identity = CSS[CSS.index(".if-identity {"):CSS.index(".if-inline-actions")]
+    assert "min-width: 0" in identity
+    assert "text-overflow: ellipsis" in identity
+    assert "white-space: nowrap" in identity
+
+
+def test_terminal_card_carries_no_dead_chrome_below_the_last_row():
+    """The QAQC annotation's 14px: the card's own bottom padding plus the
+    pane's row-gap. Both must be gone, and the row estimate must subtract the
+    padding that actually remains — leaving it at 12 would silently hand back
+    6px of the space this unit reclaimed."""
+    term = CSS[CSS.index(".if-term {"):CSS.index(".if-term .xterm")]
+    assert "padding: 6px 6px 0;" in term
+    assert "padding: 6px;" not in term
+    assert ".if-term + .if-composer { margin-top: -.5rem; }" in CSS
+    assert "Math.floor((h - 6) / 17)" in APP
+    assert "Math.floor((h - 12) / 17)" not in APP
