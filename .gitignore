@@ -64,6 +64,12 @@
 /db_backups/
 /shared/
 
+# The live_model opencode fixture is a real WAL-mode database, so even a
+# READ-ONLY open re-creates these two side files on every test run. The .db
+# itself is tracked (it is the fixture); these are run artifacts.
+/tests/fixtures/live_model/opencode/opencode.db-wal
+/tests/fixtures/live_model/opencode/opencode.db-shm
+
 # Python / tooling
 __pycache__/
 *.pyc

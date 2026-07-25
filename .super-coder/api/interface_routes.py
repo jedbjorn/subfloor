@@ -62,6 +62,7 @@ import interface_hooks  # noqa: E402
 import interface_recovery  # noqa: E402
 import interface_state  # noqa: E402
 import interface_wake  # noqa: E402
+import live_model  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
 
@@ -617,6 +618,53 @@ def _worktree_for(shortname: str, flavor: "str | None" = None) -> str:
     return str(run_mod.shell_work_dir(shortname, flavor))
 
 
+# The shape when we do not probe at all. `none` (not `unsupported`) is
+# deliberate: `unsupported` is a claim ABOUT THE HARNESS — that it cannot
+# express a per-message model — and we have no standing to make it when the
+# engine simply does not know which harness is running (a shell with no managed
+# session). Nothing to report is `none`.
+_NO_LIVE_MODEL = {"live_model": None, "live_model_at": None,
+                  "live_model_verdict": "none"}
+
+
+def _live_model(con, harness, session_id, *, worktree=None, shortname=None,
+                flavor=None) -> dict:
+    """The live-model projection for one shell/session (spec doc 44).
+
+    Truthful CURRENT model, read from the harness transcript, beside — never
+    instead of — the launch route: `model_route` says what the session was
+    started with, these say what it is answering with now. Decision #55 keeps
+    them separate fields with separate meanings.
+
+    `worktree` when the caller holds the session's own recorded cwd (the
+    sessions route); `shortname`+`flavor` when it must be derived the way the
+    CLI boot derives it (the shells route).
+
+    Never raises. This runs once per rail row on a 5s poll, so a single
+    unreadable transcript costs one field, not the whole shells response. The
+    guard covers input resolution as well as the read: a shell with a flavor
+    `shell_work_dir` cannot place must not 500 the rail either.
+    """
+    if not harness:
+        return dict(_NO_LIVE_MODEL)
+    try:
+        if worktree is None:
+            worktree = _worktree_for(shortname, flavor)
+        since = None
+        if session_id is not None:
+            r = con.execute("SELECT last_human_input_at FROM "
+                            "interface_input_state WHERE session_id=?",
+                            (session_id,)).fetchone()
+            since = r[0] if r else None
+        res = live_model.probe(harness, worktree, active_since=since, log=_log)
+    except Exception as e:  # noqa: BLE001 — the route must survive any drift
+        _log(f"live_model: probe failed for {harness}/{shortname or worktree}: {e!r}")
+        return dict(_NO_LIVE_MODEL)
+    return {"live_model": res["last_model"],
+            "live_model_at": res["live_model_at"],
+            "live_model_verdict": res["verdict"]}
+
+
 def _resolved_launch_route(con, flavor: str | None, requested_harness,
                            requested_model) -> tuple[str, "str | None"]:
     """Resolve the effective harness/model before reserving a generation."""
@@ -987,6 +1035,7 @@ def _get_session(session_id: int):
             "clients": (runtime_state or {}).get("attached_clients", 0),
             "alerts": _alert_count(con, session_id),
             **client_state,
+            **_live_model(con, row[4], session_id, worktree=row[6]),
         })
     finally:
         con.close()
@@ -1019,7 +1068,10 @@ def _list_shells():
                         "default_model":
                             launch_default.get("default_model"),
                         "wake_state": _wake_state(
-                            con, planner_shell_id=shell_id), **proj})
+                            con, planner_shell_id=shell_id), **proj,
+                        **_live_model(con, proj.get("harness"),
+                                      proj.get("session_id"),
+                                      shortname=shortname, flavor=flavor)})
         return _json(200, {"shells": out})
     finally:
         con.close()

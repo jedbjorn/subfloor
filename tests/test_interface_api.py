@@ -320,9 +320,16 @@ class InterfaceApiTest(unittest.TestCase):
 
     def test_model_surfaces_stay_the_launch_route_across_a_switch_back(self):
         # Launched on fable, ran opus, switched back to opus's predecessor and
-        # back again: the sweep cannot express that, so neither surface may
-        # derive a "current" model from it. `model_route` — the launch route,
-        # named as such — stays the only model-bearing field on both.
+        # back again: the SWEEP cannot express that (flag #136 — its schema
+        # degenerates to parser insertion order), so no surface may derive a
+        # "current" model from it.
+        #
+        # Spec doc 44 added live_model/_at/_verdict beside model_route, and
+        # that makes this guard sharper rather than obsolete: those fields read
+        # the harness TRANSCRIPT, never session_token_usage. This fixture has
+        # sweep rows and no transcript, so the probe must come back empty. If
+        # anyone ever wires live_model to the sweep to "fill it in", the rows
+        # below are exactly an A->B->A and this goes red.
         session_id = self.occupy()
         self.set_route(session_id, "fable")
         self.sweep_switch_back()
@@ -339,7 +346,14 @@ class InterfaceApiTest(unittest.TestCase):
         session_model_keys = sorted(
             k for k in (*shell, *detail)
             if "model" in k and not k.startswith("default_"))
-        self.assertEqual(set(session_model_keys), {"model_route"})
+        self.assertEqual(
+            set(session_model_keys),
+            {"model_route", "live_model", "live_model_at",
+             "live_model_verdict"})
+        for surface in (shell, detail):
+            self.assertIsNone(surface["live_model"])
+            self.assertIsNone(surface["live_model_at"])
+            self.assertNotEqual(surface["live_model_verdict"], "ok")
 
     def test_interface_json_is_never_served_cacheable(self):
         """Freshness (spec #43 U3, gate follow-up): these responses carried no
