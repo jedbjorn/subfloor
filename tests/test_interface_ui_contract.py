@@ -1729,3 +1729,184 @@ def test_terminal_card_carries_no_dead_chrome_below_the_last_row():
     assert "padding: 6px 6px 0;" in term
     assert "padding: 6px;" not in term
     assert ".if-term + .if-composer { margin-top: -.5rem; }" in CSS
+
+
+# ── spec #43 U5 — the live-model badge ───────────────────────────────────────
+# The display consumer of the feature #17 probe. The whole unit is one claim
+# and its boundary: say the observed model where a transcript actually recorded
+# one, and say nothing new anywhere else.
+
+LIVE_BADGE_SETUP = RAIL_POLL_SETUP + r"""
+const occupied = (extra = {}) => shellRow("S3", "occupied",
+  { harness: "kimi", model_route: "k3-coder", ...extra });
+const subOf = (root) => all(railOf(root), (n) =>
+  n.className === "if-row-sub")[0];
+// The hover lives on the model span, not on the row: reading it off the row
+// would pass even if the label carried no title at all.
+const hoverOf = (sub) => (sub.children.find((c) => c && c.title) || {}).title;
+const paint = async (extra) => {
+  serveShells([occupied(extra)]);
+  const root = new FakeElement("div");
+  await renderInterface(root);
+  ifStopRailPoll();
+  const sub = subOf(root);
+  return { text: sub.textContent, hover: hoverOf(sub) };
+};
+const FRESH = { live_model: "k3-coder-0711",
+  live_model_at: "2026-07-25T12:41:03Z", live_model_verdict: "ok" };
+"""
+
+
+def test_rail_badge_claims_a_live_model_only_on_a_fresh_explicit_reading():
+    """The unit's entire contract, as a matrix over the probe's verdict.
+
+    `ok` + an explicit id is the ONLY state that may say `(live)`; every other
+    verdict falls back to today's launch label, hover included. Text and hover
+    are asserted as two separate properties — a test pinning only the text
+    would pass with a badge that claims a live model and explains nothing.
+    """
+    run_recovery_js(LIVE_BADGE_SETUP + r"""
+// 1. A fresh explicit reading — the one case that may claim the live model.
+const live = await paint(FRESH);
+invariant(live.text.includes("K3 CODER 0711 (live)"),
+  `a fresh reading never reached the badge: ${live.text}`);
+invariant(!live.text.includes("(launched)"),
+  `the badge claimed live and launched at once: ${live.text}`);
+invariant(live.hover.includes("2026-07-25T12:41:03Z"),
+  `the hover named no observation time: ${live.hover}`);
+invariant(live.hover.includes("kimi transcript"),
+  `the hover named no source for the reading: ${live.hover}`);
+
+// 2. No probe fields at all — a server that never shipped feature #17, and
+//    the state every non-occupied rail row is in. Today's label, untouched.
+const bare = await paint();
+invariant(bare.text.includes("K3 CODER (launched)"),
+  `the launch label did not survive an absent probe: ${bare.text}`);
+invariant(bare.hover.includes("launched with"),
+  `the launch hover did not survive an absent probe: ${bare.hover}`);
+
+// 3. Every other verdict falls back — including one this code has never
+//    heard of, because the fallback is gated on `ok` positively.
+for (const verdict of ["stale", "none", "unsupported", "some-future-verdict"]) {
+  const r = await paint({ ...FRESH, live_model_verdict: verdict });
+  invariant(r.text === bare.text,
+    `verdict ${verdict} changed the badge text: ${r.text}`);
+  invariant(r.hover === bare.hover,
+    `verdict ${verdict} changed the badge hover: ${r.hover}`);
+}
+
+// 4. `ok` with nothing to report is not a reading either.
+for (const model of [null, ""]) {
+  const r = await paint({ ...FRESH, live_model: model });
+  invariant(r.text === bare.text,
+    `an empty live_model still claimed a live badge: ${r.text}`);
+}
+""")
+
+
+def test_a_stale_reading_never_paints_its_model_name_as_live():
+    """The fail direction that matters, on its own.
+
+    A stale reading is one the session has already moved past, so naming it
+    would be the surface asserting a model the harness may have switched away
+    from — the exact claim decision #55 forbids. Falling back is not enough:
+    the stale id must not appear on the rail in ANY form.
+    """
+    run_recovery_js(LIVE_BADGE_SETUP + r"""
+const stale = await paint({ ...FRESH, live_model_verdict: "stale" });
+invariant(!stale.text.includes("(live)"),
+  `a stale reading was labelled live: ${stale.text}`);
+invariant(!stale.text.includes("K3 CODER 0711") &&
+          !stale.text.includes("0711"),
+  `the stale model id was painted on the rail anyway: ${stale.text}`);
+invariant(stale.text.includes("K3 CODER (launched)"),
+  `a stale reading did not fall back to the launch route: ${stale.text}`);
+invariant(!stale.hover.includes("0711") &&
+          !stale.hover.includes("2026-07-25T12:41:03Z"),
+  `the stale reading leaked into the hover: ${stale.hover}`);
+""")
+
+
+def test_the_hover_never_invents_an_observation_time_it_does_not_have():
+    """`live_model_at` is the transcript's own clock and can be absent on a
+    perfectly good reading. The hover then says so — it must not fall back to
+    render time (a claim about the harness nobody observed) nor print the
+    missing value into the copy."""
+    run_recovery_js(LIVE_BADGE_SETUP + r"""
+const r = await paint({ ...FRESH, live_model_at: null });
+invariant(r.text.includes("K3 CODER 0711 (live)"),
+  `a missing clock suppressed a good reading: ${r.text}`);
+invariant(!r.hover.includes("null") && !r.hover.includes("undefined"),
+  `the hover printed the missing timestamp: ${r.hover}`);
+invariant(r.hover.includes("no observation time"),
+  `the hover did not state that the time is missing: ${r.hover}`);
+invariant(r.hover.includes("kimi transcript"),
+  `the hover dropped the source with the time: ${r.hover}`);
+""")
+
+
+def test_a_live_model_change_repaints_the_badge_without_rebuilding_the_pane():
+    """The membership property, behaviourally: `ifRailSig` is a whitelist, so
+    a live_model that is not in it repaints NOTHING on the 5s poll — the badge
+    would sit on the first model the session ever reported. And it must repaint
+    the rail ONLY: the selected shell stays occupied through a /model switch,
+    so re-rendering the pane would tear down a live terminal to change a word.
+    """
+    run_recovery_js(LIVE_BADGE_SETUP + r"""
+ifSelected = "S3";
+serveShells([occupied(FRESH)]);
+const root = new FakeElement("div");
+await renderInterface(root);
+const text = () => subOf(root).textContent;
+invariant(text().includes("K3 CODER 0711 (live)"), `first paint: ${text()}`);
+
+let rendered = 0;
+renderInterface = async () => { rendered += 1; };
+
+// An in-harness /model switch: same availability, a new observed model.
+serveShells([occupied({ ...FRESH, live_model: "k3-turbo" })]);
+await ifPollRail();
+invariant(text().includes("K3 TURBO (live)"),
+  `the switch never reached the badge — live_model is not in ifRailSig: ${text()}`);
+invariant(rendered === 0,
+  "a model switch re-rendered the pane and would drop the live terminal");
+
+// And the fallback direction repaints too: the reading going stale is a
+// badge change even though the model id is unchanged.
+serveShells([occupied({ ...FRESH, live_model: "k3-turbo",
+  live_model_verdict: "stale" })]);
+await ifPollRail();
+invariant(text().includes("K3 CODER (launched)"),
+  `a reading going stale left the live badge up — live_model_verdict is not `
+  + `in ifRailSig: ${text()}`);
+invariant(rendered === 0, "the fallback re-rendered the pane");
+ifStopRailPoll();
+""")
+
+
+def test_the_observation_clock_is_kept_out_of_the_rail_signature():
+    """The counterpart to the title whitelist test above. The two text-bearing
+    fields are in; `live_model_at` is hover-only and moves on every assistant
+    message, so in the signature it would rebuild the rail every few seconds
+    for the entire time a shell is working — dropping rail-button focus and
+    slamming the mobile dropdown shut, which is what the signature compare
+    exists to prevent."""
+    sig = APP[APP.index("function ifRailSig"):
+              APP.index("function ifStopRailPoll")]
+    assert "s.live_model," in sig
+    assert "s.live_model_verdict" in sig
+    assert "s.live_model_at" not in sig
+
+
+def test_both_rail_display_sites_read_one_model_decision():
+    """The desktop row and the mobile picker must never disagree about which
+    claim the surface is making — one helper, two consumers. Pinned in source
+    because the picker's option text is a string the DOM harness above reads
+    only as part of a longer line."""
+    rail = APP[APP.index("function ifBuildRail"):
+               APP.index("// ── Rail poll")]
+    assert "const model = s.availability === \"occupied\"" in rail
+    assert "ifModelDisplay(s)" in rail
+    assert rail.count("ifModelDisplay(") == 1      # one decision, not two
+    assert "ifLaunchedDisplay(" not in rail        # never the launch route direct
+    assert "model ? \" · \" + model.text : \"\"" in rail

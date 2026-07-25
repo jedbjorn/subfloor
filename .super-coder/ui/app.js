@@ -2215,14 +2215,50 @@ function ifModelLabel(route) {
 // /model switch never reaches the engine — so it is labelled as the launch
 // route and never rendered as a claim about the live model. The analytics sweep
 // cannot supply the live one either: its rows carry one model per session-wide
-// window, so they cannot express switch order (flag #136). Deriving a truthful
-// current model is a feature #17 follow-up, not something this surface guesses.
+// window, so they cannot express switch order (flag #136).
 const IF_LAUNCHED_TITLE =
   "the route this session was launched with — not necessarily the model it is "
   + "running now, since an in-harness /model switch never reaches the engine";
 
 function ifLaunchedDisplay(route) {
   return { text: ifModelLabel(route) + " (launched)", title: IF_LAUNCHED_TITLE };
+}
+
+// The truthful current model, when a transcript actually recorded one: the
+// feature #17 probe (`live_model` / `live_model_at` / `live_model_verdict`,
+// server-side) read the last main-thread assistant message and says which model
+// answered it. That is a real observation, so the badge may state it — decision
+// #55 is honored here, not superseded: the label still only ever claims what a
+// transcript recorded, and everything short of that keeps the launch label.
+//
+// The `ok` verdict is required POSITIVELY rather than excluding the known bad
+// ones. `stale`, `none` and `unsupported` are today's other verdicts, but a
+// verdict this code has never heard of must fall back to the launch route too —
+// the failure direction that matters is never claiming live what is not.
+function ifLiveDisplay(s) {
+  if (!s || s.live_model_verdict !== "ok" || !s.live_model) return null;
+  // The hover carries the provenance the badge itself has no room for: what was
+  // read and when. `live_model_at` is the transcript's own clock and can be
+  // absent even on a good reading, which is said plainly rather than papered
+  // over with the time we rendered at — that would be a claim about the harness
+  // we did not observe.
+  const observed = s.live_model_at
+    ? "observed " + s.live_model_at
+    : "the transcript recorded no observation time";
+  return {
+    text: ifModelLabel(s.live_model) + " (live)",
+    title: "the model this session answered with last, read from the "
+      + (s.harness ? s.harness + " transcript" : "session transcript")
+      + " — " + observed,
+  };
+}
+
+// One decision point for every site that shows a session's model: the observed
+// model where the probe has a fresh explicit one, the launch route everywhere
+// else. Two call sites read it (rail row, mobile picker) and they must never
+// disagree about which claim the surface is making.
+function ifModelDisplay(s) {
+  return ifLiveDisplay(s) || ifLaunchedDisplay(s.model_route);
 }
 
 // The sprint a working shell is on, from the archive's sprint_ref (server-side
@@ -2296,18 +2332,16 @@ function ifBuildRail(rail, picker, shells) {
     if (s.alerts > 0)
       head.append(el("span", { className: "pill if-badge bad",
         title: s.alerts + " current alert(s)" }, "⚠ " + s.alerts));
-    const launched = s.availability === "occupied"
-      ? ifLaunchedDisplay(s.model_route)
-      : null;
+    const model = s.availability === "occupied" ? ifModelDisplay(s) : null;
     const sub = el("div", { className: "if-row-sub" },
       s.shortname + (s.harness ? " · " + s.harness : ""));
-    if (launched)
-      sub.append(el("span", { title: launched.title }, " · " + launched.text));
+    if (model)
+      sub.append(el("span", { title: model.title }, " · " + model.text));
     sub.append(ifSprintSuffix(s));
     row.append(head, sub);
     row.onclick = () => { location.hash = "interface/" + s.shortname; };
     rail.append(row);
-    const mobileModel = launched ? " · " + launched.text : "";
+    const mobileModel = model ? " · " + model.text : "";
     const opt = el("option", { value: s.shortname },
       `${s.display_name || s.shortname} · ${s.shortname}` +
       `${s.harness ? " · " + s.harness : ""}${mobileModel}` +
@@ -2334,9 +2368,23 @@ function ifBuildRail(rail, picker, shells) {
 const IF_POLL_MS = 5000;
 let ifPoll = null;
 
+// The whitelist below is what makes a payload field repaint anything: a field
+// the signature ignores can change every tick and the rail will never rebuild.
+// `live_model` and `live_model_verdict` are in because both change the badge's
+// TEXT — a /model switch, or a reading going stale and the badge falling back
+// to the launch label.
+//
+// `live_model_at` is deliberately OUT. It moves on every assistant message, so
+// in the signature it would rebuild the rail every few seconds for the whole
+// time a shell is working — dropping focus from a rail button and slamming a
+// mobile picker's open dropdown shut, the exact two harms the signature compare
+// exists to prevent. The cost is that the hover's observation time can lag
+// while the model itself is unchanged; that under-states how fresh a reading is
+// and never over-states it, which is the safe direction for this badge.
 function ifRailSig(shells) {
   return JSON.stringify(shells.map((s) => [s.shortname, s.availability, s.alerts,
-    s.harness, s.model_route, s.sprint_ref, s.sprint_title, s.display_name]));
+    s.harness, s.model_route, s.sprint_ref, s.sprint_title, s.display_name,
+    s.live_model, s.live_model_verdict]));
 }
 
 function ifStopRailPoll() {
