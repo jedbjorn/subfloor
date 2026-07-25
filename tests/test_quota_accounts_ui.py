@@ -348,10 +348,14 @@ def test_a_real_zero_percent_still_draws_a_measured_zero():
 
 # ── per-provider status list ─────────────────────────────────────────────────
 
-def test_na_provider_renders_no_card_at_all():
-    """A missing credential file is not a limit of zero — it is no card. Asserted
-    against a payload where another provider IS configured, so "renders nothing"
-    cannot pass by the whole section being empty."""
+def test_na_provider_with_no_registry_row_renders_no_card_at_all():
+    """A missing credential file is not a limit of zero — and with nothing in the
+    registry for that provider there is nothing to show, so it is no card.
+    Asserted against a payload where another provider IS configured, so "renders
+    nothing" cannot pass by the whole section being empty.
+
+    The narrow case: no registry row. When a row DOES exist the card survives —
+    the two tests below are the other half, and neither is safe alone."""
     r = run_js("""
       const r0 = root(); anDrawAccounts(r0, PAYLOAD);
       out({ groups: texts(byClass(r0, "an-prov-head")), cards: byClass(r0, "an-acct").length,
@@ -364,6 +368,67 @@ def test_na_provider_renders_no_card_at_all():
     assert r["groups"] == ["Claudeanthropic"]
     assert r["cards"] == 1
     assert "Codex" not in r["body"] and "Kimi" not in r["body"]
+
+
+def test_na_provider_keeps_its_registry_card_muted_with_refresh_disabled():
+    """The credential file is removed WITHOUT switching accounts (spec 49, "the
+    registry and the status list can disagree"). The row keeps is_current, and
+    is_current is exempt from the 7-day filter, so this card would otherwise
+    render forever — unmuted, looking live, with a refresh that provably cannot
+    change it, while the same response reports the provider `na`.
+
+    Both failure directions are asserted here, because they are each other's
+    cure: filtering the card out (direction 1) throws away the last account this
+    host saw, and rendering it live (direction 2) is the button-that-lies shape
+    this unit already refused on the Codex exception. Passing needs the card to
+    EXIST and to be visibly last-known."""
+    r = run_js("""
+      const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+      const cards = byClass(r0, "an-acct");
+      const btn = buttons(cards[0]).filter((b) => cls(b).includes("act"))[0];
+      out({ cards: cards.length, groups: texts(byClass(r0, "an-prov-head")),
+            muted: cls(cards[0]).includes("an-muted"),
+            disabled: btn.disabled, title: btn.title, onclick: btn.onclick !== null,
+            pct: texts(byClass(cards[0], "an-win-pct")), body: cards[0].textContent });
+    """, payload(
+        accounts=[account(is_current=1,
+                          windows=[window(pct=61.0, captured_at=iso(hours=-3))])],
+        providers=[{"provider": "anthropic", "status": "na", "detail": None}]))
+    # direction 1 — the registry row survives the status disagreeing with it.
+    assert r["cards"] == 1 and r["groups"] == ["Claudeanthropic"]
+    assert r["pct"] == ["61%"]          # last known values kept, not blanked
+    # direction 2 — and it does not present as live.
+    assert r["muted"] is True
+    assert r["disabled"] is True and r["onclick"] is False
+    assert "credential file" in r["title"]
+    assert "snapshot 3h ago" in r["body"]
+
+
+def test_na_is_reported_as_observed_not_inferred_as_a_sign_out():
+    """`na` means the engine could not read a credential file — which is a
+    different fact from an account the operator switched away from, and from a
+    token the provider rejected. Rendering all three with one string would be an
+    inference about WHY, and the operator may simply be mid-login.
+
+    Asserted by rendering all three and comparing, so reusing one wording for
+    another fails: an assertion that `na` merely "says something" would pass
+    against exactly the collapse this pins."""
+    def body(accounts, providers):
+        return run_js("""
+          const r0 = root(); anDrawAccounts(r0, PAYLOAD);
+          out({ body: byClass(r0, "an-acct")[0].textContent });
+        """, payload(accounts=accounts, providers=providers))["body"]
+
+    na = body([account(is_current=1)],
+              [{"provider": "anthropic", "status": "na", "detail": None}])
+    unauth = body([account(is_current=1)],
+                  [{"provider": "anthropic", "status": "unauth", "detail": "expired"}])
+    switched = body([account(is_current=0, last_seen=iso(days=-2))],
+                    [{"provider": "anthropic", "status": "ok", "detail": None}])
+
+    assert "no readable credential file" in na
+    assert "not signed in" not in na and "signed out" not in na
+    assert na != unauth and na != switched
 
 
 def test_error_before_identification_still_renders_a_card_with_its_status():

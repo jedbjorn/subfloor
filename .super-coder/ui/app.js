@@ -2123,8 +2123,18 @@ async function anTokenSection(root) {
 //
 // Provider state comes from the response's per-provider status list, NEVER
 // inferred from the accounts array: an empty array is both "nothing configured"
-// and "every probe failed", and those render differently (na = no card at all,
-// error = a card carrying the HTTP status).
+// and "every probe failed", and those render differently (na with no registry
+// row = no card, error = a card carrying the HTTP status).
+//
+// 3. WHERE THE REGISTRY AND THE STATUS LIST DISAGREE, THE STATUS GOVERNS WHAT
+//    IS SEEN AND THE REGISTRY KEEPS WHAT IS KNOWN. The registry says what was
+//    true as of the last successful probe; the status says what is true now.
+//    Remove a credential file without switching accounts and the row keeps
+//    is_current — which is exempt from the 7-day filter — so the card would
+//    render forever, unmuted and live-looking, while the same response reports
+//    that provider `na`. The card is muted and its refresh disabled instead;
+//    the row is never filtered out and never mutated, because clearing
+//    is_current on a transiently unreadable file would demote a real account.
 const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kimi" };
 // Display order for a card's windows. Unrecognized kinds sort last rather than
 // being dropped — the probe stores a window it could not map under its raw
@@ -2211,14 +2221,21 @@ function anAccountCard(acct, prov, onRefresh) {
   const status = prov ? prov.status : null;
   // unauth is the current account with a dead token: last known values, muted,
   // with their age — the same treatment a signed-out account gets, for the same
-  // reason (the numbers are real, they are just not now).
-  const muted = !current || status === "unauth";
+  // reason (the numbers are real, they are just not now). `na` joins them from
+  // a third direction: the row still says is_current, but the credential file
+  // it named is not readable now, so the numbers are equally last-known.
+  const muted = !current || status === "unauth" || status === "na";
   const card = el("div", { className: "card an-acct" + (muted ? " an-muted" : "") });
 
   const head = el("div", { className: "an-acct-head" });
   head.append(el("span", { className: "an-acct-label" }, acct.account_label || acct.account_ref));
   if (acct.plan) head.append(el("span", { className: "pill" }, acct.plan));
   if (!current) head.append(el("span", { className: "pill" }, "not signed in"));
+  // What was OBSERVED, not what it implies. "not signed in" would be an
+  // inference about why the file is gone — the operator may be mid-login, or
+  // the file may simply be unreadable — and the engine did not see a sign-out.
+  else if (status === "na") head.append(el("span", { className: "pill warn" },
+    "no readable credential file — last known"));
   else if (status === "unauth") head.append(el("span", { className: "pill warn" }, "signed out — last known"));
   else if (status === "error") head.append(el("span", { className: "pill warn" },
     "error" + (prov.detail ? " · " + prov.detail : "")));
@@ -2242,6 +2259,12 @@ function anAccountCard(acct, prov, onRefresh) {
   if (!current) {
     refresh.disabled = true;
     refresh.title = "signed out — this account's token is gone, so it cannot be re-probed";
+  } else if (status === "na") {
+    // Same inert-button shape, reached from the status side rather than the
+    // registry side: there is no credential file to read, so a probe fired
+    // from here provably cannot change this card either.
+    refresh.disabled = true;
+    refresh.title = "no readable credential file — a probe cannot reach this account now";
   } else {
     refresh.onclick = () => onRefresh(refresh);
   }
@@ -2276,13 +2299,20 @@ function anDrawAccounts(root, d) {
   root.append(head);
 
   // Provider order follows the status list (the dispatcher's own order), then
-  // any provider present only in the registry. `na` — no credential file — is
-  // dropped entirely: the absence of a limit is not a limit of zero, and the
-  // spec's edge table says no card for that provider.
+  // any provider present only in the registry.
+  //
+  // `na` — no credential file readable now — is dropped ONLY when the registry
+  // has nothing for it: the absence of a limit is not a limit of zero, so a
+  // provider this host has never seen gets no card. When a registry row DOES
+  // exist the card stays and renders muted (see anAccountCard): the status
+  // governs how the row is drawn, never whether the row is believed. Filtering
+  // it out would throw away the last account this host actually saw.
   const statusOf = new Map(providers.map((p) => [p.provider, p]));
+  const known = new Set(accounts.map((a) => a.provider));
   const groups = new Map();
   for (const name of [...providers.map((p) => p.provider), ...accounts.map((a) => a.provider)]) {
-    if (groups.has(name) || statusOf.get(name)?.status === "na") continue;
+    if (groups.has(name)) continue;
+    if (statusOf.get(name)?.status === "na" && !known.has(name)) continue;
     groups.set(name, { name, prov: statusOf.get(name) || null, accounts: [] });
   }
   for (const a of accounts) groups.get(a.provider)?.accounts.push(a);

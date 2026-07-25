@@ -8,7 +8,7 @@ pinned, whatever the suite's colour says.
 
     python3 tests/mutations/u4_quota_accounts_ui.py [-v]
 
-Asked per PROPERTY, not per test. Three of this unit's rules have TWO failure
+Asked per PROPERTY, not per test. Four of this unit's rules have TWO failure
 directions each, and a one-directional leg is satisfied by a fix that merely
 trades the bug for its mirror image — the shape U2's reviewer caught mid-sprint:
 
@@ -18,8 +18,13 @@ trades the bug for its mirror image — the shape U2's reviewer caught mid-sprin
   * the seven-day note: M16 renders it on every page, M17 on none. "Never an
     empty page" and "not a note nobody reads" are different requirements living
     in one condition.
-  * muted: M13 drops the signed-out half, M14 drops the unauth half. One
-    condition, two independent reasons a card is not current.
+  * muted: M13 drops the signed-out half, M14 drops the unauth half, M29 drops
+    the `na` half. One condition, three independent reasons a card is not live.
+  * the registry disagreeing with the status (spec 49): M29/M30 render an `na`
+    card as live, M31 is the mirror that HIDES it. Hiding also stops the card
+    lying, so the pair is what forbids the cheap fix — the registry row is what
+    makes first_seen and account-switch survival work, and dropping it on a
+    permissions blip loses the last account this host actually saw.
 
 M6 is the one that matters most and the one a percent-only suite cannot see: it
 colours from a provider's status rather than from used_percent. Every threshold
@@ -45,7 +50,8 @@ SUITE = "tests/test_quota_accounts_ui.py"
 THRESHOLDS = ('const anQuotaClass = (pct) => pct == null ? "" : '
               'pct >= 95 ? " red" : pct >= 80 ? " amber" : "";')
 FILL_GUARD = "  if (pct != null) {"
-MUTED = '  const muted = !current || status === "unauth";'
+MUTED = '  const muted = !current || status === "unauth" || status === "na";'
+NA_GROUP_GATE = '    if (statusOf.get(name)?.status === "na" && !known.has(name)) continue;'
 WINS = "  const wins = [...(acct.windows || [])].sort((a, b) => anWindowRank(a) - anWindowRank(b));"
 GROUP_ORDER = ("  for (const name of [...providers.map((p) => p.provider), "
                "...accounts.map((a) => a.provider)]) {")
@@ -110,11 +116,12 @@ MUTATIONS = [
         "  for (const name of accounts.map((a) => a.provider)) {",
     ),
     (
-        "M8 `na` stops being skipped — a missing credential file renders a "
-        "card, which is the absence of a limit shown as a limit",
-        "na_provider_renders_no_card",
-        '    if (groups.has(name) || statusOf.get(name)?.status === "na") continue;',
-        "    if (groups.has(name)) continue;",
+        "M8 `na` stops being skipped even with nothing in the registry — a "
+        "provider this host has never seen renders a card, which is the "
+        "absence of a limit shown as a limit",
+        "na_provider_with_no_registry_row",
+        NA_GROUP_GATE,
+        "    if (false) continue;",
     ),
     (
         "M9 a NULL percent draws its bar anyway — labelled n/a, drawn as a "
@@ -149,14 +156,14 @@ MUTATIONS = [
         "full emphasis, reading as live",
         "non_current_account",
         MUTED,
-        '  const muted = status === "unauth";',
+        '  const muted = status === "unauth" || status === "na";',
     ),
     (
         "M14 muted loses the unauth half — an expired token's last-known "
         "numbers render as if they were measured now",
         "unauth_keeps_last_known",
         MUTED,
-        "  const muted = !current;",
+        '  const muted = !current || status === "na";',
     ),
     (
         "M15 the card's age comes from last_seen rather than the newest "
@@ -262,6 +269,42 @@ MUTATIONS = [
         "failed_refresh",
         "    btn.disabled = false;\n    btn.textContent = label;",
         "    void label;",
+    ),
+    # ── the registry/status disagreement (spec 49 §"can disagree") ────────────
+    # Four legs, because the ruling is a BALANCE and every single-leg fix trades
+    # one failure for the other. M29 is the pre-ruling source exactly as it
+    # shipped in the first push of #605 — it is here so the regression cannot
+    # come back quietly.
+    (
+        "M29 muted loses the `na` half — the credential file is gone but the "
+        "card renders at full emphasis, which is the pre-ruling behaviour",
+        "na_provider_keeps_its_registry_card",
+        MUTED,
+        '  const muted = !current || status === "unauth";',
+    ),
+    (
+        "M30 refresh stays enabled on an `na` card — the button-that-lies "
+        "shape arriving from the status side instead of the registry side",
+        "na_provider_keeps_its_registry_card",
+        '  } else if (status === "na") {',
+        "  } else if (false) {",
+    ),
+    (
+        "M31 the `na` group is dropped whenever the provider reports it, not "
+        "only when the registry is empty — the account the host last saw is "
+        "thrown away on a permissions blip. The MIRROR of M29/M30: a fix that "
+        "merely hides the card also stops it lying, and this leg refuses it",
+        "na_provider_keeps_its_registry_card",
+        NA_GROUP_GATE,
+        '    if (statusOf.get(name)?.status === "na") continue;',
+    ),
+    (
+        "M32 `na` reuses the sign-out wording — the panel infers WHY the file "
+        "is missing instead of reporting what was observed, and an operator "
+        "mid-login is told they signed out",
+        "reported_as_observed",
+        '    "no readable credential file — last known"));',
+        '    "signed out — last known"));',
     ),
 ]
 
