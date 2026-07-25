@@ -331,6 +331,40 @@ class OpenAIProbeTest(ProbeCase):
         self.assertEqual(acct["windows"], [])
         self.assertEqual([n for n in self.notes if "drift" in n], [])
 
+    def test_an_additional_rate_limits_that_is_not_a_list_is_drift(self):
+        """The same rule moonshot's `limits` obeys: no legitimate-empty
+        reading exists for the wrong TYPE under a key the normalizer
+        iterates. Skipping it silently reports `ok` while every scoped
+        window vanishes — the failure shape SC-167 was blocked for."""
+        payload = fixture("openai_usage.json")
+        payload["rate_limit"]["additional_rate_limits"] = {"premium": {
+            "used_percent": 3.0}}
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the two intact windows must not "
+                         "ship as if they were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
+    def test_an_absent_or_empty_additional_rate_limits_is_data_not_drift(self):
+        """The other direction, which the guard must not over-fire on: a plan
+        with no scoped window omits the key or sends `[]`, and both readings
+        are real. The main fixture's two windows still stand."""
+        for value in (None, []):
+            with self.subTest(additional_rate_limits=value):
+                self.notes.clear()
+                payload = fixture("openai_usage.json")
+                if value is None:
+                    del payload["rate_limit"]["additional_rate_limits"]
+                else:
+                    payload["rate_limit"]["additional_rate_limits"] = value
+                acct, _ = self.probe(payload=payload)
+                self.assertEqual(acct["status"], "ok")
+                self.assertEqual({w["window_kind"] for w in acct["windows"]},
+                                 {"five_hour", "weekly"})
+                self.assertEqual([n for n in self.notes if "drift" in n], [])
+
     def test_a_200_that_is_not_a_json_object_says_so(self):
         acct, _ = self.probe(payload=["not", "an", "object"])
         self.assertEqual(acct["status"], "error")
@@ -423,6 +457,22 @@ class MoonshotProbeTest(ProbeCase):
         self.assertEqual(acct["status"], "ok")
         w = self.one(acct["windows"])
         self.assertEqual((w["window_kind"], w["used"]), ("weekly", 128000))
+        self.assertEqual([n for n in self.notes if "drift" in n], [])
+
+    def test_an_empty_usage_block_is_data_not_drift(self):
+        """The block's EMPTY direction, mirroring the absent-`limits` test:
+        `usage: {}` is present and reports nothing, so the row is all-null
+        rather than an error. Crying drift here would false-alarm exactly the
+        idle account the panel exists to reassure."""
+        payload = fixture("moonshot_usages.json")
+        payload["usage"] = {}
+        payload["limits"] = []
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "ok")
+        w = self.one(acct["windows"])
+        self.assertEqual((w["window_kind"], w["used"], w["limit_value"],
+                          w["used_percent"]), ("weekly", None, None, None),
+                         "an empty block reports nothing, it does not read 0")
         self.assertEqual([n for n in self.notes if "drift" in n], [])
 
     def test_a_limits_key_that_is_not_a_list_is_drift(self):

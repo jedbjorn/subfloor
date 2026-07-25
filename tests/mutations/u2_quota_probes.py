@@ -224,11 +224,32 @@ MUTATIONS = [
         new="    if not rate_limit or not isinstance(rate_limit, dict):",
     ),
     Mutation(
+        name="openai-wrong-typed-collection-swallowed",
+        property="a present-but-non-list additional_rate_limits is drift",
+        path=OPENAI,
+        old="    missing = _drift(rate_limit, payload)\n    if missing:",
+        new="    missing = _drift(rate_limit, payload)\n    if False:",
+    ),
+    Mutation(
+        name="openai-empty-collection-cried-as-drift",
+        property="an absent or empty additional_rate_limits is data, not drift",
+        path=OPENAI,
+        old="        if extra is not None and not isinstance(extra, list):",
+        new="        if not isinstance(extra, list):",
+    ),
+    Mutation(
         name="moonshot-lost-usage-parsed-as-zero",
         property="a 200 with no usage{} is error, not an ok reading zero",
         path=MOONSHOT,
         old='    if not isinstance(payload.get("usage"), dict):',
         new="    if False:",
+    ),
+    Mutation(
+        name="moonshot-empty-usage-cried-as-drift",
+        property="an intact but empty usage{} is data, never a false alarm",
+        path=MOONSHOT,
+        old='    if not isinstance(payload.get("usage"), dict):',
+        new='    if not payload.get("usage"):',
     ),
     Mutation(
         name="moonshot-absent-limits-cried-as-drift",

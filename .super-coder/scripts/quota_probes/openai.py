@@ -50,6 +50,23 @@ def _window_row(entry, captured_at: str, log, scope=None,
                   captured_at=captured_at, probe_version=PROBE_VERSION)
 
 
+def _drift(rate_limit: dict, payload: dict) -> "str | None":
+    """What the normalizer cannot trust, or None when the envelope is intact.
+
+    `additional_rate_limits` is a COLLECTION, and moonshot's asymmetry applies
+    unchanged: absent or `[]` is a real answer (a plan with no scoped window),
+    so erroring on it would cry wolf at an idle account. A present-but-wrong
+    TYPE has no such reading — the type is part of the envelope (spec #49), and
+    silently skipping it would vanish every scoped window while reporting `ok`.
+    Both containers are checked because the reader coalesces across them.
+    """
+    for container in (rate_limit, payload):
+        extra = container.get("additional_rate_limits")
+        if extra is not None and not isinstance(extra, list):
+            return f"additional_rate_limits is {type(extra).__name__}, not a list"
+    return None
+
+
 def _windows(rate_limit: dict, payload: dict, captured_at: str, log) -> list[dict]:
     rows = []
     for key in ("primary_window", "secondary_window"):
@@ -110,6 +127,11 @@ def probe(log, timeout) -> list[dict]:
         # response having changed shape under us.
         return result(status="error", **common, detail=drift(
             HARNESS_PROVIDER, "no rate_limit{} in the usage payload", log))
+
+    missing = _drift(rate_limit, payload)
+    if missing:
+        return result(status="error", **common,
+                      detail=drift(HARNESS_PROVIDER, missing, log))
 
     return result(plan=payload.get("plan_type"), **common,
                   windows=_windows(rate_limit, payload, captured_at, log))
