@@ -92,18 +92,37 @@ class HarnessEpochDockerfile(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.text = (ENGINE / "Dockerfile").read_text()
+        sys.path.insert(0, str(ENGINE / "scripts"))
+        import install as install_mod  # noqa: PLC0415 — engine scripts are path-loaded
+        # The harness set, from the one place that owns it — the same dict the
+        # Dockerfile's header comment says to keep these installers in sync with.
+        # Selecting by NAME, never by installer hostname: matching a bare domain
+        # substring is the url-sanitization anti-pattern CodeQL flags, and it
+        # would silently stop finding a layer the day a vendor moves its host.
+        cls.harness_names = tuple(install_mod.HARNESS_INSTALL)
+
+    def folded(self) -> str:
+        """The Dockerfile with line continuations joined, so each instruction is
+        one line and a position comparison is a comparison of instructions."""
+        return self.text.replace("\\\n", " ")
 
     def harness_runs(self) -> list[str]:
-        """The two RUN instructions that install harness CLIs, line
-        continuations folded, so a reference can be found anywhere inside."""
-        folded = self.text.replace("\\\n", " ")
-        return [line for line in folded.splitlines()
-                if line.startswith("RUN ") and "install" in line
-                and ("claude.ai" in line or "code.kimi.com" in line)]
+        """The RUN instructions that install harness CLIs — one line each."""
+        return [line for line in self.folded().splitlines()
+                if line.startswith("RUN ") and "curl" in line
+                and any(name in line for name in self.harness_names)]
 
     def test_both_harness_layers_exist(self):
         self.assertEqual(len(self.harness_runs()), 2,
                          "expected the kimi RUN and the claude/opencode/codex/vibe RUN")
+
+    def test_every_harness_the_engine_installs_is_baked(self):
+        """A harness added to HARNESS_INSTALL but not to the image would be
+        absent from every sandbox while `./sc install` reported it present."""
+        baked = " ".join(self.harness_runs())
+        for name in self.harness_names:
+            with self.subTest(harness=name):
+                self.assertIn(name, baked)
 
     def test_every_harness_layer_references_the_epoch(self):
         """Declaring the ARG near a RUN is not enough — docker only reliably
@@ -114,8 +133,11 @@ class HarnessEpochDockerfile(unittest.TestCase):
                 self.assertIn("SC_HARNESS_EPOCH", run)
 
     def test_epoch_arg_is_declared_before_the_layers_it_expires(self):
-        arg_at = self.text.index("ARG SC_HARNESS_EPOCH")
-        first_harness_at = self.text.index("code.kimi.com")
+        """An ARG is in scope from its declaration to the end of the stage — a
+        harness RUN above it would expand the epoch to nothing and never bust."""
+        folded = self.folded()
+        arg_at = folded.index("ARG SC_HARNESS_EPOCH")
+        first_harness_at = min(folded.index(run) for run in self.harness_runs())
         self.assertLess(arg_at, first_harness_at)
 
     def test_epoch_arg_defaults_to_unrolled(self):
@@ -156,6 +178,16 @@ class ScFixture:
             shutil.copy2(ENGINE / "scripts" / script, self.scripts / script)
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
         self._write_fake_docker()
+        # Stub curl too. The no-docker branch of update-harnesses runs the real
+        # vendor installers; a regression that took that branch under docker
+        # would otherwise pipe the live internet into bash on the test machine.
+        self._write_executable("curl", """\
+            #!/bin/sh
+            printf 'curl' >> "$SC_TEST_LOG"
+            printf ' %s' "$@" >> "$SC_TEST_LOG"
+            printf '\\n' >> "$SC_TEST_LOG"
+            exit 0
+            """)
         self.env = os.environ.copy()
         self.env.update({
             "PATH": f"{self.fakebin}:{self.env['PATH']}",
@@ -169,6 +201,11 @@ class ScFixture:
 
     def close(self) -> None:
         self._tmp.cleanup()
+
+    def _write_executable(self, name: str, body: str) -> None:
+        path = self.fakebin / name
+        path.write_text(textwrap.dedent(body))
+        path.chmod(0o755)
 
     def _write_fake_docker(self) -> None:
         path = self.fakebin / "docker"
@@ -243,9 +280,13 @@ class ScHarnessCommands(unittest.TestCase):
 
     def test_update_harnesses_does_not_install_onto_the_host_when_docker_runs(self):
         """The old behavior: run the installers here, report success, change
-        nothing a shell can see. The container mounts creds, never binaries."""
+        nothing a shell can see. The container mounts creds, never binaries.
+        Asserted on the stubbed curl rather than on output text, so a regression
+        is caught by what the command TRIED to do — and cannot reach the network
+        from a test run either way."""
         result = self.fx.run("update-harnesses")
-        self.assertNotIn("claude.ai/install.sh", result.stdout)
+        self.assertEqual([c for c in self.fx.calls() if c.startswith("curl ")], [],
+                         "ran a harness installer against a host no shell can see")
         self.assertNotIn("Updating harness CLIs", result.stdout)
 
     def test_update_harnesses_names_the_restart_that_runs_them(self):
