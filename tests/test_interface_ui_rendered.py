@@ -906,7 +906,7 @@ def _assert_grid_fits(grid: dict[str, float], label: str) -> None:
     ],
 )
 def test_terminal_grid_keeps_the_last_row_visible(
-    browser, ui_url, label, css_width, css_height, zoom
+    browser, ui_url, tmp_path, label, css_width, css_height, zoom
 ):
     """The whole point of the unit: whatever the real cell turns out to be, the
     last row a harness paints is inside the card the operator can see."""
@@ -918,6 +918,11 @@ def test_terminal_grid_keeps_the_last_row_visible(
         grid = _grid(page)
         assert FINAL_OPTION in grid["lastRowText"]
         _assert_grid_fits(grid, label)
+        # The spec's bottom-edge acceptance is an eyeball, judged together with
+        # U4's padding line — so ship the pane it is judged on.
+        page.locator(".if-pane").screenshot(
+            path=str(_artifact(tmp_path, f"interface-grid-{label}.png"))
+        )
     finally:
         context.close()
 
