@@ -1,22 +1,44 @@
----
-name: sprint_orchestration
-description: Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Wake ops are provider-neutral: arm the binding before the first wake, monitor `sc sprint status`/`alerts`, retry parks as NEW gated batches (never resubmit), close releases bindings and cancels queued wake work. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.
-category: craft
-common: false
----
+-- 0099 — forward-reseed sprint_orchestration: the fault protocol must confirm
+-- the WORKER's state, not the task row's, and a planner must never task a
+-- worker with "ask the FnB".
+--
+-- Flag #200: both "Worker faulted mid-task" and "Link gone quiet" read a task
+-- row's READ/UNREAD state as a runtime fact about consumption, and prescribed a
+-- re-boot when it read unread. Marking read is a MANUAL RECIPIENT ACTION, so
+-- read_at records worker discipline, not system state -- READ is real evidence,
+-- UNREAD carries no information at all and cannot separate "never received"
+-- from "received and building hard". The skill used it in the direction where
+-- it means nothing, and the prescribed remedy is the destructive one: a re-boot
+-- of a worker holding an uncommitted tree can destroy the unit. Both passages
+-- now require a POSITIVE second check before any boot, worktree before mailbox.
+--
+-- Flag #199: routing a worker's human-held dependency through "ask the FnB"
+-- sends it down a channel the operator does not read, and it presents as a
+-- stalled worker rather than an unreachable human. Step 2 now names it an
+-- anti-pattern with the two ways to write the task instead.
+--
+-- UPSERT by name so skill_id + grants survive.
 
-# sprint_orchestration — governing a coordinated multi-shell push
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_orchestration',
+  'Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Wake ops are provider-neutral: arm the binding before the first wake, monitor `sc sprint status`/`alerts`, retry parks as NEW gated batches (never resubmit), close releases bindings and cancels queued wake work. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_orchestration — governing a coordinated multi-shell push
 
 The FnB declares *that* a sprint happens; you make it run: decompose the
 push into units, sequence who builds on whom, assign a reviewer to every
-unit, interview the FnB for the sprint's models, boot each worker when its
+unit, interview the FnB for the sprint''s models, boot each worker when its
 turn comes, watch the event stream, unblock stalls, close out with a
 report. The participant loop (build → PR + watch → CI → sprint review →
 merge on green+clean → hand off, plus the reviewer slot) = the `sprint`
 skill — devs and reviewers run it; you run this.
 
 The skills meet at one artifact, the **sprint doc**: your declaration
-turns the participants' scoped authority ON (dev merge-on-green+clean,
+turns the participants'' scoped authority ON (dev merge-on-green+clean,
 reviewer direct handoffs); your close-out turns it OFF.
 
 **The sprint is event-driven — nobody polls on a schedule.** Every
@@ -26,7 +48,7 @@ with the watcher daemon, which sends you `pr_event` rows. Your inbox
 watcher wakes you the moment any row lands. Workers are ephemeral,
 per-task sessions; you are the one long-lived context in the loop — you
 manage, you never load code. The full trail replays with
-`SELECT * FROM shell_messages WHERE kind != 'shell' ORDER BY created_at`.
+`SELECT * FROM shell_messages WHERE kind != ''shell'' ORDER BY created_at`.
 
 ## Step 1: Declare the sprint
 
@@ -35,19 +57,19 @@ dependency order stingily: a dependency edge = a real code dependency, not
 a preference. Keep chains short and the graph wide where the code allows.
 
 **Then check MERGE SURFACE, which is a different question from dependency.**
-Predict each unit's file set and compute the pairwise intersection. Logical
+Predict each unit''s file set and compute the pairwise intersection. Logical
 independence does NOT imply merge independence: units that need none of each
-other's code still collide if they edit the same files, and that collision
+other''s code still collide if they edit the same files, and that collision
 lands at merge time, after every review is done.
 
 - Empty intersection → genuinely parallel; say so.
 - Non-empty → either sequence them, or declare them parallel **with the merge
   protocol and the overlap map attached at kickoff** so reviewers know from the
   start that their verdicts are SHA-bound.
-- A file touched by **three or more** units → reconsider the cut, don't just
+- A file touched by **three or more** units → reconsider the cut, don''t just
   manage the merges.
 
-Record overlap in the board's `depends on` column. A bare dash means only "no
+Record overlap in the board''s `depends on` column. A bare dash means only "no
 logical dependency" and is read as "independent" — which is how one sprint
 declared five units independent while 21 of their 30 file-touches landed on
 nine shared files, three of them touched by three units apiece. The cost was a
@@ -56,7 +78,7 @@ hand-resolved conflict. Surfaces that concentrate a lot of behaviour into a few
 large files make this the normal case, not the exception.
 
 Assign each unit a dev shell + a reviewer shell (one reviewer may gate
-several units — don't let one reviewer become the whole sprint's
+several units — don''t let one reviewer become the whole sprint''s
 bottleneck).
 
 **How many shells to deploy = your call, not a formula.** Weigh the
@@ -91,11 +113,11 @@ the chosen harness exactly:
 
 # Anthropic / Claude: exit 0 = plan; 10 = API key; 11 = unknown auth.
 claude auth status --json 2>/dev/null |
-  python3 -c 'import json,sys
+  python3 -c ''import json,sys
 try: s=json.load(sys.stdin)
 except Exception: print("billing=unknown"); raise SystemExit(11)
 key=s.get("apiKeySource"); plan=s.get("loggedIn") and s.get("authMethod") == "claude.ai" and s.get("apiProvider") == "firstParty" and s.get("subscriptionType") and not key
-print("billing=plan source=claude.ai" if plan else ("billing=api source=" + str(key) if key else "billing=unknown")); raise SystemExit(0 if plan else (10 if key else 11))'
+print("billing=plan source=claude.ai" if plan else ("billing=api source=" + str(key) if key else "billing=unknown")); raise SystemExit(0 if plan else (10 if key else 11))''
 ```
 
 Exit 0 + `billing=plan` -> launch normally. Exit 10 -> hold and ask the FnB to
@@ -151,7 +173,7 @@ sc models resolve <reviewers-harness> <reviewers-model>
 Each must return `route:` plus an exact `call:` ending in `--effort high`.
 Failure means the selector is not locally callable, the harness lacks a
 headless/high-effort seam, or Refresh models has not seen it. Run
-`sc models list <harness>` for the local choices; the FnB's **Refresh models**
+`sc models list <harness>` for the local choices; the FnB''s **Refresh models**
 button in `/#shells` repopulates the same runtime table. Resolve again after a
 refresh. Never silently fall back across a provider or lineage.
 
@@ -189,14 +211,14 @@ Note the returned `document_id` — every task and report references it —
 and embed `SPRINT doc=<id> governing` in your own `current_state`; drop
 it at close-out.
 
-You are the doc's only writer: devs report transitions as `result` rows;
+You are the doc''s only writer: devs report transitions as `result` rows;
 fold them into the board with `sc mem doc edit <id> --body-file`.
 
 **Verify every board edit.** A scripted edit whose pattern has drifted silently
 matches nothing and reports success. Assert the target text exists before
 replacing, then read the doc back and confirm the fields actually changed. One
 sprint reported unit statuses to the FnB for four turns off a board where three
-edits had no-op'd — a merged unit still read `building` and a whole row was
+edits had no-op''d — a merged unit still read `building` and a whole row was
 missing — until a REVIEWER noticed the board contradicted the SHA in its own task
 row. You cannot report from memory and call it the board.
 
@@ -208,7 +230,7 @@ task (it blocks until any message row lands for you, then exits — the
 exit is your wake-up):
 
 ```
-./sc watch inbox        # background it via your harness's background-task tool
+./sc watch inbox        # background it via your harness''s background-task tool
 ```
 
 **Interactive sessions only.** A harness background task is
@@ -219,7 +241,7 @@ row boots you again. The watcher belongs to the long-lived interactive
 planner seat, nowhere else.
 
 Re-arm it every time you finish draining your inbox. On other harnesses
-the watcher isn't available — check your inbox at every task boundary
+the watcher isn''t available — check your inbox at every task boundary
 instead; correctness is identical, latency degrades gracefully. (Strong
 recommendation, not a gate: the planner seat runs best on claude/Fable —
 the one long-lived, low-volume, high-leverage context in the loop, and
@@ -230,7 +252,7 @@ load the `sprint` skill + the slot), then boot whoever can start:
 
 ```
 # devs — unit, dependencies, reviewer:
-sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. Depends on unit <k> (<shell>); <shell'> depends on you; <reviewer> reviews you. Load the sprint skill and take your slot; your merge closes with the unit report. First move: <start now | build locally, wait for unit <k>>." --kind task
+sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. Depends on unit <k> (<shell>); <shell''> depends on you; <reviewer> reviews you. Load the sprint skill and take your slot; your merge closes with the unit report. First move: <start now | build locally, wait for unit <k>>." --kind task
 
 # reviewers — assigned units, the severity bar:
 sc mem message send <reviewer> "SPRINT <doc-id>: you review units <seq,seq> — Major/Medium block, Low goes to the report. Load the sprint skill (reviewer slot). Review requests come to you directly as units go green." --kind task
@@ -239,22 +261,22 @@ sc mem message send <reviewer> "SPRINT <doc-id>: you review units <seq,seq> — 
 ./sc run <dev> --harness <devs-harness> -m <devs-model> --effort high
 ```
 
-`./sc run` renders the shell's boot doc and drains its inbox
+`./sc run` renders the shell''s boot doc and drains its inbox
 non-interactively — the `task` row you just sent is what it acts on. The
 default prompt is exactly that ("check your inbox and act"); pass
-`-p` only to say something the task row doesn't. A shell with a live
+`-p` only to say something the task row doesn''t. A shell with a live
 session refuses to boot (one shell, one session) — a live session reads
 the same `task` row at its next inbox check.
 
 Keep `task` bodies model-neutral and constraint-explicit: point at the
-sprint doc, the unit, the spec, and the skill — don't restate them in
+sprint doc, the unit, the spec, and the skill — don''t restate them in
 your own phrasing. Constraints live in specs, which every lineage reads
 the same way.
 
 **Never task a worker with "ask the FnB".** A human-held dependency — a
 credential, a token, a browser action, a decision only the operator can make
 — routed through a worker is routed through a channel the operator does not
-read: browser entry into a `working` shell does not work, and the FnB's
+read: browser entry into a `working` shell does not work, and the FnB''s
 settled preference is to relay through a planner already in conversation
 rather than enter a shell at all (flag #199). The worker asks, nobody
 answers, and it presents as a stalled worker rather than an unreachable
@@ -263,12 +285,12 @@ the task instead, both of which keep the dependency off the worker:
 
 - **Satisfy it before booting.** Capture the artifact yourself, sanitize it,
   leave it in `shared/` and point the task row at the file. That is what
-  closed #199's live case, and it is the pattern to reuse.
+  closed #199''s live case, and it is the pattern to reuse.
 - **Sequence it to a gate the operator is already attending** — a kickoff, a
   merge decision, a close-out — so the ask reaches the FnB through you.
 
-This kickoff activates each dev's scoped merge authority and each
-reviewer's direct-handoff authority for its assigned units.
+This kickoff activates each dev''s scoped merge authority and each
+reviewer''s direct-handoff authority for its assigned units.
 
 ## Step 3: Monitor the event stream
 
@@ -276,7 +298,7 @@ Your watcher wakes you on every row. On wake, drain the inbox and act:
 
 - **`result` rows** (dev/reviewer transitions — pr-open, in-review,
   review-clean, merged, ambiguity calls, stall reports): fold into the
-  board, then move whatever it unblocks. A dev's merge arrives as its
+  board, then move whatever it unblocks. A dev''s merge arrives as its
   **unit report** (the one multi-line `result` row — shipped /
   judgements / issues / deviations / follow-ups): file it whole; it is
   a primary source for the sprint report, and its `deviations` +
@@ -286,7 +308,7 @@ Your watcher wakes you on every row. On wake, drain the inbox and act:
 - **`pr_event` rows** (daemon ground truth — checks green/red, review
   submitted, merged, closed): the wake-up for transitions no worker is
   live to report. Green on an in-review unit -> nothing (the reviewer
-  gate holds); red -> re-task the unit's dev (`task` row + `./sc run`);
+  gate holds); red -> re-task the unit''s dev (`task` row + `./sc run`);
   merged -> boot the downstream dev whose turn it is.
 - Mark rows read as you fold them; then **re-arm the watcher**.
 
@@ -299,7 +321,7 @@ the message is the wake-up.
 At any moment, be able to answer: which link is the bottleneck? The board
 is what the FnB and any rebooted shell reads to re-orient mid-sprint —
 fold every state change in as it happens. The board + message table ARE
-the sprint's state: a rebooted planner replays the rows and loses
+the sprint''s state: a rebooted planner replays the rows and loses
 nothing.
 
 Messages are your steering wheel: a headless boot drains the inbox first
@@ -312,7 +334,7 @@ update the board to match.
 long build has few step starts, so a ruling issued mid-build routinely arrives
 after the work it was meant to change. Staleness runs BOTH ways: the worker is
 also reporting against a snapshot of you that has moved, so it may tell you that
-you don't know something you ruled on half an hour ago.
+you don''t know something you ruled on half an hour ago.
 
 Phrase instructions to live workers **idempotently** — "if you have not already
 X, do X" — and state the **observed facts** they rest on ("main is at X", "the
@@ -324,7 +346,7 @@ reasoned from the facts. A fourth, phrased as a bare directive, would have
 destroyed a record had it been obeyed literally.
 
 **Never delegate a mutation by an identifier the tool does not take.** Give the
-tool's identifier and the human label together — "close flag_id 141 (SC-144)" —
+tool''s identifier and the human label together — "close flag_id 141 (SC-144)" —
 and prefer mutating your own records yourself. Display names and row ids sit in
 different counters that can overlap in range, so a name-only instruction can
 resolve to a different real row and destroy it while reporting success.
@@ -340,15 +362,15 @@ reconstructed at close-out from old messages are calls lost.
 Provider-neutral operator workflow for the wake machinery — identical on
 every harness (claude / codex / kimi); there are no provider-specific
 steps. The operator surfaces are `sc sprint status` / `alerts` / `retry`
-and the Interface tab's Sprint wake panel; both read the same API
+and the Interface tab''s Sprint wake panel; both read the same API
 projection. None of it is scheduled polling — they are on-demand reads of
 durable state, and the events still wake you.
 
-- **Arm before the sprint's first wake.** Once your Interface chat is
+- **Arm before the sprint''s first wake.** Once your Interface chat is
   live, start one arm attempt by generating an attempt nonce once:
 
   ```sh
-  arm_attempt_id="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  arm_attempt_id="$(python3 -c ''import secrets; print(secrets.token_hex(16))'')"
   ```
 
   Retain that value until the attempt ends, then arm the binding with the
@@ -364,7 +386,7 @@ durable state, and the events still wake you.
   Reuse that exact caller-stable key only for retries of this arm attempt,
   including after an ambiguous transport failure. A successful release or a
   conclusive refusal ends the attempt. Generate a new `arm_attempt_id` for
-  every later arm or re-arm; reusing a released attempt's key would replay its
+  every later arm or re-arm; reusing a released attempt''s key would replay its
   released binding and leave the sprint unarmed. Never generate a timestamp or
   random value separately for each transport retry. A shell may arm only
   itself; the operator may arm any planner. Arming is fail-closed: a frozen or
@@ -374,14 +396,14 @@ durable state, and the events still wake you.
 - **Monitor wake status.** `./sc sprint status` shows binding
   armed/released, the sprint doc ACTIVE/frozen, the derived wake state
   (armed/queued/submitting/running/parked), the current batch, the last
-  wake outcome, and the park/quarantine reason. The Interface tab's
+  wake outcome, and the park/quarantine reason. The Interface tab''s
   Sprint wake panel on your session shows the same projection.
 - **Read the alerts.** `./sc sprint alerts` (+ the Interface alert
   panel) is the ONLY window into wake failures — session-loss,
   delivery_unknown parks, pre-send retries exhausted, quarantine,
   unmanaged-writer. Alerts are deduplicated while open; an open critical
   alert means the loop is NOT healthy no matter how quiet the inbox
-  looks. Investigate the alert before concluding a stall is a shell's
+  looks. Investigate the alert before concluding a stall is a shell''s
   fault.
 - **Retry a park — never resubmit it.** A parked (`delivery_unknown`)
   batch is never sent again: the parking invariant is law.
@@ -409,7 +431,7 @@ Needed whenever any two units share a file. Declare it in the kickoff `task`
 rows so reviewers know their verdicts are SHA-bound before they spend a pass.
 
 1. Before merging, check whether anything merged since the head was cut touches
-   THIS unit's files. Overlapping -> rebase onto current `origin/main`, confirm
+   THIS unit''s files. Overlapping -> rebase onto current `origin/main`, confirm
    checks green on the **rebased** head, report that SHA. Empty intersection ->
    the head stands; say so with the evidence and merge. Do not rebase reflexively:
    with disjoint file sets a rebase is ceremony that costs a CI cycle and buys
@@ -419,7 +441,7 @@ rows so reviewers know their verdicts are SHA-bound before they spend a pass.
 3. Merge order is review-clean order unless you state otherwise.
 
 **A reviewer verdict is bound to the exact SHA it was given.** The carry-over
-rule: a verdict carries when the unit's **own contribution is diff-identical**
+rule: a verdict carries when the unit''s **own contribution is diff-identical**
 and its hunks are **disjoint** from the incoming content — NOT when the reviewed
 files are byte-identical. File-identity conflates "did my reviewed change
 survive?" (answered exactly by diff-identity) with "did anything else touch this
@@ -444,13 +466,13 @@ Stalls and the moves:
   per the `sprint` skill): pair another shell onto it / re-scope the
   unit / pull the failing part into a follow-up unit so the chain moves.
 - **Anomalous red** (flaky test, runner death, `main` red underneath — the
-  dev's job was to rerun and report, not patch healthy code): fix the
+  dev''s job was to rerun and report, not patch healthy code): fix the
   cause as its own unit, or hold the chain while infra recovers; rule by
-  `task` row when the dev may proceed. Don't count phantom reds against
-  the dev's fix attempts — and don't let anyone merge over one; green
+  `task` row when the dev may proceed. Don''t count phantom reds against
+  the dev''s fix attempts — and don''t let anyone merge over one; green
   means green.
 - **Unit growing past scope**: split it — the piece downstream needs ships
-  first; the rest becomes a new unit at the chain's tail.
+  first; the rest becomes a new unit at the chain''s tail.
 - **Merge broke `main`**: `task` row to all devs to hold merges, insert a
   fix unit at the front of the chain, resume when green.
 - **Review stall** (unit sitting `in-review` while its reviewer is idle):
@@ -464,8 +486,8 @@ Stalls and the moves:
   died): re-launching alone may drain an inbox the worker already drained,
   leaving it idle on the default prompt — a re-boot is not a re-task. So
   re-send the task row (same unit, plus where the work stopped and what is
-  already on the branch), *then* `./sc run`. But **confirm the WORKER's
-  state before you boot, not the row's** — and check the WORKTREE before the
+  already on the branch), *then* `./sc run`. But **confirm the WORKER''s
+  state before you boot, not the row''s** — and check the WORKTREE before the
   mailbox, because that check is the one that can save the unit:
 
   ```
@@ -478,11 +500,11 @@ Stalls and the moves:
   A branch that exists, modified files, or commits ahead of base means the
   worker consumed its task and is building, whatever the mailbox says.
   **Do not re-boot it.** A re-boot of a worker holding an uncommitted tree
-  can destroy the unit's work — flag #200 is a planner one step from exactly
+  can destroy the unit''s work — flag #200 is a planner one step from exactly
   that, over a tree carrying a whole half-built unit, saved only by looking
   at the worktree instead of acting on the signal in front of it. Need that
   worker to move? Send an idempotent `task` row and let it land at the
-  worker's next step start.
+  worker''s next step start.
 
   Read receipts are trustworthy in ONE direction only, and the fault
   protocol is where that bites:
@@ -505,7 +527,7 @@ Stalls and the moves:
   stream -> boot it with its declared sprint route — `./sc run <shortname>
   --harness <role-harness> -m <role-model> --effort high` drains its inbox and
   acts; that IS the nudge in an event-driven sprint. Re-send the task row
-  first, since the worker may have drained it already and the row's read
+  first, since the worker may have drained it already and the row''s read
   state cannot tell you whether it did. The liveness guard refusing (session
   already live) + still silent -> escalate to the FnB with the worktree state.
   The bottleneck question in Step 3 is what surfaces a dead link.
@@ -519,14 +541,14 @@ Stalls and the moves:
   switch is theirs), resume where the board says you stopped.
 - **CI queue clogged at the tail**: a queued verify whose commit a later
   stack head already supersedes is pure queue time — cancel it (`gh run
-  cancel`) and let the head's run stand for the stack. Cancelling
+  cancel`) and let the head''s run stand for the stack. Cancelling
   anything to protect a measurement run is allowed but logged: rationale
   in the board or a `result` row, and re-run the cancelled check after.
   Green means green — cancellation never substitutes for a verdict on
   what still needs one.
 - **Judgment calls** (scope vs. deadline, cutting a unit, changing an
   interface another team reads): escalate to the FnB immediately — the one
-  stall you can't unblock yourself.
+  stall you can''t unblock yourself.
 
 You boot workers; the daemon never does (it only writes rows), and the
 FnB is only pulled in for judgment. Autonomous wake stays a deliberate
@@ -539,7 +561,7 @@ When every unit is `merged` and `main` is green:
 1. **Run the conformance pass — before the freeze.** "All units merged"
    and "the spec shipped" are different claims; this is where the second
    one gets checked. Boot review shell(s) — reviewer lineage, the
-   sprint's reviewer harness/model; one shell by default, shard by spec
+   sprint''s reviewer harness/model; one shell by default, shard by spec
    section only when the spec genuinely exceeds one context:
 
    ```
@@ -557,7 +579,7 @@ When every unit is `merged` and `main` is green:
    that spec. Decision-driven units — no spec doc, built from a decision or a
    flag — cannot be judged by it, and a verdict that appears to bless them is a
    false certification. Their bar is their unit reports, their reviewer verdicts
-   at exact heads, and the mutation round trips. Put the split in the report's
+   at exact heads, and the mutation round trips. Put the split in the report''s
    Verdict so freezing cannot be read as certifying everything. Assign the pass
    to a reviewer that did NOT review the unit being certified, and hand over any
    DECLARED deviation up front so the pass judges whether the declaration is
@@ -569,17 +591,17 @@ When every unit is `merged` and `main` is green:
      the freeze — a reopened sprint re-grants nothing); re-run the pass
      scoped to the fix when it merges.
    - **Medium** -> your judgment: fix unit now, or defer with the FnB
-     told explicitly in the report's Verdict.
+     told explicitly in the report''s Verdict.
    - **Low** -> Deferred & Follow-ups; never holds the close.
 2. Set `status: CLOSED` in the body, then freeze:
    `sc mem doc freeze <doc-id>`. Freezing IS the revocation — a frozen or
    `CLOSED` sprint doc is exactly what the `sprint` skill checks before
-   any merge; every participant's scoped authority ends with it.
+   any merge; every participant''s scoped authority ends with it.
 3. Message every participant (`task` row): sprint closed, default merge
    gates resume.
-4. Verify the watches are gone: `./sc watch list` — every sprint PR's
+4. Verify the watches are gone: `./sc watch list` — every sprint PR''s
    watch retired itself at merge/close; a survivor means an unmerged PR
-   or a mis-registered watch — resolve it, don't leave it. Then stop
+   or a mis-registered watch — resolve it, don''t leave it. Then stop
    re-arming your inbox watcher (a running one just times out — it holds
    no authority and wakes nothing that matters).
 5. Write the sprint report — one `documents` row, the durable record:
@@ -589,7 +611,7 @@ When every unit is `merged` and `main` is green:
    ```
 
    Fixed skeleton — fill it by **reasoning over the unit reports and the
-   conformance doc against each other** (a dev's `deviations: none`
+   conformance doc against each other** (a dev''s `deviations: none`
    meeting a `deviated-silently` finding on its unit is exactly what the
    report exists to say), not by pasting either verbatim:
 
@@ -598,20 +620,20 @@ When every unit is `merged` and `main` is green:
    | `## Verdict` | your synthesis — five-second answer: N units / N PRs, conformance state (conforms / conforms-with-deviations / gaps-found), main green, anything deferred-with-eyes-open |
    | `## Units Shipped` | the board — final table, planned vs. actual order |
    | `## Judgements Made` | unit reports (`judgements:`) + your rulings + severity disputes; every call with its final state |
-   | `## Spec Accuracy` | conformance doc — verdict table + findings, cross-checked against unit reports' `deviations:` |
+   | `## Spec Accuracy` | conformance doc — verdict table + findings, cross-checked against unit reports'' `deviations:` |
    | `## Issues Encountered` | unit reports (`issues:`) + the `pr_event`/stall trail — CI fights, anomalous reds, re-scopes, unblocks |
-   | `## Deferred & Follow-ups` | unit reports (`follow-ups:`) + reviewers' Lows + conformance Lows + anything cut — one actionable backlog, the next sprint's seed list |
+   | `## Deferred & Follow-ups` | unit reports (`follow-ups:`) + reviewers'' Lows + conformance Lows + anything cut — one actionable backlog, the next sprint''s seed list |
    | `## Spec Debt` | judgement calls that should be written back into the spec + places the spec was silent, wrong, or contradictory — the input to the spec-update pass |
    | `## Metrics` (optional) | mechanical from the trail: review cycles per unit, CI reds, boots per shell, planned vs. actual merge order |
 
-   The `kind != 'shell'` message trail remains the in-order backbone;
-   the CONFORMANCE doc stays alongside as the report's evidence trail.
+   The `kind != ''shell''` message trail remains the in-order backbone;
+   the CONFORMANCE doc stays alongside as the report''s evidence trail.
 
    Then drop a copy at the repo root: write the same body to
    `shared/SPRINT_REPORT_<slug>.md` (`mkdir -p shared` — the dir may
    not exist yet). Message the FnB: sprint closed, report at doc
    `<id>` + the `shared/` file.
-6. Settle the bookkeeping — close the sprint's flags, advance roadmap /
+6. Settle the bookkeeping — close the sprint''s flags, advance roadmap /
    feature status, note docs-pending.
 
 ## Stance
@@ -622,15 +644,23 @@ When every unit is `merged` and `main` is green:
 - Zero scheduled polling by any shell: rows wake you, you boot workers,
   watches retire themselves. A scheduled tracker anywhere in the sprint
   is a defect.
-- Local long work rides `./sc job` (see the `sprint` skill) — a job's
+- Local long work rides `./sc job` (see the `sprint` skill) — a job''s
   completion is a `result` row like any other wake-up. A hand-rolled
-  nohup/poll waiter anywhere in the sprint is a defect: one sprint's
+  nohup/poll waiter anywhere in the sprint is a defect: one sprint''s
   hand-rolled waiter carried a self-match bug that masked a dead bench.
 - You manage; you never load code. Your context grows at coordination
-  density — the workers' grows at code density and is discarded per task.
+  density — the workers'' grows at code density and is discarded per task.
 - Monitor > interrogate: `pr_event` rows and `gh` reads cost no dev a
   context switch; `task` rows are for changing behavior.
 - The conformance shell files verdicts, never rulings — Major/Medium/Low
-  routing stays yours; what the sprint *means* stays the FnB's.
+  routing stays yours; what the sprint *means* stays the FnB''s.
 - Escalate judgment, absorb mechanics: re-sequencing and worker boots are
-  yours; changing what the sprint *means* is the FnB's.
+  yours; changing what the sprint *means* is the FnB''s.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
