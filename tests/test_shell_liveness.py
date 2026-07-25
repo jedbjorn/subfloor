@@ -271,13 +271,18 @@ class NamespaceAwareTtyTest(unittest.TestCase):
 
     def _proc(self, td: str, *, tty=TTY, ns_has_tty=True, ns_readable=True,
               tty_nr=34816, ppid=4242) -> Path:
-        """A fake /proc with one pid: stat, fd/0 → tty, and root → its own
-        namespace root (which may or may not hold the tty device)."""
+        """A fake /proc with one pid: comm, stat, cwd → this repo, fd/0 → tty,
+        and root → its own namespace root (which may or may not hold the tty
+        device). comm + cwd are what let compute() pick the pid up as a live
+        session, so the same fixture serves both the seam tests below and the
+        end-to-end ones."""
         proc = Path(td) / "proc"
         entry = proc / "4242"
         (entry / "fd").mkdir(parents=True)
+        entry.joinpath("comm").write_text("kimi-code\n")
         entry.joinpath("stat").write_text(
             f"4242 (kimi-code) S {ppid} 4242 4242 {tty_nr} -1 0 0 0\n")
+        entry.joinpath("cwd").symlink_to(shell_liveness.REPO_ROOT)
         entry.joinpath("fd", "0").symlink_to(tty)
         if ns_readable:
             ns_root = Path(td) / "nsroot"
@@ -349,6 +354,35 @@ class NamespaceAwareTtyTest(unittest.TestCase):
             with mock.patch.object(shell_liveness, "PROC", proc):
                 self.assertEqual("detached",
                                  shell_liveness._orphan_verdict(4242))
+
+    def _snapshot(self, **kw) -> dict:
+        """compute() over the same fake /proc — the end-to-end vantage."""
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td, **kw)
+            with mock.patch.object(shell_liveness, "PROC", proc), \
+                    mock.patch.object(shell_liveness, "harness_binaries",
+                                      return_value={"kimi-code"}), \
+                    mock.patch.object(shell_liveness, "_shell_labels",
+                                      return_value={}):
+                return shell_liveness.compute()
+
+    # The two below are the only tests that pin compute()'s orphan seam. Every
+    # case above drives _orphan_verdict directly, so dropping compute()'s
+    # tty_exists argument — the pre-PR call shape, and exactly what a partial
+    # revert or conflict resolution restores — leaves them all green while
+    # silently disabling every existence-based tty-gone verdict in production.
+
+    def test_compute_reports_a_dead_pty_as_tty_gone(self):
+        snap = self._snapshot(ns_has_tty=False)
+        self.assertEqual(["tty-gone"], [p["orphaned"] for p in snap["processes"]])
+        self.assertEqual([4242], snap["orphaned_pids"])
+
+    def test_compute_leaves_a_live_container_pty_unaccused(self):
+        # Present through the process's own root, absent at the bare path: a
+        # scanner-namespace check would convict this live session here.
+        snap = self._snapshot()
+        self.assertEqual([None], [p["orphaned"] for p in snap["processes"]])
+        self.assertEqual([], snap["orphaned_pids"])
 
 
 class ZombieHarnessTest(unittest.TestCase):
