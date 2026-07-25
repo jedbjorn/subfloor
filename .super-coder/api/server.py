@@ -2789,9 +2789,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/analytics/filters":
                 return self._send(200, get_analytics_filters(con))
             if path == "/api/analytics/accounts":
-                # Arrival at #analytics-accounts. Probes only when the newest
-                # capture is older than the TTL — never at boot, never on a
-                # timer, never from the Token Analytics section.
+                # Arrival at #analytics-accounts. Probes only when this
+                # process's last probe ATTEMPT is older than the TTL — never
+                # at boot, never on a timer, never from the Token Analytics
+                # section.
                 return self._send(200, get_analytics_accounts(con))
             if path == "/api/scripts":
                 return self._send(200, {"scripts": script_list()})
