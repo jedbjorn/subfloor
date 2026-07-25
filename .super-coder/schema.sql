@@ -385,7 +385,7 @@ CREATE TABLE interface_sessions (
     -- (schema.sql + migrations both apply on rebuild — never inline).
     -- title TEXT — chat title, client-minted once from the first composer
     -- message (60-char cap, set-if-unset); launch_effort TEXT — the effort
-    -- the session was launched with, for U7's +Chat relaunch. Migration 0092.
+    -- the session was launched with, for U7's +Chat relaunch. Migration 0093.
     UNIQUE (shell_id, generation),
     FOREIGN KEY (shell_id, generation)
         REFERENCES interface_generations(shell_id, generation)

@@ -1,4 +1,4 @@
--- 0092 — chat title + launch effort on interface_sessions (spec #43 U4).
+-- 0093 — chat title + launch effort on interface_sessions (spec #43 U4).
 --
 -- Two columns, ONE migration, deliberately: U7's +Chat reuses the launch
 -- triple (harness, model_route, effort) of the session it ends, and effort
