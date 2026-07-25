@@ -3913,13 +3913,27 @@ async function ifDiagnoseVendor(a, ticket, attempt, missing) {
 // Open the sc-term.v1 stream: 0x00 output → write, 0x04 snapshot → reset+write;
 // keystrokes go out as 0x01 ‖ seq:u64be ‖ payload, one unacked frame at a time.
 function ifOpenStream(a, ticket, attempt = 0) {
+  // Named because it is both written and RETRACTED below: a note nobody can
+  // identify is a note nobody can safely clear.
+  const IF_VENDOR_WAIT_NOTE =
+    "terminal library not ready — checking the vendored scripts…";
   const missing = ["Terminal", "FitAddon"]
     .filter((g) => typeof globalThis[g] === "undefined");
   if (missing.length) {
-    a.st.note = "terminal library not ready — checking the vendored scripts…";
+    a.st.note = IF_VENDOR_WAIT_NOTE;
     a.paint();
     ifDiagnoseVendor(a, ticket, attempt, missing);
     return;
+  }
+  // The race the note describes is over — and nothing downstream repaints on a
+  // successful mount, so left standing it is permanent: a working terminal
+  // under a banner saying the library is missing, whose standing remedy is a
+  // floor restart that kills live sessions. Retract only OUR note (compare, do
+  // not blank), because between the wait and here an unrelated writer — the
+  // read-only take-over notice, a control frame — may own the line.
+  if (a.st.note === IF_VENDOR_WAIT_NOTE) {
+    a.st.note = "";
+    a.paint();
   }
   const term = new Terminal({ convertEol: false, cursorBlink: true,
     fontFamily: "ui-monospace, monospace" });

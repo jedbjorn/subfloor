@@ -252,6 +252,13 @@ class VendoredAssetTest(ServedAssetTestCase):
         self.assertEqual(headers.get("Content-Type"),
                          get_headers.get("Content-Type"))
         self.assertEqual(headers.get("ETag"), get_headers.get("ETag"))
+        # HEAD rides the GET path, conditional branch included — so the branch
+        # gets walked here rather than left to inference. (The shell's own probe
+        # fetches `no-store` and never sends the tag, but a client that holds
+        # one must not fall off the route into a 405 or a 500.)
+        conditional = self.request("HEAD", "/vendor/xterm/xterm.js",
+                                   {"If-None-Match": get_headers["ETag"]})
+        self.assertEqual((conditional[0], conditional[2]), (304, b""))
 
     def test_head_reports_a_missing_vendored_asset_as_404(self):
         """The probe's whole job: tell "served" from "not served"."""

@@ -2482,14 +2482,14 @@ class Handler(BaseHTTPRequestHandler):
         byte-identical to the text path for the current vendor set, so nothing
         re-downloads on rollout.
         """
-        hit, detail = _resolve_vendor(unquote(path[len("/vendor/"):]))
+        hit, ctype_or_reason = _resolve_vendor(unquote(path[len("/vendor/"):]))
         if hit is None:
             # Name the gate. The old two 404 shapes (JSON route-miss vs
             # `not built`) were what made the outage diagnosable at all, and a
             # per-request resolver collapses that distinction — so replace it
             # deliberately rather than losing it. Loopback-only surface: the
             # reason costs nothing and is half of what this route is for.
-            return self._send(404, detail, "text/plain")   # detail = the gate
+            return self._send(404, ctype_or_reason, "text/plain")
         data = hit.read_bytes()
         headers = {
             "Cache-Control": "no-cache",
@@ -2497,7 +2497,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         if self._if_none_match(headers["ETag"]):
             return self._not_modified(headers)
-        return self._send(200, data, detail, headers=headers)  # detail = ctype
+        return self._send(200, data, ctype_or_reason, headers=headers)
 
     def do_HEAD(self):
         """Vendored assets answer HEAD; everything else keeps the 405.

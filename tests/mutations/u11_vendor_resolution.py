@@ -111,7 +111,7 @@ MUTATIONS = [
         "M8 every rejection answers with one generic reason, so the 404 stops "
         "naming the gate",
         SERVER_SUITE, "names_the_gate", SERVER,
-        '            return self._send(404, detail, "text/plain")   # detail = the gate',
+        '            return self._send(404, ctype_or_reason, "text/plain")',
         '            return self._send(404, "not found", "text/plain")',
     ),
     (
@@ -149,7 +149,7 @@ MUTATIONS = [
         "M13 the old assertion comes back: a 404 is reported as a load race "
         "with a refresh remedy",
         UI_SUITE, "named_with_its_status or old_remedy", APP,
-        '    a.st.note = "terminal library not ready — checking the vendored scripts…";\n'
+        '    a.st.note = IF_VENDOR_WAIT_NOTE;\n'
         '    a.paint();\n'
         '    ifDiagnoseVendor(a, ticket, attempt, missing);\n'
         '    return;',
@@ -233,6 +233,33 @@ MUTATIONS = [
         '  const srcs = Array.from(document.querySelectorAll(\'script[src^="/vendor/"]\'))\n'
         '    .map((s) => s.getAttribute("src"));',
         '  const srcs = ["/vendor/xterm/xterm.js", "/vendor/xterm/addon-fit.js"];',
+    ),
+    (
+        "M24 the wait banner is never retracted — SC-168 itself: a race that "
+        "healed itself still reads `terminal library not ready` over a working "
+        "terminal, indefinitely",
+        UI_SUITE, "retracts_its_own_banner", APP,
+        '  if (a.st.note === IF_VENDOR_WAIT_NOTE) {\n'
+        '    a.st.note = "";\n'
+        '    a.paint();\n'
+        '  }\n',
+        '',
+    ),
+    (
+        "M25 the note is cleared without a repaint — st.note and the pane "
+        "disagree, and since a mount repaints nothing the operator keeps "
+        "reading the stale banner",
+        UI_SUITE, "retracts_its_own_banner", APP,
+        '    a.st.note = "";\n'
+        '    a.paint();',
+        '    a.st.note = "";',
+    ),
+    (
+        "M26 the retraction blanks unconditionally — it stops being ours to "
+        "retract and swallows whatever another writer put on the line",
+        UI_SUITE, "not_ours_survives", APP,
+        '  if (a.st.note === IF_VENDOR_WAIT_NOTE) {',
+        '  if (true) {',
     ),
 ]
 

@@ -269,6 +269,61 @@ class VendorProbeTest(unittest.TestCase):
           "reported a fault after recovering: " + a.st.note);
         """)
 
+    def test_the_resolved_race_retracts_its_own_banner(self):
+        """SC-168. The wait note is painted before every probe round and the
+        mount is the only thing that ends the wait — so if nothing retracts it,
+        the operator reads `terminal library not ready` over a terminal that is
+        working, forever. Worse than useless mid-incident: its standing remedy
+        is a floor restart, which kills live sessions.
+
+        Separate from the race test above because that one asserts the absence
+        of a FAULT report (`returned` / `did not define`), and the stale banner
+        is neither — it stayed green through the whole defect."""
+        run_js(r"""
+        const a = attach();
+        respond = async () => {
+          if (rounds() >= 2) defineGlobals();     // the deferred scripts execute
+          return { status: 200 };
+        };
+        ifOpenStream(a, "ticket-1");
+        const deadline = Date.now() + 4000;
+        while (!sockets.length && Date.now() < deadline) await sleep(20);
+        invariant(sockets.length === 1, "the attach never recovered on its own");
+        // The banner was really shown — otherwise this test proves nothing.
+        invariant(a.notes.some((n) => /checking the vendored scripts/.test(n)),
+          "the wait note was never painted, so its retraction is untested");
+        invariant(a.st.note === "",
+          "left a note standing over a working terminal: " +
+          JSON.stringify(a.st.note));
+        // The pane has to be told, not just the state: statusNoteEl is written
+        // from st.note on repaint, and a mount repaints nothing by itself.
+        invariant(a.notes[a.notes.length - 1] === "",
+          "cleared the note without repainting, so the banner stays on screen: " +
+          JSON.stringify(a.notes));
+        """)
+
+    def test_a_note_that_is_not_ours_survives_the_mount(self):
+        """The retraction compares before it clears. A blanket blanking would
+        swallow whatever the read-only/take-over path put on the line between
+        the wait and the mount — trading a false banner for a missing one."""
+        run_js(r"""
+        const a = attach();
+        respond = async () => {
+          if (rounds() >= 2) {
+            defineGlobals();
+            // Another writer owns the line by the time the retry lands.
+            a.st.note = "control was taken by another client — you are now read-only";
+          }
+          return { status: 200 };
+        };
+        ifOpenStream(a, "ticket-1");
+        const deadline = Date.now() + 4000;
+        while (!sockets.length && Date.now() < deadline) await sleep(20);
+        invariant(sockets.length === 1, "the attach never recovered on its own");
+        invariant(/read-only/.test(a.st.note),
+          "the mount blanked a note it did not write: " + JSON.stringify(a.st.note));
+        """)
+
     def test_a_probe_landing_after_the_operator_moved_on_does_nothing(self):
         """The attach can end while the HEADs are in flight, and what the dead
         attachment must not do is CONTINUE — no repaint of a pane nobody is
