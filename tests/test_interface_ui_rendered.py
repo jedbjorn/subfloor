@@ -1013,10 +1013,18 @@ HEADER_LINES = """() => {
     .map((child) => child.getBoundingClientRect())
     .filter((rect) => rect.height > 0);
   const centre = (rect) => Math.round(rect.top + rect.height / 2);
+  // The identity holds a bare text node, so a Range over its contents measures
+  // the TEXT — unclipped by the segment's overflow, and independent of the box
+  // sized around it. The distance to the controls cannot see the segment
+  // overgrow its content: the controls are the next flex items along, so they
+  // travel with it and the 16px between them never moves.
+  const range = document.createRange();
+  range.selectNodeContents(identity);
   return {
     lines: new Set([box, ...controls].map(centre)).size,
     truncated: identity.scrollWidth > identity.clientWidth,
-    gapToControls: Math.min(...controls.map((rect) => rect.left)) - box.right,
+    boxWidth: box.width,
+    textWidth: range.getBoundingClientRect().width,
   };
 }"""
 
@@ -1058,9 +1066,10 @@ def test_long_identity_truncates_without_wrapping_the_header(browser, ui_url):
         wide = page.evaluate(HEADER_LINES)
         assert wide["lines"] == 1
         assert not wide["truncated"]
-        assert wide["gapToControls"] <= 17, (
-            f"{wide['gapToControls']}px between identity and controls — the "
-            "segment grew past its text (.if-head's own gap is 16px)"
+        assert wide["boxWidth"] - wide["textWidth"] <= 1, (
+            f"a {wide['boxWidth']:.0f}px segment around "
+            f"{wide['textWidth']:.0f}px of text — it grew past its content and "
+            "shoved the controls to the far right"
         )
     finally:
         context.close()
