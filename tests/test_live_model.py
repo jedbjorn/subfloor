@@ -351,15 +351,27 @@ class Freshness(ProbeCase):
         self.assertEqual(r["verdict"], "ok")
 
     def test_the_same_instant_in_either_form_gets_the_same_verdict(self):
-        """The defect itself. One instant, one minute after the observation,
-        written the two ways the two sides of this comparison write it: the
-        verdict is a fact about time and must not depend on which."""
+        """The defect itself, and the boundary it sits on.
+
+        One instant, written the two ways the two sides of this comparison
+        write it: the verdict is a fact about time and must not depend on
+        which. Run at two shifts, because the pair only says everything at
+        both — +60s pins that `stale` can fire at all (SC-165), and 0 pins
+        WHERE it starts. `stale` means the session moved AFTER we observed it,
+        so activity at the very instant of the observation is not stale: the
+        comparison is `<`, and a `<=` survives every other test in this file
+        (REV2 L5). Same-second is the everyday case here — the observation and
+        the keystroke that produced it are one turn apart, not one minute.
+        """
         observed = self.observation()
-        verdicts = {fmt: self.probe("claude", CLAUDE_BACK,
-                                    active_since=_shift(observed, 60, fmt))
-                    ["verdict"] for fmt in (BROKER_TS, HARNESS_TS)}
-        self.assertEqual(verdicts[BROKER_TS], verdicts[HARNESS_TS], verdicts)
-        self.assertEqual(verdicts[BROKER_TS], "stale")
+        for shift, expected in ((60, "stale"), (0, "ok")):
+            verdicts = {fmt: self.probe("claude", CLAUDE_BACK,
+                                        active_since=_shift(observed, shift, fmt))
+                        ["verdict"] for fmt in (BROKER_TS, HARNESS_TS)}
+            with self.subTest(shift=shift):
+                self.assertEqual(verdicts[BROKER_TS], verdicts[HARNESS_TS],
+                                 verdicts)
+                self.assertEqual(verdicts[BROKER_TS], expected)
 
     def test_an_unreadable_active_since_asserts_no_freshness(self):
         """Absent and unparseable are the same answer — `ok` without a
@@ -498,6 +510,36 @@ class WorktreeIsolation(ProbeCase):
             src = self.probe("claude", wt)["source"]
             self.assertIn(p_claude._encode(wt) + "/", src.replace("\\", "/"))
 
+    def test_a_longer_project_dir_name_still_answers_when_the_records_say_so(self):
+        """The prefix prefilter's whole reason for existing: the dir NAME is a
+        hint, the per-record `cwd` is the fact.
+
+        A SILENT file in a longer-named dir is not ours — that dir cannot be
+        an encoding of our cwd, and `SilentTranscripts` pins it. But one whose
+        records name our cwd is ours wherever it sits, or the prefilter would
+        be matching dirs it can never act on. Real transcript bytes, placed in
+        a dir name this host has not produced — the same category as the
+        truncation and `time_updated` perturbations.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        src = FIXTURES / "claude" / "projects" / p_claude._encode(CLAUDE_TWO)
+        projects = tmp / "projects"
+        shutil.copytree(src, projects / src.name)
+        sessions = _claude_session_models(CLAUDE_TWO)
+        moved, expected = sorted(sessions.items())[0]
+        odd = projects / (src.name + "-2")
+        odd.mkdir()
+        shutil.move(str(projects / src.name / moved.name), odd / moved.name)
+        p_claude.DATA_DIR = projects
+        others = list((projects / src.name).glob("*.jsonl"))
+        self.assertTrue(others, "the pair must not both move")
+        _stamp_newest(odd / moved.name, [odd / moved.name, *others])
+
+        r = self.probe("claude", CLAUDE_TWO)
+        self.assertEqual(r["last_model"], expected)
+        self.assertTrue(r["source"].startswith(str(odd)), r["source"])
+
     def test_kimi_and_opencode_separate_worktrees(self):
         self.assertNotEqual(self.probe("kimi", KIMI_AB)["last_model"],
                             self.probe("kimi", KIMI_BACK)["last_model"])
@@ -588,6 +630,164 @@ class CurrentSessionSelection(ProbeCase):
         self.assertGreaterEqual(len(answered), 2, opencode)
         self.assertIsNotNone(opencode[-1][1], opencode)
         self.assertNotIn(opencode[-1][1], answered[:-1], opencode)
+
+
+class SilentTranscripts(ProbeCase):
+    """A transcript that says nothing about the worktree it belongs to.
+
+    Two ways a real file goes silent: it cannot be read at all, or it was
+    written before its session's first user turn — every captured transcript
+    opens with cwd-less lines (`queue-operation`, `ai-title`, `mode`) and only
+    names its `cwd` when the operator first speaks, so a session caught in its
+    first seconds is exactly this shape, and a 5s rail poll is exactly what
+    catches it.
+
+    Silence is not evidence of ANOTHER worktree, and reading it as such is
+    what these tests exist to stop. Read as "not mine", a silent CURRENT
+    transcript hands the answer to the PREVIOUS session in the same project
+    dir and the probe reports a dead session's model as `ok` — the one
+    falsehood this feature can state (sprint 45 L1). Read as "mine", a silent
+    file in a NEIGHBOUR's project dir blanks an answer that was perfectly good
+    (L2). One fact decides both: `_encode` maps one character to one, so only
+    a dir named EXACTLY this cwd's encoding can hold this cwd's sessions.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        shutil.copytree(FIXTURES / "claude" / "projects", self.projects)
+        p_claude.DATA_DIR = self.projects
+
+    def dir_of(self, worktree):
+        return self.projects / p_claude._encode(worktree)
+
+    def two_sessions(self):
+        """The copied CLAUDE_TWO pair, {path: its own last model}.
+
+        Two REAL sessions of ONE worktree answering DIFFERENT models is the
+        premise the fall-through is visible through: with one session, or with
+        two that agree, the wrong answer and the right one are the same string.
+        """
+        models = {self.dir_of(CLAUDE_TWO) / path.name: model
+                  for path, model in _claude_session_models(CLAUDE_TWO).items()}
+        self.assertEqual(len(models), 2, models)
+        self.assertEqual(len(set(models.values())), 2, models)
+        return models
+
+    def test_an_unreadable_current_transcript_never_answers_with_an_older_one(self):
+        sessions = self.two_sessions()
+        current, previous = sorted(sessions)
+        _stamp_newest(current, list(sessions))
+        # Precondition, stated as an assertion: while the current transcript
+        # is readable the probe answers with ITS model, and the previous
+        # session — still on disk, still readable — answers a different one.
+        self.assertEqual(self.probe("claude", CLAUDE_TWO)["last_model"],
+                         sessions[current])
+        self.assertNotEqual(sessions[previous], sessions[current])
+
+        _unreadable(current)
+        _stamp_newest(current, list(sessions))  # unlink+mkdir reset the mtime
+        r = self.probe("claude", CLAUDE_TWO)
+        self.assertEqual(r["verdict"], "none", r)
+        self.assertIsNone(r["last_model"], r)
+        self.assertIsNone(r["live_model_at"], r)
+
+    def test_a_session_before_its_first_turn_answers_nothing_for_its_own_worktree(self):
+        """Same rule, the other silence: the CURRENT session has simply not
+        said anything yet. `none` is the honest answer — the previous
+        session's model is not what is running."""
+        sessions = self.two_sessions()
+        fresh = _pre_first_turn(self.dir_of(CLAUDE_TWO))
+        self.assertTrue(fresh.read_text(encoding="utf-8").strip(), "empty cut")
+        self.assertNotIn('"cwd"', fresh.read_text(encoding="utf-8"))
+        _stamp_newest(fresh, [fresh, *sessions])
+
+        r = self.probe("claude", CLAUDE_TWO)
+        self.assertEqual(r["verdict"], "none", r)
+        self.assertNotIn(r["last_model"], set(sessions.values()))
+
+    def test_a_session_before_its_first_turn_does_not_shadow_a_neighbour(self):
+        """And the direction that must NOT become `none`.
+
+        `-tmp-lm-capture-claude-ab` is longer than `-tmp-lm-capture-claude`,
+        so it cannot be an encoding of CLAUDE_BACK's cwd — a silent file there
+        is not CLAUDE_BACK's newest session however recently it was touched,
+        and CLAUDE_BACK's own answer stands.
+        """
+        expected = self.probe("claude", CLAUDE_BACK)["last_model"]
+        self.assertIsNotNone(expected)
+        fresh = _pre_first_turn(self.dir_of(CLAUDE_AB))
+        self.assertNotIn('"cwd"', fresh.read_text(encoding="utf-8"))
+        _stamp_newest(fresh, [fresh, *self.projects.glob("*/*.jsonl")])
+
+        r = self.probe("claude", CLAUDE_BACK)
+        self.assertEqual(r["last_model"], expected)
+        self.assertEqual(r["verdict"], "ok")
+        # ...and the same file does not leak into the worktree it IS next to
+        self.assertEqual(self.probe("claude", CLAUDE_AB)["verdict"], "none")
+
+
+class SwallowedFailuresAreLogged(ProbeCase):
+    """Spec doc 44: an unreadable transcript is `none`, LOGGED ONCE.
+
+    `_read`'s boundary logs what a harness module lets ESCAPE. These are the
+    failures each module handles itself — a permission change on one
+    transcript, a wire that is not a file, a database that will not open — and
+    which used to return `None` in silence, leaving the operator a blank badge
+    and stderr with nothing to say why. Once per message, not per 5s poll:
+    the rail would otherwise turn one bad file into a stderr flood.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def claude_case(self):
+        proj = self.tmp / "projects" / p_claude._encode(CLAUDE_AB)
+        broken = proj / "broken.jsonl"
+        broken.mkdir(parents=True)
+        p_claude.DATA_DIR = self.tmp / "projects"
+        return CLAUDE_AB, broken
+
+    def kimi_case(self):
+        base = self.tmp / "sessions"
+        shutil.copytree(FIXTURES / "kimi" / "sessions", base)
+        wire = next(p for p in base.glob("wd_*/session_*/agents/main/wire.jsonl")
+                    if json.loads((p.parents[2] / "state.json").read_text(
+                        encoding="utf-8")).get("workDir") == KIMI_BACK)
+        wire.unlink()
+        wire.mkdir()
+        p_kimi.DATA_DIR = base
+        return KIMI_BACK, wire
+
+    def opencode_case(self):
+        db = self.tmp / "opencode.db"
+        db.mkdir()
+        p_opencode.DB = db
+        return OC_BACK, db
+
+    def test_a_read_failure_the_module_swallows_is_logged_once(self):
+        for harness, build in (("claude", self.claude_case),
+                               ("kimi", self.kimi_case),
+                               ("opencode", self.opencode_case)):
+            with self.subTest(harness=harness):
+                worktree, path = build()
+                seen = []
+                live_model.cache_clear()
+                first = live_model.probe(harness, worktree, log=seen.append)
+                # Expire the READING only — `cache_clear()` would also drop the
+                # log-once ledger, which is the thing under test.
+                live_model._cache.clear()
+                second = live_model.probe(harness, worktree, log=seen.append)
+
+                self.assertEqual(first["verdict"], "none", first)
+                self.assertEqual(second["verdict"], "none", second)
+                self.assertEqual(len(seen), 1, seen)
+                self.assertIn(harness, seen[0])
+                self.assertIn(str(path), seen[0])
 
 
 class Caching(ProbeCase):
@@ -698,6 +898,37 @@ def _stamp_newest(newest, paths, *, gap_s=600):
     base = 1_800_000_000
     for path in paths:
         os.utime(path, (base, base if path == newest else base - gap_s))
+
+
+def _unreadable(path):
+    """Put the path beyond reading, at any uid.
+
+    These run as uid 0 in the sandbox, where a mode-000 file is still
+    readable; a DIRECTORY where a transcript is expected raises the same
+    OSError family for the same reason — the path cannot be read as a file —
+    and does so for every user.
+    """
+    path.unlink()
+    path.mkdir()
+
+
+def _pre_first_turn(proj, name="0" * 8 + "-0000-0000-0000-" + "0" * 12 + ".jsonl"):
+    """A real transcript from `proj`, cut where its first `cwd` record starts.
+
+    A prefix of real bytes, not a hand-authored shape: this is the file as it
+    existed on disk in the seconds between the session opening and the
+    operator's first message, which is a state every captured session passed
+    through and none of them could be asked to hold still in.
+    """
+    src = sorted(proj.glob("*.jsonl"))[0]
+    kept = []
+    for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
+        if json.loads(line).get("cwd"):
+            break
+        kept.append(line)
+    out = proj / name
+    out.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return out
 
 
 # ----------------------------------------------------------------- fixture readers

@@ -26,7 +26,8 @@ Contract — every harness module exposes:
             MAIN-THREAD assistant message carrying an EXPLICIT model id, or
             None when the current session has no such record. None is a real
             answer (fresh session, unreadable dir, nothing but placeholders) —
-            never an exception.
+            never an exception. A read failure it swallows on the way there
+            goes to `note()`, so a blank answer is never a silent one.
 
 Rules, in decision #55's spirit — the claim this feature makes is exactly
 "`live_model` is the model id of the last main-thread assistant message in the
@@ -76,10 +77,35 @@ CACHE_TTL_S = 5.0  # the rail poll's own period: one disk read per poll, not per
 
 _cache: "dict[tuple, tuple]" = {}   # (harness, worktree) -> (expires_at, result)
 _logged: "set[tuple]" = set()       # (harness, worktree, kind) — log once, not per poll
+_log_sink = None                    # the caller's log, for the duration of one read
 
 
 def _default_log(msg: str) -> None:
     print(f"[live_model] {msg}", file=sys.stderr, flush=True)
+
+
+def note(kind: str, detail: str) -> None:
+    """Report a read failure a harness module swallowed — ONCE per message.
+
+    Spec doc 44 asks for "unreadable transcript -> `none`, LOGGED ONCE, never
+    an exception on the shells route". `_read`'s boundary covers the failures a
+    module lets escape; this covers the ones it handles itself — a permission
+    change on one transcript, a stat that races a rotation, a locked SQLite
+    file — which otherwise turn into a silently blank badge with nothing on
+    stderr to say why.
+
+    Routed through the same ledger and the same caller-supplied `log` as the
+    boundary, so `probe(log=…)` remains the single place everything this
+    package says comes out. `_log_sink` is set only for the duration of one
+    `mod.read()` call; a caller that injects its own log from one thread while
+    another polls can see a line on the wrong sink, which is why the sink is
+    never the thing being asserted — the ledger is.
+    """
+    mark = (kind, detail)
+    if mark in _logged:
+        return
+    _logged.add(mark)
+    (_log_sink or _default_log)(f"{kind}: {detail}")
 
 
 def placeholder(model) -> bool:
@@ -125,12 +151,14 @@ def _read(harness: str, worktree: str, log) -> "dict | None":
     a permission change, a format drift that trips an attribute error, a
     corrupt SQLite page.
     """
+    global _log_sink
     key = (harness, worktree)
     now = _time.monotonic()
     hit = _cache.get(key)
     if hit is not None and hit[0] > now:
         return hit[1]
     mod = _module(harness)
+    _log_sink = log  # `note()` from inside the module lands on the caller's log
     try:
         result = mod.read(worktree) if mod is not None else None
     except Exception as e:  # noqa: BLE001 — see docstring: never raise on the route
@@ -139,6 +167,8 @@ def _read(harness: str, worktree: str, log) -> "dict | None":
         if mark not in _logged:
             _logged.add(mark)
             log(f"{harness}: probe failed for {worktree}: {type(e).__name__}: {e}")
+    finally:
+        _log_sink = None
     _cache[key] = (now + CACHE_TTL_S, result)
     return result
 
