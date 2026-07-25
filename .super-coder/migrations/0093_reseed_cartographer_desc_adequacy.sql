@@ -1,12 +1,22 @@
----
-name: cartographer
-description: Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.
-category: substrate
-command: sc map-setup
-common: false
----
+-- 0093 — forward-reseed cartographer: description ADEQUACY, not just presence.
+-- A full remap surfaced ~2/3 of dr_filepath descs as auto-authored filler of
+-- the shape "Engine database migration: 0042_x.sql" — non-NULL, so the
+-- NULL-only worklist never surfaced them, and they said nothing the path
+-- didn't. The worklist now also flags descs that END with the filename or its
+-- stem (the "<kind restated>: <name>" shape, judged per hit), the standard is
+-- stated (a desc must say something the path does not; derive from the file's
+-- own docstring/frontmatter/header), and the bootstrap/heal steps close on
+-- "NULLs and filler both". UPSERT by name so skill_id + grants survive.
 
-# cartographer — own the repo map so no other shell has to
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'cartographer',
+  'Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
+  'substrate',
+  'sc map-setup',
+  0,
+  '# cartographer — own the repo map so no other shell has to
 
 Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
 map. You alone do three things: **configure** how this repo is mapped, **wire**
@@ -32,7 +42,7 @@ and reload on a fresh map db.
   leaves an empty map.
 - **Hourly cron** — pm2 runs `sc-map-<repo>` on `cron_restart`
   (`.super-coder/ecosystem.config.cjs`) while the stack is up (`sc up`);
-  catches uncommitted local restructuring the git hooks can't see. Verify:
+  catches uncommitted local restructuring the git hooks can''t see. Verify:
   `pm2 list | grep sc-map` — state cycling stopped→online per tick = the
   one-shot pattern, not a crash. A fork without pm2 has no cron; the hooks
   still cover it, and manual `sc map` always works.
@@ -82,7 +92,7 @@ and reload on a fresh map db.
    SELECT file_count, mapped_at FROM dr_repo;   -- non-zero, just now
    ```
    Spot-check overrides took:
-   `SELECT path, role FROM dr_filepath WHERE path LIKE 'cmd/%';`
+   `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
 
 5. **Describe — NULLs and filler** — run the description worklist (Standing
    jobs § 2); leave only when it returns zero rows, NULLs and filler both.
@@ -123,25 +133,25 @@ one-line `description`.
 ```sql
 -- the current index + live file counts:
 SELECT s.name, s.path_prefix, s.description,
-       (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') n
+       (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') n
 FROM dr_section s ORDER BY s.sort_order, s.name;
 
 -- split / rename / describe (authored — survives the remap, snapshotted):
-UPDATE dr_section SET name='API', path_prefix='shell_core/api/', description='FastAPI routers' WHERE name='shell_core';
+UPDATE dr_section SET name=''API'', path_prefix=''shell_core/api/'', description=''FastAPI routers'' WHERE name=''shell_core'';
 INSERT INTO dr_section (name, path_prefix, description, sort_order)
-VALUES ('UI', 'shell_core/ui/', 'SvelteKit substrate UI', 5);
+VALUES (''UI'', ''shell_core/ui/'', ''SvelteKit substrate UI'', 5);
 
 -- WORKLIST — keep the catch-all empty. Files under no section = a new area to
 -- section (they render under "other / unsectioned" in CONNECTIONS until you do):
 SELECT path FROM dr_filepath f WHERE NOT EXISTS
-  (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || '%')
+  (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || ''%'')
 ORDER BY path;
 
 -- STALE SECTIONS (run after any migration or restructure — dr_filepath pruning
 -- is automatic; dr_section is authored and never auto-pruned):
 SELECT s.name, s.path_prefix, s.description
 FROM dr_section s
-WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') = 0
+WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') = 0
 ORDER BY s.name;
 -- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
@@ -152,7 +162,7 @@ what the file *does* or *holds*, never its kind restated from the name —
 "Engine database migration: 0042_x.sql" is filler (non-NULL, zero information
 beyond the path), and a NULL-only worklist is blind to it: one mapped repo
 carried 263 such placeholders, invisible for months because every row was
-non-NULL. Derive each one-liner from the file's own docstring / frontmatter /
+non-NULL. Derive each one-liner from the file''s own docstring / frontmatter /
 header comment; hand-write the few with nothing extractable. Run the worklist
 every session; every run ends with zero rows — NULLs *and* filler — not
 optional. Queried by working shells within a chosen section
@@ -164,10 +174,10 @@ optional. Queried by working shells within a chosen section
 -- restated>: <name>" shape); judge each hit — and treat a desc you could have
 -- written from the path alone as filler even if the query missed it:
 WITH f AS (SELECT path, role, desc,
-                  replace(path, rtrim(path, replace(path,'/','')), '') AS base
+                  replace(path, rtrim(path, replace(path,''/'','''')), '''') AS base
            FROM dr_filepath),
-     g AS (SELECT *, CASE WHEN instr(base,'.') > 0
-                          THEN substr(base, 1, instr(base,'.')-1)
+     g AS (SELECT *, CASE WHEN instr(base,''.'') > 0
+                          THEN substr(base, 1, instr(base,''.'')-1)
                           ELSE base END AS stem FROM f)
 SELECT path, role, desc FROM g
 WHERE desc IS NULL
@@ -176,15 +186,15 @@ WHERE desc IS NULL
 ORDER BY (desc IS NULL) DESC, role, path;
 
 -- describe (≤100 chars; preserved across the next auto-remap):
-UPDATE dr_filepath SET desc='Boot composer — assembles CLAUDE.md from DB state' WHERE path='.super-coder/render/compose.py';
+UPDATE dr_filepath SET desc=''Boot composer — assembles CLAUDE.md from DB state'' WHERE path=''.super-coder/render/compose.py'';
 ```
 
 Before leaving the job, spot-read a few descs per section against the files
 themselves; any desc derivable from the path alone goes back on the list.
-(Deliberate uniform tags — e.g. Standing job 3's product-DB tagging — pass the
-bar: they state tenancy the path doesn't.)
+(Deliberate uniform tags — e.g. Standing job 3''s product-DB tagging — pass the
+bar: they state tenancy the path doesn''t.)
 
-**3. Product DB** — the app's own database, separate from engine memory
+**3. Product DB** — the app''s own database, separate from engine memory
 (`.super-coder/shell_db.db`); working shells change them in completely
 different ways (boot `## DATABASES`), and the map you author is the only
 per-fork signal of where the app DB lives. The live `.db` is usually
@@ -193,20 +203,20 @@ durable anchor. Tag them plainly as the product/app DB so no shell mistakes
 them for engine memory; give them a section if they form an area.
 
 ```sql
--- tag the product DB's definition (the engine-vs-app split made visible):
-UPDATE dr_filepath SET desc='Product DB schema — the APP database (NOT engine memory)' WHERE path='<app schema file>';
-UPDATE dr_filepath SET desc='Product DB migration — change the app schema here' WHERE path LIKE '<app migrations dir>/%';
+-- tag the product DB''s definition (the engine-vs-app split made visible):
+UPDATE dr_filepath SET desc=''Product DB schema — the APP database (NOT engine memory)'' WHERE path=''<app schema file>'';
+UPDATE dr_filepath SET desc=''Product DB migration — change the app schema here'' WHERE path LIKE ''<app migrations dir>/%'';
 -- optional: a section if the product DB is its own area
 INSERT INTO dr_section (name, path_prefix, description, sort_order)
-VALUES ('App DB', '<db dir>/', 'Product runtime database — schema + migrations (NOT the engine memory DB)', 7);
+VALUES (''App DB'', ''<db dir>/'', ''Product runtime database — schema + migrations (NOT the engine memory DB)'', 7);
 ```
 
 Fork ships no database of its own -> skip.
 
 After a curation pass your writes are already live in the shared map db —
 done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc
-snapshot`. Don't chase it. (Sections are snapshotted; descriptions ride the
+persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 ./sc
+snapshot`. Don''t chase it. (Sections are snapshotted; descriptions ride the
 live DB + survive remap — refill from the worklist if a rebuild drops them.)
 
 ## Extending the map — semantic extractors
@@ -226,7 +236,7 @@ Adopt one per stack:
 1. **Detect the stack:** `SELECT manager, name FROM dr_dependency;`
    (fastapi? flask? svelte? next?) + the file mix
    (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
-2. **Copy the matching reference** from the engine's
+2. **Copy the matching reference** from the engine''s
    `.super-coder/templates/map_extractors/` into `.sc-state/map_extractors/`:
    - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
    - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
@@ -258,7 +268,7 @@ act on as cartographer.
 Sender = the **dev/coder** shell on merge (feature landed, doc written); NOT
 the planner — specs render into a known area and need no curation. Sent via
 the `messaging` skill to `cartographer` — a role alias the API resolves to
-this fork's cartographer shell whatever its actual shortname:
+this fork''s cartographer shell whatever its actual shortname:
 
 ```
 --message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."
@@ -273,7 +283,7 @@ region -> mark read:
 ```sql
 -- 1. the new files this notice is about (scope by the region it named):
 SELECT path, role FROM dr_filepath
-WHERE desc IS NULL AND path LIKE 'region/%' ORDER BY role, path;
+WHERE desc IS NULL AND path LIKE ''region/%'' ORDER BY role, path;
 -- 2. describe them (≤100 chars) — UPDATE dr_filepath SET desc=… per the worklist above.
 -- 3. do they form / join a section? curate dr_section if the region is a new area.
 ```
@@ -291,5 +301,13 @@ exactly the uncurated tail.
 - Config is the lever: tune `map.config.json`; touch `map_repo.py` only when
   the mechanism itself (a parser, a role kind) is wrong.
 - Verify the automation, not just the file: a written hook that
-  `core.hooksPath` doesn't point at does nothing -> check the wiring after
-  every setup.
+  `core.hooksPath` doesn''t point at does nothing -> check the wiring after
+  every setup.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
