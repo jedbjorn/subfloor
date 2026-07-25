@@ -54,6 +54,26 @@ must not propagate an address even when the wire offers one, and a fixture with
 the field removed could not tell the difference between a probe that drops it
 and a probe that never saw it.
 
+### One case in the suite is DERIVED, not recorded — and it says so
+
+Every file in this directory is a recording. The suite additionally builds one
+case that is **not**, and it is named here so the distinction never has to be
+rediscovered from the test body.
+
+Moonshot's live five-hour window reads `limit: "100", remaining: "100"`, so the
+derivation under test — `used = limit - remaining` — lands on **zero**. Zero is
+also what every *broken* derivation returns: a missing key coerces to `None` and
+then to 0, and a wrong nesting level finds nothing and yields 0. A test built
+only on the capture would therefore pass against a derivation that never works —
+this sprint's own vacuous-coverage shape, arriving in the fixture layer.
+
+So `test_limits_entry_unwraps_detail_and_derives_used` starts from the capture,
+holds its structure exactly, and moves only the numbers (`400`/`150` → `250`).
+It asserts the capture's entry shape first, so if the wire's shape ever moves the
+derived case fails loudly instead of pinning a structure that no longer exists.
+The capture's own zero is kept as a separate case: an untouched window really
+does read zero, and that is a measured value, not a failure.
+
 ## What drift detection actually covers
 
 An earlier version of this file promised that *"a drift between the two shows up
