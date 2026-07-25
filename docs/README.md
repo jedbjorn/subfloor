@@ -3,14 +3,14 @@ title: subfloor — Docs
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
 date: 2026-07-20
 project: subfloor
-purpose: The full documentation, ten sections
+purpose: The full documentation, eleven sections
 ---
 
 # subfloor — Docs
 
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md)
 
-One page, ten sections — each `##` heading renders as a tab in md-converter;
+One page, eleven sections — each `##` heading renders as a tab in md-converter;
 on GitHub this reads as one long page with the same anchors.
 
 ## Architecture
@@ -464,6 +464,162 @@ needed. They all work the same repo without clobbering each other:
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
   — and the post-commit hook prints the shell's URL after each commit.
 
+## Interface
+
+> [!class2]
+> **UI** Interface · **Shells** all flavors (sprint wake is planner-only)
+
+Every interactive session runs inside a **tmux pane the engine owns**, not in
+the terminal you started it from. `./sc enter` is a *client* of that pane — and
+so is the browser. The Review GUI's **Interface** tab is a real terminal: pick a
+shell in the rail, and you're looking at its live harness TUI, with the same
+keyboard, slash commands, permission prompts, and model routing you get in a
+terminal. Nothing is re-implemented; subfloor streams the pane.
+
+![Review GUI, Interface tab — the shell rail with per-shell availability, the live harness TUI streamed into the browser, and the message composer](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/interface-tab.png)
+
+What the tmux host buys you:
+
+- **A session outlives its client.** Close the tab, drop the SSH link, kill the
+  terminal emulator — the harness keeps working. Reattach and the pane is still
+  there, mid-turn if that's where you left it.
+- **One live chat per shell, seen the same way everywhere.** Browser and CLI
+  attach to the *same* generation. There is no second process to reconcile, and
+  no provider-side "resume" — the tmux pane is the continuity.
+- **Reattach is a redraw, not a replay.** A headless xterm sidecar keeps each
+  generation's grid, so a fresh attach paints the current screen — alternate
+  screen, colors, cursor, modes intact — instead of dumping scrollback at you.
+- **Every writable byte is serialized.** An API-owned input broker orders and
+  acknowledges input from all sources before it reaches the pane, so a browser
+  keystroke, a CLI paste, and an automatic sprint wake can never interleave
+  into one garbled line.
+
+### The Interface tab
+
+The left rail lists every shell with the state the API can *prove*, not a
+guess:
+
+| Rail state | Means |
+|---|---|
+| `available` | No live generation — the pane offers one **New chat** command (harness · model · effort, from the live model catalogue). |
+| `starting` | The reservation committed; the pane is spawning. Only **Cancel start** is offered — a reservation is not a terminal. |
+| `occupied` | One live API-managed generation owns the shell. The row shows harness and the model route it was *launched* with. |
+| `working` | A live harness process holds the shell with no Interface session of its own — typically a headless `./sc run` sprint worker, and the row names the sprint. Not startable, and *not* something to recover. |
+| `unreconciled` | A process holds the shell but every PID is orphaned (a closed terminal, a dead parent), or a spawn ended ambiguously. New chat stays blocked; recovery is offered. |
+| `lost` / `error` | The generation's diagnostics are preserved, with only the actions whose preconditions are actually satisfied. |
+
+Selecting an occupied shell attaches the terminal. The header carries the
+session's exact state — harness and launch route, archive age, whether you hold
+the **writer lease** or are read-only, whether the composer is clean, dirty, or
+unknown, and the sprint-wake state — behind **Details** and **Alerts**
+disclosures so the terminal keeps the viewport.
+
+Below it sits a **message composer**: type a line, hit **Send**, and it goes
+through the broker as ordered, acknowledged input — the convenient path when
+you just want to answer a shell rather than drive its TUI. **End chat** is the
+explicit, confirmed close; **certify clean** tells the broker the composer is
+empty (the one thing quiet time can never prove).
+
+**One writer at a time.** The first client to attach takes the writer lease;
+everyone else attaches read-only and can request an explicit **take-over**,
+which atomically revokes the old lease. Closing a viewer releases only that
+client's lease — never the chat.
+
+### From the CLI
+
+Same API, same state machine — the CLI never touches tmux or the DB behind the
+server's back:
+
+```bash
+./sc enter                    # pick a shell → New chat or reattach, in one flow
+./sc interface status [shell] # the rail, as text (--json for scripts)
+./sc interface start <shell>  # scriptable New chat  [--harness H --model M --effort E]
+./sc interface view <shell>   # attach read-only — watch without taking the lease
+./sc interface attach <shell> # attach as writer (never steals an existing lease)
+./sc interface take-control <shell>   # explicit writer transfer
+./sc interface stop <shell>   # graceful end; --force only after a timeout, and it
+                              #   names the PID/generation it will end
+./sc interface reconcile <shell>      # revalidate tmux/process/lease state (--close)
+./sc interface recover <shell>        # preview + execute stranded-shell recovery
+./sc url                      # reprint the GUI URL the harness TUI overdrew
+```
+
+`./sc boot` — the raw launch primitive — now **refuses** without an Interface
+reservation capability, so there is no side door that creates a second harness
+process outside the state machine.
+
+> [!class2]
+> **The GUI URL scrolls away now.** Because `./sc enter` hands the terminal to
+> the harness TUI inside the pane, the boot summary gets overdrawn. `./sc url`
+> (alias `make dos-url`) reprints this fork's Review GUI and dev-server URLs on
+> demand; `./sc launch` still prints them at start.
+
+### Signing in — and what that trusts
+
+Open the Interface tab and it works: no sign-in step, nothing to paste, no
+credential in the browser. A same-origin bootstrap mints an `HttpOnly`,
+`SameSite=Strict` session cookie plus an anti-forgery token held only in page
+memory; the mode-`0600` operator capability stays a CLI/server credential and
+never enters JavaScript. Streams additionally consume single-use tickets bound
+to session, generation, client, role, and expiry.
+
+That convenience is bought by a stated boundary: **subfloor is a
+personal-machine tool.** Other processes running as you are not treated as
+adversaries — they can already reach your repos, harness credentials, and
+terminal processes. What *is* defended, as release-critical controls: other web
+origins (exact `Origin` + `Sec-Fetch-Site`, CSRF on every mutation, CORS off),
+DNS rebinding (exact `Host` allowlist), and network exposure (loopback only —
+off-sandbox the server *exits* rather than bind wide; in the sandbox the fence
+is `./sc launch`'s `-p 127.0.0.1:PORT:PORT` mapping). Full threat model:
+[`.super-coder/docs/interface-trust-boundary.md`](../.super-coder/docs/interface-trust-boundary.md).
+
+> [!class4]
+> **If untrusted people use your machine, don't run subfloor on it.** That is
+> the boundary stated plainly, rather than a lock that implies a protection it
+> cannot deliver.
+
+### When a session strands
+
+A killed container, a crashed broker, or a harness that outlived its terminal
+leaves a shell that reads `unreconciled` — and a shell you cannot free is a
+shell you cannot use. **Recover** is evidence-fenced, not a big red button:
+preview first, and the API projects exactly what it observed (is the process in
+`/proc`, is the tmux pane present, is the worktree dirty), then offers only the
+actions that evidence makes legal. Proven-absent closes as bookkeeping;
+proven-live refuses; ambiguous stays ambiguous and says so. **Force recover**
+appears only after a graceful attempt has failed, and shows what it will end.
+`./sc interface recover <shell>` runs the identical preview/execute flow.
+
+### Waking a live planner
+
+During a sprint, events are durable rows (`task` / `result` / `pr_event`) — but
+a planner already sitting in a live pane needs to be *told*. Arming an `ACTIVE`
+sprint document to a planner generation lets the broker submit one fixed line:
+
+```
+Check your inbox and act on unread sprint events.
+```
+
+Message bodies never enter the terminal — the row is the work, the submission
+is only the doorbell. It fires only when every gate holds: a supported planner
+harness, lifecycle `idle`, composer **certified clean**, three seconds since
+the last accepted human input, and the broker owning the input queue. Any
+writable path that bypasses the broker makes input state unknown and disables
+automatic delivery; quiet time alone never turns dirty into clean. If the
+broker dies with a human frame reserved but unacknowledged, that frame parks as
+`delivery_unknown` and is **never** blind-replayed — the session disarms until
+you look at the pane and reconcile it.
+
+### Requirements
+
+Interface needs the Linux sandbox and a declared tmux — the image builds
+**tmux 3.5a from source** with a pinned checksum (the fence proofs are
+version-specific), and the runtime gates `tmux -V` ≥ 3.4 at startup. The
+browser terminal is vendored `@xterm/xterm`, with `@xterm/headless` as the
+redraw sidecar; nothing loads from a CDN. A non-Linux or no-sandbox server
+keeps the whole review UI and simply reports Interface unavailable — every
+other tab still works.
+
 ## Sprints
 
 > [!class2]
@@ -638,7 +794,10 @@ design is [`specs_sc/sprint-eventing.md`](../specs_sc/sprint-eventing.md).
   wakes the live planner session the moment anything arrives, at zero token
   cost while idle. Claude-harness only; on other harnesses the planner
   keeps the task-boundary inbox check, so correctness is identical and only
-  wake latency degrades.
+  wake latency degrades. A planner sitting in a live Interface pane can also
+  be woken *at the terminal*: arm its generation to the `ACTIVE` sprint doc
+  and the input broker submits one fixed line, gated on idle + certified-clean
+  + quiet ([Interface → Waking a live planner](#interface)).
 - **Session-surviving jobs.** `./sc job start [--label <slug>] [--timeout <s>]
   -- <cmd>` runs long local work — a suite, a bench, a build — as a detached,
   supervised one-shot that **outlives the session that started it** (a harness
@@ -784,8 +943,11 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 
 ```bash
 ./sc launch              # build + start the sandbox container (server + GUI), 127.0.0.1 only
-./sc enter               # attach a session: auth + pick a shell + pick a harness + boot
+./sc enter               # attach a session: pick a shell, then New chat (harness picker) or reattach
 ./sc enter-<shortname>   # attach + boot one shell directly, skip the shell picker
+./sc interface <verb>    # the same sessions, scriptable: status · start · view · attach ·
+                         #   take-control · stop · reconcile · recover  (see Interface)
+./sc url                 # reprint this fork's Review GUI + dev-server URLs
 ./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
 ./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
 ./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
@@ -1226,15 +1388,16 @@ plus the host steps it prints are the whole setup. Full design:
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Interface · Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
 A zero-dependency localhost GUI to review the substrate — shells, roadmap,
-flags. One stdlib Python server serves both the JSON API and a static UI; no
-venv, no npm, no build step. Its nine tabs are the windows the workflow above
-refers to:
+flags — and, since the Interface tab, to *drive* it. One stdlib Python server
+serves the JSON API, the static UI, and the terminal stream; no venv, no npm,
+no build step. Its ten tabs are the windows the workflow above refers to:
 
 | Tab | What it shows |
 |---|---|
+| **Interface** | The live terminals. Every shell in a rail with its proven availability; an available shell offers **New chat**, an occupied one streams its tmux-hosted harness TUI with a writer lease, composer, and recovery controls. The whole surface: [Interface](#interface). |
 | **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
 | **Skills** | The skill catalogue (Repo · Substrate · Craft), with per-shell grant toggles and full content in a modal. |
 | **Roadmap** | Features in a planning funnel (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. Two views — a **Board** for editing a feature inline, and a **Flow** that groups features by work-stream and wires their blocker dependencies (see below). |
@@ -1280,9 +1443,11 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
 
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it;
-`./sc enter` then attaches the interactive harness session into that same
-container via `docker exec`, so the shell and the GUI run side by side, sharing
-the one bind-mounted repo + creds. The port publishes to `127.0.0.1` only.
+`./sc enter` then attaches you to a harness session hosted in that same
+container — a tmux pane the server owns, reached over the Interface API — so
+the shell and the GUI run side by side on one bind-mounted repo + creds, and
+the same session is attachable from the browser ([Interface](#interface)). The
+port publishes to `127.0.0.1` only.
 
 ```bash
 ./sc health    # curl /api/health

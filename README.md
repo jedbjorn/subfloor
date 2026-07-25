@@ -24,7 +24,8 @@ development team in a box.** Add it to an existing project from the command
 line, install it, launch it, and start working with a Shell (subfloor's name for
 an AI agent). Launching also prints the address of the local Review GUI: a
 friendly home base where you can see your team, roadmap, specs and docs, open
-flags, repo map, worktrees, and token use.
+flags, repo map, worktrees, and token use — and, in the **Interface** tab, sit
+down at any Shell's live terminal right there in the browser.
 
 ![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
@@ -75,6 +76,13 @@ Free to use, open source, MIT License.
 
 ### The headliners
 
+- **Your team's terminals, in the browser.** Every session lives in a
+  tmux pane the engine owns, so it survives the tab, the terminal, and the SSH
+  link. The **Interface** tab streams a shell's real harness TUI — same
+  keyboard, same slash commands — with one writer at a time, a message
+  composer, evidence-fenced recovery for stranded shells, and full CLI parity
+  (`./sc interface …`). No sign-in step and no credential in the browser; the
+  boundary is loopback + same-origin. ([*Interface*](docs/README.md#interface))
 - **Cross-provider orchestration.** A sprint runs planner → devs → reviewers
   **across providers** — devs on Codex, reviewers on Claude, the planner woken
   by events, workers booted headless per task. Zero scheduled polling: typed
@@ -99,6 +107,8 @@ Free to use, open source, MIT License.
   migrates the DB under the fork's feet — memory intact, sound
   `./sc rollback`, and `./sc eject` the day you'd rather own it outright.
   ([*Update a fork*](docs/README.md#update-a-fork))
+
+![subfloor's Review GUI, Interface tab — the shell rail with each shell's live availability, a shell's harness TUI streamed into the browser terminal, and the message composer](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/interface-tab.png)
 
 The bet: **we build the data layer, we rent the harness.** The agent loop, the
 tools, the model API are the harness's job. We own identity + memory + content
@@ -152,7 +162,7 @@ whole team behind it. Installer internals and harness sign-in, step by step:
 
 ## Docs
 
-One page, ten sections — [docs/README.md](docs/README.md), or tab through it
+One page, eleven sections — [docs/README.md](docs/README.md), or tab through it
 themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
 
 | Section | What's in it |
@@ -162,11 +172,12 @@ themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/
 | [**The loop**](docs/README.md#the-loop) | The everyday cycle: map → spec → build → review → freeze → verify |
 | [**Harnesses & models**](docs/README.md#harnesses--models) | Plans over API keys; which model each role runs, and why |
 | [**Shells & worktrees**](docs/README.md#shells--worktrees) | How a whole team shares one repo without clobbering it |
+| [**Interface**](docs/README.md#interface) | tmux-hosted sessions, the browser terminal, writer leases, recovery, planner wake |
 | [**Sprints**](docs/README.md#sprints) | The multi-shell mode: declared pushes on a zero-polling event loop |
 | [**Update a fork**](docs/README.md#update-a-fork) | `./sc update` / `rollback`; customize vs upstream vs eject |
 | [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
 | [**Opt-in features**](docs/README.md#opt-in-features) | pg sidecar · Windows Test VM · tailnet / pm2 / db brokers |
-| [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's nine tabs + token & session analytics |
+| [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's ten tabs + token & session analytics |
 
 > [!class2]
 > **Reading the docs.** The docs are themed markdown — GitHub renders the page fine, and the md-converter link above serves the intended render: one tab per section, arrow keys to move between them.
