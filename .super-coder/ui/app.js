@@ -2185,6 +2185,7 @@ function ifDetach() {
   if (!a) return;
   ifAttach = null;
   clearInterval(a.heartbeat);
+  clearTimeout(a.vendorRetry);   // a pending vendor re-attempt dies with the attach
   ifClearComposerAckTimer(a);
   a.resizeObs?.disconnect();
   try { a.ws?.close(); } catch { /* already closed */ }
@@ -3215,7 +3216,7 @@ async function ifSessionPane(pane, sel) {
     stateReason: sess.state_reason || "",
     ws: null, term: null, leaseId: null, leaseToken: null, role: "viewer",
     seq: 1, inflight: 0, lastAck: 0, outBuf: "", awaiting: false, halted: false,
-    heartbeat: 0, resizeObs: null, paint: null,
+    heartbeat: 0, resizeObs: null, paint: null, vendorRetry: null,
     composerInput: null, composerEnd: null, composerNewChat: null,
     composerNote: null, composerActionsBusy: false,
     composerPendingSeq: null, composerPendingText: null,
@@ -3849,13 +3850,90 @@ async function ifTakeover(a) {
   } catch (e) { a.st.note = "take-over failed: " + e.message; a.paint(); }
 }
 
+// The terminal globals are undefined in two entirely different worlds, and the
+// attach guard cannot tell them apart by looking: the vendor scripts are
+// `defer`red in <head> while app.js is a plain script at the end of <body>, so
+// during the genuine load race they really are absent — and they are equally
+// absent when the running server never served the file at all. The old guard
+// picked one world (still loading, refresh the page) and prescribed a
+// remedy that cannot work in the other: no refresh will ever define a global
+// whose script 404s. So observe instead of asserting (spec #48). ~8 attempts
+// across ~2s: long enough for the defer race, short enough that a corrupt
+// vendor file becomes a sentence rather than a permanent spinner.
+const IF_VENDOR_RETRY_MS = 250;
+const IF_VENDOR_RETRY_MAX = 8;
+
+// A probe outlives the attach that started it whenever the operator moves on
+// mid-flight, so every note it produces re-checks the generation first — a
+// finding about a session you already left must never repaint a newer one.
+function ifVendorNote(a, note) {
+  if (ifAttach !== a) return;
+  a.st.note = note;
+  a.paint();
+}
+
+// Ask the server what it is actually serving for the scripts THIS page
+// declares — enumerated off the DOM rather than from a second hardcoded list,
+// because a restatement of index.html here is exactly the thing that drifts.
+async function ifDiagnoseVendor(a, ticket, attempt, missing) {
+  const srcs = Array.from(document.querySelectorAll('script[src^="/vendor/"]'))
+    .map((s) => s.getAttribute("src"));
+  if (!srcs.length)
+    return ifVendorNote(a, "terminal unavailable — " + missing.join(" and ") +
+      " undefined and this page declares no /vendor/ scripts to check");
+  let probes;
+  try {
+    probes = await Promise.all(srcs.map(async (src) => ({
+      src, status: (await fetch(src, { method: "HEAD", cache: "no-store" })).status,
+    })));
+  } catch (e) {
+    // Cannot determine — say that and claim nothing else.
+    return ifVendorNote(a, "terminal unavailable — could not check the " +
+      "vendored scripts: " + e.message);
+  }
+  if (ifAttach !== a) return;
+  const failed = probes.filter((p) => p.status !== 200);
+  if (failed.length)
+    return ifVendorNote(a, "terminal unavailable — " +
+      failed.map((p) => p.src + " returned " + p.status).join(", ") +
+      ". The running server is older than this page; the engine floor needs a restart.");
+  if (attempt + 1 >= IF_VENDOR_RETRY_MAX)
+    return ifVendorNote(a, "terminal unavailable — " + srcs.join(", ") +
+      " served but did not define " + missing.join(" and ") + " after " +
+      (attempt + 1) + " attempts (a corrupt or empty vendored file)");
+  // Served and simply not executed yet: retrying is the whole remedy, so do it
+  // here rather than delegating it to the human.
+  a.vendorRetry = setTimeout(() => {
+    a.vendorRetry = null;
+    if (ifAttach !== a) return;
+    ifOpenStream(a, ticket, attempt + 1);
+  }, IF_VENDOR_RETRY_MS);
+}
+
 // Open the sc-term.v1 stream: 0x00 output → write, 0x04 snapshot → reset+write;
 // keystrokes go out as 0x01 ‖ seq:u64be ‖ payload, one unacked frame at a time.
-function ifOpenStream(a, ticket) {
-  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
-    a.st.note = "terminal library still loading — refresh the page";  // deferred vendor scripts
+function ifOpenStream(a, ticket, attempt = 0) {
+  // Named because it is both written and RETRACTED below: a note nobody can
+  // identify is a note nobody can safely clear.
+  const IF_VENDOR_WAIT_NOTE =
+    "terminal library not ready — checking the vendored scripts…";
+  const missing = ["Terminal", "FitAddon"]
+    .filter((g) => typeof globalThis[g] === "undefined");
+  if (missing.length) {
+    a.st.note = IF_VENDOR_WAIT_NOTE;
     a.paint();
+    ifDiagnoseVendor(a, ticket, attempt, missing);
     return;
+  }
+  // The race the note describes is over — and nothing downstream repaints on a
+  // successful mount, so left standing it is permanent: a working terminal
+  // under a banner saying the library is missing, whose standing remedy is a
+  // floor restart that kills live sessions. Retract only OUR note (compare, do
+  // not blank), because between the wait and here an unrelated writer — the
+  // read-only take-over notice, a control frame — may own the line.
+  if (a.st.note === IF_VENDOR_WAIT_NOTE) {
+    a.st.note = "";
+    a.paint();
   }
   const term = new Terminal({ convertEol: false, cursorBlink: true,
     fontFamily: "ui-monospace, monospace" });

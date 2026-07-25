@@ -38,7 +38,7 @@ import traceback
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -90,24 +90,74 @@ import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
 import pm2 as pm2_mod  # noqa: E402  (host pm2 stack — config + live checks)
 
+# The app SHELL stays a frozen route table (spec #48): four files, a closed set
+# that has not changed in the life of the project, and index.html is where the
+# CSP header hangs. Adding one is a route change its author is already looking
+# at. Vendored assets are the opposite population — see _VENDOR_TYPES below.
 _STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
-    # vendored markdown pipeline (marked MIT, DOMPurify MPL-2.0/Apache-2.0) —
-    # local copies so the no-build UI renders sanitized GFM without a CDN.
-    "/vendor/marked.umd.js": ("vendor/marked.umd.js", "application/javascript; charset=utf-8"),
-    "/vendor/purify.min.js": ("vendor/purify.min.js", "application/javascript; charset=utf-8"),
-    # vendored browser terminal (xterm.js 6.0.0, MIT — spec #20: a proven
-    # terminal-emulation library, never hand-rolled emulation).
-    "/vendor/xterm/xterm.js": ("vendor/xterm/xterm.js", "application/javascript; charset=utf-8"),
-    "/vendor/xterm/xterm.css": ("vendor/xterm/xterm.css", "text/css; charset=utf-8"),
-    # FitAddon reads the renderer's ACTUAL cell metrics, which is the only way
-    # to size the grid to what the browser will really paint — hardcoded cell
-    # estimates overshoot the row count and clip the bottom rows.
-    "/vendor/xterm/addon-fit.js": ("vendor/xterm/addon-fit.js", "application/javascript; charset=utf-8"),
 }
+
+# Vendored assets resolve PER REQUEST against `ui/vendor/` (spec #48). The
+# frozen table above ages at a different rate than the file bodies it points
+# at: bodies are read from disk every request, so pulling the repo under a
+# running server updated every registered asset instantly while a NEWLY
+# vendored one stayed unreachable until a restart. That shipped a current
+# app.js to a browser against a server that would not serve its dependencies —
+# a state neither version was tested in (the 2026-07-25 GUI outage: xterm's
+# addon-fit.js on disk, 404 from the route table).
+#
+# This mapping is the ALLOWLIST the frozen table used to be — the second job it
+# was quietly doing, and the one any replacement has to keep. Suffix decides the
+# content type; nothing is ever sniffed from bytes. `.map` is deliberately
+# absent (ruled this round): a source map is a debugging affordance this
+# loopback GUI does not need to serve, and widening this dict is a filesystem
+# tenancy decision, not a convenience one.
+_VENDOR_TYPES = {
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+}
+
+
+def _resolve_vendor(rel: str) -> tuple:
+    """Resolve one `/vendor/` request path to a servable file.
+
+    `rel` is the ALREADY-DECODED remainder of the URL path. Returns
+    `(Path, content-type)` on a hit and `(None, <the gate that said no>)` on a
+    miss — the miss reason is served to the operator, because the SHAPE of a
+    404 was the entire diagnosis in the incident this route comes from.
+
+    Gate order is the security contract, not a style choice: decoding precedes
+    containment (checking first and decoding after is the classic hole), and
+    resolution precedes the bound check (which is what makes a symlink out of
+    the tree fail the same way `..` does).
+    """
+    root = (UI_DIR / "vendor").resolve()
+    try:
+        ctype = _VENDOR_TYPES.get(Path(rel).suffix.lower())
+        if ctype is None:
+            return None, "suffix not allowlisted"
+        candidate = (root / rel).resolve()
+        if not candidate.is_relative_to(root):
+            return None, "outside the vendor root"
+        # Regular files only: no directory listings, no devices, and no bare
+        # `/vendor/` prefix.
+        if not candidate.is_file():
+            return None, "no such file"
+    except (OSError, ValueError):
+        # A path the filesystem itself refuses to interpret — NUL bytes, a
+        # name too long, a symlink loop — is a miss, not a server fault. The
+        # read below stays OUTSIDE this guard on purpose: a file that passed
+        # every gate and still cannot be read is a real fault and must be
+        # loud, not a 404 claiming it was never there.
+        return None, "unresolvable path"
+    return candidate, ctype
 
 # The Interface's own authorities, for the socket sources in the CSP below —
 # the same three `interface_routes._ALLOWED_HOSTS` fences the API to. Spelled
@@ -1413,16 +1463,26 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "super-coder/1.0"
 
     def _send(self, code, payload, ctype="application/json", headers=None):
-        body = (json.dumps(payload, default=_json_default)
-                if ctype.startswith("application/json")
-                else payload).encode()
+        # Bytes pass through untouched. Vendored assets are not all text — a
+        # str-only sender would force the allowlist to exclude fonts and
+        # images, which is a trap for the next person to vendor one.
+        if isinstance(payload, (bytes, bytearray)):
+            body = bytes(payload)
+        else:
+            body = (json.dumps(payload, default=_json_default)
+                    if ctype.startswith("application/json")
+                    else payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        # HEAD is the identical response minus the body, Content-Length
+        # included (RFC 9110 9.3.2) — so the answer to "is this served?" is
+        # generated from the same code that serves it and cannot drift.
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _redirect(self, location: str):
         self.send_response(302)
@@ -2414,8 +2474,52 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def _serve_vendor(self, path: str):
+        """GET/HEAD a vendored asset, resolved against the tree as it is NOW.
+
+        Headers match the shell files': `no-cache` plus a content-derived
+        ETag, and the same 304. The tag is computed over raw bytes, which is
+        byte-identical to the text path for the current vendor set, so nothing
+        re-downloads on rollout.
+        """
+        hit, ctype_or_reason = _resolve_vendor(unquote(path[len("/vendor/"):]))
+        if hit is None:
+            # Name the gate. The old two 404 shapes (JSON route-miss vs
+            # `not built`) were what made the outage diagnosable at all, and a
+            # per-request resolver collapses that distinction — so replace it
+            # deliberately rather than losing it. Loopback-only surface: the
+            # reason costs nothing and is half of what this route is for.
+            return self._send(404, ctype_or_reason, "text/plain")
+        data = hit.read_bytes()
+        headers = {
+            "Cache-Control": "no-cache",
+            "ETag": '"%s"' % hashlib.sha256(data).hexdigest()[:32],
+        }
+        if self._if_none_match(headers["ETag"]):
+            return self._not_modified(headers)
+        return self._send(200, data, ctype_or_reason, headers=headers)
+
+    def do_HEAD(self):
+        """Vendored assets answer HEAD; everything else keeps the 405.
+
+        The app shell probes its own `<script src="/vendor/…">` tags with HEAD
+        to tell "not executed yet" from "the floor cannot serve this build"
+        (spec #48). Against a server that 405s the method, every healthy
+        script reads as a broken floor — the probe would manufacture exactly
+        the dishonest report it exists to replace. HEAD on the API is not a
+        contract this server offers, so the narrow route is the whole fix.
+        """
+        path = urlparse(self.path).path
+        if not path.startswith("/vendor/"):
+            # Same body the shim's send_error would have produced, sent the
+            # way HEAD requires: headers only, no bytes after them.
+            return self._send(405, {"error": "method not allowed"})
+        return self._serve_vendor(path)
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/vendor/"):
+            return self._serve_vendor(path)
         if path in _STATIC:
             fname, ctype = _STATIC[path]
             f = UI_DIR / fname

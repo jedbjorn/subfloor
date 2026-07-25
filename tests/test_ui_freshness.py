@@ -31,9 +31,15 @@ import server  # noqa: E402
 import transport as transport_mod  # noqa: E402
 
 
-class ServedAssetFreshnessTest(unittest.TestCase):
-    """A throwaway UI dir, so the tests can rewrite an asset the way an
-    engine update does without touching the shipped one."""
+class ServedAssetTestCase(unittest.TestCase):
+    """A throwaway UI dir served by the real transport, so the tests can
+    rewrite an asset the way an engine update does without touching the
+    shipped one.
+
+    Shared with tests/test_vendor_assets.py (spec #48): both suites need the
+    same "a real socket, the real dispatcher, a disposable tree" apparatus,
+    and a second copy of it is a fixture that drifts from this one.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -73,14 +79,21 @@ class ServedAssetFreshnessTest(unittest.TestCase):
         self.thread.join(timeout=10)
         self.loop.close()
 
-    def get(self, path, headers=None):
+    def request(self, method, path, headers=None):
         con = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
-            con.request("GET", path, headers=headers or {})
+            con.request(method, path, headers=headers or {})
             resp = con.getresponse()
             return resp.status, dict(resp.getheaders()), resp.read()
         finally:
             con.close()
+
+    def get(self, path, headers=None):
+        return self.request("GET", path, headers)
+
+
+class ServedAssetFreshnessTest(ServedAssetTestCase):
+    """Spec #43 U3 — cache directives and the revalidation round trip."""
 
     # -- the validator exists at all -----------------------------------------
 

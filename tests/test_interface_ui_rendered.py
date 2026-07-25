@@ -1151,3 +1151,70 @@ def test_long_identity_truncates_without_wrapping_the_header(browser, ui_url):
         )
     finally:
         context.close()
+
+
+def _vendor_fault_pane(browser, ui_url, *, routes):
+    """The attach pane with the vendored terminal scripts broken as `routes`
+    says — no Terminal stub, because the point is what the page does when the
+    real ones do not arrive."""
+    context = browser.new_context(viewport={"width": 1600, "height": 1000})
+    page = context.new_page()
+    page.route("**/api/**", _mock_api)
+    for pattern, handler in routes:
+        page.route(pattern, handler)
+    page.goto(f"{ui_url}/#interface/DEV3", wait_until="networkidle")
+    return context, page
+
+
+def test_a_vendor_script_the_server_cannot_serve_is_named_with_its_status(
+    browser, ui_url
+):
+    """Spec #48, in the real browser: the incident was a vendored asset the
+    running server had no route for, and the pane answered with a refresh the
+    operator dutifully performed several times.
+
+    This is the one place the DOM enumeration is proven — the node-driven
+    contract (tests/test_ui_vendor_probe.py) has to stub querySelectorAll, so
+    only a real page can show that the selector matches the tags index.html
+    actually declares.
+    """
+    context, page = _vendor_fault_pane(
+        browser, ui_url,
+        routes=[("**/vendor/xterm/addon-fit.js", lambda route: route.fulfill(
+            status=404, content_type="text/plain", body="no such file"))],
+    )
+    try:
+        # The pane holds several .if-note boxes (alerts, composer); the
+        # terminal's is the one this unit writes.
+        note = page.locator(".if-note").filter(has_text="terminal unavailable")
+        note.wait_for(timeout=10_000)
+        text = note.inner_text()
+        assert "/vendor/xterm/addon-fit.js returned 404" in text, text
+        assert "restart" in text, text
+        assert "refresh" not in text.lower(), (
+            f"the pane still prescribes a refresh for a 404: {text}"
+        )
+    finally:
+        context.close()
+
+
+def test_a_vendor_script_that_defines_nothing_ends_in_a_sentence_not_a_spinner(
+    browser, ui_url
+):
+    """Served, 200, and empty: the retry has to run out and say so. An
+    unbounded retry would leave the operator watching a pane that never
+    resolves and never lies either — the same silence in a nicer costume."""
+    context, page = _vendor_fault_pane(
+        browser, ui_url,
+        routes=[(f"**/vendor/xterm/{asset}", lambda route: route.fulfill(
+            status=200, content_type="application/javascript", body=""))
+            for asset in ("xterm.js", "addon-fit.js")],
+    )
+    try:
+        note = page.locator(".if-note").filter(has_text="did not define")
+        note.wait_for(timeout=15_000)
+        text = note.inner_text()
+        assert "Terminal and FitAddon" in text, text
+        assert "refresh" not in text.lower(), text
+    finally:
+        context.close()
