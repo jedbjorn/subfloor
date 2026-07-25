@@ -103,6 +103,10 @@ _STATIC = {
     # terminal-emulation library, never hand-rolled emulation).
     "/vendor/xterm/xterm.js": ("vendor/xterm/xterm.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm/xterm.css": ("vendor/xterm/xterm.css", "text/css; charset=utf-8"),
+    # FitAddon reads the renderer's ACTUAL cell metrics, which is the only way
+    # to size the grid to what the browser will really paint — hardcoded cell
+    # estimates overshoot the row count and clip the bottom rows.
+    "/vendor/xterm/addon-fit.js": ("vendor/xterm/addon-fit.js", "application/javascript; charset=utf-8"),
 }
 
 # The Interface's own authorities, for the socket sources in the CSP below —
