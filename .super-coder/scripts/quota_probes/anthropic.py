@@ -7,15 +7,16 @@ Two files, and only the first is the credential file:
   ~/.claude.json                oauthAccount.accountUuid — the account
                                 identifier.
 
-Spec #49 and decisions #65/#67 both say `account_ref` comes from "the
+Spec #49 and decisions #65/#67 both said `account_ref` comes from "the
 credential file's account uuid". It is NOT there: that file holds only
 accessToken / refreshToken / expiresAt / refreshTokenExpiresAt / scopes /
 subscriptionType / rateLimitTier. The uuid lives in ~/.claude.json under
-`oauthAccount`, which also carries `emailAddress` in full — so the spec's
-label ladder ("Anthropic: credential-file account uuid, first 8", written on
-the premise that Anthropic returns no email) is reachable but not forced.
-Both gaps were reported to the planner before this module was written; the
-label below follows the spec AS WRITTEN and is the one line a ruling flips.
+`oauthAccount`, which also carries `emailAddress` in full — so decision #67's
+premise that neither Anthropic nor Moonshot returns an email, true of the
+usage RESPONSE, is false at the file level. Both gaps were reported to the
+planner before this module was written and ruled on in decision #69: the
+label is the full email, the uuid stays the ref, and reading two files here
+is ratified rather than scope creep.
 
 The usage payload itself returns no account identifier at all, which is why
 the uuid is load-bearing. Whether it survives a re-login is unverified —
@@ -42,20 +43,25 @@ KIND_MAP = {"session": "session", "weekly_all": "weekly",
             "weekly_scoped": "weekly_scoped"}
 
 
-def _account_uuid(log) -> "str | None":
+def _identity(log) -> "tuple[str | None, str | None]":
+    """(account uuid, full email) — both from ~/.claude.json's oauthAccount,
+    which is the only place either exists. The usage response carries neither."""
     profile = read_json(PROFILE, log, HARNESS_PROVIDER)
     oauth = (profile or {}).get("oauthAccount")
     if not isinstance(oauth, dict):
-        return None
-    uuid = oauth.get("accountUuid")
-    return str(uuid) if uuid else None
+        return None, None
+    uuid, email = oauth.get("accountUuid"), oauth.get("emailAddress")
+    return (str(uuid) if uuid else None), (str(email) if email else None)
 
 
-def _label(uuid: str) -> str:
-    """Spec #49's ladder: the account uuid, first 8. ~/.claude.json also holds
-    `oauthAccount.emailAddress` in full, so a planner ruling to label Anthropic
-    by email changes this function and nothing else."""
-    return uuid[:8]
+def _label(uuid: str, email: "str | None") -> str:
+    """The full email, falling back to the uuid's first 8 only when the profile
+    carries no address (decision #69). A card reading 'a3f2b1c8' beside an
+    OpenAI card reading a full address does not tell the operator which account
+    they are looking at, and the address is safe to store for the same reason
+    OpenAI's already is: the engine DB is gitignored and both tables are
+    excluded from content.sql (decision #67)."""
+    return email or uuid[:8]
 
 
 def _windows(limits, captured_at: str, log) -> list[dict]:
@@ -96,14 +102,14 @@ def probe(log, timeout) -> list[dict]:
         # subscription session. Absence of a limit is not a limit of zero.
         return result(status="na", is_current=0)
 
-    uuid = _account_uuid(log)
+    uuid, email = _identity(log)
     if not uuid:
         log(f"{HARNESS_PROVIDER}: no oauthAccount.accountUuid in {PROFILE} — "
             "the usage payload carries no account id, so this account cannot "
             "be identified")
         return result(status="error", detail="no account identifier")
 
-    common = dict(account_ref=uuid, account_label=_label(uuid))
+    common = dict(account_ref=uuid, account_label=_label(uuid, email))
     if is_expired((oauth or {}).get("expiresAt")):
         # Reported, not repaired: refreshing out-of-band rotates the refresh
         # token and can break the operator's own login.

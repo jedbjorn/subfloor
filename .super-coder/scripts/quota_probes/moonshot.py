@@ -39,7 +39,7 @@ def _window_seconds(spec) -> "float | None":
 
 def _counts_window(entry: dict, captured_at: str, kind, scope) -> dict:
     used, limit = as_count(entry.get("used")), as_count(entry.get("limit"))
-    return window(window_kind=kind, scope=scope, used=used, limit=limit,
+    return window(window_kind=kind, scope=scope, used=used, limit_value=limit,
                   used_percent=percent_from(used, limit),
                   resets_at=norm_iso(entry.get("resetTime")),
                   captured_at=captured_at, probe_version=PROBE_VERSION)

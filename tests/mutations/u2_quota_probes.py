@@ -101,9 +101,24 @@ MUTATIONS = [
         name="credential-file-rewritten",
         property="a probe never writes the harness's credential file",
         path=ANTHROPIC,
-        old="    uuid = _account_uuid(log)",
+        old="    uuid, email = _identity(log)",
         new="    CREDENTIALS.write_text(CREDENTIALS.read_text())\n"
-            "    uuid = _account_uuid(log)",
+            "    uuid, email = _identity(log)",
+    ),
+    # ── The label ruled in decision #69 ──────────────────────────────────────
+    Mutation(
+        name="anthropic-labelled-by-uuid",
+        property="Anthropic's card carries the full email, not the uuid stub",
+        path=ANTHROPIC,
+        old="    return email or uuid[:8]",
+        new="    return uuid[:8]",
+    ),
+    Mutation(
+        name="label-has-no-fallback",
+        property="a profile with no address still labels the card",
+        path=ANTHROPIC,
+        old="    return email or uuid[:8]",
+        new="    return email",
     ),
     # ── Invariant: one provider's failure is contained ───────────────────────
     Mutation(
@@ -169,7 +184,7 @@ MUTATIONS = [
         path=ANTHROPIC,
         old='            used_percent=as_percent(item.get("percent")),',
         new='            used_percent=as_percent(item.get("percent")),\n'
-            '            used=as_percent(item.get("percent")), limit=100,',
+            '            used=as_percent(item.get("percent")), limit_value=100,',
     ),
     # ── Status vocabulary ────────────────────────────────────────────────────
     Mutation(

@@ -211,14 +211,18 @@ def account(*, provider: str, probe_version: str, captured_at: str,
 
 
 def window(*, window_kind: "str | None", probe_version: str, captured_at: str,
-           scope=None, used_percent=None, used=None, limit=None,
+           scope=None, used_percent=None, used=None, limit_value=None,
            resets_at=None, status="ok") -> dict:
     """One window row. An unrecognized duration keeps its raw duration in
     `scope` (done by the caller) and window_kind 'unknown' — rendered under
-    its own row rather than dropped."""
+    its own row rather than dropped.
+
+    `limit_value`, not `limit`: the column it feeds cannot be called `limit`
+    because that is a SQLite reserved word (found by U1's premise check,
+    ruled in message #1899). The pair is used/limit_value everywhere."""
     return {
         "window_kind": window_kind or "unknown", "scope": scope,
-        "used_percent": used_percent, "used": used, "limit": limit,
+        "used_percent": used_percent, "used": used, "limit_value": limit_value,
         "resets_at": resets_at, "captured_at": captured_at,
         "status": status, "probe_version": probe_version,
     }

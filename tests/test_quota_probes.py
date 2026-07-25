@@ -176,7 +176,8 @@ class AnthropicProbeTest(ProbeCase):
         self.assertEqual(acct["plan"], "max")
         self.assertEqual(acct["account_ref"],
                          "abcd1234-0000-4000-8000-00000000beef")
-        self.assertEqual(acct["account_label"], "abcd1234")
+        self.assertEqual(acct["account_label"], "placeholder@example.com",
+                         "decision #69: the label is the full email")
         windows = self.by_kind(acct)
         self.assertEqual(set(windows), {("session", None), ("weekly", None),
                                         ("weekly_scoped", "Claude Opus 5")})
@@ -187,11 +188,22 @@ class AnthropicProbeTest(ProbeCase):
         self.assertEqual(ep.calls[0][1]["anthropic-beta"],
                          p_anthropic.BETA_HEADER)
 
+    def test_label_falls_back_to_the_uuid_when_no_address_is_on_file(self):
+        """The ref and the label come from the same object but are not the
+        same field: an older profile without emailAddress must still key AND
+        label the card."""
+        self.write(self.claude_profile, {"oauthAccount": {
+            "accountUuid": "abcd1234-0000-4000-8000-00000000beef"}})
+        acct, _ = self.probe()
+        self.assertEqual(acct["account_label"], "abcd1234")
+        self.assertEqual(acct["account_ref"],
+                         "abcd1234-0000-4000-8000-00000000beef")
+
     def test_percent_only_provider_leaves_counts_null(self):
         acct, _ = self.probe()
         for w in acct["windows"]:
             self.assertIsNone(w["used"], "a count was invented from a percent")
-            self.assertIsNone(w["limit"])
+            self.assertIsNone(w["limit_value"])
 
     def test_expired_token_is_reported_never_used(self):
         self.write(self.claude_creds, {"claudeAiOauth": {
@@ -314,7 +326,7 @@ class MoonshotProbeTest(ProbeCase):
         self.assertEqual(acct["plan"], "LEVEL_ADVANCED")
         windows = self.by_kind(acct)
         weekly = windows[("weekly", None)]
-        self.assertEqual((weekly["used"], weekly["limit"]), (128000, 500000))
+        self.assertEqual((weekly["used"], weekly["limit_value"]), (128000, 500000))
         self.assertEqual(weekly["used_percent"], 25.6)
         five_hour = windows[("five_hour", None)]
         self.assertEqual(five_hour["used_percent"], 21.0)
@@ -337,7 +349,7 @@ class MoonshotProbeTest(ProbeCase):
         acct, _ = self.probe(payload=payload)
         w = self.one(acct["windows"])
         self.assertIsNone(w["used_percent"])
-        self.assertEqual((w["used"], w["limit"]), (128000, 0),
+        self.assertEqual((w["used"], w["limit_value"]), (128000, 0),
                          "the raw counts still stand")
 
     def test_unknown_time_unit_keeps_the_window(self):
