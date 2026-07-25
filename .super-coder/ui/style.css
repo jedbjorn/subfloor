@@ -777,20 +777,22 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .if-alerts.warning summary { color: var(--warn); border-color: var(--warn); }
 .if-alerts.critical summary { color: #d45a5a; border-color: #d45a5a; }
 .if-alerts-body { color: var(--ink); }
-/* Who this pane is — "<display name> · <SHORTNAME> · <chat title>" on the
-   header's left. It truncates instead of pushing the controls onto a second
-   header line — but .if-head wraps (the note and an open disclosure claim
-   their own line through flex-basis:100%), and a wrapping flex container
-   breaks the line on an item's CONTENT width before it will shrink that item,
-   so min-width:0 alone never got the chance to engage. A zero flex-basis
-   keeps the segment out of the line-breaking decision entirely; it then grows
-   into whatever room the controls leave, capped at its own content width so a
-   short identity sits exactly where it always did, and ellipsis-truncates
-   once there is no room left (min-width:0 is what lets it shrink that far). */
-.if-identity {
-  flex: 1 1 0; max-width: max-content; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis;
+/* Controls stay on the left; the data group consumes the remaining line and
+   aligns the work context, sprint badge, and shell identity to the right.
+   Both text segments may shrink so long subjects never move the controls. */
+.if-head-data {
+  flex: 1 1 0; min-width: 0; margin-left: auto;
+  display: flex; align-items: center; justify-content: flex-end; gap: .75rem;
+}
+.if-work-context {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; color: var(--ink); font-size: .85rem;
+}
+.if-work-badge { flex: 0 0 auto; color: var(--accent); border-color: var(--accent); }
+.if-identity {
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--ink); font-size: .85rem; text-align: right;
 }
 .if-inline-actions { display: flex; align-items: center; gap: .4rem; }
 .if-stat { color: var(--dim); font-size: .8rem; }

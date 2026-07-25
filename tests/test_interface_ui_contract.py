@@ -1731,19 +1731,49 @@ def test_title_is_not_added_to_the_rail_signature():
     assert "s.launch_effort" not in sig
 
 
-def test_header_identity_segment_is_composed_and_styled_to_truncate():
-    """Composition and the truncation styling only. Whether the header ACTUALLY
-    stays one line is a layout fact no CSS-text assertion can witness — this
-    file once asserted all three properties below while a long title still
-    wrapped the controls onto a second line (SC-156). That property is pinned
-    in a real browser by test_interface_ui_rendered's header-line test.
-    """
+def test_header_keeps_controls_left_and_composes_work_data_on_the_right():
+    """The DOM order pins the two-zone hierarchy; rendered coverage below owns
+    the actual geometry and truncation behavior."""
+    assert 'el("div", { className: "if-head-data" })' in APP
+    assert 'el("div", { className: "if-work-context" })' in APP
     assert 'el("div", { className: "if-identity" })' in APP
-    assert "[sel.display_name, sel.shortname, st.title]" in APP
+    assert "headEl.append(detailsEl, alertsEl, sessionActionsEl, sprintActionsEl," in APP
+    assert "headDataEl, statusNoteEl" in APP
+    assert "[sel.display_name, sel.shortname]" in APP
+    assert '.join(" | ")' in APP
+    data = CSS[CSS.index(".if-head-data {"):CSS.index(".if-inline-actions")]
+    assert "margin-left: auto" in data
+    assert "justify-content: flex-end" in data
+    assert "text-overflow: ellipsis" in data
     identity = CSS[CSS.index(".if-identity {"):CSS.index(".if-inline-actions")]
     assert "min-width: 0" in identity
     assert "text-overflow: ellipsis" in identity
     assert "white-space: nowrap" in identity
+
+
+def test_work_context_prefers_live_sprint_scope_then_chat_title():
+    helper = APP[APP.index("function ifWorkContext"):
+                 APP.index("function ifPaintHeader")]
+    script = helper + r"""
+function invariant(ok, message) { if (!ok) throw new Error(message); }
+invariant(
+  ifWorkContext({
+    sprintTitle: "SPRINT: Account Analytics",
+    title: "Tighten the chat header",
+  }) === "Account Analytics · Tighten the chat header",
+  "bound chat did not render sprint subject then chat title");
+invariant(
+  ifWorkContext({ sprintTitle: null, title: "Standalone fix" }) ===
+    "Standalone fix",
+  "unbound chat did not fall back to its first-message title");
+invariant(
+  ifWorkContext({ sprintTitle: "Account Analytics", title: "Account Analytics" }) ===
+    "Account Analytics",
+  "identical scope and title were repeated");
+"""
+    result = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_terminal_card_carries_no_dead_chrome_below_the_last_row():

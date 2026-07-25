@@ -3185,6 +3185,15 @@ async function ifSprintPanel(pane, sel, sessionUi = null) {
         renderVersion !== sessionUi.sprintPanelVersion)) ||
       (!sel.session_id && !bindings.length && !alerts.length)) return;
 
+  if (sessionUi) {
+    const active = bindings.find((binding) =>
+      !binding.released_at && binding.session_id === sessionUi.sessionId);
+    sessionUi.st.sprintRef = active ? active.sprint_doc_id : null;
+    sessionUi.st.sprintTitle =
+      active && active.sprint ? active.sprint.title || null : null;
+    sessionUi.paint();
+  }
+
   const detailNodes = [];
   const actionNodes = [];
   const alertNodes = [];
@@ -3498,10 +3507,17 @@ async function ifSessionPane(pane, sel) {
     archive: sess.archive_id ?? null,
     since: sess.occupied_at || sess.created_at || null,
     title: sess.title || null,      // minted once, from the first composer send
+    sprintRef: sel.sprint_ref || null,
+    sprintTitle: sel.sprint_title || null,
     note: "",
   };
   const headEl = el("div", { className: "if-head" });
+  const headDataEl = el("div", { className: "if-head-data" });
+  const workContextEl = el("div", { className: "if-work-context" });
+  const sprintBadgeEl = el("span",
+    { className: "pill if-badge accent if-work-badge" });
   const identityEl = el("div", { className: "if-identity" });
+  headDataEl.append(workContextEl, sprintBadgeEl, identityEl);
   const sessionDetailsEl = el("div", { className: "if-diag" });
   const sprintDetailsEl = el("div", { className: "if-diag" });
   const detailsEl = el("details", { className: "if-disclosure if-details" },
@@ -3514,14 +3530,14 @@ async function ifSessionPane(pane, sel) {
   const sessionActionsEl = el("div", { className: "if-inline-actions" });
   const sprintActionsEl = el("div", { className: "if-inline-actions" });
   const statusNoteEl = el("div", { className: "if-note" });
-  headEl.append(identityEl, detailsEl, alertsEl, sessionActionsEl,
-    sprintActionsEl, statusNoteEl);
+  headEl.append(detailsEl, alertsEl, sessionActionsEl, sprintActionsEl,
+    headDataEl, statusNoteEl);
   const termEl = el("div", { className: "if-term" });
   const composerEl = el("div", { className: "if-composer" });
   const a = { sessionId, shortname: sel.shortname, st, headEl, termEl,
     composerEl, pane, sel, sessionDetailsEl, sprintDetailsEl, detailsEl,
     alertsEl, alertsSummary, alertsBody, sessionActionsEl, sprintActionsEl,
-    statusNoteEl, identityEl,
+    statusNoteEl, headDataEl, workContextEl, sprintBadgeEl, identityEl,
     legalActions: new Set(
       Array.isArray(sess.legal_actions) ? sess.legal_actions : []),
     stateReason: sess.state_reason || "",
@@ -3602,14 +3618,28 @@ function ifAge(ts) {
   return Math.floor(s / 86400) + "d";
 }
 
+function ifWorkContext(st) {
+  const sprintTitle = String(st.sprintTitle || "")
+    .replace(/^sprint\s*:\s*/i, "").trim();
+  return [sprintTitle, st.title].filter((value, index, all) =>
+    value && all.indexOf(value) === index).join(" · ");
+}
+
 function ifPaintHeader(a, sel, pane) {
   const st = a.st;
   const controlsActive = IF_ATTACHABLE_LIFECYCLES.has(st.lifecycle);
-  // Whose session this is, on the left of the header (spec #43 U4). A chat
-  // with no title yet — nothing sent from the composer — renders the segment
-  // without one rather than reserving an empty slot for it.
-  const identity = [sel.display_name, sel.shortname, st.title]
-    .filter(Boolean).join(" · ");
+  // Actions stay left; the right-aligned data group answers "what" before
+  // "who". A live sprint binding is the honest scope source for a managed
+  // planner session. Its title leads, with the first-message chat title as
+  // the more specific subject (or the sole fallback for an unbound chat).
+  const work = ifWorkContext(st);
+  a.workContextEl.textContent = work;
+  a.workContextEl.title = work;
+  a.workContextEl.hidden = !work;
+  a.sprintBadgeEl.textContent = st.sprintRef ? "Sprint " + st.sprintRef : "";
+  a.sprintBadgeEl.hidden = !st.sprintRef;
+  const identity = [sel.display_name, sel.shortname]
+    .filter(Boolean).join(" | ");
   a.identityEl.textContent = identity;
   a.identityEl.title = identity;
   const stat = (k, v, title) => el("span",
