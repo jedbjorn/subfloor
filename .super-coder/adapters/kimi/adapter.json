@@ -1,6 +1,7 @@
 {
   "harness": "kimi",
   "launch": ["kimi"],
+  "comm_aliases": ["kimi-code"],
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},

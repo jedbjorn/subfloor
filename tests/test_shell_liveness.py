@@ -11,6 +11,8 @@ Run:
 from __future__ import annotations
 
 import io
+import json
+import os
 import sys
 import tempfile
 import unittest
@@ -57,6 +59,14 @@ class ClassifyOrphanTest(unittest.TestCase):
     def test_tty_present_but_stdio_redirected_is_conservative(self):
         # tty_nr says attached, but no stdio fd resolves to a tty → no verdict.
         self.assertIsNone(shell_liveness.classify_orphan(34816, 4242, None, None))
+
+    def test_unknown_tty_existence_is_conservative(self):
+        # The classifier is namespace-BLIND: it is handed the answer, and an
+        # unknown answer stays unknown. It must never go and test the path in
+        # the scanner's own namespace — that is a different question about a
+        # different device, and answering it confidently is the U1 Part 2 bug.
+        self.assertIsNone(shell_liveness.classify_orphan(
+            34816, 4242, "/dev/pts/3", None))
 
 
 class OrphanSplitTest(unittest.TestCase):
@@ -166,6 +176,237 @@ class AdminPresenceTest(unittest.TestCase):
         self.assertEqual("present", snap["admin_presence"])
         self.assertEqual([123], snap["admin_root_pids"])
         self.assertTrue(snap["safe_to_clean_all"])
+
+
+def _adapter(root: Path, name: str, spec: "dict | None") -> None:
+    """One adapters/<name>/ dir; spec None = a dir with no adapter.json."""
+    d = root / name
+    d.mkdir()
+    if spec is not None:
+        (d / "adapter.json").write_text(json.dumps(spec))
+
+
+class HarnessBinariesTest(unittest.TestCase):
+    """comm is the RUNTIME name — the expected set unions launch[0],
+    headless.launch[0] and the adapter's declared comm_aliases."""
+
+    def _bins(self, build) -> set:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            build(root)
+            with mock.patch.object(shell_liveness, "ADAPTERS", root):
+                return shell_liveness.harness_binaries()
+
+    def test_comm_alias_is_matched(self):
+        bins = self._bins(lambda r: _adapter(r, "kimi", {
+            "launch": ["kimi"], "comm_aliases": ["kimi-code"]}))
+        self.assertIn("kimi-code", bins)
+
+    def test_headless_launch_binary_is_matched(self):
+        # A harness whose headless entry point differs from its interactive one
+        # is live under BOTH names; matching only launch[0] misses half of them.
+        bins = self._bins(lambda r: _adapter(r, "h", {
+            "launch": ["h-tui"], "headless": {"launch": ["h-batch"]}}))
+        self.assertIn("h-tui", bins)
+        self.assertIn("h-batch", bins)
+
+    def test_long_alias_truncated_to_comm_width(self):
+        # /proc/<pid>/comm is capped at 15 chars, so a longer declared alias
+        # must be compared in its truncated form or it can never match.
+        long = "a-very-long-harness-name"
+        bins = self._bins(lambda r: _adapter(r, "long", {
+            "launch": ["short"], "comm_aliases": [long]}))
+        self.assertIn(long[:15], bins)
+        self.assertNotIn(long, bins)
+        self.assertTrue(all(len(b) <= 15 for b in bins))
+
+    def test_alias_is_basenamed(self):
+        bins = self._bins(lambda r: _adapter(r, "p", {
+            "launch": ["p"], "comm_aliases": ["/opt/vendor/bin/p-runtime"]}))
+        self.assertIn("p-runtime", bins)
+
+    def test_duplicate_aliases_across_adapters_union_harmlessly(self):
+        def build(r):
+            _adapter(r, "a", {"launch": ["a"], "comm_aliases": ["shared-rt"]})
+            _adapter(r, "b", {"launch": ["b"], "comm_aliases": ["shared-rt"]})
+        bins = self._bins(build)
+        self.assertIn("shared-rt", bins)
+
+    def test_adapter_dir_without_json_leaves_the_fallback_floor(self):
+        bins = self._bins(lambda r: _adapter(r, "empty", None))
+        self.assertEqual(shell_liveness._FALLBACK_BINS, bins)
+
+    def test_malformed_adapter_json_is_skipped_not_fatal(self):
+        def build(r):
+            (r / "broken").mkdir()
+            (r / "broken" / "adapter.json").write_text("{not json")
+            _adapter(r, "ok", {"launch": ["ok"], "comm_aliases": ["ok-rt"]})
+        bins = self._bins(build)
+        self.assertIn("ok-rt", bins)
+
+    def test_adapter_without_aliases_is_unaffected(self):
+        bins = self._bins(lambda r: _adapter(r, "plain", {"launch": ["plain"]}))
+        self.assertIn("plain", bins)
+
+
+class KimiCommAliasTest(unittest.TestCase):
+    """Against the REAL adapters dir. A live headless kimi execs
+    /usr/local/bin/kimi and then renames itself `kimi-code` (PR_SET_NAME) —
+    captured from a real worker, not quoted from a transcript. Unaliased, the
+    worker matched nothing and its shell projected `available`, inviting the
+    operator to double-book a shell that was busy."""
+
+    def test_kimi_runtime_comm_is_recognised(self):
+        self.assertIn("kimi-code", shell_liveness.harness_binaries())
+
+
+class NamespaceAwareTtyTest(unittest.TestCase):
+    """The pty existence question is asked in the PROCESS's mount namespace.
+
+    Every case below uses a tty path that does NOT exist in the scanner's own
+    namespace, so a check against the bare path cannot pass them by accident.
+    """
+
+    TTY = "/dev/pts/99999"           # absent in this test runner's namespace
+
+    def _proc(self, td: str, *, tty=TTY, ns_has_tty=True, ns_readable=True,
+              tty_nr=34816, ppid=4242) -> Path:
+        """A fake /proc with one pid: stat, fd/0 → tty, and root → its own
+        namespace root (which may or may not hold the tty device)."""
+        proc = Path(td) / "proc"
+        entry = proc / "4242"
+        (entry / "fd").mkdir(parents=True)
+        entry.joinpath("stat").write_text(
+            f"4242 (kimi-code) S {ppid} 4242 4242 {tty_nr} -1 0 0 0\n")
+        entry.joinpath("fd", "0").symlink_to(tty)
+        if ns_readable:
+            ns_root = Path(td) / "nsroot"
+            (ns_root / tty.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+            if ns_has_tty:
+                (ns_root / tty.lstrip("/")).write_text("")
+            entry.joinpath("root").symlink_to(ns_root)
+        return proc
+
+    def test_live_container_pty_is_not_an_orphan(self):
+        # The repro: a tmux-hosted session holding a pty from the container's
+        # devpts, scanned from the host. The device is absent at the bare path
+        # and present through the process's own root → the session is LIVE.
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td)
+            self.assertFalse(os.path.exists(self.TTY),
+                             "fixture invalid: tty must be absent to the scanner")
+            with mock.patch.object(shell_liveness, "PROC", proc):
+                self.assertTrue(shell_liveness._tty_exists(4242, self.TTY))
+                self.assertIsNone(shell_liveness._orphan_verdict(4242))
+
+    def test_dead_pty_still_classifies_tty_gone(self):
+        # The regression case: same vantage, but the device is genuinely gone
+        # inside the process's own namespace too. Still an orphan.
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td, ns_has_tty=False)
+            with mock.patch.object(shell_liveness, "PROC", proc):
+                self.assertFalse(shell_liveness._tty_exists(4242, self.TTY))
+                self.assertEqual("tty-gone",
+                                 shell_liveness._orphan_verdict(4242))
+
+    def test_unreadable_namespace_yields_no_verdict(self):
+        # /proc/<pid>/root unreadable (foreign user) or the process exited
+        # mid-scan: we cannot tell, so we do not accuse. os.path.exists would
+        # have folded this into False and called a live session an orphan.
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td, ns_readable=False)
+            with mock.patch.object(shell_liveness, "PROC", proc):
+                self.assertIsNone(shell_liveness._tty_exists(4242, self.TTY))
+                self.assertIsNone(shell_liveness._orphan_verdict(4242))
+
+    def test_unresolvable_tty_path_is_not_an_absent_device(self):
+        # ONLY "the device is not there" (ENOENT) may become a tty-gone verdict.
+        # Any other failure to resolve the path — here a non-directory component
+        # inside the namespace — is us being unable to answer, and an unanswered
+        # question must not convict a live session. Distinct from the case
+        # above: /proc/<pid>/root itself stats fine, so the first guard passes
+        # and it is the SECOND lookup that has to stay conservative.
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td, ns_has_tty=False)
+            pts = Path(td) / "nsroot" / "dev" / "pts"
+            pts.rmdir()
+            pts.write_text("not a directory")
+            with mock.patch.object(shell_liveness, "PROC", proc):
+                self.assertIsNone(shell_liveness._tty_exists(4242, self.TTY))
+                self.assertIsNone(shell_liveness._orphan_verdict(4242))
+
+    def test_no_tty_fd_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td)
+            with mock.patch.object(shell_liveness, "PROC", proc):
+                self.assertIsNone(shell_liveness._tty_exists(4242, None))
+
+    def test_detached_verdict_survives_the_new_seam(self):
+        # tty_nr == 0 and reparented to init: decided before the pty question
+        # is ever asked, so the namespace change must not disturb it.
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._proc(td, tty_nr=0, ppid=1)
+            with mock.patch.object(shell_liveness, "PROC", proc):
+                self.assertEqual("detached",
+                                 shell_liveness._orphan_verdict(4242))
+
+
+class ZombieHarnessTest(unittest.TestCase):
+    """A zombie keeps its comm, so it still LOOKS like a harness — but it has
+    exited, holds no worktree, and its cwd link is empty. Counting it files it
+    under `indeterminate`, which pins safe_to_clean_all False permanently on the
+    word of a process that is gone. Container PID 1 is frequently not a reaper,
+    so these accumulate and never clear (ruled into U1 by the planner, #1660)."""
+
+    def _snapshot(self, state: str, *, with_cwd: bool):
+        with tempfile.TemporaryDirectory() as td:
+            proc = Path(td) / "proc"
+            entry = proc / "4242"
+            entry.mkdir(parents=True)
+            entry.joinpath("comm").write_text("kimi-code\n")
+            entry.joinpath("stat").write_text(
+                f"4242 (kimi-code) {state} 1 4242 4242 0 -1 0 0 0\n")
+            if with_cwd:
+                entry.joinpath("cwd").symlink_to(shell_liveness.REPO_ROOT)
+            with mock.patch.object(shell_liveness, "PROC", proc), \
+                    mock.patch.object(shell_liveness, "harness_binaries",
+                                      return_value={"kimi-code"}), \
+                    mock.patch.object(shell_liveness, "_shell_labels",
+                                      return_value={}):
+                return shell_liveness.compute()
+
+    def test_zombie_harness_is_not_a_live_session(self):
+        # No cwd link — exactly what a real zombie looks like in /proc.
+        snap = self._snapshot("Z", with_cwd=False)
+        self.assertEqual([], snap["processes"])
+        self.assertEqual([], snap["indeterminate_pids"])
+        self.assertEqual(0, snap["indeterminate"])
+
+    def test_zombie_does_not_pin_the_cleanup_gate(self):
+        # The consequence that matters: a dead process must not be able to hold
+        # the admin's cleanup gate shut forever.
+        snap = self._snapshot("Z", with_cwd=False)
+        self.assertNotIn(4242, snap["admin_root_pids"])
+        self.assertEqual([], snap["active_other_shells"])
+
+    def test_zombie_never_holds_a_shell_slot(self):
+        # Even with a readable cwd inside the repo, an exited process must not
+        # be attributed to a shell — that is what blocks a headless re-boot.
+        snap = self._snapshot("Z", with_cwd=True)
+        self.assertEqual([], snap["processes"])
+        self.assertEqual({}, snap["worktree_sessions"])
+
+    def test_live_harness_with_the_same_comm_is_still_counted(self):
+        # The guard keys on state, not on the name — a running process with the
+        # identical comm must survive it, or the guard has eaten the feature.
+        snap = self._snapshot("S", with_cwd=True)
+        self.assertEqual([4242], [p["pid"] for p in snap["processes"]])
+
+    def test_live_harness_with_unreadable_cwd_is_still_indeterminate(self):
+        # The honesty gap the scan DOES own (roadmap #24's case) is untouched.
+        snap = self._snapshot("S", with_cwd=False)
+        self.assertEqual([4242], snap["indeterminate_pids"])
+        self.assertFalse(snap["safe_to_clean_all"])
 
 
 class ComputeSmokeTest(unittest.TestCase):

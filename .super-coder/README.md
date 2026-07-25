@@ -74,6 +74,7 @@ is harness-blind. Each holds an `adapter.json`:
 | field | meaning |
 |---|---|
 | `launch` | argv exec'd to start the harness |
+| `comm_aliases` | optional; extra `/proc/<pid>/comm` values a live harness presents when its runtime name differs from its launch binary (liveness scanning — see `scripts/shell_liveness.py`) |
 | `boot_artifact` | the context file this harness reads (informational) |
 | `emit` | files in the adapter dir copied to the repo root at launch (gitignored, regenerated each launch from the tracked template) |
 | `env` | extra env merged into the launch environment |
