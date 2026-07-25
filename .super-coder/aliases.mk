@@ -28,14 +28,14 @@
 #   LONG-ONLY: Interface status/start/view/attach/take-control/stop/reconcile/
 #              recover; models; sprint/watch/job; build/logs/serve/health/ports;
 #              verify/map/render/snapshot/deps/install/rollback/token/
-#              update-harnesses/feature/eject
+#              update-harnesses/harness-status/feature/eject
 #              passthrough: make dos ARGS=health
 #
 SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-url dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
-        dos-update-harnesses dos-feat dos-feature dos-eject dos-token dos-status \
+        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-token dos-status \
         dos-start dos-view dos-attach dos-take dos-take-control dos-stop \
         dos-reconcile dos-recover dos-models dos-model-refresh dos-model-list \
         dos-model-resolve dos-sprint dos-watch dos-job dos-setup dos
@@ -103,6 +103,11 @@ dos-rollback:         ; $(SC) rollback
 # credential to stdout (never rotates, never logs); exact alias of ./sc token.
 dos-token:            ; $(SC) token
 dos-update-harnesses: ; $(SC) update-harnesses
+# What the shells' harness CLIs actually are, in the sandbox — and whether the
+# image owes a harness rebuild. The picker shows model ALIASES, never the CLI
+# build that decides which models an alias can reach, so this is the only place
+# that answers it.
+dos-harness-status:   ; $(SC) harness-status
 # Opt-in features: make dos-feat (list) · make dos-feat ARGS="enable pg"
 dos-feature:          ; $(SC) feature $(ARGS)
 dos-feat: dos-feature
@@ -181,7 +186,9 @@ dos-help:
 	@echo "    dos-setup / dos-install     first-launch bootstrap: reqs, harness, first shell"
 	@echo "    dos-rollback                undo a bad update — restore the DB + engine pair"
 	@echo "                                (without engine.ref.prev: DB only, with a warning)"
-	@echo "    dos-update-harnesses        update claude + opencode + codex + vibe + kimi"
+	@echo "    dos-update-harnesses        refresh claude + opencode + codex + vibe + kimi in the sandbox image"
+	@echo "                                (rolls the harness epoch + rebuilds; dos-r to run them)"
+	@echo "    dos-harness-status          harness CLI versions in the sandbox + is a harness rebuild owed"
 	@echo "    dos-feat / dos-feature      list/enable/disable opt-in features"
 	@echo "    dos-token                   print the browser sign-in token (stdout only)"
 	@echo "    dos-eject                   ONE-WAY: own the engine"

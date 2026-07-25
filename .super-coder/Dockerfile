@@ -145,13 +145,36 @@ RUN printf '%s\n' \
       > /usr/local/bin/sc \
  && chmod 0755 /usr/local/bin/sc
 
+# ── Harness freshness seam ───────────────────────────────────────────────────
+# The harness CLIs are BAKED (here + below), never mounted from the host: their
+# binaries are host-ABI artifacts, not portable config. A darwin binary in a
+# linux container is fatal (see kimi's note below), vibe's entry point is a
+# script with an absolute shebang into a host uv interpreter, and glibc baselines
+# differ across the distros we support. Auth travels; binaries do not.
+#
+# Baking alone froze them, though: docker serves the installer RUNs from layer
+# cache forever, so `./sc launch|restart` — which DO build — could never make a
+# harness newer, and a new model (Opus 5, in claude 2.1.219) stayed invisible to
+# every shell. This ARG is the expiry. Rolling it invalidates the two harness
+# layers and nothing above them (node/playwright/pip stay cached); it is
+# REFERENCED inside each RUN so the bust is guaranteed, not merely implied by
+# docker's arg-cache heuristics.
+#
+# Who rolls it: `./sc update` (dos-u) and `./sc update-harnesses`, to today's
+# date — see sc's harness_epoch()/harness_epoch_roll(). Routine launches reuse
+# the stored value and stay fully cached. Because the value is a DATE and every
+# fork on a machine shares the `super-coder-sandbox` tag, the first fork to
+# update that day refreshes harnesses for all of them; the rest cache-hit.
+ARG SC_HARNESS_EPOCH=0
+
 # Kimi Code — baked HERE (root stage) with its binary DELIBERATELY redirected to
 # /usr/local/bin (root-writable, on every PATH), unlike the $HOME installs below.
 # Its default home, ~/.kimi-code, holds bin/ AND config in one dir, and
 # `./sc launch` bind-mounts the host's ~/.kimi-code for creds — installing there
 # would let the mount shadow the baked binary (fatal on a macOS host: darwin
 # binary, linux container). KIMI_NO_MODIFY_PATH skips its shell-rc edit.
-RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
+RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
+ && curl -fsSL https://code.kimi.com/kimi-code/install.sh \
       | env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
@@ -173,10 +196,18 @@ ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 # codex drops into ~/.local/bin (already on PATH above), same as claude. vibe's
 # installer self-bootstraps uv (astral.sh) then `uv tool install`s into ~/.local/bin.
 # (kimi is baked earlier, in the root stage — see the comment there.)
-RUN curl -fsSL https://claude.ai/install.sh | bash \
+# SC_HARNESS_EPOCH is referenced so a rolled epoch re-runs these installers; they
+# resolve "latest" themselves, so the epoch is an expiry, not a version pin.
+RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
+ && curl -fsSL https://claude.ai/install.sh | bash \
  && curl -fsSL https://opencode.ai/install | bash \
  && curl -fsSL https://chatgpt.com/codex/install.sh | sh \
  && curl -LsSf https://mistral.ai/vibe/install.sh | bash
+
+# Stamp the epoch the harness layers were built with, so an image can be asked
+# what it is rather than guessed at: `./sc harness-status` reads this label and
+# says so when the image predates the stored epoch (i.e. a build is owed).
+LABEL sc.harness_epoch="${SC_HARNESS_EPOCH}"
 
 # Safe in-container git auth — structurally prevents a token in a URL. The
 # sandbox has no ssh, so `git@github.com:` remotes (e.g. a fork's default

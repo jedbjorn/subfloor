@@ -129,13 +129,33 @@ dnet() {
     || docker network create "$SC_NET" >/dev/null
 }
 
+# Sandbox harness freshness. The harness CLIs are baked into the image (their
+# binaries are host-ABI artifacts — see install.py's harness-epoch note for why
+# they can never be mounted in like creds), and docker serves those installer
+# layers from cache forever. The epoch is their expiry: rolling it re-runs the
+# installers on the next build, and nothing else in the image is invalidated.
+# install.py owns the value + its file; these are thin readers so there is one
+# implementation of it, not two that can disagree.
+harness_epoch()      { "$PY" "$S/install.py" --harness-epoch; }
+harness_epoch_roll() { "$PY" "$S/install.py" --roll-harness-epoch; }
+
+# What the CURRENT image was actually built with, read back from the label the
+# Dockerfile stamps. Empty for an image built before this seam existed (or none
+# at all) — callers treat that as "unknown", never as "current".
+harness_epoch_built() {
+  docker image inspect "$IMG" --format '{{index .Config.Labels "sc.harness_epoch"}}' 2>/dev/null \
+    | sed 's/^<no value>$//' || true
+}
+
 # Build the env image (the repo is bind-mounted at run time, never baked — see
-# .dockerignore: the build context is empty). Cheap to re-run; layers cache.
+# .dockerignore: the build context is empty). Cheap to re-run; layers cache —
+# including the harness layers, unless the epoch below has been rolled since.
 dbuild() {
   docker build -t "$IMG" -f "$ENGINE/Dockerfile" \
     --build-arg SC_USER="$(id -un)" \
     --build-arg SC_UID="$(id -u)" \
     --build-arg SC_GID="$(id -g)" \
+    --build-arg SC_HARNESS_EPOCH="$(harness_epoch)" \
     "$here"
 }
 
@@ -146,6 +166,41 @@ dimage_preflight() {
   echo "✗ --no-build: sandbox image '$IMG:latest' is missing; nothing was stopped." >&2
   echo "  Run ./sc build, then retry with --no-build." >&2
   return 1
+}
+
+drunning() { [ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null || echo false)" = true ]; }
+
+# Which harness CLIs the shells will actually run, and whether the image owes a
+# build. Answers from INSIDE the sandbox when one is up, because that is the
+# runtime shells get — the host's own CLIs are not mounted in and do not decide
+# anything on the docker path. Never fatal: this is a status surface, and a
+# probe that cannot run should say so rather than take a launch down with it.
+sc_harness_status() {
+  # In-container (or no docker at all): this process IS the runtime.
+  if [ -n "${SC_SANDBOX:-}" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "harness CLIs (this runtime):"
+    "$PY" "$S/harness_versions.py" || true
+    return 0
+  fi
+  stored="$(harness_epoch)"
+  built="$(harness_epoch_built)"
+  if drunning; then
+    echo "harness CLIs (in the sandbox — what shells run):"
+    # python3, not $PY: the container's interpreter is its own (the image's), and
+    # a host SC_PYTHON pointing at a host venv would not exist in there. $S is a
+    # host absolute path that resolves identically inside — launch bind-mounts
+    # the repo at its own path, which is what makes this exec work at all.
+    docker exec "$CNAME" python3 "$S/harness_versions.py" 2>/dev/null \
+      || echo "  (could not probe $CNAME)"
+  else
+    echo "harness CLIs: sandbox '$CNAME' is not running — ./sc launch to start it."
+  fi
+  echo "harness epoch: image built with ${built:-<none — predates the epoch seam>} · stored ${stored}"
+  # A rolled-but-unbuilt epoch is the actionable state: the operator asked for
+  # fresh harnesses and the image has not caught up yet. Say the command.
+  if [ "$stored" != "0" ] && [ "$stored" != "$built" ]; then
+    echo "  ! the image predates the stored epoch — ./sc restart (or ./sc build) to bake fresh harnesses"
+  fi
 }
 
 # ── dev kit (deps + test) — in-container primitives, like serve/boot ──────────
@@ -1012,7 +1067,25 @@ case "$cmd" in
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   doctor)          exec "$PY" "$S/install.py" --check-docker ;;
   update)            exec "$PY" "$S/update.py" "$@" ;;
-  update-harnesses) exec "$PY" "$S/install.py" --update-harnesses ;;
+  # Refresh the harness CLIs the SHELLS run — which, on the docker path, means
+  # the image and nothing else. Running the installers on the host here is what
+  # this command used to do, and it reported success while changing nothing: the
+  # container mounts creds (~/.claude, ~/.codex, …), never binaries, and every
+  # launch `docker rm -f`s the writable layer that an in-container install would
+  # land in. So: roll the epoch, rebuild, and name the restart that runs it.
+  # Without docker the host IS the runtime, so the installers are correct there.
+  update-harnesses)
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      echo "→ harness epoch rolled to $(harness_epoch_roll)"
+      dbuild
+      echo "→ image rebuilt with fresh harness CLIs"
+      sc_harness_status || true
+      echo "  running sandboxes keep the OLD image until they restart: ./sc restart"
+    else
+      echo "→ no docker — updating this host's harness CLIs (the no-docker runtime)"
+      "$PY" "$S/install.py" --update-harnesses
+    fi ;;
+  harness-status)  sc_harness_status ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
@@ -1244,6 +1317,13 @@ case "$cmd" in
     fi
     echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
     echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
+    # One line naming the claude build the shells got. It is the version that
+    # decides which models an alias like `opus` can resolve to, and until this
+    # line existed nothing anywhere reported it — a sandbox stuck one release
+    # behind a new model looked identical to a current one. Best-effort: a probe
+    # that cannot answer must not fail a launch that otherwise succeeded.
+    claude_v="$(docker exec "$CNAME" claude --version 2>/dev/null | head -1 || true)"
+    [ -n "$claude_v" ] && echo "  harnesses:     claude $claude_v   (all: ./sc harness-status)"
     # Bring the VM broker up alongside the sandbox when a VM is linked (self-skips
     # otherwise, and no-ops if systemd already owns it). The shells need it to
     # drive the VM; this keeps it from being a forgotten manual step.
@@ -1317,7 +1397,16 @@ case "$cmd" in
     launch_rc=0
     "$0" launch --no-build || launch_rc=$?
     sc_restart_health_summary "$launch_rc" ;;
-  build)        dcheck; dbuild ;;
+  # --harnesses expires the baked harness CLIs first, so the build re-runs their
+  # installers instead of serving them from a cache that has no expiry of its own.
+  build)
+    dcheck
+    case "${1:-}" in
+      --harnesses) echo "→ harness epoch rolled to $(harness_epoch_roll)"; shift ;;
+      "") : ;;
+      *) echo "sc build: unknown argument '$1' (usage: ./sc build [--harnesses])" >&2; exit 2 ;;
+    esac
+    dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
     "$PY" "$S/rebuild.py"
@@ -1357,7 +1446,10 @@ super-coder — forkable shell substrate
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
                              live Interface state asks continue-or-rollback; headless discard requires --discard-live-state
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
-  ./sc update-harnesses    update claude + opencode + codex + vibe + kimi to latest (force-reruns official installers)
+  ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
+                             (they are baked, never mounted — so a running sandbox keeps the old ones until ./sc restart)
+                             without docker, updates this host's CLIs instead — there the host IS the runtime
+  ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
                              --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
   ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)
@@ -1443,7 +1535,7 @@ super-coder — forkable shell substrate
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services
                              --yes skips the prompt · --no-build preflights/reuses the existing image
-  ./sc build               (re)build the sandbox image
+  ./sc build               (re)build the sandbox image · --harnesses also expires the baked harness CLIs so they reinstall
   ./sc logs                tail the sandbox server logs
 
   Primitives (run inside the container; also the no-docker host escape hatch):
