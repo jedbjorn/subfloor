@@ -3479,9 +3479,15 @@ function ifComposerSend(a) {
 
 const IF_TITLE_MAX = 60;
 
+// Array.from before the cap: String.slice counts UTF-16 code units, so an
+// astral character straddling the 60th unit would be cut into a lone
+// surrogate — which sqlite3 refuses to encode server-side, 500ing a mint that
+// then retries the same first line forever. Python's [:60] counts code points,
+// so this is also what makes the two caps agree.
 function ifDeriveTitle(text) {
   return typeof text === "string"
-    ? text.trim().split("\n")[0].trim().slice(0, IF_TITLE_MAX) : "";
+    ? Array.from(text.trim().split("\n")[0].trim())
+      .slice(0, IF_TITLE_MAX).join("") : "";
 }
 
 // The CLIENT mints the chat title, not the input broker. Composer sends and

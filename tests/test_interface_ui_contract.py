@@ -662,6 +662,10 @@ a.paint();
     (c) => c.path === "/interface/sessions/7/title");
   invariant(titleCalls.length === 1 && titleCalls[0].body.title === "hello",
     `title was not minted from the acknowledged send: ${JSON.stringify(apiCalls)}`);
+  // Closed world: the two filters above are the whole call set, so a future
+  // call to some third route from the ack path cannot slip past them.
+  invariant(apiCalls.length === 3,
+    `the ack path made unexpected API calls: ${JSON.stringify(apiCalls)}`);
 
   a.halted = false;
   a.composerInput.value = "retain on reject";
@@ -1574,6 +1578,11 @@ const makeAttach = (title) => {
     "leading blank lines must not produce an empty title");
   invariant(ifDeriveTitle("z".repeat(200)).length === 60,
     "the 60-char cap must hold");
+  const astral = "z".repeat(59) + "\u{1F600}" + " and the rest";
+  invariant(Array.from(ifDeriveTitle(astral)).length === 60 &&
+    ifDeriveTitle(astral).endsWith("\u{1F600}"),
+    "the cap must count code points: cutting an astral character in half " +
+    "leaves a lone surrogate sqlite3 refuses to store");
   invariant(ifDeriveTitle("   ") === "" && ifDeriveTitle(undefined) === "",
     "whitespace-only and non-string input derive nothing");
 

@@ -1000,3 +1000,67 @@ def test_terminal_bottom_edge_carries_no_dead_chrome(browser, ui_url):
         )
     finally:
         context.close()
+
+
+HEADER_LINES = """() => {
+  const head = document.querySelector(".if-head");
+  const identity = document.querySelector(".if-identity");
+  const box = identity.getBoundingClientRect();
+  // .if-head centres its items, so a shared flex line is a shared centre —
+  // the tops differ whenever a button is taller than the identity text.
+  const controls = Array.from(head.children)
+    .filter((child) => child !== identity)
+    .map((child) => child.getBoundingClientRect())
+    .filter((rect) => rect.height > 0);
+  const centre = (rect) => Math.round(rect.top + rect.height / 2);
+  return {
+    lines: new Set([box, ...controls].map(centre)).size,
+    truncated: identity.scrollWidth > identity.clientWidth,
+    gapToControls: Math.min(...controls.map((rect) => rect.left)) - box.right,
+  };
+}"""
+
+
+def test_long_identity_truncates_without_wrapping_the_header(browser, ui_url):
+    """Spec #43 U4: the identity segment "stays one line at any width" and the
+    action controls "keep their placement" (SC-156). .if-head wraps, and a
+    wrapping flex container breaks the line on an item's content width before
+    it shrinks that item — so a segment sized by its content dropped the
+    controls onto a second header line and never reached its own ellipsis.
+    Narrow viewport + a title at the 60-char cap forces the choice.
+    """
+    titled = {**SESSION, "title": "Wire the watcher daemon into the planner "
+                                  "inbox before freeze"}
+    assert len(titled["title"]) == 60
+
+    def titled_api(route) -> None:
+        if route.request.url.split("/api", 1)[-1] == "/interface/sessions/7":
+            return _json(route, titled)
+        return _mock_api(route)
+
+    context, page = _open_interface(
+        browser, ui_url, height=1000, width=700, api_handler=titled_api
+    )
+    try:
+        narrow = page.evaluate(HEADER_LINES)
+        assert narrow["lines"] == 1, (
+            f"the header laid out on {narrow['lines']} lines: the identity "
+            "wrapped the controls instead of truncating"
+        )
+        assert narrow["truncated"], (
+            "the identity fits at 700px — widen the fixture title, this test "
+            "is not measuring anything"
+        )
+
+        # ...and it is capped at its content width, so a segment with room to
+        # spare does not grow and shove the controls to the far right.
+        page.set_viewport_size({"width": 1600, "height": 1000})
+        wide = page.evaluate(HEADER_LINES)
+        assert wide["lines"] == 1
+        assert not wide["truncated"]
+        assert wide["gapToControls"] <= 17, (
+            f"{wide['gapToControls']}px between identity and controls — the "
+            "segment grew past its text (.if-head's own gap is 16px)"
+        )
+    finally:
+        context.close()
