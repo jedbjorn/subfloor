@@ -215,7 +215,9 @@ def _mock_api(route) -> None:
     return _json(route, {})
 
 
-INIT_SCRIPT = r"""
+# The socket stub is shared by the layout tests (which fake the terminal) and
+# the grid-fit tests (which drive the REAL vendored xterm), so it is split out.
+WS_STUB = r"""
 window.__wsInstances = 0;
 window.__wsResizeFrames = [];
 window.__terminalResizes = [];
@@ -248,19 +250,31 @@ class RenderedWebSocket {
   close() { this.readyState = RenderedWebSocket.CLOSED; }
 }
 window.WebSocket = RenderedWebSocket;
+"""
 
+# These tests are about the PANE's flex layout, so the terminal is faked. The
+# fake mirrors the real contract the app depends on — a loadAddon that hands the
+# terminal to the addon, and a proposeDimensions derived from the container's
+# real computed box — with a pretend cell, because measuring an actual cell is
+# what the grid-fit tests below exist to check.
+STUB_CELL_WIDTH = 9
+STUB_CELL_HEIGHT = 18
+TERMINAL_STUB = r"""
 class RenderedTerminal {
   constructor() {
     this.rows = 24;
     this.cols = 80;
     this._resize = null;
+    this._container = null;
   }
   open(container) {
+    this._container = container;
     const terminal = document.createElement("div");
     terminal.className = "xterm";
     terminal.textContent = "Rendered xterm viewport";
     container.append(terminal);
   }
+  loadAddon(addon) { addon.activate(this); }
   onData(callback) { this._data = callback; }
   onResize(callback) { this._resize = callback; }
   resize(cols, rows) {
@@ -274,7 +288,28 @@ class RenderedTerminal {
   dispose() {}
 }
 window.Terminal = RenderedTerminal;
-"""
+
+window.FitAddon = { FitAddon: class {
+  activate(terminal) { this._terminal = terminal; }
+  dispose() {}
+  proposeDimensions() {
+    const parent = this._terminal?._container;
+    if (!parent) return undefined;
+    const style = window.getComputedStyle(parent);
+    const height = parseInt(style.getPropertyValue("height"));
+    const width = Math.max(0, parseInt(style.getPropertyValue("width"))) - 14;
+    if (!height || width <= 0) return undefined;
+    return {
+      cols: Math.max(2, Math.floor(width / __CELL_W__)),
+      rows: Math.max(1, Math.floor(height / __CELL_H__)),
+    };
+  }
+} };
+""".replace("__CELL_W__", str(STUB_CELL_WIDTH)).replace(
+    "__CELL_H__", str(STUB_CELL_HEIGHT)
+)
+
+INIT_SCRIPT = WS_STUB + TERMINAL_STUB
 
 
 def _open_interface(
@@ -284,9 +319,13 @@ def _open_interface(
     context = browser.new_context(viewport={"width": width, "height": height})
     page = context.new_page()
     page.add_init_script(INIT_SCRIPT)
-    page.route("**/vendor/xterm/xterm.js", lambda route: route.fulfill(
-        status=200, content_type="application/javascript", body=""
-    ))
+    # Both vendor scripts must be blanked, not just xterm: the real addon-fit
+    # would otherwise overwrite the stub and then decline to measure the fake
+    # terminal, freezing the grid at 80x24 for every layout test.
+    for asset in ("xterm.js", "addon-fit.js"):
+        page.route(f"**/vendor/xterm/{asset}", lambda route: route.fulfill(
+            status=200, content_type="application/javascript", body=""
+        ))
     page.route("**/api/**", api_handler)
     page.goto(f"{ui_url}/#interface/DEV3", wait_until="networkidle")
     page.locator(".if-term .xterm").wait_for()
@@ -707,5 +746,213 @@ def test_not_occupied_end_chat_detaches_into_preserving_recovery(
         assert "Worktree preserved" in page.locator(
             ".if-recovery-result"
         ).inner_text()
+    finally:
+        context.close()
+
+
+# --------------------------------------------------------------------------
+# Terminal grid fit (spec 43 U6) — driven against the REAL vendored xterm.
+#
+# Every test above fakes the terminal, so none of them can see the defect this
+# section exists for: the grid used to be derived from hardcoded cell metrics
+# (9x17px), and the cell this font stack actually renders is 18px tall. The row
+# count therefore overshot the box and the bottom rows painted below `.if-term`'s
+# clipped edge — hiding precisely the lines a harness anchors to the bottom,
+# like the final option of a question prompt.
+#
+# So these load the real xterm and the real FitAddon and assert the geometry of
+# what the browser actually painted. The assertions are invariants rather than
+# pinned pixel counts, so they hold under any font, zoom, or platform metrics —
+# and go red whenever the grid is derived from an assumed cell size again.
+
+
+def _open_interface_real_terminal(
+    browser, ui_url: str, *, css_width: int, css_height: int,
+    zoom: float = 1.0,
+):
+    """Attach the Interface pane with the genuine xterm + FitAddon.
+
+    Only the socket is stubbed. Browser zoom is emulated the way Chromium
+    implements it: the layout viewport shrinks by the zoom factor while the
+    device pixel ratio grows by it.
+    """
+    context = browser.new_context(
+        viewport={"width": css_width, "height": css_height},
+        device_scale_factor=zoom,
+    )
+    page = context.new_page()
+    page.add_init_script(WS_STUB)
+    page.route("**/api/**", _mock_api)
+    page.goto(f"{ui_url}/#interface/DEV3", wait_until="networkidle")
+    page.locator(".if-term .xterm-rows").wait_for()
+    page.wait_for_function("window.__wsResizeFrames.length > 0")
+    return context, page
+
+
+# One frame per row, written through the app's own 0x00 output path so the
+# bytes reach the terminal exactly as the broker would deliver them.
+def _write_output(page, payload: str) -> None:
+    page.evaluate(
+        """(text) => {
+          const bytes = new TextEncoder().encode(text);
+          const frame = new Uint8Array(bytes.length + 1);
+          frame[0] = 0x00;
+          frame.set(bytes, 1);
+          window.__lastWs.onmessage({ data: frame.buffer });
+        }""",
+        payload,
+    )
+
+
+FINAL_OPTION = "3) explain the diff — FINAL OPTION"
+
+
+def _write_question_prompt(page) -> None:
+    """Reproduce the reported repro: a bottom-anchored question prompt whose
+    last option is the last thing on screen."""
+    rows = page.evaluate(
+        "document.querySelector('.if-term .xterm-rows').children.length"
+    )
+    prompt = (
+        "\r\n" * (rows + 3)
+        + "Apply this change?\r\n  1) yes\r\n  2) no\r\n  " + FINAL_OPTION
+    )
+    _write_output(page, prompt)
+    page.wait_for_function(
+        """(needle) => {
+          const rows = document.querySelector('.if-term .xterm-rows');
+          const last = rows.children[rows.children.length - 1];
+          return last && last.textContent.includes(needle);
+        }""",
+        arg=FINAL_OPTION,
+    )
+
+
+def _grid(page) -> dict[str, float]:
+    return page.evaluate(
+        """() => {
+          const card = document.querySelector(".if-term");
+          const rowsElement = card.querySelector(".xterm-rows");
+          const style = getComputedStyle(card);
+          const box = card.getBoundingClientRect();
+          const rows = Array.from(rowsElement.children);
+          const first = rows[0].getBoundingClientRect();
+          const last = rows[rows.length - 1].getBoundingClientRect();
+          // Everything here is border-box, so getComputedStyle().height is the
+          // BORDER box — the exact trap this unit fixes. Derive the content box
+          // from the edges instead, or the test measures the wrong thing too.
+          const contentTop = box.top
+            + parseFloat(style.borderTopWidth) + parseFloat(style.paddingTop);
+          const contentBottom = box.bottom
+            - parseFloat(style.borderBottomWidth)
+            - parseFloat(style.paddingBottom);
+          const contentLeft = box.left
+            + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft);
+          const contentRight = box.right
+            - parseFloat(style.borderRightWidth)
+            - parseFloat(style.paddingRight);
+          return {
+            rowCount: rows.length,
+            cellHeight: first.height,
+            // `overflow: hidden` clips at the padding box; the grid is sized
+            // against the content box, which is the stricter of the two.
+            contentBottom,
+            clipBottom: box.bottom - parseFloat(style.borderBottomWidth),
+            contentRight,
+            gridTop: first.top,
+            gridRight: first.right,
+            lastRowBottom: last.bottom,
+            lastRowText: rows[rows.length - 1].textContent,
+            availableHeight: contentBottom - contentTop,
+            availableWidth: contentRight - contentLeft,
+          };
+        }"""
+    )
+
+
+def _assert_grid_fits(grid: dict[str, float], label: str) -> None:
+    cell = grid["cellHeight"]
+    assert cell > 0, f"{label}: no rendered cell to measure"
+
+    # The acceptance itself: the operator can read the bottom line.
+    assert grid["lastRowBottom"] <= grid["contentBottom"] + 0.5, (
+        f"{label}: last row overflows the terminal card by "
+        f"{grid['lastRowBottom'] - grid['contentBottom']:.1f}px "
+        f"({grid['rowCount']} rows x {cell}px cell in "
+        f"{grid['availableHeight']}px)"
+    )
+
+    # ...and it is not bought by shrinking the grid: any unused strip must be
+    # smaller than one more row, or we are wasting space the operator paid for.
+    slack = grid["availableHeight"] - grid["rowCount"] * cell
+    assert 0 <= slack < cell, (
+        f"{label}: grid leaves {slack:.1f}px unused with a {cell}px cell — "
+        f"the fit is not tracking the real metrics"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "css_width", "css_height", "zoom"),
+    [
+        # 100% zoom, tall and short panes.
+        ("tall-100", 1600, 1400, 1.0),
+        ("default-100", 1600, 1000, 1.0),
+        ("short-100", 1600, 760, 1.0),
+        # Chromium zoom: the CSS viewport shrinks as the device ratio grows.
+        ("zoom-80", 2000, 1250, 0.8),
+        ("zoom-125", 1280, 800, 1.25),
+        # The mobile layout's shorter pane (`.if-pane` goes full width).
+        ("mobile", 620, 900, 1.0),
+    ],
+)
+def test_terminal_grid_keeps_the_last_row_visible(
+    browser, ui_url, label, css_width, css_height, zoom
+):
+    """The whole point of the unit: whatever the real cell turns out to be, the
+    last row a harness paints is inside the card the operator can see."""
+    context, page = _open_interface_real_terminal(
+        browser, ui_url, css_width=css_width, css_height=css_height, zoom=zoom
+    )
+    try:
+        _write_question_prompt(page)
+        grid = _grid(page)
+        assert FINAL_OPTION in grid["lastRowText"]
+        _assert_grid_fits(grid, label)
+    finally:
+        context.close()
+
+
+def test_terminal_grid_refits_and_reports_the_measured_size_to_tmux(
+    browser, ui_url
+):
+    """Resizing re-measures, and the row count the browser painted is exactly
+    the one forwarded down term.onResize -> ifSendResize -> tmux."""
+    context, page = _open_interface_real_terminal(
+        browser, ui_url, css_width=1600, css_height=900
+    )
+    try:
+        _write_question_prompt(page)
+        before = _grid(page)
+        _assert_grid_fits(before, "before-resize")
+        assert page.evaluate("window.__wsResizeFrames.at(-1).rows") == (
+            before["rowCount"]
+        )
+
+        page.set_viewport_size({"width": 1600, "height": 1300})
+        page.wait_for_function(
+            "(rows) => window.__wsResizeFrames.at(-1).rows !== rows",
+            arg=before["rowCount"],
+        )
+        _write_question_prompt(page)
+        after = _grid(page)
+
+        assert after["rowCount"] > before["rowCount"]
+        assert after["cellHeight"] == before["cellHeight"]
+        _assert_grid_fits(after, "after-resize")
+        # The grid the operator sees and the grid tmux is told about are one
+        # number — the resize path this unit deliberately left unchanged.
+        assert page.evaluate("window.__wsResizeFrames.at(-1).rows") == (
+            after["rowCount"]
+        )
     finally:
         context.close()

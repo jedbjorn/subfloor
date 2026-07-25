@@ -757,6 +757,9 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   padding: 6px; width: 100%; max-width: 1300px;
   flex: 1 1 500px; min-height: 500px; overflow: hidden;
 }
+/* The grid is measured against this wrapper, so it must carry no padding or
+   border of its own — it is exactly the card's content box. */
+.if-term > .if-term-fit { height: 100%; width: 100%; }
 .if-term .xterm { height: 100%; }
 .if-composer {
   flex: 0 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto;

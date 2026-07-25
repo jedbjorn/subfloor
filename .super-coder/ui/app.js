@@ -3581,15 +3581,26 @@ async function ifTakeover(a) {
 // Open the sc-term.v1 stream: 0x00 output → write, 0x04 snapshot → reset+write;
 // keystrokes go out as 0x01 ‖ seq:u64be ‖ payload, one unacked frame at a time.
 function ifOpenStream(a, ticket) {
-  if (typeof Terminal === "undefined") {   // deferred vendor script not ready yet
-    a.st.note = "terminal library still loading — refresh the page";
+  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+    a.st.note = "terminal library still loading — refresh the page";  // deferred vendor scripts
     a.paint();
     return;
   }
   const term = new Terminal({ convertEol: false, cursorBlink: true,
     fontFamily: "ui-monospace, monospace" });
   a.term = term;
-  term.open(a.termEl);
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  // Mount into a padding-free wrapper rather than straight into the card.
+  // FitAddon sizes the grid from getComputedStyle(parentElement).height and
+  // subtracts only the xterm element's own padding — but everything here is
+  // border-box, so the card's height reads as its BORDER box and the addon
+  // would hand back a grid 14px (6px padding x2 + 1px border x2) taller than
+  // the card can show. The wrapper fills the card's content box exactly, with
+  // no padding or border of its own, which makes the addon's measurement true.
+  const mount = el("div", { className: "if-term-fit" });
+  a.termEl.replaceChildren(mount);
+  term.open(mount);
   const ws = new WebSocket(
     (location.protocol === "https:" ? "wss://" : "ws://") + location.host +
     "/api/interface/session-streams/" + a.sessionId + "?ticket=" + encodeURIComponent(ticket),
@@ -3625,17 +3636,26 @@ function ifOpenStream(a, ticket) {
   }, 10000);
   if (a.role === "writer") term.onData((d) => ifSendInput(a, d));
   term.onResize(({ rows, cols }) => ifSendResize(a, rows, cols));
-  // No FitAddon is vendored — estimate the char grid from the container and
-  // resize the terminal to fill it; the onResize hook above forwards it.
+  // Measure, don't estimate. The grid used to be derived from hardcoded cell
+  // metrics (9x17px), but the real cell depends on the font that actually
+  // resolves, and whenever it renders taller than the guess the row count
+  // overshoots what fits — the surplus rows paint below the card's clipped
+  // edge, hiding exactly the lines a harness anchors to the bottom, like the
+  // last option of a question prompt. (Measured here: 18px tall, 7.5px wide,
+  // so rows overflowed AND ~30 columns of width went unused.) FitAddon reads
+  // the renderer's actual css cell dimensions, so the grid tracks whatever the
+  // browser really paints across fonts, fallbacks, and zoom levels. The
+  // resulting size still flows out through term.onResize -> ifSendResize ->
+  // tmux resize-window, unchanged — this only fixes what we ask for.
   const fit = () => {
-    const w = a.termEl.clientWidth, h = a.termEl.clientHeight;
-    if (!w || !h) return;
-    const cols = Math.max(20, Math.floor((w - 12) / 9));
-    const rows = Math.max(4, Math.floor((h - 12) / 17));
+    const dims = fitAddon.proposeDimensions();
+    if (!dims || !dims.cols || !dims.rows) return;   // renderer not measured yet
+    const cols = Math.max(20, dims.cols);
+    const rows = Math.max(4, dims.rows);             // tmux floor, as before
     if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
   };
   a.resizeObs = new ResizeObserver(fit);
-  a.resizeObs.observe(a.termEl);
+  a.resizeObs.observe(mount);   // the box the fit is measured against
   ws.onopen = () => {
     fit();
     ifSendResize(a, term.rows, term.cols);
