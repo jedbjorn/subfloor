@@ -148,6 +148,7 @@ class InterfaceApiTest(unittest.TestCase):
         # Browser sessions are process-global live state — start each test
         # from the empty store a fresh server would have.
         routes._browser_sessions.clear()
+        routes._browser_bootstraps.clear()
         routes.ensure_operator_capability()
         (run_dir / "operator.token").write_text("optok")
         self.runtime = FakeRuntime()
@@ -640,6 +641,7 @@ class InterfaceApiTest(unittest.TestCase):
                     " ".join(str(c) for row in rows for c in row),
                     f"browser session leaked into {table}")
         routes._browser_sessions.clear()          # what a restart does
+        routes._browser_bootstraps.clear()        # ...including replays
         status, _, body = self.call("GET", "/api/interface/shells",
                                     (f"Cookie: {cookie}",))
         self.assertEqual(status, 401)
