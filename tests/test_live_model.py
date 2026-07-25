@@ -491,24 +491,54 @@ class Robustness(ProbeCase):
 class WorktreeIsolation(ProbeCase):
     """One shell's model must never be another's."""
 
+    # `_encode(CLAUDE_BACK)` is a PREFIX of all three, so a probe for
+    # CLAUDE_BACK scans their transcripts too.
+    NEIGHBOURS = (CLAUDE_AB, CLAUDE_SUB, CLAUDE_SINGLE)
+    ANSWERS = {CLAUDE_BACK: "claude-haiku-4-5-20251001",
+               CLAUDE_AB: "claude-sonnet-5",
+               CLAUDE_SUB: "claude-sonnet-5",
+               CLAUDE_SINGLE: "claude-haiku-4-5-20251001"}
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = self.tmp / "projects"
+        shutil.copytree(FIXTURES / "claude" / "projects", self.projects)
+        p_claude.DATA_DIR = self.projects
+
+    def assert_each_worktree_answers_for_itself(self):
+        for wt, model in self.ANSWERS.items():
+            r = self.probe("claude", wt)
+            self.assertEqual(r["last_model"], model, wt)
+            # ...and from its OWN project dir. Not redundant: two of these
+            # four worktrees answer the same model, so the source is the only
+            # thing that separates a right answer from a lucky one.
+            self.assertIn(p_claude._encode(wt) + "/",
+                          r["source"].replace("\\", "/"), wt)
+
     def test_claude_project_dir_prefix_collision_is_resolved_by_cwd(self):
         """`_encode` is lossy and `-tmp-lm-capture-claude` is a PREFIX of the
         -ab/-sub/-single fixture dirs, so the prefilter matches all four. Only
-        the per-record `cwd` separates them — and the newest file among them
-        belongs to a DIFFERENT worktree, so a probe that trusted mtime alone
-        would answer with its model."""
-        by_worktree = {wt: self.probe("claude", wt)["last_model"]
-                       for wt in (CLAUDE_BACK, CLAUDE_AB, CLAUDE_SUB,
-                                  CLAUDE_SINGLE)}
-        self.assertEqual(by_worktree[CLAUDE_AB], "claude-sonnet-5")
-        self.assertEqual(by_worktree[CLAUDE_SUB], "claude-sonnet-5")
-        self.assertEqual(by_worktree[CLAUDE_BACK], "claude-haiku-4-5-20251001")
-        self.assertEqual(by_worktree[CLAUDE_SINGLE],
-                         "claude-haiku-4-5-20251001")
-        # and each answer came from its OWN project dir
-        for wt in (CLAUDE_BACK, CLAUDE_AB, CLAUDE_SUB, CLAUDE_SINGLE):
-            src = self.probe("claude", wt)["source"]
-            self.assertIn(p_claude._encode(wt) + "/", src.replace("\\", "/"))
+        the per-record `cwd` separates them.
+
+        The mtimes have to be OWNED here, and were not: git records content,
+        never mtimes, so a fresh checkout stamps all four in the same instant,
+        and the (mtime, path) tie-break then puts CLAUDE_BACK's OWN file first
+        every time — `/` sorts above `-`. The scan reached the right answer
+        before ever consulting a foreign `cwd`, so deleting the guard this
+        test is named for left it green. Each neighbour now takes a turn at
+        being the newest file in the scan, which is the only arrangement in
+        which the guard does any work.
+        """
+        transcripts = {wt: sorted((self.projects / p_claude._encode(wt))
+                                  .glob("*.jsonl"))
+                       for wt in self.ANSWERS}
+        every = [p for paths in transcripts.values() for p in paths]
+        for neighbour in self.NEIGHBOURS:
+            with self.subTest(newest=neighbour):
+                _stamp_newest(transcripts[neighbour][0], every)
+                self.assert_each_worktree_answers_for_itself()
 
     def test_a_longer_project_dir_name_still_answers_when_the_records_say_so(self):
         """The prefix prefilter's whole reason for existing: the dir NAME is a
@@ -521,19 +551,15 @@ class WorktreeIsolation(ProbeCase):
         a dir name this host has not produced — the same category as the
         truncation and `time_updated` perturbations.
         """
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        src = FIXTURES / "claude" / "projects" / p_claude._encode(CLAUDE_TWO)
-        projects = tmp / "projects"
-        shutil.copytree(src, projects / src.name)
+        own = self.projects / p_claude._encode(CLAUDE_TWO)
         sessions = _claude_session_models(CLAUDE_TWO)
         moved, expected = sorted(sessions.items())[0]
-        odd = projects / (src.name + "-2")
+        odd = self.projects / (own.name + "-2")
         odd.mkdir()
-        shutil.move(str(projects / src.name / moved.name), odd / moved.name)
-        p_claude.DATA_DIR = projects
-        others = list((projects / src.name).glob("*.jsonl"))
+        shutil.move(str(own / moved.name), odd / moved.name)
+        others = list(own.glob("*.jsonl"))
         self.assertTrue(others, "the pair must not both move")
+        self.assertNotIn(expected, [sessions[p] for p in sessions if p != moved])
         _stamp_newest(odd / moved.name, [odd / moved.name, *others])
 
         r = self.probe("claude", CLAUDE_TWO)
