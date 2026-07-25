@@ -1,22 +1,33 @@
----
-name: flag_sweep
-description: Admin's every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.
-category: substrate
-common: false
----
+-- 0091 — forward-reseed flag_sweep: fix the Step-3 dedup guards. The 3B
+-- template mints "[Docs] <title> shipped, doc pending" (singular) and legacy
+-- hand-written flags say "feature doc pending", but both NOT EXISTS guards
+-- matched only '%docs pending%' (plural) — so template-minted flags never
+-- suppressed their own rows and every later sweep re-listed covered gaps
+-- (ADM1 session 0003: seven already-flagged rows re-surfaced). Guards now
+-- match the [Docs]/[Ship] tag at position zero first, with a loosened
+-- '%doc%pending%' prose fallback. Keeps existing installations aligned
+-- with assets/skills.
 
-# flag_sweep — reconcile flags against state
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'flag_sweep',
+  'Admin''s every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.',
+  'substrate',
+  NULL,
+  0,
+  '# flag_sweep — reconcile flags against state
 
 Admin-only. Leg 1 of the standing every-session pass -> then `git_cleanup` ->
 then optional `local_skill_management`. Working shells close the flags their
 own work clears (boot doc, "Finish before you stop"); this sweep is the
 backstop for the stragglers they dropped + the docs nobody opened a flag for.
-Two directions: close what's provably resolved, open what's provably missing.
+Two directions: close what''s provably resolved, open what''s provably missing.
 
 `<self>` = your shell_id. Resolve the planner once up front:
 
 ```sql
-SELECT shortname FROM shells WHERE flavor='planner' AND COALESCE(is_deleted,0)=0;
+SELECT shortname FROM shells WHERE flavor=''planner'' AND COALESCE(is_deleted,0)=0;
 -- no planner in this fork → surface to the FnB instead of messaging.
 ```
 
@@ -35,8 +46,8 @@ WHERE f.resolved=0 AND COALESCE(f.is_deleted,0)=0
 ORDER BY f.priority, f.flag_id;
 ```
 
-`frozen_docs` counts ANY frozen document on the feature — kind='spec' AND
-kind='doc' both qualify (#319: forks that freeze kind='doc' rows for shipped
+`frozen_docs` counts ANY frozen document on the feature — kind=''spec'' AND
+kind=''doc'' both qualify (#319: forks that freeze kind=''doc'' rows for shipped
 docs got false "undocumented" positives every sweep under a spec-only count).
 
 Sort every open flag into exactly one bucket (Step 2 / Step 4). Auto-close
@@ -57,7 +68,7 @@ sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for featur
 ```
 
 **B. Ship-blocker, feature now shipped** = flag of the form
-`… | Blocker for: <X>` + linked feature's `roadmap_status` is `shipped` (or
+`… | Blocker for: <X>` + linked feature''s `roadmap_status` is `shipped` (or
 later) + the flag text is about that feature shipping / becoming available. A
 separate concern that merely hangs off the same feature does NOT qualify:
 ```
@@ -87,7 +98,7 @@ apply. Pick `SC-###` for any open below = next free id
 ### 3A — Implemented but not marked shipped (ship-drift)
 
 The dev flips the horizon to `shipped` when Verification passes (`spec` skill,
-hand-off step) — the flip sometimes gets missed. Deterministic signal = spec's
+hand-off step) — the flip sometimes gets missed. Deterministic signal = spec''s
 **Verification task `done`** + feature **not** `shipped`. Open a durable
 `[Ship]` flag — it governs both halves of the dropped hand-off (mark shipped +
 reconcile the doc to the spec) and stays open until a planner does both.
@@ -96,14 +107,14 @@ reconcile the doc to the spec) and stays open until a planner does both.
 -- specs finished (Verification done) on features still short of shipped, with no open ship/docs flag:
 SELECT DISTINCT r.feature_id, r.title, r.roadmap_status
 FROM roadmap r
-JOIN documents d   ON d.feature_id = r.feature_id AND d.kind='spec'
-JOIN spec_tasks t  ON t.document_id = d.document_id AND t.title='Verification' AND t.status='done'
-WHERE r.roadmap_status NOT IN ('shipped','retired')
+JOIN documents d   ON d.feature_id = r.feature_id AND d.kind=''spec''
+JOIN spec_tasks t  ON t.document_id = d.document_id AND t.title=''Verification'' AND t.status=''done''
+WHERE r.roadmap_status NOT IN (''shipped'',''retired'')
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE '[Ship]%' OR f.description LIKE '[Docs]%'
-           OR f.description LIKE '%not marked shipped%' OR f.description LIKE '%doc%pending%'));
+      AND (f.description LIKE ''[Ship]%'' OR f.description LIKE ''[Docs]%''
+           OR f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%doc%pending%''));
 ```
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
@@ -118,27 +129,27 @@ sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) —
 
 Devs open a docs-pending flag when they ship — sometimes skipped. Find
 `shipped` features with no frozen doc + no open docs-pending flag; open one
-per row. (Finished-but-not-shipped is 3A's job, not this one.)
+per row. (Finished-but-not-shipped is 3A''s job, not this one.)
 
 ```sql
 -- shipped features with no frozen doc and no open docs-pending flag:
 SELECT r.feature_id, r.title, r.roadmap_status
 FROM roadmap r
-WHERE r.roadmap_status = 'shipped'
+WHERE r.roadmap_status = ''shipped''
   AND NOT EXISTS (
     SELECT 1 FROM documents d
     WHERE d.feature_id = r.feature_id AND d.frozen=1)
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE '[Docs]%' OR f.description LIKE '%doc%pending%'));
+      AND (f.description LIKE ''[Docs]%'' OR f.description LIKE ''%doc%pending%''));
 ```
 
 The dedup guards match the `[Docs]`/`[Ship]` tag at position zero FIRST — the
 templates below mint "doc pending" (singular) and legacy hand-written flags say
-"feature doc pending", so a prose-only `'%docs pending%'` pattern matched
+"feature doc pending", so a prose-only `''%docs pending%''` pattern matched
 neither and every later sweep re-listed already-flagged rows (found session
-ADM1/0003, seven covered rows re-surfaced). The `'%doc%pending%'` fallback
+ADM1/0003, seven covered rows re-surfaced). The `''%doc%pending%''` fallback
 catches untagged organic wordings; its over-breadth only ever SKIPS an open —
 the conservative direction.
 
@@ -152,14 +163,14 @@ sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) is 
 
 ---
 
-## Step 4: Surface the rest — don't guess
+## Step 4: Surface the rest — don''t guess
 
-Everything that isn't a clean Step-2 close / Step-3 open -> short list to the
+Everything that isn''t a clean Step-2 close / Step-3 open -> short list to the
 FnB (no `send` unless a specific shell owns it): review-failure flags (author
 dev closes those when the fix lands), FnB-decision flags, blockers whose
-resolution you can't verify from state, anything ambiguous. One line each:
+resolution you can''t verify from state, anything ambiguous. One line each:
 
-> `SC-042` [High] — <description> · feature #N at <status> · *why I didn't auto-act*
+> `SC-042` [High] — <description> · feature #N at <status> · *why I didn''t auto-act*
 
 The FnB or the owning shell closes these with a real note. Auto-act ONLY on
 unambiguous evidence.
@@ -171,10 +182,18 @@ unambiguous evidence.
 - **Deterministic-only auto-close.** Evidence in the DB + cited in the note,
   or it surfaces. A wrongly-closed live blocker is worse than a straggler.
 - **Backstop, not owner.** The shell that did the work closes its own flag
-  with the richer "how" note; don't race to close a flag whose owner is still
+  with the richer "how" note; don''t race to close a flag whose owner is still
   active on that feature.
 - **Both directions, every session.** An implemented-but-unshipped spec and an
   undocumented shipped feature are dropped handoffs; the signal is already in
   the DB (a `done` Verification task, a missing frozen doc) — surfacing them
   is deterministic.
-- **Then `git_cleanup`.** flag_sweep is leg 1 of the pass, not the whole pass.
+- **Then `git_cleanup`.** flag_sweep is leg 1 of the pass, not the whole pass.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
