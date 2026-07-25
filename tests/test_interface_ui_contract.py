@@ -1271,6 +1271,9 @@ invariant(document._listeners.get("visibilitychange").size === 1,
   "the poll registered no visibility listener");
 
 // A re-render replaces the poll; it must not leave the old listener behind.
+// (Registering the stable ifPollRail reference makes this true by the DOM's
+// own de-duplication — the pin is against reintroducing a per-poll closure
+// without a matching teardown, which is how this leaks.)
 await renderInterface(root);
 invariant(document._listeners.get("visibilitychange").size === 1,
   "a re-render stacked a second visibility listener");
