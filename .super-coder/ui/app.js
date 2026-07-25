@@ -2342,6 +2342,7 @@ function ifRailSig(shells) {
 function ifStopRailPoll() {
   if (!ifPoll) return;
   clearInterval(ifPoll.timer);
+  document.removeEventListener("visibilitychange", ifPoll.onVisible);
   ifPoll = null;
 }
 
@@ -2349,7 +2350,14 @@ function ifStartRailPoll(root, rail, picker, shells) {
   ifStopRailPoll();
   const sel = shells.find((s) => s.shortname === ifSelected);
   ifPoll = { root, rail, picker, sig: ifRailSig(shells), timer: null,
-    rendered: sel ? sel.availability : null };   // what the pane was built for
+    rendered: sel ? sel.availability : null,     // what the pane was built for
+    onVisible: null };
+  // Hidden-tab ticks are skipped, so every badge change while the tab was in
+  // the background is invisible for up to one interval after the operator
+  // comes back. Tick once on return instead of waiting out that interval;
+  // the listener is owned by this poll and torn down with it.
+  ifPoll.onVisible = () => { if (!document.hidden) ifPollRail(); };
+  document.addEventListener("visibilitychange", ifPoll.onVisible);
   ifPoll.timer = setInterval(ifPollRail, IF_POLL_MS);
 }
 

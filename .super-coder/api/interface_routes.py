@@ -135,7 +135,15 @@ def _db():
 
 def _json(status: int, obj, headers=None):
     body = json.dumps(obj).encode()
-    hdrs = [("Content-Type", "application/json")] + list(headers or [])
+    # Every Interface response is live state — availability, leases, alerts,
+    # generations. Served with no cache directives at all, a browser is
+    # PERMITTED to reuse a heuristically-cached copy, so the rail poll's 5s
+    # freshness rested on browsers declining to do so (spec #43 U3, gate
+    # follow-up). `no-store` states it here, at the sole constructor every
+    # Interface response is built by, rather than per-route where it would
+    # drift away from the routes added next.
+    hdrs = [("Content-Type", "application/json"),
+            ("Cache-Control", "no-store")] + list(headers or [])
     return status, hdrs, body
 
 
