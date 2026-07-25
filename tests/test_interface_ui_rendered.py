@@ -789,8 +789,9 @@ def _open_interface_real_terminal(
     return context, page
 
 
-# One frame per row, written through the app's own 0x00 output path so the
-# bytes reach the terminal exactly as the broker would deliver them.
+# Written through the app's own 0x00 output path, so the bytes reach the
+# terminal exactly as the broker would deliver them rather than via a shape
+# hand-authored into the DOM.
 def _write_output(page, payload: str) -> None:
     page.evaluate(
         """(text) => {
