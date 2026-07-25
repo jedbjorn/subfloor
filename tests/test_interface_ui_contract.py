@@ -1929,6 +1929,76 @@ def test_the_observation_clock_is_kept_out_of_the_rail_signature():
     assert "s.live_model_at" not in sig
 
 
+# A fleet whose SERVER order (ORDER BY shell_id) is deliberately nothing like
+# the ranked order, so an unsorted or half-sorted rail cannot pass by accident.
+# It carries both bespoke shapes: `cc` is the fork's own shell and its flavor is
+# literally NULL in the payload, and `GARD1` is a type this engine has never
+# heard of. Neither is a known type, and both must land after `devops`.
+ORDER_FLEET_SETUP = r"""
+const orderFleet = [
+  ["cc", null], ["REV1", "reviewer"], ["DEV3", "dev"], ["OPS1", "devops"],
+  ["PLN1", "planner"], ["CART1", "cartographer"], ["ADM1", "admin"],
+  ["GARD1", "gardener"], ["DEV4", "dev"], ["PLN2", "planner"],
+].map(([shortname, flavor], i) => ({
+  shell_id: i + 1, shortname, display_name: shortname, flavor,
+  availability: "available", session_id: null }));
+const railNames = (root) =>
+  all(railOf(root), (n) => n.tagName === "b").map((n) => n.textContent);
+const pickerNames = (root) =>
+  all(root, (n) => n.className === "if-picker")[0]
+    .children.slice(1).map((o) => o.value);
+"""
+RANKED = "CART1,ADM1,PLN1,PLN2,DEV3,DEV4,REV1,OPS1,cc,GARD1"
+
+
+def test_both_shell_lists_group_by_type_with_bespoke_shells_last():
+    """The FnB's roster order (shared/order.png): cartographer, admin, planner,
+    dev, reviewer, devops — and anything a fork invented after all of them.
+    Both surfaces are one loop, so both must show it; `devops` is a KNOWN type
+    and outranks the unknown bucket (planner ruling, sprint 45 unit 12)."""
+    run_recovery_js(RAIL_POLL_SETUP + ORDER_FLEET_SETUP + r"""
+serveShells(orderFleet);
+const root = new FakeElement("div");
+await renderInterface(root);
+invariant(railNames(root).join(",") === """ + f'"{RANKED}"' + r""",
+  `the rail is not grouped by type: ${railNames(root)}`);
+invariant(pickerNames(root).join(",") === """ + f'"{RANKED}"' + r""",
+  `the mobile picker disagrees with the rail: ${pickerNames(root)}`);
+
+// The placeholder stays first — the sort must not reach the option that
+// exists to say nothing is selected.
+invariant(all(root, (n) => n.className === "if-picker")[0].children[0].value
+  === "", "the picker lost its placeholder option");
+
+// And the payload itself is untouched: the same array is the poll's signature
+// input and renderInterface's selection lookup, both of which read the
+// server's order.
+invariant(orderFleet.map((s) => s.shortname).join(",")
+  === "cc,REV1,DEV3,OPS1,PLN1,CART1,ADM1,GARD1,DEV4,PLN2",
+  "ifBuildRail reordered the caller's array in place");
+ifStopRailPoll();
+""")
+
+
+def test_shells_of_one_type_keep_the_servers_order():
+    """Grouping is the ONLY thing that moves. Within a type the server's
+    `ORDER BY shell_id` must survive — including inside the bespoke bucket,
+    where `cc` (null) and `GARD1` (unknown string) share a rank and an
+    unstable sort would be free to swap them."""
+    run_recovery_js(RAIL_POLL_SETUP + ORDER_FLEET_SETUP + r"""
+serveShells(orderFleet);
+const root = new FakeElement("div");
+await renderInterface(root);
+const names = railNames(root);
+const before = (a, b) => names.indexOf(a) < names.indexOf(b);
+invariant(before("PLN1", "PLN2"), `planners were reordered: ${names}`);
+invariant(before("DEV3", "DEV4"), `devs were reordered: ${names}`);
+invariant(before("cc", "GARD1"),
+  `the bespoke bucket was reordered — the sort is not stable: ${names}`);
+ifStopRailPoll();
+""")
+
+
 def test_both_rail_display_sites_read_one_model_decision():
     """The desktop row and the mobile picker must never disagree about which
     claim the surface is making — one helper, two consumers. Pinned in source
