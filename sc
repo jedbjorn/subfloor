@@ -1450,6 +1450,7 @@ super-coder — forkable shell substrate
                              (they are baked, never mounted — so a running sandbox keeps the old ones until ./sc restart)
                              without docker, updates this host's CLIs instead — there the host IS the runtime
   ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
+                             (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
                              --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
   ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)
