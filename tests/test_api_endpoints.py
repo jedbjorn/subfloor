@@ -22,6 +22,7 @@ Run:
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import unittest
@@ -136,6 +137,11 @@ class AssemblerSmokeTest(unittest.TestCase):
         self.assertTrue(any(d["feature_id"] == self.ids["feature_id"]
                             for d in out["docs"]))
 
+    def test_get_active_sprints_empty(self) -> None:
+        self.assertEqual(
+            server.get_active_sprints(self.con),
+            {"active_count": 0, "sprints": []})
+
     def test_get_flags(self) -> None:
         out = server.get_flags(self.con)
         self.assertTrue(out["flags"])
@@ -174,6 +180,255 @@ class AssemblerSmokeTest(unittest.TestCase):
         out = server.get_roadmap(self.con)
         feats = [f for b in out["buckets"] for f in b["features"]]
         self.assertTrue(all(isinstance(f.get("blockers"), list) for f in feats))
+
+
+class ActiveSprintsProjectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.con = build_db()
+        self.planner_old = self._shell("PLN-OLD")
+        self.planner_new = self._shell("PLN-NEW")
+        self.dev = self._shell("DEV")
+        self.reviewer = self._shell("REV")
+        self.feature = self.con.execute(
+            "INSERT INTO roadmap (title, roadmap_status) "
+            "VALUES ('Flow Board', 'in_progress')").lastrowid
+        self.con.commit()
+
+    def tearDown(self) -> None:
+        self.con.close()
+
+    def _shell(self, shortname: str) -> int:
+        return self.con.execute(
+            "INSERT INTO shells "
+            "(display_name, shortname, system_prompt, flavor) "
+            "VALUES (?, ?, 'x', 'dev')",
+            (shortname, shortname)).lastrowid
+
+    def _doc(self, title: str, *, frozen=0, body="status: ACTIVE",
+             created_at="2026-07-26 12:00:00", feature_id=None,
+             kind="doc") -> int:
+        seq = self.con.execute(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
+            "WHERE feature_id IS ? AND kind=?",
+            (feature_id, kind)).fetchone()[0]
+        return self.con.execute(
+            "INSERT INTO documents "
+            "(feature_id, kind, seq, title, frozen, body, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (feature_id, kind, seq, title, frozen, body, created_at)).lastrowid
+
+    def _unit(self, doc_id: int, seq: str, *, state="pending") -> int:
+        return self.con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, dev_shell_id, "
+            "reviewer_shell_id, state, depends_on, overlap, branch, pr_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'U0', 'server.py', 'feat/unit', 42)",
+            (doc_id, seq, f"Unit {seq}", self.dev, self.reviewer,
+             state)).lastrowid
+
+    def _binding(self, doc_id: int, planner_id: int, *,
+                 released=False) -> int:
+        generation = self.con.execute(
+            "SELECT COALESCE(MAX(generation),0)+1 FROM interface_generations "
+            "WHERE shell_id=?", (planner_id,)).fetchone()[0]
+        self.con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (?, ?)", (planner_id, generation))
+        session_id = self.con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation) "
+            "VALUES (?, ?)", (planner_id, generation)).lastrowid
+        return self.con.execute(
+            "INSERT INTO sprint_planner_bindings "
+            "(sprint_doc_id, planner_shell_id, session_id, shell_id, generation, "
+            "released_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (doc_id, planner_id, session_id, planner_id, generation,
+             "2026-07-26 12:30:00" if released else None)).lastrowid
+
+    def _projected_ids(self) -> list[int]:
+        return [
+            sprint["document_id"]
+            for sprint in server.get_active_sprints(self.con)["sprints"]
+        ]
+
+    def test_unfrozen_closed_body_still_projects(self) -> None:
+        doc_id = self._doc(
+            "SPRINT: Closed prose, live record", body="status: CLOSED")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+
+        out = server.get_active_sprints(self.con)
+
+        self.assertEqual(out["active_count"], 1)
+        self.assertEqual(out["sprints"][0]["document_id"], doc_id)
+
+    def test_frozen_sprint_excluded_while_unfrozen_control_projects(self) -> None:
+        active_id = self._doc("SPRINT: Active control")
+        frozen_id = self._doc("SPRINT: Frozen", frozen=1)
+        self._unit(active_id, "U1")
+        self._unit(frozen_id, "U1")
+        self.con.commit()
+
+        ids = self._projected_ids()
+
+        self.assertIn(active_id, ids)
+        self.assertNotIn(frozen_id, ids)
+
+    def test_zero_unit_sprint_still_projects(self) -> None:
+        doc_id = self._doc("SPRINT: No units")
+        self.con.commit()
+
+        out = server.get_active_sprints(self.con)
+
+        self.assertEqual(out["sprints"], [{
+            "document_id": doc_id,
+            "title": "SPRINT: No units",
+            "started_at": "2026-07-26T12:00:00Z",
+            "planner": None,
+            "feature": None,
+            "units": [],
+        }])
+
+    def test_empty_title_remainder_uses_document_id_fallback(self) -> None:
+        doc_id = self._doc("SPRINT:")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+
+        sprint = server.get_active_sprints(self.con)["sprints"][0]
+
+        self.assertEqual(sprint["title"], f"Sprint #{doc_id}")
+
+    def test_kind_and_title_are_structural_predicate_operands(self) -> None:
+        active_id = self._doc("SPRINT: Active")
+        self._unit(active_id, "U1")
+        self._doc("SPRINT: Spec is not a sprint doc", kind="spec")
+        self._doc("Ordinary document")
+        self.con.commit()
+
+        self.assertEqual(self._projected_ids(), [active_id])
+
+    def test_orders_sprints_and_units_and_projects_full_unit_shape(self) -> None:
+        later = self._doc(
+            "SPRINT: Later", created_at="2026-07-26 13:00:00")
+        earlier = self._doc(
+            "SPRINT: Earlier", created_at="2026-07-26 11:00:00",
+            feature_id=self.feature)
+        self._unit(later, "U1")
+        for seq in ("U10", "U-H", "U2", "U1"):
+            self._unit(earlier, seq, state="working")
+        self._binding(earlier, self.planner_old, released=True)
+        self._binding(earlier, self.planner_new, released=True)
+        self.con.commit()
+
+        out = server.get_active_sprints(self.con)
+
+        self.assertEqual(
+            [s["document_id"] for s in out["sprints"]], [earlier, later])
+        sprint = out["sprints"][0]
+        self.assertEqual(sprint["started_at"], "2026-07-26T11:00:00Z")
+        self.assertEqual(sprint["planner"], {
+            "shell_id": self.planner_new, "shortname": "PLN-NEW"})
+        self.assertEqual(sprint["feature"], {
+            "feature_id": self.feature, "title": "Flow Board"})
+        self.assertEqual(
+            [u["seq"] for u in sprint["units"]],
+            ["U1", "U2", "U-H", "U10"])
+        self.assertEqual(set(sprint["units"][0]), {
+            *server._SPRINT_UNIT_COLUMNS,
+            "dev_shortname", "reviewer_shortname",
+        })
+        self.assertEqual(sprint["units"][0]["dev_shortname"], "DEV")
+        self.assertEqual(sprint["units"][0]["reviewer_shortname"], "REV")
+
+    def test_missing_metadata_is_explicit_and_corrupt_time_is_null(self) -> None:
+        valid_id = self._doc(
+            "SPRINT: Valid time", created_at="2026-07-26 13:00:00")
+        self._unit(valid_id, "U1")
+        corrupt_id = self._doc(
+            "SPRINT: Missing metadata", created_at="not-a-time")
+        self._unit(corrupt_id, "U1")
+        self.con.commit()
+
+        out = server.get_active_sprints(self.con)
+        sprint = out["sprints"][1]
+
+        self.assertEqual(
+            [s["document_id"] for s in out["sprints"]],
+            [valid_id, corrupt_id])
+        self.assertIsNone(sprint["started_at"])
+        self.assertIsNone(sprint["planner"])
+        self.assertIsNone(sprint["feature"])
+
+    def test_unassigned_unit_roles_remain_explicit(self) -> None:
+        doc_id = self._doc("SPRINT: Unassigned")
+        self.con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state) "
+            "VALUES (?, 'U1', 'Unassigned unit', 'pending')", (doc_id,))
+        self.con.commit()
+
+        unit = server.get_active_sprints(self.con)["sprints"][0]["units"][0]
+
+        self.assertIsNone(unit["dev_shell_id"])
+        self.assertIsNone(unit["dev_shortname"])
+        self.assertIsNone(unit["reviewer_shell_id"])
+        self.assertIsNone(unit["reviewer_shortname"])
+
+    def test_unknown_unit_state_fails_the_projection(self) -> None:
+        doc_id = self._doc("SPRINT: Corrupt state")
+        self.con.execute("PRAGMA ignore_check_constraints=ON")
+        self.con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state) "
+            "VALUES (?, 'U1', 'Corrupt unit', 'mystery')", (doc_id,))
+        self.con.commit()
+
+        with self.assertRaisesRegex(ValueError, "unknown sprint unit state"):
+            server.get_active_sprints(self.con)
+
+    def test_projection_is_one_snapshot_and_never_reads_document_body(self) -> None:
+        doc_id = self._doc("SPRINT: Snapshot", body="status: CLOSED")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+        statements = []
+        self.con.set_trace_callback(statements.append)
+
+        def authorizer(action, table, column, _db_name, _source):
+            if action == sqlite3.SQLITE_READ \
+                    and table == "documents" and column == "body":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        self.con.set_authorizer(authorizer)
+        try:
+            out = server.get_active_sprints(self.con)
+        finally:
+            self.con.set_authorizer(None)
+            self.con.set_trace_callback(None)
+
+        reads = [
+            statement for statement in statements
+            if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        ]
+        self.assertEqual(out["active_count"], 1)
+        self.assertEqual(len(reads), 1, reads)
+
+    def test_get_route_requires_active_status(self) -> None:
+        doc_id = self._doc("SPRINT: Routed")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+        proxy = mock.Mock(wraps=self.con)
+        proxy.close.return_value = None
+        with mock.patch.object(server, "db", return_value=proxy):
+            status, _headers, body = server.dispatch_http(
+                "GET", "/api/sprints?status=active", "", b"")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["active_count"], 1)
+
+        with mock.patch.object(server, "db", return_value=proxy):
+            status, _headers, body = server.dispatch_http(
+                "GET", "/api/sprints", "", b"")
+        self.assertEqual(status, 400)
+        self.assertIn("status=active", json.loads(body)["error"])
 
 
 class FeatureBlockerTest(unittest.TestCase):

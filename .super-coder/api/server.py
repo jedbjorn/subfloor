@@ -86,6 +86,7 @@ import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin ru
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
+from sprint_units import UNIT_STATES  # noqa: E402
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
@@ -573,6 +574,110 @@ def get_docs(con) -> dict:
         "d.frozen_date, r.title AS feature_title FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
+
+
+_SPRINT_UNIT_COLUMNS = (
+    "unit_id", "sprint_doc_id", "seq", "unit_title", "dev_shell_id",
+    "reviewer_shell_id", "state", "depends_on", "overlap", "branch",
+    "pr_number", "assigned_at", "state_changed_at", "updated_at",
+    "updated_by_shell_id",
+)
+
+
+def get_active_sprints(con) -> dict:
+    """Build the active-sprint board from one consistent read snapshot.
+
+    One SELECT reads active documents, latest planner bindings, feature and
+    role labels, and units. The document body is deliberately absent from
+    both the projection and predicate.
+    """
+    result = rows(con.execute(
+        "WITH latest_bindings AS ("
+        "  SELECT sprint_doc_id, MAX(binding_id) AS binding_id "
+        "  FROM sprint_planner_bindings GROUP BY sprint_doc_id"
+        ") "
+        "SELECT "
+        "d.document_id, d.title AS sprint_title, "
+        "strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) AS started_at, "
+        "d.feature_id, feature.title AS feature_title, "
+        "binding.planner_shell_id, planner.shortname AS planner_shortname, "
+        "unit.unit_id AS unit_unit_id, "
+        "unit.sprint_doc_id AS unit_sprint_doc_id, "
+        "unit.seq AS unit_seq, unit.unit_title AS unit_unit_title, "
+        "unit.dev_shell_id AS unit_dev_shell_id, "
+        "unit.reviewer_shell_id AS unit_reviewer_shell_id, "
+        "unit.state AS unit_state, unit.depends_on AS unit_depends_on, "
+        "unit.overlap AS unit_overlap, unit.branch AS unit_branch, "
+        "unit.pr_number AS unit_pr_number, "
+        "unit.assigned_at AS unit_assigned_at, "
+        "unit.state_changed_at AS unit_state_changed_at, "
+        "unit.updated_at AS unit_updated_at, "
+        "unit.updated_by_shell_id AS unit_updated_by_shell_id, "
+        "dev.shortname AS dev_shortname, "
+        "reviewer.shortname AS reviewer_shortname "
+        "FROM documents d "
+        "LEFT JOIN roadmap feature ON feature.feature_id=d.feature_id "
+        "LEFT JOIN latest_bindings latest "
+        "  ON latest.sprint_doc_id=d.document_id "
+        "LEFT JOIN sprint_planner_bindings binding "
+        "  ON binding.binding_id=latest.binding_id "
+        "LEFT JOIN shells planner "
+        "  ON planner.shell_id=binding.planner_shell_id "
+        "LEFT JOIN sprint_units unit "
+        "  ON unit.sprint_doc_id=d.document_id "
+        "LEFT JOIN shells dev ON dev.shell_id=unit.dev_shell_id "
+        "LEFT JOIN shells reviewer "
+        "  ON reviewer.shell_id=unit.reviewer_shell_id "
+        "WHERE d.kind='doc' AND d.frozen=0 "
+        "  AND d.title LIKE 'SPRINT:%' "
+        "ORDER BY started_at IS NULL, started_at, d.document_id, "
+        "  CASE WHEN unit.unit_id IS NULL THEN 0 ELSE 1 END, "
+        "  LENGTH(unit.seq), unit.seq"
+    ))
+
+    sprints = []
+    by_document = {}
+    for row in result:
+        document_id = row["document_id"]
+        sprint = by_document.get(document_id)
+        if sprint is None:
+            planner_id = row["planner_shell_id"]
+            feature_id = row["feature_id"]
+            title = row["sprint_title"]
+            if not title[len("SPRINT:"):].strip():
+                title = f"Sprint #{document_id}"
+            sprint = {
+                "document_id": document_id,
+                "title": title,
+                "started_at": row["started_at"],
+                "planner": None if planner_id is None else {
+                    "shell_id": planner_id,
+                    "shortname": row["planner_shortname"],
+                },
+                "feature": None if feature_id is None else {
+                    "feature_id": feature_id,
+                    "title": row["feature_title"],
+                },
+                "units": [],
+            }
+            by_document[document_id] = sprint
+            sprints.append(sprint)
+
+        if row["unit_unit_id"] is None:
+            continue
+        unit = {
+            column: row[f"unit_{column}"]
+            for column in _SPRINT_UNIT_COLUMNS
+        }
+        if unit["state"] not in UNIT_STATES:
+            raise ValueError(
+                f"unknown sprint unit state {unit['state']!r} "
+                f"for unit {unit['unit_id']}")
+        unit["dev_shortname"] = row["dev_shortname"]
+        unit["reviewer_shortname"] = row["reviewer_shortname"]
+        sprint["units"].append(unit)
+
+    return {"active_count": len(sprints), "sprints": sprints}
 
 
 _EMPTY_MAP = {"repo": None, "total_files": 0, "by_lang": [],
@@ -2919,6 +3024,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, tag_origin([dict(r)])[0])
             if path == "/api/roadmap":
                 return self._send(200, get_roadmap(con))
+            if path == "/api/sprints":
+                q = parse_qs(urlparse(self.path).query)
+                if q.get("status") != ["active"]:
+                    return self._send(
+                        400, {"error": "status=active is required"})
+                return self._send(200, get_active_sprints(con))
             if path == "/api/docs":
                 return self._send(200, get_docs(con))
             if path == "/api/map":
