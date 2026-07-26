@@ -450,6 +450,9 @@ class DatabaseContractTest(ReaderCase):
                     {"durable_write", "result_row", "state_changed_at"}
                     <= set(evidence.unreadable)
                 )
+                self.assertNotIn(
+                    ar.AMBIGUOUS_PLANNER_BINDING, evidence.unreadable
+                )
 
     def test_rowless_shell_does_not_collapse_two_live_sprints(self):
         con = sqlite3.connect(self.db)
@@ -477,6 +480,7 @@ class DatabaseContractTest(ReaderCase):
             {"durable_write", "result_row", "state_changed_at"}
             <= set(evidence.unreadable)
         )
+        self.assertIn(ar.AMBIGUOUS_PLANNER_BINDING, evidence.unreadable)
 
     def test_each_unreadable_input_is_nullable_and_read_never_raises(self):
         broken = ar.ActivityReader(
@@ -532,6 +536,13 @@ class DatabaseContractTest(ReaderCase):
                 ),
                 "process_binding": frozenset(
                     {"launch_shape", "cpu_delta"}
+                ),
+                "planner_binding:ambiguous": frozenset(
+                    {
+                        "last_durable_write_at",
+                        "last_result_row_at",
+                        "state_changed_at",
+                    }
                 ),
                 "result_row": frozenset({"last_result_row_at"}),
                 "session": frozenset(
@@ -1057,7 +1068,10 @@ class HarnessMarkerTest(ReaderCase):
         main = projects / expected_container
         scratch = (
             projects
-            / f"-tmp-claude-0-{expected_container}-session-scratchpad"
+            / (
+                f"-tmp-claude-0-{expected_container}-"
+                "a925d37b-9782-4674-9922-af0b7452ec3f-scratchpad"
+            )
         )
         foreign = projects / "-tmp-claude-0--foreign-session-scratchpad"
         for path in (main, scratch, foreign):
@@ -1075,6 +1089,29 @@ class HarnessMarkerTest(ReaderCase):
             datetime(2020, 1, 3, tzinfo=UTC),
             self.reader._claude_marker(dotted_worktree, EPOCH),
         )
+
+    def test_claude_root_worktree_rejects_nested_worker_scratchpad(self):
+        fixture_root = Path("/tmp") / f"scactivity-root{os.getpid()}"
+        self.addCleanup(shutil.rmtree, fixture_root, True)
+        projects = self.home / ".claude/projects"
+        root_encoded = "".join(
+            c if c.isalnum() else "-" for c in str(fixture_root)
+        )
+        worker_encoded = "".join(
+            c if c.isalnum() else "-"
+            for c in str(fixture_root / ".sc-worktrees" / "pln2")
+        )
+        (projects / root_encoded).mkdir(parents=True)
+        foreign = projects / (
+            f"-tmp-claude-0-{worker_encoded}-"
+            "a925d37b-9782-4674-9922-af0b7452ec3f-scratchpad"
+        )
+        foreign.mkdir()
+        transcript = foreign / "foreign.jsonl"
+        transcript.write_text("{}\n")
+        stamp(transcript, datetime(2020, 1, 9, tzinfo=UTC))
+
+        self.assertIsNone(self.reader._claude_marker(fixture_root, EPOCH))
 
     def _rollout(self, name: str, records: list[dict], when: datetime) -> Path:
         directory = self.home / ".codex/sessions/2019/01/01"

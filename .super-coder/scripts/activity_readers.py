@@ -31,6 +31,7 @@ PROC = Path("/proc")
 
 CODEX_CANDIDATE_WINDOW = timedelta(minutes=60)
 UNTIMED_DELETE_RENAME = "last_work_at:untimed_delete_rename"
+AMBIGUOUS_PLANNER_BINDING = "planner_binding:ambiguous"
 BOOT_ARTIFACTS = {
     "CLAUDE.md",
     "AGENTS.md",
@@ -49,6 +50,13 @@ UNREADABLE_FIELDS = {
     "newest_mtime": frozenset({"newest_mtime"}),
     "process": frozenset({"process_present", "launch_shape", "cpu_delta"}),
     "process_binding": frozenset({"launch_shape", "cpu_delta"}),
+    AMBIGUOUS_PLANNER_BINDING: frozenset(
+        {
+            "last_durable_write_at",
+            "last_result_row_at",
+            "state_changed_at",
+        }
+    ),
     "result_row": frozenset({"last_result_row_at"}),
     "session": frozenset({"session_ended_at", "session_end_reason"}),
     "state_changed_at": frozenset({"state_changed_at"}),
@@ -195,6 +203,8 @@ class ActivityReader:
                         self._mark(evidence, "state_changed_at")
                 else:
                     sprint_doc_id = None
+                    if len(rows) > 1:
+                        self._mark(evidence, AMBIGUOUS_PLANNER_BINDING)
                     for name in (
                         "durable_write",
                         "result_row",
@@ -606,9 +616,10 @@ class ActivityReader:
                 p
                 for p in root.iterdir()
                 if p.is_dir()
-                and p.name.startswith("-tmp-claude-")
-                and encoded in p.name
-                and p.name.endswith("-scratchpad")
+                and re.fullmatch(
+                    rf"-tmp-claude-\d+-{re.escape(encoded)}-[^-].*-scratchpad",
+                    p.name,
+                )
             )
         if not containers:
             return None
