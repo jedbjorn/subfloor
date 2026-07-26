@@ -356,6 +356,70 @@ class EnginePathsAtRefTest(unittest.TestCase):
             "ref files",
         )
 
+    def test_delta_heal_that_does_not_land_is_refused(self):
+        installed = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text("old dispatcher\n")
+        self.write_manifest(installed)
+        (self.scripts / "update.py").write_text(
+            "from engine_manifest import ENGINE_PATHS\n"
+        )
+        old_sha = self.commit("installed allow-list")
+
+        target = [*installed, ".super-coder/new-path"]
+        (self.root / "sc").write_text("new dispatcher\n")
+        (self.scripts / "engine_manifest.py").write_text(
+            "def load_paths():\n"
+            f"    return {target!r}\n"
+            "ENGINE_PATHS = load_paths()\n"
+        )
+        new_file = self.root / ".super-coder" / "new-path" / "new.txt"
+        new_file.parent.mkdir()
+        new_file.write_text("new path content\n")
+        target_sha = self.commit("dynamic target allow-list")
+        _git(self.root, "checkout", old_sha)
+
+        state = self.root / ".sc-state"
+        engine = self.root / ".super-coder"
+        real_materialize = update.materialize_engine
+
+        def heal_that_does_not_land(
+            ref: str,
+            *,
+            engine_paths: list[str] | None = None,
+        ) -> None:
+            real_materialize(ref, engine_paths=engine_paths)
+            if engine_paths == [".super-coder/new-path"]:
+                new_file.unlink()
+                new_file.parent.rmdir()
+
+        with mock.patch.multiple(
+            update,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            STATE_DIR=state,
+            ENGINE_REF=state / "engine.ref",
+            ENGINE_REF_PREV=state / "engine.ref.prev",
+            ENGINE_PATHS=installed,
+            materialize_engine=heal_that_does_not_land,
+        ), mock.patch.multiple(
+            update.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=engine / "engine.manifest",
+            local_edits=mock.Mock(return_value={}),
+        ), contextlib.redirect_stderr(
+            io.StringIO()
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ), self.assertRaises(SystemExit) as failed:
+            update.materialize_fetched_engine(target_sha)
+
+        self.assertIn(".super-coder/new-path", str(failed.exception))
+        self.assertFalse(
+            (state / "engine.ref").exists(),
+            "a delta heal that did not land must not be recorded as current",
+        )
+
     def test_missing_materialized_path_exits_nonzero_and_names_remedy(self):
         target = ["sc", ".super-coder/scripts", ".super-coder/new-path"]
         (self.root / "sc").write_text("old dispatcher\n")
