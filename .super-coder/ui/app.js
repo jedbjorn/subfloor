@@ -4521,7 +4521,9 @@ const sprintsState = {
 function sprintsDuration(startedAt, now = Date.now()) {
   const started = Date.parse(startedAt);
   if (!Number.isFinite(started)) return null;
-  const minutes = Math.floor(Math.max(0, now - started) / 60000);
+  // Negative deltas deliberately share the "<1m" zero bucket; a numeric
+  // clamp would be dead code because the branch below already covers them.
+  const minutes = Math.floor((now - started) / 60000);
   if (minutes < 1) return "<1m";
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
@@ -4566,8 +4568,9 @@ function sprintsPaint() {
   const root = sprintsState.root;
   if (!sprintsState.active || !root || !root.isConnected) return;
   if (!sprintsState.payload) {
-    const message = sprintsState.error
-      ? "error: " + sprintsState.error : "Loading active sprints…";
+    const message = sprintsState.lastFetchAt
+      ? "error: " + (sprintsState.error || "request failed")
+      : "Loading active sprints…";
     root.replaceChildren(el("div", { className: "card" }, message));
     return;
   }
@@ -4595,6 +4598,8 @@ async function sprintsRefresh({ render = true } = {}) {
   const request = (async () => {
     try {
       const payload = await api("/sprints?status=active");
+      if (!Number.isFinite(payload?.active_count))
+        throw new Error("invalid active sprint projection");
       sprintsState.payload = payload;
       sprintsState.error = null;
       sprintsState.stale = false;
@@ -4623,34 +4628,37 @@ async function sprintsRefresh({ render = true } = {}) {
 }
 
 function sprintsPoll() {
-  if (!sprintsState.active || document.hidden) return;
+  if (document.hidden) return;
   return sprintsRefresh();
 }
 
-function sprintsStopLifecycle() {
+function sprintsStopPoll() {
   if (sprintsState.refreshTimer !== null)
     clearInterval(sprintsState.refreshTimer);
+  document.removeEventListener("visibilitychange", sprintsPoll);
+  sprintsState.refreshTimer = null;
+}
+
+function sprintsStartPoll() {
+  sprintsStopPoll();
+  document.addEventListener("visibilitychange", sprintsPoll);
+  sprintsState.refreshTimer = setInterval(sprintsPoll, SPRINTS_REFRESH_MS);
+}
+
+function sprintsStopRender() {
   if (sprintsState.durationTimer !== null)
     clearInterval(sprintsState.durationTimer);
-  document.removeEventListener("visibilitychange", sprintsPoll);
   sprintsState.active = false;
   sprintsState.root = null;
-  sprintsState.refreshTimer = null;
   sprintsState.durationTimer = null;
 }
 
 async function renderSprints(root) {
-  sprintsStopLifecycle();
+  sprintsStopRender();
   sprintsState.active = true;
   sprintsState.root = root;
   sprintsPaint();
-  document.addEventListener("visibilitychange", sprintsPoll);
-  sprintsState.refreshTimer = setInterval(sprintsPoll, SPRINTS_REFRESH_MS);
   sprintsState.durationTimer = setInterval(sprintsPaint, SPRINTS_DURATION_MS);
-  // Boot already fetched the projection before routing so the nav never
-  // flashes a guessed count. A later route entry refreshes immediately.
-  if (Date.now() - sprintsState.lastFetchAt > 1000 && !document.hidden)
-    await sprintsRefresh();
 }
 
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
@@ -4689,7 +4697,7 @@ function show(tab) {
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") { ifDetach(); ifStopRailPoll(); }   // leaving drops stream + lease + poll
-  if (tab !== "sprints") sprintsStopLifecycle();
+  if (tab !== "sprints") sprintsStopRender();
   setDocumentTitle(tab);
   load(tab);
 }
@@ -4788,8 +4796,11 @@ $("#publish").onclick = async (e) => {
     configureArtifactActions(h);
   }
   catch { setStatus("offline"); }
-  // The active count is global navigation state. Establish it before routing
-  // so the label never paints an assumed zero on initial load.
-  await sprintsRefresh({ render: false });
+  // The active count is live global navigation state. Start its document-wide
+  // poll and establish the first value before routing paints any tab.
+  try {
+    sprintsStartPoll();
+    await sprintsRefresh({ render: false });
+  } catch {}
   routeFromHash();   // honor #tab on load (refresh / deep link), else Shells
 })();

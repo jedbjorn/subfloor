@@ -21,6 +21,8 @@ ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach',
                        ROUTER_AT)]
+SHOW = APP[APP.index("function show(tab)"):
+           APP.index("// Hash routing:", APP.index("function show(tab)"))]
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node is required"
@@ -33,6 +35,7 @@ class FakeElement {
     this.tagName = tag; this.nodeType = 1; this.children = [];
     this._text = ""; this.className = ""; this.title = "";
     this.dateTime = ""; this.isConnected = true; this.hidden = false;
+    this.dataset = {};
     this.classList = {
       add: (name) => this._setClass(name, true),
       remove: (name) => this._setClass(name, false),
@@ -61,6 +64,8 @@ class FakeElement {
 }
 const navButton = new FakeElement("button");
 navButton.textContent = "Sprints";
+navButton.hidden = true;
+navButton.dataset.tab = "sprints";
 const listeners = new Map();
 const intervals = [];
 const cleared = [];
@@ -117,9 +122,9 @@ def payload(*, count=1, started_at="2026-07-26T20:00:00Z", units=None):
     }
 
 
-def run_js(body: str, *, prelude: str = "") -> dict:
+def run_js(body: str, *, prelude: str = "", suffix: str = "") -> dict:
     script = (
-        EL + HARNESS + prelude + SPRINTS
+        EL + HARNESS + prelude + SPRINTS + suffix
         + "\n(async () => {\n" + body
         + "\n})().catch((error) => { console.error(error.stack || error);"
           " process.exit(1); });\n"
@@ -198,6 +203,8 @@ out({
     assert "Doc #77" in result["text"]
     assert "Planner: PLN2" in result["text"]
     assert "Feature: #33 Active sprint flow board" in result["text"]
+    assert "Planner: Unbound" in result["text"]
+    assert "Feature: Unlinked" in result["text"]
     assert "Started:" in result["text"] and "Running:" in result["text"]
     assert result["boards"] == result["flows"] == 2
     assert result["titles"][0].startswith("sprint: rendered verbatim")
@@ -239,6 +246,28 @@ out({ text: root.textContent, nav: navButton.textContent,
         "hidden": False, "title": "Active sprint count unavailable",
     }
 
+    empty_error = run_js(
+        """
+apiQueue = [new Error("")];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+out({ text: root.textContent });
+"""
+    )
+    assert empty_error["text"] == "error: request failed"
+
+    malformed = run_js(
+        """
+apiQueue = [{}];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+out({ text: root.textContent });
+"""
+    )
+    assert malformed["text"] == "error: invalid active sprint projection"
+
 
 def test_refresh_failure_retains_payload_and_marks_it_stale():
     result = run_js(
@@ -279,7 +308,7 @@ out({ text: root.textContent, times: byTag(root, "time").length,
     assert result["times"] == result["durations"] == 0
 
 
-def test_duration_format_and_clock_skew_clamp():
+def test_duration_format_and_negative_delta_uses_zero_bucket():
     result = run_js(
         """
 const now = Date.parse("2026-07-26T20:00:00Z");
@@ -300,12 +329,13 @@ out({
     }
 
 
-def test_visibility_return_refreshes_and_route_exit_cleans_both_timers():
+def test_document_poll_survives_route_exit_while_render_wiring_detaches():
     result = run_js(
         """
-apiQueue = [DATA, DATA, DATA];
+apiQueue = [DATA, DATA, DATA, UPDATED];
 let now = Date.parse("2026-07-26T20:00:00Z");
 Date.now = () => now;
+sprintsStartPoll();
 await sprintsRefresh({ render: false });
 const root = makeRoot();
 await renderSprints(root);
@@ -316,36 +346,84 @@ const hidden = apiCalls.length;
 document.hidden = false;
 await listeners.get("visibilitychange")();
 const visible = apiCalls.length;
+await intervals.find((entry) => entry.ms === SPRINTS_REFRESH_MS).fn();
+const afterNetworkTick = apiCalls.length;
 const beforeLocalTick = apiCalls.length;
 const durationBefore = byClass(root, "sprint-duration")[0].textContent;
 now += 18 * 60000;
 intervals.find((entry) => entry.ms === SPRINTS_DURATION_MS).fn();
 const afterLocalTick = apiCalls.length;
 const durationAfter = byClass(root, "sprint-duration")[0].textContent;
-sprintsStopLifecycle();
+const renderedBeforeExit = root.textContent;
+show("roadmap");
+const routeExit = {
+  active: sprintsState.active,
+  root: sprintsState.root,
+  refreshTimer: sprintsState.refreshTimer,
+  durationTimer: sprintsState.durationTimer,
+  listenerPresent: listeners.has("visibilitychange"),
+  cleared: [...cleared],
+};
+await intervals.find((entry) => entry.ms === SPRINTS_REFRESH_MS).fn();
+const afterExitTick = apiCalls.length;
+const renderedAfterExit = root.textContent;
+const navAfterExit = navButton.textContent;
+sprintsStopPoll();
 out({
-  before, hidden, visible, beforeLocalTick, afterLocalTick,
+  before, hidden, visible, afterNetworkTick, beforeLocalTick, afterLocalTick,
   durationBefore, durationAfter,
   intervals: intervals.map((entry) => entry.ms),
-  cleared, listenerPresent: listeners.has("visibilitychange"),
-  active: sprintsState.active,
+  routeExit, afterExitTick, renderedBeforeExit, renderedAfterExit, navAfterExit,
+  finalCleared: cleared, finalListenerPresent: listeners.has("visibilitychange"),
 });
 """,
-        prelude="const DATA = " + json.dumps(payload()) + ";\n",
+        prelude=(
+            "const DATA = " + json.dumps(payload()) + ";\n"
+            "const UPDATED = " + json.dumps(payload(count=2)) + ";\n"
+        ),
+        suffix="""
+const sprintRoot = makeRoot();
+const roadmapRoot = makeRoot();
+const VIEWS = {
+  sprints: ["#view-sprints", renderSprints],
+  roadmap: ["#view-roadmap", async () => {}],
+};
+const roots = {"#view-sprints": sprintRoot, "#view-roadmap": roadmapRoot};
+function $(selector) { return roots[selector]; }
+document.querySelectorAll = (selector) =>
+  selector === "nav button" ? [navButton] : [];
+document.body = new FakeElement("body");
+function ifDetach() {}
+function ifStopRailPoll() {}
+function setDocumentTitle() {}
+function load() {}
+""" + SHOW,
     )
     assert result["hidden"] == result["before"]
     assert result["visible"] == result["before"] + 1
+    assert result["afterNetworkTick"] == result["visible"] + 1
     assert result["afterLocalTick"] == result["beforeLocalTick"]
     assert result["durationBefore"] == "Running: <1m"
     assert result["durationAfter"] == "Running: 18m"
     assert result["intervals"] == [15000, 60000]
-    assert result["cleared"] == [1, 2]
-    assert result["listenerPresent"] is False
-    assert result["active"] is False
+    assert result["routeExit"] == {
+        "active": False,
+        "root": None,
+        "refreshTimer": 1,
+        "durationTimer": None,
+        "listenerPresent": True,
+        "cleared": [2],
+    }
+    assert result["afterExitTick"] == result["afterNetworkTick"] + 1
+    assert result["renderedAfterExit"] == result["renderedBeforeExit"]
+    assert result["navAfterExit"] == "Sprints 2"
+    assert result["finalCleared"] == [2, 1]
+    assert result["finalListenerPresent"] is False
 
 
 def test_boot_fetches_projection_before_routing():
     boot = APP[APP.rindex("(async () => {"):]
+    poll_at = boot.index("sprintsStartPoll()")
     fetch_at = boot.index("await sprintsRefresh({ render: false })")
     route_at = boot.index("routeFromHash()")
-    assert fetch_at < route_at
+    assert poll_at < fetch_at < route_at

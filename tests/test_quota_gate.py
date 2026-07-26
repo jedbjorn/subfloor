@@ -549,7 +549,11 @@ let forkName = "";
 const STUB = new FakeElement("div");
 function $(sel) { return STUB; }
 function setStatus(s) {}
-async function sprintsRefresh() {}
+let sprintsRefreshError = null;
+async function sprintsRefresh() {
+  if (sprintsRefreshError) throw sprintsRefreshError;
+}
+function sprintsStartPoll() {}
 function all(root, pred, found = []) {
   if (pred(root)) found.push(root);
   for (const c of root.children || []) if (c && c.nodeType === 1) all(c, pred, found);
@@ -565,7 +569,7 @@ function root() { return new FakeElement("div"); }
 
 
 def run_js(body: str, data: dict | None = None, boot: bool = False,
-           hash: str = "") -> dict:
+           hash: str = "", preboot: str = "") -> dict:
     """Drive the real app.js regions under a minimal DOM.
 
     `boot` appends the app's own load-time IIFE — what a reload actually runs.
@@ -575,6 +579,7 @@ def run_js(body: str, data: dict | None = None, boot: bool = False,
                       'globalThis.location = { hash: "%s" };' % hash)
     script = ("const PAYLOAD = " + json.dumps(data or {"providers": []})
               + ";\n" + EL + HELPERS + SHELL_STATE + dom + QUOTA + ROUTER
+              + preboot
               + (BOOT if boot else "")
               # The boot IIFE awaits /health before it routes, so the body has
               # to let it settle — reading the view synchronously would see the
@@ -617,6 +622,18 @@ class DeepLinkSurvivesReloadTest(unittest.TestCase):
           apiFail = "offline";
           out({ view: anView, tab: shown[shown.length - 1] });
         """, boot=True, hash="#analytics-quota")
+        self.assertEqual("quota", r["view"])
+        self.assertEqual("analytics", r["tab"])
+
+    def test_the_boot_route_runs_even_when_sprints_refresh_throws(self):
+        r = run_js(
+            """
+              out({ view: anView, tab: shown[shown.length - 1] });
+            """,
+            boot=True,
+            hash="#analytics-quota",
+            preboot='sprintsRefreshError = new Error("offline");\n',
+        )
         self.assertEqual("quota", r["view"])
         self.assertEqual("analytics", r["tab"])
 
