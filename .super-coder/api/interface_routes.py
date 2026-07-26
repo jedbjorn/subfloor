@@ -2000,6 +2000,36 @@ _ALERT_COPY = {
         "Rebind the watch with `sc watch pr … --sprint <doc-id>`.",
         "warning",
     ),
+    "worker_checkup": (
+        "The worker has no recent result or work event after its expected "
+        "activity window.",
+        "Read its flags, branch, worktree, messages, and run output before "
+        "deciding whether recovery is needed.",
+        "warning",
+    ),
+    "worker_not_started": (
+        "The unit's declared branch has not appeared after the start grace.",
+        "Confirm the worker's launch evidence before reassigning the unit.",
+        "warning",
+    ),
+    "worker_work_complete_unreported": (
+        "The worker ended after producing durable output but did not report it.",
+        "Read the worker's durable output. Do not restart it; the work already "
+        "exists.",
+        "warning",
+    ),
+    "worker_recovery_blocked": (
+        "A recovery producer reported that its attempt was refused.",
+        "Reassign or escalate the unit. Do not retry a recovery guard that "
+        "keeps refusing.",
+        "warning",
+    ),
+    "reconciler_missing_binding": (
+        "The reconciler recorded a sprint finding, but the sprint has never "
+        "had a planner binding to receive its message.",
+        "Arm the sprint's real planner binding; do not synthesize a recipient.",
+        "warning",
+    ),
 }
 
 
