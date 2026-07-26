@@ -1679,7 +1679,10 @@ def test_a_failed_title_mint_never_blocks_the_ack_path():
 def test_tab_titles_name_the_view_and_the_fork():
     script = DOC_TITLE + r"""
 function invariant(ok, message) { if (!ok) throw new Error(message); }
-const NAV = { interface: "Interface", roadmap: "Roadmap", shells: "Shells" };
+const NAV = {
+  interface: "Interface", roadmap: "Roadmap", shells: "Shells",
+  sprints: "Sprints 2",
+};
 globalThis.document = {
   title: "",
   querySelector: (sel) => {
@@ -1700,6 +1703,9 @@ invariant(document.title === "DEV4 · super-coder", document.title);
 setDocumentTitle("shells");
 invariant(document.title === "Shells · super-coder",
   "a selected shell must not leak into another tab's title: " + document.title);
+setDocumentTitle("sprints");
+invariant(document.title === "Sprints · super-coder",
+  "the live count must not leak into the tab title: " + document.title);
 
 // /health has not answered (or failed): name the view, never guess a fork.
 forkName = "";
