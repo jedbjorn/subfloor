@@ -35,6 +35,7 @@ SCHEMA = ENGINE / "schema.sql"
 
 sys.path.insert(0, str(ENGINE / "render"))
 import compose  # noqa: E402
+import sprint_units  # noqa: E402
 
 DEV_SHELL = 11
 REVIEWER_SHELL = 8
@@ -385,12 +386,17 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertIsNotNone(clause, "the state CHECK clause moved — re-anchor")
         allowed = set(re.findall(r"'(\w+)'", clause.group(1)))
         self.assertNotIn("now", allowed)        # the parse stayed in the clause
+        self.assertEqual(set(sprint_units.UNIT_STATES), allowed)
         self.assertEqual(set(compose.TERMINAL_UNIT_STATES),
                          {"merged", "cancelled"})
         # the complement is the live half, named in full: a new schema state
         # lands HERE and turns this red, which is the addition case.
         self.assertEqual(allowed - set(compose.TERMINAL_UNIT_STATES),
                          {"pending", "working", "in_review", "blocked"})
+        self.assertIs(
+            compose.TERMINAL_UNIT_STATES,
+            sprint_units.TERMINAL_UNIT_STATES,
+        )
 
 
 class BootDocIntegrationTest(unittest.TestCase):

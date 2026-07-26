@@ -2,7 +2,8 @@
 """Tests for the watched-PR polling cutover (spec #20 task #85, decision
 #19): pr_poller's sprint scoping, registration baselines, bounded poll cycle
 (runs/observations/dedupe/backoff/blind windows), wake-item creation, the
-watched_prs uniqueness rebuild (migration 0080), and the service scheduler.
+watched_prs uniqueness rebuild (migration 0080), and the service scheduler's
+watch-independent worker-reconciliation cadence.
 
 Stdlib `unittest`, matching the sibling suites. The GitHub seam is injectable
 (`poll_cycle(con, fetch=...)` / `baseline_read(..., fetch=...)`), so every
@@ -537,6 +538,63 @@ class CutoverTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_scheduler_reconciles_live_units_without_a_watch(self):
+        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
+        con = build_db(tmp)
+        seed_shells(con)
+        seed_sprint_doc(con, 100, status="CLOSED")
+        con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state, dev_shell_id, "
+            " branch, state_changed_at) "
+            "VALUES (100, 'U4', 'tick', 'working', 2, 'feat/test', "
+            "        '2020-01-01T00:00:00Z')"
+        )
+        con.commit()
+        con.close()
+        reads = []
+        refreshes = []
+
+        class Reader:
+            def read(self, shell, unit, now):
+                reads.append((shell["shell_id"], unit["seq"]))
+                return pr_poller.activity_readers.Evidence(
+                    epoch="2020-01-01T00:00:00Z",
+                    state_changed_at="2020-01-01T00:00:00Z",
+                    edits_code=True,
+                    branch_declared="feat/test",
+                    branch_present=True,
+                    process_present=True,
+                )
+
+        poller = pr_poller.Poller(
+            tmp,
+            interval=30,
+            fetch=fetch_ok(),
+            activity_reader=Reader(),
+            refresh=lambda worktree: refreshes.append(worktree) or True,
+        )
+        poller.start()
+        time.sleep(0.5)
+        poller.stop()
+        poller.join(timeout=5)
+
+        self.assertEqual([(2, "U4")], reads)
+        self.assertEqual(1, len(refreshes))
+        self.assertEqual(1, len(poller.last_reconciliation))
+        con = sqlite3.connect(tmp)
+        try:
+            self.assertEqual(
+                0,
+                con.execute("SELECT COUNT(*) FROM watched_prs").fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                con.execute("SELECT COUNT(*) FROM pr_poll_runs").fetchone()[0],
+            )
+        finally:
+            con.close()
+
     def test_scheduler_surfaces_unscoped_watch_without_fetching_it(self):
         tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
         con = build_db(tmp)
@@ -595,7 +653,7 @@ class CutoverTest(unittest.TestCase):
         finally:
             con.close()
 
-    def test_scheduler_self_disables_without_gh(self):
+    def test_missing_gh_disables_only_pr_reads_not_reconciliation(self):
         import shutil
         old = shutil.which
         shutil.which = lambda name: None
@@ -604,6 +662,9 @@ class CutoverTest(unittest.TestCase):
         try:
             poller = pr_poller.Poller(tmp, interval=30)   # no injected fetch
             poller.start()
+            time.sleep(0.2)
+            self.assertTrue(poller.is_alive())
+            poller.stop()
             poller.join(timeout=5)
         finally:
             shutil.which = old

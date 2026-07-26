@@ -65,6 +65,7 @@ import interface_wake  # noqa: E402
 import live_model  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
+from sprint_units import UNIT_STATES as _UNIT_STATES  # noqa: E402
 
 TICKET_TTL_S = 60
 RESERVATION_TTL_S = 60
@@ -2267,8 +2268,6 @@ _UNIT_FIELDS = {
     "pr_number": (int, True),
 }
 _UNIT_ROLES = {"dev": "dev_shell_id", "reviewer": "reviewer_shell_id"}
-_UNIT_STATES = ("pending", "working", "in_review", "blocked", "merged",
-                "cancelled")
 
 
 def _is_int(value) -> bool:
