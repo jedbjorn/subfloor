@@ -34,12 +34,14 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import interface_routes as routes  # noqa: E402
 import interface_wake  # noqa: E402
 from test_sprint_board_record import DEV, PLANNER, _BoardCase  # noqa: E402
 
@@ -85,24 +87,35 @@ class AssignmentNoticeTest(_BoardCase):
 
     def test_reviewer_reassignment_notifies_exactly_three(self):
         """spec doc 58: "assignment change notifies exactly three | reassign a
-        reviewer | notify by any broader rule -> extra rows, red"."""
+        reviewer | notify by any broader rule -> extra rows, red".
+
+        THE RECIPIENT SET IS NOT SUFFICIENT AND THIS TEST LEARNED IT THE HARD
+        WAY. Taking the counterpart from the REQUEST instead of the row leaves
+        the same three shells in the set by a different route — the omitted
+        role reads as changed-to-None, which drags the counterpart in as a
+        "replaced" shell. Four other tests caught that; this one, the test
+        that NAMES the property, did not, and a reader who breaks the emitter
+        and sees this still green concludes the property holds.
+
+        So it asserts what each party is TOLD as well as who is told. The
+        wrong route cannot reproduce the body: it reports the dev as vacated
+        by a write that never touched the dev column.
+        """
         status, _ = self.patch(seq="U1", reviewer=REV2)
         self.assertEqual(status, 200)
         # The newly named, the one it replaced, and the counterpart on THIS
         # unit. U2's dev and reviewer are on the same board and hear nothing.
         self.assertEqual(self.told(), [REV1, REV2, DEV5])
         self.assertEqual(len(self.notices()), 3)
-
-    def test_the_notice_names_the_change_and_the_new_roster(self):
-        self.patch(seq="U1", reviewer=REV2)
-        bodies = {m["body"] for m in self.notices()}
         # ONE body, delivered to each party — three phrasings of one fact is
         # the drift this spec keeps closing.
+        bodies = {m["body"] for m in self.notices()}
         self.assertEqual(len(bodies), 1)
         body = bodies.pop()
         self.assertIn("unit U1", body)
-        self.assertIn("reviewer REV1 -> REV2", body)
-        self.assertIn("Now: dev DEV5, reviewer REV2", body)
+        # ONE role moved, so the notice names one move and no other.
+        self.assertIn("assignment change: reviewer REV1 -> REV2.", body)
+        self.assertIn("Now: dev DEV5, reviewer REV2.", body)
 
     # -- what must not emit ---------------------------------------------------
 
@@ -145,6 +158,32 @@ class AssignmentNoticeTest(_BoardCase):
         status, _ = self.patch(seq="U9", reviewer=REV2)
         self.assertEqual(status, 404)
         self.assertEqual(self.notices(), [])
+
+    def test_a_write_that_fails_before_commit_tells_nobody(self):
+        """THE ROLLBACK CASE, by fault injection rather than by construction.
+
+        The refusals below all return BEFORE the write, so they only prove the
+        emitter is not reached on a rejected request — none of them is a
+        rolled-back transaction. This one is: the rows are inserted, the
+        emitter finishes, and then the write dies before its commit. The
+        connection is closed without committing, so SQLite's deferred
+        transaction takes the notices AND the board move down together.
+
+        That pairing is the point. A notice that survived a failed board write
+        would tell three shells about a reassignment the board never recorded
+        — belief and its announcement disagreeing, which is precisely the
+        class of defect this whole service exists to detect.
+        """
+        boom = mock.patch.object(
+            routes, "_log",
+            side_effect=lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+            if "assignment change" in msg else None)
+        boom.start()
+        self.addCleanup(boom.stop)
+        with self.assertRaises(RuntimeError):
+            self.patch(seq="U1", reviewer=REV2)
+        self.assertEqual(self.notices(), [])
+        self.assertEqual(self.row("U1")["reviewer_shell_id"], REV1)
 
     def test_a_redeclared_unit_tells_nobody(self):
         """POST is not an upsert: the 409 leaves the board unchanged, so the
