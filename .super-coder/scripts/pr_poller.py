@@ -27,8 +27,8 @@ What lives here:
   watch-gated cadence; worker-expectation reconciliation runs every 10 minutes
   from structured live units even before a PR or watch exists. Explicit PR
   reconcile still rides `poll_cycle(source='reconcile')` through the API.
-  The GitHub side beats the 'watch' heartbeat so `sc watch list` liveness keeps
-  telling the truth.
+  A completed worker-reconciliation tick beats the shared 'watch' heartbeat so
+  quiet work and a silent scheduler remain distinguishable.
 
 It never injects terminal input, never marks a message read, never acts on a
 PR, and never mutates the sprint board. PR polling may create an event; the
@@ -1062,14 +1062,6 @@ class Poller(threading.Thread):
                 con = self._db()
                 try:
                     if self._github_enabled:
-                        try:
-                            beat(con, self._interval)
-                        except Exception as e:
-                            # The beat is ancillary liveness; polling is the
-                            # mission (#359). A beat raising into the cycle's
-                            # except would turn a working poller into a
-                            # dead-with-noise one — log and keep polling.
-                            print(f"pr-poller: heartbeat error ({e})", flush=True)
                         # GitHub's bounded read remains watch-gated.
                         if armed_watches(con) or live_unscoped_watch_ids(con):
                             n = poll_cycle(
@@ -1094,7 +1086,17 @@ class Poller(threading.Thread):
                             con,
                             self.last_reconciliation,
                         )
-                        con.commit()
+                        try:
+                            # Commit the reconciliation writes and its liveness
+                            # proof together. A failure before this point leaves
+                            # no fresh beat claiming the tick completed.
+                            beat(con, self._reconcile_interval)
+                        except Exception as e:
+                            # Older/malformed floors may lack the heartbeat
+                            # surface. Findings remain the mission; preserve
+                            # them while leaving the absent beat honest.
+                            con.commit()
+                            print(f"pr-poller: heartbeat error ({e})", flush=True)
                         if emitted:
                             import interface_wake
                             for message_id in emitted:
