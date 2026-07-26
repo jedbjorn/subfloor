@@ -1177,9 +1177,16 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_pat
     # runner do not resolve the same font:
     #
     #   ruler at 13.6px, 79-char context   sandbox    ubuntu-latest
-    #   [ui-sans-serif] / [system-ui]      437.6px    549.8px
+    #   [ui-sans-serif] / [system-ui]      471.5px    549.8px
     #   [Liberation Sans] / [Arial]        480.6px    480.6px
     #   [DejaVu Sans]                      437.6px    549.8px
+    #
+    # The sandbox column has THREE distinct values: this host resolves the
+    # generic stack to none of the three named rulers, so its generic row is
+    # its own measurement and must never be copied from a named one. On the
+    # runner the generic and DejaVu rows genuinely coincide at 549.8px, and
+    # carrying that identity back here is how the sandbox generic row was
+    # first written as 437.6px.
     #
     # The runner resolves the generic stack to DejaVu Sans — the WIDEST
     # candidate — not to the Arial/Liberation metrics the earlier fix assumed.
@@ -1213,7 +1220,7 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_pat
     # slot is 0px at that viewport on the runner, so any non-empty string
     # truncates by construction.
     #
-    # This does NOT mean the header is adequate. The runner's slot is 504px and
+    # This does NOT mean the header is adequate. The runner's cap is 496px and
     # a realistic 46-char work context needs 550px there, so a REAL title
     # overflows on CI's font — that is flag #206, a product question, and
     # shortening a test fixture does not touch it. The green below is evidence
