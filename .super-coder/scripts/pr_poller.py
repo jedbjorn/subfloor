@@ -449,10 +449,11 @@ def _open_reconciliation_alert(
     )
     opened_at = reading.observed_at.isoformat()
     cursor = con.execute(
-        "INSERT OR IGNORE INTO planner_alerts "
+        "INSERT INTO planner_alerts "
         "(sprint_doc_id, seq, role, signal, shell_id, severity, reason, "
         " dedupe_key, opened_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
         (
             expectation.sprint_doc_id,
             expectation.seq,
@@ -470,9 +471,10 @@ def _open_reconciliation_alert(
 
 def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
     con.execute(
-        "INSERT OR IGNORE INTO planner_alerts "
+        "INSERT INTO planner_alerts "
         "(sprint_doc_id, severity, reason, dedupe_key) "
-        "VALUES (?, 'warning', 'reconciler_missing_binding', ?)",
+        "VALUES (?, 'warning', 'reconciler_missing_binding', ?) "
+        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
         (
             sprint_doc_id,
             f"reconciler|{sprint_doc_id}|-|-|missing_binding",

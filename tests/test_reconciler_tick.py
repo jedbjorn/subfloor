@@ -335,6 +335,29 @@ class TickTest(unittest.TestCase):
         self.assertIsNone(planners[0].unit_id)
         self.assertIsNone(planners[0].unit)
 
+    def test_all_terminal_live_sprint_still_has_its_planner_expectation(self):
+        add_unit(
+            self.con,
+            state=sprint_units.TERMINAL_UNIT_STATES[0],
+        )
+        add_binding(self.con, planner=3)
+
+        expectations = pr_poller.live_expectations(self.con)
+
+        self.assertEqual(
+            [(59, None, None, "planner", 3)],
+            [
+                (
+                    item.sprint_doc_id,
+                    item.unit_id,
+                    item.seq,
+                    item.role,
+                    item.shell_id,
+                )
+                for item in expectations
+            ],
+        )
+
     def test_every_nonterminal_schema_state_remains_a_live_expectation(self):
         for offset, state in enumerate(
             ("pending", "working", "in_review", "blocked"),
