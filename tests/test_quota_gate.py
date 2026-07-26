@@ -549,6 +549,7 @@ let forkName = "";
 const STUB = new FakeElement("div");
 function $(sel) { return STUB; }
 function setStatus(s) {}
+async function sprintsRefresh() {}
 function all(root, pred, found = []) {
   if (pred(root)) found.push(root);
   for (const c of root.children || []) if (c && c.nodeType === 1) all(c, pred, found);
