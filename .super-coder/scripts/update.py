@@ -51,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import re
 import shutil
@@ -250,6 +251,13 @@ def _literal_engine_paths_at(
     return None, f"{source_path} does not define ENGINE_PATHS"
 
 
+def _engine_path_exists_at(ref: str, path: str, *, repo_root: Path) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{ref}:{path}"],
+        capture_output=True,
+    ).returncode == 0
+
+
 def _engine_paths_for(
     ref: str,
     repo_root: Path = REPO_ROOT,
@@ -275,11 +283,13 @@ def _engine_paths_for(
     )
     reasons: list[str] = []
     resolved: list[str] | None = None
+    resolution_source = ""
     for source_path in sources:
         resolved, reason = _literal_engine_paths_at(
             ref, source_path, repo_root=repo_root
         )
         if resolved is not None:
+            resolution_source = f"{source_path} at target ref"
             break
         if reason is not None:
             reasons.append(reason)
@@ -292,13 +302,11 @@ def _engine_paths_for(
             file=sys.stderr,
         )
         resolved = list(ENGINE_PATHS)
+        resolution_source = "installed ENGINE_PATHS fallback"
 
     present, missing = [], []
     for path in resolved:
-        exists = subprocess.run(
-            ["git", "-C", str(repo_root), "cat-file", "-e", f"{ref}:{path}"],
-            capture_output=True,
-        ).returncode == 0
+        exists = _engine_path_exists_at(ref, path, repo_root=repo_root)
         (present if exists else missing).append(path)
 
     added = [path for path in present if path not in ENGINE_PATHS]
@@ -321,6 +329,10 @@ def _engine_paths_for(
         )
     if not present:
         sys.exit(f"update: no engine paths exist at {ref} — wrong ref or remote?")
+    print(
+        f"  resolved {len(present)} engine path(s) for {ref[:12]} from "
+        f"{resolution_source}"
+    )
     if fallback_used is not None:
         fallback_used.append(used_installed_fallback)
     return present
@@ -357,13 +369,69 @@ def _engine_files_at(
     ).stdout.splitlines()
 
 
-def materialize_engine(ref: str) -> None:
+def _materialized_engine_paths(repo_root: Path = REPO_ROOT) -> list[str]:
+    """Load ENGINE_PATHS from the engine manifest that is currently on disk."""
+    manifest_path = repo_root / ".super-coder" / "scripts" / "engine_manifest.py"
+    spec = importlib.util.spec_from_file_location(
+        "_sc_materialized_engine_manifest",
+        manifest_path,
+    )
+    if spec is None or spec.loader is None:
+        sys.exit(
+            "update: could not load the materialized engine manifest at "
+            f"{manifest_path}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        sys.exit(
+            "update: reloading the materialized engine manifest failed: "
+            f"{exc}"
+        )
+    paths = getattr(module, "ENGINE_PATHS", None)
+    if not isinstance(paths, list) or not all(
+        isinstance(path, str) for path in paths
+    ):
+        sys.exit(
+            "update: materialized engine manifest does not expose "
+            "ENGINE_PATHS as list[str]"
+        )
+    return list(paths)
+
+
+def _assert_materialized_engine_paths(
+    engine_paths: list[str],
+    repo_root: Path = REPO_ROOT,
+) -> None:
+    """Refuse to record a successful update over a short engine tree."""
+    missing = [path for path in engine_paths if not (repo_root / path).exists()]
+    if not missing:
+        return
+    sys.exit(
+        "update: materialized engine is incomplete; missing declared path(s): "
+        f"{', '.join(missing)}\n"
+        "  remedy: rerun `./sc update --force`; if the paths remain missing, "
+        "report the target engine ref"
+    )
+
+
+def materialize_engine(
+    ref: str,
+    *,
+    engine_paths: list[str] | None = None,
+) -> None:
     """Write the engine paths at `ref` into the working tree WITHOUT touching the
     git index — the engine is gitignored, so a `git checkout -- <paths>` (which
     stages) is wrong. `git archive | tar -x` copies the fetched tree over the
     top, leaving the gitignored per-instance files (shell_db.db*, instance.json)
     in place. (Files deleted upstream linger until a future doctor sweep — same
     gap the old checkout had; acceptable for a wholesale-overwrite dependency.)"""
+    paths = (
+        engine_paths
+        if engine_paths is not None
+        else _engine_paths_for(ref, repo_root=REPO_ROOT)
+    )
     archive = subprocess.run(
         [
             "git",
@@ -372,7 +440,7 @@ def materialize_engine(ref: str) -> None:
             "archive",
             ref,
             "--",
-            *_engine_paths_for(ref, repo_root=REPO_ROOT),
+            *paths,
         ],
         capture_output=True,
     )
@@ -439,11 +507,33 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
         # engine ref if discoverable; else leave prev absent (rollback will warn).
         ENGINE_REF_PREV.unlink(missing_ok=True)
 
-    materialize_engine(sha)
+    resolved_paths = _engine_paths_for(sha, repo_root=REPO_ROOT)
+    materialize_engine(sha, engine_paths=resolved_paths)
+    materialized_paths = _materialized_engine_paths(REPO_ROOT)
+    delta = [path for path in materialized_paths if path not in resolved_paths]
+    materializable_delta = [
+        path
+        for path in delta
+        if _engine_path_exists_at(sha, path, repo_root=REPO_ROOT)
+    ]
+    if materializable_delta:
+        print(
+            "WARNING: materialized engine manifest declares "
+            f"{len(materializable_delta)} path(s) missed by target-ref "
+            "resolution; materializing the delta: "
+            f"{', '.join(materializable_delta)}",
+            file=sys.stderr,
+        )
+        materialize_engine(sha, engine_paths=materializable_delta)
+    _assert_materialized_engine_paths(materialized_paths, REPO_ROOT)
     ENGINE_REF.write_text(sha + "\n")
     n = engine_manifest.write_manifest(
-        _engine_paths_for(sha, repo_root=REPO_ROOT),
-        files=_engine_files_at(sha),
+        materialized_paths,
+        files=_engine_files_at(
+            sha,
+            repo_root=REPO_ROOT,
+            engine_paths=materialized_paths,
+        ),
     )
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
 
