@@ -9,6 +9,10 @@ delivery deliberately live elsewhere.
 ``shell_messages`` and ``sprint_units`` carry all three facts needed here: a
 per-write timestamp, shell attribution, and sprint scope.  Date-only or
 unattributed surfaces are excluded rather than guessed.
+
+``read()`` observes integration refs exactly as they currently are.  Ref
+freshness is the caller's responsibility because one reconciler tick reads
+many worktrees but must fetch the shared integration ref only once.
 """
 from __future__ import annotations
 
@@ -23,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from sprint_units import TERMINAL_UNIT_STATES
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
@@ -32,6 +38,7 @@ PROC = Path("/proc")
 CODEX_CANDIDATE_WINDOW = timedelta(minutes=60)
 UNTIMED_DELETE_RENAME = "last_work_at:untimed_delete_rename"
 AMBIGUOUS_PLANNER_BINDING = "planner_binding:ambiguous"
+INTEGRATION_REF_REFRESH = "integration_refs:refresh_failed"
 BOOT_ARTIFACTS = {
     "CLAUDE.md",
     "AGENTS.md",
@@ -45,6 +52,9 @@ UNREADABLE_FIELDS = {
     "epoch": frozenset({"epoch"}),
     "git_state": frozenset(
         {"dirty", "commits_since_epoch", "last_work_at"}
+    ),
+    INTEGRATION_REF_REFRESH: frozenset(
+        {"branch_present", "commits_since_epoch", "last_work_at"}
     ),
     "marker": frozenset({"marker_at"}),
     "newest_mtime": frozenset({"newest_mtime"}),
@@ -120,6 +130,34 @@ def _boot_artifact(path: str) -> bool:
     if path in BOOT_ARTIFACTS:
         return True
     return path.startswith(".claude/skills/") and path.endswith("/SKILL.md")
+
+
+def refresh_integration_refs(
+    worktree: Path, run=subprocess.run
+) -> bool:
+    """Refresh the shared integration ref once for a reconciler tick.
+
+    ``False`` is data, not a swallowed warning: the caller must mark every
+    affected code-unit reading with :data:`INTEGRATION_REF_REFRESH`.
+    """
+    try:
+        result = run(
+            [
+                "git",
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            cwd=Path(worktree),
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 class ActivityReader:
@@ -289,12 +327,20 @@ class ActivityReader:
                     (shell_id, sprint_doc_id),
                 ).fetchall()
                 if unit is not None:
+                    terminal_marks = ",".join(
+                        "?" for _ in TERMINAL_UNIT_STATES
+                    )
                     active_count = con.execute(
                         "SELECT COUNT(*) FROM sprint_units "
                         "WHERE sprint_doc_id=? "
                         "AND (dev_shell_id=? OR reviewer_shell_id=?) "
-                        "AND state NOT IN ('merged','cancelled')",
-                        (sprint_doc_id, shell_id, shell_id),
+                        f"AND state NOT IN ({terminal_marks})",
+                        (
+                            sprint_doc_id,
+                            shell_id,
+                            shell_id,
+                            *TERMINAL_UNIT_STATES,
+                        ),
                     ).fetchone()[0]
                     if active_count != 1:
                         seq = str(_value(unit, "seq", ""))
@@ -422,15 +468,6 @@ class ActivityReader:
 
         revision = "HEAD" if on_declared_head else f"refs/remotes/origin/{branch}"
         try:
-            fetched = self._git(
-                worktree,
-                "fetch",
-                "--quiet",
-                "origin",
-                "+refs/heads/main:refs/remotes/origin/main",
-            )
-            if fetched.returncode != 0:
-                raise OSError(fetched.stderr)
             contribution = f"refs/remotes/origin/main..{revision}"
             log = self._git(worktree, "log", contribution, "--format=%aI")
         except (OSError, subprocess.SubprocessError):

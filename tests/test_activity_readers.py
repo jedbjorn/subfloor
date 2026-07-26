@@ -526,6 +526,13 @@ class DatabaseContractTest(ReaderCase):
                 "git_state": frozenset(
                     {"dirty", "commits_since_epoch", "last_work_at"}
                 ),
+                "integration_refs:refresh_failed": frozenset(
+                    {
+                        "branch_present",
+                        "commits_since_epoch",
+                        "last_work_at",
+                    }
+                ),
                 "last_work_at:untimed_delete_rename": frozenset(
                     {"last_work_at"}
                 ),
@@ -713,6 +720,7 @@ class GitEvidenceTest(ReaderCase):
         )
         command(self.worktree, "git", "checkout", "feat/test")
         command(self.worktree, "git", "rebase", "main")
+        self.assertTrue(ar.refresh_integration_refs(self.worktree))
 
         rebased = self.read()
 
@@ -740,6 +748,45 @@ class GitEvidenceTest(ReaderCase):
         self.assertEqual(
             datetime(2020, 1, 6, tzinfo=UTC),
             contributed.last_work_at,
+        )
+
+    def test_read_is_fetch_free_and_refresh_is_the_callers_seam(self):
+        calls = []
+
+        def fake(args, **kwargs):
+            calls.append(args)
+            if args[1:3] == ["symbolic-ref", "--quiet"]:
+                return subprocess.CompletedProcess(
+                    args, 0, "feat/test\n", ""
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        reader = ar.ActivityReader(
+            db_path=self.db,
+            repo_root=self.root,
+            proc=self.proc,
+            adapters=self.adapters,
+            home=self.home,
+            run=fake,
+        )
+        reader.read(
+            self.shell,
+            self.unit,
+            datetime(2020, 1, 10, tzinfo=UTC),
+        )
+        self.assertNotIn("fetch", [arg for call in calls for arg in call])
+
+        self.assertTrue(ar.refresh_integration_refs(self.worktree, run=fake))
+        self.assertEqual(
+            1,
+            sum("fetch" in call for call in calls),
+        )
+
+        def failed(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, "", "no network")
+
+        self.assertFalse(
+            ar.refresh_integration_refs(self.worktree, run=failed)
         )
 
     def test_criss_cross_history_excludes_every_integration_commit(self):

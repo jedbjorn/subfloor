@@ -12,10 +12,14 @@ Nothing here touches the harness; nothing here writes the DB.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
+
+sys.path.insert(0, str(ENGINE / "scripts"))
+from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 
 # Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
 # map and heals discrepancies directly — telling it to report them to itself is
@@ -102,8 +106,6 @@ MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 # harness is guaranteed to read, and this section is a function of `sprint_units`
 # and the planner binding: a task row cannot grant it, and a missing task row
 # cannot withhold it. The planner is removed from the path.
-TERMINAL_UNIT_STATES = ("merged", "cancelled")
-
 # Stated inline rather than referenced, because the failure mode is precisely a
 # skill body that never loads. This renders as prose in a document every harness
 # reads, so it survives a harness with no skill mechanism at all.

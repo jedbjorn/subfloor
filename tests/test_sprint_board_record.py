@@ -53,6 +53,7 @@ import interface_routes as routes  # noqa: E402
 import interface_wake  # noqa: E402
 import migrate  # noqa: E402
 import sprint as sprint_cli  # noqa: E402
+import sprint_units  # noqa: E402
 
 OP = "Authorization: Bearer optok"
 PLANNER = "Authorization: Bearer plntok"      # shell 9, flavor planner
@@ -61,6 +62,15 @@ DEV = "Authorization: Bearer devtok"          # shell 11, flavor dev
 REVIEWER = "Authorization: Bearer revtok"     # shell 8, flavor reviewer
 
 DOC_BODY = "# SPRINT: test\nstatus: ACTIVE\n\nprose the record never touches\n"
+
+
+class SharedStateVocabularyTest(unittest.TestCase):
+    def test_api_uses_the_dependency_free_shared_vocabulary(self):
+        self.assertIs(routes._UNIT_STATES, sprint_units.UNIT_STATES)
+        self.assertEqual(
+            set(sprint_units.TERMINAL_UNIT_STATES),
+            {"merged", "cancelled"},
+        )
 
 
 def build_engine_db(path: Path) -> None:

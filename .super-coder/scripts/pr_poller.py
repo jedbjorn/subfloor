@@ -23,13 +23,16 @@ What lives here:
   and terminal retirement. Per-repo failures back off capped without blocking
   other repos; a repo recovering from failure marks its next observations as
   blind windows (GitHub may have moved unobserved — convergence, not history).
-- `Poller` — the service's scheduler thread: 30s default interval with jitter,
-  only while ACTIVE sprint watches exist, plus one startup pass; explicit
-  reconcile rides `poll_cycle(source='reconcile')` through the API. It beats
-  the 'watch' heartbeat so `sc watch list` liveness keeps telling the truth.
+- `Poller` — the service's scheduler thread. GitHub polling keeps its 30s
+  watch-gated cadence; worker-expectation reconciliation runs every 10 minutes
+  from structured live units even before a PR or watch exists. Explicit PR
+  reconcile still rides `poll_cycle(source='reconcile')` through the API.
+  The GitHub side beats the 'watch' heartbeat so `sc watch list` liveness keeps
+  telling the truth.
 
 It never injects terminal input, never marks a message read, never acts on a
-PR — polling may create an event, nothing more.
+PR, and never mutates the sprint board. PR polling may create an event; the
+worker reconciler returns report-only readings for the alert unit to consume.
 """
 from __future__ import annotations
 
@@ -42,12 +45,23 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import activity_readers
+from sprint_units import TERMINAL_UNIT_STATES
 
 CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
 
 DEFAULT_INTERVAL = int(os.environ.get("SC_PR_POLL_INTERVAL", "30"))
+DEFAULT_RECONCILE_INTERVAL = int(
+    os.environ.get("SC_RECONCILE_INTERVAL", "600")
+)
 JITTER_FRACTION = 0.25          # sleep interval + uniform(0, 25%) — herd spread
 BACKOFF_CAP_S = 900             # per-repo failure backoff ceiling (15 min)
+NO_PROGRESS_WINDOW = timedelta(minutes=20)
+START_GRACE = timedelta(minutes=20)
 
 _STATUS_ACTIVE = re.compile(r"^status:\s*ACTIVE\s*$", re.MULTILINE)
 
@@ -202,6 +216,376 @@ def transitions(prev: "dict | None", cur: dict, repo: str, number: int) -> "tupl
         events.append({"key": "closed:CLOSED",
                        "body": f"pr_event {tag}: closed without merge — watch retired"})
     return events, terminal
+
+
+# ── Worker-expectation classification (spec 58, U4) ─────────────────────────
+
+def _utc(value) -> "datetime | None":
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        stamp = value
+    else:
+        try:
+            stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _invalid_evidence_fields(evidence: activity_readers.Evidence) -> set[str]:
+    """Resolve reader markers through U3's exported mapping, never by treating
+    marker text as an Evidence field name."""
+    invalid: set[str] = set()
+    for marker in evidence.unreadable:
+        fields = activity_readers.UNREADABLE_FIELDS.get(marker)
+        if not fields:
+            invalid.add("__unknown__")
+            continue
+        invalid.update(fields)
+    return invalid
+
+
+def classify(
+    evidence: activity_readers.Evidence,
+    now,
+    *,
+    window: timedelta = NO_PROGRESS_WINDOW,
+    grace: timedelta = START_GRACE,
+) -> str:
+    """Apply spec 58's precedence ladder without side effects.
+
+    The clocks are intentionally explicit:
+    - result evidence compares with the unit/binding state clock;
+    - recent work compares with ``now``;
+    - durable completion and branch grace use the boot epoch;
+    - the no-progress window starts at the newest boot, state, or work event.
+    """
+    current = _utc(now) or datetime.now(timezone.utc)
+    epoch = _utc(evidence.epoch)
+    state_clock = _utc(evidence.state_changed_at)
+    invalid = _invalid_evidence_fields(evidence)
+
+    # Rule 1.  These three inputs fence every reliable walk through the ladder:
+    # without the boot/state clocks timing is undefined, and without the result
+    # read a lower rule could outrank a report.  An unknown marker is an
+    # undeclared U3/U4 interface and therefore indeterminate too.
+    if "__unknown__" in invalid:
+        return "indeterminate"
+    if invalid.intersection(
+        {"epoch", "state_changed_at", "last_result_row_at"}
+    ):
+        return "indeterminate"
+    if epoch is None or state_clock is None:
+        return "indeterminate"
+
+    # A failed once-per-tick refresh invalidates every git-derived decider.
+    # Do not turn stale refs into a confident "working" or "not_started".
+    git_deciders = {
+        "branch_present",
+        "commits_since_epoch",
+        "last_work_at",
+    }
+    if evidence.edits_code and git_deciders.issubset(invalid):
+        return "indeterminate"
+
+    # Rule 2 — STATE clock.  This deliberately precedes recent work.
+    result_at = _utc(evidence.last_result_row_at)
+    if result_at is not None and result_at >= state_clock:
+        return "reported"
+
+    # Rule 3 — WORK-EVENT clock.  ``dirty`` is never consulted: a delete-only
+    # tree may legally be dirty with an untimed last_work_at.
+    last_work = _utc(evidence.last_work_at)
+    if (
+        evidence.edits_code
+        and last_work is not None
+        and last_work >= current - window
+    ):
+        return "working"
+
+    # Rule 4 — BOOT clock.  Either authoritative Interface end state or an
+    # absent headless process closes the session.
+    session_over = (
+        _utc(evidence.session_ended_at) is not None
+        or evidence.process_present is False
+    )
+    durable_at = _utc(evidence.last_durable_write_at)
+    if session_over and durable_at is not None and durable_at >= epoch:
+        return "work_complete_unreported"
+
+    # Rule 5 — BOOT clock and the 20-minute grace floor.
+    if (
+        evidence.branch_declared is not None
+        and evidence.branch_present is False
+        and current > epoch + max(grace, START_GRACE)
+    ):
+        return "not_started"
+
+    # Rule 6 — newest BOOT, STATE, or WORK-EVENT clock.  Explanation-tier
+    # marker/CPU observations never enter this maximum.
+    last_evidence = max(
+        stamp for stamp in (epoch, state_clock, last_work) if stamp is not None
+    )
+    if current > last_evidence + max(window, NO_PROGRESS_WINDOW):
+        return "checkup"
+
+    # Rule 7.
+    return "working"
+
+
+@dataclass(frozen=True)
+class Expectation:
+    sprint_doc_id: int
+    unit_id: "int | None"
+    seq: "str | None"
+    role: str
+    shell_id: int
+    shell: object
+    unit: object
+
+    @property
+    def key(self) -> tuple:
+        return (
+            self.sprint_doc_id,
+            self.unit_id,
+            self.role,
+            self.shell_id,
+        )
+
+
+@dataclass
+class ReconciliationReading:
+    """One report-only comparison.  U5 owns turning confirmed signals into
+    messages and alerts; U4 never writes either surface."""
+
+    expectation: Expectation
+    signal: str
+    confirmed: bool
+    evidence: activity_readers.Evidence
+    measurement: dict[str, object]
+    observed_at: datetime
+    explanation: "str | None"
+
+
+def _measurement(evidence: activity_readers.Evidence) -> dict[str, object]:
+    """Copy classification inputs across the U4/U5 boundary in renderable form."""
+
+    def stamp(value):
+        parsed = _utc(value)
+        return parsed.isoformat() if parsed is not None else None
+
+    return {
+        "epoch": stamp(evidence.epoch),
+        "state_changed_at": stamp(evidence.state_changed_at),
+        "last_result_row_at": stamp(evidence.last_result_row_at),
+        "last_work_at": stamp(evidence.last_work_at),
+        "last_durable_write_at": stamp(evidence.last_durable_write_at),
+        "session_ended_at": stamp(evidence.session_ended_at),
+        "process_present": evidence.process_present,
+        "edits_code": evidence.edits_code,
+        "branch_declared": evidence.branch_declared,
+        "branch_present": evidence.branch_present,
+        "dirty": evidence.dirty,
+        "commits_since_epoch": evidence.commits_since_epoch,
+        "unreadable": tuple(evidence.unreadable),
+        "window_seconds": int(NO_PROGRESS_WINDOW.total_seconds()),
+        "grace_seconds": int(START_GRACE.total_seconds()),
+    }
+
+
+class ReconcilerState:
+    """Volatile consecutive-tick confirmation.
+
+    A restart intentionally resets confirmation: one fresh observation is
+    cheaper than emitting from state whose immediately preceding tick the new
+    process did not observe.
+    """
+
+    ACTIONABLE = {
+        "checkup",
+        "not_started",
+        "work_complete_unreported",
+    }
+
+    def __init__(self):
+        self._previous: dict[tuple, str] = {}
+
+    def observe(self, key: tuple, signal: str) -> bool:
+        previous = self._previous.get(key)
+        self._previous[key] = signal
+        return signal in self.ACTIONABLE and previous == signal
+
+    def retain(self, keys: set[tuple]) -> None:
+        self._previous = {
+            key: signal
+            for key, signal in self._previous.items()
+            if key in keys
+        }
+
+
+def live_expectations(con) -> list[Expectation]:
+    """Enumerate the structured board, independent of PR watches and prose."""
+    placeholders = ",".join("?" for _ in TERMINAL_UNIT_STATES)
+    units = con.execute(
+        "SELECT u.* FROM sprint_units u "
+        "JOIN documents d ON d.document_id=u.sprint_doc_id "
+        f"WHERE d.frozen=0 AND u.state NOT IN ({placeholders}) "
+        "ORDER BY u.sprint_doc_id, u.unit_id",
+        TERMINAL_UNIT_STATES,
+    ).fetchall()
+    if not units:
+        return []
+
+    doc_ids = sorted({_row(unit, "sprint_doc_id") for unit in units})
+    shell_ids = {
+        shell_id
+        for unit in units
+        for shell_id in (
+            _row(unit, "dev_shell_id"),
+            _row(unit, "reviewer_shell_id"),
+        )
+        if shell_id is not None
+    }
+    marks = ",".join("?" for _ in doc_ids)
+    bindings = con.execute(
+        "SELECT b.sprint_doc_id, b.planner_shell_id "
+        "FROM sprint_planner_bindings b "
+        "WHERE b.binding_id=("
+        " SELECT MAX(b2.binding_id) FROM sprint_planner_bindings b2 "
+        " WHERE b2.sprint_doc_id=b.sprint_doc_id"
+        f") AND b.sprint_doc_id IN ({marks}) "
+        "ORDER BY b.sprint_doc_id",
+        doc_ids,
+    ).fetchall()
+    shell_ids.update(_row(row, "planner_shell_id") for row in bindings)
+
+    if not shell_ids:
+        return []
+    shell_marks = ",".join("?" for _ in shell_ids)
+    shells = {
+        _row(row, "shell_id"): row
+        for row in con.execute(
+            "SELECT shell_id, shortname, flavor FROM shells "
+            f"WHERE shell_id IN ({shell_marks})",
+            tuple(sorted(shell_ids)),
+        ).fetchall()
+    }
+
+    expectations: list[Expectation] = []
+    for binding in bindings:
+        shell_id = _row(binding, "planner_shell_id")
+        shell = shells.get(shell_id)
+        if shell is None:
+            continue
+        expectations.append(
+            Expectation(
+                sprint_doc_id=_row(binding, "sprint_doc_id"),
+                unit_id=None,
+                seq=None,
+                role="planner",
+                shell_id=shell_id,
+                shell=shell,
+                unit=None,
+            )
+        )
+    for unit in units:
+        for role, column in (
+            ("dev", "dev_shell_id"),
+            ("reviewer", "reviewer_shell_id"),
+        ):
+            shell_id = _row(unit, column)
+            shell = shells.get(shell_id)
+            if shell is None:
+                continue
+            expectations.append(
+                Expectation(
+                    sprint_doc_id=_row(unit, "sprint_doc_id"),
+                    unit_id=_row(unit, "unit_id"),
+                    seq=_row(unit, "seq"),
+                    role=role,
+                    shell_id=shell_id,
+                    shell=shell,
+                    unit=unit,
+                )
+            )
+    return expectations
+
+
+def _row(row, key, default=None):
+    if row is None:
+        return default
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return getattr(row, key, default)
+
+
+def reconcile_tick(
+    con,
+    *,
+    now=None,
+    reader=None,
+    refresh=None,
+    state: "ReconcilerState | None" = None,
+    worktree=None,
+) -> list[ReconciliationReading]:
+    """Read and classify every live sprint expectation without DB mutation."""
+    current = _utc(now) or datetime.now(timezone.utc)
+    state = state if state is not None else ReconcilerState()
+    expectations = live_expectations(con)
+    if not expectations:
+        state.retain(set())
+        return []
+
+    refresh = refresh or activity_readers.refresh_integration_refs
+    try:
+        refs_fresh = bool(refresh(Path(worktree or activity_readers.REPO_ROOT)))
+    except Exception:  # noqa: BLE001 — failure is recorded on each code reading
+        refs_fresh = False
+
+    source = reader or activity_readers.read
+    read_one = source.read if hasattr(source, "read") else source
+    cache: dict[tuple, activity_readers.Evidence] = {}
+    readings: list[ReconciliationReading] = []
+    seen: set[tuple] = set()
+    for expectation in expectations:
+        evidence_key = (expectation.shell_id, expectation.unit_id)
+        evidence = cache.get(evidence_key)
+        if evidence is None:
+            evidence = read_one(
+                expectation.shell,
+                expectation.unit,
+                current,
+            )
+            if (
+                not refs_fresh
+                and evidence.edits_code
+                and activity_readers.INTEGRATION_REF_REFRESH
+                not in evidence.unreadable
+            ):
+                evidence.unreadable.append(
+                    activity_readers.INTEGRATION_REF_REFRESH
+                )
+                evidence.unreadable.sort()
+            cache[evidence_key] = evidence
+        signal = classify(evidence, current)
+        seen.add(expectation.key)
+        readings.append(
+            ReconciliationReading(
+                expectation=expectation,
+                signal=signal,
+                confirmed=state.observe(expectation.key, signal),
+                evidence=evidence,
+                measurement=_measurement(evidence),
+                observed_at=current,
+                explanation=None,
+            )
+        )
+    state.retain(seen)
+    return readings
 
 
 # ── Sprint scoping ────────────────────────────────────────────────────────────
@@ -445,20 +829,32 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
 # ── The service scheduler ─────────────────────────────────────────────────────
 
 class Poller(threading.Thread):
-    """The service's bounded PR-poll scheduler: 30s + jitter, only while
-    ACTIVE sprint watches exist, plus one startup pass. It polls GitHub and
-    writes the engine DB — it never touches a model, a terminal, or git.
-    A fork without `gh` disables itself exactly like the legacy daemon did."""
+    """The service's bounded scheduler.
+
+    GitHub reads remain watch-gated.  Reconciliation has its own cadence and
+    structured-unit trigger, so it still runs before a sprint has any PR.
+    """
 
     def __init__(self, db_path, interval: int = DEFAULT_INTERVAL, fetch=None,
-                 connect=None):
+                 connect=None,
+                 reconcile_interval: int = DEFAULT_RECONCILE_INTERVAL,
+                 activity_reader=None, refresh=None):
         super().__init__(name="pr-poller", daemon=True)
         self._db_path = str(db_path)
         self._interval = interval
         self._fetch = fetch
         self._connect = connect
+        self._reconcile_interval = reconcile_interval
+        self._activity_reader = activity_reader or activity_readers.ActivityReader(
+            db_path=Path(self._db_path)
+        )
+        self._refresh = refresh
+        self._reconcile_due = 0.0
+        self._github_enabled = fetch is not None or shutil.which("gh") is not None
         self._stop_event = threading.Event()
         self.state = PollerState()
+        self.reconciler_state = ReconcilerState()
+        self.last_reconciliation: list[ReconciliationReading] = []
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -470,30 +866,46 @@ class Poller(threading.Thread):
         return db_driver.connect(self._db_path)
 
     def run(self) -> None:  # pragma: no cover — thread loop; scheduler tests drive it
-        if self._fetch is None and shutil.which("gh") is None:
+        if not self._github_enabled:
             print("pr-poller: gh CLI not found — PR polling disabled "
-                  "(install gh + login to enable)", flush=True)
-            return
+                  "(worker reconciliation remains enabled)", flush=True)
         source = "startup"
         while not self._stop_event.is_set():
             try:
                 con = self._db()
                 try:
-                    try:
-                        beat(con, self._interval)
-                    except Exception as e:
-                        # The beat is ancillary liveness; polling is the
-                        # mission (#359). A beat raising into the cycle's
-                        # except would turn a working poller into a
-                        # dead-with-noise one — log and keep polling.
-                        print(f"pr-poller: heartbeat error ({e})", flush=True)
-                    # The DB read is cheap and local; the bounded GitHub poll
-                    # happens only while ACTIVE sprint watches exist.
-                    if armed_watches(con) or live_unscoped_watch_ids(con):
-                        n = poll_cycle(con, fetch=self._fetch, source=source,
-                                       state=self.state, interval=self._interval)
-                        if n["events"] or n["errors"]:
-                            print(f"pr-poller: {n}", flush=True)
+                    if self._github_enabled:
+                        try:
+                            beat(con, self._interval)
+                        except Exception as e:
+                            # The beat is ancillary liveness; polling is the
+                            # mission (#359). A beat raising into the cycle's
+                            # except would turn a working poller into a
+                            # dead-with-noise one — log and keep polling.
+                            print(f"pr-poller: heartbeat error ({e})", flush=True)
+                        # GitHub's bounded read remains watch-gated.
+                        if armed_watches(con) or live_unscoped_watch_ids(con):
+                            n = poll_cycle(
+                                con,
+                                fetch=self._fetch,
+                                source=source,
+                                state=self.state,
+                                interval=self._interval,
+                            )
+                            if n["events"] or n["errors"]:
+                                print(f"pr-poller: {n}", flush=True)
+
+                    monotonic_now = time.monotonic()
+                    if monotonic_now >= self._reconcile_due:
+                        self.last_reconciliation = reconcile_tick(
+                            con,
+                            reader=self._activity_reader,
+                            refresh=self._refresh,
+                            state=self.reconciler_state,
+                        )
+                        self._reconcile_due = (
+                            monotonic_now + self._reconcile_interval
+                        )
                 finally:
                     con.close()
             except Exception as e:
