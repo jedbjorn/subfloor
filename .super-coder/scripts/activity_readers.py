@@ -29,6 +29,7 @@ ADAPTERS = ENGINE / "adapters"
 PROC = Path("/proc")
 
 CODEX_CANDIDATE_WINDOW = timedelta(minutes=60)
+UNTIMED_DELETE_RENAME = "last_work_at:untimed_delete_rename"
 BOOT_ARTIFACTS = {
     "CLAUDE.md",
     "AGENTS.md",
@@ -293,16 +294,25 @@ class ActivityReader:
             return
         dirty_times: list[datetime] = []
         for code, rel in entries:
-            if "U" in code or _boot_artifact(rel):
+            if code in {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}:
+                continue
+            if _boot_artifact(rel):
                 continue
             if code != "??" and not any(c in "MADRC" for c in code):
+                continue
+            if "D" in code:
+                self._mark(evidence, UNTIMED_DELETE_RENAME)
                 continue
             try:
                 changed_at = _mtime(worktree / rel)
             except OSError:
+                if "R" in code:
+                    self._mark(evidence, UNTIMED_DELETE_RENAME)
                 continue
             if changed_at >= epoch:
                 dirty_times.append(changed_at)
+            elif "R" in code:
+                self._mark(evidence, UNTIMED_DELETE_RENAME)
 
         revision = "HEAD" if on_declared_head else f"refs/remotes/origin/{branch}"
         try:

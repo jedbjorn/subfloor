@@ -303,6 +303,41 @@ class GitEvidenceTest(ReaderCase):
         self.assertEqual(0, evidence.commits_since_epoch)
         self.assertIsNone(evidence.last_work_at)
 
+    def test_staged_delete_is_dirty_but_untimed(self):
+        (self.worktree / "base.txt").unlink()
+        command(self.worktree, "git", "add", "-u")
+
+        evidence = self.read()
+
+        self.assertTrue(evidence.dirty)
+        self.assertEqual(0, evidence.commits_since_epoch)
+        self.assertIsNone(evidence.last_work_at)
+        self.assertIn(ar.UNTIMED_DELETE_RENAME, evidence.unreadable)
+
+    def test_staged_rename_with_pre_epoch_mtime_is_dirty_but_untimed(self):
+        old = datetime(2019, 12, 31, 23, 59, tzinfo=UTC)
+        stamp(self.worktree / "base.txt", old)
+        command(self.worktree, "git", "mv", "base.txt", "renamed.txt")
+
+        evidence = self.read()
+
+        self.assertTrue(evidence.dirty)
+        self.assertEqual(0, evidence.commits_since_epoch)
+        self.assertIsNone(evidence.last_work_at)
+        self.assertIn(ar.UNTIMED_DELETE_RENAME, evidence.unreadable)
+
+    def test_staged_rename_with_current_epoch_mtime_is_work(self):
+        command(self.worktree, "git", "mv", "base.txt", "renamed.txt")
+        renamed_at = datetime(2020, 1, 3, tzinfo=UTC)
+        stamp(self.worktree / "renamed.txt", renamed_at)
+
+        evidence = self.read()
+
+        self.assertTrue(evidence.dirty)
+        self.assertEqual(0, evidence.commits_since_epoch)
+        self.assertEqual(renamed_at, evidence.last_work_at)
+        self.assertNotIn(ar.UNTIMED_DELETE_RENAME, evidence.unreadable)
+
     def test_author_date_counts_and_rebase_committer_date_does_not(self):
         old_author = self.worktree / "old-author.py"
         old_author.write_text("old\n")
