@@ -691,7 +691,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   border-radius: 6px; padding: .25rem .5rem; font-size: .78rem;
   pointer-events: none; white-space: nowrap; box-shadow: var(--menu-shadow); }
 
-/* ── Account Analytics: sub-view toggle, account cards, quota meters ──
+/* ── Provider Quota: sub-view toggle, provider cards, quota meters ──
    Colour here is threshold-driven and provider-blind (spec #49): one amber and
    one red, both keyed off used_percent, never off a provider's own severity
    field. A window with no percent gets NEITHER class and draws no bar — an
@@ -702,19 +702,21 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-view .chip:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
 .an-acct-bar { display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; }
 .an-acct-bar .act { margin-left: auto; }
-.an-note { color: var(--warn); font-size: .85rem; margin-bottom: .5rem; }
-.an-prov { margin-bottom: .8rem; }
-.an-prov-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
-.an-prov-head h2 { margin: 0; font-size: 1rem; }
 .an-acct { margin-bottom: .5rem; }
-/* A signed-out or unauth card keeps its numbers and loses its emphasis: the
-   values are real, they are simply not now. Recessed, never hidden. */
-.an-acct.an-muted { opacity: .62; }
+/* No muted variant. Dimming marked a card as "not the current account", a
+   distinction a provider-level panel does not have — and a degraded card's
+   numbers are exactly as real as a fresh one's. The AGE in the footer is what
+   separates them, so the age carries that job alone. */
 .an-acct-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
-.an-acct-label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+.an-acct-head h2 { margin: 0; font-size: 1rem; }
 .an-acct-foot { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; }
-.an-acct-foot .act { margin-left: auto; }
-.an-acct-foot .act:disabled { opacity: .45; cursor: not-allowed; }
+/* The card's actions sit right whether or not the age is there to push them —
+   a card with no reading yet has no age, and the link must not drift left when
+   it doesn't. There is no disabled state to style: the only control here is the
+   usage link, and the refresh button that could be disabled is gone with the
+   per-card refresh it belonged to. */
+.an-acct-actions { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
+.an-acct-foot a.act { text-decoration: none; }
 .an-win { margin: .45rem 0; }
 .an-win-head { display: flex; align-items: baseline; gap: .5rem; font-size: .85rem; }
 .an-win-name { color: var(--dim); }

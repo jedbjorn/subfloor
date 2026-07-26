@@ -1,26 +1,42 @@
 {
   "user": {
-    "userId": "placeholder-user-0001"
-  },
-  "membership": {
-    "level": "LEVEL_ADVANCED"
+    "userId": "placeholderuser000001",
+    "region": "REGION_OVERSEA",
+    "membership": {
+      "level": "LEVEL_ADVANCED"
+    },
+    "businessId": ""
   },
   "usage": {
-    "used": 128000,
-    "limit": 500000,
-    "remaining": 372000,
-    "resetTime": "2026-07-31T00:00:00Z"
+    "limit": "100",
+    "used": "97",
+    "remaining": "3",
+    "resetTime": "2026-07-29T11:38:20.162687Z"
   },
   "limits": [
     {
       "window": {
         "duration": 300,
-        "timeUnit": "MINUTE"
+        "timeUnit": "TIME_UNIT_MINUTE"
       },
-      "used": 42,
-      "limit": 200,
-      "remaining": 158,
-      "resetTime": "2026-07-25T20:00:00Z"
+      "detail": {
+        "limit": "100",
+        "remaining": "100",
+        "resetTime": "2026-07-26T00:38:20.162687Z"
+      }
     }
-  ]
+  ],
+  "parallel": {
+    "limit": "30",
+    "details": [
+      "00000000-0000-0000-0000-000000000000"
+    ]
+  },
+  "totalQuota": {},
+  "authentication": {
+    "method": "METHOD_ACCESS_TOKEN",
+    "scope": "FEATURE_CODING"
+  },
+  "subType": "TYPE_PURCHASE",
+  "domain": "DOMAIN_NEXUS"
 }

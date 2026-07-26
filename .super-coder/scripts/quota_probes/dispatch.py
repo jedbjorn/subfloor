@@ -22,7 +22,7 @@ WALL_CLOCK_GRACE = 1.0
 
 def _error(provider: str, detail: str) -> dict:
     return account(provider=provider, probe_version="0", captured_at=now_iso(),
-                   status="error", detail=detail, is_current=0)
+                   status="error", detail=detail)
 
 
 def _run(name: str, log, timeout: float) -> list[dict]:

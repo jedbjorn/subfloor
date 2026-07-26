@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Tests for the quota probe package — spec doc #49, sprint 52 unit 2.
+"""Tests for the quota probe package — spec doc #57, superseding #49.
+
+THE FIXTURES ARE NOW SANITIZED REAL CAPTURES, and that is the single most
+load-bearing fact about this suite. The originals were TRANSCRIBED from spec
+49's observed-field tables, which were wrong about moonshot in three places —
+so the normalizer was pinned against the planner's reading of the payload and
+every test agreed with it. Six field-level defects lived behind that agreement,
+in all three providers, every one of them invisible because the fixture said
+what the probe said.
+
+Two consequences run through the tests below. Where a live capture's own value
+is too weak to pin an arithmetic (moonshot's five-hour window reads 100/100, so
+`used` derives to zero — and zero is also what a broken derivation returns), a
+second case is DERIVED from the capture with the structure held exactly and
+only the numbers moved. And where the wire does not currently send a shape the
+code must handle (a five-hour SCOPED openai window), it is pinned anyway: a
+test that only covers what the wire sends today is how this feature got here.
 
 Every test drives the probes against the recorded fixtures in
 tests/fixtures/quota_probes/ (see that dir's README for provenance). NO TEST
@@ -31,6 +47,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -44,6 +61,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "quota_probes"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 
+import harness_versions  # noqa: E402
 import quota_probes as qp  # noqa: E402
 from quota_probes import anthropic as p_anthropic  # noqa: E402
 from quota_probes import dispatch  # noqa: E402
@@ -52,6 +70,14 @@ from quota_probes import openai as p_openai  # noqa: E402
 
 TOKEN = "sentinel-access-token-must-never-leak"
 HOUR_MS = 3600 * 1000
+
+# The real version probe, captured before any stub replaces the module
+# attribute — the seam test below runs it for real against a scrubbed PATH.
+REAL_VERSION_PROBE = harness_versions.probe
+# What a codex-equipped host answers. Stubbed for every test (see ProbeCase),
+# because `harness_versions.probe` shells out to the installed CLI and the
+# openai probe is the one caller that depends on it.
+STUB_CODEX_VERSION = "codex-cli 0.145.0"
 
 
 def fixture(name: str) -> dict:
@@ -78,6 +104,15 @@ class ProbeCase(unittest.TestCase):
     Every probe module resolves its credential paths at import time, so the
     constants are patched rather than $HOME — the same thing the real code
     would read, without touching the operator's own files.
+
+    HTTP IS NOT THE ONLY EXTERNAL DEPENDENCY, and stubbing only that one is
+    what put 20 failures in CI (SC-170). The openai probe derives its client
+    version from the INSTALLED codex CLI, so on a runner without one it
+    short-circuits to a named error before the get_json seam is ever reached
+    and every openai leg reds — the suite's result depending on the host's
+    toolchain, which is precisely what the fixture work exists to end. Both
+    seams are stubbed here; `test_the_version_seam_is_the_installed_cli` runs
+    the real one against a scrubbed PATH so the coupling itself stays pinned.
     """
 
     def setUp(self):
@@ -107,6 +142,7 @@ class ProbeCase(unittest.TestCase):
                    PROFILE=self.claude_profile)
         self.patch(p_openai, CREDENTIALS=self.codex_auth)
         self.patch(p_moonshot, CREDENTIALS=self.kimi_creds)
+        self.patch(harness_versions, probe=lambda _: STUB_CODEX_VERSION)
 
         # The no-live-call guard. Reached only if a probe bypasses get_json.
         guard = mock.patch("urllib.request.urlopen",
@@ -173,31 +209,55 @@ class AnthropicProbeTest(ProbeCase):
     def test_normalizes_the_three_observed_windows(self):
         acct, ep = self.probe()
         self.assertEqual(acct["status"], "ok")
-        self.assertEqual(acct["plan"], "max")
         self.assertEqual(acct["account_ref"],
                          "abcd1234-0000-4000-8000-00000000beef")
-        self.assertEqual(acct["account_label"], "placeholder@example.com",
-                         "decision #69: the label is the full email")
         windows = self.by_kind(acct)
         self.assertEqual(set(windows), {("session", None), ("weekly", None),
-                                        ("weekly_scoped", "Claude Opus 5")})
-        self.assertEqual(windows[("session", None)]["used_percent"], 22.0)
+                                        ("weekly_scoped", "Fable")})
+        self.assertEqual(windows[("session", None)]["used_percent"], 47.0)
         self.assertEqual(windows[("session", None)]["resets_at"],
-                         "2026-07-25T21:00:00Z")
+                         "2026-07-25T23:10:00Z")
+        self.assertEqual(windows[("weekly", None)]["used_percent"], 36.0)
+        self.assertEqual(windows[("weekly_scoped", "Fable")]["used_percent"],
+                         47.0)
         self.assertEqual(ep.calls[0][0], p_anthropic.URL)
         self.assertEqual(ep.calls[0][1]["anthropic-beta"],
                          p_anthropic.BETA_HEADER)
 
-    def test_label_falls_back_to_the_uuid_when_no_address_is_on_file(self):
-        """The ref and the label come from the same object but are not the
-        same field: an older profile without emailAddress must still key AND
-        label the card."""
-        self.write(self.claude_profile, {"oauthAccount": {
-            "accountUuid": "abcd1234-0000-4000-8000-00000000beef"}})
+    def test_the_operator_address_on_disk_never_reaches_the_result(self):
+        """THE POSITIVE CONTROL IS THE POINT OF THIS TEST.
+
+        ~/.claude.json really does carry `emailAddress`, and setUp really does
+        write one — asserted present here so the absence assertion below cannot
+        pass merely because nothing was there to find. Decision #69 once made
+        that address the card's label; decision #75 stopped collecting it.
+
+        The uuid from the SAME object must still be read, or this test would
+        also pass against a probe that had stopped reading the file at all."""
+        on_disk = json.loads(self.claude_profile.read_text())
+        self.assertEqual(on_disk["oauthAccount"]["emailAddress"],
+                         "placeholder@example.com")
         acct, _ = self.probe()
-        self.assertEqual(acct["account_label"], "abcd1234")
         self.assertEqual(acct["account_ref"],
                          "abcd1234-0000-4000-8000-00000000beef")
+        self.assertNotIn("placeholder@example.com", json.dumps(acct))
+        self.assertNotIn("@", json.dumps(acct))
+        self.assertNotIn("account_label", acct)
+        self.assertEqual([n for n in self.notes if "@" in n], [])
+
+    def test_no_plan_is_collected_from_either_source(self):
+        """`plan` is dropped (migration 0097), and BOTH candidate sources are
+        pinned because the probe read the wrong one for its whole life.
+
+        `subscriptionType` is a real key of the CREDENTIAL FILE — setUp writes
+        `max` — and was never a key of the payload, which is why reading it
+        from the payload returned None silently and no test noticed. Neither
+        may reach the result now."""
+        self.assertEqual(json.loads(self.claude_creds.read_text())
+                         ["claudeAiOauth"]["subscriptionType"], "max")
+        acct, _ = self.probe()
+        self.assertNotIn("plan", acct)
+        self.assertNotIn("max", json.dumps(acct))
 
     def test_percent_only_provider_leaves_counts_null(self):
         acct, _ = self.probe()
@@ -250,6 +310,23 @@ class AnthropicProbeTest(ProbeCase):
         self.assertEqual([n for n in self.notes if "drift" in n], [],
                          "an idle account must not be reported as drift")
 
+    def test_an_unreadable_limits_entry_is_drift_not_a_silent_skip(self):
+        """L-614-1, this provider's instance. Every window on a Claude card
+        comes out of this list, so an entry the reader cannot open is a window
+        vanishing — and the reader's answer to it was `continue`, under status
+        `ok`, with the account's OTHER windows still rendering as though the
+        card were whole. That is the same failure as the wrong-typed container
+        one level up, which this suite already calls drift."""
+        payload = fixture("anthropic_usage.json")
+        payload["limits"].append("five_hour")
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the readable limits must not ship "
+                         "as if they were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
     def test_unknown_limit_kind_is_kept_not_dropped(self):
         acct, _ = self.probe(payload={"limits": [
             {"kind": "monthly_all", "percent": 5, "resets_at": None}]})
@@ -267,36 +344,106 @@ class OpenAIProbeTest(ProbeCase):
         return self.one(p_openai.probe(self.log, 5)), ep
 
     def test_normalizes_the_observed_windows(self):
+        """Both windows the live capture carries — and the scoped one is the
+        whole of new defect A: it lives inside `additional_rate_limits[0]
+        .rate_limit`, one level below where the shipped probe looked."""
         acct, ep = self.probe()
         self.assertEqual(acct["status"], "ok")
-        self.assertEqual(acct["account_label"], "placeholder@example.com",
-                         "the label is the full address, not a local part")
-        self.assertEqual(acct["account_ref"], "acct_placeholder_0001")
-        self.assertEqual(acct["plan"], "prolite")
         windows = self.by_kind(acct)
-        self.assertEqual(set(windows), {("five_hour", None), ("weekly", None),
-                                        ("weekly", "premium")})
-        self.assertEqual(windows[("five_hour", None)]["used_percent"], 12.5)
+        self.assertEqual(set(windows),
+                         {("weekly", None), ("weekly", "GPT-5.3-Codex-Spark")})
+        self.assertEqual(windows[("weekly", None)]["used_percent"], 2.0)
         self.assertEqual(windows[("weekly", None)]["resets_at"],
-                         "2026-07-30T12:00:00Z")
+                         "2026-08-01T22:18:28Z")
+        scoped = windows[("weekly", "GPT-5.3-Codex-Spark")]
+        self.assertEqual(scoped["used_percent"], 0.0)
+        self.assertEqual(scoped["resets_at"], "2026-08-01T22:58:31Z")
         self.assertEqual(ep.calls[0][1]["chatgpt-account-id"],
                          "acct_placeholder_0001")
 
-    def test_kind_follows_the_duration_not_the_window_name(self):
-        """Swap the two windows' durations: their kinds must swap with them.
+    def test_the_scoped_window_carries_real_numbers_not_an_empty_row(self):
+        """THE REGRESSION PIN FOR DEFECT A, and the reason it needs its own
+        test: the shipped probe read `used_percent` / `limit_window_seconds` /
+        `reset_at` at ENTRY level, where the live payload carries none of them.
+        It produced a row of NULLs, logged NO drift, and returned status `ok`.
 
-        A probe that mapped primary→five_hour / secondary→weekly by name or
-        position passes the test above and fails only here.
-        """
+        `assertIsNotNone` rather than a value match is deliberate — this pins
+        the failure MODE (an empty row shipping as a healthy reading), so it
+        stays meaningful when the capture's numbers are refreshed."""
+        acct, _ = self.probe()
+        scoped = self.by_kind(acct)[("weekly", "GPT-5.3-Codex-Spark")]
+        self.assertIsNotNone(scoped["used_percent"],
+                             "the scoped row shipped with no percent while "
+                             "status stayed ok — defect A, exactly")
+        self.assertIsNotNone(scoped["resets_at"])
+        self.assertEqual(acct["status"], "ok")
+        self.assertEqual([n for n in self.notes if "drift" in n], [])
+
+    def test_a_scoped_five_hour_window_is_not_labelled_weekly(self):
+        """The wire does not currently send this, and that is the point.
+
+        The scoped row's kind used to be right BY ACCIDENT: the duration was
+        unreadable at entry level, so `kind_for_seconds` returned None and a
+        `fallback_kind="weekly"` caught it — while the live window happened to
+        be 604800. Any other duration would have been labelled weekly just as
+        confidently. A test that only covers what the wire sends today is how
+        this feature got here."""
         payload = fixture("openai_usage.json")
-        primary = payload["rate_limit"]["primary_window"]
-        secondary = payload["rate_limit"]["secondary_window"]
-        primary["limit_window_seconds"], secondary["limit_window_seconds"] = \
-            secondary["limit_window_seconds"], primary["limit_window_seconds"]
+        entry = payload["additional_rate_limits"][0]
+        entry["rate_limit"]["primary_window"]["limit_window_seconds"] = 18000
         acct, _ = self.probe(payload=payload)
-        kinds = {w["used_percent"]: w["window_kind"] for w in acct["windows"]}
-        self.assertEqual(kinds[12.5], "weekly")
-        self.assertEqual(kinds[47.0], "five_hour")
+        scoped = self.by_kind(acct)[("five_hour", "GPT-5.3-Codex-Spark")]
+        self.assertEqual(scoped["window_kind"], "five_hour")
+        self.assertNotEqual(scoped["window_kind"], "weekly")
+
+    def test_an_entry_carrying_no_rate_limit_is_drift(self):
+        """One level below the envelope is where defect A lived, so that is
+        where the check has to reach. An entry with no `rate_limit{}` is a
+        payload that has moved, not an idle account — and the shipped probe's
+        answer to it was a silent empty row under status `ok`."""
+        payload = fixture("openai_usage.json")
+        del payload["additional_rate_limits"][0]["rate_limit"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the intact top-level window must "
+                         "not ship as if it were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
+    def test_an_entry_that_is_not_an_object_is_drift(self):
+        """L-614-1 — the same finding as the test above, one TYPE up, and it
+        shipped inside the fix for the container-level twin.
+
+        `additional_rate_limits: 5` is drift because a list is where the reader
+        iterates; `additional_rate_limits: [5]` was a silent `continue` under
+        status `ok`, which is the identical scoped-window-vanishes failure with
+        the identical "nothing looks wrong" card. The mirror leg is the test
+        below: `[]` and an absent key stay `ok`, so this cannot be satisfied by
+        erroring on every empty collection."""
+        payload = fixture("openai_usage.json")
+        payload["additional_rate_limits"] = ["gpt-5.3-codex-spark"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the intact top-level window must "
+                         "not ship as if it were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
+    def test_kind_follows_the_duration_not_the_window_name(self):
+        """Give the two windows different durations: their kinds follow the
+        DURATION, not the container they arrived in.
+
+        A probe that mapped top-level→weekly / scoped→weekly by position or by
+        a fallback passes the test above and fails only here. The live capture
+        has both at 604800, which is exactly why it cannot pin this itself."""
+        payload = fixture("openai_usage.json")
+        payload["rate_limit"]["primary_window"]["limit_window_seconds"] = 18000
+        acct, _ = self.probe(payload=payload)
+        kinds = {w["scope"]: w["window_kind"] for w in acct["windows"]}
+        self.assertEqual(kinds[None], "five_hour")
+        self.assertEqual(kinds["GPT-5.3-Codex-Spark"], "weekly")
 
     def test_unrecognized_duration_keeps_the_window_under_its_own_row(self):
         payload = {"account_id": "a1", "rate_limit": {"primary_window": {
@@ -364,13 +511,14 @@ class OpenAIProbeTest(ProbeCase):
                 self.notes.clear()
                 payload = fixture("openai_usage.json")
                 if value is None:
-                    del payload["rate_limit"]["additional_rate_limits"]
+                    del payload["additional_rate_limits"]
                 else:
-                    payload["rate_limit"]["additional_rate_limits"] = value
+                    payload["additional_rate_limits"] = value
                 acct, _ = self.probe(payload=payload)
                 self.assertEqual(acct["status"], "ok")
-                self.assertEqual({w["window_kind"] for w in acct["windows"]},
-                                 {"five_hour", "weekly"})
+                self.assertEqual(self.by_kind(acct).keys(),
+                                 {("weekly", None)},
+                                 "the top-level window still stands alone")
                 self.assertEqual([n for n in self.notes if "drift" in n], [])
 
     def test_a_200_that_is_not_a_json_object_says_so(self):
@@ -387,11 +535,104 @@ class OpenAIProbeTest(ProbeCase):
         self.assertIsNone(acct["account_ref"])
         self.assertEqual(ep.calls, [])
 
-    def test_rejection_keeps_the_account_identified(self):
-        acct, _ = self.probe(code=401)
-        self.assertEqual(acct["status"], "unauth")
-        self.assertEqual(acct["account_ref"], "acct_placeholder_0001",
-                         "the ref is on disk, so an unauth card still keys")
+    def test_a_failed_probe_claims_no_account(self):
+        """INVERTED FROM SPRINT 52, and flag #196 is why.
+
+        This used to assert the opposite — that the file's account_id keeps an
+        unauth card keyed. But the file's id is a GUESS at who the endpoint
+        will name, and a WRONG one: the file says `acct_placeholder_0001`
+        while a 200 says `user-PLACEHOLDER…`. Writing the guess on every
+        failure is what minted a permanent second registry row under one
+        account. A failed probe learned nothing about identity, so it claims
+        none — which is what stops the duplicate at its source rather than
+        reconciling it afterwards.
+
+        The last successful probe's rows are untouched by this and still
+        render with their own age; that is `_latest_readings`' job, pinned in
+        the API suite."""
+        for code in (401, 403, 503):
+            with self.subTest(code=code):
+                acct, _ = self.probe(code=code)
+                self.assertIsNone(acct["account_ref"])
+                self.assertEqual(acct["windows"], [])
+
+    def test_a_403_is_a_loud_client_rejection_never_unauth(self):
+        """Flag #196's half that does not dissolve, with its MIRROR LEGS.
+
+        A 403 from this endpoint is an anti-bot rejection of the CLIENT, not a
+        verdict on the operator's session — it arrived with an HTML body while
+        the token was perfectly valid. Mapping it to `unauth` blamed the
+        operator for being signed out when they were not, and a silently empty
+        card would hide the breakage entirely."""
+        acct, _ = self.probe(code=403)
+        self.assertEqual(acct["status"], "error")
+        self.assertNotEqual(acct["status"], "unauth",
+                            "a 403 here is a client rejection, and telling "
+                            "the operator they are signed out is a claim the "
+                            "probe has not established")
+        self.assertTrue(acct["detail"],
+                        "an empty detail is the silent-empty-card failure — "
+                        "the operator must see WHY the probe broke")
+        self.assertIn("403", acct["detail"])
+
+    def test_the_client_version_comes_from_the_installed_cli(self):
+        """The fork installs harnesses at --latest on every update, so a baked
+        constant goes stale by design. Pinned by moving the installed version
+        and watching every header follow it."""
+        with mock.patch.object(p_openai.harness_versions, "probe",
+                               lambda _: "codex-cli 9.9.9"):
+            _, ep = self.probe()
+        headers = ep.calls[0][1]
+        self.assertEqual(headers["version"], "9.9.9")
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertEqual(headers["User-Agent"], "codex_cli_rs/9.9.9")
+
+    def test_no_codex_cli_is_a_named_error_not_a_bare_request(self):
+        """Sending no client identity provokes the very 403 this fix exists to
+        avoid, and a 403 we caused ourselves is indistinguishable from the
+        endpoint tightening. Say which one it is instead."""
+        with mock.patch.object(p_openai.harness_versions, "probe",
+                               lambda _: None):
+            acct, ep = self.probe()
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(ep.calls, [], "a request went out with no client identity")
+        self.assertIn("client", acct["detail"])
+
+    def test_the_version_seam_is_a_real_subprocess_against_the_hosts_path(self):
+        """SC-170's pin: THE SEAM ITSELF, run for real, both directions.
+
+        Every other test here stubs `harness_versions.probe` — correct
+        isolation, and also where a coupling hides. The seam is a subprocess
+        against the host's PATH, and this suite stubbed only the HTTP one until
+        CI found the second: 20 red legs on every runner without a codex CLI,
+        because the probe short-circuits before `get_json` is reached. So the
+        real seam gets a leg, with PATH pointed at a directory this test owns:
+
+        Leg 1 — a `codex` on PATH: the version reaches every header, through
+        shutil.which and a real `--version` call, with nothing stubbed.
+        Leg 2 — the same PATH with no codex in it: the loud named error, and no
+        request. Without leg 1 this passes for a probe that can never find a
+        CLI at all, which is the failure it is here to detect."""
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        fake = bindir / "codex"
+        fake.write_text("#!/bin/sh\necho 'codex-cli 1.2.3'\n")
+        fake.chmod(0o755)
+
+        with mock.patch.object(harness_versions, "probe", REAL_VERSION_PROBE):
+            with mock.patch.dict(os.environ, {"PATH": str(bindir)}):
+                acct, ep = self.probe()
+            self.assertEqual(acct["status"], "ok")
+            self.assertEqual(ep.calls[0][1]["version"], "1.2.3")
+            self.assertEqual(ep.calls[0][1]["User-Agent"], "codex_cli_rs/1.2.3")
+
+            fake.unlink()
+            with mock.patch.dict(os.environ, {"PATH": str(bindir)}):
+                acct, ep = self.probe()
+        self.assertEqual(acct["status"], "error")
+        self.assertIn("codex", acct["detail"])
+        self.assertEqual(ep.calls, [],
+                         "a request went out with no client identity")
 
 
 class MoonshotProbeTest(ProbeCase):
@@ -402,17 +643,69 @@ class MoonshotProbeTest(ProbeCase):
         return self.one(p_moonshot.probe(self.log, 5)), ep
 
     def test_derives_percent_from_absolute_counts(self):
+        """The account-wide `usage` block, which pins its own arithmetic: the
+        capture reads 97/100 and the counts arrive as STRINGS."""
         acct, _ = self.probe()
         self.assertEqual(acct["status"], "ok")
-        self.assertEqual(acct["account_ref"], "placeholder-user-0001")
-        self.assertEqual(acct["plan"], "LEVEL_ADVANCED")
-        windows = self.by_kind(acct)
-        weekly = windows[("weekly", None)]
-        self.assertEqual((weekly["used"], weekly["limit_value"]), (128000, 500000))
-        self.assertEqual(weekly["used_percent"], 25.6)
-        five_hour = windows[("five_hour", None)]
-        self.assertEqual(five_hour["used_percent"], 21.0)
-        self.assertEqual(five_hour["resets_at"], "2026-07-25T20:00:00Z")
+        self.assertEqual(acct["account_ref"], "placeholderuser000001")
+        weekly = self.by_kind(acct)[("weekly", None)]
+        self.assertEqual((weekly["used"], weekly["limit_value"]), (97, 100))
+        self.assertEqual(weekly["used_percent"], 97.0)
+        self.assertEqual(weekly["resets_at"], "2026-07-29T11:38:20Z")
+
+    def test_limits_entry_unwraps_detail_and_derives_used(self):
+        """Defect 3: entries nest their counts under `detail` and carry NO
+        `used` key at all, so `used` is derived as limit - remaining.
+
+        THIS CASE IS DERIVED FROM THE CAPTURE, NOT RECORDED. The live window
+        reads limit=100 remaining=100, so the real derivation lands on ZERO —
+        and zero is also what every BROKEN derivation returns (missing key →
+        None → 0, wrong nesting → nothing found → 0). A test built only on the
+        capture would pass against a derivation that never works.
+
+        So the structure is the capture's exactly and only the numbers move.
+        The zero case is pinned too, in the test below, because it is what the
+        wire actually sends."""
+        payload = fixture("moonshot_usages.json")
+        detail = payload["limits"][0]["detail"]
+        self.assertEqual(set(payload["limits"][0]), {"window", "detail"},
+                         "the capture's entry shape moved — re-derive this case")
+        self.assertNotIn("used", detail, "defect 3 was that no `used` exists")
+        detail["limit"], detail["remaining"] = "400", "150"
+        acct, _ = self.probe(payload=payload)
+        five_hour = self.by_kind(acct)[("five_hour", None)]
+        self.assertEqual((five_hour["used"], five_hour["limit_value"]),
+                         (250, 400), "used must be limit - remaining")
+        self.assertEqual(five_hour["used_percent"], 62.5)
+        self.assertEqual(five_hour["resets_at"], "2026-07-26T00:38:20Z",
+                         "resetTime is read from `detail`, not entry level")
+
+    def test_an_untouched_five_hour_window_reads_zero_not_nothing(self):
+        """The capture's own numbers, kept as their own case: an unused window
+        is a MEASURED zero with its limit intact. The pair is what separates it
+        from a failed read — a broken derivation returns used=0 too, but it
+        cannot also produce limit_value=100 and a reset time."""
+        acct, _ = self.probe()
+        five_hour = self.by_kind(acct)[("five_hour", None)]
+        self.assertEqual((five_hour["used"], five_hour["limit_value"]), (0, 100))
+        self.assertEqual(five_hour["used_percent"], 0.0)
+        self.assertEqual(five_hour["resets_at"], "2026-07-26T00:38:20Z")
+
+    def test_the_time_unit_prefix_is_stripped_not_enumerated(self):
+        """Defect 1, both spellings. The wire sends `TIME_UNIT_MINUTE`; the
+        shipped map keyed on a bare `MINUTE`, so 300 minutes — a five-hour
+        window, a kind the vocabulary already had — filed as unrecognized.
+
+        Both must work: the prefix is STRIPPED rather than the two spellings
+        enumerated, so a `TIME_UNIT_HOUR` the wire has not sent yet resolves
+        too."""
+        for unit in ("TIME_UNIT_MINUTE", "MINUTE"):
+            with self.subTest(timeUnit=unit):
+                payload = fixture("moonshot_usages.json")
+                payload["limits"][0]["window"]["timeUnit"] = unit
+                acct, _ = self.probe(payload=payload)
+                self.assertIn(("five_hour", None), self.by_kind(acct),
+                              f"300 {unit} is five hours")
 
     def test_300_minutes_is_five_hours(self):
         """The kind comes from duration × timeUnit, so changing the unit
@@ -431,16 +724,59 @@ class MoonshotProbeTest(ProbeCase):
         acct, _ = self.probe(payload=payload)
         w = self.one(acct["windows"])
         self.assertIsNone(w["used_percent"])
-        self.assertEqual((w["used"], w["limit_value"]), (128000, 0),
+        self.assertEqual((w["used"], w["limit_value"]), (97, 0),
                          "the raw counts still stand")
 
     def test_unknown_time_unit_keeps_the_window(self):
+        """A unit the vocabulary cannot convert still yields a ROW — the limit
+        is real and dropping it would hide a real constraint.
+
+        The raw window goes to the LOG, which is a diagnostic the operator
+        never reads, and NOT to `scope`, which renders on the card and is
+        persisted. That split is the whole lesson of defect 2: the place to
+        put an untrusted value is the log."""
         payload = fixture("moonshot_usages.json")
         payload["limits"][0]["window"] = {"duration": 2, "timeUnit": "FORTNIGHT"}
         acct, _ = self.probe(payload=payload)
         odd = [w for w in acct["windows"] if w["window_kind"] == "unknown"]
-        self.assertEqual(len(odd), 1)
-        self.assertIn("FORTNIGHT", str(odd[0]["scope"]))
+        self.assertEqual(len(odd), 1, "an unconvertible window was dropped")
+        self.assertEqual(odd[0]["scope"], "unrecognized window")
+        self.assertNotIn("FORTNIGHT", str(odd[0]["scope"]))
+        self.assertTrue(any("FORTNIGHT" in n for n in self.notes),
+                        f"the raw window must be diagnosable; log was {self.notes}")
+
+    def test_no_container_repr_ever_reaches_operator_visible_text(self):
+        """DEFECT 2, PINNED AS A CLASS RATHER THAN AS THE TYPO IT LOOKED LIKE.
+
+        The shipped probe interpolated the whole window DICT into `scope`, so
+        `{'duration': 300, 'timeUnit': 'TIME_UNIT_MINUTE'}` rendered on the
+        card AND was persisted to the DB. The rule is general — a container is
+        never interpolated into text the operator reads — so this asserts the
+        SHAPE of the output rather than one expected string, and sweeps every
+        field a card renders.
+
+        The unrecognized-window path is the one that reads an uncontrolled
+        value straight from the wire, so each case below is a container
+        arriving where a scalar was assumed. OpenAI carried the identical
+        latent bug on its own duration field, which is why `duration_label` is
+        shared rather than copied — a class needs one implementation."""
+        for bad in ({"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                    [300, "MINUTE"],
+                    {"nested": {"duration": 7}}):
+            with self.subTest(window=bad):
+                payload = fixture("moonshot_usages.json")
+                payload["limits"][0]["window"] = bad
+                acct, _ = self.probe(payload=payload)
+                for w in acct["windows"]:
+                    for field in ("scope", "window_kind"):
+                        text = w[field]
+                        if text is None:
+                            continue
+                        self.assertNotRegex(
+                            str(text), r"[{}\[\]]|'\w+':",
+                            f"a container repr reached {field} — the exact "
+                            "defect that put a Python dict on the card and "
+                            "into the database")
 
     def test_lost_usage_block_is_drift_not_a_measured_zero(self):
         """`usage` is the account-wide block every payload carries — an
@@ -451,7 +787,7 @@ class MoonshotProbeTest(ProbeCase):
         acct, _ = self.probe(payload=payload)
         self.assertEqual(acct["status"], "error")
         self.assertEqual(acct["windows"], [])
-        self.assertEqual(acct["account_ref"], "placeholder-user-0001",
+        self.assertEqual(acct["account_ref"], "placeholderuser000001",
                          "a drifted card still keys to its account")
         self.assertTrue(any("shape drift" in n for n in self.notes),
                         f"drift must be loud; log was {self.notes}")
@@ -464,7 +800,7 @@ class MoonshotProbeTest(ProbeCase):
         acct, _ = self.probe(payload=payload)
         self.assertEqual(acct["status"], "ok")
         w = self.one(acct["windows"])
-        self.assertEqual((w["window_kind"], w["used"]), ("weekly", 128000))
+        self.assertEqual((w["window_kind"], w["used"]), ("weekly", 97))
         self.assertEqual([n for n in self.notes if "drift" in n], [])
 
     def test_an_empty_usage_block_is_data_not_drift(self):
@@ -492,6 +828,23 @@ class MoonshotProbeTest(ProbeCase):
         self.assertEqual(acct["status"], "error")
         self.assertEqual(acct["windows"], [])
         self.assertTrue(any("shape drift" in n for n in self.notes))
+
+    def test_a_limits_entry_that_is_not_an_object_is_drift(self):
+        """L-614-1 here, and this one is not new to the PR — it is the silent
+        skip the wrong-type check above was always sitting on top of. A metered
+        sub-window the reader cannot open disappears from the card while the
+        account-wide weekly figure keeps rendering, so nothing on the card says
+        anything went wrong. The absent/empty legs above are the mirror: this
+        must not fire on an idle account."""
+        payload = fixture("moonshot_usages.json")
+        payload["limits"] = list(payload["limits"]) + ["five_hour"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the weekly figure must not ship "
+                         "as if it were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
 
     def test_a_200_that_is_not_a_json_object_says_so(self):
         acct, _ = self.probe(payload="<html>maintenance</html>")

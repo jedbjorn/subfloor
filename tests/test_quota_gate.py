@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
-"""Spec #49 verification gate — sprint 52, unit 5.
+"""Verification gate — spec #57 (Provider Quota), superseding spec #49's.
 
-The spec's gate is eleven checkboxes. Five are already proven by the units that
-built the code, and this file deliberately does NOT restate them:
+A second copy of a passing check is a second place to drift, so this file holds
+only what nothing else proves. Most of spec #57's gate items belong to the
+layer that owns them and are pinned there:
 
-    1   three probes normalize from fixtures     tests/test_quota_probes.py
-    2   expired token -> unauth, values kept     test_quota_probes / _api / _ui
-    5   two accounts, one refreshable            tests/test_quota_accounts_ui.py
-    6   7-day-stale hidden, row survives         tests/test_quota_accounts_api.py
-    10  neither table in content.sql             test_quota_snapshot_exclusion.py
+    account_label gone from the schema, no email anywhere
+                                             test_quota_schema / _snapshot / _api
+    snapshot exclusion still passes           test_quota_snapshot_exclusion.py
+    openai 200 + version from the CLI         tests/test_quota_probes.py
+    403 -> error, never unauth (+ mirror)     tests/test_quota_probes.py
+    TIME_UNIT_MINUTE at 300 -> five_hour      tests/test_quota_probes.py
+    no container repr reaches scope/card      test_quota_probes / _accounts_ui
+    limits[].detail unwrapped, used derived   tests/test_quota_probes.py
+    plan gone from schema and probes          test_quota_schema / this file
+    fixtures are sanitized real captures      tests/fixtures/.../README.md
+    degraded probe keeps figures + age        test_quota_accounts_api / _ui
+    README drift claim corrected              tests/fixtures/.../README.md
 
-A second copy of a passing check is a second place to drift, so what lives here
-is only what nothing else proves:
+What lives HERE is what no single layer can reach:
 
-  * the CROSS-UNIT checkboxes, which no single unit could reach because they
-    span the probe package, the API and the UI at once (4, 9, 11);
-  * the ones that fell through a seam between units (3, 7, 8).
+  * the CROSS-LAYER items, which span the probe package, the API and the UI at
+    once — token containment, `na` parity across all three providers, a hung
+    provider costing only its own reading, and one probe per toggle;
+  * deep-linking, which needs the router AND the boot IIFE executed;
+  * "every removed mechanism is REMOVED, not left inert", which is a claim
+    about the source of every layer at once and cannot be asked of any one.
+
+SPEC #49'S CHECKBOX 7 IS GONE RATHER THAN UNPROVEN — a hidden account switched
+back with its first_seen intact. The 7-day filter, the is_current exemption and
+first_seen were all dropped by 0097, so there is nothing to hide, switch back
+to, or preserve. `NoInertAccountMachineryTest` is what took its place.
 
 Where a checkbox crosses units, the composition is driven through a real
 artifact rather than an assumption about one: the toggle test replays the
@@ -34,6 +49,7 @@ Run:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -57,6 +73,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "quota_probes"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 
+import harness_versions  # noqa: E402
 import quota_probes as qp  # noqa: E402
 import server  # noqa: E402
 from quota_probes import anthropic as p_anthropic  # noqa: E402
@@ -137,6 +154,11 @@ class GateCase(unittest.TestCase):
                    PROFILE=self.claude_profile)
         self.patch(p_openai, CREDENTIALS=self.codex_auth)
         self.patch(p_moonshot, CREDENTIALS=self.kimi_creds)
+        # The openai probe's SECOND external dependency: it derives its client
+        # version from the installed codex CLI, so an unstubbed seam makes this
+        # gate answer differently on a runner that has one and a runner that
+        # does not (SC-170). The seam itself is pinned in the probe suite.
+        self.patch(harness_versions, probe=lambda _: "codex-cli 0.145.0")
 
     def write_credentials(self, token: str = CANARY) -> None:
         expires = int((time.time() + 3600) * 1000)
@@ -189,7 +211,7 @@ class GateCase(unittest.TestCase):
     def stack(self, force: bool = False) -> dict:
         """The real thing: probe_all -> upsert -> response. Nothing stubbed
         between the probe package and the API's own assembler."""
-        return server.get_analytics_accounts(self.con, force=force)
+        return server.get_analytics_quota(self.con, force=force)
 
     def db_text(self) -> str:
         """Every cell of both quota tables, as text."""
@@ -334,84 +356,136 @@ class MissingCredentialParityTest(GateCase):
         out = self.stack()
         self.assertEqual({"anthropic": "na", "openai": "na", "moonshot": "na"},
                          {p["provider"]: p["status"] for p in out["providers"]})
-        # `na` is not `0%`: no registry row, no card, and no zero anywhere in
-        # the payload that a meter could render as measured.
-        self.assertEqual([], out["accounts"])
+        # `na` is not `0%`: no registry row, and no zero anywhere in the payload
+        # that a meter could render as measured. THE CARDS STILL RENDER — every
+        # provider gets an entry regardless — so the check is that they carry no
+        # numbers, not that they are absent.
         self.assertEqual("", self.db_text())
-        for account in out["accounts"]:
-            for w in account["windows"]:
-                self.assertIsNone(w["used_percent"])
+        for entry in out["providers"]:
+            self.assertEqual([], entry["windows"])
+            self.assertIsNone(entry["captured_at"])
 
 
-# ── Checkbox 7 — hidden, then switched back, with first_seen intact ──────────
+# ── Spec 57 gate — every removed mechanism is REMOVED, not left inert ────────
 
-class HiddenAccountRoundTripTest(GateCase):
-    """U3 proves first_seen is never re-minted, but its account is
-    `is_current=1` for the whole test — and `is_current` is exempt from the
-    7-day filter, so that account is never actually hidden. The round trip the
-    spec names ("switching back to a hidden account restores it with its
-    original first_seen") is therefore unproven: the hide and the restore are
-    the two halves that have to meet."""
+class NoInertAccountMachineryTest(unittest.TestCase):
+    """Spec #57's gate item: "Every removed piece of account machinery is
+    removed, not left inert: no reader remains for anything dropped, and no
+    comment describes a mechanism that no longer exists."
 
-    def probe_returning(self, accounts):
-        return mock.patch.object(server.quota_dispatch, "probe_all",
-                                 lambda log, *a, **kw: accounts)
+    THIS REPLACES SPEC #49'S CHECKBOX 7 (a hidden account switched back with its
+    first_seen intact). That checkbox is not unproven here — its MECHANISM is
+    gone: the 7-day filter, the is_current exemption and first_seen were all
+    dropped by 0097, so there is no hiding, no switching back, and no timestamp
+    to preserve. Testing it would be testing a mechanism that does not exist,
+    which is the same defect this item exists to catch.
 
-    def acct(self, ref, label, captured_at, percent):
-        return qp.account(
-            provider="anthropic", probe_version="1", captured_at=captured_at,
-            account_ref=ref, account_label=label, plan="max", is_current=1,
-            windows=[qp.window(window_kind="weekly", probe_version="1",
-                               captured_at=captured_at, used_percent=percent)])
+    Source-level on purpose, and it is the one gate item where that is the
+    right instrument: "no reader remains" is a claim about the CODE, and a
+    behavioural test cannot distinguish dead code from absent code — which is
+    exactly the distinction the item is about. This feature's documented
+    recurring defect is dead machinery carrying a live comment.
+    """
 
-    def test_a_hidden_account_comes_back_intact_when_it_is_switched_to(self):
-        old = iso(days_ago=30)
-        first = self.acct("uuid-old", "old@person.com", old, 40.0)
-        other = self.acct("uuid-new", "new@person.com", iso(), 10.0)
+    ENGINE_SOURCES = ("api/server.py", "ui/app.js", "ui/style.css",
+                      "scripts/quota_probes/__init__.py",
+                      "scripts/quota_probes/anthropic.py",
+                      "scripts/quota_probes/openai.py",
+                      "scripts/quota_probes/moonshot.py")
+    # Every column 0097 drops, plus the two UI mechanisms that read them.
+    DROPPED = ("account_label", "is_current", "first_seen", "last_seen")
 
-        # 1. seen 30 days ago...
-        with self.probe_returning([first]):
-            self.stack()
-        minted = self.con.execute(
-            "SELECT first_seen FROM harness_quota_account "
-            "WHERE account_ref='uuid-old'").fetchone()["first_seen"]
-        self.assertEqual(old, minted)
+    def quota_region(self, text: str, path: str) -> str:
+        """Only the quota code — these names are common words elsewhere in the
+        engine (watched_prs has its own last_seen, and every tab has a plan)."""
+        if path == "api/server.py":
+            return text[text.index("def _quota_upsert"):text.index("# \u2500\u2500 Mutations")]
+        if path == "ui/app.js":
+            return text[text.index("// \u2500\u2500 Provider Quota"):
+                        text.index("// \u2500\u2500 Interface tab")]
+        if path == "ui/style.css":
+            return text[text.index("/* \u2500\u2500 Provider Quota"):]
+        return text
 
-        # 2. ...operator switches away, so it loses is_current and, being
-        #    outside the window, stops rendering. The row survives.
-        with self.probe_returning([other]):
-            out = self.stack(force=True)
-        self.assertEqual(["uuid-new"], [a["account_ref"] for a in out["accounts"]],
-                         "the aged, non-current account still rendered")
-        self.assertEqual(2, self.con.execute(
-            "SELECT COUNT(*) c FROM harness_quota_account").fetchone()["c"],
-            "the hidden row was deleted rather than filtered")
+    @staticmethod
+    def code_only(text: str, rel: str) -> str:
+        """Executable code with prose stripped out.
 
-        # 3. ...and switches back. It reappears, with its ORIGINAL first_seen
-        #    and no second identity minted for it.
-        back = self.acct("uuid-old", "old@person.com", iso(), 55.0)
-        with self.probe_returning([back]):
-            out = self.stack(force=True)
-        rendered = {a["account_ref"]: a for a in out["accounts"]}
-        self.assertIn("uuid-old", rendered, "the account did not come back")
-        row = self.con.execute(
-            "SELECT * FROM harness_quota_account WHERE account_ref='uuid-old'"
-        ).fetchone()
-        self.assertEqual(old, row["first_seen"], "first_seen was re-minted")
-        self.assertEqual(1, row["is_current"])
-        self.assertEqual(2, self.con.execute(
-            "SELECT COUNT(*) c FROM harness_quota_account").fetchone()["c"],
-            "coming back minted a duplicate account")
-        # Its window came back with it, updated rather than twinned.
-        windows = rendered["uuid-old"]["windows"]
-        self.assertEqual([55.0], [w["used_percent"] for w in windows])
+        The distinction is deliberate and is the whole reason this helper
+        exists. A comment SAYING a column was dropped and why is the opposite
+        of the defect — it is how the next reader learns the mechanism is gone.
+        What the gate forbids is a comment describing a mechanism AS IF IT
+        STILL RAN, and a live reader for a column that is not there. Only the
+        second is decidable by grep, so only the second is asserted."""
+        if rel.endswith(".py"):
+            text = re.sub(r'""".*?"""', "", text, flags=re.S)
+            return "\n".join(line.split("#")[0] for line in text.splitlines())
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        return "\n".join(line for line in text.splitlines()
+                         if not line.lstrip().startswith("//"))
+
+    def test_no_dropped_column_has_a_reader_left_anywhere(self):
+        for rel in self.ENGINE_SOURCES:
+            region = self.code_only(
+                self.quota_region((ENGINE / rel).read_text(), rel), rel)
+            for name in self.DROPPED:
+                self.assertNotIn(
+                    name, region,
+                    f"{rel} still READS {name} in live code, which 0097 "
+                    "dropped — the column does not exist to be read")
+
+    def test_the_stripper_can_actually_see_a_reader(self):
+        """POSITIVE CONTROL for the test above, and it needs one badly: the
+        assertion is a grep over text that has had prose removed, so an
+        over-eager stripper would return an empty string and pass everything.
+
+        A real reader is planted in each language's code AND in its comments;
+        the code one must be seen and the comment one must not."""
+        cases = [("x.py", 'q = "SELECT last_seen FROM t"  # last_seen in a comment\n'
+                          '"""last_seen in a docstring"""\n'),
+                 ("x.js", "const a = row.last_seen;\n// last_seen in a comment\n"),
+                 ("x.css", ".last_seen { color: red }\n/* last_seen in a comment */\n")]
+        for rel, src in cases:
+            with self.subTest(rel=rel):
+                stripped = self.code_only(src, rel)
+                self.assertIn("last_seen", stripped, "the stripper ate the code")
+                self.assertEqual(1, stripped.count("last_seen"),
+                                 f"prose survived stripping in {rel}: {stripped!r}")
+
+    def test_the_probe_package_no_longer_collects_a_plan(self):
+        """`plan` gets its own leg because it is the one that reads as
+        harmless. It is not identity the way an email is, so "leave it, it
+        costs nothing" is the argument that would have kept it — and it is
+        precisely the argument that let two of three probes read it from the
+        wrong place undetected."""
+        acct = qp.account(provider="anthropic", probe_version="1",
+                          captured_at=iso())
+        self.assertNotIn("plan", acct)
+        # ...and no probe module passes one, which the builder alone cannot say.
+        for rel in ("anthropic", "openai", "moonshot"):
+            src = (ENGINE / f"scripts/quota_probes/{rel}.py").read_text()
+            self.assertNotIn("plan=", src, f"{rel}.py still collects a plan")
+
+    def test_the_ui_carries_no_sign_in_language_at_all(self):
+        """The claims both shipped defects made, gone from the source rather
+        than merely unreachable. A string a card cannot currently render is one
+        refactor away from rendering again."""
+        region = self.quota_region((ENGINE / "ui/app.js").read_text(), "ui/app.js")
+        for claim in ("signed out", "not signed in", "no account identified"):
+            self.assertNotIn(
+                claim.lower(),
+                # The section's own commentary NAMES these strings to explain
+                # why they are gone, so only rendered literals are examined.
+                "".join(line for line in region.splitlines(keepends=True)
+                        if not line.lstrip().startswith("//")).lower(),
+                f"the section can still render {claim!r}")
 
 
 # ── Node-driven halves: checkboxes 8 and 4 ───────────────────────────────────
 
 EL = APP[APP.index("const el ="):APP.index("const esc =")]
 HELPERS = APP[APP.index("const fmt = (n)"):APP.index("// On/off switch")]
-ACCOUNTS = APP[APP.index("// ── Account Analytics"):APP.index("// ── Interface tab")]
+QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Interface tab")]
 _ROUTER_AT = APP.index("function routeFromHash()")
 # U4's slice stops at the nav-button line; this one deliberately runs PAST it,
 # through `window.addEventListener("hashchange", routeFromHash)` — the wiring
@@ -496,8 +570,8 @@ def run_js(body: str, data: dict | None = None, boot: bool = False,
     has it; setting it afterwards would test a navigation, not a reload."""
     dom = DOM.replace('globalThis.location = { hash: "" };',
                       'globalThis.location = { hash: "%s" };' % hash)
-    script = ("const PAYLOAD = " + json.dumps(data or {"accounts": [], "providers": []})
-              + ";\n" + EL + HELPERS + dom + ACCOUNTS + ROUTER
+    script = ("const PAYLOAD = " + json.dumps(data or {"providers": []})
+              + ";\n" + EL + HELPERS + dom + QUOTA + ROUTER
               + (BOOT if boot else "")
               # The boot IIFE awaits /health before it routes, so the body has
               # to let it settle — reading the view synchronously would see the
@@ -513,7 +587,7 @@ def run_js(body: str, data: dict | None = None, boot: bool = False,
 
 @unittest.skipUnless(HAS_NODE, "node is required")
 class DeepLinkSurvivesReloadTest(unittest.TestCase):
-    """Checkbox 8. U4 proves that routeFromHash MAPS #analytics-accounts to the
+    """Checkbox 8. U4 proves that routeFromHash MAPS #analytics-quota to the
     accounts sub-view, and that the toggle sets the hash. Neither proves the
     hash is ever READ — its ROUTER slice stops before
     `window.addEventListener("hashchange", routeFromHash)`, and the boot-time
@@ -524,11 +598,11 @@ class DeepLinkSurvivesReloadTest(unittest.TestCase):
     were already on the page. That is precisely the half "survives a reload"
     means, so both wirings are executed here rather than read."""
 
-    def test_loading_the_page_on_the_accounts_hash_lands_on_the_section(self):
+    def test_loading_the_page_on_the_quota_hash_lands_on_the_section(self):
         r = run_js("""
           out({ view: anView, tab: shown[shown.length - 1], routed: shown.length });
-        """, boot=True, hash="#analytics-accounts")
-        self.assertEqual("accounts", r["view"])
+        """, boot=True, hash="#analytics-quota")
+        self.assertEqual("quota", r["view"])
         self.assertEqual("analytics", r["tab"])
         self.assertEqual(1, r["routed"], "the load routed more than once")
 
@@ -539,11 +613,11 @@ class DeepLinkSurvivesReloadTest(unittest.TestCase):
         r = run_js("""
           apiFail = "offline";
           out({ view: anView, tab: shown[shown.length - 1] });
-        """, boot=True, hash="#analytics-accounts")
-        self.assertEqual("accounts", r["view"])
+        """, boot=True, hash="#analytics-quota")
+        self.assertEqual("quota", r["view"])
         self.assertEqual("analytics", r["tab"])
 
-    def test_a_reload_on_the_token_hash_does_not_land_on_accounts(self):
+    def test_a_reload_on_the_token_hash_does_not_land_on_quota(self):
         """The other direction, so the test above cannot pass by the sub-view
         happening to default to accounts."""
         r = run_js("""
@@ -561,12 +635,12 @@ class DeepLinkSurvivesReloadTest(unittest.TestCase):
     def test_the_hash_listener_is_registered_so_back_and_forward_route(self):
         r = run_js("""
           const registered = (listeners.hashchange || []).length;
-          location.hash = "#analytics-accounts";
+          location.hash = "#analytics-quota";
           for (const fn of listeners.hashchange || []) fn();
           out({ registered, view: anView, tab: shown[shown.length - 1] });
         """)
         self.assertEqual(1, r["registered"], "nothing listens for a hash change")
-        self.assertEqual("accounts", r["view"])
+        self.assertEqual("quota", r["view"])
         self.assertEqual("analytics", r["tab"])
 
 
@@ -613,7 +687,6 @@ class ProbeCountAcrossToggleTest(unittest.TestCase):
             self.calls.append(True)
             return [qp.account(provider="anthropic", probe_version="1",
                                captured_at=iso(), account_ref="uuid-1",
-                               account_label="jed@gmail.com", plan="max",
                                windows=[qp.window(window_kind="weekly",
                                                   probe_version="1",
                                                   captured_at=iso(),
@@ -631,21 +704,21 @@ class ProbeCountAcrossToggleTest(unittest.TestCase):
                 r.read()
 
     @unittest.skipUnless(HAS_NODE, "node is required")
-    def test_accounts_then_tokens_then_accounts_inside_a_minute_probes_once(self):
+    def test_quota_then_tokens_then_quota_inside_a_minute_probes_once(self):
         emitted = run_js("""
-          anView = "accounts"; await renderAnalytics(root());
-          anView = "tokens";   await renderAnalytics(root());
-          anView = "accounts"; await renderAnalytics(root());
+          anView = "quota";  await renderAnalytics(root());
+          anView = "tokens"; await renderAnalytics(root());
+          anView = "quota";  await renderAnalytics(root());
           out({ emitted: calls });
         """)["emitted"]
         # The UI's real behaviour, stated so a change to it is visible here:
-        # two arrivals at accounts, one at tokens, no POST anywhere.
+        # two arrivals at quota, one at tokens, no POST anywhere.
         self.assertEqual(
-            ["/analytics/accounts GET", "/analytics/sweep POST",
-             "/analytics/accounts GET"],
+            ["/analytics/quota GET", "/analytics/sweep POST",
+             "/analytics/quota GET"],
             [c["path"] + " " + c["method"] for c in emitted])
         with self.probed():
-            self.replay([c for c in emitted if "accounts" in c["path"]])
+            self.replay([c for c in emitted if "quota" in c["path"]])
         self.assertEqual(1, len(self.calls),
                          "the toggle hammered the providers twice inside the TTL")
 
@@ -653,9 +726,9 @@ class ProbeCountAcrossToggleTest(unittest.TestCase):
         """The other side of the same clock: the TTL must absorb a toggle and
         must never absorb the refresh button."""
         with self.probed():
-            self.replay([{"path": "/analytics/accounts", "method": "GET"},
-                         {"path": "/analytics/accounts", "method": "GET"},
-                         {"path": "/analytics/accounts/probe", "method": "POST"}])
+            self.replay([{"path": "/analytics/quota", "method": "GET"},
+                         {"path": "/analytics/quota", "method": "GET"},
+                         {"path": "/analytics/quota/probe", "method": "POST"}])
         self.assertEqual(2, len(self.calls))
 
 
@@ -694,15 +767,18 @@ class TimeoutLeavesOtherCardsTest(GateCase):
         self.assertIn("timed out", by_provider["openai"]["detail"])
 
         rendered = run_js("""
-          const r0 = root(); anDrawAccounts(r0, PAYLOAD);
-          out({ labels: byClass(r0, "an-acct-label").map((n) => n.textContent),
-                cards: byClass(r0, "an-acct").length,
+          const r0 = root(); anDrawQuota(r0, PAYLOAD);
+          out({ cards: byClass(r0, "an-acct").length,
+                withWindows: byClass(r0, "an-acct").filter(
+                  (c) => byClass(c, "an-win").length).length,
                 body: r0.textContent });
         """, data=json.loads(json.dumps(out, default=str)))
-        # The two healthy providers still have their cards...
-        self.assertEqual(2, len([a for a in out["accounts"]]),
-                         "the hang cost another provider its account")
-        self.assertGreaterEqual(rendered["cards"], 2)
+        # Every provider still renders a card, and the two healthy ones still
+        # carry their NUMBERS — the card count alone cannot show that, since
+        # cards render unconditionally now.
+        self.assertEqual(3, rendered["cards"])
+        self.assertEqual(2, rendered["withWindows"],
+                         "the hang cost another provider its reading")
         self.assertIn("Claude", rendered["body"])
         self.assertIn("Kimi", rendered["body"])
         # ...and the hung one says so rather than going quiet or reading 0%.
