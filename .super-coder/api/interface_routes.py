@@ -2407,6 +2407,120 @@ def _unit_projection(con, unit_id: int) -> dict:
     return unit
 
 
+# ------------------------------------------------- assignment change notice
+
+# The two role columns, in one order, derived from the single definition
+# above — the counterpart lookup below indexes into this.
+_ROLE_COLS = tuple(_UNIT_ROLES.values())
+
+
+def _counterpart(col: str) -> str:
+    """The other role on the unit. A unit has exactly two roles — the pair IS
+    the unit — so "the counterpart" is total and needs no default."""
+    return _ROLE_COLS[1 - _ROLE_COLS.index(col)]
+
+
+def _assignment_parties(before: dict, after: dict) -> set:
+    """The shells one board write must tell — the spec's rule and nothing
+    wider (doc 58 "Assignment change notice"): for each role that ACTUALLY
+    moved, the shell newly named, the shell it replaced, and the counterpart
+    role on that unit as the board now reads.
+
+    The set is read OFF THE RECORD. There is no subscription and no reader
+    log because the audit that retired feature #29 found the shells who need
+    telling are exactly the shells the record names — so any rule broader
+    than "these columns" is the defect this emitter exists to avoid, not a
+    generalisation of it.
+
+    A role re-asserted to the same shell has not moved and tells nobody: the
+    sprint-52 incident was a column that CHANGED under two workers, and a
+    planner re-typing the value it already holds is not that.
+    """
+    parties = set()
+    for col in _ROLE_COLS:
+        if before.get(col) == after.get(col):
+            continue
+        parties.update({before.get(col), after.get(col),
+                        after.get(_counterpart(col))})
+    parties.discard(None)
+    return parties
+
+
+def _role_phrase(con, before: dict, after: dict) -> str:
+    named = []
+    for role, col in _UNIT_ROLES.items():
+        if before.get(col) != after.get(col):
+            named.append(f"{role} {_shortname(con, before.get(col))} -> "
+                         f"{_shortname(con, after.get(col))}")
+    roster = ", ".join(f"{role} {_shortname(con, after.get(col))}"
+                       for role, col in _UNIT_ROLES.items())
+    return f"{', '.join(named)}. Now: {roster}."
+
+
+def _shortname(con, shell_id) -> str:
+    if shell_id is None:
+        return "unassigned"
+    row = con.execute("SELECT shortname FROM shells WHERE shell_id=?",
+                      (shell_id,)).fetchone()
+    return row[0] if row is not None else f"shell {shell_id}"
+
+
+def _emit_assignment_notice(con, actor, doc_id: int, seq: str,
+                            before: dict, after: dict) -> int:
+    """The remainder of retired feature #29 (spec doc 58, decision #74): at
+    most three rows per assignment change, only on change, only while the
+    sprint is ACTIVE. Returns the number of rows written.
+
+    Called from inside the board write's own transaction, before its commit,
+    so a board write that rolls back tells nobody it happened — and the
+    routes' Idempotency-Key discipline means a replayed request returns its
+    cached response without reaching this at all. That is why there is no
+    dedupe_key here: the write it rides is already idempotent.
+
+    ONE BODY, delivered to each party rather than three phrasings of one
+    fact. Every recipient can locate itself in it, and a per-role restatement
+    is the drift shape this spec keeps closing.
+
+    `kind='shell'` DELIBERATELY. task / result / pr_event are exactly
+    interface_wake.ELIGIBLE_KINDS, so any of them could turn a planner's
+    board edit into a BOOT — narrowly (a wake item forms only when the
+    recipient is the sprint's bound planner) but really, since a planner may
+    hold a role on its own board. This is a notice, not work; `shell` is
+    inert by construction. The sprint scope is still stamped so the rows
+    filter with the rest of the sprint's traffic.
+    """
+    if not interface_broker._sprint_active(con, doc_id):
+        return 0
+    parties = _assignment_parties(before, after)
+    if actor.kind == "shell":
+        # The shell that just wrote the board does not need telling what it
+        # wrote. This can only take the count BELOW the spec's ceiling.
+        parties.discard(actor.shell_id)
+    live = [s for s in sorted(parties) if con.execute(
+        "SELECT 1 FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+        (s,)).fetchone() is not None]
+    if not live:
+        return 0
+    body = (f"sprint {doc_id} unit {seq} assignment change: "
+            + _role_phrase(con, before, after))
+    # from_shell_id is NOT NULL and the operator token carries no shell, so
+    # the sender falls back to the sprint's planner (the shell whose belief
+    # this is) and finally to the recipient itself — the same self-addressing
+    # pr_poller.py uses for daemon-emitted rows. No synthetic shell is minted.
+    sender = actor.shell_id if actor.kind == "shell" else None
+    sender = sender if sender is not None else _board_writer(con, doc_id)
+    for shell_id in live:
+        con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id, to_shell_id, body, kind, sprint_doc_id) "
+            "VALUES (?,?,?,'shell',?)",
+            (sender if sender is not None else shell_id, shell_id, body,
+             doc_id))
+    _log(f"sprint board: doc={doc_id} unit={seq} assignment change "
+         f"notified {len(live)} shell(s)")
+    return len(live)
+
+
 def _sprint_units(actor, query: dict):
     """GET /api/sprint-units?sprint_doc_id=N — the board, read. Every
     participant reads it (it is the board they work from); only the planner
@@ -2495,6 +2609,10 @@ def _add_sprint_unit(actor, headers, body):
                     "unit_exists",
                     f"sprint {doc_id} already has unit {seq} — edit it with "
                     "PATCH rather than declaring it twice")
+            # A declaration that names a role IS an assignment change: before
+            # is the empty board this row did not exist on.
+            _emit_assignment_notice(con, actor, doc_id, seq,
+                                    {c: None for c in _ROLE_COLS}, roles)
             con.commit()
             _log(f"sprint board: doc={doc_id} unit={seq} declared "
                  f"by={actor.scope}")
@@ -2593,6 +2711,11 @@ def _patch_sprint_unit(actor, headers, body):
             con.execute(
                 f"UPDATE sprint_units SET {', '.join(sets)} WHERE unit_id=?",
                 (*params, unit_id))
+            # A role omitted from the body is left alone, so `after` is the
+            # row as it now reads — not the request. The counterpart the
+            # notice names has to be the board's, not the caller's subset.
+            _emit_assignment_notice(con, actor, doc_id, seq, was,
+                                    {**was, **resolved})
             con.commit()
             _log(f"sprint board: doc={doc_id} unit={seq} moved "
                  f"by={actor.scope} ({'state ' + state if state else 'fields'})")
