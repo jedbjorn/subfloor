@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import sqlite3
 import subprocess
 import sys
@@ -55,6 +56,229 @@ def read_db(path: Path) -> str:
 
 
 class HalfFloorRollbackTest(unittest.TestCase):
+    def test_path_resolution_fallbacks_only_under_delete_rollback_delta(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            scripts = root / ".super-coder" / "scripts"
+            future = root / ".super-coder" / "future"
+            scripts.mkdir(parents=True)
+            future.mkdir()
+
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "Rollback Test")
+            git(root, "config", "user.email", "rollback@example.invalid")
+            (root / "sc").write_text("dispatcher\n")
+            (scripts / "engine_manifest.py").write_text(
+                'ENGINE_PATHS = ["sc", ".super-coder/scripts"]\n'
+            )
+            future_file = future / "newly-owned.txt"
+            future_file.write_text("tracked before engine ownership\n")
+            git(root, "add", ".")
+            git(root, "commit", "-m", "previous exact list")
+            previous_exact_sha = git(root, "rev-parse", "HEAD")
+
+            (scripts / "engine_manifest.py").write_text(
+                "ENGINE_PATHS = load_paths()\n"
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-m", "previous unparseable list")
+            previous_fallback_sha = git(root, "rev-parse", "HEAD")
+
+            current_paths = [
+                "sc",
+                ".super-coder/scripts",
+                ".super-coder/future",
+            ]
+            (scripts / "engine_manifest.py").write_text(
+                "ENGINE_PATHS = " + repr(current_paths) + "\n"
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-m", "current exact list")
+            current_exact_sha = git(root, "rev-parse", "HEAD")
+
+            (scripts / "engine_manifest.py").write_text(
+                "ENGINE_PATHS = load_paths()\n"
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-m", "current unparseable list")
+            current_fallback_sha = git(root, "rev-parse", "HEAD")
+
+            with mock.patch.object(rollback.update_mod, "REPO_ROOT", root):
+                previous_exact = set(
+                    rollback.update_mod._engine_files_at(previous_exact_sha)
+                )
+                current_exact = set(
+                    rollback.update_mod._engine_files_at(current_exact_sha)
+                )
+                exact_delta = current_exact - previous_exact
+
+                warnings = io.StringIO()
+                with mock.patch.object(
+                    rollback.update_mod,
+                    "ENGINE_PATHS",
+                    ["sc", ".super-coder/scripts"],
+                ), contextlib.redirect_stderr(warnings):
+                    current_fallback = set(
+                        rollback.update_mod._engine_files_at(
+                            current_fallback_sha
+                        )
+                    )
+
+                with mock.patch.object(
+                    rollback.update_mod,
+                    "ENGINE_PATHS",
+                    current_paths,
+                ), contextlib.redirect_stderr(warnings):
+                    previous_fallback = set(
+                        rollback.update_mod._engine_files_at(
+                            previous_fallback_sha
+                        )
+                    )
+
+            expected = ".super-coder/future/newly-owned.txt"
+            self.assertIn(expected, exact_delta)
+            current_fallback_delta = current_fallback - previous_exact
+            previous_fallback_delta = current_exact - previous_fallback
+            self.assertLess(current_fallback_delta, exact_delta)
+            self.assertLess(previous_fallback_delta, exact_delta)
+            self.assertEqual(
+                warnings.getvalue().count(
+                    "falling back to installed ENGINE_PATHS"
+                ),
+                2,
+            )
+
+    def test_restore_engine_resolves_each_refs_allow_list(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            engine = root / ".super-coder"
+            scripts = engine / "scripts"
+            state = root / ".sc-state"
+            scripts.mkdir(parents=True)
+            state.mkdir()
+
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "Rollback Test")
+            git(root, "config", "user.email", "rollback@example.invalid")
+            (root / "sc").write_text("old dispatcher\n")
+            (scripts / "floor.txt").write_text("old engine\n")
+            (scripts / "engine_manifest.py").write_text(
+                'ENGINE_PATHS = ["sc", ".super-coder/scripts"]\n'
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-m", "old floor")
+            old_sha = git(root, "rev-parse", "HEAD")
+
+            (root / "sc").write_text("new dispatcher\n")
+            (scripts / "floor.txt").write_text("new engine\n")
+            (scripts / "engine_manifest.py").write_text(
+                'ENGINE_PATHS = ["sc", ".super-coder/scripts", '
+                '".super-coder/new-path"]\n'
+            )
+            new_path = engine / "new-path" / "new-only.txt"
+            new_path.parent.mkdir()
+            new_path.write_text("new upstream file\n")
+            git(root, "add", ".")
+            git(root, "commit", "-m", "new floor")
+            new_sha = git(root, "rev-parse", "HEAD")
+            engine_ref = state / "engine.ref"
+            engine_ref.write_text(new_sha + "\n")
+
+            with mock.patch.multiple(
+                rollback,
+                REPO_ROOT=root,
+                ENGINE=engine,
+                ENGINE_REF=engine_ref,
+            ), mock.patch.multiple(
+                rollback.update_mod,
+                REPO_ROOT=root,
+                ENGINE=engine,
+            ), mock.patch.multiple(
+                rollback.engine_manifest,
+                REPO_ROOT=root,
+                ENGINE=engine,
+                MANIFEST=engine / "engine.manifest",
+            ):
+                rollback.restore_engine(old_sha)
+
+            self.assertFalse(
+                new_path.exists(),
+                "the current ref's newly allow-listed upstream file must be "
+                "part of current_files - previous_files",
+            )
+            self.assertEqual((root / "sc").read_text(), "old dispatcher\n")
+            self.assertEqual(
+                (scripts / "floor.txt").read_text(), "old engine\n"
+            )
+            self.assertEqual(engine_ref.read_text(), old_sha + "\n")
+
+    def test_restore_engine_fallback_keeps_broader_installed_paths_symmetric(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            engine = root / ".super-coder"
+            scripts = engine / "scripts"
+            fork_area = engine / "fork-area"
+            state = root / ".sc-state"
+            scripts.mkdir(parents=True)
+            fork_area.mkdir()
+            state.mkdir()
+
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "Rollback Test")
+            git(root, "config", "user.email", "rollback@example.invalid")
+            (root / "sc").write_text("old dispatcher\n")
+            (scripts / "floor.txt").write_text("old engine\n")
+            (scripts / "engine_manifest.py").write_text(
+                'ENGINE_PATHS = ["sc", ".super-coder/scripts"]\n'
+            )
+            sentinel = fork_area / "sentinel.txt"
+            sentinel.write_bytes(b"tracked fork bytes\n")
+            git(root, "add", ".")
+            git(root, "commit", "-m", "old exact floor")
+            old_sha = git(root, "rev-parse", "HEAD")
+
+            (root / "sc").write_text("new dispatcher\n")
+            (scripts / "floor.txt").write_text("new engine\n")
+            (scripts / "engine_manifest.py").write_text(
+                "ENGINE_PATHS = load_paths()\n"
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-m", "new unparseable floor")
+            new_sha = git(root, "rev-parse", "HEAD")
+            engine_ref = state / "engine.ref"
+            engine_ref.write_text(new_sha + "\n")
+            sentinel.write_bytes(b"fork sentinel bytes\n")
+
+            installed = [
+                "sc",
+                ".super-coder/scripts",
+                ".super-coder/fork-area",
+            ]
+            with mock.patch.multiple(
+                rollback,
+                REPO_ROOT=root,
+                ENGINE_REF=engine_ref,
+            ), mock.patch.object(
+                rollback.update_mod,
+                "ENGINE_PATHS",
+                installed,
+            ), mock.patch.object(
+                rollback.update_mod,
+                "materialize_engine",
+            ), mock.patch.object(
+                rollback.engine_manifest,
+                "write_manifest",
+            ):
+                rollback.restore_engine(old_sha)
+
+            self.assertEqual(
+                sentinel.read_bytes(),
+                b"fork sentinel bytes\n",
+                "a broader installed fallback must not turn tracked fork "
+                "content into a rollback deletion candidate",
+            )
+            self.assertEqual(engine_ref.read_text(), old_sha + "\n")
+
     def test_engine_only_refuses_previous_floor_with_unrelated_extra(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
