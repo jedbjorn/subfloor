@@ -408,6 +408,27 @@ class BoardRecordTest(_BoardCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.row()["state"], "working")
 
+    def test_a_handover_leaves_the_board_with_the_planner_that_took_it(self):
+        """"The most recent planner ever bound" is the fallback's whole shape,
+        and a released binding is now part of the answer — so WHICH released
+        binding answers is load-bearing rather than incidental. A sprint handed
+        from one planner to the next (`idx_spb_live_sprint` allows one live
+        binding, so a handover is release-then-arm) and then released again
+        must answer with the planner that TOOK the sprint, not the one that
+        started it. Reading the bindings in the other order gives a
+        confidently wrong writer instead of no writer."""
+        first = self.arm_binding(planner_shell_id=9)
+        self.release(first, "shell_recovery")
+        second = self.arm_binding(planner_shell_id=10)
+        self.release(second, "sprint closed")
+        status, _ = self.add((PLANNER2,), dev="DEV5")
+        self.assertEqual(status, 201, "the planner that took the sprint over "
+                                      "cannot write its board")
+        status, err = self.patch((PLANNER,), state="merged")
+        self.assertEqual(status, 403, "the superseded planner still writes")
+        self.assertEqual(err["error"]["code"], "not_the_planner")
+        self.assertEqual(self.row()["state"], "pending")
+
     def test_a_released_binding_does_not_open_a_sprint_next_door(self):
         """The cross-sprint leg of flag 222: a planner running its own sprint
         reached a board on a doc it never bound, once that doc's binding had
