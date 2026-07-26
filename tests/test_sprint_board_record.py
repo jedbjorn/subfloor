@@ -474,6 +474,65 @@ class BoardRecordTest(unittest.TestCase):
             sprint_cli.cmd_board(mock.Mock(sprint=1))
         self.assertIn("| U3 | activity readers | — | — |", buf.getvalue())
 
+    # -- the CLI reaches the routes it claims to ------------------------------
+
+    def test_each_verb_calls_the_method_and_path_it_claims(self):
+        """The route tests prove the handlers; this proves the verbs actually
+        REACH them. A wrong method or path in the CLI would ship invisibly —
+        the handler tests stay green either way, and the live server is on the
+        stale engine floor this sprint, so no end-to-end call can catch it.
+
+        `set` and `state` deliberately share one route: state is refused
+        server-side when it arrives beside other edits, so the separation is
+        enforced where it cannot be bypassed by calling the API directly."""
+        seen = []
+
+        def spy(method, path, payload=None, idem=None):
+            seen.append((method, path, payload))
+            return {"units": [], "seq": "U1", "sprint_doc_id": 1,
+                    "unit_title": "t", "state": "pending"}
+
+        args = mock.Mock(sprint=1, seq="U1", title="t", dev="DEV5",
+                         reviewer="REV2", depends_on="U0", overlap="note",
+                         branch="b", pr=7, state="working")
+        with mock.patch.object(sprint_cli, "_api", spy):
+            sprint_cli.cmd_unit_add(args)
+            sprint_cli.cmd_unit_set(args)
+            sprint_cli.cmd_unit_state(args)
+            sprint_cli.cmd_unit_list(args)
+            sprint_cli.cmd_board(args)
+
+        self.assertEqual([m for m, _p, _b in seen],
+                         ["POST", "PATCH", "PATCH", "GET", "GET"])
+        for _m, path, _b in seen:
+            self.assertTrue(path.startswith("/api/sprint-units"), path)
+        # the state verb sends state ALONE — the CLI must not smuggle the
+        # other parsed arguments along and earn a 422 on every call
+        self.assertEqual(seen[2][2],
+                         {"sprint_doc_id": 1, "seq": "U1", "state": "working"})
+        # and `set` must not send state, which would make every field edit a
+        # refusal
+        self.assertNotIn("state", seen[1][2])
+        self.assertEqual(seen[1][2]["overlap"], "note")
+
+    def test_the_cli_clears_a_slot_only_on_the_literal_none(self):
+        """`--dev none` clears; `--dev DEV5` assigns. Mapping a missing flag
+        to a clear would de-assign a role on every unrelated edit."""
+        seen = []
+        with mock.patch.object(
+                sprint_cli, "_api",
+                lambda m, p, payload=None, idem=None: (
+                    seen.append(payload) or {"seq": "U1", "sprint_doc_id": 1,
+                                             "unit_title": "t",
+                                             "state": "pending"})):
+            sprint_cli.cmd_unit_set(mock.Mock(
+                sprint=1, seq="U1", title=None, dev="none", reviewer=None,
+                depends_on=None, overlap=None, branch=None, pr=-1))
+        self.assertIsNone(seen[0]["dev"], "'none' did not clear the dev slot")
+        self.assertIsNone(seen[0]["pr_number"], "--pr -1 did not clear the PR")
+        self.assertNotIn("reviewer", seen[0],
+                         "an omitted --reviewer was sent as a change")
+
     # -- the board survives a rebuild ----------------------------------------
 
     def test_the_board_is_snapshot_content_not_a_rebuildable_cache(self):
