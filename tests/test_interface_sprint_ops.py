@@ -317,6 +317,100 @@ class SprintOpsRoutesTest(unittest.TestCase):
                                  (SHELL2,))
         self.assertEqual(body["alerts"], [])
 
+    def test_structured_reconciler_alert_is_sprint_scoped_and_filterable(self):
+        self.arm()
+        con = sqlite3.connect(self.db_path)
+        unit_id = con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state, dev_shell_id) "
+            "VALUES (1, 'U5', 'delivery', 'working', 2)"
+        ).lastrowid
+        con.execute(
+            "INSERT INTO planner_alerts "
+            "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
+            " dedupe_key) "
+            "VALUES (1, ?, 'dev', 'checkup', 2, 'warning', "
+            "        'worker_checkup', ?)",
+            (unit_id, f"reconciler|1|{unit_id}|dev|checkup"),
+        )
+        con.commit()
+        con.close()
+
+        status, body = self.call(
+            "GET",
+            "/api/interface/sprint-alerts?sprint_doc_id=1",
+            (SHELL1,),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(1, len(body["alerts"]))
+        alert = body["alerts"][0]
+        self.assertEqual(
+            (1, unit_id, "dev", "checkup", 2),
+            (
+                alert["sprint_doc_id"],
+                alert["unit_id"],
+                alert["role"],
+                alert["signal"],
+                alert["shell_id"],
+            ),
+        )
+
+        status, body = self.call(
+            "GET",
+            "/api/interface/sprint-alerts?sprint_doc_id=1",
+            (SHELL2,),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([], body["alerts"])
+
+        status, body = self.call(
+            "GET",
+            "/api/interface/sprint-alerts?sprint_doc_id=999",
+            (OP,),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([], body["alerts"])
+
+        status, body = self.call(
+            "GET",
+            "/api/interface/sprint-alerts?sprint_doc_id=not-an-id",
+            (OP,),
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual("validation", body["error"]["code"])
+
+    def test_work_complete_alert_explicitly_forbids_restart(self):
+        con = sqlite3.connect(self.db_path)
+        unit_id = con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state, dev_shell_id) "
+            "VALUES (1, 'U5', 'delivery', 'working', 2)"
+        ).lastrowid
+        con.execute(
+            "INSERT INTO planner_alerts "
+            "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
+            " dedupe_key) "
+            "VALUES (1, ?, 'dev', 'work_complete_unreported', 2, 'info', "
+            "        'worker_work_complete_unreported', ?)",
+            (
+                unit_id,
+                f"reconciler|1|{unit_id}|dev|work_complete_unreported",
+            ),
+        )
+        con.commit()
+        con.close()
+
+        status, body = self.call(
+            "GET",
+            "/api/interface/sprint-alerts?sprint_doc_id=1",
+            (OP,),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(1, len(body["alerts"]))
+        action = body["alerts"][0]["next_action"]
+        self.assertIn("Do not restart", action)
+        self.assertNotIn("start a new", action)
+
     def test_unscoped_watch_alert_is_visible_only_to_its_owner(self):
         con = sqlite3.connect(self.db_path)
         con.execute("DELETE FROM interface_input_state")

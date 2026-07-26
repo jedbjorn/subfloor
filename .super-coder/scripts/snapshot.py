@@ -100,7 +100,6 @@ PER_INSTANCE_TABLES = [
     "planner_wake_items",
     "planner_action_receipts",
     "pr_poll_observations",
-    "planner_alerts",
     # sprint_units (0098) is the planner's AUTHORED board — the declared belief
     # about who should be doing what — not a derived cache: nothing re-derives
     # it, so a mid-sprint rebuild without it drops the whole sprint's state and
@@ -109,6 +108,10 @@ PER_INSTANCE_TABLES = [
     # rebuilds. Loads after `shells` and `documents`, both its FK targets. No
     # row filter: every unit row is durable planner content, terminal or not.
     "sprint_units",
+    # Reconciler alerts may reference sprint_units.unit_id (0102), so alerts
+    # load after the board record just as they already load after their
+    # session, binding, message, and watch parents.
+    "planner_alerts",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/map_content.sql by snapshot_map() below, not here.

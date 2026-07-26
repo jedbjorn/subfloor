@@ -66,6 +66,7 @@ import live_model  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
 from sprint_units import UNIT_STATES as _UNIT_STATES  # noqa: E402
+from sprint_units import board_writer as _board_writer  # noqa: E402
 
 TICKET_TTL_S = 60
 RESERVATION_TTL_S = 60
@@ -1999,6 +2000,30 @@ _ALERT_COPY = {
         "Rebind the watch with `sc watch pr … --sprint <doc-id>`.",
         "warning",
     ),
+    "worker_checkup": (
+        "The worker has no recent result or work event after its expected "
+        "activity window.",
+        "Read its flags, branch, worktree, messages, and run output before "
+        "deciding whether recovery is needed.",
+        "warning",
+    ),
+    "worker_not_started": (
+        "The unit's declared branch has not appeared after the start grace.",
+        "Confirm the worker's launch evidence before reassigning the unit.",
+        "warning",
+    ),
+    "worker_work_complete_unreported": (
+        "The worker ended after producing durable output but did not report it.",
+        "Read the worker's durable output. Do not restart it; the work already "
+        "exists.",
+        "warning",
+    ),
+    "reconciler_missing_binding": (
+        "The reconciler recorded a sprint finding, but the sprint has never "
+        "had a planner binding to receive its message.",
+        "Arm the sprint's real planner binding; do not synthesize a recipient.",
+        "warning",
+    ),
 }
 
 
@@ -2006,7 +2031,8 @@ def _alert_projection(row) -> dict:
     cols = (
         "alert_id", "session_id", "binding_id", "message_id", "watch_id",
         "severity", "reason", "opened_at", "resolved_at", "acknowledged_at",
-        "acknowledged_by", "shell_id", "generation",
+        "acknowledged_by", "sprint_doc_id", "unit_id", "role", "signal",
+        "shell_id", "generation",
     )
     alert = dict(zip(cols, row))
     meaning, action, category = _ALERT_COPY.get(
@@ -2037,13 +2063,19 @@ def _sprint_alerts(actor, query: dict):
     binding_id = _qint(query, "binding_id")
     planner = _qint(query, "planner_shell_id")
     generation = _qint(query, "generation")
+    sprint_doc_id = _qint(query, "sprint_doc_id")
+    if query.get("sprint_doc_id", [None])[0] not in (None, "") \
+            and sprint_doc_id is None:
+        return _err(422, "validation",
+                    "sprint_doc_id filter must be an integer")
     include_resolved = query.get("include_resolved", ["0"])[0] in (
         "1", "true", "yes")
     sql = (
         "SELECT a.alert_id, a.session_id, a.binding_id, a.message_id, "
         "a.watch_id, a.severity, a.reason, a.opened_at, a.resolved_at, "
         "a.acknowledged_at, a.acknowledged_by, "
-        "COALESCE(s.shell_id, b.shell_id), "
+        "a.sprint_doc_id, a.unit_id, a.role, a.signal, "
+        "COALESCE(a.shell_id, s.shell_id, b.shell_id), "
         "COALESCE(s.generation, b.generation) "
         "FROM planner_alerts a "
         "LEFT JOIN interface_sessions s ON s.session_id=a.session_id "
@@ -2056,8 +2088,14 @@ def _sprint_alerts(actor, query: dict):
             "WHERE shell_id=?) OR a.binding_id IN (SELECT binding_id FROM "
             "sprint_planner_bindings WHERE planner_shell_id=?) OR "
             "a.watch_id IN (SELECT watch_id FROM watched_prs "
-            "WHERE shell_id=?))")
-        params += [actor.shell_id, actor.shell_id, actor.shell_id]
+            "WHERE shell_id=?) OR a.sprint_doc_id IN (SELECT sprint_doc_id "
+            "FROM sprint_planner_bindings WHERE planner_shell_id=?))")
+        params += [
+            actor.shell_id,
+            actor.shell_id,
+            actor.shell_id,
+            actor.shell_id,
+        ]
         planner = actor.shell_id
     elif planner is not None:
         conds.append(
@@ -2065,14 +2103,18 @@ def _sprint_alerts(actor, query: dict):
             "WHERE shell_id=?) OR a.binding_id IN (SELECT binding_id FROM "
             "sprint_planner_bindings WHERE planner_shell_id=?) OR "
             "a.watch_id IN (SELECT watch_id FROM watched_prs "
-            "WHERE shell_id=?))")
-        params += [planner, planner, planner]
+            "WHERE shell_id=?) OR a.sprint_doc_id IN (SELECT sprint_doc_id "
+            "FROM sprint_planner_bindings WHERE planner_shell_id=?))")
+        params += [planner, planner, planner, planner]
     if session_id is not None:
         conds.append("a.session_id=?")
         params.append(session_id)
     if binding_id is not None:
         conds.append("a.binding_id=?")
         params.append(binding_id)
+    if sprint_doc_id is not None:
+        conds.append("a.sprint_doc_id=?")
+        params.append(sprint_doc_id)
     if generation is None and planner is not None and session_id is None \
             and binding_id is None:
         current = None
@@ -2087,13 +2129,17 @@ def _sprint_alerts(actor, query: dict):
         if current is None:
             # Session/binding alerts require a current generation by default,
             # but a dormant watch may be the reason no planner session exists.
-            # Keep that repair signal owner-visible without a live session.
-            conds.append("a.watch_id IS NOT NULL")
+            # Sprint-scoped reconciler alerts likewise remain owner-visible
+            # between planner generations.
+            conds.append(
+                "(a.watch_id IS NOT NULL OR a.sprint_doc_id IS NOT NULL)"
+            )
         else:
             generation = current[0]
     if generation is not None:
         conds.append(
-            "(a.watch_id IS NOT NULL OR COALESCE(s.generation, b.generation)=?)")
+            "(a.watch_id IS NOT NULL OR a.sprint_doc_id IS NOT NULL "
+            "OR COALESCE(s.generation, b.generation)=?)")
         params.append(generation)
     if not include_resolved:
         conds.append("a.resolved_at IS NULL AND a.acknowledged_at IS NULL")
@@ -2318,38 +2364,6 @@ def _bad_unit_field(body):
                         f"{field} cannot be blank"
                         + (" — pass null to clear it" if clearable else ""))
     return None
-
-
-def _board_writer(con, sprint_doc_id: int) -> "int | None":
-    """The one shell allowed to move this sprint's board: the planner bound to
-    it. ONE definition — the alert delivery in U5 resolves the same question
-    and must call this rather than restate it.
-
-    The spec's rule reads "the binding's planner_shell_id, else the sprint
-    doc's author". The second clause is not implementable as written:
-    `documents` carries no author column at all (schema.sql:204), so there is
-    nothing to fall back TO. An unbound sprint therefore falls back to flavor
-    instead — see _may_write_board.
-
-    RELEASED BINDINGS STILL NAME THE WRITER. Filtering on `released_at IS
-    NULL` made the fallback mean "before a binding is armed" OR "after the
-    planner's session ended" (interface_recovery release_binding
-    'shell_recovery') OR "after the sprint was closed or frozen"
-    (_close_sprint_wake) — three engine paths that release with no operator
-    action at all. In that window the fence widened from ONE shell to a CLASS
-    of shells, and a foreign planner could move a unit of a sprint it has no
-    relationship to into `merged` — the terminal state that makes the
-    reconciler stop watching it. The spec's rule names one shell in both of
-    its branches, so this one does too: the most recent planner ever bound to
-    this sprint. Flavor now stands in only for a sprint that never had a
-    binding. The cost is deliberate — a NEW planner taking a sprint over must
-    arm its binding before it can write.
-    """
-    row = con.execute(
-        "SELECT planner_shell_id FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? "
-        "ORDER BY binding_id DESC LIMIT 1", (sprint_doc_id,)).fetchone()
-    return row[0] if row is not None else None
 
 
 def _may_write_board(con, actor, sprint_doc_id: int):

@@ -27,8 +27,8 @@ What lives here:
   watch-gated cadence; worker-expectation reconciliation runs every 10 minutes
   from structured live units even before a PR or watch exists. Explicit PR
   reconcile still rides `poll_cycle(source='reconcile')` through the API.
-  The GitHub side beats the 'watch' heartbeat so `sc watch list` liveness keeps
-  telling the truth.
+  PR polling beats the status-visible watch heartbeat. Worker reconciliation
+  records tick completion in a separate heartbeat row that has no reader.
 
 It never injects terminal input, never marks a message read, never acts on a
 PR, and never mutates the sprint board. PR polling may create an event; the
@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
-from sprint_units import TERMINAL_UNIT_STATES
+from sprint_units import TERMINAL_UNIT_STATES, board_writer
 
 CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
 
@@ -348,6 +348,12 @@ class Expectation:
 
     @property
     def key(self) -> tuple:
+        """Confirmation identity, not planner-alert identity.
+
+        The assignee is intentional here: a reassignment must earn two fresh
+        observations. Alert identity is constructed separately from immutable
+        unit_id and deliberately excludes shell_id.
+        """
         return (
             self.sprint_doc_id,
             self.unit_id,
@@ -426,9 +432,209 @@ class ReconcilerState:
         }
 
 
+RECONCILER_SEVERITY = {
+    "checkup": "warning",
+    "not_started": "warning",
+    "work_complete_unreported": "info",
+    # Mapping only: reconcile_tick cannot confirm this signal because it is
+    # deliberately absent from ReconcilerState.ACTIONABLE. No producer exists.
+    "recovery_blocked": "critical",
+}
+HEALTHY_RECONCILER_SIGNALS = {"reported", "working"}
+
+
+def _open_reconciliation_alert(
+    con,
+    reading: ReconciliationReading,
+    severity: str,
+) -> "int | None":
+    expectation = reading.expectation
+    unit_key = (
+        expectation.unit_id
+        if expectation.unit_id is not None
+        else "-"
+    )
+    dedupe_key = (
+        f"reconciler|{expectation.sprint_doc_id}|{unit_key}|"
+        f"{expectation.role}|{reading.signal}"
+    )
+    opened_at = reading.observed_at.isoformat()
+    cursor = con.execute(
+        "INSERT INTO planner_alerts "
+        "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
+        " dedupe_key, opened_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
+        (
+            expectation.sprint_doc_id,
+            expectation.unit_id,
+            expectation.role,
+            reading.signal,
+            expectation.shell_id,
+            severity,
+            f"worker_{reading.signal}",
+            dedupe_key,
+            opened_at,
+        ),
+    )
+    if cursor.rowcount == 1:
+        return cursor.lastrowid
+    con.execute(
+        "UPDATE planner_alerts SET shell_id=? "
+        "WHERE dedupe_key=? AND resolved_at IS NULL AND shell_id IS NOT ?",
+        (expectation.shell_id, dedupe_key, expectation.shell_id),
+    )
+    return None
+
+
+def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
+    con.execute(
+        "INSERT INTO planner_alerts "
+        "(sprint_doc_id, severity, reason, dedupe_key) "
+        "VALUES (?, 'warning', 'reconciler_missing_binding', ?) "
+        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
+        (
+            sprint_doc_id,
+            f"reconciler|{sprint_doc_id}|-|-|missing_binding",
+        ),
+    )
+
+
+def _resolve_reconciliation_alerts(
+    con,
+    reading: ReconciliationReading,
+) -> None:
+    if reading.signal not in HEALTHY_RECONCILER_SIGNALS:
+        return
+    expectation = reading.expectation
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=? "
+        "WHERE sprint_doc_id=? AND unit_id IS ? AND role=? "
+        "AND signal IN ('checkup','not_started',"
+        "'work_complete_unreported') "
+        "AND resolved_at IS NULL",
+        (
+            reading.observed_at.isoformat(),
+            expectation.sprint_doc_id,
+            expectation.unit_id,
+            expectation.role,
+        ),
+    )
+
+
+def _reconciliation_body(reading: ReconciliationReading) -> str:
+    expectation = reading.expectation
+    shell = _row(expectation.shell, "shortname", expectation.shell_id)
+    measurement = json.dumps(
+        reading.measurement,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    body = (
+        f"reconciler unit={expectation.seq or '-'} role={expectation.role} "
+        f"shell={shell} signal={reading.signal} measurement={measurement} "
+        f"observed_at={reading.observed_at.isoformat()}"
+    )
+    if reading.explanation is not None:
+        body += " explanation=" + json.dumps(
+            reading.explanation,
+            ensure_ascii=False,
+        )
+    return body
+
+
+def deliver_reconciliation_readings(
+    con,
+    readings: "list[ReconciliationReading]",
+) -> list[int]:
+    """Record confirmed findings and push each newly-opened one to its planner.
+
+    The structured alert is the unconditional record. A message is only the
+    push layer and therefore exists only when the sprint has a historical
+    binding whose planner can be addressed. This function consumes U4's
+    rendered fields and never inspects Evidence or classifies a reading.
+
+    The caller owns the transaction. Returning message ids lets it notify the
+    wake coordinator only after the tick and its heartbeat commit together.
+    """
+    emitted: list[int] = []
+    writers: dict[int, "int | None"] = {}
+    for reading in readings:
+        sprint_doc_id = reading.expectation.sprint_doc_id
+        if sprint_doc_id not in writers:
+            writers[sprint_doc_id] = board_writer(con, sprint_doc_id)
+        planner_shell_id = writers[sprint_doc_id]
+        if planner_shell_id is not None:
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=? "
+                "WHERE sprint_doc_id=? "
+                "AND reason='reconciler_missing_binding' "
+                "AND resolved_at IS NULL",
+                (reading.observed_at.isoformat(), sprint_doc_id),
+            )
+
+        _resolve_reconciliation_alerts(con, reading)
+        if not reading.confirmed:
+            continue
+        # ReconcilerState only confirms ACTIONABLE signals, and every one is
+        # required to have an explicit severity. Fail loudly if that contract
+        # ever drifts instead of preserving an unreachable fallback.
+        severity = RECONCILER_SEVERITY[reading.signal]
+        if planner_shell_id is None:
+            _open_missing_binding_alert(con, sprint_doc_id)
+
+        alert_id = _open_reconciliation_alert(con, reading, severity)
+        if alert_id is None or planner_shell_id is None:
+            continue
+
+        message_id = con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id, to_shell_id, body, kind, sprint_doc_id, "
+            " dedupe_key) VALUES (?,?,?,'pr_event',?,?)",
+            (
+                planner_shell_id,
+                planner_shell_id,
+                _reconciliation_body(reading),
+                sprint_doc_id,
+                f"reconciler-alert|{alert_id}",
+            ),
+        ).lastrowid
+        binding = con.execute(
+            "SELECT binding_id FROM sprint_planner_bindings "
+            "WHERE sprint_doc_id=? AND planner_shell_id=? "
+            "AND released_at IS NULL ORDER BY binding_id DESC LIMIT 1",
+            (sprint_doc_id, planner_shell_id),
+        ).fetchone()
+        binding_id = binding[0] if binding is not None else None
+        con.execute(
+            "UPDATE planner_alerts SET message_id=?, binding_id=? "
+            "WHERE alert_id=?",
+            (message_id, binding_id, alert_id),
+        )
+        if binding_id is not None:
+            con.execute(
+                "INSERT OR IGNORE INTO planner_wake_items "
+                "(binding_id, message_id) VALUES (?,?)",
+                (binding_id, message_id),
+            )
+        emitted.append(message_id)
+    return emitted
+
+
 def live_expectations(con) -> list[Expectation]:
     """Enumerate the structured board, independent of PR watches and prose."""
     placeholders = ",".join("?" for _ in TERMINAL_UNIT_STATES)
+    planner_doc_ids = [
+        _row(row, "document_id")
+        for row in con.execute(
+            "SELECT d.document_id FROM documents d "
+            "WHERE d.frozen=0 "
+            "AND EXISTS (SELECT 1 FROM sprint_units u "
+            "WHERE u.sprint_doc_id=d.document_id) "
+            "ORDER BY d.document_id"
+        ).fetchall()
+    ]
     units = con.execute(
         "SELECT u.* FROM sprint_units u "
         "JOIN documents d ON d.document_id=u.sprint_doc_id "
@@ -436,10 +642,13 @@ def live_expectations(con) -> list[Expectation]:
         "ORDER BY u.sprint_doc_id, u.unit_id",
         TERMINAL_UNIT_STATES,
     ).fetchall()
-    if not units:
+    doc_ids = sorted(
+        set(planner_doc_ids)
+        | {_row(unit, "sprint_doc_id") for unit in units}
+    )
+    if not doc_ids:
         return []
 
-    doc_ids = sorted({_row(unit, "sprint_doc_id") for unit in units})
     shell_ids = {
         shell_id
         for unit in units
@@ -666,14 +875,16 @@ class PollerState:
         return blind
 
 
-# ── Heartbeat (#359 — same row the legacy daemon beat; liveness UI unchanged) ─
+# ── Heartbeats (#359 — one row per independently observed poller) ────────────
 
-def beat(con, interval: int) -> None:
+def beat(con, interval: int, *, name: str = "watch") -> None:
     con.execute(
         "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
-        "VALUES ('watch', datetime('now'), ?) "
+        "VALUES (?, datetime('now'), ?) "
         "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at, "
-        "interval_s=excluded.interval_s", (interval,))
+        "interval_s=excluded.interval_s",
+        (name, interval),
+    )
     con.commit()
 
 
@@ -882,7 +1093,10 @@ class Poller(threading.Thread):
                             # mission (#359). A beat raising into the cycle's
                             # except would turn a working poller into a
                             # dead-with-noise one — log and keep polling.
-                            print(f"pr-poller: heartbeat error ({e})", flush=True)
+                            print(
+                                f"pr-poller: heartbeat error ({e})",
+                                flush=True,
+                            )
                         # GitHub's bounded read remains watch-gated.
                         if armed_watches(con) or live_unscoped_watch_ids(con):
                             n = poll_cycle(
@@ -903,6 +1117,29 @@ class Poller(threading.Thread):
                             refresh=self._refresh,
                             state=self.reconciler_state,
                         )
+                        emitted = deliver_reconciliation_readings(
+                            con,
+                            self.last_reconciliation,
+                        )
+                        try:
+                            # Commit the reconciliation writes and its liveness
+                            # proof together. A failure before this point leaves
+                            # no fresh beat claiming the tick completed.
+                            beat(
+                                con,
+                                self._reconcile_interval,
+                                name="reconcile",
+                            )
+                        except Exception as e:
+                            # Older/malformed floors may lack the heartbeat
+                            # surface. Findings remain the mission; preserve
+                            # them while leaving the absent beat honest.
+                            con.commit()
+                            print(f"pr-poller: heartbeat error ({e})", flush=True)
+                        if emitted:
+                            import interface_wake
+                            for message_id in emitted:
+                                interface_wake.notify_message(message_id)
                         self._reconcile_due = (
                             monotonic_now + self._reconcile_interval
                         )

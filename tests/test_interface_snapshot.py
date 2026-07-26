@@ -181,9 +181,23 @@ class InterfaceSnapshotTest(unittest.TestCase):
             " idem_key, request_hash, response_status, response_resource,"
             " expires_at) VALUES ('operator','certify_clean','expired','h',"
             "200,'{}', '2000-01-01')")
+        unit_id = self.con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state, dev_shell_id) "
+            "VALUES (2, 'U5', 'delivery', 'merged', 2)"
+        ).lastrowid
+        self.reconciler_unit_id = unit_id
         self.con.execute(
             "INSERT INTO planner_alerts (severity, reason, dedupe_key) "
             "VALUES ('critical','crash','-|-|crash')")
+        self.con.execute(
+            "INSERT INTO planner_alerts "
+            "(sprint_doc_id, unit_id, role, signal, shell_id, severity, "
+            " reason, dedupe_key) "
+            "VALUES (2, ?, 'dev', 'checkup', 2, 'warning', "
+            " 'worker_checkup', ?)",
+            (unit_id, f"reconciler|2|{unit_id}|dev|checkup"),
+        )
         self.con.execute(
             "INSERT INTO planner_alerts (session_id, severity, reason, dedupe_key) "
             "VALUES (1,'warning','live-session','1|-|-|-|live')")
@@ -355,6 +369,13 @@ class InterfaceSnapshotTest(unittest.TestCase):
             alerts = set(rebuilt.execute(
                 "SELECT reason FROM planner_alerts "
                 "WHERE session_id=2 OR binding_id=2").fetchall())
+            reconciler_alert = rebuilt.execute(
+                "SELECT a.sprint_doc_id, a.unit_id, a.role, a.signal, "
+                "a.shell_id, u.seq "
+                "FROM planner_alerts a "
+                "JOIN sprint_units u ON u.unit_id=a.unit_id "
+                "WHERE a.reason='worker_checkup'"
+            ).fetchone()
             open_session_alerts = rebuilt.execute(
                 "SELECT alert_id FROM planner_alerts "
                 "WHERE session_id=2 AND resolved_at IS NULL").fetchall()
@@ -370,6 +391,10 @@ class InterfaceSnapshotTest(unittest.TestCase):
         finally:
             rebuilt.close()
         self.assertEqual(violations, [])
+        self.assertEqual(
+            reconciler_alert,
+            (2, self.reconciler_unit_id, "dev", "checkup", 2, "U5"),
+        )
         self.assertEqual(input_park, ("unknown", "delivery_unknown", 9))
         self.assertEqual(binding, (None,))
         self.assertEqual(wake_park, ("delivery_unknown",))

@@ -530,6 +530,13 @@ class CutoverTest(unittest.TestCase):
             self.assertEqual(con.execute(
                 "SELECT COUNT(*) FROM daemon_heartbeats WHERE name='watch'"
             ).fetchone()[0], 1)
+            self.assertEqual(
+                30,
+                con.execute(
+                    "SELECT interval_s FROM daemon_heartbeats "
+                    "WHERE name='watch'"
+                ).fetchone()[0],
+            )
             self.assertIsNotNone(con.execute(
                 "SELECT last_seen FROM watched_prs").fetchone()["last_seen"])
             run = con.execute("SELECT source, status FROM pr_poll_runs").fetchone()
@@ -653,7 +660,7 @@ class CutoverTest(unittest.TestCase):
         finally:
             con.close()
 
-    def test_missing_gh_disables_only_pr_reads_not_reconciliation(self):
+    def test_missing_gh_keeps_poll_heartbeat_absent_but_reconciliation_beats(self):
         import shutil
         old = shutil.which
         shutil.which = lambda name: None
@@ -671,8 +678,79 @@ class CutoverTest(unittest.TestCase):
         self.assertFalse(poller.is_alive())
         con = sqlite3.connect(tmp)
         try:
-            self.assertEqual(con.execute(
-                "SELECT COUNT(*) FROM daemon_heartbeats").fetchone()[0], 0)
+            self.assertEqual(
+                [("reconcile", 600)],
+                con.execute(
+                    "SELECT name, interval_s FROM daemon_heartbeats "
+                    "ORDER BY name"
+                ).fetchall(),
+            )
+        finally:
+            con.close()
+
+    def test_mid_reconciliation_failure_leaves_no_fresh_heartbeat(self):
+        import contextlib
+        import io
+
+        tmp = Path(tempfile.mkdtemp()) / "shell_db.db"
+        con = build_db(tmp)
+        seed_shells(con)
+        seed_sprint_doc(con, 100)
+        con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state, dev_shell_id, branch) "
+            "VALUES (100, 'U5', 'delivery', 'working', 2, 'feat/test')"
+        )
+        con.execute(
+            "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
+            "VALUES ('reconcile', '2000-01-01 00:00:00', 600)"
+        )
+        con.commit()
+        con.close()
+
+        class RaisingReader:
+            def read(self, shell, unit, now):
+                raise RuntimeError("mid-tick sentinel")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            poller = pr_poller.Poller(
+                tmp,
+                interval=30,
+                fetch=fetch_ok(),
+                activity_reader=RaisingReader(),
+                refresh=lambda worktree: True,
+            )
+            poller.start()
+            time.sleep(0.2)
+            poller.stop()
+            poller.join(timeout=5)
+
+        self.assertIn("cycle error (mid-tick sentinel)", out.getvalue())
+        con = sqlite3.connect(tmp)
+        try:
+            self.assertEqual(
+                ("2000-01-01 00:00:00", 600),
+                con.execute(
+                    "SELECT beat_at, interval_s FROM daemon_heartbeats "
+                    "WHERE name='reconcile'"
+                ).fetchone(),
+            )
+            self.assertEqual(
+                30,
+                con.execute(
+                    "SELECT interval_s FROM daemon_heartbeats "
+                    "WHERE name='watch'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                con.execute("SELECT COUNT(*) FROM planner_alerts").fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                con.execute("SELECT COUNT(*) FROM shell_messages").fetchone()[0],
+            )
         finally:
             con.close()
 
