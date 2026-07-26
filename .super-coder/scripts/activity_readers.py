@@ -163,6 +163,8 @@ class ActivityReader:
         except (OSError, sqlite3.Error):
             for name in ("epoch", "session", "durable_write", "result_row"):
                 self._mark(evidence, name)
+            if unit is None:
+                self._mark(evidence, "state_changed_at")
             return None
 
         harness = None
@@ -170,15 +172,39 @@ class ActivityReader:
         planner_session = None
         if unit is None:
             try:
-                row = con.execute(
-                    "SELECT sprint_doc_id FROM sprint_planner_bindings "
-                    "WHERE planner_shell_id=? ORDER BY binding_id DESC LIMIT 1",
+                rows = con.execute(
+                    "SELECT b.sprint_doc_id, b.armed_at "
+                    "FROM sprint_planner_bindings b "
+                    "JOIN documents d ON d.document_id=b.sprint_doc_id "
+                    "WHERE b.binding_id=("
+                    " SELECT MAX(b2.binding_id) FROM sprint_planner_bindings b2"
+                    " WHERE b2.sprint_doc_id=b.sprint_doc_id"
+                    ") AND b.planner_shell_id=? AND d.frozen=0 "
+                    "AND EXISTS (SELECT 1 FROM sprint_units u "
+                    "            WHERE u.sprint_doc_id=b.sprint_doc_id) "
+                    "ORDER BY b.sprint_doc_id",
                     (shell_id,),
-                ).fetchone()
-                sprint_doc_id = row["sprint_doc_id"] if row else None
+                ).fetchall()
+                # U9 can render several live planner roles, but Evidence carries
+                # one sprint scope.  Never collapse several bindings to a
+                # confident answer for whichever row happens to sort newest.
+                if len(rows) == 1:
+                    sprint_doc_id = rows[0]["sprint_doc_id"]
+                    evidence.state_changed_at = _timestamp(rows[0]["armed_at"])
+                    if evidence.state_changed_at is None:
+                        self._mark(evidence, "state_changed_at")
+                else:
+                    sprint_doc_id = None
+                    for name in (
+                        "durable_write",
+                        "result_row",
+                        "state_changed_at",
+                    ):
+                        self._mark(evidence, name)
             except sqlite3.Error:
                 self._mark(evidence, "durable_write")
                 self._mark(evidence, "result_row")
+                self._mark(evidence, "state_changed_at")
 
         try:
             if unit is None:
@@ -280,7 +306,8 @@ class ActivityReader:
         if not seq:
             return False
         return re.search(
-            rf"(?<![A-Za-z0-9_]){re.escape(seq)}(?![A-Za-z0-9_])",
+            rf"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_]\.)"
+            rf"{re.escape(seq)}(?![A-Za-z0-9_]|\.[A-Za-z0-9_])",
             body or "",
         ) is not None
 
@@ -385,15 +412,16 @@ class ActivityReader:
 
         revision = "HEAD" if on_declared_head else f"refs/remotes/origin/{branch}"
         try:
-            merge_base = self._git(
+            fetched = self._git(
                 worktree,
-                "merge-base",
-                "refs/remotes/origin/main",
-                revision,
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
             )
-            if merge_base.returncode != 0 or not merge_base.stdout.strip():
-                raise OSError(merge_base.stderr)
-            contribution = f"{merge_base.stdout.strip()}..{revision}"
+            if fetched.returncode != 0:
+                raise OSError(fetched.stderr)
+            contribution = f"refs/remotes/origin/main..{revision}"
             log = self._git(worktree, "log", contribution, "--format=%aI")
         except (OSError, subprocess.SubprocessError):
             log = None
@@ -705,6 +733,8 @@ class ActivityReader:
         except Exception:  # noqa: BLE001 — complete value, never an escape
             for name in ("epoch", "session", "durable_write", "result_row"):
                 self._mark(evidence, name)
+            if unit is None:
+                self._mark(evidence, "state_changed_at")
 
         on_declared_head = False
         if evidence.branch_declared is not None:

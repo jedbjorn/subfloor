@@ -62,7 +62,10 @@ def make_db(path: Path) -> None:
         );
         CREATE TABLE sprint_planner_bindings (
           binding_id INTEGER PRIMARY KEY, sprint_doc_id INTEGER,
-          planner_shell_id INTEGER
+          planner_shell_id INTEGER, armed_at TEXT
+        );
+        CREATE TABLE documents (
+          document_id INTEGER PRIMARY KEY, frozen INTEGER
         );
         CREATE TABLE spec_tasks (
           task_id INTEGER PRIMARY KEY, status TEXT
@@ -85,12 +88,48 @@ def make_db(path: Path) -> None:
         "(1,1,59,'2020-01-02T00:00:00Z','result',"
         "'sprint 59: unit U3 fixing')"
     )
+    # Each row violates exactly one result-evidence predicate.  All are newer
+    # than the qualifying row so deleting any one SQL predicate turns the
+    # contract assertion red.
+    con.executemany(
+        "INSERT INTO shell_messages VALUES (?,?,?,?,?,?)",
+        [
+            (
+                2,
+                1,
+                59,
+                "2020-01-06T00:00:00Z",
+                "task",
+                "sprint 59: unit U3 task",
+            ),
+            (
+                3,
+                2,
+                59,
+                "2020-01-05T00:00:00Z",
+                "result",
+                "sprint 59: unit U3 foreign shell",
+            ),
+            (
+                4,
+                1,
+                60,
+                "2020-01-04T00:00:00Z",
+                "result",
+                "sprint 60: unit U3 foreign sprint",
+            ),
+        ],
+    )
     con.execute(
         "INSERT INTO sprint_units VALUES "
         "(1,59,'U3','feat/test','working','2020-01-04T00:00:00Z',"
         "'2020-01-03T00:00:00Z',1,1,2)"
     )
-    con.execute("INSERT INTO sprint_planner_bindings VALUES (1,59,1)")
+    con.execute("INSERT INTO documents VALUES (59,0)")
+    con.execute(
+        "INSERT INTO sprint_planner_bindings VALUES "
+        "(1,59,1,'2020-01-04T00:00:00Z')"
+    )
     con.commit()
     con.close()
 
@@ -174,10 +213,19 @@ class ReaderCase(unittest.TestCase):
         command(
             self.worktree,
             "git",
-            "update-ref",
-            "refs/remotes/origin/main",
-            "HEAD",
+            "init",
+            "--bare",
+            str(self.root / "origin.git"),
         )
+        command(
+            self.worktree,
+            "git",
+            "remote",
+            "add",
+            "origin",
+            str(self.root / "origin.git"),
+        )
+        command(self.worktree, "git", "push", "origin", "HEAD:refs/heads/main")
         self.db = self.root / "shell.db"
         make_db(self.db)
         self.proc = self.root / "proc"
@@ -217,7 +265,7 @@ class DatabaseContractTest(ReaderCase):
         self.assertIsNone(evidence.session_ended_at)
         self.assertIsNone(evidence.session_end_reason)
         self.assertEqual(
-            datetime(2020, 1, 3, tzinfo=UTC), evidence.last_durable_write_at
+            datetime(2020, 1, 6, tzinfo=UTC), evidence.last_durable_write_at
         )
         self.assertEqual(
             datetime(2020, 1, 2, tzinfo=UTC), evidence.last_result_row_at
@@ -256,7 +304,7 @@ class DatabaseContractTest(ReaderCase):
             "INSERT INTO shell_messages VALUES (?,?,?,?,?,?)",
             [
                 (
-                    2,
+                    5,
                     1,
                     59,
                     "2020-01-05T00:00:00Z",
@@ -264,7 +312,7 @@ class DatabaseContractTest(ReaderCase):
                     "sprint 59: unit U4 ready",
                 ),
                 (
-                    3,
+                    6,
                     1,
                     59,
                     "2020-01-04T12:00:00Z",
@@ -283,9 +331,19 @@ class DatabaseContractTest(ReaderCase):
             evidence.last_result_row_at,
         )
         self.assertEqual(
-            datetime(2020, 1, 5, tzinfo=UTC),
+            datetime(2020, 1, 6, tzinfo=UTC),
             evidence.last_durable_write_at,
         )
+
+    def test_unit_name_boundaries_pin_the_real_dotted_family(self):
+        names = ar.ActivityReader._names_unit
+
+        self.assertTrue(names("sprint 59: unit U-H.", "U-H"))
+        self.assertTrue(names("sprint 59: unit U-H.1 ready", "U-H.1"))
+        self.assertTrue(names("sprint 59: unit U-H.2 ready", "U-H.2"))
+        self.assertFalse(names("sprint 59: unit U-H.1 ready", "U-H"))
+        self.assertFalse(names("sprint 59: unit U-H.2 ready", "U-H"))
+        self.assertFalse(names("sprint 59: unit U1f ready", "U1"))
 
     def test_missing_state_clock_is_independently_unreadable(self):
         unit = dict(self.unit)
@@ -326,12 +384,98 @@ class DatabaseContractTest(ReaderCase):
         self.assertEqual(datetime(2020, 1, 5, tzinfo=UTC), rowless.epoch)
         self.assertIsNone(rowless.branch_declared)
         self.assertEqual(
-            datetime(2020, 1, 3, tzinfo=UTC),
+            datetime(2020, 1, 6, tzinfo=UTC),
             rowless.last_durable_write_at,
         )
         self.assertEqual(
             datetime(2020, 1, 2, tzinfo=UTC),
             rowless.last_result_row_at,
+        )
+        self.assertEqual(
+            datetime(2020, 1, 4, tzinfo=UTC),
+            rowless.state_changed_at,
+        )
+
+    def test_rowless_shell_rejects_a_binding_superseded_for_that_sprint(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO sprint_planner_bindings VALUES "
+            "(2,59,2,'2020-01-07T00:00:00Z')"
+        )
+        con.commit()
+        con.close()
+
+        evidence = self.reader.read(
+            self.shell, None, datetime(2020, 1, 10, tzinfo=UTC)
+        )
+
+        self.assertIsNone(evidence.last_durable_write_at)
+        self.assertIsNone(evidence.last_result_row_at)
+        self.assertIsNone(evidence.state_changed_at)
+        self.assertTrue(
+            {"durable_write", "result_row", "state_changed_at"}
+            <= set(evidence.unreadable)
+        )
+
+    def test_rowless_shell_rejects_frozen_or_unitless_binding(self):
+        mutations = (
+            "UPDATE documents SET frozen=1",
+            "DELETE FROM sprint_units",
+            "DELETE FROM sprint_planner_bindings",
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(mutation=mutation):
+                db = self.root / f"binding-{index}.db"
+                make_db(db)
+                con = sqlite3.connect(db)
+                con.execute(mutation)
+                con.commit()
+                con.close()
+                reader = ar.ActivityReader(
+                    db_path=db,
+                    repo_root=self.root,
+                    proc=self.proc,
+                    adapters=self.adapters,
+                    home=self.home,
+                )
+
+                evidence = reader.read(
+                    self.shell, None, datetime(2020, 1, 10, tzinfo=UTC)
+                )
+
+                self.assertIsNone(evidence.last_durable_write_at)
+                self.assertIsNone(evidence.last_result_row_at)
+                self.assertIsNone(evidence.state_changed_at)
+                self.assertTrue(
+                    {"durable_write", "result_row", "state_changed_at"}
+                    <= set(evidence.unreadable)
+                )
+
+    def test_rowless_shell_does_not_collapse_two_live_sprints(self):
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO documents VALUES (60,0)")
+        con.execute(
+            "INSERT INTO sprint_units VALUES "
+            "(2,60,'U1','feat/other','working','2020-01-07T00:00:00Z',"
+            "'2020-01-07T00:00:00Z',1,2,3)"
+        )
+        con.execute(
+            "INSERT INTO sprint_planner_bindings VALUES "
+            "(2,60,1,'2020-01-07T00:00:00Z')"
+        )
+        con.commit()
+        con.close()
+
+        evidence = self.reader.read(
+            self.shell, None, datetime(2020, 1, 10, tzinfo=UTC)
+        )
+
+        self.assertIsNone(evidence.last_durable_write_at)
+        self.assertIsNone(evidence.last_result_row_at)
+        self.assertIsNone(evidence.state_changed_at)
+        self.assertTrue(
+            {"durable_write", "result_row", "state_changed_at"}
+            <= set(evidence.unreadable)
         )
 
     def test_each_unreadable_input_is_nullable_and_read_never_raises(self):
@@ -542,9 +686,19 @@ class GitEvidenceTest(ReaderCase):
         command(
             self.worktree,
             "git",
+            "push",
+            "origin",
+            "main:refs/heads/main",
+        )
+        stale_main = command(
+            self.worktree, "git", "rev-parse", "HEAD^"
+        ).stdout.strip()
+        command(
+            self.worktree,
+            "git",
             "update-ref",
             "refs/remotes/origin/main",
-            "HEAD",
+            stale_main,
         )
         command(self.worktree, "git", "checkout", "feat/test")
         command(self.worktree, "git", "rebase", "main")
@@ -575,6 +729,107 @@ class GitEvidenceTest(ReaderCase):
         self.assertEqual(
             datetime(2020, 1, 6, tzinfo=UTC),
             contributed.last_work_at,
+        )
+
+    def test_criss_cross_history_excludes_every_integration_commit(self):
+        base = command(self.worktree, "git", "rev-parse", "HEAD").stdout.strip()
+        command(self.worktree, "git", "checkout", "-b", "integration", base)
+        (self.worktree / "left.py").write_text("left\n")
+        command(self.worktree, "git", "add", "left.py")
+        command(
+            self.worktree,
+            "git",
+            "commit",
+            "-m",
+            "left",
+            env={
+                "GIT_AUTHOR_DATE": "2020-01-02T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2020-01-02T00:00:00+00:00",
+            },
+        )
+        left = command(self.worktree, "git", "rev-parse", "HEAD").stdout.strip()
+
+        command(self.worktree, "git", "checkout", "feat/test")
+        (self.worktree / "right.py").write_text("right\n")
+        command(self.worktree, "git", "add", "right.py")
+        command(
+            self.worktree,
+            "git",
+            "commit",
+            "-m",
+            "right",
+            env={
+                "GIT_AUTHOR_DATE": "2020-01-03T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2020-01-03T00:00:00+00:00",
+            },
+        )
+        right = command(self.worktree, "git", "rev-parse", "HEAD").stdout.strip()
+
+        merge_env = {
+            "GIT_AUTHOR_DATE": "2019-06-01T00:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2019-06-01T00:00:00+00:00",
+        }
+        command(self.worktree, "git", "checkout", "integration")
+        command(
+            self.worktree,
+            "git",
+            "merge",
+            "--no-ff",
+            "-m",
+            "merge right",
+            right,
+            env=merge_env,
+        )
+        command(
+            self.worktree,
+            "git",
+            "push",
+            "--force",
+            "origin",
+            "integration:refs/heads/main",
+        )
+
+        command(self.worktree, "git", "checkout", "feat/test")
+        command(
+            self.worktree,
+            "git",
+            "merge",
+            "--no-ff",
+            "-m",
+            "merge left",
+            left,
+            env=merge_env,
+        )
+        (self.worktree / "mine.py").write_text("mine\n")
+        command(self.worktree, "git", "add", "mine.py")
+        command(
+            self.worktree,
+            "git",
+            "commit",
+            "-m",
+            "own work",
+            env={
+                "GIT_AUTHOR_DATE": "2020-01-04T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2020-01-04T00:00:00+00:00",
+            },
+        )
+
+        merge_bases = command(
+            self.worktree,
+            "git",
+            "merge-base",
+            "--all",
+            "refs/remotes/origin/main",
+            "HEAD",
+        ).stdout.splitlines()
+        self.assertEqual(2, len(merge_bases))
+
+        evidence = self.read()
+
+        self.assertEqual(1, evidence.commits_since_epoch)
+        self.assertEqual(
+            datetime(2020, 1, 4, tzinfo=UTC),
+            evidence.last_work_at,
         )
 
     def test_conflicted_path_is_dirty_but_not_a_work_event(self):
