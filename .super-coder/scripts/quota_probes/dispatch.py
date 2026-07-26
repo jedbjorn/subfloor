@@ -9,6 +9,7 @@ it never has to reason about a partial result.
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 import time
 
 from . import PROVIDERS, account, now_iso
@@ -18,6 +19,14 @@ DEFAULT_TIMEOUT = 5.0
 # that wedges somewhere OTHER than the socket, so a hung provider still costs
 # the caller a bounded wait rather than the request.
 WALL_CLOCK_GRACE = 1.0
+_STATUS_LOCK = threading.Lock()
+_LATEST_STATUS: dict[str, tuple[str, str]] = {}
+
+
+def latest_statuses() -> dict[str, tuple[str, str]]:
+    """Return the latest process-local (status, captured_at) per provider."""
+    with _STATUS_LOCK:
+        return dict(_LATEST_STATUS)
 
 
 def _error(provider: str, detail: str) -> dict:
@@ -68,4 +77,17 @@ def probe_all(log, timeout: float = DEFAULT_TIMEOUT,
         # the caller on the exact probe this timeout exists to contain. The
         # abandoned thread ends on its own socket timeout.
         pool.shutdown(wait=False)
-    return [row for name in names for row in results.get(name, [])]
+    rows = [row for name in names for row in results.get(name, [])]
+    observed: dict[str, tuple[str, str]] = {}
+    for row in rows:
+        provider = row.get("provider")
+        status = row.get("status")
+        captured_at = row.get("captured_at")
+        if not provider or not status or not captured_at:
+            continue
+        prior = observed.get(provider)
+        if prior is None or captured_at >= prior[1]:
+            observed[provider] = (status, captured_at)
+    with _STATUS_LOCK:
+        _LATEST_STATUS.update(observed)
+    return rows
