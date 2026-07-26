@@ -419,7 +419,7 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             "WHERE signal='checkup'"
         ).fetchall()
         self.assertEqual(
-            [(self.unit["unit_id"], "dev", "checkup", 2)],
+            [(self.unit["unit_id"], "dev", "checkup", 4)],
             [tuple(row) for row in rows],
         )
 

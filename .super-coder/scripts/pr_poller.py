@@ -471,7 +471,14 @@ def _open_reconciliation_alert(
             opened_at,
         ),
     )
-    return cursor.lastrowid if cursor.rowcount == 1 else None
+    if cursor.rowcount == 1:
+        return cursor.lastrowid
+    con.execute(
+        "UPDATE planner_alerts SET shell_id=? "
+        "WHERE dedupe_key=? AND resolved_at IS NULL AND shell_id IS NOT ?",
+        (expectation.shell_id, dedupe_key, expectation.shell_id),
+    )
+    return None
 
 
 def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
