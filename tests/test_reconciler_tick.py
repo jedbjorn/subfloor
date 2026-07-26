@@ -339,7 +339,38 @@ class ExplanationTierTest(unittest.TestCase):
         )
         self.assertNotIn("status=ok", " | ".join(parts))
 
-    def test_persisted_exhaustion_and_ok_probe_both_render_with_their_ages(self):
+    def test_persisted_exhaustion_carries_resets_at(self):
+        add_quota_tables(self.con)
+        account_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('anthropic', 'acct-a')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used_percent, resets_at, captured_at) "
+            "VALUES (?, 'five_hour', 100, ?, ?)",
+            (
+                account_pk,
+                "2020-01-01T02:00:00Z",
+                "2020-01-01T00:55:00Z",
+            ),
+        )
+
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            "anthropic quota exhausted window=five_hour "
+            "resets_at=2020-01-01T02:00:00Z "
+            "as of 2020-01-01T00:55:00Z",
+            parts[0],
+        )
+
+    def test_persisted_exhaustion_and_ok_probe_both_render(self):
         add_quota_tables(self.con)
         account_pk = self.con.execute(
             "INSERT INTO harness_quota_account(provider, account_ref) "
@@ -365,18 +396,26 @@ class ExplanationTierTest(unittest.TestCase):
         ):
             parts = pr_poller._provider_explanation(self.con)
 
+        self.assertEqual(6, len(parts))
+        self.assertTrue(
+            parts[0].startswith(
+                "anthropic quota exhausted window=five_hour "
+            ),
+            parts[0],
+        )
+        self.assertTrue(
+            parts[0].endswith("as of 2020-01-01T00:55:00Z"),
+            parts[0],
+        )
         self.assertEqual(
             [
-                "anthropic quota exhausted window=five_hour "
-                "resets_at=2020-01-01T02:00:00Z "
-                "as of 2020-01-01T00:55:00Z",
                 "anthropic probe status=ok as of 2020-01-01T00:59:00Z",
                 "openai quota unavailable",
                 "openai probe status unavailable",
                 "moonshot quota unavailable",
                 "moonshot probe status unavailable",
             ],
-            parts,
+            parts[1:],
         )
 
     def test_unreadable_quota_value_degrades_to_unavailable(self):
