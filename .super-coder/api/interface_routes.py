@@ -394,12 +394,22 @@ def _idempotent(con, actor: _Actor, operation: str, headers, body_obj,
                     "Idempotency-Key header is required for Interface mutations")
     canonical = hashlib.sha256(
         json.dumps(body_obj, sort_keys=True, default=str).encode()).hexdigest()
+    # The schema has always carried a 24-hour expiry, but lookup used to ignore
+    # it and no sweep removed stale rows. Besides growing without bound, that
+    # kept credential-bearing responses replayable forever. Expiry is part of
+    # the contract: remove stale records before lookup so an old key no longer
+    # shadows a fresh mutation.
+    expired = con.execute(
+        "DELETE FROM interface_idempotency_keys "
+        "WHERE expires_at <= datetime('now')").rowcount
     row = con.execute(
         "SELECT request_hash, response_status, response_resource "
         "FROM interface_idempotency_keys "
         "WHERE actor_scope=? AND operation=? AND idem_key=?",
         (actor.scope, operation, key)).fetchone()
     if row is not None:
+        if expired:
+            con.commit()
         if row[0] != canonical:
             return _err(409, "idempotency_conflict",
                         "Idempotency-Key reused with a different request body")

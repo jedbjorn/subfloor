@@ -784,6 +784,33 @@ class InterfaceApiTest(unittest.TestCase):
                                  {"shell_id": 2})
         self.assertEqual(status, 422)
 
+    def test_expired_idempotency_record_is_purged_not_replayed(self):
+        status, _, first = self.create_session(key="expired-create")
+        self.assertEqual(status, 201)
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "UPDATE interface_idempotency_keys SET expires_at='2000-01-01' "
+            "WHERE actor_scope='operator' AND operation='create_session' "
+            "AND idem_key='expired-create'")
+        con.commit()
+        con.close()
+
+        # The old 201 must not replay after its guarantee window. Producing the
+        # request again reaches current state and sees the occupied shell.
+        status, _, second = self.create_session(key="expired-create")
+        self.assertEqual(status, 409)
+        self.assertEqual(second["error"]["code"], "shell_occupied")
+
+        con = sqlite3.connect(self.db_path)
+        row = con.execute(
+            "SELECT response_status, expires_at > datetime('now') "
+            "FROM interface_idempotency_keys "
+            "WHERE actor_scope='operator' AND operation='create_session' "
+            "AND idem_key='expired-create'").fetchone()
+        con.close()
+        self.assertEqual(row, (409, 1),
+                         "expired row was not replaced by the fresh outcome")
+
     # -- New chat refusal ---------------------------------------------------------------
 
     def unmanaged(self, orphaned, shortname="s1"):
