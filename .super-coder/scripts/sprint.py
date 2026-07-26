@@ -6,9 +6,30 @@ sprint 25 seq 8 task #84; wake ops seq 10 task #86).
     ./sc sprint action complete  <receipt_id> [--detail "…"]
     ./sc sprint action unknown   <receipt_id> [--detail "…"]
     ./sc sprint action reconcile <receipt_id> [--detail "…"]
+    ./sc sprint unit add   --sprint <doc-id> --seq U1 --title "…" [roles/fields]
+    ./sc sprint unit set   --sprint <doc-id> --seq U1 [roles/fields]
+    ./sc sprint unit state --sprint <doc-id> --seq U1 <state>
+    ./sc sprint unit list  [--sprint <doc-id>]
+    ./sc sprint board      --sprint <doc-id>
     ./sc sprint status  [--sprint <doc-id>] [--all]
     ./sc sprint alerts  [--all]
     ./sc sprint retry   --binding <id> [--outcome delivered|not_delivered]
+
+The BOARD is a record, not a markdown table a planner edits by hand (spec
+doc 58). The planner is its only writer — devs and reviewers work and
+message, and the planner moves the board as their messages arrive; a worker
+that could mark its own unit done would make the board agree with reality by
+construction and leave the reconciler nothing to compare. Workers read it
+freely (`unit list` / `board`); their writes are refused per sprint.
+
+`unit state` is a separate verb from `unit set` on purpose: state is the only
+column role expectation derives from, so it moves in its own call and
+`state_changed_at` has exactly one writer. The API refuses a state move that
+carries other edits — the separation is a property, not a convention.
+
+`board` RENDERS the unit table from the record and prints it. It does not
+write it back into the document: the document keeps its prose, the record is
+the source, and a stored copy would state the board twice.
 
 Before a planner performs an engine-owned or external side effect for a
 message it records action INTENT (begin) under a key derived from
@@ -102,6 +123,141 @@ def _cmd_update(args, state: str) -> int:
              {"state": state, "result_detail": args.detail},
              f"action-update|{args.receipt_id}|{state}")
     print(f"sc sprint: receipt #{r['receipt_id']} → {r['state']}")
+    return 0
+
+
+# ── the board as a record (spec doc 58 U1): unit add/set/state/list, board ──
+
+_STATES = ("pending", "working", "in_review", "blocked", "merged",
+           "cancelled")
+
+
+def _role(value: "str | None"):
+    """A --dev/--reviewer argument: a shortname, or the literal 'none' to
+    clear the slot. Absent (None) leaves the slot untouched — the API
+    distinguishes an omitted field from an explicit null, so clearing a role
+    must be said out loud."""
+    return None if value is not None and value.lower() == "none" else value
+
+
+def _field(value: "str | None"):
+    return None if value is not None and value.lower() == "none" else value
+
+
+def _unit_body(args, *, creating: bool) -> dict:
+    body = {"sprint_doc_id": args.sprint, "seq": args.seq}
+    if creating or args.title is not None:
+        body["unit_title"] = args.title
+    for name in ("dev", "reviewer"):
+        if getattr(args, name) is not None:
+            body[name] = _role(getattr(args, name))
+    if args.depends_on is not None:
+        body["depends_on"] = _field(args.depends_on)
+    if args.overlap is not None:
+        body["overlap"] = _field(args.overlap)
+    if args.branch is not None:
+        body["branch"] = _field(args.branch)
+    if args.pr is not None:
+        body["pr_number"] = None if args.pr < 0 else args.pr
+    return body
+
+
+def _depends_cell(u: dict) -> str:
+    """The board's "depends on" cell — the machine-readable dependency and the
+    human-readable merge-surface annotation share it, exactly as the markdown
+    board writes it today ("— · owns migration 0098; schema.sql"). Two columns,
+    one cell: the annotation is how a dev knows whether its head can stand or
+    must rebase, so dropping it from the render would lose what the record was
+    widened to keep."""
+    dep = u.get("depends_on") or "—"
+    return f"{dep} · {u['overlap']}" if u.get("overlap") else dep
+
+
+def _print_unit(u: dict) -> None:
+    roles = (f"dev={u.get('dev_shortname') or '—'} "
+             f"rev={u.get('reviewer_shortname') or '—'}")
+    extra = " ".join(
+        p for p in (
+            f"depends={_depends_cell(u)}"
+            if (u.get("depends_on") or u.get("overlap")) else "",
+            f"branch={u['branch']}" if u.get("branch") else "",
+            f"pr=#{u['pr_number']}" if u.get("pr_number") else "")
+        if p)
+    print(f"{u['seq']:<5} [{u['state']}] {u['unit_title']} · {roles}"
+          + (f" · {extra}" if extra else ""))
+
+
+def cmd_unit_add(args) -> int:
+    body = _unit_body(args, creating=True)
+    if args.state:
+        body["state"] = args.state
+    r = _api("POST", "/api/sprint-units", body,
+             f"unit-add|{args.sprint}|{args.seq}")
+    print(f"sc sprint: unit {r['seq']} declared on sprint "
+          f"{r['sprint_doc_id']}")
+    _print_unit(r)
+    return 0
+
+
+def cmd_unit_set(args) -> int:
+    body = _unit_body(args, creating=False)
+    if len(body) == 2:
+        raise _die("nothing to set — pass at least one of --title, --dev, "
+                   "--reviewer, --depends-on, --branch, --pr "
+                   "(state moves with `unit state`)")
+    r = _api("PATCH", "/api/sprint-units", body,
+             f"unit-set|{args.sprint}|{args.seq}|{uuid.uuid4()}")
+    _print_unit(r)
+    return 0
+
+
+def cmd_unit_state(args) -> int:
+    r = _api("PATCH", "/api/sprint-units",
+             {"sprint_doc_id": args.sprint, "seq": args.seq,
+              "state": args.state},
+             f"unit-state|{args.sprint}|{args.seq}|{args.state}|"
+             f"{uuid.uuid4()}")
+    _print_unit(r)
+    return 0
+
+
+def _units(sprint: "int | None") -> list:
+    path = "/api/sprint-units"
+    if sprint is not None:
+        path += f"?sprint_doc_id={sprint}"
+    return _api("GET", path).get("units", [])
+
+
+def cmd_unit_list(args) -> int:
+    units = _units(args.sprint)
+    if not units:
+        print("sc sprint: no units on the board"
+              + (f" for sprint {args.sprint}" if args.sprint else ""))
+        return 0
+    for u in units:
+        _print_unit(u)
+    return 0
+
+
+def cmd_board(args) -> int:
+    """Render the board from the record. A VIEW — printed, never stored back
+    into the document body."""
+    units = _units(args.sprint)
+    if not units:
+        print(f"sc sprint: sprint {args.sprint} has no units on record")
+        return 0
+    print("| seq | unit | dev | reviewer | depends on | branch | pr | state |")
+    print("|---|---|---|---|---|---|---|---|")
+    for u in units:
+        print("| {seq} | {title} | {dev} | {rev} | {dep} | {branch} | {pr} "
+              "| {state} |".format(
+                  seq=u["seq"], title=u["unit_title"],
+                  dev=u.get("dev_shortname") or "—",
+                  rev=u.get("reviewer_shortname") or "—",
+                  dep=_depends_cell(u),
+                  branch=u.get("branch") or "—",
+                  pr=f"#{u['pr_number']}" if u.get("pr_number") else "—",
+                  state=u["state"]))
     return 0
 
 
@@ -218,6 +374,57 @@ def main(argv: "list[str] | None" = None) -> int:
         sp.add_argument("receipt_id", type=int)
         sp.add_argument("--detail", default=None)
         sp.set_defaults(_state=state)
+    un = sub.add_parser("unit", help="the sprint board record — declare, "
+                                     "reassign, and move units (planner "
+                                     "writes; anyone reads)")
+    usub = un.add_subparsers(dest="unit_cmd", required=True)
+
+    def _roles_and_fields(sp, *, creating: bool):
+        sp.add_argument("--sprint", type=int, required=True,
+                        help="the sprint document id")
+        sp.add_argument("--seq", required=True,
+                        help="the unit, as the board names it (e.g. U1)")
+        sp.add_argument("--title", required=creating, default=None,
+                        help="the unit's one-line name")
+        for role, who in (("dev", "builds"), ("reviewer", "reviews")):
+            sp.add_argument(f"--{role}", default=None,
+                            help=f"shortname of the shell that {who} this "
+                                 "unit ('none' to clear the slot)")
+        sp.add_argument("--depends-on", dest="depends_on", default=None,
+                        help="units this one waits on, e.g. U1,U3 "
+                             "('none' to clear)")
+        sp.add_argument("--overlap", default=None,
+                        help="the merge-surface annotation sharing the "
+                             "'depends on' cell, e.g. 'shares schema.sql with "
+                             "U5 — MUST rebase onto merged U2' "
+                             "('none' to clear)")
+        sp.add_argument("--branch", default=None, help="('none' to clear)")
+        sp.add_argument("--pr", type=int, default=None,
+                        help="PR number (-1 to clear)")
+
+    ua = usub.add_parser("add", help="declare a unit on the board (never an "
+                                     "upsert — an existing seq is a 409)")
+    _roles_and_fields(ua, creating=True)
+    ua.add_argument("--state", choices=_STATES, default=None,
+                    help="initial state (default pending)")
+    us = usub.add_parser("set", help="edit a unit's roles/fields — NOT its "
+                                     "state (see `unit state`)")
+    _roles_and_fields(us, creating=False)
+    ust = usub.add_parser("state", help="move one unit's state; takes no "
+                                        "other edits, so state_changed_at "
+                                        "has exactly one writer")
+    ust.add_argument("--sprint", type=int, required=True)
+    ust.add_argument("--seq", required=True)
+    ust.add_argument("state", choices=_STATES)
+    ul = usub.add_parser("list", help="the board's units, one line each "
+                                      "(read-only)")
+    ul.add_argument("--sprint", type=int, default=None)
+
+    bd = sub.add_parser("board", help="render the unit table from the record "
+                                      "(a VIEW — never written back into the "
+                                      "document)")
+    bd.add_argument("--sprint", type=int, required=True)
+
     st = sub.add_parser("status", help="wake status: binding, batch, park, "
                                        "last outcome (read-only)")
     st.add_argument("--sprint", type=int, default=None,
@@ -240,6 +447,12 @@ def main(argv: "list[str] | None" = None) -> int:
         if args.action_cmd == "begin":
             return cmd_begin(args)
         return _cmd_update(args, args._state)
+    if args.cmd == "unit":
+        return {"add": cmd_unit_add, "set": cmd_unit_set,
+                "state": cmd_unit_state, "list": cmd_unit_list}[
+                    args.unit_cmd](args)
+    if args.cmd == "board":
+        return cmd_board(args)
     if args.cmd == "status":
         return cmd_status(args)
     if args.cmd == "alerts":

@@ -545,6 +545,39 @@ CREATE TABLE planner_alerts (
     resolved_at TEXT
 );
 
+-- ── The sprint board, as a record (spec doc 58; migrations/0098_sprint_units) ─
+-- The planner's declared belief about who should be doing what. It was a
+-- markdown table inside a documents body, which carried no reviewer at all
+-- (spec_tasks has one shell_id) — so a dead REVIEWER was invisible to any
+-- comparator. The document keeps its prose; this table is the source and the
+-- table `sc sprint board` prints is a view of it, never a copy stored back.
+--
+-- THE PLANNER IS THE ONLY WRITER (API-enforced: the sprint's binding
+-- planner_shell_id, else the doc author). A worker marking its own unit done
+-- would make the board agree with reality by construction and destroy the
+-- comparison the reconciler is. CURRENT STATE ONLY — no change log, FnB ruling.
+
+CREATE TABLE sprint_units (
+    unit_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sprint_doc_id     INTEGER NOT NULL REFERENCES documents(document_id),
+    seq               TEXT    NOT NULL,   -- "U1" verbatim, as every message names it
+    unit_title        TEXT    NOT NULL,
+    dev_shell_id      INTEGER REFERENCES shells(shell_id),
+    reviewer_shell_id INTEGER REFERENCES shells(shell_id),
+    state             TEXT    NOT NULL DEFAULT 'pending'
+                      CHECK (state IN ('pending','working','in_review',
+                                       'blocked','merged','cancelled')),
+    depends_on        TEXT,               -- "U1,U3" as the board writes it
+    overlap           TEXT,               -- the merge-surface annotation sharing that cell ("shares X with U8 — MUST rebase"); load-bearing prose, rendered beside depends_on
+    branch            TEXT,
+    pr_number         INTEGER,
+    assigned_at       TEXT,
+    state_changed_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_by_shell_id INTEGER REFERENCES shells(shell_id),
+    UNIQUE (sprint_doc_id, seq)
+);
+
 -- Transition validators — the DB backstop (app pre-checks for friendly
 -- errors via scripts/interface_state.py; keep the edge sets in sync).
 
@@ -776,3 +809,8 @@ CREATE INDEX idx_ppo_watch
     ON pr_poll_observations(watch_id, observed_at);
 CREATE UNIQUE INDEX idx_planner_alerts_open
     ON planner_alerts(dedupe_key) WHERE resolved_at IS NULL;
+
+-- The board record (0098) — the reconciler's per-tick read is "the
+-- non-terminal units of an ACTIVE sprint".
+CREATE INDEX idx_sprint_units_live
+    ON sprint_units(sprint_doc_id, state);

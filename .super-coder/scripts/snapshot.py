@@ -95,6 +95,14 @@ PER_INSTANCE_TABLES = [
     "planner_action_receipts",
     "pr_poll_observations",
     "planner_alerts",
+    # sprint_units (0098) is the planner's AUTHORED board — the declared belief
+    # about who should be doing what — not a derived cache: nothing re-derives
+    # it, so a mid-sprint rebuild without it drops the whole sprint's state and
+    # leaves the reconciler with nothing to compare against. Same class as
+    # watched_prs/flags, and unlike the quota tables (0096) which a probe
+    # rebuilds. Loads after `shells` and `documents`, both its FK targets. No
+    # row filter: every unit row is durable planner content, terminal or not.
+    "sprint_units",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/map_content.sql by snapshot_map() below, not here.
