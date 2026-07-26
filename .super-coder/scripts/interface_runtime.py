@@ -72,7 +72,7 @@ def _log(tag: str, msg: str) -> None:
 
 
 class InterfaceUnavailable(RuntimeError):
-    """tmux/node stack missing or too old — review UI keeps working."""
+    """tmux/node/sidecar stack missing or too old — review UI keeps working."""
 
 
 class SpawnAborted(RuntimeError):
@@ -464,11 +464,15 @@ class InterfaceRuntime:
     # -- availability -----------------------------------------------------------
 
     def _check_available(self) -> str | None:
-        """None if the tmux/node stack is usable, else the reason string."""
+        """None if the tmux/node/sidecar stack is usable, else its reason."""
         if shutil.which("tmux") is None:
             return "tmux not found on PATH"
         if shutil.which("node") is None:
             return "node not found on PATH (shadow sidecar)"
+        sidecar = Path(self.shadow._script)
+        if not sidecar.is_file():
+            return (f"shadow sidecar file missing: {sidecar} — "
+                    "engine materialize is incomplete")
         version = _tmux_version()
         if version is None:
             return "could not parse `tmux -V`"
