@@ -88,6 +88,172 @@ PROJECT_VS_ENGINE_SOURCE = (
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 
+# ── The sprint directive (spec doc 58, unit U9) ──────────────────────────────
+# A shell holding sprint work is told so BY THE BOOT RENDER, resolved from the
+# record. The directive used to live in a task row the planner hand-wrote; an
+# audit found it in every kickoff row (written from a template) and absent from
+# all six improvised afterwards. A worker booted without it behaved exactly as a
+# shell should in a normal interactive session — it finished a full review pass,
+# filed its flags, then ended its turn on a question. Nothing reads a headless
+# run's stdout, so the planner read the silence as death and re-booted it over
+# eleven minutes of completed work.
+#
+# So the remedy is not a better sentence. The boot doc is the one artifact the
+# harness is guaranteed to read, and this section is a function of `sprint_units`
+# and the planner binding: a task row cannot grant it, and a missing task row
+# cannot withhold it. The planner is removed from the path.
+TERMINAL_UNIT_STATES = ("merged", "cancelled")
+
+# Stated inline rather than referenced, because the failure mode is precisely a
+# skill body that never loads. This renders as prose in a document every harness
+# reads, so it survives a harness with no skill mechanism at all.
+PARTICIPANT_RULES = (
+    "**There may be no one to ask.** A shell booted by `./sc run` gets ONE turn "
+    "and no observer — the planner sees message rows and durable artifacts "
+    "(flags, docs, PRs, commits), never the text you print at the end of a turn. "
+    "Three rules follow, and they are not optional:\n"
+    "\n"
+    "1. **Filing is your own authority.** Findings, flags, verdicts, unit "
+    "reports, PRs — file them. Never ask permission to REPORT something.\n"
+    "2. **A ruling request goes out as a MESSAGE ROW, then the turn ends** — "
+    "`sc mem message send <planner> \"…\" --kind result`. Durable, addressed, "
+    "and it wakes the planner. A question living only in your final stdout "
+    "reaches nobody and is indistinguishable from death.\n"
+    "3. **A turn ending with work unfinished sends a PARTIAL.** \"Items 1-2 "
+    "done, here is what I found, item 3 untouched\" beats silence — silence is "
+    "read as death, and has been."
+)
+
+
+def _sprint_doc_live(body: "str | None") -> bool:
+    """A sprint is live while its doc body carries `status: ACTIVE`. Callers
+    pair this with `documents.frozen = 0` in SQL — the same predicate the
+    reconciler's trigger uses, so the two cannot disagree about whether a
+    sprint is live.
+
+    Restated here rather than imported on purpose: this module is the boot
+    render and holds no engine imports by contract (a bare `sqlite3` read,
+    nothing out of `scripts/` or `api/`), and `run.py` puts `render/` on the
+    path before `scripts/`. The siblings are `interface_broker._sprint_active`,
+    `server._sprint_doc_status` and `run._sprint_doc_is_active` — this is the
+    fourth. Move the predicate and you must move all four; grep `status:`.
+    """
+    for line in (body or "").splitlines():
+        if line.startswith("status:"):
+            return line.split(":", 1)[1].strip() == "ACTIVE"
+    return False
+
+
+def resolve_sprint_roles(con, shell_id: int) -> list:
+    """Every sprint role `shell_id` holds right now, read fresh from the record
+    — never cached, so a role changed since the last boot resolves correctly.
+
+    Returns a list of `{doc_id, doc_title, role, units}`, planner first, then
+    dev, then reviewer; empty means no section renders. A shell with roles in
+    two sprints gets an entry per (sprint, role) — every one is named, because
+    silently choosing one is the failure this unit removes.
+
+    THE PLANNER IS RESOLVED FROM THE LATEST BINDING, ARMED OR RELEASED. The
+    spec said "the armed binding", and that predicate is anti-correlated with
+    the need: `_arm_binding` refuses unless the planner already has an
+    `occupied` Interface session, so the session being booted cannot have a
+    binding yet, and the previous one is generation-bound and released when
+    that generation ends (`interface_recovery`). Under the armed reading the
+    directive renders only when recovery lags — a race, not a record. The
+    latest binding names who the sprint's planner IS; the doc predicate below
+    is what retires it, since closing a sprint both releases its bindings and
+    flips the body to CLOSED. Same definition as
+    `interface_routes._board_writer` minus the armed filter, so the two cannot
+    disagree about whose sprint it is. (Reported to the planner as an ambiguity
+    call before build; PLN1 message #2257.)
+
+    Degrades to `[]` on OperationalError rather than failing a boot: this runs
+    against the LIVE db at every launch, and a floor that has not applied
+    migration 0098 has no `sprint_units` table at all — which is the state of
+    this repo's own running floor as U9 is written. A boot doc that cannot
+    render is worse than one missing a section.
+    """
+    entries = []
+    try:
+        planner_docs = con.execute(
+            "SELECT b.sprint_doc_id, d.title, d.body FROM sprint_planner_bindings b "
+            "JOIN documents d ON d.document_id = b.sprint_doc_id "
+            "WHERE b.binding_id = (SELECT MAX(b2.binding_id) "
+            "                      FROM sprint_planner_bindings b2 "
+            "                      WHERE b2.sprint_doc_id = b.sprint_doc_id) "
+            "  AND b.planner_shell_id = ? AND d.frozen = 0 "
+            "ORDER BY b.sprint_doc_id",
+            (shell_id,)).fetchall()
+    except sqlite3.OperationalError:
+        planner_docs = []
+    for doc_id, title, body in planner_docs:
+        if _sprint_doc_live(body):
+            entries.append({"doc_id": doc_id, "doc_title": title,
+                            "role": "planner", "units": []})
+
+    placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
+    try:
+        rows = con.execute(
+            "SELECT u.sprint_doc_id, d.title, d.body, u.seq, u.unit_title, "
+            "       u.dev_shell_id, u.reviewer_shell_id "
+            "FROM sprint_units u "
+            "JOIN documents d ON d.document_id = u.sprint_doc_id "
+            "WHERE (u.dev_shell_id = ? OR u.reviewer_shell_id = ?) "
+            f"  AND u.state NOT IN ({placeholders}) AND d.frozen = 0 "
+            "ORDER BY u.sprint_doc_id, u.unit_id",
+            (shell_id, shell_id, *TERMINAL_UNIT_STATES)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    # (doc, role) -> entry, so a shell holding four review units in one sprint
+    # gets one line naming all four rather than four sections.
+    by_role = {}
+    for doc_id, title, body, seq, unit_title, dev_id, reviewer_id in rows:
+        if not _sprint_doc_live(body):
+            continue
+        for role, holder in (("dev", dev_id), ("reviewer", reviewer_id)):
+            if holder != shell_id:
+                continue
+            entry = by_role.get((doc_id, role))
+            if entry is None:
+                entry = {"doc_id": doc_id, "doc_title": title, "role": role,
+                         "units": []}
+                by_role[(doc_id, role)] = entry
+                entries.append(entry)
+            entry["units"].append((seq, unit_title))
+    return entries
+
+
+def render_sprint_directive(con, shell_id: int) -> str:
+    """The `## SPRINT DIRECTIVE` body, or "" when this shell holds no sprint
+    role — no ceremony for a shell with no sprint work."""
+    entries = resolve_sprint_roles(con, shell_id)
+    if not entries:
+        return ""
+    lines = [
+        "You hold sprint work. This section is resolved from the RECORD at "
+        "every boot — the board's `sprint_units` rows and the planner binding "
+        "— never from a message. A task row cannot grant it and a missing task "
+        "row cannot withhold it.",
+        "",
+    ]
+    for e in entries:
+        sprint = f"**Sprint doc {e['doc_id']}**"
+        if e["doc_title"]:
+            sprint += f" — {e['doc_title']}"
+        if e["role"] == "planner":
+            lines.append(f"- {sprint}: you are the **PLANNER**. Invoke the "
+                         "`sprint_orchestration` skill.")
+            continue
+        units = ", ".join(f"`{seq}` ({title})" for seq, title in e["units"])
+        slot = "dev" if e["role"] == "dev" else "reviewer"
+        lines.append(f"- {sprint}: you are the **{slot.upper()}** for {units}. "
+                     f"Invoke the `sprint` skill, {slot} slot.")
+    if len(entries) > 1:
+        lines.append("")
+        lines.append("**Every role you hold is listed above — do not pick one.**")
+    return "\n".join(lines + ["", PARTICIPANT_RULES])
+
 
 def open_map_ro() -> "sqlite3.Connection | None":
     """Read-only handle to the map DB, or None if the repo isn't mapped yet
@@ -378,12 +544,21 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     if floor_note:
         active_session.append(f"- floor: {floor_note}")
 
+    # Directly after ACTIVE SESSION and ahead of everything else the render
+    # appends: it is this session's standing orders, and the whole unit exists
+    # because a worker missed the context it was operating in. Empty for a
+    # shell with no sprint role — the section is mandatory, never unconditional.
+    sprint_directive = render_sprint_directive(con, shell_id)
+    sprint_block = (["## SPRINT DIRECTIVE — MANDATORY", "", sprint_directive,
+                     "", "---", ""] if sprint_directive else [])
+
     parts = [
         template,
         "",
         "## ACTIVE SESSION", "",
         *active_session,
         "", "---", "",
+        *sprint_block,
         *first_run,
         "## OPERATOR", "", render_operator(user),
         "", "---", "",
