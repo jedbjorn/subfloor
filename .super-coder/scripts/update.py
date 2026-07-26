@@ -411,8 +411,10 @@ def _assert_materialized_engine_paths(
     sys.exit(
         "update: materialized engine is incomplete; missing declared path(s): "
         f"{', '.join(missing)}\n"
-        "  remedy: rerun `./sc update --force`; if the paths remain missing, "
-        "report the target engine ref"
+        "  engine.ref was not advanced; the recorded engine pin remains "
+        "unchanged.\n"
+        "  no automated recovery is available; report the target engine ref "
+        "upstream"
     )
 
 

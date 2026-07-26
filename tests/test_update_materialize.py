@@ -409,8 +409,10 @@ class EnginePathsAtRefTest(unittest.TestCase):
             str(failed.exception),
             "update: materialized engine is incomplete; missing declared "
             "path(s): .super-coder/new-path\n"
-            "  remedy: rerun `./sc update --force`; if the paths remain "
-            "missing, report the target engine ref",
+            "  engine.ref was not advanced; the recorded engine pin remains "
+            "unchanged.\n"
+            "  no automated recovery is available; report the target engine "
+            "ref upstream",
         )
         self.assertFalse(
             (state / "engine.ref").exists(),
