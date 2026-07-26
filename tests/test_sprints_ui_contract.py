@@ -301,7 +301,7 @@ out({
 def test_visibility_return_refreshes_and_route_exit_cleans_both_timers():
     result = run_js(
         """
-apiQueue = [DATA, DATA];
+apiQueue = [DATA, DATA, DATA];
 let now = Date.parse("2026-07-26T20:00:00Z");
 Date.now = () => now;
 await sprintsRefresh({ render: false });
