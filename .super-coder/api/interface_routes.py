@@ -2321,10 +2321,24 @@ def _board_writer(con, sprint_doc_id: int) -> "int | None":
     `documents` carries no author column at all (schema.sql:204), so there is
     nothing to fall back TO. An unbound sprint therefore falls back to flavor
     instead — see _may_write_board.
+
+    RELEASED BINDINGS STILL NAME THE WRITER. Filtering on `released_at IS
+    NULL` made the fallback mean "before a binding is armed" OR "after the
+    planner's session ended" (interface_recovery release_binding
+    'shell_recovery') OR "after the sprint was closed or frozen"
+    (_close_sprint_wake) — three engine paths that release with no operator
+    action at all. In that window the fence widened from ONE shell to a CLASS
+    of shells, and a foreign planner could move a unit of a sprint it has no
+    relationship to into `merged` — the terminal state that makes the
+    reconciler stop watching it. The spec's rule names one shell in both of
+    its branches, so this one does too: the most recent planner ever bound to
+    this sprint. Flavor now stands in only for a sprint that never had a
+    binding. The cost is deliberate — a NEW planner taking a sprint over must
+    arm its binding before it can write.
     """
     row = con.execute(
         "SELECT planner_shell_id FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? AND released_at IS NULL "
+        "WHERE sprint_doc_id=? "
         "ORDER BY binding_id DESC LIMIT 1", (sprint_doc_id,)).fetchone()
     return row[0] if row is not None else None
 
@@ -2467,9 +2481,15 @@ def _shortname(con, shell_id) -> str:
 
 def _emit_assignment_notice(con, actor, doc_id: int, seq: str,
                             before: dict, after: dict) -> int:
-    """The remainder of retired feature #29 (spec doc 58, decision #74): at
-    most three rows per assignment change, only on change, only while the
-    sprint is ACTIVE. Returns the number of rows written.
+    """The remainder of retired feature #29 (spec doc 58, decision #74): one
+    row per shell whose relationship to the unit changed, only on change, only
+    while the sprint is ACTIVE. Returns the number of rows written.
+
+    THE INVARIANT IS "AT MOST ONE ROW PER SHELL PER WRITE", not a row count.
+    The spec's "at most three" was a proxy for it and is wrong at the edge: a
+    PATCH that moves BOTH roles at once tells four shells — two vacated, two
+    arriving — and each of them exactly once. Stating the ceiling instead of
+    the invariant is what put a false number in three places at once.
 
     Called from inside the board write's own transaction, before its commit,
     so a board write that rolls back tells nobody it happened — and the
@@ -2540,7 +2560,15 @@ def _sprint_units(actor, query: dict):
     if doc_id is not None:
         sql += " WHERE sprint_doc_id=?"
         params.append(doc_id)
-    sql += " ORDER BY sprint_doc_id, seq"
+    # LENGTH BEFORE VALUE, because `seq` is TEXT and a plain sort is
+    # lexicographic: U1, U2, U3, U10, U11 reads back as U1, U10, U11, U2, U3.
+    # The board is a WORK ORDER — a planner reads it top to bottom and a
+    # reader that scrambles at U10 misreports what runs next. Sorting by
+    # length first makes same-prefix numbering natural (every U0-U9 before
+    # every U10-U99) without inventing a numeric column the planner would
+    # then have to keep in sync. Seqs of unlike shape (U-H beside U9) still
+    # order by length then value — deterministic, and no worse than today.
+    sql += " ORDER BY sprint_doc_id, LENGTH(seq), seq"
     con = _db()
     try:
         units = [_unit_projection(con, r[0])
@@ -2582,10 +2610,32 @@ def _add_sprint_unit(actor, headers, body):
             return refusal
 
         def produce():
-            if con.execute("SELECT 1 FROM documents WHERE document_id=?",
-                           (doc_id,)).fetchone() is None:
+            # "A sprint document" already has a definition in this engine —
+            # pr_poller's `kind='doc' AND frozen=0 AND title LIKE 'SPRINT:%'`
+            # — and the same clause is used here rather than a second one that
+            # can drift from it. MINUS `frozen=0`, deliberately: whether a
+            # frozen board stays mutable is a separate parked question, and
+            # folding it in here would decide it as a side effect of a typo
+            # guard.
+            #
+            # The typo this catches is adjacent-integer, not exotic: a sprint
+            # doc and its spec are consecutive ids (59 and 58 for this very
+            # sprint). A board minted on the spec is invisible to every
+            # participant — they read the sprint doc — while the rows exist
+            # and the reconciler watches them.
+            doc = con.execute(
+                "SELECT title, kind='doc' AND title LIKE 'SPRINT:%' "
+                "FROM documents WHERE document_id=?", (doc_id,)).fetchone()
+            if doc is None:
                 return 404, _err_obj("no_such_sprint",
                                      f"no document {doc_id} to hold a board")
+            if not doc[1]:
+                return 422, _err_obj(
+                    "not_a_sprint_doc",
+                    f"document {doc_id} is {doc[0]!r}, not a sprint board — "
+                    "a board declared here is invisible to every participant "
+                    "(they read the sprint doc) while its units are watched "
+                    "all the same; check the --sprint id")
             try:
                 roles = {col: _resolve_shell(con, body.get(role))
                          for role, col in _UNIT_ROLES.items()}

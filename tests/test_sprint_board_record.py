@@ -34,9 +34,12 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+import urllib.error
+import uuid
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlparse
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -45,6 +48,7 @@ MIGRATION = MIGRATIONS / "0098_sprint_units.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
+import interface_broker  # noqa: E402
 import interface_routes as routes  # noqa: E402
 import interface_wake  # noqa: E402
 import migrate  # noqa: E402
@@ -110,6 +114,34 @@ def seed_fixtures(con) -> None:
 
 def hdrs(*lines) -> str:
     return "\r\n".join(("Host: 127.0.0.1:8800", *lines))
+
+
+def _unit_args(**over):
+    """A parsed argv for the `unit` verbs — every flag the parser defines,
+    defaulted the way argparse leaves an absent one, since the CLI reads the
+    difference between "absent" and "explicitly cleared"."""
+    args = dict(sprint=1, seq="U1", title="board record", dev=None,
+                reviewer=None, depends_on=None, overlap=None, branch=None,
+                pr=None, state=None)
+    args.update(over)
+    return mock.Mock(**args)
+
+
+class _FakeResponse:
+    """What `urlopen` hands `_api` on success: a context manager whose read()
+    returns the body."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class _NoCoordinator:
@@ -196,11 +228,12 @@ class _BoardCase(unittest.TestCase):
         finally:
             con.close()
 
-    def arm_binding(self, planner_shell_id=9):
+    def arm_binding(self, planner_shell_id=9, sprint_doc_id=1) -> int:
         """A live binding for that planner. `session_id` is NOT NULL, so the
         binding needs a generation + session behind it — written directly
         rather than through the arm route, which additionally demands a
-        hook-capable harness this test has no opinion about."""
+        hook-capable harness this test has no opinion about. Returns the
+        binding_id, which is what `release_binding` is addressed by."""
         con = sqlite3.connect(self.db_path)
         try:
             con.execute(
@@ -211,14 +244,59 @@ class _BoardCase(unittest.TestCase):
                 "occupancy, lifecycle, harness, cli_version) "
                 "VALUES (?,1,'occupied','idle','kimi','kimi-code 0.27.0')",
                 (planner_shell_id,)).lastrowid
-            con.execute(
+            binding_id = con.execute(
                 "INSERT INTO sprint_planner_bindings (sprint_doc_id, "
                 "planner_shell_id, session_id, shell_id, generation) "
-                "VALUES (1,?,?,?,1)",
-                (planner_shell_id, sid, planner_shell_id))
+                "VALUES (?,?,?,?,1)",
+                (sprint_doc_id, planner_shell_id, sid,
+                 planner_shell_id)).lastrowid
+            con.commit()
+            return binding_id
+        finally:
+            con.close()
+
+    def release(self, binding_id, reason="shell_recovery") -> None:
+        """Release through the ENGINE's own path, not a hand-written UPDATE.
+        The three callers that release with no operator action at all
+        (shell_recovery, update_discard, sprint close/freeze) all land here,
+        so a test that wrote `released_at` itself would be asserting against
+        its own idea of what release means."""
+        con = sqlite3.connect(self.db_path)
+        try:
+            interface_broker.release_binding(con, binding_id, reason)
             con.commit()
         finally:
             con.close()
+
+    @contextmanager
+    def cli(self, token="plntok"):
+        """Drive the SHIPPED cli verbs against the real in-process routes.
+
+        The route tests call `handle` directly and mint a fresh
+        Idempotency-Key per call, so nothing in them can see the CLI's own key
+        strategy — which is exactly where flag 221 lived. So this patches
+        `urlopen` UNDERNEATH `_api` rather than replacing `_api` with a spy:
+        the token, the headers and the key that reach the route are the ones
+        the shipped code assembles, and the CLI's own error handling runs.
+        Yields the list collecting each request's Idempotency-Key."""
+        keys = []
+
+        def fake_urlopen(req, timeout=None):
+            keys.append(req.headers.get("Idempotency-key"))
+            u = urlparse(req.full_url)
+            status, _h, resp = routes.handle(
+                req.get_method(), u.path + (f"?{u.query}" if u.query else ""),
+                hdrs(*(f"{k}: {v}" for k, v in req.headers.items())),
+                req.data or b"")
+            if status >= 400:
+                raise urllib.error.HTTPError(
+                    req.full_url, status, "error", {}, io.BytesIO(resp))
+            return _FakeResponse(resp)
+
+        with mock.patch.object(sprint_cli, "SC_API_TOKEN", token), \
+                mock.patch.object(sprint_cli.urllib.request, "urlopen",
+                                  fake_urlopen):
+            yield keys
 
 
 class BoardRecordTest(_BoardCase):
@@ -302,6 +380,73 @@ class BoardRecordTest(_BoardCase):
         self.assertEqual(status, 403)
         self.assertEqual(err["error"]["code"], "not_the_planner")
         self.assertEqual(self.row()["state"], "pending")
+
+    def test_a_released_binding_still_names_the_board_writer(self):
+        """flag 222. `released_at IS NULL` made the fence read "before a
+        binding is armed" — but a binding is ALSO released with no operator
+        action when the planner's session ends (shell_recovery), on
+        update_discard, and when the sprint is closed or frozen. In that
+        window every planner-flavored shell inherited every board.
+
+        The state moved to is the sharp one: `merged` is terminal, and
+        terminal is exactly what makes the reconciler stop watching a unit —
+        so a foreign planner could silently end the sprint's watch on a unit
+        it has nothing to do with. Asserted with the row UNMOVED, because a
+        403 that still wrote would satisfy a status-code-only test."""
+        binding_id = self.arm_binding(planner_shell_id=9)
+        status, _ = self.add((PLANNER,), dev="DEV5")
+        self.assertEqual(status, 201)
+        self.release(binding_id)
+        status, err = self.patch((PLANNER2,), state="merged")
+        self.assertEqual(status, 403,
+                         "a foreign planner wrote the board after release")
+        self.assertEqual(err["error"]["code"], "not_the_planner")
+        self.assertEqual(self.row()["state"], "pending")
+        # and the planner the sprint actually belongs to still writes it —
+        # the fix narrows the fallback to one shell, it does not close it
+        status, _ = self.patch((PLANNER,), state="working")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.row()["state"], "working")
+
+    def test_a_handover_leaves_the_board_with_the_planner_that_took_it(self):
+        """"The most recent planner ever bound" is the fallback's whole shape,
+        and a released binding is now part of the answer — so WHICH released
+        binding answers is load-bearing rather than incidental. A sprint handed
+        from one planner to the next (`idx_spb_live_sprint` allows one live
+        binding, so a handover is release-then-arm) and then released again
+        must answer with the planner that TOOK the sprint, not the one that
+        started it. Reading the bindings in the other order gives a
+        confidently wrong writer instead of no writer."""
+        first = self.arm_binding(planner_shell_id=9)
+        self.release(first, "shell_recovery")
+        second = self.arm_binding(planner_shell_id=10)
+        self.release(second, "sprint closed")
+        status, _ = self.add((PLANNER2,), dev="DEV5")
+        self.assertEqual(status, 201, "the planner that took the sprint over "
+                                      "cannot write its board")
+        status, err = self.patch((PLANNER,), state="merged")
+        self.assertEqual(status, 403, "the superseded planner still writes")
+        self.assertEqual(err["error"]["code"], "not_the_planner")
+        self.assertEqual(self.row()["state"], "pending")
+
+    def test_a_released_binding_does_not_open_a_sprint_next_door(self):
+        """The cross-sprint leg of flag 222: a planner running its own sprint
+        reached a board on a doc it never bound, once that doc's binding had
+        been released. Its own sprint stays writable throughout — the fence is
+        per-sprint, not a global lock."""
+        self.sql("INSERT INTO documents (document_id, kind, title, body) "
+                 "VALUES (2,'doc','SPRINT: next door','x')")
+        theirs = self.arm_binding(planner_shell_id=9, sprint_doc_id=2)
+        self.arm_binding(planner_shell_id=10, sprint_doc_id=1)
+        self.release(theirs, "sprint closed")
+        status, err = self.call("POST", "/api/sprint-units", (PLANNER2,),
+                                {"sprint_doc_id": 2, "seq": "U1",
+                                 "unit_title": "not its sprint"})
+        self.assertEqual(status, 403, "declared a unit on a foreign board")
+        self.assertEqual(err["error"]["code"], "not_the_planner")
+        self.assertIsNone(self.row("U1"))
+        self.assertEqual(self.add((PLANNER2,), dev="DEV5")[0], 201)
+        self.assertEqual(self.row()["sprint_doc_id"], 1)
 
     def test_unbound_sprint_falls_back_to_planner_flavor_not_to_anyone(self):
         """The spec's fallback is 'the sprint doc's author', which `documents`
@@ -569,6 +714,102 @@ class BoardRecordTest(_BoardCase):
         self.assertNotIn("reviewer", seen[0],
                          "an omitted --reviewer was sent as a change")
 
+    # -- the key the CLI mints is part of the verb -----------------------------
+
+    def test_a_failed_declaration_can_be_corrected(self):
+        """flag 221, and the reason it reached main: the route tests mint a
+        fresh key per call, so NO test drove the CLI's own key strategy.
+
+        `unit-add|{sprint}|{seq}` is deterministic, and `_idempotent` stores
+        whatever produce() returns INCLUDING its error statuses. So a typo'd
+        --dev cached a 422 against that (sprint, seq), and the corrected retry
+        — the one the error message asks for — came back 409
+        idempotency_conflict for good: nothing reads expires_at, nothing
+        sweeps the table, and it is snapshot content. The unit could never be
+        declared again under its own seq.
+
+        Driven through the shipped verb end to end, because that is the only
+        vantage the defect is visible from."""
+        with self.cli() as keys:
+            with self.assertRaises(SystemExit) as typo:
+                sprint_cli.cmd_unit_add(_unit_args(dev="DEV55"))
+            self.assertIn("422", str(typo.exception))
+            self.assertIn("no such shell", str(typo.exception))
+            self.assertIsNone(self.row("U1"), "a refused declare wrote a row")
+            with redirect_stdout(io.StringIO()):
+                rc = sprint_cli.cmd_unit_add(_unit_args(dev="DEV5"))
+
+        self.assertEqual(rc, 0)
+        row = self.row("U1")
+        self.assertIsNotNone(
+            row, "the corrected declaration never landed — the failed "
+                 "attempt still owns the key")
+        self.assertEqual(row["dev_shell_id"], 11)
+        self.assertNotEqual(keys[0], keys[1],
+                            "the retry reused the failed attempt's key")
+
+    def test_every_mutating_verb_mints_a_fresh_key_and_reads_carry_none(self):
+        """The key shape, per verb, asserted on the header that actually
+        leaves the CLI — `test_each_verb_calls_the_method_and_path_it_claims`
+        spies `_api` and drops the key argument, which is why a deterministic
+        key on ONE of three verbs shipped unnoticed.
+
+        The prefix stays human-readable in the store; the uuid is what makes a
+        failed attempt cost one attempt instead of the (sprint, seq) forever.
+        Declaring twice is refused by the route's natural key instead — see
+        below — so nothing is lost by not keying on it here."""
+        with self.cli() as keys, redirect_stdout(io.StringIO()):
+            sprint_cli.cmd_unit_add(_unit_args())
+            with self.assertRaises(SystemExit):
+                sprint_cli.cmd_unit_add(_unit_args())
+            sprint_cli.cmd_unit_set(_unit_args(branch="feat/one"))
+            sprint_cli.cmd_unit_set(_unit_args(branch="feat/two"))
+            sprint_cli.cmd_unit_state(_unit_args(state="working"))
+            sprint_cli.cmd_unit_state(_unit_args(state="working"))
+            sprint_cli.cmd_unit_list(_unit_args())
+
+        expected = ("unit-add|1|U1|", "unit-set|1|U1|",
+                    "unit-state|1|U1|working|")
+        for prefix, (first, second) in zip(expected,
+                                           (keys[0:2], keys[2:4], keys[4:6])):
+            for key in (first, second):
+                self.assertTrue(key.startswith(prefix),
+                                f"{key!r} is not a {prefix!r} key")
+                suffix = key[len(prefix):]
+                self.assertEqual(uuid.UUID(suffix).version, 4,
+                                 f"{prefix!r} key has no uuid4 suffix")
+            self.assertNotEqual(
+                first, second,
+                f"{prefix!r} repeats its key — one failed call locks it out")
+        self.assertIsNone(keys[6], "a read sent an Idempotency-Key")
+
+    def test_a_redeclaration_reaches_the_routes_refusal_not_the_key_cache(self):
+        """The Low the same fix closes. `unit_exists` — "edit it with PATCH
+        rather than declaring it twice" — is what the migration comment, the
+        route docstring and the CLI all present as the answer to a double
+        declare, and on the shipped path it was UNREACHABLE: the deterministic
+        key answered first, with a replay of the original 201 or a 409 about
+        request bodies. The code was right; nothing could get to it.
+
+        Asserted on what the planner is TOLD, not just the status: a body
+        mismatch and a duplicate unit are different mistakes with different
+        repairs, and the operator acts on the sentence."""
+        with self.cli(), redirect_stdout(io.StringIO()):
+            sprint_cli.cmd_unit_add(_unit_args(dev="DEV5", branch="feat/real"))
+            with self.assertRaises(SystemExit) as dup:
+                sprint_cli.cmd_unit_add(
+                    _unit_args(title="typo redeclare", dev="PLN2"))
+
+        told = str(dup.exception)
+        self.assertIn("409", told)
+        self.assertIn("already has unit U1", told)
+        self.assertIn("edit it with PATCH", told)
+        self.assertNotIn("Idempotency-Key", told)
+        live = self.row("U1")
+        self.assertEqual(live["unit_title"], "board record")
+        self.assertEqual(live["dev_shell_id"], 11)
+        self.assertEqual(live["branch"], "feat/real")
+
     # -- the board survives a rebuild ----------------------------------------
 
     def test_the_board_is_snapshot_content_not_a_rebuildable_cache(self):
@@ -630,6 +871,81 @@ class BoardRecordTest(_BoardCase):
         self.assertEqual(self.row()["branch"], "feat/real")
         self.patch(branch=None)
         self.assertIsNone(self.row()["branch"])
+
+    def test_a_board_cannot_be_minted_on_a_document_that_is_not_a_sprint(self):
+        """flag 223. `sprint_doc_id` was validated as "a document that exists"
+        and the FK carries no kind constraint, so a board could be declared on
+        a SPEC — and a sprint doc and its spec are consecutive ids (59 and 58
+        for this very sprint), which is a typo a planner makes at the same
+        rate as any other.
+
+        Worse than a wrong row: the board is invisible where anyone would look
+        for it — participants read the sprint doc — while `sprint_units` rows
+        exist and the reconciler watches them. The seq axis of this same typo
+        class is already defended (PATCH never creates); this is the doc axis.
+
+        Deliberately NOT asserted here: whether a FROZEN sprint doc still
+        accepts units. That is a live question parked for the FnB, and the
+        engine's predicate carries a `frozen=0` clause this check omits on
+        purpose — pinning it either way would decide it by side effect."""
+        self.sql("INSERT INTO documents (document_id, kind, title, body) "
+                 "VALUES (2,'spec','Worker expectation reconciler','x')")
+        status, err = self.call("POST", "/api/sprint-units", (OP,),
+                                {"sprint_doc_id": 2, "seq": "U1",
+                                 "unit_title": "phantom board"})
+        self.assertEqual(status, 422, "a board was minted on a spec")
+        self.assertEqual(err["error"]["code"], "not_a_sprint_doc")
+        # and it says WHICH document, because the planner's next move is to
+        # retype the id and it needs to see what it hit
+        self.assertIn("Worker expectation reconciler",
+                      err["error"]["message"])
+        self.assertIsNone(self.row("U1"))
+        # a doc that is not there at all is still the OTHER refusal — the two
+        # mistakes have different repairs
+        status, err = self.call("POST", "/api/sprint-units", (OP,),
+                                {"sprint_doc_id": 99, "seq": "U1",
+                                 "unit_title": "no doc"})
+        self.assertEqual(status, 404)
+        self.assertEqual(err["error"]["code"], "no_such_sprint")
+        self.assertEqual(self.add()[0], 201, "the real sprint doc was refused")
+
+    def test_the_board_reads_back_in_work_order_not_lexicographic_order(self):
+        """`seq` is TEXT, so `ORDER BY seq` puts U10 and U11 between U1 and
+        U2. The board is a work order read top to bottom, and no test covered
+        ordering at all — this sprint stops at U9, so the first sprint to
+        reach ten units would have been the one to find it.
+
+        Asserted on the RENDERED board as well as the API: the render is what
+        a planner actually reads, and a projection can re-sort."""
+        for seq in ("U10", "U2", "U1", "U11", "U9", "U3"):
+            self.add(seq=seq, unit_title=f"unit {seq}")
+        _s, out = self.call("GET", "/api/sprint-units?sprint_doc_id=1", (OP,))
+        self.assertEqual([u["seq"] for u in out["units"]],
+                         ["U1", "U2", "U3", "U9", "U10", "U11"])
+        buf = io.StringIO()
+        with mock.patch.object(sprint_cli, "_api", return_value=out), \
+                redirect_stdout(buf):
+            sprint_cli.cmd_board(mock.Mock(sprint=1))
+        rendered = [line.split("|")[1].strip()
+                    for line in buf.getvalue().splitlines()
+                    if line.startswith("| U")]
+        self.assertEqual(rendered, ["U1", "U2", "U3", "U9", "U10", "U11"])
+
+    def test_the_cli_refuses_to_title_a_unit_none(self):
+        """`none` is the CLI's spelling of retraction on every role and field,
+        and its help says so — but a unit cannot be untitled, so `--title
+        none` stored the four letters as the title and the board read "none".
+        Refusing names which of the two things the planner meant; storing it
+        silently produces a board that is wrong and looks deliberate."""
+        with self.cli(), redirect_stdout(io.StringIO()):
+            for verb in (sprint_cli.cmd_unit_add, sprint_cli.cmd_unit_set):
+                with self.assertRaises(SystemExit) as refused:
+                    verb(_unit_args(title="none"))
+                self.assertIn("cannot be cleared", str(refused.exception))
+            self.assertIsNone(self.row("U1"), "a refused title wrote a row")
+            # the guard is about the WORD, not about titles it dislikes
+            sprint_cli.cmd_unit_add(_unit_args(title="none of the above"))
+        self.assertEqual(self.row("U1")["unit_title"], "none of the above")
 
     def test_a_malformed_filter_refuses_rather_than_widening(self):
         """The failure that matters most on the read path: a filter that fails

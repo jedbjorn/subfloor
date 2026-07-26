@@ -147,6 +147,15 @@ def _field(value: "str | None"):
 def _unit_body(args, *, creating: bool) -> dict:
     body = {"sprint_doc_id": args.sprint, "seq": args.seq}
     if creating or args.title is not None:
+        if args.title is not None and args.title.lower() == "none":
+            # Every other field spells retraction `none` and the CLI's own
+            # help says so — but a unit cannot BE untitled, so `--title none`
+            # has no honest meaning and used to store the four letters as the
+            # title. Refusing says which of the two things the planner meant
+            # to type; storing it silently makes the board read "none".
+            raise _die("--title none: a unit's title cannot be cleared "
+                       "(`none` clears a role or field, and unit_title is "
+                       "neither) — pass the real title")
         body["unit_title"] = args.title
     for name in ("dev", "reviewer"):
         if getattr(args, name) is not None:
@@ -191,8 +200,17 @@ def cmd_unit_add(args) -> int:
     body = _unit_body(args, creating=True)
     if args.state:
         body["state"] = args.state
+    # The uuid suffix is load-bearing, exactly as it is on `set` and `state`.
+    # A key of just (sprint, seq) is deterministic, and `_idempotent` caches
+    # the response it gets from produce() INCLUDING an error status — so a
+    # typo'd --dev returned 422, the 422 was stored against that key, and the
+    # corrected retry the message asks for came back 409 idempotency_conflict
+    # forever (nothing reads expires_at, nothing sweeps the table, and it is
+    # snapshot content). Declaring twice is refused by the route's own natural
+    # key instead: (sprint_doc_id, seq) is UNIQUE, so a genuine duplicate gets
+    # 409 unit_exists and the live row is untouched.
     r = _api("POST", "/api/sprint-units", body,
-             f"unit-add|{args.sprint}|{args.seq}")
+             f"unit-add|{args.sprint}|{args.seq}|{uuid.uuid4()}")
     print(f"sc sprint: unit {r['seq']} declared on sprint "
           f"{r['sprint_doc_id']}")
     _print_unit(r)
