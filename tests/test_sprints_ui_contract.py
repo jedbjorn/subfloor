@@ -13,6 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
+STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 EL = APP[APP.index("const el ="):APP.index("const esc =")]
 SPRINTS = APP[APP.index("// ── Active sprints"):
               APP.index("// ── Tabs + boot")]
@@ -137,6 +138,7 @@ def test_nav_order_route_and_section_are_reload_safe():
     assert nav.index('data-tab="roadmap"') < nav.index('data-tab="docs"')
     assert 'data-tab="sprints" hidden' in nav
     assert INDEX.count('id="view-sprints"') == 1
+    assert "nav button.warn { color: var(--warn); }" in STYLE
 
     script = r"""
 globalThis.location = { hash: "#sprints" };

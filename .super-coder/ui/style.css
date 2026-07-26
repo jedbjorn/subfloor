@@ -48,6 +48,7 @@ nav button {
 }
 nav button:hover { color: rgba(255,255,255,.70); }
 nav button.active { color: #fff; }
+nav button.warn { color: var(--warn); }
 nav button.active::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
   background: var(--accent);
