@@ -390,7 +390,7 @@ def tag_origin(skills: list[dict]) -> list[dict]:
 
 
 def get_skills(con) -> dict:
-    """The full skills catalogue + per-skill grants, for the Skills tab.
+    """The full catalogue + per-skill grants for Shells → Skill Assignments.
     Grouping into sections (repo / category) happens client-side, like
     flags/docs."""
     skills = rows(con.execute(

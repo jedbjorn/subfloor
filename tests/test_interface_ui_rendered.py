@@ -383,7 +383,7 @@ def _artifact(tmp_path: Path, name: str) -> Path:
     return directory / name
 
 
-def test_local_artifact_mode_keeps_save_and_disables_publish(browser, ui_url):
+def test_local_artifact_mode_keeps_actions_without_idle_status_noise(browser, ui_url):
     context = browser.new_context(viewport={"width": 1600, "height": 1000})
     page = context.new_page()
     page.route("**/api/**", _mock_api)
@@ -394,7 +394,7 @@ def test_local_artifact_mode_keeps_save_and_disables_publish(browser, ui_url):
         assert snapshot.text_content() == "save locally ⤓"
         assert publish.text_content() == "publish off"
         assert publish.is_disabled()
-        assert "local artifacts" in page.locator("#status").text_content()
+        assert page.locator("#status").text_content() == ""
     finally:
         context.close()
 

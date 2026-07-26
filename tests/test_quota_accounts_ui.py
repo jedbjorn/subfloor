@@ -54,6 +54,8 @@ EL = APP[APP.index("const el ="):APP.index("const esc =")]
 # fmt / microlabel / statRow — sliced, not restated, so a card's meta row is
 # rendered by the app's own helper.
 HELPERS = APP[APP.index("const fmt = (n)"):APP.index("// On/off switch")]
+SHELL_STATE = APP[APP.index("let selectedShell ="):
+                  APP.index("// Rough token estimator")]
 QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Interface tab")]
 _ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[_ROUTER_AT:
@@ -166,7 +168,7 @@ function root() { return new FakeElement("div"); }
 
 def run_js(body: str, data: dict | None = None) -> dict:
     script = ("const PAYLOAD = " + json.dumps(data or payload()) + ";\n"
-              + EL + HELPERS + HARNESS + QUOTA + ROUTER
+              + EL + HELPERS + SHELL_STATE + HARNESS + QUOTA + ROUTER
               + "\n(async () => {\n" + body + "\n})().catch((e) => {"
               " console.error(e.stack || e); process.exit(1); });\n")
     proc = subprocess.run(["node", "-e", script], text=True, capture_output=True)

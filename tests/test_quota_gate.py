@@ -485,6 +485,8 @@ class NoInertAccountMachineryTest(unittest.TestCase):
 
 EL = APP[APP.index("const el ="):APP.index("const esc =")]
 HELPERS = APP[APP.index("const fmt = (n)"):APP.index("// On/off switch")]
+SHELL_STATE = APP[APP.index("let selectedShell ="):
+                  APP.index("// Rough token estimator")]
 QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Interface tab")]
 _ROUTER_AT = APP.index("function routeFromHash()")
 # U4's slice stops at the nav-button line; this one deliberately runs PAST it,
@@ -571,7 +573,7 @@ def run_js(body: str, data: dict | None = None, boot: bool = False,
     dom = DOM.replace('globalThis.location = { hash: "" };',
                       'globalThis.location = { hash: "%s" };' % hash)
     script = ("const PAYLOAD = " + json.dumps(data or {"providers": []})
-              + ";\n" + EL + HELPERS + dom + QUOTA + ROUTER
+              + ";\n" + EL + HELPERS + SHELL_STATE + dom + QUOTA + ROUTER
               + (BOOT if boot else "")
               # The boot IIFE awaits /health before it routes, so the body has
               # to let it settle — reading the view synchronously would see the
