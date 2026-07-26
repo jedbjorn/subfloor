@@ -240,21 +240,40 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertEqual(self.render(BYSTANDER_SHELL), "")
         self.assertNotEqual(self.render(DEV_SHELL), "")     # control
 
-    def test_terminal_units_only_render_nothing(self):
-        # This is also what retires the PLANNER's directive: a sprint whose
-        # every unit is merged or cancelled is over, and the structured pair
-        # says so without anyone editing prose.
+    def test_terminal_units_retire_the_WORKERS_but_not_the_planner(self):
+        # The predicate split (flag_id 231, spec doc 58 "The boot directive").
+        # A dev whose every unit is merged or cancelled is done. THE PLANNER IS
+        # NOT: every step of close-out — the conformance pass, `status: CLOSED`,
+        # the freeze, the participant messages, the watch sweep, the sprint
+        # report, the flag and roadmap bookkeeping — happens in exactly this
+        # state, all units merged and the doc not yet frozen. The first cut of
+        # this test asserted the planner rendered "" here and called the sprint
+        # "over"; it is not over, and the assertion pinned the defect.
         add_doc(self.con, 59)
         add_unit(self.con, 59, "U9", dev=DEV_SHELL, state="merged")
         add_unit(self.con, 59, "U8", dev=DEV_SHELL, state="cancelled")
         arm_binding(self.con, 59, PLANNER_SHELL)
         self.assertEqual(self.render(DEV_SHELL), "")
-        self.assertEqual(self.render(PLANNER_SHELL), "")
-        # control: the SAME rows, one moved off a terminal state
+        self.assertIn("PLANNER", self.render(PLANNER_SHELL))
+        # control: the SAME rows, one moved off a terminal state — the dev's
+        # directive comes back, so the absence above was about the state and
+        # not about an empty board
         self.con.execute("UPDATE sprint_units SET state='working' WHERE seq='U9'")
         self.con.commit()
         self.assertNotEqual(self.render(DEV_SHELL), "")
-        self.assertNotEqual(self.render(PLANNER_SHELL), "")
+        self.assertIn("PLANNER", self.render(PLANNER_SHELL))
+
+    def test_the_freeze_alone_retires_the_planner(self):
+        # The other half of the split: what DOES end the planner's directive is
+        # the freeze, which is the `sprint` skill's own revocation predicate.
+        # Terminal units + frozen doc, one field apart from the test above.
+        add_doc(self.con, 59)
+        add_unit(self.con, 59, "U9", dev=DEV_SHELL, state="merged")
+        arm_binding(self.con, 59, PLANNER_SHELL)
+        self.assertIn("PLANNER", self.render(PLANNER_SHELL))   # control first
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=59")
+        self.con.commit()
+        self.assertEqual(self.render(PLANNER_SHELL), "")
 
     def test_frozen_doc_renders_nothing(self):
         add_doc(self.con, 59, frozen=1)
@@ -303,8 +322,8 @@ class SprintDirectiveTest(unittest.TestCase):
         self.con.execute("DROP TABLE sprint_units")
         self.con.commit()
         self.assertEqual(self.render(DEV_SHELL), "")
-        # the planner goes quiet too: liveness is the structured pair, and
-        # half of that pair is the table that just vanished
+        # the planner goes quiet too — its predicate needs a unit ROW, and the
+        # table those rows live in is the one that just vanished
         self.assertEqual(self.render(PLANNER_SHELL), "")
 
         self.con.execute("DROP TABLE sprint_planner_bindings")
@@ -312,20 +331,58 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertEqual(self.render(PLANNER_SHELL), "")
         self.assertEqual(self.render(DEV_SHELL), "")
 
+    def test_a_BROKEN_query_raises_where_a_missing_table_degrades(self):
+        # flag_id 233. The degrade above is load-bearing but its justification
+        # is TEMPORARY — it evaporates the moment the floor applies 0098 —
+        # whereas a bare `except OperationalError` would be PERMANENT. Past
+        # that point the only thing such a catch could still swallow is a
+        # genuine fault: a later migration renaming a column, a typo. It would
+        # revert the whole fleet to pre-U9 behaviour on a section the render
+        # itself labels MANDATORY, with no error, no stderr and no failing
+        # test — which is the same shape as the bug this unit exists to close,
+        # one layer down.
+        #
+        # No test above this one can tell the two cases apart: DROPping the
+        # table satisfies "absent" and "broken" alike. This one separates them.
+        add_doc(self.con, 59)
+        add_unit(self.con, 59, "U9", dev=DEV_SHELL)
+        self.assertNotEqual(self.render(DEV_SHELL), "")        # control first
+        # the table is PRESENT and a column the query reads is gone — exactly
+        # what a later migration or a typo leaves behind
+        self.con.execute(
+            "ALTER TABLE sprint_units RENAME COLUMN state TO unit_state")
+        self.con.commit()
+        with self.assertRaises(sqlite3.OperationalError):
+            self.render(DEV_SHELL)
+
     # ── the terminal set is the schema's, not a private opinion ─────────────
 
-    def test_terminal_states_are_a_subset_of_the_schema_check(self):
-        # A state added to sprint_units that this renderer does not know about
+    def test_the_state_vocabulary_is_pinned_to_the_schema_check_exactly(self):
+        # A state ADDED to sprint_units that this renderer does not know about
         # is the silent failure: an unknown state reads as non-terminal, which
-        # errs toward telling a shell it is still in a sprint. Pin the set
-        # against the CHECK so a schema move surfaces here.
+        # errs toward telling a shell it is still in a sprint.
+        #
+        # So this asserts EQUALITY, both directions (flag_id 232). Its first
+        # cut asserted TERMINAL <= allowed — a subset, which can only fail on a
+        # REMOVAL, i.e. the one direction the comment above says is not the
+        # risk. REV2's M10 mutation (adding 'archived' to the CHECK) survived
+        # it with 19/19 green: one leg of eleven lived, and it was this one.
         ddl = self.con.execute(
             "SELECT sql FROM sqlite_master WHERE name='sprint_units'"
         ).fetchone()[0]
-        allowed = set(re.findall(r"'(\w+)'", ddl.split("CHECK (state IN")[1]))
-        self.assertTrue(set(compose.TERMINAL_UNIT_STATES) <= allowed)
-        self.assertIn("merged", allowed)
-        self.assertIn("cancelled", allowed)
+        # Bounded to the clause. Splitting on "CHECK (state IN" and taking the
+        # REST of the DDL swept up the rest of the column list, so `allowed`
+        # actually contained 'now' — from DEFAULT (datetime('now')).
+        clause = re.search(r"CHECK\s*\(state IN\s*\(([^)]*)\)", ddl)
+        self.assertIsNotNone(clause, "the state CHECK clause moved — re-anchor")
+        allowed = set(re.findall(r"'(\w+)'", clause.group(1)))
+        self.assertNotIn("now", allowed)        # the parse stayed in the clause
+        self.assertEqual(set(compose.TERMINAL_UNIT_STATES),
+                         {"merged", "cancelled"})
+        # the complement is the live half, named in full: a new schema state
+        # lands HERE and turns this red, which is the addition case.
+        self.assertEqual(allowed - set(compose.TERMINAL_UNIT_STATES),
+                         {"pending", "working", "in_review", "blocked"})
 
 
 class BootDocIntegrationTest(unittest.TestCase):

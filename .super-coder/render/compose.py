@@ -129,10 +129,13 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     """Every sprint role `shell_id` holds right now, read fresh from the record
     — never cached, so a role changed since the last boot resolves correctly.
 
-    Returns a list of `{doc_id, doc_title, role, units}`, planner first, then
-    dev, then reviewer; empty means no section renders. A shell with roles in
-    two sprints gets an entry per (sprint, role) — every one is named, because
-    silently choosing one is the failure this unit removes.
+    Returns a list of `{doc_id, doc_title, role, units}` — planner entries
+    first, then the dev/reviewer ones in `unit_id` order (so whichever role's
+    lowest unit_id comes first, NOT dev-before-reviewer); `units` within an
+    entry are in `unit_id` order too, which is the order the planner wrote the
+    board. Empty means no section renders. A shell with roles in two sprints
+    gets an entry per (sprint, role) — every one is named, because silently
+    choosing one is the failure this unit removes.
 
     THE PLANNER IS RESOLVED FROM THE LATEST BINDING, ARMED OR RELEASED. The
     spec said "the armed binding", and that predicate is anti-correlated with
@@ -147,57 +150,78 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     is. (Reported to the planner as an ambiguity call before build; adopted in
     PLN1 messages #2257 / #2263.)
 
-    A SPRINT IS LIVE ON THE STRUCTURED PAIR ONLY — `documents.frozen = 0` plus
-    at least one non-terminal `sprint_units` row. Deliberately NOT the body's
-    `status: ACTIVE` line: regex-matching liveness out of prose is part of the
-    structural gap this feature exists to close (flag_id 213 removed exactly
-    that from the reconciler's trigger), and reintroducing it here would have
-    the boot render and the reconciler disagreeing the moment someone
-    reformats a line. Same pair on both sides, one definition, no drift.
+    LIVENESS IS STRUCTURED, NEVER THE BODY'S PROSE — `documents.frozen` plus
+    `sprint_units` rows, never the `status: ACTIVE` line. Regex-matching
+    liveness out of prose is part of the structural gap this feature exists to
+    close (flag_id 213 removed exactly that from the reconciler's trigger), and
+    reintroducing it here would have the boot render and the reconciler
+    disagreeing the moment someone reformats a line.
+
+    BUT THE TWO ROLES DO NOT SHARE ONE PREDICATE, and collapsing them was
+    flag_id 231 (my first cut did, on the planner's own instruction; the
+    planner withdrew it):
+
+    - dev / reviewer: `frozen = 0` AND a NON-TERMINAL row of their own. Same
+      pair as the reconciler's trigger, which likewise should not watch a
+      sprint with no live units.
+    - planner: `frozen = 0` AND ANY unit row at all. Every step of close-out —
+      the pre-freeze conformance pass, `status: CLOSED`, the freeze, the
+      participant messages, the watch-retirement sweep, the sprint report, the
+      flag and roadmap bookkeeping — happens AFTER the last unit reaches
+      `merged` and BEFORE the doc is frozen. A non-terminal gate would delete
+      the planner's directive at the exact moment its longest and most
+      procedure-heavy phase begins. So the planner retires on the freeze alone,
+      which is the `sprint` skill's own revocation predicate — the two surfaces
+      cannot disagree about when a sprint ends.
 
     Consequence, decided rather than discovered: at a sprint's very first boot
     no unit rows exist yet, so the planner gets no directive — correct, since
     the planner is the shell CREATING those rows.
 
-    Degrades to `[]` on OperationalError rather than failing a boot: this runs
-    against the LIVE db at every launch, and a floor that has not applied
-    migration 0098 has no `sprint_units` table at all — which is the state of
-    this repo's own running floor as U9 is written. A boot doc that cannot
-    render is worse than one missing a section.
+    Returns `[]` when `sprint_units` DOES NOT EXIST — a floor that has not
+    applied migration 0098 has no such table, which was the state of this
+    repo's own running floor as U9 was written, and compose reads the live db at
+    every boot of every shell. That degrade is gated on the table's ACTUAL
+    ABSENCE and nothing else (flag_id 233): the missing table is temporary, a
+    bare `except OperationalError` would be permanent, and once 0098 is applied
+    the only thing such a catch could still swallow is a genuine fault — a
+    renamed column, a typo — silently reverting the whole fleet to pre-U9
+    behaviour on a section the render itself labels MANDATORY. Faults raise.
     """
     entries = []
+    if not con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='sprint_units'").fetchone():
+        return []
+    # `sprint_planner_bindings` needs no check of its own: it arrived in
+    # migration 0078 and `sprint_units` in 0098, so units-present implies
+    # bindings-present on any floor that can reach this line.
     placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
-    try:
-        planner_docs = con.execute(
-            "SELECT b.sprint_doc_id, d.title FROM sprint_planner_bindings b "
-            "JOIN documents d ON d.document_id = b.sprint_doc_id "
-            "WHERE b.binding_id = (SELECT MAX(b2.binding_id) "
-            "                      FROM sprint_planner_bindings b2 "
-            "                      WHERE b2.sprint_doc_id = b.sprint_doc_id) "
-            "  AND b.planner_shell_id = ? AND d.frozen = 0 "
-            "  AND EXISTS (SELECT 1 FROM sprint_units u "
-            "              WHERE u.sprint_doc_id = b.sprint_doc_id "
-            f"                AND u.state NOT IN ({placeholders})) "
-            "ORDER BY b.sprint_doc_id",
-            (shell_id, *TERMINAL_UNIT_STATES)).fetchall()
-    except sqlite3.OperationalError:
-        planner_docs = []
+    planner_docs = con.execute(
+        "SELECT b.sprint_doc_id, d.title FROM sprint_planner_bindings b "
+        "JOIN documents d ON d.document_id = b.sprint_doc_id "
+        "WHERE b.binding_id = (SELECT MAX(b2.binding_id) "
+        "                      FROM sprint_planner_bindings b2 "
+        "                      WHERE b2.sprint_doc_id = b.sprint_doc_id) "
+        "  AND b.planner_shell_id = ? AND d.frozen = 0 "
+        # ANY row, not a non-terminal one — see the predicate split above.
+        "  AND EXISTS (SELECT 1 FROM sprint_units u "
+        "              WHERE u.sprint_doc_id = b.sprint_doc_id) "
+        "ORDER BY b.sprint_doc_id",
+        (shell_id,)).fetchall()
     for doc_id, title in planner_docs:
         entries.append({"doc_id": doc_id, "doc_title": title,
                         "role": "planner", "units": []})
 
-    try:
-        rows = con.execute(
-            "SELECT u.sprint_doc_id, d.title, u.seq, u.unit_title, "
-            "       u.dev_shell_id, u.reviewer_shell_id "
-            "FROM sprint_units u "
-            "JOIN documents d ON d.document_id = u.sprint_doc_id "
-            "WHERE (u.dev_shell_id = ? OR u.reviewer_shell_id = ?) "
-            f"  AND u.state NOT IN ({placeholders}) AND d.frozen = 0 "
-            "ORDER BY u.sprint_doc_id, u.unit_id",
-            (shell_id, shell_id, *TERMINAL_UNIT_STATES)).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+    rows = con.execute(
+        "SELECT u.sprint_doc_id, d.title, u.seq, u.unit_title, "
+        "       u.dev_shell_id, u.reviewer_shell_id "
+        "FROM sprint_units u "
+        "JOIN documents d ON d.document_id = u.sprint_doc_id "
+        "WHERE (u.dev_shell_id = ? OR u.reviewer_shell_id = ?) "
+        f"  AND u.state NOT IN ({placeholders}) AND d.frozen = 0 "
+        "ORDER BY u.sprint_doc_id, u.unit_id",
+        (shell_id, shell_id, *TERMINAL_UNIT_STATES)).fetchall()
 
     # (doc, role) -> entry, so a shell holding four review units in one sprint
     # gets one line naming all four rather than four sections.
