@@ -147,6 +147,15 @@ def _field(value: "str | None"):
 def _unit_body(args, *, creating: bool) -> dict:
     body = {"sprint_doc_id": args.sprint, "seq": args.seq}
     if creating or args.title is not None:
+        if args.title is not None and args.title.lower() == "none":
+            # Every other field spells retraction `none` and the CLI's own
+            # help says so — but a unit cannot BE untitled, so `--title none`
+            # has no honest meaning and used to store the four letters as the
+            # title. Refusing says which of the two things the planner meant
+            # to type; storing it silently makes the board read "none".
+            raise _die("--title none: a unit's title cannot be cleared "
+                       "(`none` clears a role or field, and unit_title is "
+                       "neither) — pass the real title")
         body["unit_title"] = args.title
     for name in ("dev", "reviewer"):
         if getattr(args, name) is not None:

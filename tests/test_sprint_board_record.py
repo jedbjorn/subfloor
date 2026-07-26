@@ -872,6 +872,81 @@ class BoardRecordTest(_BoardCase):
         self.patch(branch=None)
         self.assertIsNone(self.row()["branch"])
 
+    def test_a_board_cannot_be_minted_on_a_document_that_is_not_a_sprint(self):
+        """flag 223. `sprint_doc_id` was validated as "a document that exists"
+        and the FK carries no kind constraint, so a board could be declared on
+        a SPEC — and a sprint doc and its spec are consecutive ids (59 and 58
+        for this very sprint), which is a typo a planner makes at the same
+        rate as any other.
+
+        Worse than a wrong row: the board is invisible where anyone would look
+        for it — participants read the sprint doc — while `sprint_units` rows
+        exist and the reconciler watches them. The seq axis of this same typo
+        class is already defended (PATCH never creates); this is the doc axis.
+
+        Deliberately NOT asserted here: whether a FROZEN sprint doc still
+        accepts units. That is a live question parked for the FnB, and the
+        engine's predicate carries a `frozen=0` clause this check omits on
+        purpose — pinning it either way would decide it by side effect."""
+        self.sql("INSERT INTO documents (document_id, kind, title, body) "
+                 "VALUES (2,'spec','Worker expectation reconciler','x')")
+        status, err = self.call("POST", "/api/sprint-units", (OP,),
+                                {"sprint_doc_id": 2, "seq": "U1",
+                                 "unit_title": "phantom board"})
+        self.assertEqual(status, 422, "a board was minted on a spec")
+        self.assertEqual(err["error"]["code"], "not_a_sprint_doc")
+        # and it says WHICH document, because the planner's next move is to
+        # retype the id and it needs to see what it hit
+        self.assertIn("Worker expectation reconciler",
+                      err["error"]["message"])
+        self.assertIsNone(self.row("U1"))
+        # a doc that is not there at all is still the OTHER refusal — the two
+        # mistakes have different repairs
+        status, err = self.call("POST", "/api/sprint-units", (OP,),
+                                {"sprint_doc_id": 99, "seq": "U1",
+                                 "unit_title": "no doc"})
+        self.assertEqual(status, 404)
+        self.assertEqual(err["error"]["code"], "no_such_sprint")
+        self.assertEqual(self.add()[0], 201, "the real sprint doc was refused")
+
+    def test_the_board_reads_back_in_work_order_not_lexicographic_order(self):
+        """`seq` is TEXT, so `ORDER BY seq` puts U10 and U11 between U1 and
+        U2. The board is a work order read top to bottom, and no test covered
+        ordering at all — this sprint stops at U9, so the first sprint to
+        reach ten units would have been the one to find it.
+
+        Asserted on the RENDERED board as well as the API: the render is what
+        a planner actually reads, and a projection can re-sort."""
+        for seq in ("U10", "U2", "U1", "U11", "U9", "U3"):
+            self.add(seq=seq, unit_title=f"unit {seq}")
+        _s, out = self.call("GET", "/api/sprint-units?sprint_doc_id=1", (OP,))
+        self.assertEqual([u["seq"] for u in out["units"]],
+                         ["U1", "U2", "U3", "U9", "U10", "U11"])
+        buf = io.StringIO()
+        with mock.patch.object(sprint_cli, "_api", return_value=out), \
+                redirect_stdout(buf):
+            sprint_cli.cmd_board(mock.Mock(sprint=1))
+        rendered = [line.split("|")[1].strip()
+                    for line in buf.getvalue().splitlines()
+                    if line.startswith("| U")]
+        self.assertEqual(rendered, ["U1", "U2", "U3", "U9", "U10", "U11"])
+
+    def test_the_cli_refuses_to_title_a_unit_none(self):
+        """`none` is the CLI's spelling of retraction on every role and field,
+        and its help says so — but a unit cannot be untitled, so `--title
+        none` stored the four letters as the title and the board read "none".
+        Refusing names which of the two things the planner meant; storing it
+        silently produces a board that is wrong and looks deliberate."""
+        with self.cli(), redirect_stdout(io.StringIO()):
+            for verb in (sprint_cli.cmd_unit_add, sprint_cli.cmd_unit_set):
+                with self.assertRaises(SystemExit) as refused:
+                    verb(_unit_args(title="none"))
+                self.assertIn("cannot be cleared", str(refused.exception))
+            self.assertIsNone(self.row("U1"), "a refused title wrote a row")
+            # the guard is about the WORD, not about titles it dislikes
+            sprint_cli.cmd_unit_add(_unit_args(title="none of the above"))
+        self.assertEqual(self.row("U1")["unit_title"], "none of the above")
+
     def test_a_malformed_filter_refuses_rather_than_widening(self):
         """The failure that matters most on the read path: a filter that fails
         to parse must not fall open to EVERY board. The caller believes it

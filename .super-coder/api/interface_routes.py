@@ -2560,7 +2560,15 @@ def _sprint_units(actor, query: dict):
     if doc_id is not None:
         sql += " WHERE sprint_doc_id=?"
         params.append(doc_id)
-    sql += " ORDER BY sprint_doc_id, seq"
+    # LENGTH BEFORE VALUE, because `seq` is TEXT and a plain sort is
+    # lexicographic: U1, U2, U3, U10, U11 reads back as U1, U10, U11, U2, U3.
+    # The board is a WORK ORDER — a planner reads it top to bottom and a
+    # reader that scrambles at U10 misreports what runs next. Sorting by
+    # length first makes same-prefix numbering natural (every U0-U9 before
+    # every U10-U99) without inventing a numeric column the planner would
+    # then have to keep in sync. Seqs of unlike shape (U-H beside U9) still
+    # order by length then value — deterministic, and no worse than today.
+    sql += " ORDER BY sprint_doc_id, LENGTH(seq), seq"
     con = _db()
     try:
         units = [_unit_projection(con, r[0])
@@ -2602,10 +2610,32 @@ def _add_sprint_unit(actor, headers, body):
             return refusal
 
         def produce():
-            if con.execute("SELECT 1 FROM documents WHERE document_id=?",
-                           (doc_id,)).fetchone() is None:
+            # "A sprint document" already has a definition in this engine —
+            # pr_poller's `kind='doc' AND frozen=0 AND title LIKE 'SPRINT:%'`
+            # — and the same clause is used here rather than a second one that
+            # can drift from it. MINUS `frozen=0`, deliberately: whether a
+            # frozen board stays mutable is a separate parked question, and
+            # folding it in here would decide it as a side effect of a typo
+            # guard.
+            #
+            # The typo this catches is adjacent-integer, not exotic: a sprint
+            # doc and its spec are consecutive ids (59 and 58 for this very
+            # sprint). A board minted on the spec is invisible to every
+            # participant — they read the sprint doc — while the rows exist
+            # and the reconciler watches them.
+            doc = con.execute(
+                "SELECT title, kind='doc' AND title LIKE 'SPRINT:%' "
+                "FROM documents WHERE document_id=?", (doc_id,)).fetchone()
+            if doc is None:
                 return 404, _err_obj("no_such_sprint",
                                      f"no document {doc_id} to hold a board")
+            if not doc[1]:
+                return 422, _err_obj(
+                    "not_a_sprint_doc",
+                    f"document {doc_id} is {doc[0]!r}, not a sprint board — "
+                    "a board declared here is invisible to every participant "
+                    "(they read the sprint doc) while its units are watched "
+                    "all the same; check the --sprint id")
             try:
                 roles = {col: _resolve_shell(con, body.get(role))
                          for role, col in _UNIT_ROLES.items()}
