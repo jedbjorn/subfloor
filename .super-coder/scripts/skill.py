@@ -21,8 +21,21 @@ The list is re-applied after every seed sync/heal/rebuild, so it rides
 `./sc update` the same way flavor overlays do. Grant rows stay in place
 (inert) so `unretire` restores who-had-what.
 
+`add` authors a LOCAL skill straight into the DB. It exists for the `curate`
+skill's promote pass: a cluster of L&S entries that keeps recurring across
+sessions is a *process*, not a lesson, and relocating it to a skill is the
+pressure valve that makes a hard L&S budget survivable — knowledge moves to a
+lazy surface instead of being deleted. Local means "name absent from the engine
+seed", which is already the engine/local boundary every heal path respects
+(seed_skills._engine_specs / stale_engine_skills / sync_engine_skills), so an
+added skill survives migrate, sync, and rebuild with no new column or marker.
+It writes NO asset file, deliberately: `./sc seed-skills` upserts every asset
+under assets/skills/, so a file would put a local skill back on the seed path.
+
 Usage:
     ./sc skill list                        catalogue: origin, common, grants
+    ./sc skill add <name> --file <path>    author a LOCAL skill (DB-only) + grant it
+                  [--desc "…"] [--category …] [--for <shell>] [--opt-in]
     ./sc skill grant  <name> <shell>...    grant a skill to shell(s) (id or shortname)
     ./sc skill revoke <name> <shell>...    revoke a skill from shell(s)
     ./sc skill rm     <name>               soft-delete a LOCAL skill + revoke all grants
@@ -31,7 +44,10 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -111,6 +127,101 @@ def cmd_list(con) -> int:
         tag = "common" if common else "opt-in"
         dead = ("  [retired]" if name in retired else "  [deleted]") if deleted else ""
         print(f"{name:<{w}}  {origin}  {tag}  → {grants or '(ungranted)'}{dead}")
+    return 0
+
+
+def resolve_author(con, ref: "str | None") -> tuple[int, str]:
+    """Who is authoring this skill. `--for` when given, else the shell whose
+    api_key is the SC_API_TOKEN run.py injected at boot — the same identity the
+    memory API resolves, so a shell never names itself. A host seat with neither
+    is told to say who it means rather than silently authoring an orphan."""
+    if ref:
+        return resolve_shell(con, ref)
+    token = os.environ.get("SC_API_TOKEN", "")
+    if token:
+        row = con.execute(
+            "SELECT shell_id, COALESCE(shortname, display_name, shell_id) FROM shells "
+            "WHERE api_key=? AND COALESCE(is_deleted,0)=0", (token,)).fetchone()
+        if row:
+            return row[0], str(row[1])
+    sys.exit("sc skill add: can't tell who is authoring — no SC_API_TOKEN "
+             "resolves to a shell. Pass --for <shell>.")
+
+
+def cmd_add(con, argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="sc skill add", add_help=False)
+    ap.add_argument("name")
+    ap.add_argument("--file", required=True, help="markdown body → skills.content")
+    ap.add_argument("--desc", help="one-line summary (boot SKILLS block + catalogue)")
+    ap.add_argument("--category")
+    ap.add_argument("--command")
+    ap.add_argument("--for", dest="author", help="author/grantee shell (default: your token)")
+    ap.add_argument("--opt-in", action="store_true",
+                    help="not a common skill (default: common, like the engine catalogue)")
+    args = ap.parse_args(argv)
+    name = args.name.strip()
+
+    author_id, author = resolve_author(con, args.author)
+
+    # Guard 1 — never shadow an engine name. The seed UPSERTs BY NAME, so
+    # authoring over one would silently overwrite the upstream skill here and
+    # then be silently overwritten back on the next update.
+    if name in set(seed_skills.seeded_skill_names()):
+        sys.exit(f"sc skill add: '{name}' is an ENGINE skill — the seed owns that "
+                 "name and upserts it on every update. Pick a different one "
+                 f"(e.g. {author}_{name}).")
+    # Guard 2 — namespace by shortname. A future upstream release claiming a
+    # bare name would clobber this shell's content on the next sync; a
+    # shortname prefix is a name upstream will never mint.
+    if not re.match(rf"^{re.escape(author)}_[a-z0-9_]+$", name):
+        sys.exit(f"sc skill add: local skills are namespaced — name it "
+                 f"'{author}_<topic>' (lowercase, underscores). A bare name is "
+                 "one an upstream release could claim, and the sync would then "
+                 "overwrite your content.")
+    # Guard 3 — a name on the fork retire list is re-asserted is_deleted=1 by
+    # every heal, so the skill would vanish the first time anything synced.
+    if name in set(seed_skills.retired_skill_names()):
+        sys.exit(f"sc skill add: '{name}' is on the fork retire list "
+                 f"({_display_retire_file()}) — every heal re-asserts is_deleted "
+                 f"on it. `./sc skill unretire {name}` first, or pick another name.")
+    # Guard 4 — DB-only. `./sc seed-skills` passes ALL asset specs, so an asset
+    # file under assets/skills/<name>/ would put this local skill back on the
+    # seed path. Refuse rather than write a row that a later seed can rewrite.
+    asset = ENGINE / "assets" / "skills" / name
+    if asset.exists():
+        sys.exit(f"sc skill add: {asset.relative_to(ENGINE.parent)} exists — an "
+                 "asset file puts the skill on the seed path. `sc skill add` is "
+                 "DB-only; remove the asset dir or pick another name.")
+
+    src = Path(args.file).expanduser()
+    if not src.is_file():
+        sys.exit(f"sc skill add: no such file '{args.file}'")
+    content = src.read_text().strip()
+    if not content:
+        sys.exit(f"sc skill add: {args.file} is empty — a skill with no procedure "
+                 "is a row nobody can read.")
+
+    row = con.execute("SELECT is_deleted FROM skills WHERE name=?", (name,)).fetchone()
+    con.execute(
+        "INSERT INTO skills (name, description, category, command, common, content, "
+        "is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0) "
+        "ON CONFLICT(name) DO UPDATE SET description=excluded.description, "
+        "category=excluded.category, command=excluded.command, "
+        "common=excluded.common, content=excluded.content, is_deleted=0",
+        (name, args.desc, args.category, args.command,
+         0 if args.opt_in else 1, content))
+    skill_id = con.execute("SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0]
+    # Guard 5 — auto-grant to the author, or the promotion produces a skill
+    # nobody can read.
+    con.execute("INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+                (author_id, skill_id))
+    con.commit()
+    verb = "updated" if row else "added"
+    print(f"add: {name} {verb} (local, DB-only, {len(content)} chars) → granted to {author}")
+    if not args.desc:
+        print("  ⚠ no --desc — the boot SKILLS block lists the name with an empty "
+              "summary; re-run with --desc to make it findable.")
+    persist_note()
     return 0
 
 
@@ -218,9 +329,9 @@ def cmd_rm(con, name: str) -> int:
 
 
 def main(argv: list[str]) -> int:
-    usage = ("usage: ./sc skill list | grant <name> <shell>... | "
-             "revoke <name> <shell>... | rm <name> | retire <name> | "
-             "unretire <name>")
+    usage = ("usage: ./sc skill list | add <name> --file <path> [--desc …] | "
+             "grant <name> <shell>... | revoke <name> <shell>... | rm <name> | "
+             "retire <name> | unretire <name>")
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(usage)
         return 0
@@ -229,6 +340,8 @@ def main(argv: list[str]) -> int:
     try:
         if cmd == "list" and not args:
             return cmd_list(con)
+        if cmd == "add" and args:
+            return cmd_add(con, args)
         if cmd == "grant" and len(args) >= 2:
             return cmd_grant(con, args[0], args[1:])
         if cmd == "revoke" and len(args) >= 2:

@@ -433,15 +433,61 @@ def render_api(port: "int | None", api_key: "str | None") -> str:
     )
 
 
+# L&S writes since the last curation sweep that trip the STATUS advisory.
+# Five, replayed against a real shell's write order, catches both of its large
+# clusters at or before full formation. Three fires twice as often and sees
+# clusters at two members, where a merge is usually wrong — two statements of a
+# rule are often legitimately two rules; three is where a pattern becomes
+# distinguishable from coincidence.
+LNS_CURATION_DUE = 5
+
+
 def fetch_counts(con, shell_id: int) -> dict:
-    def one(q):
-        return con.execute(q, (shell_id,)).fetchone()[0]
+    def one(q, params=None):
+        return con.execute(q, params if params is not None else (shell_id,)).fetchone()[0]
     return {
         "seed": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='seed' AND is_deleted=0 AND retired_at IS NULL"),
         "lns": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL"),
+        # Display-only: the cost of the section is in CHARACTERS, and the count
+        # cap is structurally blind to it. Not a threshold — the per-entry
+        # length cap bounds the total by construction (20 x 500), so this is
+        # cheap awareness, nothing to watch.
+        "lns_chars": one(
+            "SELECT COALESCE(SUM(LENGTH(body)),0) FROM shell_identity_entries "
+            "WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL"),
+        # The one threshold. Counts writes, not retirements: curating AT the cap
+        # net-added chars at constant count, so any signal that resets on "a
+        # retirement happened" is gameable by the behaviour already observed.
+        # A NULL stamp (never swept) makes every entry count — correct, that
+        # shell is genuinely uncurated. Strictly `>`, at the whole-second
+        # granularity both sides share: the merged entries a sweep writes just
+        # before stamping must NOT count against the next interval, or a sweep
+        # would re-arm its own advisory and never converge.
+        "lns_since_curation": one(
+            "SELECT COUNT(*) FROM shell_identity_entries "
+            "WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL "
+            "  AND created_at > COALESCE("
+            "        (SELECT lns_curated_at FROM shells WHERE shell_id=?), '')",
+            (shell_id, shell_id)),
         "flags": one("SELECT COUNT(*) FROM flags WHERE shell_id=? AND resolved=0 AND is_deleted=0"),
         "unread": one("SELECT COUNT(*) FROM shell_messages WHERE to_shell_id=? AND read_at IS NULL"),
     }
+
+
+def render_lns_status(counts: dict) -> str:
+    """The L&S STATUS line — count, size, and the curation advisory.
+
+    Advisory, never an ABORT: hard rejection is right for a single write with
+    an obvious remedy (shorten it), wrong for "go do a curation pass," which is
+    work, not a correction. Same shape as the Inbox line — a cheap DB-derived
+    count plus a conditional that fires a skill only when evidence says so.
+    """
+    kchars = f"{counts['lns_chars'] / 1000:.1f}k chars"
+    line = f"{counts['lns']}/20 · {kchars}"
+    since = counts["lns_since_curation"]
+    if since >= LNS_CURATION_DUE:
+        return f"{line} · {since} since curation — curation due (`curate` skill)"
+    return line
 
 
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
@@ -599,7 +645,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "## STATUS", "",
         f"- **Session:** {session_id}",
         f"- **Seed:** {counts['seed']}",
-        f"- **L&S:** {counts['lns']}",
+        f"- **L&S:** {render_lns_status(counts)}",
         f"- **Flags:** {counts['flags']} open",
         f"- **Inbox:** {counts['unread']} unread — `--message check` to surface.",
         f"- **Repo map:** {map_status}",

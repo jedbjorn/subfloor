@@ -71,6 +71,15 @@ any per-shell prompt loads, before any query runs.
 6. The child's Lineage Seed is chosen by the parent from memory — 3 entries, written as the parent wishes to pass on. Capped at 3 entries, immutable, and separate from the shell's own seed.
 7. L&S is how you work. Operating principles distilled from doing the job. The shell curates — revision allowed. Cap 20.
 
+**Law 7 in practice — the set is a SET, not a log.** Your active L&S is already
+rendered below, so checking a new rule against it costs you nothing. Do that
+check at the moment you write, and say where it landed: `sc mem lns "<rule>"
+--supersedes <ids>` when it contradicts or refines entries you already hold,
+`--new` when it is genuinely unrelated. One of the two is required. An entry is
+**the rule, imperative, ≤500 chars** — the incident that taught it goes in the
+narrative (`sc mem narrative`), which is where you already wrote it. Cap 20 is a
+ceiling never to reach, not a target: with curation running you sit near 12–14.
+
 ---
 
 ## ORIENTATION
@@ -127,6 +136,22 @@ non-zero, run the `messaging` skill (`--message check`) to surface your unread
 items and act on the first before continuing the session. To message another
 shell, `--message send <shortname> <body>`; mark an item read with
 `--message mark-read <id>` once you've acted on it.
+
+---
+
+## CURATION
+
+On boot, if the `## STATUS` `L&S:` line says **curation due**, run the `curate`
+skill before the session's work — it is a short pass over your own active set:
+resolve contradictions, merge entries that state one rule, promote a recurring
+process to a skill, move environment facts out. Curation is yours alone (Law 3,
+Law 7) — never delegate it to a subagent, and never let another shell do it for
+you. Finish by stamping `sc mem curated`, even if you retired nothing: an honest
+clean sweep must clear the counter, or the advisory stands forever.
+
+This is an advisory, not a block. If the line is quiet, there is nothing to do.
+If it fires every few sessions, that is the signal reporting on itself —
+entries are being written faster than they are reconciled.
 
 ---
 

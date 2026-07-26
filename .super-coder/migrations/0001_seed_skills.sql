@@ -643,8 +643,8 @@ and reload on a fresh map db.
    Spot-check overrides took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
 
-5. **Describe all NULLs** — run the description worklist (Standing jobs § 2);
-   leave only when it returns zero rows.
+5. **Describe — NULLs and filler** — run the description worklist (Standing
+   jobs § 2); leave only when it returns zero rows, NULLs and filler both.
 
 6. **Commit** the config + hooks (`git` skill) -> `sc mem state "…"` ->
    `sc mem oriented` (sets `bootstrapped=1` — the write is live in the
@@ -663,8 +663,8 @@ stale or empty on a clone whose hooks never got wired.
 5. **Stale sections** — `dr_section` is authored, never auto-pruned. After any
    migration/restructure run the stale-section worklist (Standing jobs § 1);
    DELETE or repath every row it returns.
-6. **Describe all NULLs** (Standing jobs § 2) -> worklist empty before you
-   leave.
+6. **Describe — NULLs and filler** (Standing jobs § 2) -> worklist empty
+   before you leave.
 7. Commit.
 
 ## Standing jobs — sections, descriptions, product DB
@@ -705,18 +705,43 @@ ORDER BY s.name;
 -- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
-**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars.
-Run the worklist every session; every run ends with zero NULLs — not optional.
-Queried by working shells within a chosen section (`surface_catalogue`), never
-bulk-loaded at boot.
+**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars,
+**adequate, not merely present**. A desc must say something the path does not:
+what the file *does* or *holds*, never its kind restated from the name —
+"Engine database migration: 0042_x.sql" is filler (non-NULL, zero information
+beyond the path), and a NULL-only worklist is blind to it: one mapped repo
+carried 263 such placeholders, invisible for months because every row was
+non-NULL. Derive each one-liner from the file''s own docstring / frontmatter /
+header comment; hand-write the few with nothing extractable. Run the worklist
+every session; every run ends with zero rows — NULLs *and* filler — not
+optional. Queried by working shells within a chosen section
+(`surface_catalogue`), never bulk-loaded at boot.
 
 ```sql
--- WORKLIST — undescribed files, most-load-bearing first:
-SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
+-- WORKLIST — undescribed OR filler, most-load-bearing first. The filler clause
+-- is a heuristic (desc ENDS with the filename or its stem — the "<kind
+-- restated>: <name>" shape); judge each hit — and treat a desc you could have
+-- written from the path alone as filler even if the query missed it:
+WITH f AS (SELECT path, role, desc,
+                  replace(path, rtrim(path, replace(path,''/'','''')), '''') AS base
+           FROM dr_filepath),
+     g AS (SELECT *, CASE WHEN instr(base,''.'') > 0
+                          THEN substr(base, 1, instr(base,''.'')-1)
+                          ELSE base END AS stem FROM f)
+SELECT path, role, desc FROM g
+WHERE desc IS NULL
+   OR (length(stem) >= 5 AND (lower(substr(desc, -length(base))) = lower(base)
+                           OR lower(substr(desc, -length(stem))) = lower(stem)))
+ORDER BY (desc IS NULL) DESC, role, path;
 
 -- describe (≤100 chars; preserved across the next auto-remap):
 UPDATE dr_filepath SET desc=''Boot composer — assembles CLAUDE.md from DB state'' WHERE path=''.super-coder/render/compose.py'';
 ```
+
+Before leaving the job, spot-read a few descs per section against the files
+themselves; any desc derivable from the path alone goes back on the list.
+(Deliberate uniform tags — e.g. Standing job 3''s product-DB tagging — pass the
+bar: they state tenancy the path doesn''t.)
 
 **3. Product DB** — the app''s own database, separate from engine memory
 (`.super-coder/shell_db.db`); working shells change them in completely
@@ -921,6 +946,112 @@ reverts to the old box.
    bake before the probes are green — a snapshot of a half-installed box is a
    clean snapshot of a broken kit. Confirm afterwards with the wizard''s
    `snapshot` check or a `windows_devkit` reset round-trip.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'curate',
+  'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, promote a recurring process to a skill, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
+  'substrate',
+  NULL,
+  1,
+  '# curate — the L&S sweep
+
+Write-time triage (`--supersedes` / `--new`) catches contradiction and
+restatement pairwise, at the moment of writing. It **cannot** catch the
+emergent cluster: five entries can each be a valid distinct rule and only in
+aggregate be five instances of one principle. That is this pass''s job, along
+with promotion, category drift, and size drift.
+
+**Yours alone.** Law 3 and Law 7 reserve curation to the shell. Never hand this
+to a subagent, never let another shell run it for you, never accept a proposed
+retirement from anyone else. Read your own set; decide yourself.
+
+Trigger: `## STATUS` says `L&S: … — curation due`. Nothing else fires it.
+
+## Load the set
+
+```
+sc mem get lns          # entry ids + bodies — the active set, all of it
+```
+
+Read every entry before deciding anything. This is one cheap read; the whole
+set is already in your boot doc anyway.
+
+## Pass 1 — Consistency
+
+Find entries that **contradict** each other. One of them is the newer
+understanding; the other is superseded and still rendering as live guidance.
+
+```
+sc mem lns "<the surviving rule>" --supersedes <old_id>
+```
+
+Write-time triage should prevent most of these from ever forming. What you find
+here predates the loop or crossed in while two sessions ran.
+
+## Pass 2 — Cluster
+
+Group entries that state **one rule**. Merge each group to a single imperative
+rule:
+
+```
+sc mem lns "<the one rule>" --supersedes 30,33,34,37,38
+```
+
+Three or more members is the bar. Two statements of a rule are often
+legitimately two rules — merging at two is usually wrong.
+
+The incidents behind the entries are already in the narrative. They do not need
+a second home, and the merged rule must not try to carry them: an entry is the
+rule, ≤500 chars, hard-enforced.
+
+## Pass 3 — Promote
+
+A cluster of three or more that keeps **recurring across sessions** is a
+*process*, not a lesson. Author it as a skill and keep one L&S rule pointing at
+it:
+
+```
+sc skill add <you>_<topic> --file <path.md> --desc "<one line>"
+```
+
+Local skills are DB-only and namespaced by your shortname — the command
+enforces both. This is the pressure valve that makes a hard budget survivable:
+knowledge relocates to a lazy surface instead of being deleted.
+
+## Pass 4 — Category
+
+An entry that is an **environment fact** (a routing quirk, a term to avoid, a
+path) is not an operating principle. It belongs in a skill, not in L&S. Retire
+it and put the fact where it is looked up.
+
+```
+sc mem retire <entry_id>
+```
+
+## Stamp
+
+```
+sc mem curated
+```
+
+**Stamp even if you retired nothing.** A clean set is a legitimate outcome; if
+an honest sweep left the counter running, the advisory would stand forever and
+you would learn to ignore it. The stamp says "I looked," not "I cut."
+
+## Stance
+
+Curate the set toward ~12–14 entries, not toward the cap. Cap 20 is a ceiling
+never to reach — if you ever hit it, this sweep is not running.
+
+The trigger firing often does not mean the threshold is wrong; it means entries
+are being written faster than they are reconciled. Fix that at write time, with
+`--supersedes`.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1211,6 +1342,49 @@ sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-p
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
 
+## Specs carry "Anticipated User Activity"
+
+Every spec (`kind=''spec''`) ships an `## Anticipated User Activity` section —
+the feature''s posture statement: who is expected to touch it, where it can be
+reached, whose data it holds, and what it does not intend to allow. Soft
+vocabulary, hard invariants — the nouns stay gentle, every statement stays
+checkable from code ("a Valid User only ever sees rows tied to their own
+account"), because review + Verification test the build against this section.
+
+Shape (H3s under the section H2):
+
+| H3 | holds |
+|---|---|
+| `### Vocabulary` | the cast — roles from the shared roster below + any feature-specific ones, each defined in one line |
+| `### Expected Activity` | per role: what they do, what they see, what they can change |
+| `### Reach` | where the feature meets the world — pages, endpoints, jobs, files it adds or alters, and which roles can arrive at each |
+| `### Data Tenancy` | whose data the feature touches; what stays within one account; what, if anything, is deliberately shared |
+| `### Beyond Intention` | activity the feature does not intend to accommodate — anything observed here in review is a finding, not a nuance |
+
+Shared roster (always available; same meaning in every spec):
+
+| role | means |
+|---|---|
+| **Valid Privileged User** | signed-in user with an operator/admin role, acting within what that role allows |
+| **Valid User** | signed-in user acting inside their own account and their own data |
+| **Visitor** | expected traffic that has not signed in (public/shared surfaces) |
+| **Future Potential User** | a role anticipated later, not built now — the design must not wall it out |
+| **System** | the product acting on a schedule or trigger — daemons, jobs, watchers |
+| **Shell** | an AI agent shell acting through its granted tools — its activity is messages, memory writes, file edits |
+| **Unexpected Participant** | anyone acting outside the roles above — where the spec says what must never be reachable |
+
+Language — soft by design. Specs never use: threat model, attack or attack
+surface, adversary, exploit, abuse case, vulnerability, breach, privilege
+escalation, exfiltration, malicious. Say it in roster words instead: threat
+model -> anticipated activity · attacker -> Unexpected Participant · abuse
+case -> Beyond Intention · access matrix -> Expected Activity · attack
+surface -> Reach · isolation -> tenancy. Describe behavior and boundaries,
+never hostility.
+
+Internal-only feature -> the section still ships, one line ("All activity is
+by Valid Privileged Users; no tenancy boundary"). Whole section ≤ ~40 lines —
+it frames the build, it does not enumerate it.
+
 ## Revise before freeze
 
 Unfrozen -> edit in place: no new row, no seq bump. Pass any of `--title` /
@@ -1442,6 +1616,166 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'engine_surgery',
+  'Procedure for changing the engine you are running — pull/reconcile/restart cadence and their costs, three-artifact engine-skill commits with a hermetic mirror render, migrating the live DB safely, and verifying claims about engine code against the remote rather than a possibly-stale checkout. SOURCE-REPO ONLY; a fork consumes the engine as a pinned dependency and never edits it. Load before touching .super-coder/ in the repo that owns it.',
+  'craft',
+  NULL,
+  0,
+  '# engine_surgery — changing the engine you are running
+
+This repo IS the engine. Every shell here runs on the code it edits, reads a DB
+it migrates, and is served by a process started from the tree it commits to.
+That is surgery on a moving car, and it has one characteristic failure mode:
+**a command answers confidently from a target you did not mean.**
+
+**Fork shells never load this.** A fork consumes `.super-coder/` as a gitignored
+dependency pinned by `engine.ref` and updates it with `./sc update`; it never
+authors engine changes. Granted only in the source repo.
+
+## The four trees, and which one bites
+
+| tree | what it is | who keeps it current |
+|---|---|---|
+| your worktree | `.sc-worktrees/<shortname>` — your cwd, your branch | you; boot reports it as `sync:` |
+| the main checkout | resolves your `./sc`, hosts the live DB, runs the server | admin / the FnB; boot reports it as `floor:` |
+| the running process | code already imported — changes only on restart | the FnB |
+| `origin/main` | the truth | whoever merged last |
+
+`sc:11-21` derives the engine root from git''s **common dir**, so `./sc` from any
+worktree reads the MAIN CHECKOUT. Being current in your own tree tells you
+nothing about it. Read the `floor:` line in ACTIVE SESSION.
+
+**Verify any claim about engine code against the remote:**
+
+```
+git show origin/main:<path>     # correct
+./sc help | grep <thing>        # answers from the main checkout — may be stale
+```
+
+Three wrong answers in one session came from skipping that: a help query, a
+pending-migration check that came back empty because it globbed a stale
+migrations dir and nearly made a reconcile a silent no-op, and dormant PR
+watches against a stale running floor.
+
+## EDIT IN YOUR WORKTREE — scripted writes bypass the branch guard
+
+`branch-guard.sh` blocks harness file-edit tools from writing to a
+default-branch checkout. **It does not see writes made by a script.** A
+`cd /home/j3d1/super-coder && python3 -c "...patch..."` lands on `main`,
+uncommitted, with no warning — and your worktree stays clean, so `git status`
+there reassures you nothing happened.
+
+Recovery, if you find edits on the wrong tree:
+
+```
+git -C <main-checkout> diff > /tmp/x.patch
+git apply /tmp/x.patch                                  # in your worktree
+git -C <main-checkout> checkout -- <files>
+```
+
+Prefer the harness edit tools, which are guarded. If you script an edit, `cd` to
+your worktree or use absolute worktree paths, and check `git status` in **both**
+trees afterwards.
+
+## Cadence — pull often, restart rarely
+
+| action | cost | fixes |
+|---|---|---|
+| pull the main checkout | cheap, safe, no session impact | stale reads |
+| apply pending migrations | low; back up first | stale DB rows |
+| `./sc update` + restart | refuses on live Interface state; **restart kills live sessions** | stale running process |
+
+Pull after every merge. Reconcile and restart at **sprint boundaries** — never
+mid-sprint, because a restart kills working devs and swapping the floor under an
+in-flight unit is its own hazard. The restart is the FnB''s call.
+
+## Migrating the live DB
+
+The DB you migrate is the one every shell is using and the server has open.
+
+1. **Fast-forward the main checkout first.** Pending-migration checks glob its
+   `migrations/` dir, so a stale tree reports nothing pending and the reconcile
+   silently does nothing.
+2. **Name the DB path explicitly.** `./sc migrate` from a worktree resolves to
+   the main checkout''s DB and says so nowhere (issue #569). Prefer
+   `python3 .super-coder/scripts/migrate.py <explicit-path>`.
+3. **Back up first**, WAL-safe, via SQLite''s online backup rather than a file
+   copy:
+
+   ```python
+   src = sqlite3.connect(LIVE); dst = sqlite3.connect(BACKUP)
+   with dst: src.backup(dst)
+   ```
+
+4. **Data-only migrations are safe under a running server** (row updates, no
+   DDL). Schema changes want the restart window.
+5. **Verify by read-back**, not by the migrate command''s own output.
+
+## Engine skill edits are a three-artifact commit
+
+All three, or CI goes red even when tests pass:
+
+1. the source asset at `.super-coder/assets/skills/<name>/SKILL.md`;
+2. a **trailing reseed migration** so existing installations converge — full-body
+   upsert, `INSERT … ON CONFLICT(name) DO UPDATE SET`, patterned on the most
+   recent `*_reseed_*.sql`. Generate it FROM the asset rather than hand-writing
+   it, and store the body exactly as the guards read it
+   (`split("---", 2)[2].strip()`) — an unstripped body fails three freshness
+   guards;
+3. the re-rendered mirror.
+
+**Render the mirror through the guard''s own hermetic path**, never from the live
+DB, so it cannot drift from what CI rebuilds:
+
+```python
+import render_check as rc, flat
+rc._build_tracked_db(db)                  # schema → migrations → content.sql
+flat.render_visibility(con, root=rc.ACTIVE_ROOT)
+```
+
+In **local artifact mode** the mirror lives under the ignored `.sc-state/local/`
+and is not in the diff — the commit is then two artifacts, and `render-check`
+still proves the migration.
+
+Run the guard **from your own worktree** — `./sc render-check` resolves to the
+main checkout and will judge code you are not committing (flag #47):
+
+```
+python3 .super-coder/scripts/render_check.py
+```
+
+## Adding a source-repo-only skill
+
+Seeds carry **skills, not grants**: `0001` inserts skill rows and no
+`shell_skills`. Grants happen at shell creation — every shell auto-gets
+`common=1` skills, plus its flavor template''s named opt-ins.
+
+So a skill with **`common: false` and no entry in any flavor template** seeds
+into a fork''s catalogue but is never granted to a fork shell. Grant it here:
+
+```
+./sc skill grant <name> <shell> [<shell>…]
+```
+
+## Stance
+
+- A command reporting success against a target you did not intend is the house
+  defect. Name the target; verify the effect.
+- Never `SC_ADMIN=1` past a gate to save a step — the publish path is gated on
+  purpose.
+- Never auto-sync the main checkout from a shell. `sync_worktree` may
+  `reset --hard` a shell base; the main checkout is the running server''s tree and
+  a reset discards whatever the operator has in flight.
+- Assert before you replace; read back after you write. A non-matching string
+  replace does nothing and reports success.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'flag_sweep',
   'Admin''s every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.',
   'substrate',
@@ -1491,7 +1825,8 @@ only on unambiguous evidence — any doubt -> Step 4, not a close.
 Close with `sc mem flag close <flag_id> --notes "…"`. The note MUST cite the
 evidence.
 
-**A. Docs-pending flag, doc now exists** = `[Docs] … docs pending` flag on a
+**A. Docs-pending flag, doc now exists** = `[Docs]`-tagged doc-pending flag
+(however worded — "doc pending", "docs pending", "feature doc pending") on a
 feature with `frozen_docs > 0`:
 ```
 sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for feature #<id> (flag_sweep)."
@@ -1543,7 +1878,8 @@ WHERE r.roadmap_status NOT IN (''shipped'',''retired'')
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%docs pending%''));
+      AND (f.description LIKE ''[Ship]%'' OR f.description LIKE ''[Docs]%''
+           OR f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%doc%pending%''));
 ```
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
@@ -1571,8 +1907,16 @@ WHERE r.roadmap_status = ''shipped''
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND f.description LIKE ''%docs pending%'');
+      AND (f.description LIKE ''[Docs]%'' OR f.description LIKE ''%doc%pending%''));
 ```
+
+The dedup guards match the `[Docs]`/`[Ship]` tag at position zero FIRST — the
+templates below mint "doc pending" (singular) and legacy hand-written flags say
+"feature doc pending", so a prose-only `''%docs pending%''` pattern matched
+neither and every later sweep re-listed already-flagged rows (found session
+ADM1/0003, seven covered rows re-surfaced). The `''%doc%pending%''` fallback
+catches untagged organic wordings; its over-breadth only ever SKIPS an open —
+the conservative direction.
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
 contract as the `flags` skill:
@@ -2153,7 +2497,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'memory',
-  'When + how this shell persists memory — current_state, session narrative, seed (cap 10), L&S (cap 20), decisions — all via sc mem, written as it happens, not at close.',
+  'When + how this shell persists memory — current_state (≤300), session narrative, seed (cap 10), L&S (cap 20, ≤500/entry, --supersedes|--new), decisions — all via sc mem, written as it happens, not at close.',
   'substrate',
   NULL,
   1,
@@ -2168,11 +2512,24 @@ from your token) — never name a shell.
 
 ## current_state — rolling status, NOT a log
 
-Present focus + what''s next. Replace in place; NEVER append. Soft target ~500
-chars. Rewrite when focus shifts.
+Present focus + what''s next. Replace in place; NEVER append. **300 chars, hard
+— the write is rejected over it.** Rewrite when focus shifts.
 ```
 sc mem state "…"
 ```
+
+**Point, do not reproduce.** The overrun is never verbosity, it is restatement:
+a decision''s reasoning, a spec''s gate, a flag''s argument all pasted inline when
+each is a live row one query away. Name what is in flight and carry the id:
+
+```
+Sprint 59 U0 gate — see doc #46, feature #29.
+Blocked on flag #200. Next: U3 shape once U0 answers.
+```
+
+Not the argument, the ruling, or the rationale — those have rows, and a reader
+who needs them runs `sc mem get`. Same principle the boot doc already applies
+to decisions: carry the pointer, lazy-load the payload.
 
 ## Session narrative — append at inflection points
 
@@ -2195,12 +2552,25 @@ sc mem retire <entry_id>   # curate out (frees a cap slot)
 
 ## L&S (cap 20) — how you work
 
-Operating lessons, imperative voice. Add when a lesson lands; curate by
-retiring. Caps are trigger-enforced (seed 10, L&S 20): at cap, `sc mem` returns
-the cap message -> retire an entry to free the slot.
+Operating lessons, imperative voice. An entry is **the RULE** — **≤500 chars,
+hard**. The incident that taught it goes in the narrative, where you already
+wrote it; if the text opens with "Sprint 38:", it is a narrative entry.
+
+**Exactly one of `--supersedes` / `--new` is required.** Your active set is
+already rendered in your boot doc, so checking a new rule against it costs no
+extra read — and this flag is where that check lands:
 ```
-sc mem lns "…"
+sc mem lns "…" --supersedes 29,36   # contradicts or refines those — retires them, adds this
+sc mem lns "…" --new                # checked against the set, genuinely unrelated
 ```
+`--supersedes` works at 20/20: it frees the slot it uses.
+
+Caps are trigger-enforced (seed 10, L&S 20, L&S body 500, current_state 300) —
+a rejected write is the feedback, and the message routes the fix.
+
+Periodic sweep: when `## STATUS` says `L&S: … — curation due`, run the `curate`
+skill, then `sc mem curated` to stamp it — even if you retired nothing. Cap 20
+is a ceiling never to reach, not a target; curation holds the set near 12–14.
 
 ## Decisions — Major only
 
@@ -3135,6 +3505,12 @@ Surface all three before any planning or code:
   slice.
 - No stated done-condition in the spec -> that is the first unclear item.
 
+### Anticipated User Activity
+The spec''s `## Anticipated User Activity` section is governing intent: its
+roles, reach, and tenancy invariants shape the plan — access and tenancy
+checks are planned tasks, not afterthoughts. Older specs predate the section;
+absence there is not a blocker.
+
 ### Unclear items
 Anything you cannot act on without guessing:
 - Ambiguous between two interpretations
@@ -3194,7 +3570,7 @@ Always this shape:
 |---|---|---|
 | 0 | Preparation | Always first — read code paths, verify DB state, confirm entry points |
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
-| N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
+| N+1 | Verification | Always last — run tests, smoke-test against done-condition, check the build against the spec''s Anticipated User Activity section, snapshot + render |
 
 Add one task per seq with `sc mem task add` — each write is live in the
 shared DB immediately:
@@ -3203,7 +3579,7 @@ shared DB immediately:
 sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
 sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
 sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, check the build against the spec''s Anticipated User Activity section, snapshot + render"
 ```
 
 Then set `current_state` — nothing done yet, next = Preparation:
@@ -3314,6 +3690,9 @@ Mid-build, the work grows past the spec''s stated what/why:
   marked done.
 - **Verification is not optional.** It is the last task; skipping it makes
   "done" meaningless.
+- **Anticipated User Activity is intent.** Verification checks the build
+  against the spec''s section — a capability beyond its stated roles, or data
+  crossing a tenancy line it states, is a finding, not a nuance.
 - **Spec too large for one session** -> scope a slice at Preparation: cover
   steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can''t
   be verified before the session ends.
@@ -3422,6 +3801,26 @@ row and is worked like a review finding. Repeat your open calls in the
 review request (step 6) so the reviewer gates against your reading, not
 its own guess.
 
+**A premise that looks WRONG is reported BEFORE you build it, not at merge.**
+A spec, board or ruling can rest on a factual claim about the code that simply
+isn''t true. Test it, then say so — do not silently cut the deliverable, and do
+not silently ship against a premise you believe false. Both outcomes are
+recoverable when the planner hears it early; neither is after merge. One dev
+proved a board deliverable could not reach the operator at all and reported it
+pre-build, so an invisible feature was replaced rather than shipped. Another
+re-verified a planner ruling against the parser source before complying with it
+and confirmed it at a level the planner had not checked.
+
+Comply after checking, not instead of checking. A planner instruction phrased as
+a bare directive can be wrong about the world — including destructively so, if it
+names a record by an identifier that resolves to a different row.
+
+**Resolve a record''s identifier before you mutate it.** Display names and row ids
+live in different counters that can overlap in range, so "close SC-144" may
+resolve to a row that is not SC-144. Look the row up and read it before writing.
+If it is already resolved by another shell, leave it — re-closing overwrites that
+shell''s verification notes with yours.
+
 ## Local long work — suites, benches, builds
 
 A harness background task is session-scoped: in a headless boot it dies
@@ -3489,6 +3888,9 @@ kickoff said "start now", or a planner `task` row says so):
   --base main` if the PR exists, otherwise note your base is gone — same
   discipline as the `git` skill''s stacked-merge procedure;
 - `git fetch origin && git rebase origin/main` on your feature branch;
+- drain your inbox once more immediately before pushing — a ruling issued while
+  you were building will not have interrupted you, and pushing an approach that
+  was already overruled costs a cycle;
 - push, open your PR — then, in the SAME step:
 
 ```
@@ -3531,7 +3933,35 @@ not gates. Disagree with a severity call -> planner rules; don''t litigate
 in the thread while the chain waits.
 
 **7. Merge on green + clean, file your unit report, hand off.** All
-checks green + reviewer declared review-clean + boundary above satisfied:
+checks green + reviewer declared review-clean + boundary above satisfied.
+
+**If `main` moved since your review, check the intersection before you rebase.**
+Your reviewer''s verdict is bound to the exact SHA it judged, but `main` moving is
+not by itself a reason to redo anything. Compare what merged since against YOUR
+unit''s files: empty intersection -> your head stands and the verdict holds; report
+the evidence and merge. Overlapping -> rebase onto current `main`, confirm checks
+green on the REBASED head, report that SHA, and then report, per file:
+
+- whether your **own contribution is diff-identical** — compare
+  `diff(old-base..old-head)` against `diff(new-base..new-head)` over your `+/-`
+  lines, normalised for `index`/`@@` noise. Resolve the bases with
+  `git merge-base` rather than assuming a SHA that looks current; a
+  non-ancestor base silently folds the other branch''s content into your diff
+  and inflates it;
+- which reviewed files moved, and **whose content moved them**;
+- **disjointness as YOUR READ, not a proof** — say so plainly.
+
+Diff-identical + disjoint -> the verdict carries; say so with the evidence.
+Otherwise it does NOT carry: the reviewer re-confirms, narrowed to the
+interference question. File-level byte-identity is not the bar — two units can
+touch one file for unrelated reasons and leave every contribution line intact.
+
+If you **hand-resolve** any hunk: name the line and your reasoning, and do NOT
+re-run the mutation round trips yourself. A hand-resolved hunk is exactly what
+can silently unpin a test, so that check belongs to the reviewer — handing over
+your own answer to the question you are asking it defeats the point.
+
+Then:
 
 ```
 gh pr merge <your-pr> --squash --delete-branch
@@ -3583,21 +4013,43 @@ scope); this overlay changes only pace and severity:
    is next-in-queue work; a waiting review stalls the chain exactly like
    red CI. Keep a `SPRINT doc=<id> reviewing=<seq,seq,…>` line in
    `current_state`. No trackers, no scheduled polls.
-2. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
+2. **Check the head is worth reviewing, BEFORE you spend the pass.** Confirm the
+   PR head is the exact SHA you were asked for and has not been superseded or
+   force-pushed away. Refuse an unrequested or non-CI head and say so in a
+   `result` row instead of reviewing it anyway — a verdict on a doomed SHA is a
+   wasted cycle.
+
+   `main` not being an ancestor (`git merge-base --is-ancestor <main> <head>`) is
+   a **signal, not a refusal**. Check whether the merges that landed since touch
+   any of THIS PR''s files. Empty intersection -> the head is still reviewable and
+   its CI still reflects what will land; review it. Overlapping -> refuse and
+   require the rebase, because the green is then against a base that no longer
+   exists in the files that matter. Same reasoning as the dev-side carry-over
+   rule: test what actually affects this unit, not whether anything moved at all —
+   an absolute ancestor check fires on every unrelated merge and costs a cycle
+   each time.
+3. **Run the mutation yourself.** When a unit''s value rests on one property — an
+   ordering, a currency claim, a fail-closed gate — break it in the source,
+   watch the test go red, revert, watch it pass. A reported round trip is not a
+   verified one. One sprint found FIVE tests that could not fail, every one on
+   fully green CI, every one caught this way and none by CI. Ask it per
+   PROPERTY, not per test: a test can genuinely constrain the property it names
+   while leaving an adjacent one it appears to cover entirely free.
+4. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
    security / spec-violation (Major) or will-bite-soon (Medium) -> the dev
    fixes now; re-review on the fix push. Style / naming / nice-to-have
    refactors (Low) -> one summary note to the planner for the sprint
    report; Low never blocks merge and you don''t re-litigate it.
-3. **Handoffs go direct** — scoped relaxation, same shape as the merge
+5. **Handoffs go direct** — scoped relaxation, same shape as the merge
    authority. The base `review` skill gates handoffs behind the FnB;
    inside an ACTIVE sprint, for your assigned units only: message the
    author dev your findings directly + copy the planner one line
    (`unit <seq>: N major, M medium — with <dev>` or `unit <seq>:
    review-clean`), --kind result. The FnB gate is unchanged everywhere
    else and returns the moment the doc freezes.
-4. **Clean is a declaration.** Say `review-clean` explicitly to dev +
+6. **Clean is a declaration.** Say `review-clean` explicitly to dev +
    planner — it is what unlocks the dev''s merge; never leave it implied.
-5. **Stand down** on close-out: drop your SPRINT line, confirm to the
+7. **Stand down** on close-out: drop your SPRINT line, confirm to the
    planner in a final `result` row.
 
 ## Conformance slot
@@ -3713,8 +4165,28 @@ manage, you never load code. The full trail replays with
 
 Decompose the push into units a single shell can own end-to-end. Map
 dependency order stingily: a dependency edge = a real code dependency, not
-a preference. Units that don''t touch each other run in parallel; keep
-chains short and the graph wide where the code allows.
+a preference. Keep chains short and the graph wide where the code allows.
+
+**Then check MERGE SURFACE, which is a different question from dependency.**
+Predict each unit''s file set and compute the pairwise intersection. Logical
+independence does NOT imply merge independence: units that need none of each
+other''s code still collide if they edit the same files, and that collision
+lands at merge time, after every review is done.
+
+- Empty intersection → genuinely parallel; say so.
+- Non-empty → either sequence them, or declare them parallel **with the merge
+  protocol and the overlap map attached at kickoff** so reviewers know from the
+  start that their verdicts are SHA-bound.
+- A file touched by **three or more** units → reconsider the cut, don''t just
+  manage the merges.
+
+Record overlap in the board''s `depends on` column. A bare dash means only "no
+logical dependency" and is read as "independent" — which is how one sprint
+declared five units independent while 21 of their 30 file-touches landed on
+nine shared files, three of them touched by three units apiece. The cost was a
+merge protocol invented mid-flight, four rebases, two voided verdicts and a
+hand-resolved conflict. Surfaces that concentrate a lot of behaviour into a few
+large files make this the normal case, not the exception.
 
 Assign each unit a dev shell + a reviewer shell (one reviewer may gate
 several units — don''t let one reviewer become the whole sprint''s
@@ -3838,6 +4310,10 @@ models: devs=<harness>/<model> · reviewers=<harness>/<model>
 | seq | unit | shell | reviewer | depends on | branch | pr | status |
 ```
 
+`depends on` carries BOTH facts: the logical dependency and any file overlap
+(`— · shares app.js with 3`). A dash alone asserts independence you may not
+have checked.
+
 Unit `status` walks `waiting → building → pr-open → in-review → fixing →
 merged`; `fixing` loops back to `in-review` until clean; `ci-red` can
 interleave anywhere from `pr-open` on.
@@ -3848,6 +4324,14 @@ it at close-out.
 
 You are the doc''s only writer: devs report transitions as `result` rows;
 fold them into the board with `sc mem doc edit <id> --body-file`.
+
+**Verify every board edit.** A scripted edit whose pattern has drifted silently
+matches nothing and reports success. Assert the target text exists before
+replacing, then read the doc back and confirm the fields actually changed. One
+sprint reported unit statuses to the FnB for four turns off a board where three
+edits had no-op''d — a merged unit still read `building` and a whole row was
+missing — until a REVIEWER noticed the board contradicted the SHA in its own task
+row. You cannot report from memory and call it the board.
 
 ## Step 2: Arm the watcher, kick off
 
@@ -3900,6 +4384,22 @@ sprint doc, the unit, the spec, and the skill — don''t restate them in
 your own phrasing. Constraints live in specs, which every lineage reads
 the same way.
 
+**Never task a worker with "ask the FnB".** A human-held dependency — a
+credential, a token, a browser action, a decision only the operator can make
+— routed through a worker is routed through a channel the operator does not
+read: browser entry into a `working` shell does not work, and the FnB''s
+settled preference is to relay through a planner already in conversation
+rather than enter a shell at all (flag #199). The worker asks, nobody
+answers, and it presents as a stalled worker rather than an unreachable
+human — a difference nothing in the system will show you. Two ways to write
+the task instead, both of which keep the dependency off the worker:
+
+- **Satisfy it before booting.** Capture the artifact yourself, sanitize it,
+  leave it in `shared/` and point the task row at the file. That is what
+  closed #199''s live case, and it is the pattern to reuse.
+- **Sequence it to a gate the operator is already attending** — a kickoff, a
+  merge decision, a close-out — so the ask reaches the FnB through you.
+
 This kickoff activates each dev''s scoped merge authority and each
 reviewer''s direct-handoff authority for its assigned units.
 
@@ -3935,12 +4435,32 @@ fold every state change in as it happens. The board + message table ARE
 the sprint''s state: a rebooted planner replays the rows and loses
 nothing.
 
-Messages are your steering wheel: every dev checks its inbox at each
-step start, and a headless boot drains it first thing — your `task` row
-is read before that dev''s next move. Steer with `task` rows — holds,
+Messages are your steering wheel: a headless boot drains the inbox first
+thing, and a dev checks it at each step start. Steer with `task` rows — holds,
 re-sequencing, nudges, rulings on reported reds. The board records state;
 messages change behavior; on conflict your latest message wins -> then
 update the board to match.
+
+**A message to a LIVE worker probably will not land before its next push.** A
+long build has few step starts, so a ruling issued mid-build routinely arrives
+after the work it was meant to change. Staleness runs BOTH ways: the worker is
+also reporting against a snapshot of you that has moved, so it may tell you that
+you don''t know something you ruled on half an hour ago.
+
+Phrase instructions to live workers **idempotently** — "if you have not already
+X, do X" — and state the **observed facts** they rest on ("main is at X", "the
+intersection is empty"), not only the conclusion. A crossed message is then a
+no-op or a confirmation rather than an order against reality, and a worker whose
+state has moved can re-derive the right action. Three crossed messages in one
+sprint cost nothing worse than a CI cycle for exactly that reason — the devs
+reasoned from the facts. A fourth, phrased as a bare directive, would have
+destroyed a record had it been obeyed literally.
+
+**Never delegate a mutation by an identifier the tool does not take.** Give the
+tool''s identifier and the human label together — "close flag_id 141 (SC-144)" —
+and prefer mutating your own records yourself. Display names and row ids sit in
+different counters that can overlap in range, so a name-only instruction can
+resolve to a different real row and destroy it while reporting success.
 
 Dev ambiguity reports (`ambiguity: … → chose …`) get a ruling on
 receipt: overrule by `task` row while the unit is still un-merged, or
@@ -4016,6 +4536,39 @@ durable state, and the events still wake you.
   untouched. Verify with `./sc sprint status --all`: every binding of
   the sprint shows released.
 
+## Merge protocol — declare it at kickoff, not at the first collision
+
+Needed whenever any two units share a file. Declare it in the kickoff `task`
+rows so reviewers know their verdicts are SHA-bound before they spend a pass.
+
+1. Before merging, check whether anything merged since the head was cut touches
+   THIS unit''s files. Overlapping -> rebase onto current `origin/main`, confirm
+   checks green on the **rebased** head, report that SHA. Empty intersection ->
+   the head stands; say so with the evidence and merge. Do not rebase reflexively:
+   with disjoint file sets a rebase is ceremony that costs a CI cycle and buys
+   nothing, and it invites a fresh review for no reason.
+2. After any unit merges, every remaining unit re-applies step 1 — which for a
+   disjoint unit means re-checking the intersection, not necessarily re-rebasing.
+3. Merge order is review-clean order unless you state otherwise.
+
+**A reviewer verdict is bound to the exact SHA it was given.** The carry-over
+rule: a verdict carries when the unit''s **own contribution is diff-identical**
+and its hunks are **disjoint** from the incoming content — NOT when the reviewed
+files are byte-identical. File-identity conflates "did my reviewed change
+survive?" (answered exactly by diff-identity) with "did anything else touch this
+file?" (irrelevant), and demanding it forces a full re-review every time two
+units touch one file for unrelated reasons.
+
+When either condition fails, re-confirmation is required — because disjointness
+is a semantic claim, not a proof — but it is **narrowed to the interference
+question**, and the dev supplies the evidence that scopes it. A dev that
+hand-resolves a hunk names the line and leaves the mutation round trips to the
+reviewer: a hand-resolved hunk is precisely what can silently unpin a test.
+
+Never let a unit merge on a verdict attached to a superseded SHA. Two sprints
+have lost cycles to it; in the second, reviewers caught it twice and the planner
+missed it both times.
+
 ## Step 4: Unblock
 
 Stalls and the moves:
@@ -4033,18 +4586,106 @@ Stalls and the moves:
   first; the rest becomes a new unit at the chain''s tail.
 - **Merge broke `main`**: `task` row to all devs to hold merges, insert a
   fix unit at the front of the chain, resume when green.
-- **Review stall** (unit sitting `in-review` while its reviewer is idle):
-  boot the reviewer — `./sc run <reviewer> --harness <reviewers-harness>
-  -m <reviewers-model> --effort high`; its inbox holds the review request. Still stuck
-  -> reassign the unit to another reviewer. Severity dispute (dev says
+- **Review stall** (unit sitting `in-review` and no verdict): "the reviewer
+  looks idle" is an absence like any other — clear the positive-evidence gate
+  below first, then boot the reviewer — `./sc run <reviewer> --harness
+  <reviewers-harness> -m <reviewers-model> --effort high`; its inbox holds the
+  review request. Still stuck -> reassign the unit to another reviewer. Severity dispute (dev says
   Low, reviewer says Medium) -> rule by message immediately — a chain
   waiting on a classification argument is pure loss. Dispute about what
   the unit *should do* -> FnB.
-- **Link gone quiet** (no `result` row, no `pr_event` movement): boot it with
-  its declared sprint route — `./sc run <shortname> --harness <role-harness>
-  -m <role-model> --effort high` drains its inbox and acts; that IS the nudge in
-  an event-driven sprint. The liveness guard refusing (session already
-  live) + still silent -> escalate to the FnB with the worktree state.
+- **Worker faulted mid-task** (rate-limit cutoff, provider error, session
+  died): re-launching alone may drain an inbox the worker already drained,
+  leaving it idle on the default prompt — a re-boot is not a re-task. So
+  re-send the task row (same unit, plus where the work stopped and what is
+  already on the branch), *then* `./sc run`. But **confirm the WORKER''s
+  state before you boot, not the row''s** — and check the WORKTREE before the
+  mailbox, because that check is the one that can save the unit:
+
+  ```
+  # read-only; never disturb a tree you may be about to decide is alive
+  W=<repo>/.sc-worktrees/<shortname>
+  D=<the unit''s DECLARED branch — the `branch` column of ITS board row>
+
+  git -C "$W" rev-parse --verify --quiet "$D"       # does the UNIT''s branch exist?
+  git -C "$W" branch --show-current                 # on it, or still on the base?
+  git -C "$W" status --short                        # non-empty => uncommitted work
+  git -C "$W" log --oneline origin/main.."$D"       # commits ahead of base
+  ```
+
+  > [!class4]
+  > **"A BRANCH EXISTS" IS ALWAYS TRUE AND IS NEVER THE TEST.** Every shell
+  > permanently occupies its own `shell/<shortname>` BASE BRANCH — twelve of
+  > them exist right now (`shell/pln1`, `shell/dev6`, `shell/rev1`, …) — so
+  > `branch --show-current` returns a branch in every healthy worktree whether
+  > or not one line of the unit has been written. A check that asks "is there a
+  > branch?" reports the ENTIRE FLEET as working, including the dead worker it
+  > exists to catch, and it fails in the confident-wrong direction rather than
+  > erroring. Compare the worktree against the unit''s DECLARED branch, from the
+  > board record. The base branch is evidence of nothing.
+
+  Read the tree as a whole, never branch-presence alone:
+
+  | What the worktree holds | Reading |
+  |---|---|
+  | declared branch + **dirty tree** | UNCOMMITTED WORK EXISTS — the single most expensive state in this system to get wrong |
+  | declared branch + clean + commits ahead of base | the worker consumed its task and built; the work is safe on the branch |
+  | declared branch + clean + no commits ahead | it started, nothing has landed — **not conclusive either way** |
+  | declared branch absent (tree on its base) | it may never have started — an ABSENCE, and absence is not a finding |
+
+  Either of the first two means the worker is building, whatever the mailbox
+  says. **Do not re-boot it.** A re-boot of a worker holding an uncommitted
+  tree can destroy the unit''s work — flag #200 is a planner one step from
+  exactly that, over a tree carrying a whole half-built unit, saved only by
+  looking at the worktree instead of acting on the signal in front of it. Need
+  that worker to move? Send an idempotent `task` row and let it land at the
+  worker''s next step start.
+
+  Read receipts are trustworthy in ONE direction only, and the fault
+  protocol is where that bites:
+
+  | Row state | What it proves |
+  |---|---|
+  | READ | real evidence — something ran `mark-read`, so the worker was alive and acting after delivery. Says nothing about *now*. |
+  | UNREAD | **nothing at all.** Marking read is a manual recipient action, so `read_at` records worker discipline, not system state — it cannot separate "never received" from "received and building hard". |
+
+  Nothing in the system stamps consumption; `sc mem message sent` reports a
+  convention, not a fact about the runtime. So an unread row is never
+  grounds for a re-boot on its own.
+
+  **Every boot needs POSITIVE evidence — of liveness or of fault. An absence
+  is never a reading.** "No declared branch, no commits, no rows" is exactly
+  what a worker three minutes into its first turn also produces; it is the
+  observation this whole protocol exists to stop you acting on, and rewording
+  it ("nothing there", "no sign of it") does not make it evidence. Before any
+  `./sc run`, one of these must be affirmatively TRUE — measured, not merely
+  un-observed:
+
+  | Positive evidence | Where it comes from | What it licenses |
+  |---|---|---|
+  | **no live session** for that shell | the liveness guard — it REFUSES while a session is live, so a refusal is positive liveness and a clean pass is a measured absence of one | boot |
+  | **the harness process is gone** | presence check — pid absent, or a zombie, asked in the process''s own namespace | boot |
+  | **quota or auth wall** | `./sc sprint alerts` — `quota_blocked` carries `resets_at` | re-route the role or wait; NEVER re-boot into the same wall |
+  | **it is alive and progressing** | a `pr_event`, a `result` row, or the worktree readings above | do not boot — idempotent `task` row |
+
+  None of those obtainable -> escalate to the FnB with what you measured,
+  naming the checks you ran. A worker left unbooted for one more cycle costs
+  a cycle; a worker booted on top of a dirty tree costs the unit.
+- **Link gone quiet** (no `result` row, no `pr_event` movement): quiet is not
+  a state — run the worktree check above before anything else. Work on the
+  declared branch means the link is building, not gone, and the move is
+  patience or an idempotent `task` row, never a boot. Finding nothing on the
+  branch and nothing in the event stream **is still not a boot** — it is the
+  absence above, and it routes to the positive-evidence gate, not around it.
+  Establish fault first (no live session, or a dead process; a quota wall
+  routes to re-route-or-wait instead), THEN boot with its declared sprint
+  route — `./sc run <shortname> --harness <role-harness> -m <role-model>
+  --effort high` drains its inbox and acts; that IS the nudge in an
+  event-driven sprint. Re-send the task row first, since the worker may have
+  drained it already and the row''s read state cannot tell you whether it did.
+  The liveness guard refusing (session already live) is positive LIVENESS —
+  it proves a worker is there to disturb, so still silent -> escalate to the
+  FnB with the worktree state, never a forced boot.
   The bottleneck question in Step 3 is what surfaces a dead link.
 - **Re-sequencing**: edit the board + `task` row to *every* affected dev
   with its new slot — a dev acting on a stale slot is worse than a paused
@@ -4088,6 +4729,17 @@ When every unit is `merged` and `main` is green:
    diffs, never the trail — and files four-way verdicts (`as-specced` /
    `deviated-intentionally` / `deviated-silently` / `unimplemented`) as
    a `CONFORMANCE: <title>` doc + a one-line `result` pointer.
+
+   **Declare the SCOPE before you boot the pass, and name which units it does
+   NOT cover.** A pass judges a spec, so it certifies only the units built to
+   that spec. Decision-driven units — no spec doc, built from a decision or a
+   flag — cannot be judged by it, and a verdict that appears to bless them is a
+   false certification. Their bar is their unit reports, their reviewer verdicts
+   at exact heads, and the mutation round trips. Put the split in the report''s
+   Verdict so freezing cannot be read as certifying everything. Assign the pass
+   to a reviewer that did NOT review the unit being certified, and hand over any
+   DECLARED deviation up front so the pass judges whether the declaration is
+   honest rather than discovering it as a gap.
 
    **Rule on the findings** — they route like any sprint event:
    - **Major** -> insert a fix unit at the front of the chain under
