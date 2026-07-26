@@ -1196,7 +1196,9 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_pat
     # makes Liberation the one ruler a local run can trust.
     #
     # The arithmetic, from the 1600px CI run of 3bb3ced (slot=504px, need=550px
-    # at 79 chars, font=13.6px):
+    # at 79 chars, font=13.6px). That 504 is the FAILING run's slot — do not
+    # reconcile it with the 496 cap below: a slot equals the cap only while the
+    # context overflows, so the two are different quantities, not a discrepancy.
     #
     #   px/char under the widest ruler   549.8 / 79     = 6.96px
     #   target                           need <= .75 * slot = 378px
