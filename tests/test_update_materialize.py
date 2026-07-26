@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import update  # noqa: E402
+import rollback  # noqa: E402
 
 # Deliberately NOT materialized — per-instance / gitignored / runtime, per the
 # ENGINE_PATHS comment in update.py.
@@ -197,16 +198,28 @@ class EnginePathsAtRefTest(unittest.TestCase):
         _git(self.root, "checkout", old_sha)
         retired_file.write_text("fork sentinel\n")
 
+        state = self.root / ".sc-state"
+        engine = self.root / ".super-coder"
         output = io.StringIO()
         with mock.patch.multiple(
             update,
             REPO_ROOT=self.root,
+            ENGINE=engine,
+            STATE_DIR=state,
+            ENGINE_REF=state / "engine.ref",
+            ENGINE_REF_PREV=state / "engine.ref.prev",
             ENGINE_PATHS=installed,
+        ), mock.patch.multiple(
+            update.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=engine / "engine.manifest",
+            local_edits=mock.Mock(return_value={}),
         ), contextlib.redirect_stdout(output):
             resolved = update._engine_paths_for(
                 new_sha, repo_root=self.root
             )
-            update.materialize_engine(new_sha)
+            update.materialize_fetched_engine(new_sha)
 
         self.assertEqual(resolved, base)
         self.assertNotIn(".super-coder/retired-path", resolved)
@@ -220,6 +233,63 @@ class EnginePathsAtRefTest(unittest.TestCase):
             f"{new_sha[:12]} — skipping: .super-coder/retired-path",
             output.getvalue(),
         )
+        self.assertNotIn(
+            ".super-coder/retired-path/retired.txt",
+            json.loads((engine / "engine.manifest").read_text()),
+            "a retired upstream file lingering on disk must leave the "
+            "materialized manifest",
+        )
+
+    def test_restore_engine_threads_fallback_authority_to_materialize(self):
+        base = ["sc", ".super-coder/scripts"]
+        installed = [*base, ".super-coder/upstream-owned"]
+        (self.root / "sc").write_text("old dispatcher\n")
+        self.write_manifest(base)
+        upstream_file = (
+            self.root / ".super-coder" / "upstream-owned" / "owned.txt"
+        )
+        upstream_file.parent.mkdir()
+        upstream_file.write_text("old upstream content\n")
+        previous_sha = self.commit("previous exact allow-list")
+
+        (self.root / "sc").write_text("new dispatcher\n")
+        (self.scripts / "engine_manifest.py").write_text(
+            "ENGINE_PATHS = load_paths()\n"
+        )
+        upstream_file.write_text("new upstream content\n")
+        current_sha = self.commit("current unparseable allow-list")
+
+        state = self.root / ".sc-state"
+        engine = self.root / ".super-coder"
+        engine_ref = state / "engine.ref"
+        state.mkdir()
+        engine_ref.write_text(current_sha + "\n")
+
+        with mock.patch.multiple(
+            rollback,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            ENGINE_REF=engine_ref,
+        ), mock.patch.multiple(
+            rollback.update_mod,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            ENGINE_PATHS=installed,
+        ), mock.patch.multiple(
+            rollback.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=engine / "engine.manifest",
+        ), contextlib.redirect_stderr(io.StringIO()):
+            rollback.restore_engine(previous_sha)
+
+        self.assertEqual(
+            upstream_file.read_text(),
+            "old upstream content\n",
+            "rollback must materialize the previous engine with the same "
+            "installed-list authority used for its deletion sets",
+        )
+        self.assertEqual(engine_ref.read_text(), previous_sha + "\n")
 
     def test_ref_before_manifest_module_uses_update_literal(self):
         (self.root / "README").write_text("precursor\n")
@@ -418,6 +488,58 @@ class EnginePathsAtRefTest(unittest.TestCase):
         self.assertFalse(
             (state / "engine.ref").exists(),
             "a delta heal that did not land must not be recorded as current",
+        )
+
+    def test_invalid_materialized_manifest_names_half_floor_remedy(self):
+        installed = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text("old dispatcher\n")
+        self.write_manifest(installed)
+        (self.scripts / "update.py").write_text(
+            "from engine_manifest import ENGINE_PATHS\n"
+        )
+        old_sha = self.commit("installed allow-list")
+
+        (self.root / "sc").write_text("new dispatcher\n")
+        (self.scripts / "engine_manifest.py").write_text(
+            f"ENGINE_PATHS = {tuple(installed)!r}\n"
+        )
+        target_sha = self.commit("runtime-invalid target allow-list")
+        _git(self.root, "checkout", old_sha)
+
+        state = self.root / ".sc-state"
+        engine = self.root / ".super-coder"
+        with mock.patch.multiple(
+            update,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            STATE_DIR=state,
+            ENGINE_REF=state / "engine.ref",
+            ENGINE_REF_PREV=state / "engine.ref.prev",
+            ENGINE_PATHS=installed,
+        ), mock.patch.multiple(
+            update.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=engine / "engine.manifest",
+            local_edits=mock.Mock(return_value={}),
+        ), contextlib.redirect_stderr(
+            io.StringIO()
+        ), self.assertRaises(SystemExit) as failed:
+            update.materialize_fetched_engine(target_sha)
+
+        self.assertEqual(
+            str(failed.exception),
+            "update: materialized engine manifest does not expose "
+            "ENGINE_PATHS as list[str]\n"
+            "  engine.ref was not advanced; the recorded engine pin remains "
+            "unchanged.\n"
+            "  no automated recovery is available; report the target engine "
+            "ref upstream",
+        )
+        self.assertEqual((self.root / "sc").read_text(), "new dispatcher\n")
+        self.assertFalse(
+            (state / "engine.ref").exists(),
+            "the overwritten half floor must not be recorded as current",
         )
 
     def test_missing_materialized_path_exits_nonzero_and_names_remedy(self):

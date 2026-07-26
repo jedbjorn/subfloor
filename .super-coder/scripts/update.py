@@ -369,6 +369,14 @@ def _engine_files_at(
     ).stdout.splitlines()
 
 
+_MATERIALIZE_FAILURE_REMEDY = (
+    "\n  engine.ref was not advanced; the recorded engine pin remains "
+    "unchanged.\n"
+    "  no automated recovery is available; report the target engine ref "
+    "upstream"
+)
+
+
 def _materialized_engine_paths(repo_root: Path = REPO_ROOT) -> list[str]:
     """Load ENGINE_PATHS from the engine manifest that is currently on disk."""
     manifest_path = repo_root / ".super-coder" / "scripts" / "engine_manifest.py"
@@ -380,6 +388,7 @@ def _materialized_engine_paths(repo_root: Path = REPO_ROOT) -> list[str]:
         sys.exit(
             "update: could not load the materialized engine manifest at "
             f"{manifest_path}"
+            + _MATERIALIZE_FAILURE_REMEDY
         )
     module = importlib.util.module_from_spec(spec)
     try:
@@ -388,6 +397,7 @@ def _materialized_engine_paths(repo_root: Path = REPO_ROOT) -> list[str]:
         sys.exit(
             "update: reloading the materialized engine manifest failed: "
             f"{exc}"
+            + _MATERIALIZE_FAILURE_REMEDY
         )
     paths = getattr(module, "ENGINE_PATHS", None)
     if not isinstance(paths, list) or not all(
@@ -396,6 +406,7 @@ def _materialized_engine_paths(repo_root: Path = REPO_ROOT) -> list[str]:
         sys.exit(
             "update: materialized engine manifest does not expose "
             "ENGINE_PATHS as list[str]"
+            + _MATERIALIZE_FAILURE_REMEDY
         )
     return list(paths)
 
@@ -411,10 +422,7 @@ def _assert_materialized_engine_paths(
     sys.exit(
         "update: materialized engine is incomplete; missing declared path(s): "
         f"{', '.join(missing)}\n"
-        "  engine.ref was not advanced; the recorded engine pin remains "
-        "unchanged.\n"
-        "  no automated recovery is available; report the target engine ref "
-        "upstream"
+        + _MATERIALIZE_FAILURE_REMEDY.lstrip("\n")
     )
 
 

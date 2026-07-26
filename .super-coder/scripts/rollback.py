@@ -98,6 +98,15 @@ def restore_engine(prev_sha: str) -> None:
     )
     if any(fallback_used):
         previous_paths = current_paths = list(update_mod.ENGINE_PATHS)
+    previous_materialize_paths = [
+        path
+        for path in previous_paths
+        if update_mod._engine_path_exists_at(
+            prev_sha,
+            path,
+            repo_root=REPO_ROOT,
+        )
+    ]
     previous_files = set(
         update_mod._engine_files_at(
             prev_sha,
@@ -126,12 +135,18 @@ def restore_engine(prev_sha: str) -> None:
         if path.is_file() or path.is_symlink():
             path.unlink()
     try:
-        update_mod.materialize_engine(prev_sha)
+        update_mod.materialize_engine(
+            prev_sha,
+            engine_paths=previous_materialize_paths,
+        )
     except SystemExit:
         print("  ref not present locally — fetching super-coder, then retrying")
         remote = update_mod.super_coder_remote()
         update_mod.git("fetch", remote)
-        update_mod.materialize_engine(prev_sha)
+        update_mod.materialize_engine(
+            prev_sha,
+            engine_paths=previous_materialize_paths,
+        )
     ENGINE_REF.write_text(prev_sha + "\n")
     # Re-baseline the hash manifest at the restored engine — without this, the
     # next update would read every rolled-back file as a "local edit" and block.
