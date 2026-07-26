@@ -20,11 +20,13 @@ import pr_poller  # noqa: E402
 NOW = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
 
-def build_db() -> sqlite3.Connection:
+def build_db(skip: set[str] | None = None) -> sqlite3.Connection:
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA.read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
+        if skip and migration.name in skip:
+            continue
         con.executescript(migration.read_text())
     con.executescript(
         """
@@ -577,6 +579,64 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         ).fetchall()
         self.assertEqual(1, len(rows))
         self.assertIsNotNone(rows[0][0])
+
+    def test_migration_expands_a_dirty_legacy_alert_table_without_rewriting_rows(self):
+        migration_name = "0102_reconciler_alert_keys.sql"
+        legacy = build_db(skip={migration_name})
+        self.addCleanup(legacy.close)
+        interface_broker._alert(
+            legacy,
+            severity="warning",
+            reason="legacy_open",
+        )
+        legacy.commit()
+        before = legacy.execute(
+            "SELECT alert_id, severity, reason, dedupe_key, resolved_at "
+            "FROM planner_alerts"
+        ).fetchone()
+
+        legacy.executescript((MIGRATIONS / migration_name).read_text())
+
+        after = legacy.execute(
+            "SELECT alert_id, severity, reason, dedupe_key, resolved_at, "
+            "sprint_doc_id, unit_id, role, signal, shell_id "
+            "FROM planner_alerts"
+        ).fetchone()
+        self.assertEqual(
+            tuple(before) + (None, None, None, None, None),
+            tuple(after),
+        )
+        interface_broker._alert(
+            legacy,
+            severity="warning",
+            reason="legacy_open",
+        )
+        self.assertEqual(
+            1,
+            legacy.execute(
+                "SELECT COUNT(*) FROM planner_alerts "
+                "WHERE reason='legacy_open'"
+            ).fetchone()[0],
+        )
+        legacy.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE reason='legacy_open'"
+        )
+        interface_broker._alert(
+            legacy,
+            severity="warning",
+            reason="legacy_open",
+        )
+        rows = legacy.execute(
+            "SELECT resolved_at, sprint_doc_id, unit_id, role, signal, shell_id "
+            "FROM planner_alerts WHERE reason='legacy_open' ORDER BY alert_id"
+        ).fetchall()
+        self.assertEqual(2, len(rows))
+        self.assertIsNotNone(rows[0]["resolved_at"])
+        self.assertEqual(
+            (None, None, None, None, None, None),
+            tuple(rows[1]),
+        )
 
 
 if __name__ == "__main__":
