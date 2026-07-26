@@ -212,6 +212,73 @@ class HalfFloorRollbackTest(unittest.TestCase):
             )
             self.assertEqual(engine_ref.read_text(), old_sha + "\n")
 
+    def test_restore_engine_fallback_keeps_broader_installed_paths_symmetric(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            engine = root / ".super-coder"
+            scripts = engine / "scripts"
+            fork_area = engine / "fork-area"
+            state = root / ".sc-state"
+            scripts.mkdir(parents=True)
+            fork_area.mkdir()
+            state.mkdir()
+
+            git(root, "init", "-b", "main")
+            git(root, "config", "user.name", "Rollback Test")
+            git(root, "config", "user.email", "rollback@example.invalid")
+            (root / "sc").write_text("old dispatcher\n")
+            (scripts / "floor.txt").write_text("old engine\n")
+            (scripts / "engine_manifest.py").write_text(
+                'ENGINE_PATHS = ["sc", ".super-coder/scripts"]\n'
+            )
+            sentinel = fork_area / "sentinel.txt"
+            sentinel.write_bytes(b"tracked fork bytes\n")
+            git(root, "add", ".")
+            git(root, "commit", "-m", "old exact floor")
+            old_sha = git(root, "rev-parse", "HEAD")
+
+            (root / "sc").write_text("new dispatcher\n")
+            (scripts / "floor.txt").write_text("new engine\n")
+            (scripts / "engine_manifest.py").write_text(
+                "ENGINE_PATHS = load_paths()\n"
+            )
+            git(root, "add", ".")
+            git(root, "commit", "-m", "new unparseable floor")
+            new_sha = git(root, "rev-parse", "HEAD")
+            engine_ref = state / "engine.ref"
+            engine_ref.write_text(new_sha + "\n")
+            sentinel.write_bytes(b"fork sentinel bytes\n")
+
+            installed = [
+                "sc",
+                ".super-coder/scripts",
+                ".super-coder/fork-area",
+            ]
+            with mock.patch.multiple(
+                rollback,
+                REPO_ROOT=root,
+                ENGINE_REF=engine_ref,
+            ), mock.patch.object(
+                rollback.update_mod,
+                "ENGINE_PATHS",
+                installed,
+            ), mock.patch.object(
+                rollback.update_mod,
+                "materialize_engine",
+            ), mock.patch.object(
+                rollback.engine_manifest,
+                "write_manifest",
+            ):
+                rollback.restore_engine(old_sha)
+
+            self.assertEqual(
+                sentinel.read_bytes(),
+                b"fork sentinel bytes\n",
+                "a broader installed fallback must not turn tracked fork "
+                "content into a rollback deletion candidate",
+            )
+            self.assertEqual(engine_ref.read_text(), old_sha + "\n")
+
     def test_engine_only_refuses_previous_floor_with_unrelated_extra(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

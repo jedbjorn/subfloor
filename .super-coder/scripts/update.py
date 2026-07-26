@@ -88,8 +88,13 @@ _VISUAL_QA_MARKER_RE = re.compile(
 )
 
 
-def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    r = subprocess.run(["git", "-C", str(REPO_ROOT), *args],
+def git(
+    *args: str,
+    check: bool = True,
+    repo_root: Path | None = None,
+) -> subprocess.CompletedProcess:
+    root = repo_root if repo_root is not None else REPO_ROOT
+    r = subprocess.run(["git", "-C", str(root), *args],
                        capture_output=True, text=True)
     if check and r.returncode != 0:
         sys.exit(f"update: `git {' '.join(args)}` failed:\n{r.stderr.strip()}")
@@ -245,12 +250,19 @@ def _literal_engine_paths_at(
     return None, f"{source_path} does not define ENGINE_PATHS"
 
 
-def _engine_paths_for(ref: str, repo_root: Path = REPO_ROOT) -> list[str]:
+def _engine_paths_for(
+    ref: str,
+    repo_root: Path = REPO_ROOT,
+    *,
+    fallback_used: list[bool] | None = None,
+) -> list[str]:
     """Resolve the target ref's allow-list, then keep paths present at ``ref``.
 
     New engines declare their list in ``engine_manifest.py``. Refs before that
     module split declare it in ``update.py``. If neither source satisfies the
     literal-list contract, use the installed list as a warned fallback.
+    ``fallback_used`` receives that provenance when a caller must keep two
+    resolutions under the same authority.
 
     `git archive` aborts wholesale if any pathspec matches nothing, so a single
     engine file retired upstream (e.g. a dropped schema variant) would otherwise
@@ -272,7 +284,8 @@ def _engine_paths_for(ref: str, repo_root: Path = REPO_ROOT) -> list[str]:
         if reason is not None:
             reasons.append(reason)
 
-    if resolved is None:
+    used_installed_fallback = resolved is None
+    if used_installed_fallback:
         print(
             f"WARNING: update could not resolve ENGINE_PATHS at {ref}: "
             f"{'; '.join(reasons)}; falling back to installed ENGINE_PATHS.",
@@ -308,10 +321,17 @@ def _engine_paths_for(ref: str, repo_root: Path = REPO_ROOT) -> list[str]:
         )
     if not present:
         sys.exit(f"update: no engine paths exist at {ref} — wrong ref or remote?")
+    if fallback_used is not None:
+        fallback_used.append(used_installed_fallback)
     return present
 
 
-def _engine_files_at(ref: str) -> list[str]:
+def _engine_files_at(
+    ref: str,
+    repo_root: Path | None = None,
+    *,
+    engine_paths: list[str] | None = None,
+) -> list[str]:
     """The exact FILE list upstream ships under the paths resolved for ``ref``.
 
     This is what a materialize writes, so it is what the manifest must cover
@@ -319,13 +339,21 @@ def _engine_files_at(ref: str) -> list[str]:
     skill's SKILL.md) and upstream-retired stragglers on disk stay out of the
     manifest: they are not upstream-owned, so they must never guard — and later
     block — a future update (see engine_manifest.write_manifest)."""
+    if repo_root is None:
+        repo_root = REPO_ROOT
+    paths = (
+        engine_paths
+        if engine_paths is not None
+        else _engine_paths_for(ref, repo_root=repo_root)
+    )
     return git(
         "ls-tree",
         "-r",
         "--name-only",
         ref,
         "--",
-        *_engine_paths_for(ref, repo_root=REPO_ROOT),
+        *paths,
+        repo_root=repo_root,
     ).stdout.splitlines()
 
 

@@ -80,10 +80,42 @@ def restore_db(src: Path) -> None:
 def restore_engine(prev_sha: str) -> None:
     """Re-materialize the engine at the prior pin. The SHA should already be in
     the object store (it is the ref we updated *from*); fetch as a fallback."""
-    previous_files = set(update_mod._engine_files_at(prev_sha))
+    fallback_used: list[bool] = []
+    previous_paths = update_mod._engine_paths_for(
+        prev_sha,
+        repo_root=REPO_ROOT,
+        fallback_used=fallback_used,
+    )
     current_sha = ENGINE_REF.read_text().strip() if ENGINE_REF.exists() else ""
-    current_files = (set(update_mod._engine_files_at(current_sha))
-                     if current_sha else set())
+    current_paths = (
+        update_mod._engine_paths_for(
+            current_sha,
+            repo_root=REPO_ROOT,
+            fallback_used=fallback_used,
+        )
+        if current_sha
+        else []
+    )
+    if any(fallback_used):
+        previous_paths = current_paths = list(update_mod.ENGINE_PATHS)
+    previous_files = set(
+        update_mod._engine_files_at(
+            prev_sha,
+            repo_root=REPO_ROOT,
+            engine_paths=previous_paths,
+        )
+    )
+    current_files = (
+        set(
+            update_mod._engine_files_at(
+                current_sha,
+                repo_root=REPO_ROOT,
+                engine_paths=current_paths,
+            )
+        )
+        if current_sha
+        else set()
+    )
     # materialize_engine overlays an archive and deliberately leaves upstream-
     # retired files alone during a forward update. Rollback is different: a
     # target-only migration left behind would make the restored old server
@@ -105,7 +137,7 @@ def restore_engine(prev_sha: str) -> None:
     # next update would read every rolled-back file as a "local edit" and block.
     engine_manifest.write_manifest(
         update_mod._engine_paths_for(prev_sha, repo_root=REPO_ROOT),
-        files=update_mod._engine_files_at(prev_sha),
+        files=update_mod._engine_files_at(prev_sha, repo_root=REPO_ROOT),
     )
     print(f"→ engine re-materialized at {prev_sha[:12]} (engine.ref restored)")
 
