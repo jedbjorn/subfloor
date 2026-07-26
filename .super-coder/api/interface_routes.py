@@ -2321,10 +2321,24 @@ def _board_writer(con, sprint_doc_id: int) -> "int | None":
     `documents` carries no author column at all (schema.sql:204), so there is
     nothing to fall back TO. An unbound sprint therefore falls back to flavor
     instead — see _may_write_board.
+
+    RELEASED BINDINGS STILL NAME THE WRITER. Filtering on `released_at IS
+    NULL` made the fallback mean "before a binding is armed" OR "after the
+    planner's session ended" (interface_recovery release_binding
+    'shell_recovery') OR "after the sprint was closed or frozen"
+    (_close_sprint_wake) — three engine paths that release with no operator
+    action at all. In that window the fence widened from ONE shell to a CLASS
+    of shells, and a foreign planner could move a unit of a sprint it has no
+    relationship to into `merged` — the terminal state that makes the
+    reconciler stop watching it. The spec's rule names one shell in both of
+    its branches, so this one does too: the most recent planner ever bound to
+    this sprint. Flavor now stands in only for a sprint that never had a
+    binding. The cost is deliberate — a NEW planner taking a sprint over must
+    arm its binding before it can write.
     """
     row = con.execute(
         "SELECT planner_shell_id FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? AND released_at IS NULL "
+        "WHERE sprint_doc_id=? "
         "ORDER BY binding_id DESC LIMIT 1", (sprint_doc_id,)).fetchone()
     return row[0] if row is not None else None
 
