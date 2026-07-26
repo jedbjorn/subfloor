@@ -134,10 +134,13 @@ def _heartbeat_line(d: "dict | None", label: str, event: str, dead: str) -> str:
 
 
 def daemon_line(d: "dict | None") -> str:
-    """Render the /_sc/watches `daemon` block as liveness lines (#359):
+    """Render the /_sc/watches `daemon` block as poller + reconciler lines.
+
     a watch is only as live as its poller, and `list` saying "live" while the
     poller is dead was the lying half of the dos-arch incident. The poller is
-    the engine service's scheduler thread since the cutover (decision #19)."""
+    the engine service's scheduler thread since the cutover (decision #19).
+    The nested reconciler row renders independently; an absent row means it
+    never ran, including on engine versions that predate reconciliation."""
     poller_dead = "watches are NOT being polled (engine service poller down — restart: ./sc restart)"
     reconcile_dead = "worker reconciliation is NOT running (restart: ./sc restart)"
     return "\n".join((

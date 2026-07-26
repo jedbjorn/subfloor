@@ -488,6 +488,16 @@ class DaemonLineTest(unittest.TestCase):
         self.assertIn("reconciler: STALE", line)
         self.assertIn("worker reconciliation is NOT running", line)
 
+        con.execute(
+            "UPDATE daemon_heartbeats SET beat_at = datetime('now', '-200 seconds') "
+            "WHERE name = 'reconcile'")
+        line = watch.daemon_line(server.Handler._daemon_state(None, con))
+        self.assertIn("reconciler: live", line)
+
+        con.execute("DELETE FROM daemon_heartbeats WHERE name = 'watch'")
+        line = watch.daemon_line(server.Handler._daemon_state(None, con))
+        self.assertIn("poller: never run", line)
+
 
 # ── API: /_sc/watches + message kinds, over the real server ─────────────────
 

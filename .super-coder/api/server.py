@@ -2733,9 +2733,11 @@ class Handler(BaseHTTPRequestHandler):
     def _daemon_state(self, con) -> "dict | None":
         """Poller + reconciler liveness (#359): heartbeat rows → age + verdict.
         Stale = beat older than 3× the daemon's own interval (one slow gh
-        call + the sleep fit comfortably inside). None = never run (or a
-        pre-0068 DB with no heartbeat table yet) — the client renders both
-        None and stale as "watches are NOT being polled"."""
+        call + the sleep fit comfortably inside). None means neither daemon
+        has run (or a pre-0068 DB has no heartbeat table); a reconcile-only
+        result is truthy but has no top-level beat_at. Reconciliation stays
+        nested so older clients ignore it while their own beat_at guard still
+        renders a never-run poller."""
         try:
             rs = con.execute(
                 "SELECT name, beat_at, interval_s, CAST((julianday('now') - "
