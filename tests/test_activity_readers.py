@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -51,11 +52,17 @@ def make_db(path: Path) -> None:
         );
         CREATE TABLE shell_messages (
           message_id INTEGER PRIMARY KEY, from_shell_id INTEGER,
-          sprint_doc_id INTEGER, created_at TEXT
+          sprint_doc_id INTEGER, created_at TEXT, kind TEXT, body TEXT
         );
         CREATE TABLE sprint_units (
           unit_id INTEGER PRIMARY KEY, sprint_doc_id INTEGER, seq TEXT,
-          branch TEXT, updated_at TEXT, updated_by_shell_id INTEGER
+          branch TEXT, state TEXT, state_changed_at TEXT, updated_at TEXT,
+          updated_by_shell_id INTEGER, dev_shell_id INTEGER,
+          reviewer_shell_id INTEGER
+        );
+        CREATE TABLE sprint_planner_bindings (
+          binding_id INTEGER PRIMARY KEY, sprint_doc_id INTEGER,
+          planner_shell_id INTEGER
         );
         CREATE TABLE spec_tasks (
           task_id INTEGER PRIMARY KEY, status TEXT
@@ -75,12 +82,15 @@ def make_db(path: Path) -> None:
     )
     con.execute(
         "INSERT INTO shell_messages VALUES "
-        "(1,1,59,'2020-01-02T00:00:00Z')"
+        "(1,1,59,'2020-01-02T00:00:00Z','result',"
+        "'sprint 59: unit U3 fixing')"
     )
     con.execute(
         "INSERT INTO sprint_units VALUES "
-        "(1,59,'U3','feat/test','2020-01-03T00:00:00Z',1)"
+        "(1,59,'U3','feat/test','working','2020-01-04T00:00:00Z',"
+        "'2020-01-03T00:00:00Z',1,1,2)"
     )
+    con.execute("INSERT INTO sprint_planner_bindings VALUES (1,59,1)")
     con.commit()
     con.close()
 
@@ -161,6 +171,13 @@ class ReaderCase(unittest.TestCase):
                 "GIT_COMMITTER_DATE": "2019-01-01T00:00:00+00:00",
             },
         )
+        command(
+            self.worktree,
+            "git",
+            "update-ref",
+            "refs/remotes/origin/main",
+            "HEAD",
+        )
         self.db = self.root / "shell.db"
         make_db(self.db)
         self.proc = self.root / "proc"
@@ -186,6 +203,7 @@ class ReaderCase(unittest.TestCase):
             "sprint_doc_id": 59,
             "seq": "U3",
             "branch": "feat/test",
+            "state_changed_at": "2020-01-04T00:00:00Z",
         }
 
     def read(self):
@@ -201,8 +219,89 @@ class DatabaseContractTest(ReaderCase):
         self.assertEqual(
             datetime(2020, 1, 3, tzinfo=UTC), evidence.last_durable_write_at
         )
+        self.assertEqual(
+            datetime(2020, 1, 2, tzinfo=UTC), evidence.last_result_row_at
+        )
+        self.assertEqual(
+            datetime(2020, 1, 4, tzinfo=UTC), evidence.state_changed_at
+        )
         self.assertTrue(evidence.edits_code)
         self.assertEqual("feat/test", evidence.branch_declared)
+
+    def test_current_archive_session_end_fields_are_observed(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO interface_sessions VALUES "
+            "(10,1,10,'2020-01-01T00:00:00Z','2020-01-05T00:00:00Z',"
+            "'stop_hook','codex')"
+        )
+        con.commit()
+        con.close()
+
+        evidence = self.read()
+
+        self.assertEqual(
+            datetime(2020, 1, 5, tzinfo=UTC), evidence.session_ended_at
+        )
+        self.assertEqual("stop_hook", evidence.session_end_reason)
+
+    def test_result_row_is_unit_scoped_when_shell_holds_multiple_units(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO sprint_units VALUES "
+            "(2,59,'U4','feat/other','working','2020-01-04T00:00:00Z',"
+            "'2020-01-03T00:00:00Z',1,1,3)"
+        )
+        con.executemany(
+            "INSERT INTO shell_messages VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    2,
+                    1,
+                    59,
+                    "2020-01-05T00:00:00Z",
+                    "result",
+                    "sprint 59: unit U4 ready",
+                ),
+                (
+                    3,
+                    1,
+                    59,
+                    "2020-01-04T12:00:00Z",
+                    "result",
+                    "sprint 59: unit=U3 ready",
+                ),
+            ],
+        )
+        con.commit()
+        con.close()
+
+        evidence = self.read()
+
+        self.assertEqual(
+            datetime(2020, 1, 4, 12, tzinfo=UTC),
+            evidence.last_result_row_at,
+        )
+        self.assertEqual(
+            datetime(2020, 1, 5, tzinfo=UTC),
+            evidence.last_durable_write_at,
+        )
+
+    def test_missing_state_clock_is_independently_unreadable(self):
+        unit = dict(self.unit)
+        unit.pop("state_changed_at")
+
+        evidence = self.reader.read(
+            self.shell, unit, datetime(2020, 1, 10, tzinfo=UTC)
+        )
+
+        self.assertIsNone(evidence.state_changed_at)
+        self.assertIn("state_changed_at", evidence.unreadable)
+        self.assertEqual(EPOCH, evidence.epoch)
+        self.assertEqual(
+            datetime(2020, 1, 2, tzinfo=UTC),
+            evidence.last_result_row_at,
+        )
 
     def test_doc_unit_and_rowless_shell_never_claim_code_work(self):
         doc = dict(self.unit, branch=None)
@@ -226,6 +325,14 @@ class DatabaseContractTest(ReaderCase):
         self.assertFalse(rowless.edits_code)
         self.assertEqual(datetime(2020, 1, 5, tzinfo=UTC), rowless.epoch)
         self.assertIsNone(rowless.branch_declared)
+        self.assertEqual(
+            datetime(2020, 1, 3, tzinfo=UTC),
+            rowless.last_durable_write_at,
+        )
+        self.assertEqual(
+            datetime(2020, 1, 2, tzinfo=UTC),
+            rowless.last_result_row_at,
+        )
 
     def test_each_unreadable_input_is_nullable_and_read_never_raises(self):
         broken = ar.ActivityReader(
@@ -246,9 +353,51 @@ class DatabaseContractTest(ReaderCase):
         self.assertIsNone(evidence.process_present)
         self.assertIsNone(evidence.marker_at)
         self.assertEqual(
-            ["branch", "durable_write", "epoch", "git_state", "marker", "process", "session"],
+            [
+                "branch",
+                "durable_write",
+                "epoch",
+                "git_state",
+                "marker",
+                "process",
+                "result_row",
+                "session",
+            ],
             evidence.unreadable,
         )
+
+    def test_unreadable_marker_mapping_is_literal_exhaustive_and_nonempty(self):
+        self.assertEqual(
+            {
+                "branch": frozenset({"branch_present"}),
+                "commits": frozenset(
+                    {"commits_since_epoch", "last_work_at"}
+                ),
+                "durable_write": frozenset({"last_durable_write_at"}),
+                "epoch": frozenset({"epoch"}),
+                "git_state": frozenset(
+                    {"dirty", "commits_since_epoch", "last_work_at"}
+                ),
+                "last_work_at:untimed_delete_rename": frozenset(
+                    {"last_work_at"}
+                ),
+                "marker": frozenset({"marker_at"}),
+                "newest_mtime": frozenset({"newest_mtime"}),
+                "process": frozenset(
+                    {"process_present", "launch_shape", "cpu_delta"}
+                ),
+                "process_binding": frozenset(
+                    {"launch_shape", "cpu_delta"}
+                ),
+                "result_row": frozenset({"last_result_row_at"}),
+                "session": frozenset(
+                    {"session_ended_at", "session_end_reason"}
+                ),
+                "state_changed_at": frozenset({"state_changed_at"}),
+            },
+            ar.UNREADABLE_FIELDS,
+        )
+        self.assertTrue(all(ar.UNREADABLE_FIELDS.values()))
 
 
 class GitEvidenceTest(ReaderCase):
@@ -372,6 +521,61 @@ class GitEvidenceTest(ReaderCase):
         evidence = self.read()
         self.assertEqual(1, evidence.commits_since_epoch)
         self.assertEqual(datetime(2020, 2, 1, tzinfo=UTC), evidence.last_work_at)
+
+    def test_rebased_in_commits_do_not_count_but_own_commit_does(self):
+        command(self.worktree, "git", "branch", "main")
+        command(self.worktree, "git", "checkout", "main")
+        integration = self.worktree / "integration.py"
+        integration.write_text("another shell\n")
+        command(self.worktree, "git", "add", integration.name)
+        command(
+            self.worktree,
+            "git",
+            "commit",
+            "-m",
+            "integration work",
+            env={
+                "GIT_AUTHOR_DATE": "2020-01-05T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2020-01-05T00:00:00+00:00",
+            },
+        )
+        command(
+            self.worktree,
+            "git",
+            "update-ref",
+            "refs/remotes/origin/main",
+            "HEAD",
+        )
+        command(self.worktree, "git", "checkout", "feat/test")
+        command(self.worktree, "git", "rebase", "main")
+
+        rebased = self.read()
+
+        self.assertEqual(0, rebased.commits_since_epoch)
+        self.assertIsNone(rebased.last_work_at)
+
+        own = self.worktree / "own.py"
+        own.write_text("mine\n")
+        command(self.worktree, "git", "add", own.name)
+        command(
+            self.worktree,
+            "git",
+            "commit",
+            "-m",
+            "own work",
+            env={
+                "GIT_AUTHOR_DATE": "2020-01-06T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2020-01-06T00:00:00+00:00",
+            },
+        )
+
+        contributed = self.read()
+
+        self.assertEqual(1, contributed.commits_since_epoch)
+        self.assertEqual(
+            datetime(2020, 1, 6, tzinfo=UTC),
+            contributed.last_work_at,
+        )
 
     def test_conflicted_path_is_dirty_but_not_a_work_event(self):
         path = self.worktree / "conflict.txt"
@@ -547,15 +751,59 @@ class ProcessReaderTest(ReaderCase):
         self.assertIsNone(unknown.process_present)
         self.assertEqual(["process"], unknown.unreadable)
 
+    def test_foreign_worktree_process_does_not_make_worker_present(self):
+        foreign = self.root / "foreign-worktree"
+        foreign.mkdir()
+        proc_row(
+            self.proc,
+            200,
+            comm="codex",
+            cwd=foreign,
+            argv=["codex", "exec"],
+        )
+
+        evidence = ar.Evidence()
+        harness = self.reader._process_inputs(evidence, self.worktree)
+
+        self.assertIsNone(harness)
+        self.assertFalse(evidence.process_present)
+        self.assertEqual([], evidence.unreadable)
+
+    def test_multiple_matching_processes_are_present_but_binding_unreadable(self):
+        for pid in (200, 201):
+            proc_row(
+                self.proc,
+                pid,
+                comm="codex",
+                cwd=self.worktree,
+                argv=["codex", "exec"],
+            )
+
+        evidence = ar.Evidence()
+        harness = self.reader._process_inputs(evidence, self.worktree)
+
+        self.assertIsNone(harness)
+        self.assertTrue(evidence.process_present)
+        self.assertIsNone(evidence.launch_shape)
+        self.assertIsNone(evidence.cpu_delta)
+        self.assertEqual(["process_binding"], evidence.unreadable)
+
 
 class HarnessMarkerTest(ReaderCase):
     def test_claude_uses_dot_encoding_and_aggregates_own_scratchpad(self):
+        fixture_root = Path("/tmp") / f"scactivity{os.getpid()}"
+        self.addCleanup(shutil.rmtree, fixture_root, True)
+        dotted_worktree = fixture_root / ".sc-worktrees" / "dev1"
+        dotted_worktree.mkdir(parents=True)
         projects = self.home / ".claude/projects"
-        encoded = "".join(
-            c if c.isalnum() else "-" for c in str(self.worktree)
+        expected_container = (
+            f"-tmp-scactivity{os.getpid()}--sc-worktrees-dev1"
         )
-        main = projects / encoded
-        scratch = projects / f"-tmp-claude-0-{encoded}-session-scratchpad"
+        main = projects / expected_container
+        scratch = (
+            projects
+            / f"-tmp-claude-0-{expected_container}-session-scratchpad"
+        )
         foreign = projects / "-tmp-claude-0--foreign-session-scratchpad"
         for path in (main, scratch, foreign):
             path.mkdir(parents=True)
@@ -568,10 +816,9 @@ class HarnessMarkerTest(ReaderCase):
         stamp(scratch_log, datetime(2020, 1, 3, tzinfo=UTC))
         stamp(foreign_log, datetime(2020, 1, 4, tzinfo=UTC))
 
-        self.assertNotIn(".", encoded)
         self.assertEqual(
             datetime(2020, 1, 3, tzinfo=UTC),
-            self.reader._claude_marker(self.worktree, EPOCH),
+            self.reader._claude_marker(dotted_worktree, EPOCH),
         )
 
     def _rollout(self, name: str, records: list[dict], when: datetime) -> Path:

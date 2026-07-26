@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -36,6 +37,23 @@ BOOT_ARTIFACTS = {
     ".claude/settings.local.json",
     ".codex/hooks.json",
 }
+UNREADABLE_FIELDS = {
+    "branch": frozenset({"branch_present"}),
+    "commits": frozenset({"commits_since_epoch", "last_work_at"}),
+    "durable_write": frozenset({"last_durable_write_at"}),
+    "epoch": frozenset({"epoch"}),
+    "git_state": frozenset(
+        {"dirty", "commits_since_epoch", "last_work_at"}
+    ),
+    "marker": frozenset({"marker_at"}),
+    "newest_mtime": frozenset({"newest_mtime"}),
+    "process": frozenset({"process_present", "launch_shape", "cpu_delta"}),
+    "process_binding": frozenset({"launch_shape", "cpu_delta"}),
+    "result_row": frozenset({"last_result_row_at"}),
+    "session": frozenset({"session_ended_at", "session_end_reason"}),
+    "state_changed_at": frozenset({"state_changed_at"}),
+    UNTIMED_DELETE_RENAME: frozenset({"last_work_at"}),
+}
 
 
 @dataclass
@@ -44,6 +62,8 @@ class Evidence:
     dirty: bool | None = None
     commits_since_epoch: int | None = None
     last_durable_write_at: datetime | None = None
+    last_result_row_at: datetime | None = None
+    state_changed_at: datetime | None = None
     session_ended_at: datetime | None = None
     session_end_reason: str | None = None
     newest_mtime: datetime | None = None
@@ -141,13 +161,25 @@ class ActivityReader:
             )
             con.row_factory = sqlite3.Row
         except (OSError, sqlite3.Error):
-            for name in ("epoch", "session", "durable_write"):
+            for name in ("epoch", "session", "durable_write", "result_row"):
                 self._mark(evidence, name)
             return None
 
         harness = None
         archive_id = None
         planner_session = None
+        if unit is None:
+            try:
+                row = con.execute(
+                    "SELECT sprint_doc_id FROM sprint_planner_bindings "
+                    "WHERE planner_shell_id=? ORDER BY binding_id DESC LIMIT 1",
+                    (shell_id,),
+                ).fetchone()
+                sprint_doc_id = row["sprint_doc_id"] if row else None
+            except sqlite3.Error:
+                self._mark(evidence, "durable_write")
+                self._mark(evidence, "result_row")
+
         try:
             if unit is None:
                 row = con.execute(
@@ -212,8 +244,45 @@ class ActivityReader:
                 evidence.last_durable_write_at = _timestamp(row[0] if row else None)
             except sqlite3.Error:
                 self._mark(evidence, "durable_write")
+
+            try:
+                rows = con.execute(
+                    "SELECT body, created_at FROM shell_messages "
+                    "WHERE from_shell_id=? AND sprint_doc_id=? AND kind='result' "
+                    "ORDER BY created_at DESC, message_id DESC",
+                    (shell_id, sprint_doc_id),
+                ).fetchall()
+                if unit is not None:
+                    active_count = con.execute(
+                        "SELECT COUNT(*) FROM sprint_units "
+                        "WHERE sprint_doc_id=? "
+                        "AND (dev_shell_id=? OR reviewer_shell_id=?) "
+                        "AND state NOT IN ('merged','cancelled')",
+                        (sprint_doc_id, shell_id, shell_id),
+                    ).fetchone()[0]
+                    if active_count != 1:
+                        seq = str(_value(unit, "seq", ""))
+                        rows = [
+                            row
+                            for row in rows
+                            if self._names_unit(row["body"], seq)
+                        ]
+                evidence.last_result_row_at = _timestamp(
+                    rows[0]["created_at"] if rows else None
+                )
+            except sqlite3.Error:
+                self._mark(evidence, "result_row")
         con.close()
         return harness
+
+    @staticmethod
+    def _names_unit(body: str, seq: str) -> bool:
+        if not seq:
+            return False
+        return re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(seq)}(?![A-Za-z0-9_])",
+            body or "",
+        ) is not None
 
     def _git(
         self, worktree: Path, *args: str
@@ -316,7 +385,16 @@ class ActivityReader:
 
         revision = "HEAD" if on_declared_head else f"refs/remotes/origin/{branch}"
         try:
-            log = self._git(worktree, "log", revision, "--format=%aI")
+            merge_base = self._git(
+                worktree,
+                "merge-base",
+                "refs/remotes/origin/main",
+                revision,
+            )
+            if merge_base.returncode != 0 or not merge_base.stdout.strip():
+                raise OSError(merge_base.stderr)
+            contribution = f"{merge_base.stdout.strip()}..{revision}"
+            log = self._git(worktree, "log", contribution, "--format=%aI")
         except (OSError, subprocess.SubprocessError):
             log = None
         author_times: list[datetime] = []
@@ -613,13 +691,19 @@ class ActivityReader:
         evidence.edits_code = (
             unit is not None and evidence.branch_declared is not None
         )
+        if unit is not None:
+            evidence.state_changed_at = _timestamp(
+                _value(unit, "state_changed_at")
+            )
+            if evidence.state_changed_at is None:
+                self._mark(evidence, "state_changed_at")
         current = _timestamp(now) or datetime.now(timezone.utc)
         worktree = self._worktree(shell)
 
         try:
             self._database_inputs(evidence, shell, unit)
         except Exception:  # noqa: BLE001 — complete value, never an escape
-            for name in ("epoch", "session", "durable_write"):
+            for name in ("epoch", "session", "durable_write", "result_row"):
                 self._mark(evidence, name)
 
         on_declared_head = False
