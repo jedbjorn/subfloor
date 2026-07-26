@@ -453,10 +453,11 @@ Stalls and the moves:
   first; the rest becomes a new unit at the chain's tail.
 - **Merge broke `main`**: `task` row to all devs to hold merges, insert a
   fix unit at the front of the chain, resume when green.
-- **Review stall** (unit sitting `in-review` while its reviewer is idle):
-  boot the reviewer — `./sc run <reviewer> --harness <reviewers-harness>
-  -m <reviewers-model> --effort high`; its inbox holds the review request. Still stuck
-  -> reassign the unit to another reviewer. Severity dispute (dev says
+- **Review stall** (unit sitting `in-review` and no verdict): "the reviewer
+  looks idle" is an absence like any other — clear the positive-evidence gate
+  below first, then boot the reviewer — `./sc run <reviewer> --harness
+  <reviewers-harness> -m <reviewers-model> --effort high`; its inbox holds the
+  review request. Still stuck -> reassign the unit to another reviewer. Severity dispute (dev says
   Low, reviewer says Medium) -> rule by message immediately — a chain
   waiting on a classification argument is pure loss. Dispute about what
   the unit *should do* -> FnB.
@@ -470,18 +471,41 @@ Stalls and the moves:
 
   ```
   # read-only; never disturb a tree you may be about to decide is alive
-  git -C <repo>/.sc-worktrees/<shortname> branch --show-current
-  git -C <repo>/.sc-worktrees/<shortname> status --short
-  git -C <repo>/.sc-worktrees/<shortname> log --oneline origin/main..HEAD
+  W=<repo>/.sc-worktrees/<shortname>
+  D=<the unit's DECLARED branch — the `branch` column of ITS board row>
+
+  git -C "$W" rev-parse --verify --quiet "$D"       # does the UNIT's branch exist?
+  git -C "$W" branch --show-current                 # on it, or still on the base?
+  git -C "$W" status --short                        # non-empty => uncommitted work
+  git -C "$W" log --oneline origin/main.."$D"       # commits ahead of base
   ```
 
-  A branch that exists, modified files, or commits ahead of base means the
-  worker consumed its task and is building, whatever the mailbox says.
-  **Do not re-boot it.** A re-boot of a worker holding an uncommitted tree
-  can destroy the unit's work — flag #200 is a planner one step from exactly
-  that, over a tree carrying a whole half-built unit, saved only by looking
-  at the worktree instead of acting on the signal in front of it. Need that
-  worker to move? Send an idempotent `task` row and let it land at the
+  > [!class4]
+  > **"A BRANCH EXISTS" IS ALWAYS TRUE AND IS NEVER THE TEST.** Every shell
+  > permanently occupies its own `shell/<shortname>` BASE BRANCH — twelve of
+  > them exist right now (`shell/pln1`, `shell/dev6`, `shell/rev1`, …) — so
+  > `branch --show-current` returns a branch in every healthy worktree whether
+  > or not one line of the unit has been written. A check that asks "is there a
+  > branch?" reports the ENTIRE FLEET as working, including the dead worker it
+  > exists to catch, and it fails in the confident-wrong direction rather than
+  > erroring. Compare the worktree against the unit's DECLARED branch, from the
+  > board record. The base branch is evidence of nothing.
+
+  Read the tree as a whole, never branch-presence alone:
+
+  | What the worktree holds | Reading |
+  |---|---|
+  | declared branch + **dirty tree** | UNCOMMITTED WORK EXISTS — the single most expensive state in this system to get wrong |
+  | declared branch + clean + commits ahead of base | the worker consumed its task and built; the work is safe on the branch |
+  | declared branch + clean + no commits ahead | it started, nothing has landed — **not conclusive either way** |
+  | declared branch absent (tree on its base) | it may never have started — an ABSENCE, and absence is not a finding |
+
+  Either of the first two means the worker is building, whatever the mailbox
+  says. **Do not re-boot it.** A re-boot of a worker holding an uncommitted
+  tree can destroy the unit's work — flag #200 is a planner one step from
+  exactly that, over a tree carrying a whole half-built unit, saved only by
+  looking at the worktree instead of acting on the signal in front of it. Need
+  that worker to move? Send an idempotent `task` row and let it land at the
   worker's next step start.
 
   Read receipts are trustworthy in ONE direction only, and the fault
@@ -494,20 +518,41 @@ Stalls and the moves:
 
   Nothing in the system stamps consumption; `sc mem message sent` reports a
   convention, not a fact about the runtime. So an unread row is never
-  grounds for a re-boot on its own. Only a POSITIVE second check moves you —
-  worktree first, then a `pr_event` or a `result` row from that shell. No
-  branch, no commits and no rows, minutes after the boot, is the one reading
-  that supports "it never started".
+  grounds for a re-boot on its own.
+
+  **Every boot needs POSITIVE evidence — of liveness or of fault. An absence
+  is never a reading.** "No declared branch, no commits, no rows" is exactly
+  what a worker three minutes into its first turn also produces; it is the
+  observation this whole protocol exists to stop you acting on, and rewording
+  it ("nothing there", "no sign of it") does not make it evidence. Before any
+  `./sc run`, one of these must be affirmatively TRUE — measured, not merely
+  un-observed:
+
+  | Positive evidence | Where it comes from | What it licenses |
+  |---|---|---|
+  | **no live session** for that shell | the liveness guard — it REFUSES while a session is live, so a refusal is positive liveness and a clean pass is a measured absence of one | boot |
+  | **the harness process is gone** | presence check — pid absent, or a zombie, asked in the process's own namespace | boot |
+  | **quota or auth wall** | `./sc sprint alerts` — `quota_blocked` carries `resets_at` | re-route the role or wait; NEVER re-boot into the same wall |
+  | **it is alive and progressing** | a `pr_event`, a `result` row, or the worktree readings above | do not boot — idempotent `task` row |
+
+  None of those obtainable -> escalate to the FnB with what you measured,
+  naming the checks you ran. A worker left unbooted for one more cycle costs
+  a cycle; a worker booted on top of a dirty tree costs the unit.
 - **Link gone quiet** (no `result` row, no `pr_event` movement): quiet is not
   a state — run the worktree check above before anything else. Work on the
-  branch means the link is building, not gone, and the move is patience or an
-  idempotent `task` row, never a boot. Nothing there and nothing in the event
-  stream -> boot it with its declared sprint route — `./sc run <shortname>
-  --harness <role-harness> -m <role-model> --effort high` drains its inbox and
-  acts; that IS the nudge in an event-driven sprint. Re-send the task row
-  first, since the worker may have drained it already and the row's read
-  state cannot tell you whether it did. The liveness guard refusing (session
-  already live) + still silent -> escalate to the FnB with the worktree state.
+  declared branch means the link is building, not gone, and the move is
+  patience or an idempotent `task` row, never a boot. Finding nothing on the
+  branch and nothing in the event stream **is still not a boot** — it is the
+  absence above, and it routes to the positive-evidence gate, not around it.
+  Establish fault first (no live session, or a dead process; a quota wall
+  routes to re-route-or-wait instead), THEN boot with its declared sprint
+  route — `./sc run <shortname> --harness <role-harness> -m <role-model>
+  --effort high` drains its inbox and acts; that IS the nudge in an
+  event-driven sprint. Re-send the task row first, since the worker may have
+  drained it already and the row's read state cannot tell you whether it did.
+  The liveness guard refusing (session already live) is positive LIVENESS —
+  it proves a worker is there to disturb, so still silent -> escalate to the
+  FnB with the worktree state, never a forced boot.
   The bottleneck question in Step 3 is what surfaces a dead link.
 - **Re-sequencing**: edit the board + `task` row to *every* affected dev
   with its new slot — a dev acting on a stale slot is worse than a paused
