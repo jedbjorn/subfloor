@@ -434,6 +434,7 @@ RECONCILER_SEVERITY = {
     # contract ready for the recovery path that eventually supplies one.
     "recovery_blocked": "critical",
 }
+HEALTHY_RECONCILER_SIGNALS = {"reported", "working"}
 
 
 def _open_reconciliation_alert(
@@ -479,6 +480,28 @@ def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
     )
 
 
+def _resolve_reconciliation_alerts(
+    con,
+    reading: ReconciliationReading,
+) -> None:
+    if reading.signal not in HEALTHY_RECONCILER_SIGNALS:
+        return
+    expectation = reading.expectation
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=? "
+        "WHERE sprint_doc_id=? AND seq IS ? AND role=? "
+        "AND signal IN ('checkup','not_started',"
+        "'work_complete_unreported','recovery_blocked') "
+        "AND resolved_at IS NULL",
+        (
+            reading.observed_at.isoformat(),
+            expectation.sprint_doc_id,
+            expectation.seq,
+            expectation.role,
+        ),
+    )
+
+
 def _reconciliation_body(reading: ReconciliationReading) -> str:
     expectation = reading.expectation
     shell = _row(expectation.shell, "shortname", expectation.shell_id)
@@ -518,14 +541,23 @@ def deliver_reconciliation_readings(
     emitted: list[int] = []
     writers: dict[int, "int | None"] = {}
     for reading in readings:
-        severity = RECONCILER_SEVERITY.get(reading.signal)
-        if not reading.confirmed or severity is None:
-            continue
-
         sprint_doc_id = reading.expectation.sprint_doc_id
         if sprint_doc_id not in writers:
             writers[sprint_doc_id] = board_writer(con, sprint_doc_id)
         planner_shell_id = writers[sprint_doc_id]
+        if planner_shell_id is not None:
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=? "
+                "WHERE sprint_doc_id=? "
+                "AND reason='reconciler_missing_binding' "
+                "AND resolved_at IS NULL",
+                (reading.observed_at.isoformat(), sprint_doc_id),
+            )
+
+        _resolve_reconciliation_alerts(con, reading)
+        severity = RECONCILER_SEVERITY.get(reading.signal)
+        if not reading.confirmed or severity is None:
+            continue
         if planner_shell_id is None:
             _open_missing_binding_alert(con, sprint_doc_id)
 
@@ -570,6 +602,17 @@ def deliver_reconciliation_readings(
 def live_expectations(con) -> list[Expectation]:
     """Enumerate the structured board, independent of PR watches and prose."""
     placeholders = ",".join("?" for _ in TERMINAL_UNIT_STATES)
+    planner_doc_ids = [
+        _row(row, "document_id")
+        for row in con.execute(
+            "SELECT d.document_id FROM documents d "
+            "WHERE d.frozen=0 AND d.kind='doc' "
+            "AND d.title LIKE 'SPRINT:%' "
+            "AND EXISTS (SELECT 1 FROM sprint_units u "
+            "WHERE u.sprint_doc_id=d.document_id) "
+            "ORDER BY d.document_id"
+        ).fetchall()
+    ]
     units = con.execute(
         "SELECT u.* FROM sprint_units u "
         "JOIN documents d ON d.document_id=u.sprint_doc_id "
@@ -577,10 +620,13 @@ def live_expectations(con) -> list[Expectation]:
         "ORDER BY u.sprint_doc_id, u.unit_id",
         TERMINAL_UNIT_STATES,
     ).fetchall()
-    if not units:
+    doc_ids = sorted(
+        set(planner_doc_ids)
+        | {_row(unit, "sprint_doc_id") for unit in units}
+    )
+    if not doc_ids:
         return []
 
-    doc_ids = sorted({_row(unit, "sprint_doc_id") for unit in units})
     shell_ids = {
         shell_id
         for unit in units
