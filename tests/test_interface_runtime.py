@@ -171,9 +171,10 @@ class AvailabilityTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _runtime(self):
+    def _runtime(self, shadow_script=None):
         return interface_runtime.InterfaceRuntime(
-            str(self.db), run_dir=str(self.tmp / "run"))
+            str(self.db), run_dir=str(self.tmp / "run"),
+            shadow_script=shadow_script)
 
     def test_late_runtime_alert_keeps_ended_session_audit_resolved(self):
         con = sqlite3.connect(self.db)
@@ -231,7 +232,9 @@ class AvailabilityTest(unittest.TestCase):
             asyncio.run(flow())
 
     def test_old_tmux_rejected(self):
-        rt = self._runtime()
+        sidecar = self.tmp / "sidecar.js"
+        sidecar.touch()
+        rt = self._runtime(shadow_script=str(sidecar))
         with mock.patch.object(interface_runtime.shutil, "which",
                                return_value="/usr/bin/x"), \
                 mock.patch.object(interface_runtime, "_tmux_version",
@@ -239,6 +242,25 @@ class AvailabilityTest(unittest.TestCase):
             reason = rt._check_available()
         self.assertIsNotNone(reason)
         self.assertIn("3.3", reason)
+
+    def test_missing_sidecar_names_incomplete_materialize(self):
+        sidecar = self.tmp / "missing-sidecar.js"
+        rt = self._runtime(shadow_script=str(sidecar))
+        with mock.patch.object(interface_runtime.shutil, "which",
+                               return_value="/usr/bin/x"):
+            reason = rt._check_available()
+        self.assertIn(str(sidecar), reason)
+        self.assertIn("engine materialize is incomplete", reason)
+
+    def test_present_sidecar_keeps_runtime_available(self):
+        sidecar = self.tmp / "sidecar.js"
+        sidecar.touch()
+        rt = self._runtime(shadow_script=str(sidecar))
+        with mock.patch.object(interface_runtime.shutil, "which",
+                               return_value="/usr/bin/x"), \
+                mock.patch.object(interface_runtime, "_tmux_version",
+                                  return_value=(3, 4)):
+            self.assertIsNone(rt._check_available())
 
     def test_tmux_version_parse(self):
         cases = [("tmux 3.5a\n", (3, 5)), ("tmux 3.4\n", (3, 4)),
