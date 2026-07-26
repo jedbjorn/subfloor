@@ -41,11 +41,13 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
+MIGRATION = MIGRATIONS / "0098_sprint_units.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 import interface_routes as routes  # noqa: E402
 import interface_wake  # noqa: E402
+import migrate  # noqa: E402
 import sprint as sprint_cli  # noqa: E402
 
 OP = "Authorization: Bearer optok"
@@ -62,6 +64,31 @@ def build_engine_db(path: Path) -> None:
     con.executescript(SCHEMA.read_text())
     for p in sorted(MIGRATIONS.glob("*.sql")):
         con.executescript(p.read_text())
+    seed_fixtures(con)
+    con.close()
+
+
+def build_pre_migration_db(path: Path) -> None:
+    """The DB this migration actually meets in the field: a fork's live engine
+    DB the moment before it pulls 0098 — everything else in place, no board.
+
+    `schema.sql` is the CURRENT baseline and therefore already carries
+    `sprint_units`, so the fixture drops it. That drop is the whole point:
+    build from the baseline and 0098 could be DELETED with every behavioural
+    test still green, because a fresh install would keep working while every
+    fork that UPGRADES would be left with no board at all.
+    """
+    con = sqlite3.connect(path)
+    con.executescript(SCHEMA.read_text())
+    for p in sorted(MIGRATIONS.glob("*.sql")):
+        if p != MIGRATION:
+            con.executescript(p.read_text())
+    con.execute("DROP TABLE IF EXISTS sprint_units")   # drops its index too
+    seed_fixtures(con)
+    con.close()
+
+
+def seed_fixtures(con) -> None:
     con.execute(
         "INSERT INTO users (user_id, username, is_active) VALUES (1,'T',1)")
     for sid, short, flavor, key in (
@@ -79,7 +106,6 @@ def build_engine_db(path: Path) -> None:
         "INSERT INTO documents (document_id, kind, title, body) "
         "VALUES (1,'doc','SPRINT: test',?)", (DOC_BODY,))
     con.commit()
-    con.close()
 
 
 def hdrs(*lines) -> str:
@@ -97,11 +123,18 @@ class _NoCoordinator:
         pass
 
 
-class BoardRecordTest(unittest.TestCase):
+class _BoardCase(unittest.TestCase):
+    """Scaffolding shared by the record tests and the live-upgrade tests: one
+    temp DB with the routes bound to it. `build` is the hook the upgrade class
+    swaps — it is the ONLY difference between a board that was installed and a
+    board that was migrated into place."""
+
+    build = staticmethod(build_engine_db)
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.db_path = self.tmp / "shell_db.db"
-        build_engine_db(self.db_path)
+        self.build(self.db_path)
         run_dir = self.tmp / "run" / "interface"
         run_dir.mkdir(parents=True)
         self.patches = [
@@ -186,6 +219,9 @@ class BoardRecordTest(unittest.TestCase):
             con.commit()
         finally:
             con.close()
+
+
+class BoardRecordTest(_BoardCase):
 
     # -- the reviewer column: the whole point of the unit ---------------------
 
@@ -549,6 +585,213 @@ class BoardRecordTest(unittest.TestCase):
             snapshot.PER_INSTANCE_TABLES.index("sprint_units"),
             snapshot.PER_INSTANCE_TABLES.index("shells"),
             "sprint_units must load after its FK target `shells`")
+
+    # -- malformed input is refused at the edge -------------------------------
+
+    def test_a_field_of_the_wrong_type_is_refused_not_stored(self):
+        """The board is a record of what a planner DECLARED, and the reconciler
+        acts on what it is handed. A field holding something no planner could
+        have typed — a PR number that is text, a branch that is a number — is
+        belief corrupted quietly; SQLite's affinity will happily keep 'seven'
+        in an INTEGER column. Enumerated as a SET, because a boundary that
+        covers the field a bug was reported on and not its neighbours is the
+        same gap one column over."""
+        self.add()
+        malformed = {"unit_title": 7, "depends_on": ["U1"], "overlap": 3.5,
+                     "branch": 42, "pr_number": "seven"}
+        for field, value in malformed.items():
+            before = self.row()[field]
+            status, err = self.patch(**{field: value})
+            self.assertEqual(status, 422, f"{field}={value!r} was accepted")
+            self.assertEqual(err["error"]["code"], "validation")
+            self.assertEqual(self.row()[field], before,
+                             f"{field} moved on a refused write")
+
+    def test_a_malformed_declaration_is_refused_without_a_500(self):
+        """Same set on the create path. `add` and `set` are two doors to one
+        record: a numeric title reached .strip() here and returned a sanitized
+        500, which tells the planner nothing about what it typed wrong."""
+        for field, value in (("unit_title", 7), ("pr_number", "seven"),
+                             ("branch", 42), ("sprint_doc_id", "1"),
+                             ("sprint_doc_id", True), ("seq", 1)):
+            status, err = self.add(**{"seq": "U8", field: value})
+            self.assertEqual(status, 422, f"{field}={value!r} was accepted")
+            self.assertEqual(err["error"]["code"], "validation")
+            self.assertIsNone(self.row("U8"))
+
+    def test_a_blank_is_not_a_value_and_null_is_the_way_to_clear(self):
+        """An empty `branch` reads as a unit whose declared branch is the empty
+        string — and U3/U4 compare that declaration against what the worktree
+        holds. Retraction has a spelling already (explicit null); a blank must
+        not become a second one that means something subtly different."""
+        self.add(branch="feat/real")
+        status, _ = self.patch(branch="   ")
+        self.assertEqual(status, 422)
+        self.assertEqual(self.row()["branch"], "feat/real")
+        self.patch(branch=None)
+        self.assertIsNone(self.row()["branch"])
+
+    def test_a_malformed_filter_refuses_rather_than_widening(self):
+        """The failure that matters most on the read path: a filter that fails
+        to parse must not fall open to EVERY board. The caller believes it
+        asked about one sprint, and the reconciler acts on what it is handed —
+        so silent widening hands it units from a sprint nobody asked about."""
+        self.add(seq="U1")
+        self.sql("INSERT INTO documents (document_id, kind, title, body) "
+                 "VALUES (2,'doc','SPRINT: other','x')")
+        self.sql("INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+                 "VALUES (2,'U1','another sprint entirely')")
+        status, err = self.call("GET", "/api/sprint-units?sprint_doc_id=abc",
+                                (OP,))
+        self.assertEqual(status, 422, err)
+        self.assertEqual(err["error"]["code"], "validation")
+        # and the honest filter still answers with ONLY that sprint
+        status, out = self.call("GET", "/api/sprint-units?sprint_doc_id=1",
+                                (OP,))
+        self.assertEqual(status, 200)
+        self.assertEqual([u["sprint_doc_id"] for u in out["units"]], [1])
+
+
+class LiveUpgradeTest(_BoardCase):
+    """Migration 0098 as the thing under test, rather than as a file that
+    happens to run on the way to a fixture.
+
+    Every test above builds its DB from `schema.sql` — the current baseline,
+    which already carries `sprint_units`. Under that fixture the migration
+    could be DELETED and all of them would stay green: fresh installs would
+    keep working, and every existing fork — including this repo's own live
+    DB — would upgrade into a board that is not there. So these start from the
+    DB the migration actually meets and drive the REAL runner across it,
+    ledger and outer-transaction stripping included.
+    """
+
+    build = staticmethod(build_pre_migration_db)
+
+    def upgrade(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            migrate.apply(con, MIGRATION)
+        finally:
+            con.close()
+
+    def shape(self, db_path):
+        """A table's structure as the DB itself reports it — columns with
+        their types, defaults and nullability, the FK targets, and the
+        indexes with their columns and uniqueness."""
+        con = sqlite3.connect(db_path)
+        try:
+            cols = con.execute("PRAGMA table_info(sprint_units)").fetchall()
+            fks = sorted(con.execute(
+                "PRAGMA foreign_key_list(sprint_units)").fetchall())
+            idx = []
+            for _s, name, unique, _o, _p in con.execute(
+                    "PRAGMA index_list(sprint_units)").fetchall():
+                cols_of = [r[2] for r in con.execute(
+                    f"PRAGMA index_info({name})").fetchall()]
+                idx.append((name, unique, cols_of))
+            return {"columns": cols, "fks": fks, "indexes": sorted(idx)}
+        finally:
+            con.close()
+
+    def test_the_migration_lands_the_board_on_a_db_that_had_none(self):
+        """Absence first: a fixture that already held the table would make
+        every assertion below vacuous — which is exactly the defect this test
+        exists to close, one layer down."""
+        con = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
+                            "type='table' AND name='sprint_units'"
+                            ).fetchone()[0], 0,
+                "the fixture already had a board — the upgrade proves nothing")
+        finally:
+            con.close()
+
+        self.upgrade()
+
+        shape = self.shape(self.db_path)
+        names = [c[1] for c in shape["columns"]]
+        # BOTH roles: the reviewer column is the gap that blocked everything,
+        # and an upgrade that landed only the dev would ship the original
+        # defect to every fork while a fresh install stayed correct.
+        self.assertIn("dev_shell_id", names)
+        self.assertIn("reviewer_shell_id", names)
+        self.assertIn("overlap", names)
+        # the reconciler's per-tick read is (sprint_doc_id, state)
+        self.assertIn(("idx_sprint_units_live", 0, ["sprint_doc_id", "state"]),
+                      shape["indexes"])
+        con = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM schema_migrations WHERE "
+                            "filename=?", (MIGRATION.name,)).fetchone()[0], 1,
+                "the runner did not stamp the ledger — it would re-run")
+        finally:
+            con.close()
+
+    def test_the_migrated_board_enforces_the_constraints_it_promises(self):
+        """Structure is not behaviour: a table can arrive with the right
+        columns and no CHECK, and the first thing that notices is a board
+        holding a state nothing can interpret."""
+        self.upgrade()
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute("INSERT INTO sprint_units (sprint_doc_id, seq, "
+                        "unit_title) VALUES (1,'U1','board record')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("UPDATE sprint_units SET state='done'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("INSERT INTO sprint_units (sprint_doc_id, seq, "
+                            "unit_title) VALUES (1,'U1','declared twice')")
+            self.assertEqual(
+                con.execute("SELECT state FROM sprint_units").fetchone()[0],
+                "pending")
+        finally:
+            con.close()
+
+    def test_the_migrated_board_serves_the_api_and_its_fence(self):
+        """The end the operator sees: after the upgrade the board takes a
+        planner's declaration and refuses a worker's — through the same routes,
+        against a table no `schema.sql` in this DB ever created."""
+        self.upgrade()
+        self.arm_binding()
+        status, unit = self.add((PLANNER,), dev="DEV5", reviewer="REV2")
+        self.assertEqual(status, 201, unit)
+        self.assertEqual(unit["reviewer_shortname"], "REV2")
+        status, _ = self.patch((DEV,), state="merged")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.row()["state"], "pending")
+
+    def test_the_upgrade_and_the_baseline_build_the_same_table(self):
+        """Two populations run this code: forks that install from `schema.sql`
+        and forks that upgrade through the migration. If the two definitions
+        drift, the same query answers differently in each — and the drift is
+        invisible to both, because each only ever builds its own way."""
+        self.upgrade()
+        installed = self.tmp / "installed.db"
+        build_engine_db(installed)
+        self.assertEqual(self.shape(self.db_path), self.shape(installed))
+
+    def test_the_migration_is_inert_when_the_board_is_already_there(self):
+        """A fresh build runs `schema.sql` and THEN every migration, so 0098
+        always meets a table that already exists — and `./sc update` can re-run
+        an unstamped file against a DB whose ledger was rebuilt. Neither may
+        error, and neither may disturb what the board already holds."""
+        installed = self.tmp / "installed.db"
+        build_engine_db(installed)
+        con = sqlite3.connect(installed)
+        try:
+            con.execute("INSERT INTO sprint_units (sprint_doc_id, seq, "
+                        "unit_title, state) VALUES (1,'U1','live',"
+                        "'in_review')")
+            con.commit()
+            migrate.apply(con, MIGRATION)
+            con.executescript(MIGRATION.read_text())      # and again, bare
+            self.assertEqual(
+                con.execute("SELECT seq, state FROM sprint_units"
+                            ).fetchall(), [("U1", "in_review")])
+        finally:
+            con.close()
 
 
 if __name__ == "__main__":

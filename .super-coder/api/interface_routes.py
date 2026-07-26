@@ -2251,19 +2251,64 @@ def _retry_binding(actor, headers, body, binding_id: int):
 # ------------------------------------------------------- the board as a record
 
 # The board's columns as the planner edits them, minus `state` — which is
-# deliberately NOT here (see _patch_sprint_unit). Keyed by request field name,
-# valued by column name; the two differ for the role columns because a request
-# names a shell, not a shell_id.
+# deliberately NOT here (see _patch_sprint_unit). Keyed by request field name
+# (identical to the column name), valued by the type the boundary demands and
+# whether an explicit null may clear it.
+#
+# ONE definition, because POST and PATCH both admit these fields and a second
+# statement of their shape would drift: the boundary that existed in `add` and
+# not in `set` is precisely how a numeric title 500'd on one route and a
+# textual pr_number landed in an INTEGER column on the other.
 _UNIT_FIELDS = {
-    "unit_title": "unit_title",
-    "depends_on": "depends_on",
-    "overlap": "overlap",
-    "branch": "branch",
-    "pr_number": "pr_number",
+    "unit_title": (str, False),
+    "depends_on": (str, True),
+    "overlap": (str, True),
+    "branch": (str, True),
+    "pr_number": (int, True),
 }
 _UNIT_ROLES = {"dev": "dev_shell_id", "reviewer": "reviewer_shell_id"}
 _UNIT_STATES = ("pending", "working", "in_review", "blocked", "merged",
                 "cancelled")
+
+
+def _is_int(value) -> bool:
+    """`True` is an `int` in Python, so a plain isinstance check would accept
+    `{"sprint_doc_id": true}` and address the board of document 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _bad_unit_field(body):
+    """Type-check every writable board field AT THE EDGE, before any of it can
+    reach a string method or an INTEGER column.
+
+    The board is a record of what a planner declared, and the reconciler acts
+    on what it is handed — so a field that lands holding something no planner
+    could have typed (a PR number that is text, a branch that is a number) is
+    belief corrupted quietly, which is worse than the 500 that the same input
+    produced on the other route. Returns an error response, or None to allow.
+    """
+    for field, (kind, clearable) in _UNIT_FIELDS.items():
+        if field not in body:
+            continue                      # omitted = leave alone, not clear
+        value = body[field]
+        if value is None:
+            if clearable:
+                continue
+            return _err(422, "validation", f"{field} cannot be cleared")
+        if kind is int and not _is_int(value):
+            return _err(422, "validation", f"{field} must be an integer or null")
+        if kind is str and not isinstance(value, str):
+            return _err(422, "validation",
+                        f"{field} must be a string"
+                        + (" or null" if clearable else ""))
+        if kind is str and not value.strip():
+            # A blank is not a value: an empty `branch` reads as a declared
+            # branch that is the empty string, which U3/U4 compare against the
+            # worktree. Retract it with an explicit null instead.
+            return _err(422, "validation",
+                        f"{field} cannot be blank"
+                        + (" — pass null to clear it" if clearable else ""))
+    return None
 
 
 def _board_writer(con, sprint_doc_id: int) -> "int | None":
@@ -2367,6 +2412,15 @@ def _sprint_units(actor, query: dict):
     participant reads it (it is the board they work from); only the planner
     writes it."""
     doc_id = _qint(query, "sprint_doc_id")
+    if query.get("sprint_doc_id", [None])[0] not in (None, "") \
+            and doc_id is None:
+        # _qint answers None for both "absent" and "unparseable", and the two
+        # mean opposite things here: absent asks for every board, unparseable
+        # would SILENTLY WIDEN to every board while the caller believes it
+        # asked about one sprint. A filter that fails open is worse than no
+        # filter, because the caller acts on units it never asked about.
+        return _err(422, "validation",
+                    "sprint_doc_id filter must be an integer")
     sql = "SELECT unit_id FROM sprint_units"
     params = []
     if doc_id is not None:
@@ -2391,14 +2445,18 @@ def _add_sprint_unit(actor, headers, body):
     reconciler then expects a shell to be working on.
     """
     doc_id = body.get("sprint_doc_id")
-    seq = (body.get("seq") or "").strip() if isinstance(
-        body.get("seq"), str) else body.get("seq")
-    title = (body.get("unit_title") or "").strip()
-    if not isinstance(doc_id, int) or not isinstance(seq, str) or not seq \
-            or not title:
+    seq = body.get("seq")
+    if not _is_int(doc_id) or not isinstance(seq, str) or not seq.strip():
         return _err(422, "validation",
-                    "sprint_doc_id (int), seq (non-empty str, e.g. 'U1'), "
-                    "unit_title (non-empty str) required")
+                    "sprint_doc_id (int) and seq (non-empty str, e.g. 'U1') "
+                    "required")
+    seq = seq.strip()
+    bad = _bad_unit_field(body)
+    if bad is not None:
+        return bad
+    if "unit_title" not in body:
+        return _err(422, "validation", "unit_title (non-empty str) required")
+    title = body["unit_title"].strip()
     state = body.get("state", "pending")
     if state not in _UNIT_STATES:
         return _err(422, "validation",
@@ -2468,11 +2526,13 @@ def _patch_sprint_unit(actor, headers, body):
     """
     doc_id = body.get("sprint_doc_id")
     seq = body.get("seq")
-    if not isinstance(doc_id, int) or not isinstance(seq, str) \
-            or not seq.strip():
+    if not _is_int(doc_id) or not isinstance(seq, str) or not seq.strip():
         return _err(422, "validation",
                     "sprint_doc_id (int) and seq (str) address the unit")
     seq = seq.strip()
+    bad = _bad_unit_field(body)
+    if bad is not None:
+        return bad
     edits = {f: body[f] for f in _UNIT_FIELDS if f in body}
     roles = {r: body[r] for r in _UNIT_ROLES if r in body}
     state = body.get("state")
@@ -2485,8 +2545,6 @@ def _patch_sprint_unit(actor, headers, body):
                     f"state must be one of {', '.join(_UNIT_STATES)}")
     if state is None and not edits and not roles:
         return _err(422, "validation", "no fields to change")
-    if "unit_title" in edits and not (edits["unit_title"] or "").strip():
-        return _err(422, "validation", "unit_title cannot be cleared")
     con = _db()
     try:
         refusal = _may_write_board(con, actor, doc_id)
@@ -2525,9 +2583,9 @@ def _patch_sprint_unit(actor, headers, body):
             was = {"dev_shell_id": was_dev, "reviewer_shell_id": was_rev}
             if any(was[c] != v for c, v in resolved.items()):
                 sets.append("assigned_at=datetime('now')")
-            for field, col in _UNIT_FIELDS.items():
+            for field in _UNIT_FIELDS:
                 if field in edits:
-                    sets.append(f"{col}=?")
+                    sets.append(f"{field}=?")
                     params.append(edits[field])
             sets.append("updated_at=datetime('now')")
             sets.append("updated_by_shell_id=?")
