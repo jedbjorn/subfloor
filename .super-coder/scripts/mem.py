@@ -34,7 +34,9 @@ Run from the repo root, like every engine command:
                                                    # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
     ./sc mem state "<text>"
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
-    ./sc mem lns   "<body>"          [--date …] [--tag …]
+    ./sc mem lns   "<body>"          (--supersedes 29,36 | --new) [--date …] [--tag …]
+                                                   # ≤500 chars: the RULE, not the incident
+    ./sc mem curated                 # stamp a curation sweep (clears the STATUS advisory)
     ./sc mem retire <entry_id>
     ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--feature ID] [--doc ID]
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID]
@@ -516,13 +518,16 @@ def cmd_state(args) -> int:
     return _finish_api(f"mem: current_state updated ({len(args.text)} chars)")
 
 
-def _insert_identity(args, kind: str) -> int:
-    r = _api("POST", f"/_sc/mem/{kind}",
-             {"body": args.body,
-              "entry_date": args.date or str(date.today()),
-              "source_tag": args.tag})
+def _insert_identity(args, kind: str, extra: "dict | None" = None) -> int:
+    payload = {"body": args.body,
+               "entry_date": args.date or str(date.today()),
+               "source_tag": args.tag}
+    payload.update(extra or {})
+    r = _api("POST", f"/_sc/mem/{kind}", payload)
     label = "seed" if kind == "seed" else "L&S"
-    return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added")
+    gone = r.get("retired") or []
+    note = f" (superseding {', '.join('#' + str(i) for i in gone)})" if gone else ""
+    return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added{note}")
 
 
 def cmd_seed(args) -> int:
@@ -530,7 +535,38 @@ def cmd_seed(args) -> int:
 
 
 def cmd_lns(args) -> int:
-    return _insert_identity(args, "lns")
+    """Add an L&S entry — with the triage that keeps the set a SET.
+
+    Exactly one of --supersedes / --new is required. This is the whole fix:
+    the active set is already rendered into your boot doc, so checking a new
+    rule against it costs no extra read, and the shell doing that check had
+    nowhere to put the answer — `lns` offered one verb, `add`. The flag is the
+    landing place, and requiring it makes the triage auditable rather than
+    hoped-for. `sc mem decision` already carries `--parent` for exactly this.
+    """
+    if bool(args.supersedes) == bool(args.new):
+        die("`lns` needs exactly one of --supersedes / --new.\n"
+            "  Check the new rule against your active set (already in your boot doc):\n"
+            "    --supersedes 29,36   it contradicts or refines those — retires them, adds this\n"
+            "    --new                checked, and genuinely unrelated to every entry")
+    ids: list[int] = []
+    if args.supersedes:
+        for part in args.supersedes.replace(" ", ",").split(","):
+            if not part:
+                continue
+            if not part.lstrip("#").isdigit():
+                die(f"--supersedes takes entry ids, got '{part}'")
+            ids.append(int(part.lstrip("#")))
+        if not ids:
+            die("--supersedes needs at least one entry id")
+    return _insert_identity(args, "lns", {"supersedes": ids})
+
+
+def cmd_curated(args) -> int:
+    """Stamp a curation sweep. Unconditional — a sweep that retires nothing is
+    still a sweep, and must clear the counter or the advisory never goes quiet."""
+    _api("POST", "/_sc/mem/lns/curated", {}, idempotent=True)
+    return _finish_api("mem: L&S curation stamped — the counter restarts here")
 
 
 def cmd_retire(args) -> int:
@@ -823,7 +859,18 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("body")
         sp.add_argument("--date")
         sp.add_argument("--tag")
+        if k == "lns":
+            # Required one-of, enforced in cmd_lns rather than by a mutually
+            # exclusive required group so the refusal can teach the triage
+            # instead of printing argparse's bare usage line.
+            sp.add_argument("--supersedes",
+                            help="entry id(s) this rule replaces — retires them, adds this")
+            sp.add_argument("--new", action="store_true",
+                            help="checked against the active set and genuinely unrelated")
         sp.set_defaults(fn=fn)
+
+    sub.add_parser("curated", help="stamp an L&S curation sweep (clears the STATUS advisory)") \
+       .set_defaults(fn=cmd_curated)
 
     sp = sub.add_parser("retire", help="retire an identity entry (frees a cap slot)")
     sp.add_argument("entry_id", type=int)

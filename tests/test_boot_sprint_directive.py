@@ -51,11 +51,24 @@ CLOSED_BODY = "# SPRINT: test\nstatus: CLOSED\n\nprose the record never touches\
 
 
 def build_db(path: Path) -> sqlite3.Connection:
-    """Engine db from the tracked baseline. `sprint_units` and
-    `sprint_planner_bindings` are both in schema.sql, so no migration replay is
-    needed to get the shapes this renderer reads."""
+    """Engine db from the tracked baseline: schema.sql THEN every migration.
+
+    `sprint_units` and `sprint_planner_bindings` are both in schema.sql, so the
+    shapes this renderer reads were once available from the baseline alone —
+    but "the sources" for a render are schema + migrations (what `./sc rebuild`
+    and the hermetic render-check both build), and compose_boot legitimately
+    reads migration-added columns (0100's `shells.lns_curated_at`). Replaying
+    them keeps this fixture the same floor the real render runs on.
+    """
     con = sqlite3.connect(path)
     con.executescript(SCHEMA.read_text())
+    for m in sorted((ENGINE / "migrations").glob("*.sql")):
+        con.executescript(m.read_text())
+    # A migration turns FK enforcement on for its own replay; this fixture was
+    # written against the schema-only default (off) and seeds rows in an order
+    # that leans on it. Replaying migrations is meant to add COLUMNS here, not
+    # to change which constraints this fixture is checked against.
+    con.execute("PRAGMA foreign_keys=OFF")
     con.execute("INSERT INTO users (user_id, username) VALUES (1, 'Jed')")
     for shell_id, shortname, flavor in (
             (DEV_SHELL, "DEV5", "dev"),

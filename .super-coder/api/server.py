@@ -1010,8 +1010,15 @@ def patch_columns(con, table, pk_col, pk, body, allowed, commit=True):
         return False, "no editable fields in payload"
     vals = [body[col] for col in cols]
     sets = ", ".join(f"{col}=?" for col in cols)
-    cur = con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
-                      tuple(vals) + (pk,))
+    try:
+        cur = con.execute(f"UPDATE {table} SET {sets} WHERE {pk_col}=?",
+                          tuple(vals) + (pk,))
+    except db_driver.IntegrityError as e:
+        # A trigger refused the write (e.g. the current_state length cap). Its
+        # message routes the fix, so hand it back as a client error instead of
+        # letting it surface as an unhandled 500 with the remedy buried.
+        con.rollback()
+        return False, str(e)
     if cur.rowcount == 0:
         return False, "not found"
     if commit:
@@ -2042,8 +2049,24 @@ class Handler(BaseHTTPRequestHandler):
         con = db()
         try:
             if path == "/_sc/mem/state":
-                con.execute("UPDATE shells SET current_state=? WHERE shell_id=?",
-                            ((body.get("body") or ""), sid))
+                try:
+                    con.execute("UPDATE shells SET current_state=? WHERE shell_id=?",
+                                ((body.get("body") or ""), sid))
+                except db_driver.IntegrityError as e:   # the 300-char cap
+                    con.rollback()
+                    return self._send(400, {"error": str(e)})
+                con.commit()
+                return self._send(200, {"ok": True})
+
+            # The curation stamp (migration 0100). Unconditional by design: a
+            # sweep that finds a clean set and retires NOTHING still clears the
+            # counter, or the advisory would stand forever on a shell that has
+            # done the work. This is the case a MAX(retired_at) signal would
+            # have shipped broken.
+            if path == "/_sc/mem/lns/curated":
+                con.execute(
+                    "UPDATE shells SET lns_curated_at=datetime('now') WHERE shell_id=?",
+                    (sid,))
                 con.commit()
                 return self._send(200, {"ok": True})
 
@@ -2080,14 +2103,49 @@ class Handler(BaseHTTPRequestHandler):
                 b = (body.get("body") or "").strip()
                 if not b:
                     return self._send(400, {"error": "body required"})
-                cur = con.execute(
-                    "INSERT INTO shell_identity_entries "
-                    "(shell_id, kind, body, entry_date, source_tag) VALUES (?, ?, ?, ?, ?)",
-                    (sid, kind, b,
-                     body.get("entry_date") or None,
-                     body.get("source_tag") or None))
+                # L&S supersession: the missing verb. Five of one shell's twenty
+                # entries NAMED the entry they duplicated and added anyway —
+                # `lns` offered exactly one verb, so the reconciliation the shell
+                # had already done had nowhere to land. Retire FIRST, then
+                # insert: a supersede at 20/20 must succeed (the freed slot is
+                # the point), and both halves ride one transaction so a rejected
+                # insert can never leave the old entries retired for nothing.
+                retired: list[int] = []
+                if kind == "lns" and body.get("supersedes"):
+                    try:
+                        retired = [int(i) for i in body["supersedes"]]
+                    except (TypeError, ValueError):
+                        return self._send(400, {"error": "supersedes must be entry ids"})
+                    for eid in retired:
+                        if not con.execute(
+                                "SELECT 1 FROM shell_identity_entries "
+                                "WHERE entry_id=? AND shell_id=? AND kind='lns' "
+                                "AND is_deleted=0 AND retired_at IS NULL",
+                                (eid, sid)).fetchone():
+                            return self._send(404, {
+                                "error": f"entry #{eid} is not one of your active "
+                                         "L&S entries — `sc mem get lns` lists them"})
+                    con.execute(
+                        "UPDATE shell_identity_entries SET retired_at=datetime('now') "
+                        "WHERE entry_id IN (%s)" % ",".join("?" * len(retired)),
+                        tuple(retired))
+                try:
+                    cur = con.execute(
+                        "INSERT INTO shell_identity_entries "
+                        "(shell_id, kind, body, entry_date, source_tag) VALUES (?, ?, ?, ?, ?)",
+                        (sid, kind, b,
+                         body.get("entry_date") or None,
+                         body.get("source_tag") or None))
+                except db_driver.IntegrityError as e:
+                    # A cap trigger (count or length) fired. That is a client
+                    # error carrying its own remedy, not a server fault — a 500
+                    # would read as "the engine broke" and bury the routing
+                    # instruction the message exists to deliver.
+                    con.rollback()
+                    return self._send(400, {"error": str(e)})
                 con.commit()
-                return self._send(201, {"entry_id": cur.lastrowid})
+                return self._send(201, {"entry_id": cur.lastrowid,
+                                        "retired": retired})
 
             if path == "/_sc/mem/decisions":
                 d = (body.get("decision") or "").strip()
