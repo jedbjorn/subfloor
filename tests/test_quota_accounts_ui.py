@@ -25,13 +25,15 @@ so all three are asked in both directions:
     WITH their age, rather than blanking the card or passing them off as fresh.
 
 WHAT THIS SUITE STOPPED PINNING, AND WHY IT IS NOT A GAP. The 7-day activity
-window, the is_current exemption, muted rendering, the disabled refresh button
-and the full-email label all had tests here and all are gone. They were not
-weakened — the mechanisms were REMOVED (decision #75, migration 0097), and a
-test for a mechanism that no longer exists is the "comment describing a
-mechanism that no longer exists" defect wearing a different hat. What replaces
-them is the property they were each approximating: every provider renders a
-card, and no card says anything about who is signed in.
+window, the is_current exemption, muted rendering, the disabled refresh button,
+the per-card refresh button and the full-email label all had tests here and all
+are gone. They were not weakened — the mechanisms were REMOVED (decision #75,
+migration 0097), and a test for a mechanism that no longer exists is the
+"comment describing a mechanism that no longer exists" defect wearing a
+different hat. What replaces them is the property they were each approximating:
+every provider renders a card, no card says anything about who is signed in,
+and the section has exactly one refresh control because one probe run is all
+the route can do.
 """
 
 from __future__ import annotations
@@ -407,15 +409,28 @@ def test_never_probed_and_idle_say_different_things():
     """Both render zero windows, and collapsing them loses the operator's next
     move. A provider that has never returned anything has nothing to show; one
     that returned an intact envelope carrying zero windows is genuinely idle,
-    and that IS its reading."""
+    and that IS its reading.
+
+    THE SIGNAL IS THE STATUS, and these three payloads are ones the API emits.
+    The card used to branch on captured_at, which the API derives from window
+    rows — so a card with no windows never had one and the idle sentence could
+    not be reached by any real response. This test pinned that branch with a
+    hand-authored payload the producer cannot emit, which is the defect class
+    this whole unit exists to end. `ok` with zero windows is the producible
+    idle reading (pinned at the API layer in the sibling suite); no status is
+    the never-probed one, and a failed probe that has never landed a reading
+    has nothing to show either."""
     r = run_js("""
       const r0 = root(); anDrawQuota(r0, PAYLOAD);
       out({ bodies: byClass(r0, "an-acct").map((c) => c.textContent) });
-    """, payload([provider("anthropic", captured_at=None, windows=[]),
-                  provider("openai", windows=[])]))
-    never, idle = r["bodies"]
+    """, payload([provider("anthropic", status=None, captured_at=None, windows=[]),
+                  provider("openai", status="ok", captured_at=None, windows=[]),
+                  provider("moonshot", status="na", captured_at=None, windows=[])]))
+    never, idle, unconfigured = r["bodies"]
     assert "no reading yet" in never
     assert "no windows reported" in idle
+    assert "no reading yet" in unconfigured
+    assert "no windows reported" not in never + unconfigured
     assert never != idle
 
 
@@ -480,21 +495,31 @@ def test_the_age_is_never_omitted_when_there_is_a_reading():
     assert "as of" not in r["none"]
 
 
-def test_refresh_is_always_available_even_on_a_degraded_card():
-    """The old panel disabled this button whenever it judged a probe could not
-    succeed — a judgement made from the registry's idea of who was signed in,
-    and wrong in exactly the case the operator most wants the button: a lapsed
-    Kimi token that a re-probe fixes the moment they boot the harness."""
+def test_one_refresh_control_for_the_section_and_none_on_the_cards():
+    """ONE PROBE RUN IS ALL THERE IS. Each card used to carry its own
+    "refresh ⟳" that POSTed the same route and re-probed all three providers —
+    a label under-describing what the button does, three times over.
+
+    Per-card refresh made sense under the ACCOUNT model, where cards differed
+    in whether they could be refreshed at all. Provider cards do not differ
+    that way, so the control belongs to the section, and it is never disabled
+    by a judgement about whether a probe can succeed: the old panel made that
+    judgement from the registry's idea of who was signed in, and was wrong in
+    exactly the case the operator most wants it — a lapsed Kimi token that a
+    re-probe fixes the moment they boot the harness. Both statuses below are
+    cases the old panel would have disabled."""
     r = run_js("""
       const r0 = root(); anDrawQuota(r0, PAYLOAD);
-      const cards = byClass(r0, "an-acct");
-      const btn = (c) => buttons(c).filter((b) => b.textContent.startsWith("refresh"))[0];
-      out({ disabled: cards.map((c) => btn(c).disabled),
-            wired: cards.map((c) => btn(c).onclick !== null) });
+      const bar = byClass(r0, "an-acct-bar")[0];
+      out({ all: buttons(r0).map((b) => b.textContent),
+            onCards: byClass(r0, "an-acct").map((c) => buttons(c).length),
+            disabled: buttons(bar)[0].disabled,
+            wired: buttons(bar)[0].onclick !== null });
     """, payload([provider("anthropic", status="unauth", captured_at=iso(hours=-3)),
                   provider("moonshot", status="na", captured_at=None, windows=[])]))
-    assert r["disabled"] == [False, False]
-    assert r["wired"] == [True, True]
+    assert r["all"] == ["refresh all ⟳"], "the section has exactly one control"
+    assert r["onCards"] == [0, 0]
+    assert r["disabled"] is False and r["wired"] is True
 
 
 def test_each_card_links_out_to_its_own_providers_usage_page():
@@ -513,8 +538,7 @@ def test_each_card_links_out_to_its_own_providers_usage_page():
 def test_refresh_forces_a_probe_and_redraws_from_its_response():
     r = run_js("""
       const r0 = root(); anDrawQuota(r0, PAYLOAD);
-      const card = byClass(r0, "an-acct")[0];
-      const btn = buttons(card).filter((b) => b.textContent.startsWith("refresh ⟳"))[0];
+      const btn = buttons(r0).filter((b) => b.textContent.startsWith("refresh all"))[0];
       await btn.onclick();
       out({ calls: calls.map((c) => c.path + " " + c.method),
             cards: byClass(r0, "an-acct").length, toasts });

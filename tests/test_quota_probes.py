@@ -47,6 +47,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -60,6 +61,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "quota_probes"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 
+import harness_versions  # noqa: E402
 import quota_probes as qp  # noqa: E402
 from quota_probes import anthropic as p_anthropic  # noqa: E402
 from quota_probes import dispatch  # noqa: E402
@@ -68,6 +70,14 @@ from quota_probes import openai as p_openai  # noqa: E402
 
 TOKEN = "sentinel-access-token-must-never-leak"
 HOUR_MS = 3600 * 1000
+
+# The real version probe, captured before any stub replaces the module
+# attribute — the seam test below runs it for real against a scrubbed PATH.
+REAL_VERSION_PROBE = harness_versions.probe
+# What a codex-equipped host answers. Stubbed for every test (see ProbeCase),
+# because `harness_versions.probe` shells out to the installed CLI and the
+# openai probe is the one caller that depends on it.
+STUB_CODEX_VERSION = "codex-cli 0.145.0"
 
 
 def fixture(name: str) -> dict:
@@ -94,6 +104,15 @@ class ProbeCase(unittest.TestCase):
     Every probe module resolves its credential paths at import time, so the
     constants are patched rather than $HOME — the same thing the real code
     would read, without touching the operator's own files.
+
+    HTTP IS NOT THE ONLY EXTERNAL DEPENDENCY, and stubbing only that one is
+    what put 20 failures in CI (SC-170). The openai probe derives its client
+    version from the INSTALLED codex CLI, so on a runner without one it
+    short-circuits to a named error before the get_json seam is ever reached
+    and every openai leg reds — the suite's result depending on the host's
+    toolchain, which is precisely what the fixture work exists to end. Both
+    seams are stubbed here; `test_the_version_seam_is_the_installed_cli` runs
+    the real one against a scrubbed PATH so the coupling itself stays pinned.
     """
 
     def setUp(self):
@@ -123,6 +142,7 @@ class ProbeCase(unittest.TestCase):
                    PROFILE=self.claude_profile)
         self.patch(p_openai, CREDENTIALS=self.codex_auth)
         self.patch(p_moonshot, CREDENTIALS=self.kimi_creds)
+        self.patch(harness_versions, probe=lambda _: STUB_CODEX_VERSION)
 
         # The no-live-call guard. Reached only if a probe bypasses get_json.
         guard = mock.patch("urllib.request.urlopen",
@@ -290,6 +310,23 @@ class AnthropicProbeTest(ProbeCase):
         self.assertEqual([n for n in self.notes if "drift" in n], [],
                          "an idle account must not be reported as drift")
 
+    def test_an_unreadable_limits_entry_is_drift_not_a_silent_skip(self):
+        """L-614-1, this provider's instance. Every window on a Claude card
+        comes out of this list, so an entry the reader cannot open is a window
+        vanishing — and the reader's answer to it was `continue`, under status
+        `ok`, with the account's OTHER windows still rendering as though the
+        card were whole. That is the same failure as the wrong-typed container
+        one level up, which this suite already calls drift."""
+        payload = fixture("anthropic_usage.json")
+        payload["limits"].append("five_hour")
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the readable limits must not ship "
+                         "as if they were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
     def test_unknown_limit_kind_is_kept_not_dropped(self):
         acct, _ = self.probe(payload={"limits": [
             {"kind": "monthly_all", "percent": 5, "resets_at": None}]})
@@ -366,6 +403,26 @@ class OpenAIProbeTest(ProbeCase):
         answer to it was a silent empty row under status `ok`."""
         payload = fixture("openai_usage.json")
         del payload["additional_rate_limits"][0]["rate_limit"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the intact top-level window must "
+                         "not ship as if it were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
+
+    def test_an_entry_that_is_not_an_object_is_drift(self):
+        """L-614-1 — the same finding as the test above, one TYPE up, and it
+        shipped inside the fix for the container-level twin.
+
+        `additional_rate_limits: 5` is drift because a list is where the reader
+        iterates; `additional_rate_limits: [5]` was a silent `continue` under
+        status `ok`, which is the identical scoped-window-vanishes failure with
+        the identical "nothing looks wrong" card. The mirror leg is the test
+        below: `[]` and an absent key stay `ok`, so this cannot be satisfied by
+        erroring on every empty collection."""
+        payload = fixture("openai_usage.json")
+        payload["additional_rate_limits"] = ["gpt-5.3-codex-spark"]
         acct, _ = self.probe(payload=payload)
         self.assertEqual(acct["status"], "error")
         self.assertEqual(acct["windows"], [],
@@ -540,6 +597,42 @@ class OpenAIProbeTest(ProbeCase):
         self.assertEqual(acct["status"], "error")
         self.assertEqual(ep.calls, [], "a request went out with no client identity")
         self.assertIn("client", acct["detail"])
+
+    def test_the_version_seam_is_a_real_subprocess_against_the_hosts_path(self):
+        """SC-170's pin: THE SEAM ITSELF, run for real, both directions.
+
+        Every other test here stubs `harness_versions.probe` — correct
+        isolation, and also where a coupling hides. The seam is a subprocess
+        against the host's PATH, and this suite stubbed only the HTTP one until
+        CI found the second: 20 red legs on every runner without a codex CLI,
+        because the probe short-circuits before `get_json` is reached. So the
+        real seam gets a leg, with PATH pointed at a directory this test owns:
+
+        Leg 1 — a `codex` on PATH: the version reaches every header, through
+        shutil.which and a real `--version` call, with nothing stubbed.
+        Leg 2 — the same PATH with no codex in it: the loud named error, and no
+        request. Without leg 1 this passes for a probe that can never find a
+        CLI at all, which is the failure it is here to detect."""
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        fake = bindir / "codex"
+        fake.write_text("#!/bin/sh\necho 'codex-cli 1.2.3'\n")
+        fake.chmod(0o755)
+
+        with mock.patch.object(harness_versions, "probe", REAL_VERSION_PROBE):
+            with mock.patch.dict(os.environ, {"PATH": str(bindir)}):
+                acct, ep = self.probe()
+            self.assertEqual(acct["status"], "ok")
+            self.assertEqual(ep.calls[0][1]["version"], "1.2.3")
+            self.assertEqual(ep.calls[0][1]["User-Agent"], "codex_cli_rs/1.2.3")
+
+            fake.unlink()
+            with mock.patch.dict(os.environ, {"PATH": str(bindir)}):
+                acct, ep = self.probe()
+        self.assertEqual(acct["status"], "error")
+        self.assertIn("codex", acct["detail"])
+        self.assertEqual(ep.calls, [],
+                         "a request went out with no client identity")
 
 
 class MoonshotProbeTest(ProbeCase):
@@ -735,6 +828,23 @@ class MoonshotProbeTest(ProbeCase):
         self.assertEqual(acct["status"], "error")
         self.assertEqual(acct["windows"], [])
         self.assertTrue(any("shape drift" in n for n in self.notes))
+
+    def test_a_limits_entry_that_is_not_an_object_is_drift(self):
+        """L-614-1 here, and this one is not new to the PR — it is the silent
+        skip the wrong-type check above was always sitting on top of. A metered
+        sub-window the reader cannot open disappears from the card while the
+        account-wide weekly figure keeps rendering, so nothing on the card says
+        anything went wrong. The absent/empty legs above are the mirror: this
+        must not fire on an idle account."""
+        payload = fixture("moonshot_usages.json")
+        payload["limits"] = list(payload["limits"]) + ["five_hour"]
+        acct, _ = self.probe(payload=payload)
+        self.assertEqual(acct["status"], "error")
+        self.assertEqual(acct["windows"], [],
+                         "no partial rows — the weekly figure must not ship "
+                         "as if it were the whole reading")
+        self.assertTrue(any("shape drift" in n for n in self.notes),
+                        f"drift must be loud; log was {self.notes}")
 
     def test_a_200_that_is_not_a_json_object_says_so(self):
         acct, _ = self.probe(payload="<html>maintenance</html>")

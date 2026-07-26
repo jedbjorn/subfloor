@@ -73,6 +73,7 @@ FIXTURES = ROOT / "tests" / "fixtures" / "quota_probes"
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 
+import harness_versions  # noqa: E402
 import quota_probes as qp  # noqa: E402
 import server  # noqa: E402
 from quota_probes import anthropic as p_anthropic  # noqa: E402
@@ -153,6 +154,11 @@ class GateCase(unittest.TestCase):
                    PROFILE=self.claude_profile)
         self.patch(p_openai, CREDENTIALS=self.codex_auth)
         self.patch(p_moonshot, CREDENTIALS=self.kimi_creds)
+        # The openai probe's SECOND external dependency: it derives its client
+        # version from the installed codex CLI, so an unstubbed seam makes this
+        # gate answer differently on a runner that has one and a runner that
+        # does not (SC-170). The seam itself is pinned in the probe suite.
+        self.patch(harness_versions, probe=lambda _: "codex-cli 0.145.0")
 
     def write_credentials(self, token: str = CANARY) -> None:
         expires = int((time.time() + 3600) * 1000)

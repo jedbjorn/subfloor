@@ -261,6 +261,62 @@ class QuotaReadTest(QuotaBase):
         self.assertEqual({20.0, 30.0}, {w["used_percent"]
                                         for w in by_provider["openai"]["windows"]})
 
+    def test_a_window_the_provider_stopped_reporting_leaves_the_reading(self):
+        """N-4. The window upsert updates and never deletes, so a kind the
+        provider stops sending keeps its row for good — and the reading used to
+        be the whole accumulated set, filed under the NEWEST capture's age. An
+        hour-old five-hour figure then rendered under "as of 1m ago", which is
+        spec #57's second empty-state wall crossed: stale figures presented as
+        fresh. A reading is one capture.
+
+        Both legs, because the naive fix (delete on write) breaks the second:
+        Leg 1 — the vanished kind is not in the reading.
+        Leg 2 — its ROW is still in the DB, untouched. Nothing is destroyed on
+        a probe's say-so; it is simply not part of this reading, and it comes
+        back the moment the provider sends that window again."""
+        old = iso(minutes_ago=60)
+        with self.stub([acct(windows=[win("weekly", None, 12.0, captured_at=old),
+                                      win("five_hour", None, 80.0, captured_at=old)])],
+                       [acct(windows=[win("weekly", None, 15.0)])]):
+            server.get_analytics_quota(self.con)
+            out = server.get_analytics_quota(self.con, force=True)
+        entry = self.providers(out)["anthropic"]
+        self.assertEqual([("weekly", 15.0)],
+                         [(w["window_kind"], w["used_percent"])
+                          for w in entry["windows"]],
+                         "an hour-old window rode along inside a fresh reading")
+        self.assertNotEqual(old[:16], entry["captured_at"][:16])
+        kept = self.q("SELECT window_kind FROM harness_quota_window "
+                      "WHERE window_kind='five_hour'")
+        self.assertEqual(1, len(kept), "the row was deleted rather than "
+                                       "left out of this reading")
+
+    def test_an_idle_provider_is_distinguishable_from_a_never_probed_one(self):
+        """L-614-2 — the distinction the card's empty state renders, asserted
+        on what this layer can actually EMIT.
+
+        captured_at is derived from window rows, so a provider with no windows
+        never has one and the card cannot read staleness off it. What separates
+        the two is the STATUS: `ok` with zero windows is a probe that got an
+        intact answer carrying nothing (an idle account), while a provider the
+        process has no status for has never produced a reading at all. The card
+        branched on captured_at until this test existed, which made its idle
+        sentence unreachable through any real response."""
+        idle = acct(status="ok", windows=[])
+        with self.stub([idle]):
+            out = server.get_analytics_quota(self.con)
+        by_provider = self.providers(out)
+        self.assertEqual(("ok", [], None),
+                         (by_provider["anthropic"]["status"],
+                          by_provider["anthropic"]["windows"],
+                          by_provider["anthropic"]["captured_at"]))
+        # ...and the provider the probe said nothing about carries no status,
+        # which is the other sentence. Same windows, same captured_at — the
+        # status is the only field that can tell them apart.
+        self.assertIsNone(by_provider["openai"]["status"])
+        self.assertEqual([], by_provider["openai"]["windows"])
+        self.assertIsNone(by_provider["openai"]["captured_at"])
+
     def test_a_degraded_probe_keeps_last_known_figures_and_their_age(self):
         """The empty-state rule, WITH BOTH MIRROR LEGS. A lapsed Kimi token is
         the common case, not an error, and the operator's most useful

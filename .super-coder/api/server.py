@@ -933,7 +933,18 @@ def _latest_readings(con) -> dict:
     Multiple accounts for one provider are not disambiguated. Under a
     provider-level panel "which account am I looking at" is not a question the
     surface answers, and decision #68's multi-account problem dissolves with
-    it."""
+    it.
+
+    A READING IS ONE CAPTURE, NOT EVERY WINDOW EVER SEEN. The window upsert
+    updates and never deletes, so a kind the provider stops reporting keeps its
+    row for good — and returning the accumulated set would file that row under
+    the newest capture's age. That is spec #57's second empty-state wall
+    crossed exactly: an hour-old figure presented as fresh under an "as of 1m
+    ago" stamp. Every window of one probe run carries that run's captured_at
+    (the probes stamp it once), so the newest capture's rows are precisely the
+    rows whose captured_at equals the newest. A probe that failed writes no
+    rows at all, which is why the degraded card still shows its whole last
+    known reading — with that reading's own age."""
     groups: dict = {}
     for w in rows(con.execute(
             "SELECT a.provider AS provider, w.* FROM harness_quota_window w "
@@ -943,8 +954,9 @@ def _latest_readings(con) -> dict:
     latest: dict = {}
     for (provider, _pk), windows in groups.items():
         captured_at = max(w["captured_at"] for w in windows)
+        reading = [w for w in windows if w["captured_at"] == captured_at]
         if provider not in latest or captured_at > latest[provider]["captured_at"]:
-            latest[provider] = {"captured_at": captured_at, "windows": windows}
+            latest[provider] = {"captured_at": captured_at, "windows": reading}
     return latest
 
 

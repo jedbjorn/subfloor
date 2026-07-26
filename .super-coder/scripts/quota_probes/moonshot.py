@@ -84,12 +84,22 @@ def _drift(payload: dict) -> "str | None":
     absent or `[]` is a real answer (a plan with no metered sub-window), and
     calling that drift would cry wolf at an idle account. A `limits` that is
     present but not a list has no such reading: that is drift.
+
+    Neither has an ENTRY inside it that is not an object. The list is a place
+    this reader iterates, so an entry it cannot read is a metered sub-window
+    disappearing from the card while the probe reports `ok` — the same finding
+    as the wrong-typed container, one level down (L-614-1).
     """
     if not isinstance(payload.get("usage"), dict):
         return "no usage{} in the usages payload"
     limits = payload.get("limits")
-    if limits is not None and not isinstance(limits, list):
+    if limits is None:
+        return None
+    if not isinstance(limits, list):
         return f"limits is {type(limits).__name__}, not a list"
+    for entry in limits:
+        if not isinstance(entry, dict):
+            return f"limits[] entry is {type(entry).__name__}, not an object"
     return None
 
 
@@ -102,6 +112,10 @@ def _windows(payload: dict, captured_at: str, log) -> list[dict]:
         rows.append(_counts_window(usage, captured_at, "weekly", None))
     for entry in payload.get("limits") or []:
         if not isinstance(entry, dict):
+            # Retained guard: `_drift` rejects a non-object entry before this
+            # runs, so this is unreachable intact — it is what makes a mutation
+            # that disables the drift check degrade to the historical defect
+            # (the entry silently skipped) instead of raising here.
             continue
         seconds = _window_seconds(entry.get("window"))
         kind = kind_for_seconds(seconds)

@@ -16,9 +16,14 @@ That file ALSO carries `emailAddress` in full, and this module used to read
 it: decision #69 made the card's label the operator's full address. Decision
 #75 dropped account identity entirely, so the address is not read here any
 more and the uuid is only ever an upsert key. The payload carries no
-identifier of any kind — verified against a live capture, whose top-level keys
-are five_hour / seven_day* / extra_usage / limits / spend /
-member_dashboard_available and nothing else.
+identifier of any kind — verified against a live capture, which alongside
+five_hour / seven_day* / extra_usage / limits / spend /
+member_dashboard_available carries half a dozen provider-internal keys this
+probe neither reads nor recognizes (`tangelo`, `nimbus_quill`, `cinder_cove`
+and friends). NONE OF THEM NAMES AN ACCOUNT — that is the claim worth making,
+and it is the one the fixture supports. The previous sentence here ended "and
+nothing else", an exhaustive promise about a payload we do not control, and it
+was already false against the capture sitting beside it.
 
 NO `plan` IS COLLECTED HERE, and the reason it is worth a note is what finding
 it produced. This module used to read `payload.subscriptionType` — a key the
@@ -70,10 +75,27 @@ def _account_uuid(log) -> "str | None":
     return str(uuid) if uuid else None
 
 
+def _drift(limits: list) -> "str | None":
+    """What the normalizer cannot read, or None when the envelope is intact.
+
+    `limits: []` is an account with no window to report and stays `ok` — the
+    length is data. An ENTRY that is not an object is not: this list is where
+    every window on the card comes from, so an unreadable entry is a window
+    disappearing while the probe reports `ok` (L-614-1, the same finding as
+    openai's `additional_rate_limits[]` and moonshot's `limits[]`)."""
+    for item in limits:
+        if not isinstance(item, dict):
+            return f"limits[] entry is {type(item).__name__}, not an object"
+    return None
+
+
 def _windows(limits, captured_at: str, log) -> list[dict]:
     rows = []
     for item in limits:
         if not isinstance(item, dict):
+            # Retained guard: `_drift` rejects a non-object entry before this
+            # runs, so a mutation that disables the check degrades to the
+            # historical silent skip instead of raising here.
             continue
         raw_kind = item.get("kind")
         kind = KIND_MAP.get(raw_kind)
@@ -136,5 +158,10 @@ def probe(log, timeout) -> list[dict]:
         # window to report and stays `ok`.
         return result(status="error", **common, detail=drift(
             HARNESS_PROVIDER, "no limits[] in the usage payload", log))
+
+    missing = _drift(limits)
+    if missing:
+        return result(status="error", **common,
+                      detail=drift(HARNESS_PROVIDER, missing, log))
 
     return result(windows=_windows(limits, captured_at, log), **common)

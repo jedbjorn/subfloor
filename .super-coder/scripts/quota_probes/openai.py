@@ -110,6 +110,11 @@ def _drift(rate_limit: dict, payload: dict) -> "str | None":
     we cannot find is a payload that has moved, not an idle account, and spec
     #49's own rule is that a drifted probe reports `error` rather than a zero
     as if it had been measured.
+
+    An entry that is not an OBJECT is the same finding one type up, and it is
+    checked here for the reason the wrong-typed container is: a list is a place
+    the reader iterates, so anything in it that cannot be read is a scoped
+    window vanishing under status `ok` (L-614-1).
     """
     for container in (rate_limit, payload):
         extra = container.get("additional_rate_limits")
@@ -118,7 +123,10 @@ def _drift(rate_limit: dict, payload: dict) -> "str | None":
         if not isinstance(extra, list):
             return f"additional_rate_limits is {type(extra).__name__}, not a list"
         for entry in extra:
-            if isinstance(entry, dict) and not isinstance(entry.get("rate_limit"), dict):
+            if not isinstance(entry, dict):
+                return (f"additional_rate_limits[] entry is "
+                        f"{type(entry).__name__}, not an object")
+            if not isinstance(entry.get("rate_limit"), dict):
                 return "additional_rate_limits[] entry carries no rate_limit{}"
     return None
 
@@ -142,6 +150,8 @@ def _windows(rate_limit: dict, payload: dict, captured_at: str, log) -> list[dic
     if isinstance(extra, list):
         for entry in extra:
             if not isinstance(entry, dict):
+                # Retained guard, same as the isinstance above and for the same
+                # reason: `_drift` rejects a non-object entry before this runs.
                 continue
             # An entry is NOT itself a window. It carries `limit_name` plus its
             # OWN rate_limit block holding primary/secondary windows, in the

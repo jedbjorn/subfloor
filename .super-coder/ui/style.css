@@ -710,12 +710,13 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .an-acct-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
 .an-acct-head h2 { margin: 0; font-size: 1rem; }
 .an-acct-foot { display: flex; align-items: center; gap: .6rem; margin-top: .5rem; }
-/* The controls travel as a group so the pair sits right whether or not the age
-   is there to push them — a card with no reading yet has no age, and the
-   buttons must not drift to the left when it doesn't. */
+/* The card's actions sit right whether or not the age is there to push them —
+   a card with no reading yet has no age, and the link must not drift left when
+   it doesn't. There is no disabled state to style: the only control here is the
+   usage link, and the refresh button that could be disabled is gone with the
+   per-card refresh it belonged to. */
 .an-acct-actions { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
 .an-acct-foot a.act { text-decoration: none; }
-.an-acct-foot .act:disabled { opacity: .45; cursor: not-allowed; }
 .an-win { margin: .45rem 0; }
 .an-win-head { display: flex; align-items: baseline; gap: .5rem; font-size: .85rem; }
 .an-win-name { color: var(--dim); }

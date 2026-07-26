@@ -2228,7 +2228,7 @@ const AN_STATUS_NOTE = {
   error: "probe failed",
 };
 
-function anProviderCard(prov, onRefresh) {
+function anProviderCard(prov) {
   const status = prov.status;
   const card = el("div", { className: "card an-acct" });
 
@@ -2252,9 +2252,18 @@ function anProviderCard(prov, onRefresh) {
   // difference is the operator's next move. A provider that has never returned
   // anything has nothing to show; one that returned an intact envelope carrying
   // zero windows is genuinely idle and that IS its reading.
+  //
+  // THE SIGNAL IS THE STATUS, NOT captured_at, and the distinction is the whole
+  // reason this branch exists at all. captured_at is derived from window rows,
+  // so a card with no windows never has one — reading it here asked a question
+  // whose answer was fixed, and the idle sentence could not be reached by any
+  // response the API can emit (L-614-2). `ok` with zero windows is the probe
+  // saying it got an intact answer and there was nothing in it; any other
+  // status with zero windows means nothing has ever been read, and the pill
+  // above already says why.
   if (!wins.length)
     card.append(el("div", { className: "muted" },
-      prov.captured_at ? "no windows reported" : "no reading yet"));
+      prov.status === "ok" ? "no windows reported" : "no reading yet"));
   for (const w of wins) card.append(anWindowRow(w));
 
   const foot = el("div", { className: "an-acct-foot" });
@@ -2264,19 +2273,18 @@ function anProviderCard(prov, onRefresh) {
   // how old they are. A card with no age would present stale figures as fresh.
   if (prov.captured_at)
     foot.append(el("span", { className: "muted" }, "as of " + anAge(prov.captured_at)));
+  // NO PER-CARD REFRESH. There was one, and it re-probed all three providers —
+  // one probe run is the only thing the route can do. Per-card refresh made
+  // sense under the ACCOUNT model, where cards differed in whether they could
+  // be refreshed at all; provider cards do not differ that way, so three
+  // buttons doing one thing were three labels under-describing it. The
+  // section's own "refresh all" says what actually happens and is one control
+  // instead of four.
   const actions = el("div", { className: "an-acct-actions" });
   const usageUrl = AN_PROVIDER_USAGE_URL[prov.provider];
   if (usageUrl)
     actions.append(el("a", { className: "act", textContent: "usage page ↗",
       href: usageUrl, target: "_blank", rel: "noopener noreferrer" }));
-  const refresh = el("button", { className: "act", type: "button", textContent: "refresh ⟳" });
-  // Always enabled. The old section disabled this button whenever it judged a
-  // probe could not succeed — but that judgement was made from the registry's
-  // idea of who was signed in, and it was wrong in exactly the case the
-  // operator most wants the button: a lapsed Kimi token that a re-probe fixes
-  // the moment they boot the harness.
-  refresh.onclick = () => onRefresh(refresh);
-  actions.append(refresh);
   foot.append(actions);
   card.append(foot);
   return card;
@@ -2302,13 +2310,16 @@ function anDrawQuota(root, d) {
   // that has never been probed. Nothing is filtered out: hiding a card is how a
   // panel stops lying and starts saying nothing, and the operator cannot tell
   // "not configured" from "not readable" from a card that is not there.
-  for (const prov of providers)
-    root.append(anProviderCard(prov, (btn) => anProbeNow(root, btn)));
+  for (const prov of providers) root.append(anProviderCard(prov));
 }
 
-// The refresh button — POSTs the probe route, which bypasses the 60s TTL. The
+// The refresh control — POSTs the probe route, which bypasses the 60s TTL. The
 // redraw replaces the button along with everything else, so it is only
-// re-enabled on the failure path.
+// re-enabled on the failure path. It is never disabled by a judgement about
+// whether a probe can succeed: the old panel made that judgement from the
+// registry's idea of who was signed in and was wrong in exactly the case the
+// operator most wants it — a lapsed Kimi token that a re-probe fixes the moment
+// they boot the harness.
 async function anProbeNow(root, btn) {
   const label = btn.textContent;
   btn.disabled = true;

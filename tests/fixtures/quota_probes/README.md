@@ -89,9 +89,13 @@ names and nesting, and an envelope check does not look there.**
 
 Stated accurately, then:
 
-- **Drift detection catches** an envelope that is absent or of the wrong type.
-  That yields `error` with no rows, and it is the case where a probe would
-  otherwise report a zero as though it had been measured.
+- **Drift detection catches** an envelope that is absent or of the wrong type,
+  and — one level down — an ENTRY of a window collection that the reader cannot
+  open: a non-object, or (openai) one carrying no `rate_limit{}`. Both yield
+  `error` with no rows. The entry-level half exists because the alternative was
+  a silent `continue`: a scoped window vanishing off the card while the status
+  stayed `ok`, which is the same failure as the envelope one and hid the same
+  way.
 - **Drift detection does not catch** a payload whose envelope is intact and
   whose *contents* have moved — a renamed field, a value that gained a nesting
   level, an enum that gained a prefix.
