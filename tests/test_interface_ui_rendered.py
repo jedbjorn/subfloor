@@ -1094,6 +1094,12 @@ HEADER_LINES = """() => {
   const centre = (rect) => Math.round(rect.top + rect.height / 2);
   const badge = document.querySelector(".if-work-badge");
   const style = getComputedStyle(context);
+  // What else is sharing the data group with the context, and the gap between
+  // them — the two terms that turn the group's width into the context's cap.
+  const siblings = Array.from(data.children)
+    .filter((node) => node !== context && !node.hidden
+                      && node.getBoundingClientRect().width > 0);
+  const dataGap = parseFloat(getComputedStyle(data).columnGap) || 0;
   // getComputedStyle reports the DECLARED stack, not the family the host
   // actually resolved from it — and the resolved family is the whole question
   // here. Measure the fixture string under each candidate at the same computed
@@ -1118,12 +1124,18 @@ HEADER_LINES = """() => {
     badge: badge.textContent,
     identity: identity.textContent,
     // The truncation budget, carried so a failure REPORTS it rather than
-    // merely denying it: `need` is the string's rendered width and `slot` the
-    // space left for it once the badge, the identity, and the gaps have taken
-    // theirs out of the data group.
+    // merely denying it: `need` is the string's rendered width and `cap` the
+    // space available for it once the badge, the identity, and the gaps have
+    // taken theirs out of the data group. `slot` is the width the context was
+    // ACTUALLY given, which equals `cap` only while it overflows — a context
+    // that fits is sized to its own content, so a green run reports
+    // slot == need and says nothing about headroom. Read `cap` for headroom.
     metrics: {
       need: context.scrollWidth,
       slot: context.clientWidth,
+      cap: Math.round(dataBox.width - siblings.reduce(
+        (sum, node) => sum + node.getBoundingClientRect().width, 0,
+      ) - dataGap * (siblings.length)),
       head: Math.round(headBox.width),
       data: Math.round(dataBox.width),
       badge: width(badge),
@@ -1144,8 +1156,8 @@ def _header_report(label: str, metrics: dict) -> str:
         for family, width in metrics["ruler"].items()
     )
     return (
-        f"{label}: context need={metrics['need']}px slot={metrics['slot']}px "
-        f"({metrics['need'] - metrics['slot']:+}px) · "
+        f"{label}: context need={metrics['need']}px cap={metrics['cap']}px "
+        f"({metrics['cap'] - metrics['need']:+}px spare) slot={metrics['slot']}px · "
         f"head={metrics['head']}px controls={round(metrics['controls'])}px "
         f"data={metrics['data']}px badge={metrics['badge']}px "
         f"identity={metrics['identity']}px · font={metrics['fontSize']} "
@@ -1156,33 +1168,61 @@ def _header_report(label: str, metrics: dict) -> str:
 def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_path):
     """A long work subject truncates inside the right data zone; it never moves
     the controls or the shell identity onto a second line."""
-    # The fixture title is deliberately SHORT — do not "restore" a realistic
-    # 60-character one. `.if-pane` caps at 1300px, so the work-context slot is
-    # ~556px at any viewport past ~1580 and the wide assert has a fixed budget,
-    # while the same string renders ~10% wider or narrower depending on which
-    # font the host resolves. Measured, slot vs. rendered width at 1600px:
+    # The fixture title is deliberately SHORT, and its length is DERIVED from
+    # the runner rather than guessed. `.if-pane` caps at 1300px, so the wide
+    # assert has a fixed budget, while the same string renders ~14% wider or
+    # narrower depending on which family the host resolves out of the generic
+    # stack. Two lengths were reasoned from local measurements and both
+    # mispredicted CI, because the canvas rulers below say the sandbox and the
+    # runner do not resolve the same font:
     #
-    #   font stack                60ch title      46ch title
-    #   system-ui (dev sandbox)   553px  (+7.6)   472px  (+88.6)
-    #   Liberation Sans (ubuntu)  564px  (-8.0)   481px  (+73.5)
-    #   Arial                     564px  (-8.0)   481px  (+73.5)
-    #   DejaVu Sans               512px  (+75.2)  437px  (+150.2)
+    #   ruler at 13.6px, 79-char context   sandbox    ubuntu-latest
+    #   [ui-sans-serif] / [system-ui]      437.6px    549.8px
+    #   [Liberation Sans] / [Arial]        480.6px    480.6px
+    #   [DejaVu Sans]                      437.6px    549.8px
     #
-    # At 60ch this asserted the font's metrics, not the layout: ~1.3% headroom
-    # against a ~10% font spread, green on the author's host and red on
-    # ubuntu-latest. At 46ch every stack clears by 73px or more. The narrow
-    # (700px) assert is unaffected — the slot is ~40px there, so the title
-    # overflows by ~430px and still truncates in all four stacks.
+    # The runner resolves the generic stack to DejaVu Sans — the WIDEST
+    # candidate — not to the Arial/Liberation metrics the earlier fix assumed.
+    # DejaVu is not installed in the sandbox, so the local DejaVu ruler falls
+    # back to something narrower and reads 437.6px; Liberation and Arial are
+    # genuinely metric-compatible and agree at 480.6px on both hosts, which
+    # makes Liberation the one ruler a local run can trust.
     #
-    # That table did NOT predict ubuntu-latest: 46ch still truncated there. It
-    # is a local measurement under a different playwright/chromium pin (flag
-    # #205), so its shaping engine is not CI's and no local number settles this
-    # — which is why both evaluations below now report their own geometry
-    # instead of only asserting against that table. Read the numbers from the
-    # runner before touching the fixture again.
-    titled = {**SESSION, "title": "Wire the watcher daemon into the planner "
-                                  "inbox"}
-    assert len(titled["title"]) == 46
+    # The arithmetic, from the 1600px CI run of 3bb3ced (slot=504px, need=550px
+    # at 79 chars, font=13.6px):
+    #
+    #   px/char under the widest ruler   549.8 / 79     = 6.96px
+    #   target                           need <= .75 * slot = 378px
+    #   flat cap                         378 / 6.96     = 54 chars of context
+    #
+    # 54 chars is the ceiling, not the answer — per-character width varies with
+    # composition, so the chosen string is measured, not counted. The 33-char
+    # sprint prefix plus a 21-char title measures 322.6px under Liberation
+    # locally, and the local Liberation ruler reproduces the runner's 480.6px
+    # for the old fixture exactly, so scaling by the runner's own DejaVu ratio
+    # (549.8 / 480.6) predicts its width there:
+    #
+    #   Liberation / Arial (both hosts)  322.6px   64.0% of slot   +181px
+    #   DejaVu, i.e. the runner          369.1px   73.2% of slot   +135px
+    #
+    # That 25% margin absorbs a font substitution of 1.56x. The observed spread
+    # between the widest and narrowest real candidate is 69.2px on a 550px
+    # string — 12.6% — so this clears the whole known spread nearly twice over,
+    # where the previous fixture cleared the sandbox by 0px and the runner by
+    # -46px. The narrow (700px) assert is unaffected and cannot be tuned: the
+    # slot is 0px at that viewport on the runner, so any non-empty string
+    # truncates by construction.
+    #
+    # This does NOT mean the header is adequate. The runner's slot is 504px and
+    # a realistic 46-char work context needs 550px there, so a REAL title
+    # overflows on CI's font — that is flag #206, a product question, and
+    # shortening a test fixture does not touch it. The green below is evidence
+    # that this test measures LAYOUT instead of font metrics, which is all it
+    # was ever meant to measure. Both evaluations report their own geometry, on
+    # a pass as well as a failure; read those numbers before touching the
+    # fixture again rather than reasoning from any table.
+    titled = {**SESSION, "title": "Wire watcher to inbox"}
+    assert len(titled["title"]) == 21
 
     def titled_api(route) -> None:
         if route.request.url.split("/api", 1)[-1] == "/interface/sessions/7":
@@ -1225,7 +1265,8 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_pat
             "The slot is what the data group has left after the badge, the "
             "identity, and two .75rem gaps; the ruler that matches `need` names "
             "the font in effect. Decide from these numbers — do not widen the "
-            "slot in CSS and do not guess a third fixture length."
+            "slot in CSS and do not guess a fixture length — derive it from "
+            "the widest ruler's px/char at 75% of the slot, as above."
         )
         assert wide["controlsRight"] <= wide["dataLeft"], report[-1]
         assert wide["rightInset"] <= 14, report[-1]
