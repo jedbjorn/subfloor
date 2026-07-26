@@ -1108,9 +1108,26 @@ HEADER_LINES = """() => {
 def test_header_keeps_controls_left_and_work_data_right(browser, ui_url):
     """A long work subject truncates inside the right data zone; it never moves
     the controls or the shell identity onto a second line."""
+    # The fixture title is deliberately SHORT — do not "restore" a realistic
+    # 60-character one. `.if-pane` caps at 1300px, so the work-context slot is
+    # ~556px at any viewport past ~1580 and the wide assert has a fixed budget,
+    # while the same string renders ~10% wider or narrower depending on which
+    # font the host resolves. Measured, slot vs. rendered width at 1600px:
+    #
+    #   font stack                60ch title      46ch title
+    #   system-ui (dev sandbox)   553px  (+7.6)   472px  (+88.6)
+    #   Liberation Sans (ubuntu)  564px  (-8.0)   481px  (+73.5)
+    #   Arial                     564px  (-8.0)   481px  (+73.5)
+    #   DejaVu Sans               512px  (+75.2)  437px  (+150.2)
+    #
+    # At 60ch this asserted the font's metrics, not the layout: ~1.3% headroom
+    # against a ~10% font spread, green on the author's host and red on
+    # ubuntu-latest. At 46ch every stack clears by 73px or more. The narrow
+    # (700px) assert is unaffected — the slot is ~40px there, so the title
+    # overflows by ~430px and still truncates in all four stacks.
     titled = {**SESSION, "title": "Wire the watcher daemon into the planner "
-                                  "inbox before freeze"}
-    assert len(titled["title"]) == 60
+                                  "inbox"}
+    assert len(titled["title"]) == 46
 
     def titled_api(route) -> None:
         if route.request.url.split("/api", 1)[-1] == "/interface/sessions/7":
@@ -1127,8 +1144,9 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url):
             "wrapped the controls instead of truncating"
         )
         assert narrow["truncated"], (
-            "the work context fits at 700px — widen the fixture title, this test "
-            "is not measuring anything"
+            "the work context fits at 700px — this test is not measuring "
+            "anything; lengthen the fixture title, but stay inside the wide "
+            "budget in the comment above"
         )
         assert narrow["controlsRight"] <= narrow["dataLeft"], (
             "right-side data crossed over the left-side controls"
