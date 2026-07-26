@@ -463,7 +463,7 @@ class EnginePathsAtRefTest(unittest.TestCase):
         )
         self.assertTrue((engine / "engine.manifest").is_file())
 
-    def test_declared_but_absent_path_gets_completeness_remedy(self):
+    def test_declared_but_absent_path_completes_cleanly(self):
         installed = ["sc", ".super-coder/scripts"]
         (self.root / "sc").write_text("old dispatcher\n")
         self.write_manifest(installed)
@@ -480,6 +480,7 @@ class EnginePathsAtRefTest(unittest.TestCase):
 
         state = self.root / ".sc-state"
         engine = self.root / ".super-coder"
+        output = io.StringIO()
         with mock.patch.multiple(
             update,
             REPO_ROOT=self.root,
@@ -494,15 +495,28 @@ class EnginePathsAtRefTest(unittest.TestCase):
             ENGINE=engine,
             MANIFEST=engine / "engine.manifest",
             local_edits=mock.Mock(return_value={}),
-        ), self.assertRaises(SystemExit) as failed:
+        ), contextlib.redirect_stdout(output):
             update.materialize_fetched_engine(target_sha)
 
         self.assertIn(
-            "materialized engine is incomplete; missing declared path(s): "
-            f"{missing_path}",
-            str(failed.exception),
+            f"1 target engine path(s) absent at {target_sha[:12]} — "
+            f"skipping: {missing_path}",
+            output.getvalue(),
         )
-        self.assertIn("remedy: rerun `./sc update --force`", str(failed.exception))
+        self.assertEqual(
+            (state / "engine.ref").read_text(),
+            target_sha + "\n",
+        )
+        self.assertFalse((self.root / missing_path).exists())
+        self.assertFalse(
+            any(
+                path == missing_path
+                or path.startswith(missing_path.rstrip("/") + "/")
+                for path in json.loads((engine / "engine.manifest").read_text())
+            ),
+            "a declared path absent at the target ref must stay out of the "
+            "materialized file manifest",
+        )
 
 
 if __name__ == "__main__":

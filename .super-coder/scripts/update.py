@@ -525,7 +525,10 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
             file=sys.stderr,
         )
         materialize_engine(sha, engine_paths=materializable_delta)
-    _assert_materialized_engine_paths(materialized_paths, REPO_ROOT)
+    _assert_materialized_engine_paths(
+        resolved_paths + materializable_delta,
+        REPO_ROOT,
+    )
     ENGINE_REF.write_text(sha + "\n")
     n = engine_manifest.write_manifest(
         materialized_paths,
