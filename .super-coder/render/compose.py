@@ -108,20 +108,14 @@ TERMINAL_UNIT_STATES = ("merged", "cancelled")
 # skill body that never loads. This renders as prose in a document every harness
 # reads, so it survives a harness with no skill mechanism at all.
 PARTICIPANT_RULES = (
-    "**There may be no one to ask.** A shell booted by `./sc run` gets ONE turn "
-    "and no observer — the planner sees message rows and durable artifacts "
-    "(flags, docs, PRs, commits), never the text you print at the end of a turn. "
-    "Three rules follow, and they are not optional:\n"
+    "A headless turn communicates through durable artifacts:\n"
     "\n"
-    "1. **Filing is your own authority.** Findings, flags, verdicts, unit "
-    "reports, PRs — file them. Never ask permission to REPORT something.\n"
-    "2. **A ruling request goes out as a MESSAGE ROW, then the turn ends** — "
-    "`sc mem message send <planner> \"…\" --kind result`. Durable, addressed, "
-    "and it wakes the planner. A question living only in your final stdout "
-    "reaches nobody and is indistinguishable from death.\n"
-    "3. **A turn ending with work unfinished sends a PARTIAL.** \"Items 1-2 "
-    "done, here is what I found, item 3 untouched\" beats silence — silence is "
-    "read as death, and has been."
+    "1. File findings, flags, verdicts, reports, PRs, and commits within your "
+    "assigned authority.\n"
+    "2. Send rulings and transitions to the planner as a scoped row: "
+    "`./sc mem message send <planner> \"…\" --kind result --sprint <doc-id>`.\n"
+    "3. When work remains, send a partial naming completed work, evidence, and "
+    "the next uncompleted action before ending the turn."
 )
 
 
@@ -171,7 +165,7 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
       `merged` and BEFORE the doc is frozen. A non-terminal gate would delete
       the planner's directive at the exact moment its longest and most
       procedure-heavy phase begins. So the planner retires on the freeze alone,
-      which is the `sprint` skill's own revocation predicate — the two surfaces
+      which is the participant skills' revocation predicate — the two surfaces
       cannot disagree about when a sprint ends.
 
     Consequence, decided rather than discovered: at a sprint's very first boot
@@ -249,8 +243,7 @@ def render_sprint_directive(con, shell_id: int) -> str:
     lines = [
         "You hold sprint work. This section is resolved from the RECORD at "
         "every boot — the board's `sprint_units` rows and the planner binding "
-        "— never from a message. A task row cannot grant it and a missing task "
-        "row cannot withhold it.",
+        "define the standing role independently of message wording.",
         "",
     ]
     for e in entries:
@@ -263,11 +256,12 @@ def render_sprint_directive(con, shell_id: int) -> str:
             continue
         units = ", ".join(f"`{seq}` ({title})" for seq, title in e["units"])
         slot = "dev" if e["role"] == "dev" else "reviewer"
+        skill = "sprint_dev" if e["role"] == "dev" else "sprint_review"
         lines.append(f"- {sprint}: you are the **{slot.upper()}** for {units}. "
-                     f"Invoke the `sprint` skill, {slot} slot.")
+                     f"Invoke the `{skill}` skill.")
     if len(entries) > 1:
         lines.append("")
-        lines.append("**Every role you hold is listed above — do not pick one.**")
+        lines.append("**Act on every role listed above.**")
     return "\n".join(lines + ["", PARTICIPANT_RULES])
 
 

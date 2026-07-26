@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """The sprint directive is STAMPED AT BOOT (spec doc 58 U9, feature 27).
 
-The defect this closes: the "load the `sprint` skill" directive lived in a task
-row the planner hand-wrote. It was present in every kickoff row and absent from
-all six improvised afterwards, so a worker booted off an improvised row had no
-participant procedure loaded and behaved like a normal interactive session —
-finished a full review pass, filed its flags, then ended its turn on a question
-nobody could hear. The remedy had to stop being a sentence someone remembers to
-type, so the BOOT RENDER carries it, resolved from the record.
+The boot render selects the role-specific participant skill from the structured
+record, independent of task wording.
 
 WHY MOST OF THIS FILE ASSERTS ABSENCE. A test that only checks the directive
 APPEARS passes for a renderer that emits the section unconditionally — which
@@ -142,7 +137,7 @@ class SprintDirectiveTest(unittest.TestCase):
                  title="boot-stamped directive")
         out = self.render(DEV_SHELL)
         self.assertIn("DEV", out)
-        self.assertIn("`sprint` skill, dev slot", out)
+        self.assertIn("`sprint_dev` skill", out)
         self.assertIn("`U9`", out)
         self.assertIn("boot-stamped directive", out)
         self.assertIn("doc 59", out)
@@ -157,7 +152,7 @@ class SprintDirectiveTest(unittest.TestCase):
         add_unit(self.con, 59, "U3", dev=DEV_SHELL, reviewer=REVIEWER_SHELL)
         out = self.render(REVIEWER_SHELL)
         self.assertIn("REVIEWER", out)
-        self.assertIn("`sprint` skill, reviewer slot", out)
+        self.assertIn("`sprint_review` skill", out)
         self.assertIn("`U3`", out)
 
     def test_planner_gets_the_orchestration_skill(self):
@@ -209,7 +204,7 @@ class SprintDirectiveTest(unittest.TestCase):
         out = self.render(REVIEWER_SHELL)
         self.assertIn("`U3`", out)
         self.assertIn("`U4`", out)
-        self.assertEqual(out.count("reviewer slot"), 1)
+        self.assertEqual(out.count("`sprint_review` skill"), 1)
 
     # ── two roles / two sprints — every one named, never a silent pick ──────
 
@@ -219,10 +214,10 @@ class SprintDirectiveTest(unittest.TestCase):
         add_unit(self.con, 59, "U3", reviewer=DEV_SHELL)
         arm_binding(self.con, 59, DEV_SHELL)
         out = self.render(DEV_SHELL)
-        self.assertIn("dev slot", out)
-        self.assertIn("reviewer slot", out)
+        self.assertIn("`sprint_dev` skill", out)
+        self.assertIn("`sprint_review` skill", out)
         self.assertIn("`sprint_orchestration` skill", out)
-        self.assertIn("do not pick one", out)
+        self.assertIn("Act on every role listed above", out)
 
     def test_a_shell_in_two_sprints_sees_both(self):
         add_doc(self.con, 59, title="SPRINT: watchdog")
@@ -233,7 +228,7 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertIn("doc 59", out)
         self.assertIn("doc 61", out)
         self.assertIn("SPRINT: the other one", out)
-        self.assertIn("do not pick one", out)
+        self.assertIn("Act on every role listed above", out)
 
     def test_the_three_participant_rules_are_in_the_section_itself(self):
         # They render as prose because the failure mode IS a skill body that
@@ -241,9 +236,9 @@ class SprintDirectiveTest(unittest.TestCase):
         add_doc(self.con, 59)
         add_unit(self.con, 59, "U9", dev=DEV_SHELL)
         out = self.render(DEV_SHELL)
-        self.assertIn("Filing is your own authority", out)
-        self.assertIn("MESSAGE ROW, then the turn ends", out)
-        self.assertIn("sends a PARTIAL", out)
+        self.assertIn("File findings, flags, verdicts", out)
+        self.assertIn("--kind result --sprint <doc-id>", out)
+        self.assertIn("send a partial", out)
 
     # ── the absences, each with its positive control ────────────────────────
 
@@ -278,7 +273,7 @@ class SprintDirectiveTest(unittest.TestCase):
 
     def test_the_freeze_alone_retires_the_planner(self):
         # The other half of the split: what DOES end the planner's directive is
-        # the freeze, which is the `sprint` skill's own revocation predicate.
+        # the freeze, which is the participant skills' revocation predicate.
         # Terminal units + frozen doc, one field apart from the test above.
         add_doc(self.con, 59)
         add_unit(self.con, 59, "U9", dev=DEV_SHELL, state="merged")

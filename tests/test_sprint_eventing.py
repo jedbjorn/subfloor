@@ -160,29 +160,109 @@ class SchemaTest(unittest.TestCase):
         for migration in sorted(MIGRATIONS.glob("*.sql")):
             if migration.name > "0086_reseed_sprint_watch_scope.sql":
                 con.executescript(migration.read_text())
+        retired = con.execute(
+            "SELECT is_deleted FROM skills WHERE name='sprint'").fetchone()[0]
         final = con.execute(
-            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
-        asset = (ENGINE / "assets" / "skills" / "sprint" /
+            "SELECT content FROM skills WHERE name='sprint_dev'").fetchone()[0]
+        asset = (ENGINE / "assets" / "skills" / "sprint_dev" /
                  "SKILL.md").read_text().split("---", 2)[2].strip()
+        self.assertEqual(retired, 1)
         self.assertEqual(final, asset)
         self.assertIn("--sprint <doc-id>", final)
 
-    def test_sprint_orchestration_requires_plan_billing_by_default(self):
+    def test_sprint_orchestration_has_no_billing_gate(self):
         body = self.con.execute(
             "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-        self.assertIn("two routine routing questions to the FnB", body)
-        self.assertIn("Plan billing by default; observe, never mutate auth", body)
-        self.assertIn('if [ -n "${CODEX_API_KEY+x}" ]', body)
-        self.assertIn('key=s.get("apiKeySource")', body)
-        self.assertIn("billing=api source=CODEX_API_KEY", body)
-        self.assertIn("Billing approval required: provider=<openai|anthropic>", body)
-        self.assertIn("Default scope = one launch", body)
-        self.assertIn("billing-exception: provider=<openai|anthropic>", body)
-        self.assertIn("current environment unchanged", body)
-        self.assertIn("No matching, unexpired approval -> do not launch", body)
-        self.assertIn("Do not claim Extra Usage was\nvalidated", body)
-        self.assertNotIn("env -u", body)
-        self.assertNotIn("flexible-credit balance", body)
+        self.assertIn("Which harness and model should every developer use?", body)
+        self.assertIn("Which harness and model should every reviewer use?", body)
+        self.assertIn("operator-managed inputs", body)
+        for retired_gate in (
+                "Billing approval required",
+                "billing-exception:",
+                "CODEX_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "Extra Usage",
+                "flexible-credit balance"):
+            self.assertNotIn(retired_gate, body)
+
+    def test_sprint_chain_migration_grants_roles_and_retires_combined_skill(self):
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.executescript(SCHEMA.read_text())
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name == "0103_sprint_skill_chain.sql":
+                break
+            con.executescript(migration.read_text())
+        con.executescript(
+            "INSERT INTO users (user_id, username, is_active) "
+            "VALUES (1, 'T', 1);"
+            "INSERT INTO shells (shell_id, display_name, shortname, flavor, "
+            "system_prompt, user_id) VALUES "
+            "(1, 'Planner', 'plan1', 'planner', 'x', 1),"
+            "(2, 'Dev', 'dev1', 'dev', 'x', 1),"
+            "(3, 'Reviewer', 'rev1', 'reviewer', 'x', 1);")
+
+        reseed = (MIGRATIONS / "0103_sprint_skill_chain.sql").read_text()
+        con.executescript(reseed)
+        con.executescript(reseed)
+
+        grants = {}
+        for shortname, skill in con.execute(
+                "SELECT sh.shortname, sk.name FROM shell_skills ss "
+                "JOIN shells sh ON sh.shell_id=ss.shell_id "
+                "JOIN skills sk ON sk.skill_id=ss.skill_id "
+                "WHERE sk.is_deleted=0"):
+            grants.setdefault(shortname, set()).add(skill)
+
+        self.assertTrue(
+            {"sprint_orchestration", "sprint_orchestration_recover",
+             "sprint_orchestration_close"}.issubset(grants["plan1"]))
+        self.assertIn("sprint_dev", grants["dev1"])
+        self.assertIn("sprint_review", grants["rev1"])
+        self.assertEqual(
+            con.execute("SELECT is_deleted FROM skills WHERE name='sprint'")
+            .fetchone()[0], 1)
+
+    def test_shell_templates_grant_only_the_role_specific_sprint_skills(self):
+        templates = ENGINE / "templates" / "shells"
+        planner = json.loads((templates / "planner.json").read_text())["skills"]
+        dev = json.loads((templates / "dev.json").read_text())["skills"]
+        reviewer = json.loads((templates / "reviewer.json").read_text())["skills"]
+
+        self.assertTrue(
+            {"sprint_orchestration", "sprint_orchestration_recover",
+             "sprint_orchestration_close"}.issubset(planner))
+        self.assertIn("sprint_dev", dev)
+        self.assertIn("sprint_review", reviewer)
+        self.assertNotIn("sprint", dev + reviewer)
+
+    def test_role_skills_keep_the_planner_as_the_event_router(self):
+        def body(name):
+            return (ENGINE / "assets" / "skills" / name / "SKILL.md"
+                    ).read_text().split("---", 2)[2]
+
+        orchestration = body("sprint_orchestration")
+        dev = body("sprint_dev")
+        review = body("sprint_review")
+
+        self.assertIn("developer reports\na green exact head", orchestration)
+        self.assertIn("The planner sends and boots the reviewer", dev)
+        self.assertIn(
+            "The planner routes fix work or\nmerge authority to the developer",
+            review)
+        self.assertNotIn(
+            "Send Major and Medium findings directly to the developer", review)
+
+    def test_recovery_requires_process_and_subject_evidence_before_reboot(self):
+        recovery = (
+            ENGINE / "assets" / "skills" / "sprint_orchestration_recover" /
+            "SKILL.md").read_text().split("---", 2)[2]
+
+        self.assertIn("/proc/<pid>/stat", recovery)
+        self.assertIn("positive CPU delta as active work", recovery)
+        self.assertIn(
+            "the board and scoped task prove which sprint and unit", recovery)
+        self.assertIn("A reconciler finding requests a checkup", recovery)
 
     def test_billing_approval_reseed_replaces_scrub_and_is_idempotent(self):
         con = sqlite3.connect(":memory:")
