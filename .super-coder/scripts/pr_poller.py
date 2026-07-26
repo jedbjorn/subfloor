@@ -27,8 +27,8 @@ What lives here:
   watch-gated cadence; worker-expectation reconciliation runs every 10 minutes
   from structured live units even before a PR or watch exists. Explicit PR
   reconcile still rides `poll_cycle(source='reconcile')` through the API.
-  PR polling and worker reconciliation beat separate heartbeat rows, so each
-  subsystem's liveness remains independently observable.
+  PR polling beats the status-visible watch heartbeat. Worker reconciliation
+  records tick completion in a separate heartbeat row that has no reader.
 
 It never injects terminal input, never marks a message read, never acts on a
 PR, and never mutates the sprint board. PR polling may create an event; the

@@ -467,12 +467,17 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             ],
         )
 
-        self.assertIsNone(
-            self.con.execute(
-                "SELECT resolved_at FROM planner_alerts "
-                "WHERE sprint_doc_id=60 AND unit_id IS NULL "
-                "AND role='planner' AND signal='checkup'"
-            ).fetchone()[0]
+        self.assertEqual(
+            [(59, 1), (60, 0)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT sprint_doc_id, resolved_at IS NOT NULL "
+                    "FROM planner_alerts WHERE sprint_doc_id IN (59, 60) "
+                    "AND unit_id IS NULL AND role='planner' "
+                    "AND signal='checkup' ORDER BY sprint_doc_id"
+                )
+            ],
         )
 
     def test_unitless_expectation_dedupes_on_an_explicit_key_sentinel(self):
