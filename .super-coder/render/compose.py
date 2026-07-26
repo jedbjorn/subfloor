@@ -390,7 +390,7 @@ def render_connections(con) -> str:
 def render_skills(con, shell_id: int) -> str:
     rows = con.execute(
         "SELECT s.name, s.description FROM skills s "
-        "JOIN shell_skills ss ON ss.skill_id = s.skill_id "
+        "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
         "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
         (shell_id,),
     ).fetchall()

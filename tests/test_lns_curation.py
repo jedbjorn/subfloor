@@ -356,7 +356,7 @@ class SkillAddTest(unittest.TestCase):
     def test_adds_a_namespaced_local_skill_and_grants_it_to_the_author(self):
         out = self.add("tc_sweep", "--file", str(self.body),
                        "--desc", "one line", "--for", "tc")
-        self.assertIn("granted to tc", out)
+        self.assertIn("granted to Bespoke tc", out)
         row = self.q("SELECT skill_id, description, content, is_deleted "
                      "FROM skills WHERE name='tc_sweep'")
         self.assertIsNotNone(row)

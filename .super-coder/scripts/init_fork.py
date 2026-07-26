@@ -147,7 +147,8 @@ def main(argv: list[str]) -> int:
                 "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
 
         n = con.execute(
-            "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?", (shell_id,)).fetchone()[0]
+            "SELECT COUNT(*) FROM resolved_shell_skills WHERE shell_id=?",
+            (shell_id,)).fetchone()[0]
         print(f"init_fork: created '{_sn(shell_id)}' ({flavor}, shell_id={shell_id}) "
               f"for user '{username}' — your primary, {n} skills, lineage + genesis seed.")
         for fl, sid in team:

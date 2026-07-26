@@ -130,16 +130,20 @@ python3 .super-coder/scripts/render_check.py
 
 ## Adding a source-repo-only skill
 
-Seeds carry **skills, not grants**: `0001` inserts skill rows and no
-`shell_skills`. Grants happen at shell creation — every shell auto-gets
-`common=1` skills, plus its flavor template's named opt-ins.
+Seeds carry **skills, not grants**: `0001` inserts catalogue rows. Standard
+shells resolve one shared `flavor_skills` pack; Bespoke shells resolve their own
+`shell_skills` rows. Newly-added common skills join every flavor/Bespoke pack
+on update. Opt-ins remain ungranted until assigned.
 
-So a skill with **`common: false` and no entry in any flavor template** seeds
-into a fork's catalogue but is never granted to a fork shell. Grant it here:
+A skill with **`common: false`** seeds into a fork's catalogue without entering
+any pack. Grant it here by naming one shell:
 
 ```
 ./sc skill grant <name> <shell> [<shell>…]
 ```
+
+Naming a standard shell changes its whole flavor pack. Naming a Bespoke shell
+changes only that shell.
 
 ## Stance
 

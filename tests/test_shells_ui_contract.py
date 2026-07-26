@@ -44,6 +44,24 @@ def test_skills_is_nested_under_shells_instead_of_global_navigation():
     assert 'id="view-shells"' in main
 
 
+def test_new_shell_creator_offers_bespoke_without_a_flavor_template():
+    creator = APP[APP.index("function openNewShellModal"):
+                  APP.index("async function renderShells(root)")]
+    assert "Bespoke — custom skill pack" in creator
+    assert "flavor: fl.value || null" in creator
+    assert '"shell type"' in creator
+
+
+def test_skill_assignments_are_flavor_scoped_with_bespoke_exceptions():
+    assignments = APP[APP.index("async function renderSkillAssignments"):
+                      APP.index("// ── Roadmap")]
+    assert "const bespokeShells = shells.filter((sh) => !sh.flavor)" in assignments
+    assert "for (const fl of flavors)" in assignments
+    assert "/flavors/${encodeURIComponent(fl.flavor)}/skills/${s.skill_id}" in assignments
+    assert "for (const sh of bespokeShells)" in assignments
+    assert "for (const sh of shells)" not in assignments
+
+
 def test_each_shell_section_has_a_distinct_reload_safe_hash():
     script = SHELL_STATE + r"""
 globalThis.location = { hash: "" };

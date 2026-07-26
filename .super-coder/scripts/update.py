@@ -31,7 +31,7 @@ Flow:
     6. sync the engine skills catalogue (idempotent, id-stable UPSERT) —
        new/changed engine skills reach the fork without a rebuild, while
        project-local skills are left intact.
-    7. re-grant common skills to all shells.
+    7. re-grant common skills to every flavor pack + Bespoke shell.
     8. wire the auto-remap hooks + map the repo + snapshot the (live) state.
 
 Then review + commit (only `.sc-state/` — content.sql + engine.ref — moves; the
@@ -677,7 +677,7 @@ def sync_skills() -> None:
         con.commit()
         # The seed just reset every engine row to is_deleted=0 — re-assert the
         # fork retire list (.sc-state/skills_retired.json) before regrant()
-        # hands the common catalogue back to every shell.
+        # hands the common catalogue back to every flavor/Bespoke pack.
         flipped = seed_skills.apply_retired(con)
     finally:
         con.close()
@@ -689,15 +689,30 @@ def sync_skills() -> None:
 def regrant() -> int:
     con = db_driver.connect(DB_PATH)
     try:
-        # Grant newly-added COMMON skills to every shell. Opt-in (common=0)
-        # skills are per-shell assignments — left untouched so an update never
-        # overrides who-has-which catalogue skill.
+        # Newly-added COMMON skills join every standard flavor pack and every
+        # Bespoke shell. Opt-ins stay exactly where the operator assigned them.
+        template_flavors = {
+            p.stem for p in (ENGINE / "templates" / "shells").glob("*.json")
+        }
+        live_flavors = {
+            r[0] for r in con.execute(
+                "SELECT DISTINCT flavor FROM shells WHERE flavor IS NOT NULL")
+        }
+        added = 0
+        for flavor in sorted(template_flavors | live_flavors):
+            cur = con.execute(
+                "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+                "SELECT ?, skill_id FROM skills "
+                "WHERE is_deleted=0 AND common=1", (flavor,))
+            added += cur.rowcount
         cur = con.execute(
             "INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
             "SELECT s.shell_id, k.skill_id FROM shells s, skills k "
-            "WHERE COALESCE(s.is_deleted,0)=0 AND k.is_deleted=0 AND k.common=1")
+            "WHERE COALESCE(s.is_deleted,0)=0 AND s.flavor IS NULL "
+            "AND k.is_deleted=0 AND k.common=1")
+        added += cur.rowcount
         con.commit()
-        return cur.rowcount
+        return added
     finally:
         con.close()
 

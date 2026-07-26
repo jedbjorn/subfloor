@@ -39,10 +39,12 @@ SKILLS_DDL = (
     "common INTEGER NOT NULL DEFAULT 1, is_deleted INTEGER NOT NULL DEFAULT 0)")
 SHELLS_DDL = (
     "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, shortname TEXT, "
-    "display_name TEXT, is_deleted INTEGER DEFAULT 0)")
+    "display_name TEXT, flavor TEXT, is_deleted INTEGER DEFAULT 0)")
 GRANTS_DDL = (
     "CREATE TABLE shell_skills (shell_skill_id INTEGER PRIMARY KEY, "
-    "shell_id INTEGER NOT NULL, skill_id INTEGER NOT NULL, UNIQUE(shell_id, skill_id))")
+    "shell_id INTEGER NOT NULL, skill_id INTEGER NOT NULL, UNIQUE(shell_id, skill_id));"
+    "CREATE TABLE flavor_skills (flavor TEXT NOT NULL, skill_id INTEGER NOT NULL, "
+    "UNIQUE(flavor, skill_id))")
 
 
 def write_asset(root: Path, name: str, body: str) -> None:

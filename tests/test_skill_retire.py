@@ -46,6 +46,12 @@ def make_db() -> sqlite3.Connection:
     con.execute(
         "CREATE TABLE shell_skills (shell_skill_id INTEGER PRIMARY KEY, "
         "shell_id INTEGER, skill_id INTEGER, UNIQUE(shell_id, skill_id))")
+    con.execute(
+        "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
+        "UNIQUE(flavor, skill_id))")
+    con.execute(
+        "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, flavor TEXT)")
+    con.execute("INSERT INTO shells (shell_id, flavor) VALUES (1, NULL)")
     con.executescript(SEED_SQL)
     con.execute("INSERT INTO skills (name, description, content) "
                 "VALUES ('test_authoring_dosarch', 'fork skill', 'body')")

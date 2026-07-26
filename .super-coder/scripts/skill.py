@@ -8,6 +8,8 @@ no-op (`INSERT ... SELECT` over zero rows, #253). This surface makes the
 lifecycle first-class and loud: unknown skill or shell names are hard
 errors, engine skills refuse `rm` (the seed would just resurrect them),
 and every write reminds you that `./sc snapshot` is the persistence step.
+Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
+targets only that shell.
 
 Catalogue rows themselves are authored as assets + `./sc seed-skills`
 (engine + fork-local alike); this command manages what's GRANTED where,
@@ -36,8 +38,8 @@ Usage:
     ./sc skill list                        catalogue: origin, common, grants
     ./sc skill add <name> --file <path>    author a LOCAL skill (DB-only) + grant it
                   [--desc "…"] [--category …] [--for <shell>] [--opt-in]
-    ./sc skill grant  <name> <shell>...    grant a skill to shell(s) (id or shortname)
-    ./sc skill revoke <name> <shell>...    revoke a skill from shell(s)
+    ./sc skill grant  <name> <shell>...    grant via shell reference (flavor/Bespoke)
+    ./sc skill revoke <name> <shell>...    revoke via shell reference
     ./sc skill rm     <name>               soft-delete a LOCAL skill + revoke all grants
     ./sc skill retire   <name>             retire an ENGINE skill fork-wide (durable)
     ./sc skill unretire <name>             restore a retired engine skill (+ its grants)
@@ -86,6 +88,54 @@ def resolve_shell(con, ref: str) -> tuple[int, str]:
              + ", ".join(f"{i} ({n})" for i, n in have))
 
 
+def set_target_grant(con, shell_id: int, label: str, skill_id: int,
+                     granted: bool) -> tuple[int, str]:
+    """Mutate the owning pack for a shell and return (rowcount, scope label)."""
+    flavor = con.execute(
+        "SELECT flavor FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
+    if flavor is not None:
+        if granted:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+                "VALUES (?, ?)", (flavor, skill_id))
+        else:
+            cur = con.execute(
+                "DELETE FROM flavor_skills WHERE flavor=? AND skill_id=?",
+                (flavor, skill_id))
+        return cur.rowcount, f"{flavor} flavor"
+    if granted:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+            (shell_id, skill_id))
+    else:
+        cur = con.execute(
+            "DELETE FROM shell_skills WHERE shell_id=? AND skill_id=?",
+            (shell_id, skill_id))
+    return cur.rowcount, f"Bespoke {label}"
+
+
+def grant_scopes(con, skill_id: int) -> list[str]:
+    rows = con.execute(
+        "SELECT 'flavor:' || flavor AS scope "
+        "FROM flavor_skills WHERE skill_id=? "
+        "UNION ALL "
+        "SELECT 'shell:' || COALESCE(sh.shortname, sh.display_name, sh.shell_id) "
+        "FROM shell_skills ss JOIN shells sh ON sh.shell_id=ss.shell_id "
+        "WHERE ss.skill_id=? AND sh.flavor IS NULL "
+        "AND COALESCE(sh.is_deleted,0)=0 ORDER BY scope",
+        (skill_id, skill_id)).fetchall()
+    return [r[0] for r in rows]
+
+
+def grant_count(con, skill_id: int) -> int:
+    return con.execute(
+        "SELECT (SELECT COUNT(*) FROM flavor_skills WHERE skill_id=?) + "
+        "(SELECT COUNT(*) FROM shell_skills ss "
+        " JOIN shells sh ON sh.shell_id=ss.shell_id "
+        " WHERE ss.skill_id=? AND sh.flavor IS NULL)",
+        (skill_id, skill_id)).fetchone()[0]
+
+
 def resolve_skill(con, name: str) -> int:
     """A live skill row by name. Loud on a miss — the silent-no-op killer."""
     row = con.execute(
@@ -113,20 +163,18 @@ def cmd_list(con) -> int:
     engine = set(seed_skills.seeded_skill_names())
     retired = set(seed_skills.retired_skill_names())
     rows = con.execute(
-        "SELECT s.skill_id, s.name, s.common, s.is_deleted, "
-        "  (SELECT GROUP_CONCAT(COALESCE(sh.shortname, sh.shell_id), ', ') "
-        "   FROM shell_skills ss JOIN shells sh ON sh.shell_id = ss.shell_id "
-        "   WHERE ss.skill_id = s.skill_id AND COALESCE(sh.is_deleted,0)=0) "
+        "SELECT s.skill_id, s.name, s.common, s.is_deleted "
         "FROM skills s ORDER BY s.is_deleted, s.name").fetchall()
     if not rows:
         print("(no skills)")
         return 0
     w = max(len(r[1]) for r in rows)
-    for _, name, common, deleted, grants in rows:
+    for skill_id, name, common, deleted in rows:
         origin = "engine" if name in engine else "local "
         tag = "common" if common else "opt-in"
         dead = ("  [retired]" if name in retired else "  [deleted]") if deleted else ""
-        print(f"{name:<{w}}  {origin}  {tag}  → {grants or '(ungranted)'}{dead}")
+        scopes = ", ".join(grant_scopes(con, skill_id)) or "(ungranted)"
+        print(f"{name:<{w}}  {origin}  {tag}  → {scopes}{dead}")
     return 0
 
 
@@ -211,13 +259,13 @@ def cmd_add(con, argv: list[str]) -> int:
         (name, args.desc, args.category, args.command,
          0 if args.opt_in else 1, content))
     skill_id = con.execute("SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0]
-    # Guard 5 — auto-grant to the author, or the promotion produces a skill
-    # nobody can read.
-    con.execute("INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
-                (author_id, skill_id))
+    # Guard 5 — auto-grant to the author's owning pack, or the promotion
+    # produces a skill nobody can read.
+    _, scope = set_target_grant(con, author_id, author, skill_id, True)
     con.commit()
     verb = "updated" if row else "added"
-    print(f"add: {name} {verb} (local, DB-only, {len(content)} chars) → granted to {author}")
+    print(f"add: {name} {verb} (local, DB-only, {len(content)} chars) "
+          f"→ granted to {scope}")
     if not args.desc:
         print("  ⚠ no --desc — the boot SKILLS block lists the name with an empty "
               "summary; re-run with --desc to make it findable.")
@@ -229,11 +277,9 @@ def cmd_grant(con, name: str, shell_refs: list[str]) -> int:
     skill_id = resolve_skill(con, name)
     for ref in shell_refs:
         shell_id, label = resolve_shell(con, ref)
-        cur = con.execute(
-            "INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
-            (shell_id, skill_id))
-        print(f"grant: {name} → {label}"
-              + ("" if cur.rowcount else "  (already granted)"))
+        changed, scope = set_target_grant(con, shell_id, label, skill_id, True)
+        print(f"grant: {name} → {scope}"
+              + ("" if changed else "  (already granted)"))
     con.commit()
     persist_note()
     return 0
@@ -243,11 +289,9 @@ def cmd_revoke(con, name: str, shell_refs: list[str]) -> int:
     skill_id = resolve_skill(con, name)
     for ref in shell_refs:
         shell_id, label = resolve_shell(con, ref)
-        cur = con.execute(
-            "DELETE FROM shell_skills WHERE shell_id=? AND skill_id=?",
-            (shell_id, skill_id))
-        print(f"revoke: {name} ⇸ {label}"
-              + ("" if cur.rowcount else "  (was not granted)"))
+        changed, scope = set_target_grant(con, shell_id, label, skill_id, False)
+        print(f"revoke: {name} ⇸ {scope}"
+              + ("" if changed else "  (was not granted)"))
     con.commit()
     persist_note()
     return 0
@@ -280,9 +324,9 @@ def cmd_retire(con, name: str) -> int:
     if not already:
         _write_retire_list(names + [name])
     seed_skills.apply_retired(con)
-    dormant = con.execute(
-        "SELECT COUNT(*) FROM shell_skills ss JOIN skills s ON s.skill_id=ss.skill_id "
-        "WHERE s.name=?", (name,)).fetchone()[0]
+    dormant = grant_count(
+        con, con.execute(
+            "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
     rel = _display_retire_file()
     print(f"retire: {name}" + ("  (already listed)" if already else "")
           + f" — retired fork-wide; {dormant} grant(s) kept dormant "
@@ -299,9 +343,9 @@ def cmd_unretire(con, name: str) -> int:
                  f"({seed_skills.RETIRED_FILE}).")
     _write_retire_list([n for n in names if n != name])
     seed_skills.apply_retired(con)
-    grants = con.execute(
-        "SELECT COUNT(*) FROM shell_skills ss JOIN skills s ON s.skill_id=ss.skill_id "
-        "WHERE s.name=?", (name,)).fetchone()[0]
+    grants = grant_count(
+        con, con.execute(
+            "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
     rel = _display_retire_file()
     print(f"unretire: {name} — restored with {grants} grant(s) live again.")
     action = "commit" if artifact_policy.tracks_local_artifacts() else "kept local at"
@@ -315,8 +359,9 @@ def cmd_rm(con, name: str) -> int:
         sys.exit(f"sc skill: '{name}' is an ENGINE skill — the seed re-inserts it "
                  "on every update/rebuild, so a local rm cannot stick. "
                  f"`./sc skill retire {name}` retires it fork-wide (durable), or "
-                 "`./sc skill revoke` removes it per shell.")
-    n = con.execute("DELETE FROM shell_skills WHERE skill_id=?", (skill_id,)).rowcount
+                 "`./sc skill revoke` removes it from a flavor or Bespoke shell.")
+    n = con.execute("DELETE FROM flavor_skills WHERE skill_id=?", (skill_id,)).rowcount
+    n += con.execute("DELETE FROM shell_skills WHERE skill_id=?", (skill_id,)).rowcount
     con.execute("UPDATE skills SET is_deleted=1 WHERE skill_id=?", (skill_id,))
     con.commit()
     print(f"rm: {name} soft-deleted, {n} grant(s) revoked.")
