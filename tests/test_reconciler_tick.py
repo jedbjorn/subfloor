@@ -451,6 +451,58 @@ class ExplanationTierTest(unittest.TestCase):
             parts,
         )
 
+    def test_quota_limit_and_scope_branches_render_exactly(self):
+        add_quota_tables(self.con)
+        moonshot_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('moonshot', 'acct-m')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used, limit_value, captured_at) "
+            "VALUES (?, 'weekly', 5, 0, ?)",
+            (moonshot_pk, "2020-01-01T00:55:00Z"),
+        )
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used, limit_value, captured_at) "
+            "VALUES (?, 'five_hour', 5, 10, ?)",
+            (moonshot_pk, "2020-01-01T00:55:00Z"),
+        )
+        openai_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('openai', 'acct-o')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, scope, used_percent, captured_at) "
+            "VALUES (?, 'weekly', 'codex', 25, ?)",
+            (openai_pk, "2020-01-01T00:55:00Z"),
+        )
+
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            [
+                "anthropic quota unavailable",
+                "anthropic probe status unavailable",
+                "openai quota not exhausted window=weekly:codex "
+                "as of 2020-01-01T00:55:00Z",
+                "openai probe status unavailable",
+                "moonshot quota not exhausted window=five_hour "
+                "as of 2020-01-01T00:55:00Z",
+                "moonshot quota unavailable window=weekly "
+                "as of 2020-01-01T00:55:00Z",
+                "moonshot probe status unavailable",
+            ],
+            parts,
+        )
+
     def test_unreadable_explanation_signals_do_not_change_the_verdict(self):
         add_unit(self.con, reviewer=None)
         before_board = tuple(

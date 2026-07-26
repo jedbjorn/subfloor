@@ -411,7 +411,9 @@ def _quota_exhausted(row) -> "bool | None":
         return None
     try:
         limit_value = float(limit)
-        return limit_value > 0 and float(used) >= limit_value
+        if limit_value <= 0:
+            return None
+        return float(used) >= limit_value
     except (TypeError, ValueError):
         return None
 
