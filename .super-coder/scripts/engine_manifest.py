@@ -51,7 +51,8 @@ FORK_TEMPLATE_PATHS = (
 # pin), shell_db.db* (gitignored), instance.json (gitignored). assets/seed/ is
 # super-coder-only (stripped on install); assets/shells/ is empty/vestigial.
 # Lives here (not update.py) so install.py can write the first manifest without
-# a circular import; update.py re-exports it as update.ENGINE_PATHS.
+# a circular import. update.py re-exports it as the installed fallback while
+# resolving each update or rollback ref's own literal list.
 ENGINE_PATHS = [
     "sc",
     ".super-coder/aliases.mk",

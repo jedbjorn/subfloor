@@ -50,6 +50,7 @@ Usage:
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shutil
@@ -77,9 +78,9 @@ import seed_skills  # noqa: E402
 
 EJECTED_MARKER = STATE_DIR / "ejected"
 
-# The materialize set — canonical list lives in engine_manifest.py (shared with
-# install.py's first-manifest write); re-exported here as the name every caller
-# and test already knows.
+# The installed materialize set — engine_manifest.py owns the source-repo and
+# fresh-install answer. Updates resolve the target ref's list independently;
+# this export remains the warned fallback and the stable name callers know.
 ENGINE_PATHS = engine_manifest.ENGINE_PATHS
 
 _VISUAL_QA_MARKER_RE = re.compile(
@@ -196,36 +197,136 @@ def super_coder_remote() -> str:
              "  git remote add super-coder https://github.com/jedbjorn/subfloor.git")
 
 
-def _engine_paths_at(ref: str) -> list[str]:
-    """ENGINE_PATHS that actually exist at `ref` (blob or tree).
+def _literal_engine_paths_at(
+    ref: str,
+    source_path: str,
+    *,
+    repo_root: Path,
+) -> tuple[list[str] | None, str | None]:
+    """Read a literal ``ENGINE_PATHS = list[str]`` assignment from ``ref``."""
+    shown = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f"{ref}:{source_path}"],
+        capture_output=True,
+        text=True,
+    )
+    if shown.returncode != 0:
+        return None, f"{source_path} is unavailable"
+
+    try:
+        tree = ast.parse(shown.stdout, filename=f"{ref}:{source_path}")
+    except SyntaxError:
+        return None, f"{source_path} is not valid Python"
+
+    for node in tree.body:
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "ENGINE_PATHS"
+            for target in node.targets
+        ):
+            value = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "ENGINE_PATHS"
+        ):
+            value = node.value
+        if value is None:
+            continue
+        try:
+            paths = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError):
+            return None, f"{source_path} does not assign a literal list[str]"
+        if not isinstance(paths, list) or not all(
+            isinstance(path, str) for path in paths
+        ):
+            return None, f"{source_path} does not assign a literal list[str]"
+        return paths, None
+
+    return None, f"{source_path} does not define ENGINE_PATHS"
+
+
+def _engine_paths_for(ref: str, repo_root: Path = REPO_ROOT) -> list[str]:
+    """Resolve the target ref's allow-list, then keep paths present at ``ref``.
+
+    New engines declare their list in ``engine_manifest.py``. Refs before that
+    module split declare it in ``update.py``. If neither source satisfies the
+    literal-list contract, use the installed list as a warned fallback.
 
     `git archive` aborts wholesale if any pathspec matches nothing, so a single
     engine file retired upstream (e.g. a dropped schema variant) would otherwise
-    break every fork's update the one time it crosses that deletion. Filter to
-    the paths present at `ref` — and report what was dropped, never silently."""
+    break every fork's update the one time it crosses that deletion. The target
+    list is authoritative; the installed export remains the fallback and the
+    comparison baseline for reporting additions and retirements."""
+    sources = (
+        ".super-coder/scripts/engine_manifest.py",
+        ".super-coder/scripts/update.py",
+    )
+    reasons: list[str] = []
+    resolved: list[str] | None = None
+    for source_path in sources:
+        resolved, reason = _literal_engine_paths_at(
+            ref, source_path, repo_root=repo_root
+        )
+        if resolved is not None:
+            break
+        if reason is not None:
+            reasons.append(reason)
+
+    if resolved is None:
+        print(
+            f"WARNING: update could not resolve ENGINE_PATHS at {ref}: "
+            f"{'; '.join(reasons)}; falling back to installed ENGINE_PATHS.",
+            file=sys.stderr,
+        )
+        resolved = list(ENGINE_PATHS)
+
     present, missing = [], []
-    for p in ENGINE_PATHS:
+    for path in resolved:
         exists = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{ref}:{p}"],
-            capture_output=True).returncode == 0
-        (present if exists else missing).append(p)
-    if missing:
-        print(f"  note: {len(missing)} engine path(s) absent at {ref[:12]} "
-              f"(retired upstream) — skipping: {', '.join(missing)}")
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{ref}:{path}"],
+            capture_output=True,
+        ).returncode == 0
+        (present if exists else missing).append(path)
+
+    added = [path for path in present if path not in ENGINE_PATHS]
+    retired = [path for path in ENGINE_PATHS if path not in present]
+    if added:
+        print(
+            f"  note: {len(added)} engine path(s) newly materialized at "
+            f"{ref[:12]}: {', '.join(added)}"
+        )
+    if retired:
+        print(
+            f"  note: {len(retired)} installed engine path(s) retired at "
+            f"{ref[:12]} — skipping: {', '.join(retired)}"
+        )
+    target_only_missing = [path for path in missing if path not in ENGINE_PATHS]
+    if target_only_missing:
+        print(
+            f"  note: {len(target_only_missing)} target engine path(s) absent "
+            f"at {ref[:12]} — skipping: {', '.join(target_only_missing)}"
+        )
     if not present:
         sys.exit(f"update: no engine paths exist at {ref} — wrong ref or remote?")
     return present
 
 
 def _engine_files_at(ref: str) -> list[str]:
-    """The exact FILE list upstream ships at `ref` under the engine paths —
-    what a materialize writes, so what the manifest must cover and nothing
-    more. Locally-added files under engine dirs (e.g. a fork-local skill's
-    SKILL.md) and upstream-retired stragglers on disk stay out of the manifest:
-    they are not upstream-owned, so they must never guard — and later block —
-    a future update (see engine_manifest.write_manifest)."""
-    return git("ls-tree", "-r", "--name-only", ref,
-               "--", *_engine_paths_at(ref)).stdout.splitlines()
+    """The exact FILE list upstream ships under the paths resolved for ``ref``.
+
+    This is what a materialize writes, so it is what the manifest must cover
+    and nothing more. Locally-added files under engine dirs (e.g. a fork-local
+    skill's SKILL.md) and upstream-retired stragglers on disk stay out of the
+    manifest: they are not upstream-owned, so they must never guard — and later
+    block — a future update (see engine_manifest.write_manifest)."""
+    return git(
+        "ls-tree",
+        "-r",
+        "--name-only",
+        ref,
+        "--",
+        *_engine_paths_for(ref, repo_root=REPO_ROOT),
+    ).stdout.splitlines()
 
 
 def materialize_engine(ref: str) -> None:
@@ -236,8 +337,17 @@ def materialize_engine(ref: str) -> None:
     in place. (Files deleted upstream linger until a future doctor sweep — same
     gap the old checkout had; acceptable for a wholesale-overwrite dependency.)"""
     archive = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "archive", ref, "--", *_engine_paths_at(ref)],
-        capture_output=True)
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "archive",
+            ref,
+            "--",
+            *_engine_paths_for(ref, repo_root=REPO_ROOT),
+        ],
+        capture_output=True,
+    )
     if archive.returncode != 0:
         sys.exit("update: git archive of the engine failed:\n"
                  + archive.stderr.decode(errors="replace").strip())
@@ -303,8 +413,10 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
 
     materialize_engine(sha)
     ENGINE_REF.write_text(sha + "\n")
-    n = engine_manifest.write_manifest(_engine_paths_at(sha),
-                                       files=_engine_files_at(sha))
+    n = engine_manifest.write_manifest(
+        _engine_paths_for(sha, repo_root=REPO_ROOT),
+        files=_engine_files_at(sha),
+    )
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
 
 

@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""Guard: every tracked engine file is materialized to forks on `./sc update`.
+"""Guards for the engine allow-list materialized by ``./sc update``.
 
-The bugs this prevents: a new top-level file under `.super-coder/` (e.g.
-map_schema.sql, added with the map split) or a new tracked SUBDIRECTORY (e.g.
-shadow/, added with the Interface runtime) that isn't in update.py's
-ENGINE_PATHS allowlist never reaches an updating fork — the fork gets the new
-code but not the files, and breaks (shadow/: 'interface_unavailable: shadow
-sidecar exited' on every fresh fork; flag #59). Known subdirs (scripts/,
-templates/, …) are materialized whole, so files inside them are covered; only
-NEW top-level files and NEW subdirs are at risk. The file-level test asserts
-every git-tracked engine file is covered by the allowlist (or is a deliberate
-per-instance / super-coder-only exclusion); the dir-level one keeps the cheap
-top-level signal.
+Two bug classes live here. First, a new tracked top-level file or directory
+missing from ENGINE_PATHS never reaches any fork. Second, an updating fork can
+run an installed ``update.py`` whose list predates the target ref's list,
+silently laying down the new code without its newly declared path for one
+update. The source-repo coverage checks pin the first class; two-commit fixture
+repos pin target-ref resolution across the version gap, including the retired
+path mirror and warned fallback legs.
+
+Known subdirs (scripts/, templates/, …) are materialized whole, so files inside
+them are covered; only new top-level files and subdirs need new allow-list
+entries. Deliberate per-instance and super-coder-only exclusions remain outside
+the list.
 
 Run:
     python3 tests/test_update_materialize.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -52,7 +57,24 @@ def _covered(rel: str) -> bool:
                for entry in update.ENGINE_PATHS)
 
 
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 class EnginePathsCoverageTest(unittest.TestCase):
+    def test_head_allow_list_is_a_literal_matching_the_export(self):
+        warning = io.StringIO()
+        with contextlib.redirect_stderr(warning):
+            resolved = update._engine_paths_for("HEAD", repo_root=ROOT)
+
+        self.assertEqual(warning.getvalue(), "")
+        self.assertEqual(resolved, update.engine_manifest.ENGINE_PATHS)
+
     def test_every_top_level_engine_file_is_materialized(self):
         listed = set(update.ENGINE_PATHS)
         missing = []
@@ -94,6 +116,162 @@ class EnginePathsCoverageTest(unittest.TestCase):
             f"tracked engine file(s) absent from update.ENGINE_PATHS — forks "
             f"won't receive them on `./sc update` (add the path to ENGINE_PATHS "
             f"or opt out in NOT_MATERIALIZED): {missing}")
+
+
+class EnginePathsAtRefTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.scripts = self.root / ".super-coder" / "scripts"
+        self.scripts.mkdir(parents=True)
+        _git(self.root, "init", "-b", "main")
+        _git(self.root, "config", "user.name", "Update Test")
+        _git(self.root, "config", "user.email", "update@example.invalid")
+
+    def commit(self, message: str) -> str:
+        _git(self.root, "add", ".")
+        _git(self.root, "commit", "-m", message)
+        return _git(self.root, "rev-parse", "HEAD")
+
+    def write_manifest(self, paths: list[str]) -> None:
+        (self.scripts / "engine_manifest.py").write_text(
+            "ENGINE_PATHS = " + repr(paths) + "\n"
+        )
+
+    def test_added_path_resolves_from_target_ref_and_materializes(self):
+        installed = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text("old dispatcher\n")
+        self.write_manifest(installed)
+        (self.scripts / "floor.txt").write_text("old floor\n")
+        old_sha = self.commit("old allow-list")
+
+        target = [*installed, ".super-coder/new-path"]
+        (self.root / "sc").write_text("new dispatcher\n")
+        self.write_manifest(target)
+        (self.scripts / "floor.txt").write_text("new floor\n")
+        new_file = self.root / ".super-coder" / "new-path" / "new.txt"
+        new_file.parent.mkdir()
+        new_file.write_text("new path content\n")
+        new_sha = self.commit("add engine path")
+        _git(self.root, "checkout", old_sha)
+        self.assertFalse(new_file.exists())
+
+        output = io.StringIO()
+        with mock.patch.multiple(
+            update,
+            REPO_ROOT=self.root,
+            ENGINE_PATHS=installed,
+        ), contextlib.redirect_stdout(output):
+            resolved = update._engine_paths_for(
+                new_sha, repo_root=self.root
+            )
+            update.materialize_engine(new_sha)
+
+        self.assertEqual(resolved, target)
+        self.assertEqual(new_file.read_text(), "new path content\n")
+        self.assertEqual((self.root / "sc").read_text(), "new dispatcher\n")
+        self.assertIn(
+            "1 engine path(s) newly materialized at "
+            f"{new_sha[:12]}: .super-coder/new-path",
+            output.getvalue(),
+        )
+
+    def test_retired_path_is_not_materialized_and_is_reported(self):
+        base = ["sc", ".super-coder/scripts"]
+        installed = [*base, ".super-coder/retired-path"]
+        (self.root / "sc").write_text("old dispatcher\n")
+        self.write_manifest(installed)
+        retired_file = (
+            self.root / ".super-coder" / "retired-path" / "retired.txt"
+        )
+        retired_file.parent.mkdir()
+        retired_file.write_text("old upstream content\n")
+        old_sha = self.commit("path still installed")
+
+        (self.root / "sc").write_text("new dispatcher\n")
+        self.write_manifest(base)
+        retired_file.write_text("tracked but no longer engine-owned\n")
+        new_sha = self.commit("retire engine path")
+        _git(self.root, "checkout", old_sha)
+        retired_file.write_text("fork sentinel\n")
+
+        output = io.StringIO()
+        with mock.patch.multiple(
+            update,
+            REPO_ROOT=self.root,
+            ENGINE_PATHS=installed,
+        ), contextlib.redirect_stdout(output):
+            resolved = update._engine_paths_for(
+                new_sha, repo_root=self.root
+            )
+            update.materialize_engine(new_sha)
+
+        self.assertEqual(resolved, base)
+        self.assertNotIn(".super-coder/retired-path", resolved)
+        self.assertEqual(
+            retired_file.read_text(),
+            "fork sentinel\n",
+            "a target-retired path must stay outside the archive",
+        )
+        self.assertIn(
+            "1 installed engine path(s) retired at "
+            f"{new_sha[:12]} — skipping: .super-coder/retired-path",
+            output.getvalue(),
+        )
+
+    def test_ref_before_manifest_module_uses_update_literal(self):
+        (self.root / "README").write_text("precursor\n")
+        self.commit("before engine files")
+
+        legacy = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text("legacy dispatcher\n")
+        (self.scripts / "update.py").write_text(
+            "ENGINE_PATHS = " + repr(legacy) + "\n"
+        )
+        legacy_sha = self.commit("legacy update literal")
+
+        warning = io.StringIO()
+        with mock.patch.object(update, "ENGINE_PATHS", ["sc"]), \
+                contextlib.redirect_stderr(warning):
+            resolved = update._engine_paths_for(
+                legacy_sha, repo_root=self.root
+            )
+
+        self.assertEqual(resolved, legacy)
+        self.assertEqual(warning.getvalue(), "")
+
+    def test_unparseable_target_list_warns_and_uses_installed_list(self):
+        installed = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text("dispatcher\n")
+        self.write_manifest(installed)
+        (self.scripts / "update.py").write_text(
+            "from engine_manifest import ENGINE_PATHS\n"
+        )
+        self.commit("literal allow-list")
+
+        (self.scripts / "engine_manifest.py").write_text(
+            "ENGINE_PATHS = load_paths()\n"
+        )
+        target_sha = self.commit("dynamic allow-list")
+
+        warning = io.StringIO()
+        with mock.patch.object(update, "ENGINE_PATHS", installed), \
+                contextlib.redirect_stderr(warning):
+            resolved = update._engine_paths_for(
+                target_sha, repo_root=self.root
+            )
+
+        self.assertEqual(resolved, installed)
+        self.assertEqual(
+            warning.getvalue(),
+            "WARNING: update could not resolve ENGINE_PATHS at "
+            f"{target_sha}: "
+            ".super-coder/scripts/engine_manifest.py does not assign a "
+            "literal list[str]; "
+            ".super-coder/scripts/update.py does not define ENGINE_PATHS; "
+            "falling back to installed ENGINE_PATHS.\n",
+        )
 
 
 if __name__ == "__main__":
