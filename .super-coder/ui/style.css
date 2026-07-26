@@ -78,7 +78,7 @@ body.interface-view main {
 }
 body.interface-view #view-interface { flex: 1 1 auto; min-height: 0; }
 
-/* ── Tight card rhythm (Skills / Roadmap / Docs / Flags) ────────────────────
+/* ── Tight card rhythm (Skill Assignments / Roadmap / Docs / Flags) ─────────
    Stacked card panels on these tabs sit a small 5px apart. Section headers
    (funnel stages, skill categories) keep enough room to read as group labels;
    only the card-to-card spacing tightens. */
@@ -88,9 +88,9 @@ body.interface-view #view-interface { flex: 1 1 auto; min-height: 0; }
 #view-docs .card + .card, #view-flags .card + .card { margin-top: 5px; }
 #view-flags { gap: 5px; }
 #view-flags .flagbar { margin-bottom: calc(1rem - 5px); }   /* restore bar→cards spacing */
-#view-skills { gap: 5px; }
-#view-skills > .muted:first-child { margin-bottom: calc(1rem - 5px); }  /* intro keeps room */
-#view-skills .bucket > h2 { margin-top: 0; }                 /* header rides on its own card */
+.skill-assignments { gap: 5px; }
+.skill-assignments > .muted:first-child { margin-bottom: calc(1rem - 5px); }  /* intro keeps room */
+.skill-assignments .bucket > h2 { margin-top: 0; }           /* header rides on its own card */
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
@@ -236,7 +236,7 @@ details.feature.shipped-bar { border-left-color: var(--lock); }
 .link-card .link-v { font-size: .82rem; color: var(--ink); }
 .tag { font-size: .72rem; color: var(--dim); }
 
-/* ── Skills catalogue (Skills tab) — expandable rows, like flags ──────────── */
+/* ── Skill Assignments — expandable rows, like flags ──────────────────────── */
 .card.skills { padding: .3rem 1.1rem; }
 .skill { border-bottom: 1px solid var(--line); }
 .skill:last-of-type { border-bottom: none; }
@@ -319,6 +319,7 @@ a { color: var(--accent); }
   background: var(--accent);
 }
 .shell-pane { display: grid; grid-template-columns: minmax(0, 1fr); gap: .6rem; align-content: start; }
+.shell-pane.skill-assignments { gap: 5px; }
 .viewer-head { display: flex; align-items: center; gap: .9rem; padding: 0 .2rem; margin-top: .2rem; }
 .vpanel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); }
 .viewer-panel { padding: 1rem 1.1rem; min-height: 12rem; }

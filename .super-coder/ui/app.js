@@ -76,10 +76,10 @@ function toast(msg) {
 function setStatus(s) { $("#status").textContent = s; }
 
 // ── Skill sections ──────────────────────────────────────────────────────────
-// One grouping rule for the Skills tab AND the Shells grant list. "Repo skills"
-// are fork-local (origin='repo', derived server-side from the snapshot rule:
-// name not under engine assets/skills) and always lead; engine skills section
-// by their category.
+// One grouping rule for the Shells skill viewer AND Skill Assignments. "Repo
+// skills" are fork-local (origin='repo', derived server-side from the snapshot
+// rule: name not under engine assets/skills) and always lead; engine skills
+// section by their category.
 const SECTION_ORDER = ["repo", "substrate", "craft"];
 const SECTION_LABEL = { repo: "Repo skills", substrate: "Substrate", craft: "Craft", other: "Other" };
 const SECTION_NOTE = {
@@ -102,11 +102,17 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 // ── Shells ──────────────────────────────────────────────────────────────────
 // dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
 // identity sub-header (pill shell picker + role/mandate), then Harness |
-// Skills sub-tabs scoped to the selected shell. Flat panels, accordions,
-// popover pickers, and a unified edit modal.
+// Skills | Skill Assignments | Default Models sub-tabs. Flat panels,
+// accordions, popover pickers, and a unified edit modal.
 let selectedShell = null;
-let shellTab = "harness";     // 'harness' | 'skills' | 'models'
+let shellTab = "harness";     // 'harness' | 'skills' | 'assignments' | 'models'
 let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+const SHELL_TAB_HASH = {
+  harness: "shells",
+  skills: "shells-skills",
+  assignments: "shells-skill-assignments",
+  models: "shells-default-models",
+};
 
 // Rough token estimator — BPE-ish, ~15% off for English; the tilde in the
 // readout makes the approximation explicit. No bundled tokenizer.
@@ -298,21 +304,26 @@ async function renderShells(root) {
   if (shellTab === "models") sub.classList.add("subbar-inert");
   root.append(sub);
 
-  // sub-tabs — Harness / Skills scoped to the selected shell; Default Models
-  // is the fork-global launch matrix (same content from any shell)
+  // Harness / Skills are scoped to the selected shell. Skill Assignments and
+  // Default Models are fork-global views nested here to keep shell setup in
+  // one place. Hash navigation gives every section a reload-safe URL.
   const tabs = el("div", { className: "vtabs" });
   for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"],
+                              ["assignments", "Skill Assignments"],
                               ["models", "Default Models"]]) {
     const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
-    b.onclick = () => { shellTab = key; renderShells(root); };
+    b.onclick = () => { location.hash = SHELL_TAB_HASH[key]; };
     tabs.append(b);
   }
   root.append(tabs);
 
-  const pane = el("div", { className: "shell-pane" });
+  const pane = el("div", {
+    className: "shell-pane" + (shellTab === "assignments" ? " skill-assignments" : ""),
+  });
   root.append(pane);
   if (shellTab === "harness") renderHarness(pane, s);
   else if (shellTab === "models") renderDefaultModels(pane, s);
+  else if (shellTab === "assignments") renderSkillAssignments(pane);
   else renderSkillViewer(pane, s);
 }
 
@@ -654,8 +665,8 @@ function renderSkillViewer(root, s) {
   }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
 }
 
-// ── Skills (catalogue, sectioned) ────────────────────────────────────────────
-async function renderSkills(root) {
+// ── Skill Assignments (catalogue, sectioned) ─────────────────────────────────
+async function renderSkillAssignments(root) {
   const { skills, shells } = await api("/skills");
   root.replaceChildren();
   root.append(el("div", { className: "muted" },
@@ -692,7 +703,7 @@ function skillRow(s, shells) {
   if (s.command) body.append(el("div", { className: "tag" }, "command: ", el("code", {}, s.command)));
 
   // grants — every available shell as a row with an on/off toggle; same PUT
-  // the Shells tab uses, managed from the skill's side here
+  // the Skills viewer uses, managed from the skill's side here
   const gr = el("div", { className: "grants" });
   gr.append(el("label", { className: "k", textContent: "granted to" }));
   const list = el("div", { className: "grant-list" });
@@ -4455,7 +4466,6 @@ function ifControl(a, m) {
 const VIEWS = {
   interface: ["#view-interface", renderInterface],
   shells: ["#view-shells", renderShells],
-  skills: ["#view-skills", renderSkills],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
@@ -4495,9 +4505,17 @@ function show(tab) {
 // hash; hashchange drives show — back/forward and deep links work too. The
 // roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
 // The analytics tab does the same: #analytics (token) | #analytics-quota.
+// Shells: #shells (Harness) | #shells-skills | #shells-skill-assignments |
+// #shells-default-models.
 // The interface tab carries its selected shell: #interface | #interface/DEV3.
 function routeFromHash() {
   const raw = location.hash.slice(1);
+  if (raw === "" || raw === "shells" || raw.startsWith("shells-")) {
+    shellTab = Object.entries(SHELL_TAB_HASH).find(([, hash]) => hash === raw)?.[0]
+      || "harness";
+    show("shells");
+    return;
+  }
   if (raw === "roadmap" || raw.startsWith("roadmap-")) {
     roadmapView = raw === "roadmap-flow" ? "flow" : "board";
     show("roadmap");
@@ -4513,6 +4531,7 @@ function routeFromHash() {
     show("interface");
     return;
   }
+  if (!VIEWS[raw]) shellTab = "harness";
   show(VIEWS[raw] ? raw : "shells");
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
@@ -4574,7 +4593,6 @@ $("#publish").onclick = async (e) => {
     $("#repo").textContent = h.repo;
     forkName = h.repo || "";
     configureArtifactActions(h);
-    setStatus(localArtifactMode ? "local artifacts · port " + h.port : "port " + h.port);
   }
   catch { setStatus("offline"); }
   routeFromHash();   // honor #tab on load (refresh / deep link), else Shells
