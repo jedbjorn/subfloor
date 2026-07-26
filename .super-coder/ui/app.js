@@ -4500,10 +4500,164 @@ function ifControl(a, m) {
   }
 }
 
+// ── Active sprints ───────────────────────────────────────────────────────────
+// This is a read-only status surface. The API owns every displayed value; the
+// browser owns only refresh timing, local duration arithmetic, and stale-state
+// retention.
+const SPRINTS_REFRESH_MS = 15000;
+const SPRINTS_DURATION_MS = 60000;
+const sprintsState = {
+  payload: null,
+  error: null,
+  stale: false,
+  active: false,
+  root: null,
+  refreshTimer: null,
+  durationTimer: null,
+  inFlight: null,
+  lastFetchAt: 0,
+};
+
+function sprintsDuration(startedAt, now = Date.now()) {
+  const started = Date.parse(startedAt);
+  if (!Number.isFinite(started)) return null;
+  const minutes = Math.floor(Math.max(0, now - started) / 60000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+function sprintsUpdateNav(payload) {
+  const button = document.querySelector('nav button[data-tab="sprints"]');
+  if (!button) return;
+  const count = payload.active_count;
+  button.textContent = count > 0 ? `Sprints ${count}` : "Sprints";
+  button.classList.toggle("warn", count > 0);
+  button.title = "";
+  button.hidden = false;
+}
+
+function sprintsHeader(sprint) {
+  const header = el("div", { className: "sprint-header" },
+    el("h2", {}, sprint.title),
+    el("span", { className: "pill" }, `Doc #${sprint.document_id}`));
+  const planner = sprint.planner
+    ? sprint.planner.shortname : "Unbound";
+  const feature = sprint.feature
+    ? `#${sprint.feature.feature_id} ${sprint.feature.title}` : "Unlinked";
+  const meta = el("div", { className: "row sprint-meta" },
+    el("span", {}, `Planner: ${planner}`),
+    el("span", {}, `Feature: ${feature}`));
+  if (sprint.started_at) {
+    const started = new Date(sprint.started_at);
+    const duration = sprintsDuration(sprint.started_at);
+    meta.append(
+      el("time", { dateTime: sprint.started_at, title: sprint.started_at },
+        `Started: ${started.toLocaleString()}`),
+      el("span", { className: "sprint-duration" },
+        `Running: ${duration}`));
+  }
+  return [header, meta];
+}
+
+function sprintsPaint() {
+  const root = sprintsState.root;
+  if (!sprintsState.active || !root || !root.isConnected) return;
+  if (!sprintsState.payload) {
+    const message = sprintsState.error
+      ? "error: " + sprintsState.error : "Loading active sprints…";
+    root.replaceChildren(el("div", { className: "card" }, message));
+    return;
+  }
+
+  const nodes = [];
+  if (sprintsState.stale) {
+    nodes.push(el("div", { className: "card" },
+      "Stale — refresh failed: " + sprintsState.error));
+  }
+  const sprints = sprintsState.payload.sprints || [];
+  if (!sprints.length)
+    nodes.push(el("div", { className: "card" }, "No active sprints."));
+  for (const sprint of sprints) {
+    const flow = el("div", { className: "sprint-flow" });
+    if (!(sprint.units || []).length)
+      flow.append(el("div", { className: "muted" }, "No units declared"));
+    nodes.push(el("section", { className: "card sprint-board" },
+      ...sprintsHeader(sprint), flow));
+  }
+  root.replaceChildren(...nodes);
+}
+
+async function sprintsRefresh({ render = true } = {}) {
+  if (sprintsState.inFlight) return sprintsState.inFlight;
+  const request = (async () => {
+    try {
+      const payload = await api("/sprints?status=active");
+      sprintsState.payload = payload;
+      sprintsState.error = null;
+      sprintsState.stale = false;
+      sprintsUpdateNav(payload);
+    } catch (error) {
+      sprintsState.error = error.message;
+      sprintsState.stale = sprintsState.payload !== null;
+      if (!sprintsState.stale) {
+        const button = document.querySelector(
+          'nav button[data-tab="sprints"]');
+        if (button) {
+          button.title = "Active sprint count unavailable";
+          button.hidden = false;
+        }
+      }
+    } finally {
+      sprintsState.lastFetchAt = Date.now();
+      if (render) sprintsPaint();
+    }
+  })();
+  sprintsState.inFlight = request;
+  try { await request; }
+  finally {
+    if (sprintsState.inFlight === request) sprintsState.inFlight = null;
+  }
+}
+
+function sprintsPoll() {
+  if (!sprintsState.active || document.hidden) return;
+  return sprintsRefresh();
+}
+
+function sprintsStopLifecycle() {
+  if (sprintsState.refreshTimer !== null)
+    clearInterval(sprintsState.refreshTimer);
+  if (sprintsState.durationTimer !== null)
+    clearInterval(sprintsState.durationTimer);
+  document.removeEventListener("visibilitychange", sprintsPoll);
+  sprintsState.active = false;
+  sprintsState.root = null;
+  sprintsState.refreshTimer = null;
+  sprintsState.durationTimer = null;
+}
+
+async function renderSprints(root) {
+  sprintsStopLifecycle();
+  sprintsState.active = true;
+  sprintsState.root = root;
+  sprintsPaint();
+  document.addEventListener("visibilitychange", sprintsPoll);
+  sprintsState.refreshTimer = setInterval(sprintsPoll, SPRINTS_REFRESH_MS);
+  sprintsState.durationTimer = setInterval(sprintsPaint, SPRINTS_DURATION_MS);
+  // Boot already fetched the projection before routing so the nav never
+  // flashes a guessed count. A later route entry refreshes immediately.
+  if (Date.now() - sprintsState.lastFetchAt > 1000 && !document.hidden)
+    await sprintsRefresh();
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   interface: ["#view-interface", renderInterface],
   shells: ["#view-shells", renderShells],
+  sprints: ["#view-sprints", renderSprints],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
@@ -4535,6 +4689,7 @@ function show(tab) {
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "interface") { ifDetach(); ifStopRailPoll(); }   // leaving drops stream + lease + poll
+  if (tab !== "sprints") sprintsStopLifecycle();
   setDocumentTitle(tab);
   load(tab);
 }
@@ -4633,5 +4788,8 @@ $("#publish").onclick = async (e) => {
     configureArtifactActions(h);
   }
   catch { setStatus("offline"); }
+  // The active count is global navigation state. Establish it before routing
+  // so the label never paints an assumed zero on initial load.
+  await sprintsRefresh({ render: false });
   routeFromHash();   // honor #tab on load (refresh / deep link), else Shells
 })();
