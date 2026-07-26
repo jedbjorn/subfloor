@@ -390,6 +390,36 @@ class BoardRecordTest(unittest.TestCase):
             con.close()
         self.assertEqual(body, DOC_BODY)
 
+    def test_every_editable_field_round_trips_through_set(self):
+        """Enumerated as a SET rather than one field at a time, because a
+        mutation round trip found the gap: dropping `overlap` from the
+        editable map reddened nothing — every test that touched a field
+        asserted some OTHER property (a refusal, a timestamp) and none
+        asserted the value landed. The ruling requires both add and set to
+        carry the annotation; the same hole covered branch, depends_on,
+        pr_number and unit_title, so all five are pinned here."""
+        self.add()
+        edits = {"unit_title": "board record v2", "depends_on": "U0,U3",
+                 "overlap": "shares scripts/sprint.py with U5",
+                 "branch": "feat/sprint-board-record", "pr_number": 613}
+        for field, value in edits.items():
+            status, unit = self.patch(**{field: value})
+            self.assertEqual(status, 200, unit)
+            self.assertEqual(self.row()[field], value,
+                             f"{field} did not survive `set`")
+
+    def test_a_clearable_field_is_cleared_only_when_said_explicitly(self):
+        """Same distinction the roles get: omitted leaves it, explicit null
+        clears it. `sc sprint unit set --overlap none` must be able to retract
+        a stale merge-surface note, and an unrelated edit must not."""
+        self.add(depends_on="U0", overlap="MUST rebase onto merged U2")
+        self.patch(branch="feat/x")
+        self.assertEqual(self.row()["overlap"], "MUST rebase onto merged U2")
+        self.patch(overlap=None)
+        self.assertIsNone(self.row()["overlap"])
+        self.assertEqual(self.row()["depends_on"], "U0",
+                         "clearing one field cleared its neighbour")
+
     def test_the_merge_surface_annotation_survives_and_renders(self):
         """The markdown board's "depends on" cell carries prose beside the
         dependency — "shares SKILL.md with U8 — MUST rebase onto merged U2" —
