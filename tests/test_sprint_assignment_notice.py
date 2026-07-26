@@ -13,6 +13,12 @@ exists to avoid rather than a generalisation of it. The board here therefore
 carries a SECOND unit whose shells must stay silent — a single-unit fixture
 cannot tell "notify the record's parties" from "notify the board".
 
+The budget is the planner's enumeration, not the spec's original sentence: no
+shell receives more than one row for one write. "At most three" was a proxy
+that holds for a single-role change and for nothing else — a PATCH moving both
+roles is two changes and four parties — so the invariant is asserted directly,
+over the emitting cases as a set.
+
 The other half is what must NOT emit. A field edit, a state move, a role
 re-asserted to the shell already in it, a closed sprint, and every refused or
 rejected write tell nobody — the sprint-52 incident was a column that CHANGED
@@ -35,8 +41,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import interface_wake  # noqa: E402
-from test_sprint_board_record import (  # noqa: E402
-    DEV, OP, PLANNER, _BoardCase)
+from test_sprint_board_record import DEV, PLANNER, _BoardCase  # noqa: E402
 
 REV1, REV2, DEV5, DEV6, PLN1, PLN2 = 7, 8, 11, 12, 9, 10
 
@@ -156,9 +161,36 @@ class AssignmentNoticeTest(_BoardCase):
         self.add(seq="U3", dev=DEV5, reviewer=REV2)
         self.assertEqual(self.told(), [REV2, DEV5])
 
+    def test_declaring_a_unit_with_one_role_notifies_only_that_shell(self):
+        """No counterpart exists yet, so the newly named shell is the whole
+        set — an empty role column is a real board state, not a missing one."""
+        self.add(seq="U3", dev=DEV5)
+        self.assertEqual(self.told(), [DEV5])
+
     def test_declaring_an_unassigned_unit_tells_nobody(self):
         self.add(seq="U3")
         self.assertEqual(self.notices(), [])
+
+    def test_no_shell_receives_more_than_one_row_for_one_write(self):
+        """The invariant the row count was only ever a proxy for (planner
+        ruling on A1). "At most three" holds for a single-role change and
+        nothing else; this holds for every write that emits at all, which is
+        why it is asserted over the emitting cases as a set rather than left
+        implied by each one's expected recipients."""
+        writes = (
+            lambda: self.add(seq="U3", dev=DEV5, reviewer=REV2),
+            lambda: self.patch(seq="U1", reviewer=REV2),
+            lambda: self.patch(seq="U1", dev=DEV6, reviewer=REV2),
+            lambda: self.patch(seq="U1", reviewer=None),
+            lambda: self.patch(seq="U1", reviewer=DEV5),
+        )
+        for i, write in enumerate(writes):
+            with self.subTest(write=i):
+                self.clear_messages()
+                write()
+                told = self.told()
+                self.assertTrue(told, "this case is supposed to emit")
+                self.assertEqual(told, sorted(set(told)), told)
 
     def test_clearing_a_role_notifies_the_departing_shell(self):
         """The shell newly named is nobody, which is a real board state — the
