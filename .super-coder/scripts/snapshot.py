@@ -43,8 +43,8 @@ LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
 # Per-instance tables, parents-before-children for readability.
 # `schema_migrations` is excluded. Engine-authored skills are system content
 # seeded from migrations; project-local skills are serialized by the special
-# `skills` dumper below. `shell_skills` loads after `skills`, so grants to
-# local skill names resolve on rebuild.
+# `skills` dumper below. Grant tables load after `skills`, so grants to local
+# skill names resolve on rebuild.
 PER_INSTANCE_TABLES = [
     "users",
     "shells",
@@ -62,6 +62,7 @@ PER_INSTANCE_TABLES = [
     "projects",
     "project_shells",
     "skills",
+    "flavor_skills",
     "shell_skills",
     # shell_messages is per-instance memory (the inbox between this fork's
     # shells), so it survives a rebuild like flags/decisions — not a derived
@@ -251,19 +252,33 @@ def engine_skill_names() -> list[str]:
 
 
 def dump_shell_skills(con) -> list[str]:
-    """Grants resolved by skill NAME, not raw skill_id. Skill ids are positional
-    (they shift when the catalogue grows), so a raw-id dump would bind a fork's
-    grants to the wrong skills after an update. Resolving by name at load time
-    makes grants id-churn-proof."""
+    """Bespoke grants resolved by skill NAME, not raw skill_id."""
     rows = con.execute(
         "SELECT ss.shell_id, s.name FROM shell_skills ss "
-        "JOIN skills s ON s.skill_id = ss.skill_id ORDER BY ss.shell_id, s.name"
+        "JOIN skills s ON s.skill_id = ss.skill_id "
+        "JOIN shells sh ON sh.shell_id = ss.shell_id "
+        "WHERE sh.flavor IS NULL ORDER BY ss.shell_id, s.name"
     ).fetchall()
     lines = ["DELETE FROM shell_skills;"]
     for shell_id, name in rows:
         lines.append(
             f"INSERT INTO shell_skills (shell_id, skill_id) "
             f"SELECT {shell_id}, skill_id FROM skills WHERE name={quote(name)};")
+    lines.append("")
+    return lines
+
+
+def dump_flavor_skills(con) -> list[str]:
+    """Flavor packs resolved by skill NAME so catalogue id churn is harmless."""
+    rows = con.execute(
+        "SELECT fs.flavor, s.name FROM flavor_skills fs "
+        "JOIN skills s ON s.skill_id = fs.skill_id ORDER BY fs.flavor, s.name"
+    ).fetchall()
+    lines = ["DELETE FROM flavor_skills;"]
+    for flavor, name in rows:
+        lines.append(
+            f"INSERT INTO flavor_skills (flavor, skill_id) "
+            f"SELECT {quote(flavor)}, skill_id FROM skills WHERE name={quote(name)};")
     lines.append("")
     return lines
 
@@ -338,6 +353,8 @@ SENSITIVE_COLUMNS = {
 def dump_table(con, table: str) -> list[str]:
     if table == "skills":
         return dump_local_skills(con)
+    if table == "flavor_skills":
+        return dump_flavor_skills(con)
     if table == "shell_skills":
         return dump_shell_skills(con)
     cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]

@@ -42,10 +42,13 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    upstream-owned engine territory. DB skills with no asset file = other local
    skills, left intact.
 
-3. **Grant to target shell(s)** — by shell id or shortname:
+3. **Grant to the target pack** — name a shell by id or shortname:
    ```bash
    sc skill grant <skill_name> <shell>...
    ```
+   A standard shell targets its shared flavor pack; every shell of that flavor
+   receives the skill. A Bespoke shell targets only itself. To create an
+   intentional one-shell assignment, create/use a Bespoke shell.
    Unknown skill/shell names = hard error (no silent no-op grants).
    `sc skill list` = catalogue with origins + current grants;
    `sc skill revoke <name> <shell>...` reverses a grant.
@@ -57,8 +60,8 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    `snapshot.py` serializes local skills (any skill the engine seed doesn't
    own) into the active snapshot (`.sc-state/content.sql` in tracked mode,
    `.sc-state/local/content.sql` in local mode) — what survives `sc update` and
-   `sc rebuild`; the row + grants reconstruct from content.sql. Skip this ->
-   the skill is lost on next update.
+   `sc rebuild`; the row + flavor/Bespoke grants reconstruct from content.sql.
+   Skip this -> the skill is lost on next update.
 
 5. **Finish.** Run `sc render-check` first — hermetic rebuild, fails if the
    `skills_sc/` mirror drifts from the DB render (the CI guard; see the
@@ -72,12 +75,14 @@ Edit the asset file -> repeat seed -> snapshot -> commit (steps 2, 4, 5).
 Asset file gone (removed / authored elsewhere) -> recreate it from the DB body
 first: `sc sql "SELECT content FROM skills WHERE name='<name>'"`.
 
-## Assigning an existing skill to additional shells
+## Assigning an existing skill
 
 ```bash
 sc skill grant <skill_name> <shell>...
 ```
-Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
+Name one standard shell to update its whole flavor, or name a Bespoke shell to
+update only that shell. Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render`
+and commit the resulting artifacts.
 
 ## Removing a skill
 
@@ -89,7 +94,7 @@ Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
    Engine skill this fork has superseded -> retire fork-wide:
    `sc skill retire <name>` (writes the tracked
    `.sc-state/skills_retired.json`, which rides updates; `sc skill unretire`
-   reverses). Per-shell removal -> `sc skill revoke`.
+   reverses). Flavor/Bespoke removal -> `sc skill revoke`.
 
 2. **Remove the asset file** (`.super-coder/assets/skills/<name>/`) —
    otherwise the next `sc seed-skills` re-inserts the skill.
@@ -101,8 +106,8 @@ Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
 
 ## How the GUI organizes skills
 
-The review GUI Skills tab shows the full catalogue in sections with per-shell
-grant toggles; the Shells tab groups its grant list by the same sections.
+Shells → Skill Assignments shows the full catalogue in sections. Each standard
+flavor appears once; Bespoke shells appear individually.
 
 - **Repo skills** — lead section: skills authored in this fork. Membership is
   *derived* — a skill the engine seed doesn't own is repo-local. Same rule
@@ -113,8 +118,10 @@ grant toggles; the Shells tab groups its grant list by the same sections.
   frontmatter. A repo skill's `category` displays as a row label but never
   moves it out of the Repo section.
 
-GUI grant toggles hit the same DB table as `sc skill grant` — they still need
-a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a rebuild.
+GUI grant toggles hit the same ownership boundary as `sc skill grant`:
+`flavor_skills` for standard flavors, `shell_skills` for Bespoke shells. They
+still need a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a
+rebuild.
 
 ## What NOT to do
 

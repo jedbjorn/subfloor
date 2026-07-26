@@ -124,39 +124,36 @@ def _write_instance(cfg: dict) -> None:
 
 
 def grant(con, skill: str, flavors: list[str]) -> int:
-    """Grant `skill` to every live shell of the given flavors. Idempotent."""
+    """Grant `skill` once to each named flavor pack. Idempotent."""
     q = ",".join("?" for _ in flavors)
     cur = con.execute(
-        f"INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
-        f"SELECT s.shell_id, k.skill_id FROM shells s, skills k "
-        f"WHERE COALESCE(s.is_deleted,0)=0 AND s.flavor IN ({q}) "
-        f"AND k.name=? AND k.is_deleted=0",
-        (*flavors, skill))
+        f"INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+        f"SELECT f.flavor, k.skill_id "
+        f"FROM (SELECT flavor FROM flavor_skills WHERE flavor IN ({q}) "
+        f"      UNION SELECT flavor FROM shells WHERE flavor IN ({q})) f, skills k "
+        f"WHERE k.name=? AND k.is_deleted=0",
+        (*flavors, *flavors, skill))
     return cur.rowcount
 
 
 def revoke(con, skill: str, flavors: list[str]) -> int:
-    """Revoke `skill` from shells of the given flavors — only the grants enable
-    would have made; a grant to a bespoke/other-flavor shell is left alone."""
+    """Revoke `skill` from named flavor packs; Bespoke grants stay untouched."""
     q = ",".join("?" for _ in flavors)
     cur = con.execute(
-        f"DELETE FROM shell_skills WHERE skill_id IN "
+        f"DELETE FROM flavor_skills WHERE skill_id IN "
         f"(SELECT skill_id FROM skills WHERE name=? AND is_deleted=0) "
-        f"AND shell_id IN (SELECT shell_id FROM shells "
-        f"WHERE COALESCE(is_deleted,0)=0 AND flavor IN ({q}))",
+        f"AND flavor IN ({q})",
         (skill, *flavors))
     return cur.rowcount
 
 
 def _grant_state(con, skill: str) -> list[str]:
-    """['dev(2)', 'reviewer(1)'] — live shells holding the skill, by flavor."""
+    """['dev', 'reviewer'] — flavor packs holding the skill."""
     rows = con.execute(
-        "SELECT COALESCE(s.flavor,'bespoke'), COUNT(*) FROM shell_skills g "
-        "JOIN shells s ON s.shell_id=g.shell_id "
+        "SELECT g.flavor FROM flavor_skills g "
         "JOIN skills k ON k.skill_id=g.skill_id "
-        "WHERE k.name=? AND COALESCE(s.is_deleted,0)=0 AND k.is_deleted=0 "
-        "GROUP BY 1 ORDER BY 1", (skill,)).fetchall()
-    return [f"{flavor}({n})" for flavor, n in rows]
+        "WHERE k.name=? AND k.is_deleted=0 ORDER BY g.flavor", (skill,)).fetchall()
+    return [flavor for (flavor,) in rows]
 
 
 def _snapshot() -> None:

@@ -5,8 +5,7 @@ Two layers: the REGISTRY must stay consistent with the assets it points at
 (every granted skill exists in assets/skills/ and is common:false — a feature
 must never grant a skill the seed doesn't ship, or auto-grant a common one
 twice; every flavor has a template), and the GRANT/REVOKE SQL must do what the
-registry means (grant to live shells of the named flavors only, revoke without
-touching other shells' grants).
+registry means (grant each named flavor pack once and leave other packs alone).
 
 Run:
     python3 tests/test_feature.py
@@ -38,6 +37,8 @@ def _mini_db() -> sqlite3.Connection:
                              is_deleted INTEGER DEFAULT 0);
         CREATE TABLE shell_skills (shell_id INTEGER, skill_id INTEGER,
                                    PRIMARY KEY (shell_id, skill_id));
+        CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER,
+                                    PRIMARY KEY (flavor, skill_id));
     """)
     con.executemany("INSERT INTO shells (shell_id, flavor, is_deleted) VALUES (?,?,?)",
                     [(1, "dev", 0), (2, "dev", 0), (3, "reviewer", 0),
@@ -97,12 +98,12 @@ class RegistryIntegrityTest(unittest.TestCase):
 
 
 class GrantRevokeTest(unittest.TestCase):
-    def test_grant_targets_live_shells_of_named_flavors(self):
+    def test_grant_targets_each_named_flavor_once(self):
         con = _mini_db()
         n = feature.grant(con, "test_authoring_pg", ["dev", "reviewer"])
-        self.assertEqual(n, 3)  # dev(1,2) + reviewer(3); deleted dev(5) skipped
-        rows = {r[0] for r in con.execute("SELECT shell_id FROM shell_skills")}
-        self.assertEqual(rows, {1, 2, 3})
+        self.assertEqual(n, 2)
+        rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
+        self.assertEqual(rows, {"dev", "reviewer"})
 
     def test_grant_is_idempotent(self):
         con = _mini_db()
@@ -117,13 +118,13 @@ class GrantRevokeTest(unittest.TestCase):
     def test_revoke_leaves_other_flavors_grants(self):
         con = _mini_db()
         feature.grant(con, "test_authoring_pg", ["dev", "reviewer"])
-        # A manual grant to a planner shell — outside the feature's flavors.
-        con.execute("INSERT INTO shell_skills VALUES (6, 10)")
+        # A manual planner-pack grant — outside the feature's flavors.
+        con.execute("INSERT INTO flavor_skills VALUES ('planner', 10)")
         n = feature.revoke(con, "test_authoring_pg", ["dev", "reviewer"])
-        self.assertEqual(n, 3)
-        rows = {r[0] for r in con.execute("SELECT shell_id FROM shell_skills")}
-        self.assertEqual(rows, {6}, "revoke must not touch grants outside the "
-                                    "feature's flavors")
+        self.assertEqual(n, 2)
+        rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
+        self.assertEqual(rows, {"planner"}, "revoke must not touch packs outside "
+                                           "the feature's flavors")
 
 
 if __name__ == "__main__":

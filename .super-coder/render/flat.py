@@ -255,7 +255,7 @@ def render_skill_md(con: sqlite3.Connection, shell_id: int,
     work_dir overrides the write root (used for dev-shell worktrees)."""
     rows = con.execute(
         "SELECT s.name, s.description, s.content FROM skills s "
-        "JOIN shell_skills ss ON ss.skill_id = s.skill_id "
+        "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
         "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
         (shell_id,),
     ).fetchall()

@@ -53,6 +53,9 @@ def seed(con: sqlite3.Connection) -> dict:
         "INSERT INTO shells (display_name, system_prompt, flavor, shortname) "
         "VALUES ('Dev', 'x', 'dev', 'dev')")
     sid = cur.lastrowid
+    bespoke_sid = con.execute(
+        "INSERT INTO shells (display_name, system_prompt, flavor, shortname) "
+        "VALUES ('Custom', 'x', NULL, 'custom')").lastrowid
     fid = con.execute(
         "INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary) "
         "VALUES ('Feature A', 'next', 1, ?, 'a summary')", (sid,)).lastrowid
@@ -72,10 +75,13 @@ def seed(con: sqlite3.Connection) -> dict:
     kid = con.execute(
         "INSERT INTO skills (name, description, category, common, is_deleted) "
         "VALUES ('local_only_skill', 'fixture repo skill', 'craft', 0, 0)").lastrowid
+    con.execute("INSERT INTO flavor_skills (flavor, skill_id) VALUES ('dev', ?)",
+                (kid,))
     con.execute("INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
-                (sid, kid))
+                (bespoke_sid, kid))
     con.commit()
-    return {"shell_id": sid, "feature_id": fid, "skill_id": kid}
+    return {"shell_id": sid, "bespoke_shell_id": bespoke_sid,
+            "feature_id": fid, "skill_id": kid}
 
 
 class AssemblerSmokeTest(unittest.TestCase):
@@ -143,7 +149,9 @@ class AssemblerSmokeTest(unittest.TestCase):
         # the fixture skill has no assets/skills/ dir → repo origin, granted once
         fixture = by_name["local_only_skill"]
         self.assertEqual(fixture["origin"], "repo")
-        self.assertEqual(fixture["granted_shells"], [self.ids["shell_id"]])
+        self.assertEqual(fixture["granted_flavors"], ["dev"])
+        self.assertEqual(
+            fixture["granted_shells"], [self.ids["bespoke_shell_id"]])
         # an engine-seeded skill derives as engine
         self.assertEqual(by_name["db_map"]["origin"], "engine")
 

@@ -685,6 +685,27 @@ CREATE TABLE shell_skills (
     UNIQUE(shell_id, skill_id)
 );
 
+-- Standard shells share one skill pack per flavor. shell_skills is reserved
+-- for bespoke shells (flavor IS NULL); resolved_shell_skills is the only read
+-- path consumers use, so stale per-shell rows can never make flavored siblings
+-- diverge.
+CREATE TABLE flavor_skills (
+    flavor    TEXT    NOT NULL,
+    skill_id  INTEGER NOT NULL REFERENCES skills(skill_id),
+    PRIMARY KEY (flavor, skill_id)
+);
+
+CREATE VIEW resolved_shell_skills AS
+SELECT sh.shell_id, fs.skill_id
+FROM shells sh
+JOIN flavor_skills fs ON fs.flavor = sh.flavor
+WHERE sh.flavor IS NOT NULL
+UNION ALL
+SELECT ss.shell_id, ss.skill_id
+FROM shell_skills ss
+JOIN shells sh ON sh.shell_id = ss.shell_id
+WHERE sh.flavor IS NULL;
+
 -- ── Projects (per-shell project standing) ───────────────────────────────────
 
 CREATE TABLE projects (

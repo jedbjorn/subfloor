@@ -228,11 +228,15 @@ function openNewShellModal(templates, root) {
   const fl = el("select", {});
   for (const t of templates)
     fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
+  fl.append(el("option", {
+    value: "",
+    textContent: "Bespoke — custom skill pack",
+  }));
   const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
   const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
   const form = el("div", { className: "modal-form" },
-    el("span", { className: "k" }, "flavor"), fl,
+    el("span", { className: "k" }, "shell type"), fl,
     el("span", { className: "k" }, "name"), nm);
   const close = openModal({ title: "New shell", bodyNode: form,
     footNodes: [create, cancel], width: 600, height: 300 });
@@ -240,7 +244,10 @@ function openNewShellModal(templates, root) {
     if (!nm.value.trim()) return toast("name required");
     create.disabled = true; create.textContent = "Creating…";
     try {
-      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
+      const r = await api("/shells", "POST", {
+        flavor: fl.value || null,
+        name: nm.value.trim(),
+      });
       selectedShell = r.shell_id; activeSkillId = null;
       close(); setStatus(`shell created — ${r.shortname}`); renderShells(root);
     } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
@@ -301,7 +308,8 @@ async function renderShells(root) {
   sub.append(delBtn);
   // Default Models is fork-global config — the shell-scoped header (picker,
   // role/mandate, ＋New shell) is greyed out and inert there, not load-bearing.
-  if (shellTab === "models") sub.classList.add("subbar-inert");
+  if (shellTab === "assignments" || shellTab === "models")
+    sub.classList.add("subbar-inert");
   root.append(sub);
 
   // Harness / Skills are scoped to the selected shell. Skill Assignments and
@@ -616,17 +624,22 @@ function renderSkillViewer(root, s) {
   btn.append(el("span", { className: "gdrop-label mono" }, active.name),
     el("span", { className: "gdrop-caret" }, "⇅"));
   const menu = el("div", { className: "gmenu", hidden: true });
+  const grantPath = (skillId) => s.flavor
+    ? `/flavors/${encodeURIComponent(s.flavor)}/skills/${skillId}`
+    : `/shells/${s.shell_id}/skills/${skillId}`;
   for (const k of skills) {
     const row = el("div", { className: "gmenu-item" + (k.skill_id === activeSkillId ? " active-row" : "") });
     const tog = el("button", { className: "gmenu-check", type: "button",
       title: k.granted ? "Revoke" : "Grant", textContent: k.granted ? "☑" : "☐" });
     tog.onclick = async () => {
       try {
-        await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: !k.granted });
+        await api(grantPath(k.skill_id), "PUT", { granted: !k.granted });
         k.granted = k.granted ? 0 : 1;
         tog.textContent = k.granted ? "☑" : "☐";
         tog.title = k.granted ? "Revoke" : "Grant";
-        setStatus("grant updated");
+        setStatus(s.flavor
+          ? `${s.flavor} flavor pack updated`
+          : `${s.display_name} Bespoke pack updated`);
       } catch (e) { toast("error: " + e.message); }
     };
     const sel = el("button", { className: "gmenu-name mono", type: "button", textContent: k.name });
@@ -643,7 +656,12 @@ function renderSkillViewer(root, s) {
   // rendered markdown by default; the right-aligned toggle shows raw text
   const rawBtn = el("button", { className: "rawtoggle", type: "button",
     title: "Toggle raw markdown", textContent: "raw", hidden: true });
-  root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
+  root.append(
+    el("div", { className: "muted note" },
+      s.flavor
+        ? `Shared ${s.flavor} pack — changes apply to every ${s.flavor} shell.`
+        : `Bespoke pack — changes apply only to ${s.display_name}.`),
+    el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
   const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
   const panel = el("div", { className: "vpanel viewer-panel" });
   root.append(stats, panel);
@@ -667,10 +685,11 @@ function renderSkillViewer(root, s) {
 
 // ── Skill Assignments (catalogue, sectioned) ─────────────────────────────────
 async function renderSkillAssignments(root) {
-  const { skills, shells } = await api("/skills");
+  const { skills, shells, flavors } = await api("/skills");
+  const bespokeShells = shells.filter((sh) => !sh.flavor);
   root.replaceChildren();
   root.append(el("div", { className: "muted" },
-    "The skills catalogue, sectioned. Engine skills ship with super-coder and group by category; repo skills are authored in this fork. Grants are editable here and on each shell."));
+    "Assign each skill once per standard flavor. Every shell of that flavor inherits the same pack. Bespoke shells remain individually assignable."));
   for (const sec of groupSkills(skills, { alwaysRepo: true })) {
     const wrap = el("div", { className: "bucket" });
     const h = el("h2", {}, `${sec.label} `, el("span", { className: "count" }, String(sec.skills.length)));
@@ -683,13 +702,13 @@ async function renderSkillAssignments(root) {
       continue;
     }
     const card = el("div", { className: "card skills" });
-    for (const s of sec.skills) card.append(skillRow(s, shells));
+    for (const s of sec.skills) card.append(skillRow(s, flavors, bespokeShells));
     wrap.append(card);
     root.append(wrap);
   }
 }
 
-function skillRow(s, shells) {
+function skillRow(s, flavors, bespokeShells) {
   const row = el("details", { className: "skill" });
   // collapsed row stays quiet: mono name + truncated description, no badges —
   // origin/section is the group header, grants live in the expanded body
@@ -702,16 +721,34 @@ function skillRow(s, shells) {
   const body = el("div", { className: "skill-body" });
   if (s.command) body.append(el("div", { className: "tag" }, "command: ", el("code", {}, s.command)));
 
-  // grants — every available shell as a row with an on/off toggle; same PUT
-  // the Skills viewer uses, managed from the skill's side here
+  // One row per standard flavor, then one row per Bespoke shell.
   const gr = el("div", { className: "grants" });
-  gr.append(el("label", { className: "k", textContent: "granted to" }));
+  gr.append(el("label", { className: "k", textContent: "assigned to" }));
   const list = el("div", { className: "grant-list" });
-  for (const sh of shells) {
+  list.append(el("div", { className: "k", textContent: "Standard flavors" }));
+  for (const fl of flavors) {
+    const sw = toggleSwitch(s.granted_flavors.includes(fl.flavor), async (next, cb) => {
+      try {
+        await api(`/flavors/${encodeURIComponent(fl.flavor)}/skills/${s.skill_id}`,
+          "PUT", { granted: next });
+        setStatus(`${fl.flavor} flavor pack updated`);
+        const i = s.granted_flavors.indexOf(fl.flavor);
+        if (next && i < 0) s.granted_flavors.push(fl.flavor);
+        if (!next && i >= 0) s.granted_flavors.splice(i, 1);
+      } catch (e) { toast("error: " + e.message); cb.checked = !next; }
+    });
+    list.append(el("div", { className: "grant-row" },
+      sw,
+      el("span", { className: "grant-name" }, fl.flavor,
+        el("span", { className: "muted", textContent: fl.role ? " · " + fl.role : "" }))));
+  }
+  if (bespokeShells.length)
+    list.append(el("div", { className: "k", textContent: "Bespoke shells" }));
+  for (const sh of bespokeShells) {
     const sw = toggleSwitch(s.granted_shells.includes(sh.shell_id), async (next, cb) => {
       try {
         await api(`/shells/${sh.shell_id}/skills/${s.skill_id}`, "PUT", { granted: next });
-        setStatus("grant updated");
+        setStatus(`${sh.display_name} Bespoke pack updated`);
         const i = s.granted_shells.indexOf(sh.shell_id);
         if (next && i < 0) s.granted_shells.push(sh.shell_id);
         if (!next && i >= 0) s.granted_shells.splice(i, 1);
@@ -720,7 +757,8 @@ function skillRow(s, shells) {
     list.append(el("div", { className: "grant-row" },
       sw,
       el("span", { className: "grant-name" }, sh.display_name,
-        el("span", { className: "muted", textContent: sh.shortname ? " /" + sh.shortname : "" }))));
+        el("span", { className: "muted",
+          textContent: sh.shortname ? " /" + sh.shortname : "" }))));
   }
   gr.append(list);
   body.append(gr);

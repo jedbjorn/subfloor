@@ -123,8 +123,18 @@ class VisualQaSeedTest(unittest.TestCase):
         with sqlite3.connect(database) as con:
             con.executescript(
                 "CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, is_active INTEGER);"
-                "CREATE TABLE shells(shell_id INTEGER PRIMARY KEY, shortname TEXT, is_deleted INTEGER DEFAULT 0);"
+                "CREATE TABLE shells(shell_id INTEGER PRIMARY KEY, shortname TEXT, "
+                "flavor TEXT, is_deleted INTEGER DEFAULT 0);"
                 "CREATE TABLE shell_skills(shell_id INTEGER, skill_id INTEGER);"
+                "CREATE TABLE flavor_skills(flavor TEXT, skill_id INTEGER);"
+                "CREATE VIEW resolved_shell_skills AS "
+                "SELECT sh.shell_id, fs.skill_id FROM shells sh "
+                "JOIN flavor_skills fs ON fs.flavor=sh.flavor "
+                "WHERE sh.flavor IS NOT NULL "
+                "UNION ALL "
+                "SELECT ss.shell_id, ss.skill_id FROM shell_skills ss "
+                "JOIN shells sh ON sh.shell_id=ss.shell_id "
+                "WHERE sh.flavor IS NULL;"
             )
 
         next_shell_id = iter(range(1, 7))
@@ -132,8 +142,9 @@ class VisualQaSeedTest(unittest.TestCase):
         def create_shell(con, *, flavor, **_kwargs):
             shell_id = next(next_shell_id)
             con.execute(
-                "INSERT INTO shells(shell_id, shortname, is_deleted) VALUES (?, ?, 0)",
-                (shell_id, f"{flavor[:3].upper()}{shell_id}"),
+                "INSERT INTO shells(shell_id, shortname, flavor, is_deleted) "
+                "VALUES (?, ?, ?, 0)",
+                (shell_id, f"{flavor[:3].upper()}{shell_id}", flavor),
             )
             return shell_id
 

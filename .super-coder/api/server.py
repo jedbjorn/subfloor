@@ -350,7 +350,7 @@ def get_shell(con, sid: int) -> dict | None:
     r = con.execute(
         "SELECT shell_id, display_name, shortname, partner, role, mandate, "
         "system_prompt, current_state, lineage_seed, "
-        "has_identity, active_archive_id FROM shells "
+        "has_identity, active_archive_id, flavor FROM shells "
         "WHERE shell_id=? AND COALESCE(is_deleted,0)=0", (sid,)).fetchone()
     if r is None:
         return None
@@ -365,7 +365,8 @@ def get_shell(con, sid: int) -> dict | None:
         "ORDER BY entry_date, entry_id", (sid,)))
     shell["skills"] = rows(con.execute(
         "SELECT s.skill_id, s.name, s.description, s.category, "
-        "(SELECT 1 FROM shell_skills ss WHERE ss.shell_id=? AND ss.skill_id=s.skill_id) "
+        "(SELECT 1 FROM resolved_shell_skills ss "
+        " WHERE ss.shell_id=? AND ss.skill_id=s.skill_id) "
         "AS granted FROM skills s WHERE s.is_deleted=0 ORDER BY s.name", (sid,)))
     tag_origin(shell["skills"])
     shell["decisions"] = rows(con.execute(
@@ -390,22 +391,33 @@ def tag_origin(skills: list[dict]) -> list[dict]:
 
 
 def get_skills(con) -> dict:
-    """The full catalogue + per-skill grants for Shells → Skill Assignments.
+    """The catalogue + flavor/Bespoke grants for Shells → Skill Assignments.
     Grouping into sections (repo / category) happens client-side, like
     flags/docs."""
     skills = rows(con.execute(
         "SELECT skill_id, name, description, category, command, common "
         "FROM skills WHERE is_deleted=0 ORDER BY name"))
     tag_origin(skills)
-    grants: dict[int, list] = {}
+    shell_grants: dict[int, list] = {}
     for g in rows(con.execute(
             "SELECT ss.skill_id, ss.shell_id FROM shell_skills ss "
             "JOIN shells sh ON sh.shell_id=ss.shell_id "
-            "WHERE COALESCE(sh.is_deleted,0)=0 ORDER BY ss.shell_id")):
-        grants.setdefault(g["skill_id"], []).append(g["shell_id"])
+            "WHERE sh.flavor IS NULL AND COALESCE(sh.is_deleted,0)=0 "
+            "ORDER BY ss.shell_id")):
+        shell_grants.setdefault(g["skill_id"], []).append(g["shell_id"])
+    flavor_grants: dict[int, list] = {}
+    for g in rows(con.execute(
+            "SELECT skill_id, flavor FROM flavor_skills "
+            "ORDER BY flavor, skill_id")):
+        flavor_grants.setdefault(g["skill_id"], []).append(g["flavor"])
     for s in skills:
-        s["granted_shells"] = grants.get(s["skill_id"], [])
-    return {"skills": skills, "shells": get_shells(con)}
+        s["granted_shells"] = shell_grants.get(s["skill_id"], [])
+        s["granted_flavors"] = flavor_grants.get(s["skill_id"], [])
+    flavors = [
+        {"flavor": t["flavor"], "role": t.get("role")}
+        for t in shell_factory.flavors()
+    ]
+    return {"skills": skills, "shells": get_shells(con), "flavors": flavors}
 
 
 def known_harnesses() -> list[str]:
@@ -1202,7 +1214,19 @@ def resolve_project(con, spec):
         "AND COALESCE(is_deleted,0)=0", (spec,)).fetchone()
 
 
-def set_grant(con, sid, skill_id, granted):
+def set_grant(con, sid, skill_id, granted) -> tuple[bool, str | None]:
+    shell = con.execute(
+        "SELECT flavor FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+        (sid,)).fetchone()
+    if shell is None:
+        return False, "no such shell"
+    if shell["flavor"] is not None:
+        return False, (
+            f"shell belongs to flavor '{shell['flavor']}' — edit the flavor pack")
+    if con.execute(
+            "SELECT 1 FROM skills WHERE skill_id=? AND is_deleted=0",
+            (skill_id,)).fetchone() is None:
+        return False, "no such skill"
     if granted:
         con.execute("INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
                     "VALUES (?, ?)", (sid, skill_id))
@@ -1210,6 +1234,35 @@ def set_grant(con, sid, skill_id, granted):
         con.execute("DELETE FROM shell_skills WHERE shell_id=? AND skill_id=?",
                     (sid, skill_id))
     con.commit()
+    return True, None
+
+
+def _known_flavors(con) -> set[str]:
+    return {t["flavor"] for t in shell_factory.flavors()} | {
+        r[0] for r in con.execute(
+            "SELECT DISTINCT flavor FROM shells WHERE flavor IS NOT NULL")
+    } | {
+        r[0] for r in con.execute("SELECT DISTINCT flavor FROM flavor_skills")
+    }
+
+
+def set_flavor_grant(con, flavor, skill_id, granted) -> tuple[bool, str | None]:
+    if flavor not in _known_flavors(con):
+        return False, f"unknown flavor '{flavor}'"
+    if con.execute(
+            "SELECT 1 FROM skills WHERE skill_id=? AND is_deleted=0",
+            (skill_id,)).fetchone() is None:
+        return False, "no such skill"
+    if granted:
+        con.execute(
+            "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) VALUES (?, ?)",
+            (flavor, skill_id))
+    else:
+        con.execute(
+            "DELETE FROM flavor_skills WHERE flavor=? AND skill_id=?",
+            (flavor, skill_id))
+    con.commit()
+    return True, None
 
 
 # Whitelisted maintenance scripts runnable from the GUI. Each is a fixed argv —
@@ -2959,11 +3012,15 @@ class Handler(BaseHTTPRequestHandler):
                                   {"error": err} if err else proj)
             if path == "/api/shells":
                 body = self._body()
-                if not body.get("name") or not body.get("flavor"):
-                    return self._send(400, {"error": "name and flavor required"})
-                sid = shell_factory.create_shell(
-                    con, flavor=body["flavor"], name=body["name"],
-                    shortname=body.get("shortname"), partner=body.get("partner"))
+                if not body.get("name") or "flavor" not in body:
+                    return self._send(400, {"error": "name and shell type required"})
+                flavor = body.get("flavor") or None
+                try:
+                    sid = shell_factory.create_shell(
+                        con, flavor=flavor, name=body["name"],
+                        shortname=body.get("shortname"), partner=body.get("partner"))
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
                 con.commit()
                 sn = con.execute(
                     "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
@@ -3112,7 +3169,9 @@ class Handler(BaseHTTPRequestHandler):
             con.close()
 
     def do_PUT(self):
-        # grant toggle: PUT /api/shells/{id}/skills/{skill_id}  {granted: bool}
+        # grant toggles:
+        #   PUT /api/flavors/{flavor}/skills/{skill_id}  {granted: bool}
+        #   PUT /api/shells/{id}/skills/{skill_id}        {granted: bool}
         # vm block:     PUT /api/vm  {vm: {...}}  (persists to instance.json)
         # ts block:     PUT /api/ts  {ts: {...}}  (persists to instance.json)
         # pm2 block:    PUT /api/pm2  {pm2: {...}}  (persists to instance.json)
@@ -3120,10 +3179,19 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         con = db()
         try:
+            if len(parts) == 5 and parts[1] == "flavors" and parts[3] == "skills":
+                ok, err = set_flavor_grant(
+                    con, parts[2], int(parts[4]),
+                    bool(self._body().get("granted")))
+                return self._send(200 if ok else 404,
+                                  {"ok": ok, "error": err})
             if len(parts) == 5 and parts[1] == "shells" and parts[3] == "skills":
-                set_grant(con, int(parts[2]), int(parts[4]),
-                          bool(self._body().get("granted")))
-                return self._send(200, {"ok": True})
+                ok, err = set_grant(
+                    con, int(parts[2]), int(parts[4]),
+                    bool(self._body().get("granted")))
+                status = 200 if ok else (
+                    409 if err and "edit the flavor pack" in err else 404)
+                return self._send(status, {"ok": ok, "error": err})
             if path == "/api/vm":
                 vm = self._body().get("vm")
                 if vm is not None and not isinstance(vm, dict):
