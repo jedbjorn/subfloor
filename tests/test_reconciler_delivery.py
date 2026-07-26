@@ -221,10 +221,10 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             ),
         )
 
-    def test_confirmed_indeterminate_reading_writes_nothing(self):
+    def test_unconfirmed_indeterminate_reading_writes_nothing(self):
         emitted = pr_poller.deliver_reconciliation_readings(
             self.con,
-            [self.reading("indeterminate")],
+            [self.reading("indeterminate", confirmed=False)],
         )
         self.assertEqual([], emitted)
         self.assertEqual(
@@ -271,7 +271,11 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             body,
         )
 
-    def test_recovery_blocked_is_mapped_but_has_no_reconciler_producer(self):
+    def test_severity_contract_has_one_documented_producerless_mapping(self):
+        self.assertEqual(
+            pr_poller.ReconcilerState.ACTIONABLE | {"recovery_blocked"},
+            set(pr_poller.RECONCILER_SEVERITY),
+        )
         self.assertEqual(
             "critical",
             pr_poller.RECONCILER_SEVERITY["recovery_blocked"],

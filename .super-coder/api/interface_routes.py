@@ -2018,12 +2018,6 @@ _ALERT_COPY = {
         "exists.",
         "warning",
     ),
-    "worker_recovery_blocked": (
-        "A recovery producer reported that its attempt was refused.",
-        "Reassign or escalate the unit. Do not retry a recovery guard that "
-        "keeps refusing.",
-        "warning",
-    ),
     "reconciler_missing_binding": (
         "The reconciler recorded a sprint finding, but the sprint has never "
         "had a planner binding to receive its message.",

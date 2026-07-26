@@ -348,6 +348,12 @@ class Expectation:
 
     @property
     def key(self) -> tuple:
+        """Confirmation identity, not planner-alert identity.
+
+        The assignee is intentional here: a reassignment must earn two fresh
+        observations. Alert identity is constructed separately from immutable
+        unit_id and deliberately excludes shell_id.
+        """
         return (
             self.sprint_doc_id,
             self.unit_id,
@@ -430,8 +436,8 @@ RECONCILER_SEVERITY = {
     "checkup": "warning",
     "not_started": "warning",
     "work_complete_unreported": "info",
-    # No producer exists in the report-only reconciler. Keep the delivery
-    # contract ready for the recovery path that eventually supplies one.
+    # Mapping only: reconcile_tick cannot confirm this signal because it is
+    # deliberately absent from ReconcilerState.ACTIONABLE. No producer exists.
     "recovery_blocked": "critical",
 }
 HEALTHY_RECONCILER_SIGNALS = {"reported", "working"}
@@ -505,7 +511,7 @@ def _resolve_reconciliation_alerts(
         "UPDATE planner_alerts SET resolved_at=? "
         "WHERE sprint_doc_id=? AND unit_id IS ? AND role=? "
         "AND signal IN ('checkup','not_started',"
-        "'work_complete_unreported','recovery_blocked') "
+        "'work_complete_unreported') "
         "AND resolved_at IS NULL",
         (
             reading.observed_at.isoformat(),
@@ -569,9 +575,12 @@ def deliver_reconciliation_readings(
             )
 
         _resolve_reconciliation_alerts(con, reading)
-        severity = RECONCILER_SEVERITY.get(reading.signal)
-        if not reading.confirmed or severity is None:
+        if not reading.confirmed:
             continue
+        # ReconcilerState only confirms ACTIONABLE signals, and every one is
+        # required to have an explicit severity. Fail loudly if that contract
+        # ever drifts instead of preserving an unreachable fallback.
+        severity = RECONCILER_SEVERITY[reading.signal]
         if planner_shell_id is None:
             _open_missing_binding_alert(con, sprint_doc_id)
 
