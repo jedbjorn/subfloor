@@ -2481,9 +2481,15 @@ def _shortname(con, shell_id) -> str:
 
 def _emit_assignment_notice(con, actor, doc_id: int, seq: str,
                             before: dict, after: dict) -> int:
-    """The remainder of retired feature #29 (spec doc 58, decision #74): at
-    most three rows per assignment change, only on change, only while the
-    sprint is ACTIVE. Returns the number of rows written.
+    """The remainder of retired feature #29 (spec doc 58, decision #74): one
+    row per shell whose relationship to the unit changed, only on change, only
+    while the sprint is ACTIVE. Returns the number of rows written.
+
+    THE INVARIANT IS "AT MOST ONE ROW PER SHELL PER WRITE", not a row count.
+    The spec's "at most three" was a proxy for it and is wrong at the edge: a
+    PATCH that moves BOTH roles at once tells four shells — two vacated, two
+    arriving — and each of them exactly once. Stating the ceiling instead of
+    the invariant is what put a false number in three places at once.
 
     Called from inside the board write's own transaction, before its commit,
     so a board write that rolls back tells nobody it happened — and the
