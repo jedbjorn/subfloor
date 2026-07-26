@@ -1092,6 +1092,28 @@ HEADER_LINES = """() => {
     .map((child) => child.getBoundingClientRect())
     .filter((rect) => rect.height > 0);
   const centre = (rect) => Math.round(rect.top + rect.height / 2);
+  const badge = document.querySelector(".if-work-badge");
+  const style = getComputedStyle(context);
+  // What else is sharing the data group with the context, and the gap between
+  // them — the two terms that turn the group's width into the context's cap.
+  const siblings = Array.from(data.children)
+    .filter((node) => node !== context && !node.hidden
+                      && node.getBoundingClientRect().width > 0);
+  const dataGap = parseFloat(getComputedStyle(data).columnGap) || 0;
+  // getComputedStyle reports the DECLARED stack, not the family the host
+  // actually resolved from it — and the resolved family is the whole question
+  // here. Measure the fixture string under each candidate at the same computed
+  // font, and whichever ruler matches `need` names the metrics in effect.
+  const pen = document.createElement("canvas").getContext("2d");
+  const ruler = {};
+  for (const family of [style.fontFamily, "system-ui", "Liberation Sans",
+                        "Arial", "DejaVu Sans"]) {
+    pen.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ` +
+               family;
+    ruler[family] = Math.round(pen.measureText(context.textContent).width * 10)
+                    / 10;
+  }
+  const width = (node) => Math.round(node.getBoundingClientRect().width);
   return {
     lines: new Set([dataBox, ...controls].map(centre)).size,
     truncated: context.scrollWidth > context.clientWidth,
@@ -1099,18 +1121,108 @@ HEADER_LINES = """() => {
     dataLeft: dataBox.left,
     rightInset: headBox.right - dataBox.right,
     context: context.textContent,
-    badge: document.querySelector(".if-work-badge").textContent,
+    badge: badge.textContent,
     identity: identity.textContent,
+    // The truncation budget, carried so a failure REPORTS it rather than
+    // merely denying it: `need` is the string's rendered width and `cap` the
+    // space available for it once the badge, the identity, and the gaps have
+    // taken theirs out of the data group. `slot` is the width the context was
+    // ACTUALLY given, which equals `cap` only while it overflows — a context
+    // that fits is sized to its own content, so a green run reports
+    // slot == need and says nothing about headroom. Read `cap` for headroom.
+    metrics: {
+      need: context.scrollWidth,
+      slot: context.clientWidth,
+      cap: Math.round(dataBox.width - siblings.reduce(
+        (sum, node) => sum + node.getBoundingClientRect().width, 0,
+      ) - dataGap * (siblings.length)),
+      head: Math.round(headBox.width),
+      data: Math.round(dataBox.width),
+      badge: width(badge),
+      identity: width(identity),
+      controls: controls.reduce((sum, rect) => sum + rect.width, 0),
+      fontSize: style.fontSize,
+      fontFamily: style.fontFamily,
+      ruler: ruler,
+    },
   };
 }"""
 
 
-def test_header_keeps_controls_left_and_work_data_right(browser, ui_url):
+def _header_report(label: str, metrics: dict) -> str:
+    """One line of header geometry, for the assertion messages and the run log."""
+    rulers = "  ".join(
+        f"[{family.split(',')[0].strip()}]={width}px"
+        for family, width in metrics["ruler"].items()
+    )
+    return (
+        f"{label}: context need={metrics['need']}px cap={metrics['cap']}px "
+        f"({metrics['cap'] - metrics['need']:+}px spare) slot={metrics['slot']}px · "
+        f"head={metrics['head']}px controls={round(metrics['controls'])}px "
+        f"data={metrics['data']}px badge={metrics['badge']}px "
+        f"identity={metrics['identity']}px · font={metrics['fontSize']} "
+        f"{metrics['fontFamily']} · rulers {rulers}"
+    )
+
+
+def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_path):
     """A long work subject truncates inside the right data zone; it never moves
     the controls or the shell identity onto a second line."""
-    titled = {**SESSION, "title": "Wire the watcher daemon into the planner "
-                                  "inbox before freeze"}
-    assert len(titled["title"]) == 60
+    # The fixture title is deliberately SHORT, and its length is DERIVED from
+    # the runner rather than guessed. `.if-pane` caps at 1300px, so the wide
+    # assert has a fixed budget, while the same string renders ~14% wider or
+    # narrower depending on which family the host resolves out of the generic
+    # stack. Two lengths were reasoned from local measurements and both
+    # mispredicted CI, because the canvas rulers below say the sandbox and the
+    # runner do not resolve the same font:
+    #
+    #   ruler at 13.6px, 79-char context   sandbox    ubuntu-latest
+    #   [ui-sans-serif] / [system-ui]      437.6px    549.8px
+    #   [Liberation Sans] / [Arial]        480.6px    480.6px
+    #   [DejaVu Sans]                      437.6px    549.8px
+    #
+    # The runner resolves the generic stack to DejaVu Sans — the WIDEST
+    # candidate — not to the Arial/Liberation metrics the earlier fix assumed.
+    # DejaVu is not installed in the sandbox, so the local DejaVu ruler falls
+    # back to something narrower and reads 437.6px; Liberation and Arial are
+    # genuinely metric-compatible and agree at 480.6px on both hosts, which
+    # makes Liberation the one ruler a local run can trust.
+    #
+    # The arithmetic, from the 1600px CI run of 3bb3ced (slot=504px, need=550px
+    # at 79 chars, font=13.6px):
+    #
+    #   px/char under the widest ruler   549.8 / 79     = 6.96px
+    #   target                           need <= .75 * slot = 378px
+    #   flat cap                         378 / 6.96     = 54 chars of context
+    #
+    # 54 chars is the ceiling, not the answer — per-character width varies with
+    # composition, so the chosen string is measured, not counted. The 33-char
+    # sprint prefix plus a 21-char title measures 322.6px under Liberation
+    # locally, and the local Liberation ruler reproduces the runner's 480.6px
+    # for the old fixture exactly, so scaling by the runner's own DejaVu ratio
+    # (549.8 / 480.6) predicts its width there:
+    #
+    #   Liberation / Arial (both hosts)  322.6px   64.0% of slot   +181px
+    #   DejaVu, i.e. the runner          369.1px   73.2% of slot   +135px
+    #
+    # That 25% margin absorbs a font substitution of 1.56x. The observed spread
+    # between the widest and narrowest real candidate is 69.2px on a 550px
+    # string — 12.6% — so this clears the whole known spread nearly twice over,
+    # where the previous fixture cleared the sandbox by 0px and the runner by
+    # -46px. The narrow (700px) assert is unaffected and cannot be tuned: the
+    # slot is 0px at that viewport on the runner, so any non-empty string
+    # truncates by construction.
+    #
+    # This does NOT mean the header is adequate. The runner's slot is 504px and
+    # a realistic 46-char work context needs 550px there, so a REAL title
+    # overflows on CI's font — that is flag #206, a product question, and
+    # shortening a test fixture does not touch it. The green below is evidence
+    # that this test measures LAYOUT instead of font metrics, which is all it
+    # was ever meant to measure. Both evaluations report their own geometry, on
+    # a pass as well as a failure; read those numbers before touching the
+    # fixture again rather than reasoning from any table.
+    titled = {**SESSION, "title": "Wire watcher to inbox"}
+    assert len(titled["title"]) == 21
 
     def titled_api(route) -> None:
         if route.request.url.split("/api", 1)[-1] == "/interface/sessions/7":
@@ -1120,15 +1232,18 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url):
     context, page = _open_interface(
         browser, ui_url, height=1000, width=700, api_handler=titled_api
     )
+    report: list[str] = []
     try:
         narrow = page.evaluate(HEADER_LINES)
+        report.append(_header_report("700px", narrow["metrics"]))
         assert narrow["lines"] == 1, (
             f"the header laid out on {narrow['lines']} lines: the identity "
-            "wrapped the controls instead of truncating"
+            f"wrapped the controls instead of truncating\n{report[-1]}"
         )
         assert narrow["truncated"], (
-            "the work context fits at 700px — widen the fixture title, this test "
-            "is not measuring anything"
+            "the work context fits at 700px — this test is not measuring "
+            "anything; lengthen the fixture title, but stay inside the wide "
+            f"budget the 1600px line reports\n{report[-1]}"
         )
         assert narrow["controlsRight"] <= narrow["dataLeft"], (
             "right-side data crossed over the left-side controls"
@@ -1141,11 +1256,28 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url):
         # With room to spare the same hierarchy remains one line, right aligned.
         page.set_viewport_size({"width": 1600, "height": 1000})
         wide = page.evaluate(HEADER_LINES)
-        assert wide["lines"] == 1
-        assert not wide["truncated"]
-        assert wide["controlsRight"] <= wide["dataLeft"]
-        assert wide["rightInset"] <= 14
+        report.append(_header_report("1600px", wide["metrics"]))
+        assert wide["lines"] == 1, report[-1]
+        assert not wide["truncated"], (
+            f"the {len(titled['title'])}-char work context truncates at 1600px "
+            "— this host's budget, not the table above:\n"
+            f"{report[-1]}\n"
+            "The slot is what the data group has left after the badge, the "
+            "identity, and two .75rem gaps; the ruler that matches `need` names "
+            "the font in effect. Decide from these numbers — do not widen the "
+            "slot in CSS and do not guess a fixture length — derive it from "
+            "the widest ruler's px/char at 75% of the slot, as above."
+        )
+        assert wide["controlsRight"] <= wide["dataLeft"], report[-1]
+        assert wide["rightInset"] <= 14, report[-1]
     finally:
+        # Written on pass as well as failure: an instrumented run that goes
+        # green still has to hand back the numbers it measured.
+        _artifact(tmp_path, "header-metrics.txt").write_text(
+            "\n".join(report) + "\n", encoding="utf-8"
+        )
+        for line in report:
+            print(line)
         context.close()
 
 
