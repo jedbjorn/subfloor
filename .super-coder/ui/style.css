@@ -40,7 +40,7 @@ h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: .2px; flex
 h1 span { color: var(--dim); font-weight: 400; }
 h1 span::before { content: " / "; color: var(--line); }
 nav { display: flex; gap: 1.1rem; align-items: center; align-self: stretch; }
-.navsep { width: 1px; height: 1.1rem; background: var(--line); margin: 0 .2rem; }
+.navsep { width: 2px; height: 1.75rem; background: var(--line); margin: 0 .2rem; }
 nav button {
   background: none; border: none; color: rgba(255,255,255,.40); position: relative;
   padding: 0 .15rem; cursor: pointer; font: inherit; font-size: 11px;
