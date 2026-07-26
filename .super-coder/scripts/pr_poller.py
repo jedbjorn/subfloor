@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
-from sprint_units import TERMINAL_UNIT_STATES
+from sprint_units import TERMINAL_UNIT_STATES, board_writer
 
 CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
 
@@ -424,6 +424,147 @@ class ReconcilerState:
             for key, signal in self._previous.items()
             if key in keys
         }
+
+
+RECONCILER_SEVERITY = {
+    "checkup": "warning",
+    "not_started": "warning",
+    "work_complete_unreported": "info",
+    # No producer exists in the report-only reconciler. Keep the delivery
+    # contract ready for the recovery path that eventually supplies one.
+    "recovery_blocked": "critical",
+}
+
+
+def _open_reconciliation_alert(
+    con,
+    reading: ReconciliationReading,
+    severity: str,
+) -> "int | None":
+    expectation = reading.expectation
+    dedupe_key = (
+        f"reconciler|{expectation.sprint_doc_id}|{expectation.seq or '-'}|"
+        f"{expectation.role}|{reading.signal}"
+    )
+    opened_at = reading.observed_at.isoformat()
+    cursor = con.execute(
+        "INSERT OR IGNORE INTO planner_alerts "
+        "(sprint_doc_id, seq, role, signal, shell_id, severity, reason, "
+        " dedupe_key, opened_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            expectation.sprint_doc_id,
+            expectation.seq,
+            expectation.role,
+            reading.signal,
+            expectation.shell_id,
+            severity,
+            f"worker_{reading.signal}",
+            dedupe_key,
+            opened_at,
+        ),
+    )
+    return cursor.lastrowid if cursor.rowcount == 1 else None
+
+
+def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
+    con.execute(
+        "INSERT OR IGNORE INTO planner_alerts "
+        "(sprint_doc_id, severity, reason, dedupe_key) "
+        "VALUES (?, 'warning', 'reconciler_missing_binding', ?)",
+        (
+            sprint_doc_id,
+            f"reconciler|{sprint_doc_id}|-|-|missing_binding",
+        ),
+    )
+
+
+def _reconciliation_body(reading: ReconciliationReading) -> str:
+    expectation = reading.expectation
+    shell = _row(expectation.shell, "shortname", expectation.shell_id)
+    measurement = json.dumps(
+        reading.measurement,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    body = (
+        f"reconciler unit={expectation.seq or '-'} role={expectation.role} "
+        f"shell={shell} signal={reading.signal} measurement={measurement} "
+        f"observed_at={reading.observed_at.isoformat()}"
+    )
+    if reading.explanation is not None:
+        body += " explanation=" + json.dumps(
+            reading.explanation,
+            ensure_ascii=False,
+        )
+    return body
+
+
+def deliver_reconciliation_readings(
+    con,
+    readings: "list[ReconciliationReading]",
+) -> list[int]:
+    """Record confirmed findings and push each newly-opened one to its planner.
+
+    The structured alert is the unconditional record. A message is only the
+    push layer and therefore exists only when the sprint has a historical
+    binding whose planner can be addressed. This function consumes U4's
+    rendered fields and never inspects Evidence or classifies a reading.
+
+    The caller owns the transaction. Returning message ids lets it notify the
+    wake coordinator only after the tick and its heartbeat commit together.
+    """
+    emitted: list[int] = []
+    writers: dict[int, "int | None"] = {}
+    for reading in readings:
+        severity = RECONCILER_SEVERITY.get(reading.signal)
+        if not reading.confirmed or severity is None:
+            continue
+
+        sprint_doc_id = reading.expectation.sprint_doc_id
+        if sprint_doc_id not in writers:
+            writers[sprint_doc_id] = board_writer(con, sprint_doc_id)
+        planner_shell_id = writers[sprint_doc_id]
+        if planner_shell_id is None:
+            _open_missing_binding_alert(con, sprint_doc_id)
+
+        alert_id = _open_reconciliation_alert(con, reading, severity)
+        if alert_id is None or planner_shell_id is None:
+            continue
+
+        message_id = con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id, to_shell_id, body, kind, sprint_doc_id, "
+            " dedupe_key) VALUES (?,?,?,'pr_event',?,?)",
+            (
+                planner_shell_id,
+                planner_shell_id,
+                _reconciliation_body(reading),
+                sprint_doc_id,
+                f"reconciler-alert|{alert_id}",
+            ),
+        ).lastrowid
+        binding = con.execute(
+            "SELECT binding_id FROM sprint_planner_bindings "
+            "WHERE sprint_doc_id=? AND planner_shell_id=? "
+            "AND released_at IS NULL ORDER BY binding_id DESC LIMIT 1",
+            (sprint_doc_id, planner_shell_id),
+        ).fetchone()
+        binding_id = binding[0] if binding is not None else None
+        con.execute(
+            "UPDATE planner_alerts SET message_id=?, binding_id=? "
+            "WHERE alert_id=?",
+            (message_id, binding_id, alert_id),
+        )
+        if binding_id is not None:
+            con.execute(
+                "INSERT OR IGNORE INTO planner_wake_items "
+                "(binding_id, message_id) VALUES (?,?)",
+                (binding_id, message_id),
+            )
+        emitted.append(message_id)
+    return emitted
 
 
 def live_expectations(con) -> list[Expectation]:
@@ -903,6 +1044,15 @@ class Poller(threading.Thread):
                             refresh=self._refresh,
                             state=self.reconciler_state,
                         )
+                        emitted = deliver_reconciliation_readings(
+                            con,
+                            self.last_reconciliation,
+                        )
+                        con.commit()
+                        if emitted:
+                            import interface_wake
+                            for message_id in emitted:
+                                interface_wake.notify_message(message_id)
                         self._reconcile_due = (
                             monotonic_now + self._reconcile_interval
                         )
