@@ -56,7 +56,7 @@ def read_db(path: Path) -> str:
 
 
 class HalfFloorRollbackTest(unittest.TestCase):
-    def test_path_resolution_fallbacks_only_under_delete_rollback_delta(self):
+    def test_current_subset_and_previous_superset_fallbacks_reduce_delta(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
             scripts = root / ".super-coder" / "scripts"
@@ -242,6 +242,9 @@ class HalfFloorRollbackTest(unittest.TestCase):
             (scripts / "engine_manifest.py").write_text(
                 "ENGINE_PATHS = load_paths()\n"
             )
+            new_path = engine / "new-path" / "new-only.txt"
+            new_path.parent.mkdir()
+            new_path.write_text("new upstream file\n")
             git(root, "add", ".")
             git(root, "commit", "-m", "new unparseable floor")
             new_sha = git(root, "rev-parse", "HEAD")
@@ -253,6 +256,7 @@ class HalfFloorRollbackTest(unittest.TestCase):
                 "sc",
                 ".super-coder/scripts",
                 ".super-coder/fork-area",
+                ".super-coder/new-path",
             ]
             with mock.patch.multiple(
                 rollback,
@@ -276,6 +280,11 @@ class HalfFloorRollbackTest(unittest.TestCase):
                 b"fork sentinel bytes\n",
                 "a broader installed fallback must not turn tracked fork "
                 "content into a rollback deletion candidate",
+            )
+            self.assertFalse(
+                new_path.exists(),
+                "the installed fallback authority must retain a current-ref "
+                "addition in the rollback deletion candidate set",
             )
             self.assertEqual(engine_ref.read_text(), old_sha + "\n")
 
