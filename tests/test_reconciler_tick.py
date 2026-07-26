@@ -53,7 +53,8 @@ def build_db() -> sqlite3.Connection:
         VALUES
           (1, 'Dev', 'DEV1', 'dev', 'x', 1),
           (2, 'Reviewer', 'REV1', 'reviewer', 'x', 1),
-          (3, 'Planner', 'PLN1', 'planner', 'x', 1);
+          (3, 'Planner', 'PLN1', 'planner', 'x', 1),
+          (4, 'Planner 2', 'PLN2', 'planner', 'x', 1);
         """
     )
     return con
@@ -92,6 +93,31 @@ def add_unit(
             branch,
             STATE_CLOCK.isoformat(),
         ),
+    )
+    con.commit()
+
+
+def add_binding(
+    con: sqlite3.Connection,
+    *,
+    doc_id: int = 59,
+    planner: int = 3,
+    generation: int = 1,
+    released_at: str | None = None,
+) -> None:
+    con.execute(
+        "INSERT INTO interface_generations (shell_id, generation) VALUES (?, ?)",
+        (planner, generation),
+    )
+    session_id = con.execute(
+        "INSERT INTO interface_sessions (shell_id, generation) VALUES (?, ?)",
+        (planner, generation),
+    ).lastrowid
+    con.execute(
+        "INSERT INTO sprint_planner_bindings "
+        "(sprint_doc_id, planner_shell_id, session_id, shell_id, generation, "
+        " released_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (doc_id, planner, session_id, planner, generation, released_at),
     )
     con.commit()
 
@@ -135,6 +161,20 @@ class ClassificationPrecedenceTest(unittest.TestCase):
             unreadable=[ar.UNTIMED_DELETE_RENAME],
         )
         self.assertEqual("checkup", pr_poller.classify(item, NOW))
+
+    def test_live_session_with_durable_write_is_not_complete(self):
+        durable = EPOCH + timedelta(minutes=1)
+        self.assertEqual(
+            "checkup",
+            pr_poller.classify(
+                evidence(
+                    process_present=True,
+                    session_ended_at=None,
+                    last_durable_write_at=durable,
+                ),
+                NOW,
+            ),
+        )
 
     def test_session_over_has_two_routes_and_uses_the_boot_clock(self):
         durable = EPOCH + timedelta(minutes=1)
@@ -235,6 +275,14 @@ class TickTest(unittest.TestCase):
         self.assertEqual(["dev", "reviewer"], [
             reading.expectation.role for reading in readings
         ])
+        for reading in readings:
+            self.assertEqual(NOW, reading.observed_at)
+            self.assertIsNone(reading.explanation)
+            self.assertEqual(EPOCH.isoformat(), reading.measurement["epoch"])
+            self.assertEqual(
+                int(pr_poller.NO_PROGRESS_WINDOW.total_seconds()),
+                reading.measurement["window_seconds"],
+            )
         self.assertEqual(
             0,
             self.con.execute("SELECT COUNT(*) FROM watched_prs").fetchone()[0],
@@ -265,6 +313,27 @@ class TickTest(unittest.TestCase):
             state=sprint_units.TERMINAL_UNIT_STATES[0],
         )
         self.assertEqual([], pr_poller.live_expectations(self.con))
+
+    def test_latest_planner_binding_emits_the_rowless_planner_expectation(self):
+        add_unit(self.con)
+        add_binding(
+            self.con,
+            planner=3,
+            released_at=(NOW - timedelta(minutes=1)).isoformat(),
+        )
+        add_binding(self.con, planner=4)
+
+        planners = [
+            expectation
+            for expectation in pr_poller.live_expectations(self.con)
+            if expectation.role == "planner"
+        ]
+
+        self.assertEqual(1, len(planners))
+        self.assertEqual(4, planners[0].shell_id)
+        self.assertEqual("PLN2", planners[0].shell["shortname"])
+        self.assertIsNone(planners[0].unit_id)
+        self.assertIsNone(planners[0].unit)
 
     def test_every_nonterminal_schema_state_remains_a_live_expectation(self):
         for offset, state in enumerate(

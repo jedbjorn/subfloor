@@ -365,6 +365,35 @@ class ReconciliationReading:
     signal: str
     confirmed: bool
     evidence: activity_readers.Evidence
+    measurement: dict[str, object]
+    observed_at: datetime
+    explanation: "str | None"
+
+
+def _measurement(evidence: activity_readers.Evidence) -> dict[str, object]:
+    """Copy classification inputs across the U4/U5 boundary in renderable form."""
+
+    def stamp(value):
+        parsed = _utc(value)
+        return parsed.isoformat() if parsed is not None else None
+
+    return {
+        "epoch": stamp(evidence.epoch),
+        "state_changed_at": stamp(evidence.state_changed_at),
+        "last_result_row_at": stamp(evidence.last_result_row_at),
+        "last_work_at": stamp(evidence.last_work_at),
+        "last_durable_write_at": stamp(evidence.last_durable_write_at),
+        "session_ended_at": stamp(evidence.session_ended_at),
+        "process_present": evidence.process_present,
+        "edits_code": evidence.edits_code,
+        "branch_declared": evidence.branch_declared,
+        "branch_present": evidence.branch_present,
+        "dirty": evidence.dirty,
+        "commits_since_epoch": evidence.commits_since_epoch,
+        "unreadable": tuple(evidence.unreadable),
+        "window_seconds": int(NO_PROGRESS_WINDOW.total_seconds()),
+        "grace_seconds": int(START_GRACE.total_seconds()),
+    }
 
 
 class ReconcilerState:
@@ -550,6 +579,9 @@ def reconcile_tick(
                 signal=signal,
                 confirmed=state.observe(expectation.key, signal),
                 evidence=evidence,
+                measurement=_measurement(evidence),
+                observed_at=current,
+                explanation=None,
             )
         )
     state.retain(seen)
