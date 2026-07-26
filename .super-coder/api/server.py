@@ -86,6 +86,7 @@ import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin ru
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
+from sprint_units import UNIT_COLUMNS as _SPRINT_UNIT_COLUMNS  # noqa: E402
 from sprint_units import UNIT_STATES  # noqa: E402
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
@@ -576,14 +577,6 @@ def get_docs(con) -> dict:
         "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
 
 
-_SPRINT_UNIT_COLUMNS = (
-    "unit_id", "sprint_doc_id", "seq", "unit_title", "dev_shell_id",
-    "reviewer_shell_id", "state", "depends_on", "overlap", "branch",
-    "pr_number", "assigned_at", "state_changed_at", "updated_at",
-    "updated_by_shell_id",
-)
-
-
 def get_active_sprints(con) -> dict:
     """Build the active-sprint board from one consistent read snapshot.
 
@@ -598,7 +591,11 @@ def get_active_sprints(con) -> dict:
         ") "
         "SELECT "
         "d.document_id, d.title AS sprint_title, "
-        "strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) AS started_at, "
+        # SQLite also parses relative clocks and bare Julian days. The shape
+        # gate keeps those fabricated/non-ISO values out of the response.
+        "CASE WHEN d.created_at LIKE '____-__-__%' "
+        "  THEN strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) "
+        "  ELSE NULL END AS started_at, "
         "d.feature_id, feature.title AS feature_title, "
         "binding.planner_shell_id, planner.shortname AS planner_shortname, "
         "unit.unit_id AS unit_unit_id, "
@@ -630,8 +627,11 @@ def get_active_sprints(con) -> dict:
         "  ON reviewer.shell_id=unit.reviewer_shell_id "
         "WHERE d.kind='doc' AND d.frozen=0 "
         "  AND d.title LIKE 'SPRINT:%' "
-        "ORDER BY started_at IS NULL, started_at, d.document_id, "
-        "  CASE WHEN unit.unit_id IS NULL THEN 0 ELSE 1 END, "
+        # The parser check is separate from the shape gate: either failure
+        # makes the timestamp corrupt, sorted after every valid instant.
+        "ORDER BY CASE WHEN d.created_at LIKE '____-__-__%' "
+        "    AND strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) IS NOT NULL "
+        "  THEN 0 ELSE 1 END, started_at, d.document_id, "
         "  LENGTH(unit.seq), unit.seq"
     ))
 
@@ -644,6 +644,8 @@ def get_active_sprints(con) -> dict:
             planner_id = row["planner_shell_id"]
             feature_id = row["feature_id"]
             title = row["sprint_title"]
+            # The active-title predicate guarantees a non-NULL matching title;
+            # the only reachable fallback is an empty/whitespace remainder.
             if not title[len("SPRINT:"):].strip():
                 title = f"Sprint #{document_id}"
             sprint = {
@@ -669,10 +671,7 @@ def get_active_sprints(con) -> dict:
             column: row[f"unit_{column}"]
             for column in _SPRINT_UNIT_COLUMNS
         }
-        if unit["state"] not in UNIT_STATES:
-            raise ValueError(
-                f"unknown sprint unit state {unit['state']!r} "
-                f"for unit {unit['unit_id']}")
+        unit["state_recognized"] = unit["state"] in UNIT_STATES
         unit["dev_shortname"] = row["dev_shortname"]
         unit["reviewer_shortname"] = row["reviewer_shortname"]
         sprint["units"].append(unit)

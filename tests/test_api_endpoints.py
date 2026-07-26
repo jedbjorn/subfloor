@@ -35,6 +35,8 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (server.py adds scripts/ to the path on import)
+import interface_routes  # noqa: E402
+import sprint_units  # noqa: E402
 
 
 def build_db() -> sqlite3.Connection:
@@ -297,14 +299,36 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
 
         self.assertEqual(sprint["title"], f"Sprint #{doc_id}")
 
-    def test_kind_and_title_are_structural_predicate_operands(self) -> None:
+    def test_whitespace_title_remainder_uses_document_id_fallback(self) -> None:
+        doc_id = self._doc("SPRINT:   ")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+
+        sprint = server.get_active_sprints(self.con)["sprints"][0]
+
+        self.assertEqual(sprint["title"], f"Sprint #{doc_id}")
+
+    def test_kind_is_an_independent_structural_predicate_operand(self) -> None:
         active_id = self._doc("SPRINT: Active")
         self._unit(active_id, "U1")
         self._doc("SPRINT: Spec is not a sprint doc", kind="spec")
+        self.con.commit()
+
+        self.assertEqual(self._projected_ids(), [active_id])
+
+    def test_title_is_an_independent_structural_predicate_operand(self) -> None:
+        active_id = self._doc("SPRINT: Active")
+        self._unit(active_id, "U1")
         self._doc("Ordinary document")
         self.con.commit()
 
         self.assertEqual(self._projected_ids(), [active_id])
+
+    def test_sprint_unit_columns_match_interface_projection(self) -> None:
+        self.assertIs(server._SPRINT_UNIT_COLUMNS, sprint_units.UNIT_COLUMNS)
+        self.assertEqual(
+            sprint_units.UNIT_COLUMNS,
+            interface_routes._UNIT_COLS)
 
     def test_orders_sprints_and_units_and_projects_full_unit_shape(self) -> None:
         later = self._doc(
@@ -321,6 +345,7 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
 
         out = server.get_active_sprints(self.con)
 
+        self.assertEqual(out["active_count"], 2)
         self.assertEqual(
             [s["document_id"] for s in out["sprints"]], [earlier, later])
         sprint = out["sprints"][0]
@@ -334,29 +359,53 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
             ["U1", "U2", "U-H", "U10"])
         self.assertEqual(set(sprint["units"][0]), {
             *server._SPRINT_UNIT_COLUMNS,
-            "dev_shortname", "reviewer_shortname",
+            "state_recognized", "dev_shortname", "reviewer_shortname",
         })
+        self.assertTrue(sprint["units"][0]["state_recognized"])
         self.assertEqual(sprint["units"][0]["dev_shortname"], "DEV")
         self.assertEqual(sprint["units"][0]["reviewer_shortname"], "REV")
 
-    def test_missing_metadata_is_explicit_and_corrupt_time_is_null(self) -> None:
+    def test_missing_metadata_is_explicit(self) -> None:
+        doc_id = self._doc("SPRINT: Missing metadata")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+
+        sprint = server.get_active_sprints(self.con)["sprints"][0]
+
+        self.assertIsNone(sprint["planner"])
+        self.assertIsNone(sprint["feature"])
+
+    def test_time_shape_gate_rejects_sqlite_relative_clock(self) -> None:
         valid_id = self._doc(
             "SPRINT: Valid time", created_at="2026-07-26 13:00:00")
         self._unit(valid_id, "U1")
         corrupt_id = self._doc(
-            "SPRINT: Missing metadata", created_at="not-a-time")
+            "SPRINT: Relative clock", created_at="now")
         self._unit(corrupt_id, "U1")
         self.con.commit()
 
         out = server.get_active_sprints(self.con)
-        sprint = out["sprints"][1]
 
         self.assertEqual(
             [s["document_id"] for s in out["sprints"]],
             [valid_id, corrupt_id])
-        self.assertIsNone(sprint["started_at"])
-        self.assertIsNone(sprint["planner"])
-        self.assertIsNone(sprint["feature"])
+        self.assertIsNone(out["sprints"][1]["started_at"])
+
+    def test_time_parser_gate_rejects_shaped_invalid_timestamp(self) -> None:
+        valid_id = self._doc(
+            "SPRINT: Valid time", created_at="2026-07-26 13:00:00")
+        self._unit(valid_id, "U1")
+        corrupt_id = self._doc(
+            "SPRINT: Invalid calendar", created_at="2026-99-99")
+        self._unit(corrupt_id, "U1")
+        self.con.commit()
+
+        out = server.get_active_sprints(self.con)
+
+        self.assertEqual(
+            [s["document_id"] for s in out["sprints"]],
+            [valid_id, corrupt_id])
+        self.assertIsNone(out["sprints"][1]["started_at"])
 
     def test_unassigned_unit_roles_remain_explicit(self) -> None:
         doc_id = self._doc("SPRINT: Unassigned")
@@ -373,17 +422,40 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
         self.assertIsNone(unit["reviewer_shell_id"])
         self.assertIsNone(unit["reviewer_shortname"])
 
-    def test_unknown_unit_state_fails_the_projection(self) -> None:
-        doc_id = self._doc("SPRINT: Corrupt state")
+    def test_unknown_unit_state_degrades_only_its_unit(self) -> None:
+        corrupt_doc_id = self._doc("SPRINT: Corrupt state")
+        healthy_doc_id = self._doc("SPRINT: Healthy board")
+        self._unit(corrupt_doc_id, "U1", state="working")
+        self._unit(healthy_doc_id, "U1", state="in_review")
         self.con.execute("PRAGMA ignore_check_constraints=ON")
         self.con.execute(
             "INSERT INTO sprint_units "
             "(sprint_doc_id, seq, unit_title, state) "
-            "VALUES (?, 'U1', 'Corrupt unit', 'mystery')", (doc_id,))
+            "VALUES (?, 'U2', 'Corrupt unit', 'mystery')",
+            (corrupt_doc_id,))
         self.con.commit()
+        self.con.execute("PRAGMA ignore_check_constraints=OFF")
+        proxy = mock.Mock(wraps=self.con)
+        proxy.close.return_value = None
 
-        with self.assertRaisesRegex(ValueError, "unknown sprint unit state"):
-            server.get_active_sprints(self.con)
+        with mock.patch.object(server, "db", return_value=proxy):
+            status, _headers, body = server.dispatch_http(
+                "GET", "/api/sprints?status=active", "", b"")
+        out = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(out["active_count"], 2)
+        self.assertEqual(
+            [sprint["document_id"] for sprint in out["sprints"]],
+            [corrupt_doc_id, healthy_doc_id])
+        self.assertEqual(
+            [(unit["state"], unit["state_recognized"])
+             for unit in out["sprints"][0]["units"]],
+            [("working", True), ("mystery", False)])
+        self.assertEqual(
+            [(unit["state"], unit["state_recognized"])
+             for unit in out["sprints"][1]["units"]],
+            [("in_review", True)])
 
     def test_projection_is_one_snapshot_and_never_reads_document_body(self) -> None:
         doc_id = self._doc("SPRINT: Snapshot", body="status: CLOSED")
