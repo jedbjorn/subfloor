@@ -88,6 +88,11 @@ PER_INSTANCE_TABLES = [
     "interface_generations",
     "interface_sessions",
     "interface_input_state",
+    # Ordinary mutation idempotency survives rebuild, but credential-producing
+    # responses do not: acquire_lease carries the raw writer bearer and
+    # mint_ticket carries a single-use stream credential. Their backing
+    # runtime state is deliberately not serialized, so replaying either after
+    # rebuild would return a dead credential as well as leak it to git.
     "interface_idempotency_keys",
     "sprint_planner_bindings",
     "planner_wake_batches",
@@ -180,6 +185,9 @@ SNAPSHOT_ROW_FILTERS = {
     "interface_input_state":
         "WHERE delivery='delivery_unknown' "
         "AND " + _serialized_session("interface_input_state.session_id"),
+    "interface_idempotency_keys":
+        "WHERE expires_at > datetime('now') "
+        "AND operation NOT IN ('acquire_lease','mint_ticket')",
     "sprint_planner_bindings":
         "WHERE " + _serialized_binding(
             "sprint_planner_bindings.binding_id"),

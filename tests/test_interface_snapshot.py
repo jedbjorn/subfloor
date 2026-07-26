@@ -38,6 +38,8 @@ import snapshot  # noqa: E402
 
 SECRET_SOCKET = "/run/sc/SECRET-tmux-socket-0700"
 SECRET_HOOK_HASH = "hookhash_SECRET_must_not_ship_to_git_00000000"
+SECRET_LEASE_TOKEN = "lease_SECRET_must_not_ship_to_git_000000000000000"
+SECRET_STREAM_TICKET = "ticket_SECRET_must_not_ship_to_git_1111111111111"
 
 
 def build_engine_db(path: Path) -> None:
@@ -161,6 +163,25 @@ class InterfaceSnapshotTest(unittest.TestCase):
             " idem_key, request_hash, expires_at) "
             "VALUES ('operator','sessions.create','k','h','2030-01-01')")
         self.con.execute(
+            "INSERT INTO interface_idempotency_keys (actor_scope, operation,"
+            " idem_key, request_hash, response_status, response_resource,"
+            " expires_at) VALUES ('browser:one','acquire_lease','lease','h',"
+            "201,?, '2030-01-01')",
+            (json.dumps({"lease_id": 1, "lease_token": SECRET_LEASE_TOKEN,
+                         "next_input_seq": 1}),))
+        self.con.execute(
+            "INSERT INTO interface_idempotency_keys (actor_scope, operation,"
+            " idem_key, request_hash, response_status, response_resource,"
+            " expires_at) VALUES ('browser:one','mint_ticket','ticket','h',"
+            "201,?, '2030-01-01')",
+            (json.dumps({"ticket": SECRET_STREAM_TICKET,
+                         "expires_in": 60}),))
+        self.con.execute(
+            "INSERT INTO interface_idempotency_keys (actor_scope, operation,"
+            " idem_key, request_hash, response_status, response_resource,"
+            " expires_at) VALUES ('operator','certify_clean','expired','h',"
+            "200,'{}', '2000-01-01')")
+        self.con.execute(
             "INSERT INTO planner_alerts (severity, reason, dedupe_key) "
             "VALUES ('critical','crash','-|-|crash')")
         self.con.execute(
@@ -270,6 +291,17 @@ class InterfaceSnapshotTest(unittest.TestCase):
         self.assertIn("'k1'", self._dump("planner_action_receipts"))
         self.assertIn("'operator'", self._dump("interface_idempotency_keys"))
         self.assertIn("'crash'", self._dump("planner_alerts"))
+
+    def test_credential_and_expired_idempotency_rows_are_not_snapshotted(self):
+        out = self._dump("interface_idempotency_keys")
+        self.assertIn("'sessions.create'", out,
+                      "ordinary unexpired retry record was dropped")
+        self.assertNotIn("'acquire_lease'", out)
+        self.assertNotIn("'mint_ticket'", out)
+        self.assertNotIn("'certify_clean'", out,
+                         "expired retry record reached the snapshot")
+        self.assertNotIn(SECRET_LEASE_TOKEN, out)
+        self.assertNotIn(SECRET_STREAM_TICKET, out)
 
     def test_alerts_require_every_referenced_parent_in_projection(self):
         out = self._dump("planner_alerts")
