@@ -2007,7 +2007,7 @@ def _alert_projection(row) -> dict:
     cols = (
         "alert_id", "session_id", "binding_id", "message_id", "watch_id",
         "severity", "reason", "opened_at", "resolved_at", "acknowledged_at",
-        "acknowledged_by", "sprint_doc_id", "seq", "role", "signal",
+        "acknowledged_by", "sprint_doc_id", "unit_id", "role", "signal",
         "shell_id", "generation",
     )
     alert = dict(zip(cols, row))
@@ -2050,7 +2050,7 @@ def _sprint_alerts(actor, query: dict):
         "SELECT a.alert_id, a.session_id, a.binding_id, a.message_id, "
         "a.watch_id, a.severity, a.reason, a.opened_at, a.resolved_at, "
         "a.acknowledged_at, a.acknowledged_by, "
-        "a.sprint_doc_id, a.seq, a.role, a.signal, "
+        "a.sprint_doc_id, a.unit_id, a.role, a.signal, "
         "COALESCE(a.shell_id, s.shell_id, b.shell_id), "
         "COALESCE(s.generation, b.generation) "
         "FROM planner_alerts a "

@@ -320,12 +320,18 @@ class SprintOpsRoutesTest(unittest.TestCase):
     def test_structured_reconciler_alert_is_sprint_scoped_and_filterable(self):
         self.arm()
         con = sqlite3.connect(self.db_path)
+        unit_id = con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state, dev_shell_id) "
+            "VALUES (1, 'U5', 'delivery', 'working', 2)"
+        ).lastrowid
         con.execute(
             "INSERT INTO planner_alerts "
-            "(sprint_doc_id, seq, role, signal, shell_id, severity, reason, "
+            "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
             " dedupe_key) "
-            "VALUES (1, 'U5', 'dev', 'checkup', 2, 'warning', "
-            "        'worker_checkup', 'reconciler|1|U5|dev|checkup')"
+            "VALUES (1, ?, 'dev', 'checkup', 2, 'warning', "
+            "        'worker_checkup', ?)",
+            (unit_id, f"reconciler|1|{unit_id}|dev|checkup"),
         )
         con.commit()
         con.close()
@@ -339,10 +345,10 @@ class SprintOpsRoutesTest(unittest.TestCase):
         self.assertEqual(1, len(body["alerts"]))
         alert = body["alerts"][0]
         self.assertEqual(
-            (1, "U5", "dev", "checkup", 2),
+            (1, unit_id, "dev", "checkup", 2),
             (
                 alert["sprint_doc_id"],
-                alert["seq"],
+                alert["unit_id"],
                 alert["role"],
                 alert["signal"],
                 alert["shell_id"],

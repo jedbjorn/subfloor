@@ -11,7 +11,7 @@ BEGIN;
 ALTER TABLE planner_alerts
     ADD COLUMN sprint_doc_id INTEGER REFERENCES documents(document_id);
 ALTER TABLE planner_alerts
-    ADD COLUMN seq TEXT;
+    ADD COLUMN unit_id INTEGER REFERENCES sprint_units(unit_id);
 ALTER TABLE planner_alerts
     ADD COLUMN role TEXT CHECK (role IN ('dev', 'reviewer', 'planner'));
 ALTER TABLE planner_alerts
@@ -20,6 +20,6 @@ ALTER TABLE planner_alerts
     ADD COLUMN shell_id INTEGER REFERENCES shells(shell_id);
 
 CREATE INDEX IF NOT EXISTS idx_planner_alerts_reconciliation
-    ON planner_alerts(sprint_doc_id, seq, role, signal, resolved_at);
+    ON planner_alerts(sprint_doc_id, unit_id, role, signal, resolved_at);
 
 COMMIT;

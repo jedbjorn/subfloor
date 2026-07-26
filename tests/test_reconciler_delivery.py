@@ -34,7 +34,8 @@ def build_db() -> sqlite3.Connection:
         VALUES
           (1, 'Planner 1', 'PLN1', 'planner', 'x', 1),
           (2, 'Developer 1', 'DEV1', 'dev', 'x', 1),
-          (3, 'Planner 2', 'PLN2', 'planner', 'x', 1);
+          (3, 'Planner 2', 'PLN2', 'planner', 'x', 1),
+          (4, 'Developer 2', 'DEV2', 'dev', 'x', 1);
         """
     )
     return con
@@ -102,17 +103,19 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         doc_id: int = 59,
         seq: str = "U5",
         unit: sqlite3.Row | None = None,
+        shell_id: int = 2,
     ) -> pr_poller.Expectation:
         unit = unit if unit is not None else self.unit
         shell = self.con.execute(
-            "SELECT * FROM shells WHERE shell_id=2"
+            "SELECT * FROM shells WHERE shell_id=?",
+            (shell_id,),
         ).fetchone()
         return pr_poller.Expectation(
             sprint_doc_id=doc_id,
             unit_id=unit["unit_id"],
             seq=seq,
             role="dev",
-            shell_id=2,
+            shell_id=shell_id,
             shell=shell,
             unit=unit,
         )
@@ -149,14 +152,14 @@ class ReconcilerDeliveryTest(unittest.TestCase):
 
         self.assertEqual(1, len(emitted))
         alert = self.con.execute(
-            "SELECT sprint_doc_id, seq, role, signal, shell_id, severity, "
+            "SELECT sprint_doc_id, unit_id, role, signal, shell_id, severity, "
             "reason, opened_at, resolved_at, message_id "
             "FROM planner_alerts"
         ).fetchone()
         self.assertEqual(
             (
                 59,
-                "U5",
+                self.unit["unit_id"],
                 "dev",
                 "checkup",
                 2,
@@ -235,23 +238,18 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_severity_map_and_recovery_explanation_are_exact(self):
+    def test_emitted_severity_map_and_explanation_are_exact(self):
         readings = [
-            self.reading("checkup"),
+            self.reading("checkup", explanation="quota resets at 01:00Z"),
             self.reading("not_started"),
             self.reading("work_complete_unreported"),
-            self.reading(
-                "recovery_blocked",
-                explanation="boot refused: shell occupied",
-            ),
         ]
         emitted = pr_poller.deliver_reconciliation_readings(self.con, readings)
-        self.assertEqual(4, len(emitted))
+        self.assertEqual(3, len(emitted))
         self.assertEqual(
             [
                 ("checkup", "warning"),
                 ("not_started", "warning"),
-                ("recovery_blocked", "critical"),
                 ("work_complete_unreported", "info"),
             ],
             [
@@ -264,11 +262,21 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         )
         body = self.con.execute(
             "SELECT body FROM shell_messages "
-            "WHERE body LIKE '%signal=recovery_blocked%'"
+            "WHERE body LIKE '%signal=checkup%'"
         ).fetchone()[0]
         self.assertIn(
-            'explanation="boot refused: shell occupied"',
+            'explanation="quota resets at 01:00Z"',
             body,
+        )
+
+    def test_recovery_blocked_is_mapped_but_has_no_reconciler_producer(self):
+        self.assertEqual(
+            "critical",
+            pr_poller.RECONCILER_SEVERITY["recovery_blocked"],
+        )
+        self.assertNotIn(
+            "recovery_blocked",
+            pr_poller.ReconcilerState.ACTIONABLE,
         )
 
     def test_open_dedupe_healthy_resolve_and_rearm_are_one_lifecycle(self):
@@ -341,6 +349,78 @@ class ReconcilerDeliveryTest(unittest.TestCase):
                 "SELECT resolved_at FROM planner_alerts "
                 "WHERE signal='not_started'"
             ).fetchone()[0],
+        )
+
+    def test_unitless_expectation_dedupes_on_an_explicit_key_sentinel(self):
+        planner = self.con.execute(
+            "SELECT * FROM shells WHERE shell_id=1"
+        ).fetchone()
+        expectation = pr_poller.Expectation(
+            sprint_doc_id=59,
+            unit_id=None,
+            seq=None,
+            role="planner",
+            shell_id=1,
+            shell=planner,
+            unit=None,
+        )
+        reading = self.reading("checkup", expectation=expectation)
+
+        first = pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [reading],
+        )
+        replay = pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [reading],
+        )
+
+        self.assertEqual(1, len(first))
+        self.assertEqual([], replay)
+        row = self.con.execute(
+            "SELECT unit_id, dedupe_key, shell_id FROM planner_alerts "
+            "WHERE role='planner'"
+        ).fetchone()
+        self.assertEqual(
+            (None, "reconciler|59|-|planner|checkup", 1),
+            tuple(row),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM shell_messages "
+                "WHERE sprint_doc_id=59 AND body LIKE '%role=planner%'"
+            ).fetchone()[0],
+        )
+
+    def test_role_reassignment_does_not_change_the_open_alert_key(self):
+        first = self.reading(
+            "checkup",
+            expectation=self.expectation(shell_id=2),
+        )
+        reassigned = self.reading(
+            "checkup",
+            expectation=self.expectation(shell_id=4),
+        )
+
+        first_ids = pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [first],
+        )
+        reassigned_ids = pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [reassigned],
+        )
+
+        self.assertEqual(1, len(first_ids))
+        self.assertEqual([], reassigned_ids)
+        rows = self.con.execute(
+            "SELECT unit_id, role, signal, shell_id FROM planner_alerts "
+            "WHERE signal='checkup'"
+        ).fetchall()
+        self.assertEqual(
+            [(self.unit["unit_id"], "dev", "checkup", 2)],
+            [tuple(row) for row in rows],
         )
 
     def test_never_bound_records_finding_and_condition_without_push(self):
@@ -480,7 +560,7 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         )
         self.con.commit()
         row = self.con.execute(
-            "SELECT sprint_doc_id, seq, role, signal, shell_id, resolved_at "
+            "SELECT sprint_doc_id, unit_id, role, signal, shell_id, resolved_at "
             "FROM planner_alerts WHERE reason='turn_failure'"
         ).fetchone()
         self.assertEqual((None, None, None, None, None, None), tuple(row))

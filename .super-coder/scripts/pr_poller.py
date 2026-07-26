@@ -443,20 +443,25 @@ def _open_reconciliation_alert(
     severity: str,
 ) -> "int | None":
     expectation = reading.expectation
+    unit_key = (
+        expectation.unit_id
+        if expectation.unit_id is not None
+        else "-"
+    )
     dedupe_key = (
-        f"reconciler|{expectation.sprint_doc_id}|{expectation.seq or '-'}|"
+        f"reconciler|{expectation.sprint_doc_id}|{unit_key}|"
         f"{expectation.role}|{reading.signal}"
     )
     opened_at = reading.observed_at.isoformat()
     cursor = con.execute(
         "INSERT INTO planner_alerts "
-        "(sprint_doc_id, seq, role, signal, shell_id, severity, reason, "
+        "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
         " dedupe_key, opened_at) "
         "VALUES (?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
         (
             expectation.sprint_doc_id,
-            expectation.seq,
+            expectation.unit_id,
             expectation.role,
             reading.signal,
             expectation.shell_id,
@@ -491,14 +496,14 @@ def _resolve_reconciliation_alerts(
     expectation = reading.expectation
     con.execute(
         "UPDATE planner_alerts SET resolved_at=? "
-        "WHERE sprint_doc_id=? AND seq IS ? AND role=? "
+        "WHERE sprint_doc_id=? AND unit_id IS ? AND role=? "
         "AND signal IN ('checkup','not_started',"
         "'work_complete_unreported','recovery_blocked') "
         "AND resolved_at IS NULL",
         (
             reading.observed_at.isoformat(),
             expectation.sprint_doc_id,
-            expectation.seq,
+            expectation.unit_id,
             expectation.role,
         ),
     )
