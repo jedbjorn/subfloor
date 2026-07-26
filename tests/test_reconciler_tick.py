@@ -358,6 +358,32 @@ class TickTest(unittest.TestCase):
             ],
         )
 
+    def test_all_terminal_planner_expectation_never_reads_the_doc_title(self):
+        add_unit(
+            self.con,
+            state=sprint_units.TERMINAL_UNIT_STATES[0],
+        )
+        self.con.execute(
+            "UPDATE documents SET title='Worker expectation reconciler' "
+            "WHERE document_id=59"
+        )
+        self.con.commit()
+        add_binding(self.con, planner=3)
+
+        self.assertEqual(
+            [(59, None, None, "planner", 3)],
+            [
+                (
+                    item.sprint_doc_id,
+                    item.unit_id,
+                    item.seq,
+                    item.role,
+                    item.shell_id,
+                )
+                for item in pr_poller.live_expectations(self.con)
+            ],
+        )
+
     def test_every_nonterminal_schema_state_remains_a_live_expectation(self):
         for offset, state in enumerate(
             ("pending", "working", "in_review", "blocked"),

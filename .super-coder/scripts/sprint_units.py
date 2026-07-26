@@ -30,9 +30,12 @@ def board_writer(con, sprint_doc_id: int) -> "int | None":
     """Return the one shell related to this sprint as its board writer.
 
     Released bindings still name the writer. Filtering on ``released_at``
-    widens the fence after a planner session ends from one related shell to a
-    whole flavor class. The most recent binding therefore remains authoritative
-    until a later binding records an explicit handoff.
+    widens the fence after any of the engine's three release paths — shell
+    recovery, update discard, or sprint close/freeze — from one related shell
+    to a whole flavor class. A foreign planner could then move a unit into
+    ``merged``, the terminal state that makes the reconciler stop watching it.
+    The most recent binding therefore remains authoritative until a later
+    binding records an explicit handoff.
 
     A sprint that has never had a binding returns ``None``. Documents carry no
     author column, so a "document author" fallback is not representable. Callers

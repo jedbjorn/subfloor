@@ -530,6 +530,13 @@ class CutoverTest(unittest.TestCase):
             self.assertEqual(con.execute(
                 "SELECT COUNT(*) FROM daemon_heartbeats WHERE name='watch'"
             ).fetchone()[0], 1)
+            self.assertEqual(
+                30,
+                con.execute(
+                    "SELECT interval_s FROM daemon_heartbeats "
+                    "WHERE name='watch'"
+                ).fetchone()[0],
+            )
             self.assertIsNotNone(con.execute(
                 "SELECT last_seen FROM watched_prs").fetchone()["last_seen"])
             run = con.execute("SELECT source, status FROM pr_poll_runs").fetchone()
@@ -653,7 +660,7 @@ class CutoverTest(unittest.TestCase):
         finally:
             con.close()
 
-    def test_missing_gh_disables_pr_reads_but_completed_reconciliation_beats(self):
+    def test_missing_gh_keeps_poll_heartbeat_absent_but_reconciliation_beats(self):
         import shutil
         old = shutil.which
         shutil.which = lambda name: None
@@ -672,10 +679,11 @@ class CutoverTest(unittest.TestCase):
         con = sqlite3.connect(tmp)
         try:
             self.assertEqual(
-                ("watch", 600),
+                [("reconcile", 600)],
                 con.execute(
-                    "SELECT name, interval_s FROM daemon_heartbeats"
-                ).fetchone(),
+                    "SELECT name, interval_s FROM daemon_heartbeats "
+                    "ORDER BY name"
+                ).fetchall(),
             )
         finally:
             con.close()
@@ -695,7 +703,7 @@ class CutoverTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
-            "VALUES ('watch', '2000-01-01 00:00:00', 600)"
+            "VALUES ('reconcile', '2000-01-01 00:00:00', 600)"
         )
         con.commit()
         con.close()
@@ -725,8 +733,15 @@ class CutoverTest(unittest.TestCase):
                 ("2000-01-01 00:00:00", 600),
                 con.execute(
                     "SELECT beat_at, interval_s FROM daemon_heartbeats "
-                    "WHERE name='watch'"
+                    "WHERE name='reconcile'"
                 ).fetchone(),
+            )
+            self.assertEqual(
+                30,
+                con.execute(
+                    "SELECT interval_s FROM daemon_heartbeats "
+                    "WHERE name='watch'"
+                ).fetchone()[0],
             )
             self.assertEqual(
                 0,

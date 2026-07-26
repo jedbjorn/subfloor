@@ -105,6 +105,7 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         doc_id: int = 59,
         seq: str = "U5",
         unit: sqlite3.Row | None = None,
+        role: str = "dev",
         shell_id: int = 2,
     ) -> pr_poller.Expectation:
         unit = unit if unit is not None else self.unit
@@ -116,10 +117,30 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             sprint_doc_id=doc_id,
             unit_id=unit["unit_id"],
             seq=seq,
-            role="dev",
+            role=role,
             shell_id=shell_id,
             shell=shell,
             unit=unit,
+        )
+
+    def planner_expectation(
+        self,
+        *,
+        doc_id: int = 59,
+        shell_id: int = 1,
+    ) -> pr_poller.Expectation:
+        shell = self.con.execute(
+            "SELECT * FROM shells WHERE shell_id=?",
+            (shell_id,),
+        ).fetchone()
+        return pr_poller.Expectation(
+            sprint_doc_id=doc_id,
+            unit_id=None,
+            seq=None,
+            role="planner",
+            shell_id=shell_id,
+            shell=shell,
+            unit=None,
         )
 
     def reading(
@@ -357,19 +378,105 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_unitless_expectation_dedupes_on_an_explicit_key_sentinel(self):
-        planner = self.con.execute(
-            "SELECT * FROM shells WHERE shell_id=1"
-        ).fetchone()
-        expectation = pr_poller.Expectation(
-            sprint_doc_id=59,
-            unit_id=None,
-            seq=None,
-            role="planner",
-            shell_id=1,
-            shell=planner,
-            unit=None,
+    def test_unitless_planner_alert_resolves_on_recovery(self):
+        expectation = self.planner_expectation()
+        pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [self.reading("checkup", expectation=expectation)],
         )
+        pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [
+                self.reading(
+                    "working",
+                    confirmed=False,
+                    minute=1,
+                    expectation=expectation,
+                )
+            ],
+        )
+
+        self.assertEqual(
+            (NOW + timedelta(minutes=1)).isoformat(),
+            self.con.execute(
+                "SELECT resolved_at FROM planner_alerts "
+                "WHERE sprint_doc_id=59 AND unit_id IS NULL "
+                "AND role='planner' AND signal='checkup'"
+            ).fetchone()[0],
+        )
+
+    def test_one_role_recovery_does_not_resolve_the_other_role(self):
+        dev = self.expectation(role="dev", shell_id=2)
+        reviewer = self.expectation(role="reviewer", shell_id=4)
+        pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [
+                self.reading("checkup", expectation=dev),
+                self.reading("checkup", expectation=reviewer),
+            ],
+        )
+        pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [
+                self.reading(
+                    "working",
+                    confirmed=False,
+                    minute=1,
+                    expectation=dev,
+                )
+            ],
+        )
+
+        self.assertEqual(
+            [
+                ("dev", (NOW + timedelta(minutes=1)).isoformat()),
+                ("reviewer", None),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT role, resolved_at FROM planner_alerts "
+                    "WHERE sprint_doc_id=59 AND unit_id=? "
+                    "AND signal='checkup' ORDER BY role",
+                    (self.unit["unit_id"],),
+                )
+            ],
+        )
+
+    def test_planner_recovery_does_not_resolve_another_sprint(self):
+        add_sprint(self.con, 60, "U6")
+        add_binding(self.con, 60, 3)
+        sprint_59 = self.planner_expectation()
+        sprint_60 = self.planner_expectation(doc_id=60, shell_id=3)
+        pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [
+                self.reading("checkup", expectation=sprint_59),
+                self.reading("checkup", expectation=sprint_60),
+            ],
+        )
+        pr_poller.deliver_reconciliation_readings(
+            self.con,
+            [
+                self.reading(
+                    "working",
+                    confirmed=False,
+                    minute=1,
+                    expectation=sprint_59,
+                )
+            ],
+        )
+
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT resolved_at FROM planner_alerts "
+                "WHERE sprint_doc_id=60 AND unit_id IS NULL "
+                "AND role='planner' AND signal='checkup'"
+            ).fetchone()[0]
+        )
+
+    def test_unitless_expectation_dedupes_on_an_explicit_key_sentinel(self):
+        expectation = self.planner_expectation()
         reading = self.reading("checkup", expectation=expectation)
 
         first = pr_poller.deliver_reconciliation_readings(
@@ -493,63 +600,100 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         )
 
     def test_bound_and_never_bound_sprints_are_isolated_in_one_completed_tick(self):
-        unit = add_sprint(self.con, 60, "U6")
-        unbound = self.reading(
-            "checkup",
-            expectation=self.expectation(doc_id=60, seq="U6", unit=unit),
+        cases = (
+            ("bound-first", 59, 60, 1),
+            ("unbound-first", 62, 61, 3),
         )
-        bound = self.reading("checkup")
-        before_board = tuple(self.con.execute(
-            "SELECT * FROM sprint_units ORDER BY unit_id"
-        ).fetchall())
+        for label, bound_doc_id, unbound_doc_id, planner_id in cases:
+            with self.subTest(order=label):
+                if bound_doc_id == 59:
+                    bound_unit = self.unit
+                else:
+                    bound_unit = add_sprint(
+                        self.con,
+                        bound_doc_id,
+                        f"U{bound_doc_id}",
+                    )
+                    add_binding(self.con, bound_doc_id, planner_id)
+                unbound_unit = add_sprint(
+                    self.con,
+                    unbound_doc_id,
+                    f"U{unbound_doc_id}",
+                )
+                bound = self.reading(
+                    "checkup",
+                    expectation=self.expectation(
+                        doc_id=bound_doc_id,
+                        seq=f"U{bound_doc_id}",
+                        unit=bound_unit,
+                    ),
+                )
+                unbound = self.reading(
+                    "checkup",
+                    expectation=self.expectation(
+                        doc_id=unbound_doc_id,
+                        seq=f"U{unbound_doc_id}",
+                        unit=unbound_unit,
+                    ),
+                )
+                readings = sorted(
+                    (bound, unbound),
+                    key=lambda item: item.expectation.sprint_doc_id,
+                )
+                before_board = tuple(self.con.execute(
+                    "SELECT * FROM sprint_units ORDER BY unit_id"
+                ).fetchall())
 
-        emitted = pr_poller.deliver_reconciliation_readings(
-            self.con,
-            [bound, unbound],
-        )
-        pr_poller.beat(self.con, 600)
+                emitted = pr_poller.deliver_reconciliation_readings(
+                    self.con,
+                    readings,
+                )
+                pr_poller.beat(self.con, 600, name="reconcile")
 
-        self.assertEqual(1, len(emitted))
-        self.assertEqual(
-            [(59, 1), (60, 0)],
-            [
-                (
-                    doc_id,
+                self.assertEqual(1, len(emitted))
+                self.assertEqual(
+                    [(bound_doc_id, 1), (unbound_doc_id, 0)],
+                    [
+                        (
+                            doc_id,
+                            self.con.execute(
+                                "SELECT COUNT(*) FROM shell_messages "
+                                "WHERE sprint_doc_id=?",
+                                (doc_id,),
+                            ).fetchone()[0],
+                        )
+                        for doc_id in (bound_doc_id, unbound_doc_id)
+                    ],
+                )
+                self.assertEqual(
+                    1,
                     self.con.execute(
-                        "SELECT COUNT(*) FROM shell_messages "
-                        "WHERE sprint_doc_id=?",
-                        (doc_id,),
+                        "SELECT COUNT(*) FROM planner_alerts "
+                        "WHERE sprint_doc_id=? AND signal='checkup'",
+                        (bound_doc_id,),
                     ).fetchone()[0],
                 )
-                for doc_id in (59, 60)
-            ],
-        )
-        self.assertEqual(
-            1,
-            self.con.execute(
-                "SELECT COUNT(*) FROM planner_alerts "
-                "WHERE sprint_doc_id=59 AND signal='checkup'"
-            ).fetchone()[0],
-        )
-        self.assertEqual(
-            2,
-            self.con.execute(
-                "SELECT COUNT(*) FROM planner_alerts "
-                "WHERE sprint_doc_id=60"
-            ).fetchone()[0],
-        )
-        self.assertEqual(
-            ("watch", 600),
-            tuple(self.con.execute(
-                "SELECT name, interval_s FROM daemon_heartbeats"
-            ).fetchone()),
-        )
-        self.assertEqual(
-            before_board,
-            tuple(self.con.execute(
-                "SELECT * FROM sprint_units ORDER BY unit_id"
-            ).fetchall()),
-        )
+                self.assertEqual(
+                    2,
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM planner_alerts "
+                        "WHERE sprint_doc_id=?",
+                        (unbound_doc_id,),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    ("reconcile", 600),
+                    tuple(self.con.execute(
+                        "SELECT name, interval_s FROM daemon_heartbeats "
+                        "WHERE name='reconcile'"
+                    ).fetchone()),
+                )
+                self.assertEqual(
+                    before_board,
+                    tuple(self.con.execute(
+                        "SELECT * FROM sprint_units ORDER BY unit_id"
+                    ).fetchall()),
+                )
 
     def test_legacy_interface_alert_opens_dedupes_resolves_with_null_new_columns(self):
         interface_broker._alert(
