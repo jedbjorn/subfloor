@@ -149,10 +149,22 @@ class SprintDirectiveTest(unittest.TestCase):
 
     def test_planner_gets_the_orchestration_skill(self):
         add_doc(self.con, 59)
+        add_unit(self.con, 59, "U9", dev=DEV_SHELL)
         arm_binding(self.con, 59, PLANNER_SHELL)
         out = self.render(PLANNER_SHELL)
         self.assertIn("PLANNER", out)
         self.assertIn("`sprint_orchestration` skill", out)
+
+    def test_planner_gets_nothing_before_the_board_has_rows(self):
+        # A sprint's very first boot: the binding exists, no unit rows do.
+        # Correct — the planner is the shell about to CREATE those rows and
+        # does not need to be told what it is doing. Decided, not discovered
+        # (PLN1 #2263).
+        add_doc(self.con, 59)
+        arm_binding(self.con, 59, PLANNER_SHELL)
+        self.assertEqual(self.render(PLANNER_SHELL), "")
+        add_unit(self.con, 59, "U9", dev=DEV_SHELL)          # control
+        self.assertIn("PLANNER", self.render(PLANNER_SHELL))
 
     def test_planner_resolves_from_a_RELEASED_binding_too(self):
         # The load-bearing departure from the spec's wording. Arming requires
@@ -162,6 +174,7 @@ class SprintDirectiveTest(unittest.TestCase):
         # directive only when recovery lagged — the sprint doc is what says
         # the sprint is live, not the binding.
         add_doc(self.con, 59)
+        add_unit(self.con, 59, "U9", dev=DEV_SHELL)
         arm_binding(self.con, 59, PLANNER_SHELL, released=True)
         self.assertIn("PLANNER", self.render(PLANNER_SHELL))
 
@@ -169,6 +182,7 @@ class SprintDirectiveTest(unittest.TestCase):
         # A sprint re-bound to a different planner must not keep telling the
         # old one it is the planner.
         add_doc(self.con, 59)
+        add_unit(self.con, 59, "U9", dev=DEV_SHELL)
         arm_binding(self.con, 59, PLANNER_SHELL, released=True,
                     session_id=1, generation=1)
         arm_binding(self.con, 59, 10, session_id=2, generation=1)
@@ -227,14 +241,20 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertNotEqual(self.render(DEV_SHELL), "")     # control
 
     def test_terminal_units_only_render_nothing(self):
+        # This is also what retires the PLANNER's directive: a sprint whose
+        # every unit is merged or cancelled is over, and the structured pair
+        # says so without anyone editing prose.
         add_doc(self.con, 59)
         add_unit(self.con, 59, "U9", dev=DEV_SHELL, state="merged")
         add_unit(self.con, 59, "U8", dev=DEV_SHELL, state="cancelled")
+        arm_binding(self.con, 59, PLANNER_SHELL)
         self.assertEqual(self.render(DEV_SHELL), "")
+        self.assertEqual(self.render(PLANNER_SHELL), "")
         # control: the SAME rows, one moved off a terminal state
         self.con.execute("UPDATE sprint_units SET state='working' WHERE seq='U9'")
         self.con.commit()
         self.assertNotEqual(self.render(DEV_SHELL), "")
+        self.assertNotEqual(self.render(PLANNER_SHELL), "")
 
     def test_frozen_doc_renders_nothing(self):
         add_doc(self.con, 59, frozen=1)
@@ -248,18 +268,25 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertNotEqual(self.render(DEV_SHELL), "")
         self.assertNotEqual(self.render(PLANNER_SHELL), "")
 
-    def test_closed_sprint_renders_nothing(self):
+    def test_liveness_is_structured_and_the_body_prose_is_never_read(self):
+        # The inverse of an absence test, and it pins a ruling rather than a
+        # behaviour: liveness is `frozen = 0` + a non-terminal unit row, NOT
+        # the body's `status:` line. Regex-matching ACTIVE-ness out of prose is
+        # part of the structural gap this feature closes (flag_id 213 removed
+        # exactly that from the reconciler's trigger), and reintroducing it
+        # here would let the boot render and the reconciler disagree about
+        # whether a sprint is live the moment someone reformats a line.
+        # So: prose says CLOSED, the record says otherwise, and the RECORD wins.
         add_doc(self.con, 59, body=CLOSED_BODY)
         add_unit(self.con, 59, "U9", dev=DEV_SHELL)
         arm_binding(self.con, 59, PLANNER_SHELL)
-        self.assertEqual(self.render(DEV_SHELL), "")
-        self.assertEqual(self.render(PLANNER_SHELL), "")
-        # control: same rows, status flipped back
-        self.con.execute("UPDATE documents SET body=? WHERE document_id=59",
-                         (ACTIVE_BODY,))
+        self.assertIn("DEV", self.render(DEV_SHELL))
+        self.assertIn("PLANNER", self.render(PLANNER_SHELL))
+        # and a body with no status line at all changes nothing either
+        self.con.execute("UPDATE documents SET body='' WHERE document_id=59")
         self.con.commit()
-        self.assertNotEqual(self.render(DEV_SHELL), "")
-        self.assertNotEqual(self.render(PLANNER_SHELL), "")
+        self.assertIn("DEV", self.render(DEV_SHELL))
+        self.assertIn("PLANNER", self.render(PLANNER_SHELL))
 
     def test_missing_tables_render_nothing_instead_of_breaking_the_boot(self):
         # Not hypothetical: as this unit was written the repo's own running
@@ -276,11 +303,14 @@ class SprintDirectiveTest(unittest.TestCase):
         self.con.execute("DROP TABLE sprint_units")
         self.con.commit()
         self.assertEqual(self.render(DEV_SHELL), "")
-        self.assertIn("PLANNER", self.render(PLANNER_SHELL))  # still resolves
+        # the planner goes quiet too: liveness is the structured pair, and
+        # half of that pair is the table that just vanished
+        self.assertEqual(self.render(PLANNER_SHELL), "")
 
         self.con.execute("DROP TABLE sprint_planner_bindings")
         self.con.commit()
         self.assertEqual(self.render(PLANNER_SHELL), "")
+        self.assertEqual(self.render(DEV_SHELL), "")
 
     # ── the terminal set is the schema's, not a private opinion ─────────────
 

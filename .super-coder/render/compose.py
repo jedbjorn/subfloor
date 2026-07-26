@@ -125,25 +125,6 @@ PARTICIPANT_RULES = (
 )
 
 
-def _sprint_doc_live(body: "str | None") -> bool:
-    """A sprint is live while its doc body carries `status: ACTIVE`. Callers
-    pair this with `documents.frozen = 0` in SQL — the same predicate the
-    reconciler's trigger uses, so the two cannot disagree about whether a
-    sprint is live.
-
-    Restated here rather than imported on purpose: this module is the boot
-    render and holds no engine imports by contract (a bare `sqlite3` read,
-    nothing out of `scripts/` or `api/`), and `run.py` puts `render/` on the
-    path before `scripts/`. The siblings are `interface_broker._sprint_active`,
-    `server._sprint_doc_status` and `run._sprint_doc_is_active` — this is the
-    fourth. Move the predicate and you must move all four; grep `status:`.
-    """
-    for line in (body or "").splitlines():
-        if line.startswith("status:"):
-            return line.split(":", 1)[1].strip() == "ACTIVE"
-    return False
-
-
 def resolve_sprint_roles(con, shell_id: int) -> list:
     """Every sprint role `shell_id` holds right now, read fresh from the record
     — never cached, so a role changed since the last boot resolves correctly.
@@ -160,12 +141,23 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     binding yet, and the previous one is generation-bound and released when
     that generation ends (`interface_recovery`). Under the armed reading the
     directive renders only when recovery lags — a race, not a record. The
-    latest binding names who the sprint's planner IS; the doc predicate below
-    is what retires it, since closing a sprint both releases its bindings and
-    flips the body to CLOSED. Same definition as
-    `interface_routes._board_writer` minus the armed filter, so the two cannot
-    disagree about whose sprint it is. (Reported to the planner as an ambiguity
-    call before build; PLN1 message #2257.)
+    latest binding names who the sprint's planner IS; the LIVE predicate below
+    is what retires it. Same definition as `interface_routes._board_writer`
+    minus the armed filter, so the two cannot disagree about whose sprint it
+    is. (Reported to the planner as an ambiguity call before build; adopted in
+    PLN1 messages #2257 / #2263.)
+
+    A SPRINT IS LIVE ON THE STRUCTURED PAIR ONLY — `documents.frozen = 0` plus
+    at least one non-terminal `sprint_units` row. Deliberately NOT the body's
+    `status: ACTIVE` line: regex-matching liveness out of prose is part of the
+    structural gap this feature exists to close (flag_id 213 removed exactly
+    that from the reconciler's trigger), and reintroducing it here would have
+    the boot render and the reconciler disagreeing the moment someone
+    reformats a line. Same pair on both sides, one definition, no drift.
+
+    Consequence, decided rather than discovered: at a sprint's very first boot
+    no unit rows exist yet, so the planner gets no directive — correct, since
+    the planner is the shell CREATING those rows.
 
     Degrades to `[]` on OperationalError rather than failing a boot: this runs
     against the LIVE db at every launch, and a floor that has not applied
@@ -174,27 +166,29 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     render is worse than one missing a section.
     """
     entries = []
+    placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
     try:
         planner_docs = con.execute(
-            "SELECT b.sprint_doc_id, d.title, d.body FROM sprint_planner_bindings b "
+            "SELECT b.sprint_doc_id, d.title FROM sprint_planner_bindings b "
             "JOIN documents d ON d.document_id = b.sprint_doc_id "
             "WHERE b.binding_id = (SELECT MAX(b2.binding_id) "
             "                      FROM sprint_planner_bindings b2 "
             "                      WHERE b2.sprint_doc_id = b.sprint_doc_id) "
             "  AND b.planner_shell_id = ? AND d.frozen = 0 "
+            "  AND EXISTS (SELECT 1 FROM sprint_units u "
+            "              WHERE u.sprint_doc_id = b.sprint_doc_id "
+            f"                AND u.state NOT IN ({placeholders})) "
             "ORDER BY b.sprint_doc_id",
-            (shell_id,)).fetchall()
+            (shell_id, *TERMINAL_UNIT_STATES)).fetchall()
     except sqlite3.OperationalError:
         planner_docs = []
-    for doc_id, title, body in planner_docs:
-        if _sprint_doc_live(body):
-            entries.append({"doc_id": doc_id, "doc_title": title,
-                            "role": "planner", "units": []})
+    for doc_id, title in planner_docs:
+        entries.append({"doc_id": doc_id, "doc_title": title,
+                        "role": "planner", "units": []})
 
-    placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
     try:
         rows = con.execute(
-            "SELECT u.sprint_doc_id, d.title, d.body, u.seq, u.unit_title, "
+            "SELECT u.sprint_doc_id, d.title, u.seq, u.unit_title, "
             "       u.dev_shell_id, u.reviewer_shell_id "
             "FROM sprint_units u "
             "JOIN documents d ON d.document_id = u.sprint_doc_id "
@@ -208,9 +202,7 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     # (doc, role) -> entry, so a shell holding four review units in one sprint
     # gets one line naming all four rather than four sections.
     by_role = {}
-    for doc_id, title, body, seq, unit_title, dev_id, reviewer_id in rows:
-        if not _sprint_doc_live(body):
-            continue
+    for doc_id, title, seq, unit_title, dev_id, reviewer_id in rows:
         for role, holder in (("dev", dev_id), ("reviewer", reviewer_id)):
             if holder != shell_id:
                 continue
