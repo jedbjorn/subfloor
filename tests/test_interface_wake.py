@@ -27,6 +27,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -107,9 +108,11 @@ class WakeFixture(unittest.TestCase):
 
     def tearDown(self):
         self.con.close()
-        for p in self.tmp.glob("*"):
-            p.unlink()
-        self.tmp.rmdir()
+        # glob-then-unlink races SQLite's WAL sidecars: a -wal/-shm listed by
+        # glob can be gone by the time unlink reaches it, and the test fails in
+        # cleanup having already passed. Same tolerant rmtree the routes case
+        # below already uses.
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def add_message(self, kind="task", sprint_doc_id=1, to_shell_id=1,
                     read=False):
@@ -621,9 +624,10 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
             quiet_s=QUIET)
 
     def tearDown(self):
-        for p in self.tmp.glob("*"):
-            p.unlink()
-        self.tmp.rmdir()
+        # The coordinator has no stop(), so a timer armed by the test can still
+        # fire a drain — opening and closing a WAL connection — while cleanup
+        # runs. Deleting the tree tolerantly is what makes that harmless.
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- helpers (sync DB access from the test's async context) ---------------
 
@@ -693,7 +697,24 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         ok = await self.wait_for(lambda: len(self.writes) == 1)
         self.assertTrue(ok)
 
+    # The ONE test here gated on the debounce itself, so the ONE that has to
+    # respect the clock the gate is measured with. `quiet` is
+    # julianday(now) - julianday(baseline) with BOTH ends from `datetime('now')`
+    # (interface_broker._now / WakeCoordinator._drain) — whole seconds. So it
+    # moves in 1s steps and a sub-second debounce is unobservable: at QUIET=0.2
+    # the byte was held or sent purely on whether a second boundary happened to
+    # fall between the fixture write and the gate, which failed ~1 run in 25
+    # locally and more under CI load.
+    #
+    # Fixed by out-scaling the clock, not by retrying: with a debounce above 1s,
+    # quiet ∈ {0, 1} is inside it and quiet = 2 is past it, for every wall-clock
+    # phase. Do NOT lower this to the module's QUIET — that reintroduces the
+    # flake. The other QUIET sleeps in this file are safe because they assert
+    # absence for lifecycle/parking reasons, not because of the debounce.
+    DEBOUNCE_S = 1.5
+
     async def test_quiet_debounce_reschedules_at_the_deadline(self):
+        self.coord.quiet_s = self.DEBOUNCE_S
         con = self.connect()
         con.execute("UPDATE interface_input_state SET last_human_input_at="
                     "datetime('now') WHERE session_id=?", (self.sid,))
@@ -702,10 +723,10 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.coord.start(asyncio.get_running_loop())
         self.add_message("task")
         self.coord.notify_binding(self.binding)
-        await asyncio.sleep(QUIET / 2)
+        await asyncio.sleep(self.DEBOUNCE_S / 2)
         self.assertEqual(self.writes, [], "inside the debounce: no byte")
         ok = await self.wait_for(lambda: len(self.writes) == 1,
-                                 timeout=QUIET * 5)
+                                 timeout=self.DEBOUNCE_S * 5)
         self.assertTrue(ok, "the deadline timer must re-attempt exactly once")
 
     async def test_pre_send_retries_are_bounded(self):
@@ -878,10 +899,8 @@ class WakeRoutesTest(unittest.TestCase):
     def tearDown(self):
         for p in self.patches:
             p.stop()
-        for f in self.tmp.glob("*"):
-            if f.is_file():
-                f.unlink()
-        import shutil
+        # rmtree alone; the glob-unlink pass that used to precede it was both
+        # redundant and racy in the same way (is_file then unlink).
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def call(self, method, path, header_lines=(), body=None):
