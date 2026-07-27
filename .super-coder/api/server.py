@@ -2731,22 +2731,31 @@ class Handler(BaseHTTPRequestHandler):
     # /_sc/watches/reconcile is the operator's explicit one-shot poll.
 
     def _daemon_state(self, con) -> "dict | None":
-        """Poller liveness (#359): the heartbeat row → age + verdict.
-        Stale = beat older than 3× the poller's own interval (one slow gh
-        call + the sleep fit comfortably inside). None = never run (or a
-        pre-0068 DB with no heartbeat table yet) — the client renders both
-        None and stale as "watches are NOT being polled"."""
+        """Poller + reconciler liveness (#359): heartbeat rows → age + verdict.
+        Stale = beat older than 3× the daemon's own interval (one slow gh
+        call + the sleep fit comfortably inside). None means neither daemon
+        has run (or a pre-0068 DB has no heartbeat table); a reconcile-only
+        result is truthy but has no top-level beat_at. Reconciliation stays
+        nested so older clients ignore it while their own beat_at guard still
+        renders a never-run poller."""
         try:
-            r = con.execute(
-                "SELECT beat_at, interval_s, CAST((julianday('now') - "
+            rs = con.execute(
+                "SELECT name, beat_at, interval_s, CAST((julianday('now') - "
                 "julianday(beat_at)) * 86400 AS INTEGER) AS age_s "
-                "FROM daemon_heartbeats WHERE name='watch'").fetchone()
+                "FROM daemon_heartbeats WHERE name IN ('watch','reconcile')").fetchall()
         except Exception:
             return None
-        if r is None:
+        states = {
+            r["name"]: {"beat_at": r["beat_at"], "interval_s": r["interval_s"],
+                        "age_s": r["age_s"],
+                        "stale": r["age_s"] > 3 * r["interval_s"]}
+            for r in rs
+        }
+        if not states:
             return None
-        return {"beat_at": r["beat_at"], "interval_s": r["interval_s"],
-                "age_s": r["age_s"], "stale": r["age_s"] > 3 * r["interval_s"]}
+        watch = states.get("watch", {})
+        watch["reconcile"] = states.get("reconcile")
+        return watch
 
     def _watches_get(self):
         sid = self._require_shell_auth()

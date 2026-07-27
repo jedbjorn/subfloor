@@ -471,6 +471,33 @@ class DaemonLineTest(unittest.TestCase):
         self.assertIn("4h ago", line)
         self.assertIn("NOT being polled", line)
 
+    def test_stale_reconciler_is_rendered_while_poller_is_fresh(self):
+        con = build_db()
+        self.addCleanup(con.close)
+        con.executescript(
+            "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
+            "VALUES ('watch', datetime('now'), 30);"
+            "INSERT INTO daemon_heartbeats (name, beat_at, interval_s) "
+            "VALUES ('reconcile', datetime('now', '-3600 seconds'), 600);"
+        )
+
+        line = watch.daemon_line(server.Handler._daemon_state(None, con))
+
+        self.assertIn("poller: live", line)
+        self.assertNotIn("poller: STALE", line)
+        self.assertIn("reconciler: STALE", line)
+        self.assertIn("worker reconciliation is NOT running", line)
+
+        con.execute(
+            "UPDATE daemon_heartbeats SET beat_at = datetime('now', '-200 seconds') "
+            "WHERE name = 'reconcile'")
+        line = watch.daemon_line(server.Handler._daemon_state(None, con))
+        self.assertIn("reconciler: live", line)
+
+        con.execute("DELETE FROM daemon_heartbeats WHERE name = 'watch'")
+        line = watch.daemon_line(server.Handler._daemon_state(None, con))
+        self.assertIn("poller: never run", line)
+
 
 # ── API: /_sc/watches + message kinds, over the real server ─────────────────
 

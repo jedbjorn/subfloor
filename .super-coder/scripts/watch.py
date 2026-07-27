@@ -124,18 +124,30 @@ def _age_str(seconds: int) -> str:
     return f"{seconds // 3600}h"
 
 
-def daemon_line(d: "dict | None") -> str:
-    """Render the /_sc/watches `daemon` block as the liveness line (#359):
-    a watch is only as live as its poller, and `list` saying "live" while the
-    poller is dead was the lying half of the dos-arch incident. The poller is
-    the engine service's scheduler thread since the cutover (decision #19)."""
-    dead = "watches are NOT being polled (engine service poller down — restart: ./sc restart)"
+def _heartbeat_line(d: "dict | None", label: str, event: str, dead: str) -> str:
     if not d or not d.get("beat_at"):
-        return f"  poller: never run — {dead}"
+        return f"  {label}: never run — {dead}"
     age = _age_str(int(d.get("age_s") or 0))
     if d.get("stale"):
-        return f"  poller: STALE — last poll {age} ago ({d['beat_at']}Z); {dead}"
-    return f"  poller: live — last poll {age} ago (interval {d.get('interval_s')}s)"
+        return f"  {label}: STALE — last {event} {age} ago ({d['beat_at']}Z); {dead}"
+    return f"  {label}: live — last {event} {age} ago (interval {d.get('interval_s')}s)"
+
+
+def daemon_line(d: "dict | None") -> str:
+    """Render the /_sc/watches `daemon` block as poller + reconciler lines.
+
+    a watch is only as live as its poller, and `list` saying "live" while the
+    poller is dead was the lying half of the dos-arch incident. The poller is
+    the engine service's scheduler thread since the cutover (decision #19).
+    The nested reconciler row renders independently; an absent row means it
+    never ran, including on engine versions that predate reconciliation."""
+    poller_dead = "watches are NOT being polled (engine service poller down — restart: ./sc restart)"
+    reconcile_dead = "worker reconciliation is NOT running (restart: ./sc restart)"
+    return "\n".join((
+        _heartbeat_line(d, "poller", "poll", poller_dead),
+        _heartbeat_line((d or {}).get("reconcile"), "reconciler",
+                        "reconciliation", reconcile_dead),
+    ))
 
 
 def cmd_pr(args) -> int:
