@@ -246,7 +246,9 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    from cli_entry import run_cli
+
     try:
-        raise SystemExit(main(sys.argv[1:]))
+        raise SystemExit(run_cli(main, sys.argv[1:]))
     except ArtifactPolicyError as exc:
         raise SystemExit(f"artifact-mode: {exc}") from exc

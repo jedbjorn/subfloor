@@ -144,4 +144,6 @@ def parse_args(argv: list[str]) -> str:
 
 
 if __name__ == "__main__":
-    sys.exit(migrate(parse_args(sys.argv[1:])))
+    from cli_entry import run_cli
+
+    sys.exit(run_cli(lambda: migrate(parse_args(sys.argv[1:]))))

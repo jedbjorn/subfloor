@@ -75,7 +75,6 @@ import argparse
 import errno
 import json
 import os
-import signal
 import stat
 import sys
 import time
@@ -1064,18 +1063,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str]) -> int:
-    # Restore the default SIGPIPE disposition so piping a render into `head`
-    # (or any reader that closes early) terminates quietly like a normal Unix
-    # filter, instead of raising BrokenPipeError mid-render loop (#299). Python
-    # installs SIG_IGN by default, which turns the closed pipe into an
-    # exception; SIG_DFL makes the write kill the process cleanly. Guarded for
-    # platforms without SIGPIPE (Windows), though this only ever runs on Linux.
-    if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # A reader that closes early (`| head`) is handled at the entrypoint, by
+    # cli_entry.run_cli — one mechanism for every sc script (#384). This used to
+    # restore SIG_DFL here (#299), which killed the process with signal 13
+    # mid-write and cost the command its own exit status.
     args = build_parser().parse_args(argv)
     _require_api()  # every command goes through the API — fail loud if unwired
     return args.fn(args)
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    sys.exit(run_cli(main, sys.argv[1:]))

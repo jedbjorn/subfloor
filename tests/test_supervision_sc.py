@@ -32,14 +32,13 @@ class SupervisionFixture:
         self.home.mkdir()
         self.docker_state.mkdir()
         shutil.copy2(ROOT / "sc", self.root / "sc")
-        shutil.copy2(
-            ROOT / ".super-coder" / "scripts" / "artifact_policy.py",
-            self.scripts / "artifact_policy.py",
-        )
-        shutil.copy2(
-            ROOT / ".super-coder" / "scripts" / "db_backup.py",
-            self.scripts / "db_backup.py",
-        )
+        # cli_entry.py rides along with every script copied here: each one
+        # imports it from its __main__ block (SIGPIPE hygiene, #384).
+        for script in ("artifact_policy.py", "db_backup.py", "cli_entry.py"):
+            shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / script,
+                self.scripts / script,
+            )
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
         self._write_scripts()
         self._write_fake_commands()
