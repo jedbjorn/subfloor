@@ -420,6 +420,62 @@ class ReleaseGateTest(unittest.TestCase):
                 self.assertEqual(status, 403, body)
                 self.assertEqual(body["error"]["code"], "host_not_allowed")
 
+    # -- flag #158: every malformed-authority class, enumerated --------------
+
+    def test_every_malformed_authority_class_fails_the_host_fence(self):
+        """#158 asked for the malformed cases to be ENUMERATED and pinned
+        rather than for whichever one prompted the work to be patched, because
+        this parser is the outermost fence in `handle()` — every Interface
+        request passes it before any authority model runs.
+
+        Two of these classes were live holes before this test existed:
+        brackets were accepted around anything (`[127.0.0.1]` reached the
+        allowlist as `127.0.0.1`), and `str.isdigit()` accepts the Latin-1
+        superscripts the header decode admits, so `127.0.0.1:PORT²` parsed as
+        a clean allowed authority.
+        """
+        cases = {
+            "empty": "",
+            "bare colon": ":",
+            "port only": f":{self.port}",
+            "unbracketed ipv6": f"::1:{self.port}",
+            "bracketed ipv4": f"[127.0.0.1]:{self.port}",
+            "bracketed reg-name": "[localhost]",
+            "superscript port": f"127.0.0.1:{self.port}²",
+            "superscript port, v6 branch": f"[::1]:{self.port}¹",
+            "userinfo": f"evil@127.0.0.1:{self.port}",
+            "host suffix": f"127.0.0.1.evil.example.com:{self.port}",
+            "double port": f"127.0.0.1:{self.port}:{self.port}",
+            "oversized": ("x" * 8000) + ".127.0.0.1",
+        }
+        for label, host in cases.items():
+            with self.subTest(case=label, host=host[:40]):
+                status, _, body = self.http(
+                    "GET", "/api/interface/shells", {"Host": host})
+                self.assertEqual(status, 403, body)
+                self.assertEqual(body["error"]["code"], "host_not_allowed")
+
+    def test_wellformed_allowed_authorities_still_pass_the_host_fence(self):
+        """The negative sweep above is only evidence if the same probe can see
+        a pass. Each of these is a well-formed allowed authority, so the fence
+        must let it through to the authority model — 401 (no credential), not
+        403 (rejected at the door). It also pins the two acceptances the
+        tightening deliberately kept: an RFC-legal empty port, and a host
+        compared case-insensitively.
+        """
+        for label, host in {
+            "ipv4 with port": f"127.0.0.1:{self.port}",
+            "ipv6 with port": f"[::1]:{self.port}",
+            "empty port": "127.0.0.1:",
+            "empty port, v6 branch": "[::1]:",
+            "no port": "localhost",
+            "uppercase host": f"LOCALHOST:{self.port}",
+        }.items():
+            with self.subTest(case=label, host=host):
+                status, _, body = self.http(
+                    "GET", "/api/interface/shells", {"Host": host})
+                self.assertEqual(status, 401, body)
+
     # -- SC-151: the bootstrap honours the key it demands --------------------
 
     def _boot(self, key, **extra):

@@ -265,7 +265,12 @@ def read_log() -> list[dict]:
 # deliberately ABSENT — the law says the shell curates them, so there is no door.
 # display_name is operator-set at creation, so the operator may also correct it.
 SHELL_EDITABLE = {"current_state", "display_name"}  # workspace + connections both retired (B5); "where things live" is the derived dr_* map
-FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "priority"}
+# display_name is editable (#288): it was settable exactly once, at open, so a
+# flag opened without a name could never be given one — and an unnamed flag is
+# the one referred to by bare integer, which is the precondition for #149's
+# id/name collision. Same reasoning as SHELL_EDITABLE above.
+FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "display_name",
+                 "feature_id", "priority"}
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
 # Typed traffic on the shell_messages bus (migration 0059). Shells send the
@@ -2202,6 +2207,27 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY f.created_date, f.flag_id"))
                 return self._send(200, {"flags": fs})
 
+            if len(parts) == 4 and parts[2] == "flags":
+                # One flag by id, RESOLVED ONES INCLUDED — the list above is
+                # open-only, so it cannot answer "what am I about to close?"
+                # (#149). `sc mem flag close` reads this before it writes, and
+                # a row that is already resolved carries the notes the closer
+                # would otherwise overwrite.
+                fid = int(parts[3])
+                r = con.execute(
+                    "SELECT f.flag_id, f.display_name, f.priority, f.description, "
+                    "f.feature_id, f.created_date, f.resolved, f.resolved_date, "
+                    "f.resolution_notes, "
+                    "(SELECT s.shortname FROM shells s WHERE s.shell_id=f.shell_id) "
+                    " AS owner, "
+                    "(SELECT title FROM roadmap WHERE feature_id=f.feature_id) "
+                    " AS feature_title "
+                    "FROM flags f WHERE f.flag_id=? "
+                    "AND COALESCE(f.is_deleted,0)=0", (fid,)).fetchone()
+                if r is None:
+                    return self._send(404, {"error": "no such flag"})
+                return self._send(200, {"flag": dict(r)})
+
             if path == "/_sc/mem/roadmap":
                 # The board is shared, not per-shell — return all live features.
                 rm = rows(con.execute(
@@ -2723,6 +2749,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, {"error": "no such flag"})
                 if body.get("resolved"):
                     body.setdefault("resolved_date", date.today().isoformat())
+                # Append to the description in ONE statement (#288 follow-on).
+                # `description` replaces the whole body, so growing a long-lived
+                # tracker flag meant fetch → concatenate → rewrite in the
+                # client, and two shells doing that concurrently lose one
+                # edit. Server-side `||` has no read to lose.
+                add = body.pop("append_description", None)
+                if add:
+                    con.execute(
+                        "UPDATE flags SET description = "
+                        "COALESCE(description,'') || ? WHERE flag_id=?",
+                        (add, fid))
+                    con.commit()
+                    if not any(c in body for c in FLAG_EDITABLE | {"resolved_date"}):
+                        return self._send(200, {"ok": True})
                 ok, err = patch_columns(con, "flags", "flag_id", fid, body,
                                         FLAG_EDITABLE | {"resolved_date"})
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
