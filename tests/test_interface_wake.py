@@ -996,6 +996,30 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.writes, [], "a drained inbox costs no wake turn")
         self.assertIsNone(self.one("SELECT batch_id FROM planner_wake_batches"))
 
+    async def test_probe_still_suppresses_when_the_sweep_loses_the_race(self):
+        """The drain probe's own read_at filter, isolated.
+
+        In the ordinary path the sweep retires read rows first, so the
+        probe's filter never decides anything — remove it and nothing goes
+        red. It exists for the window where a planner reads a row AFTER the
+        sweep commits: neutering the sweep reproduces exactly that state.
+        Without the filter the probe would form a batch and submit a prompt
+        for a row form_batch then refuses to include — a wake for nothing."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        with mock.patch.object(interface_broker, "sweep_read_queued",
+                               return_value=0) as swept:
+            self.coord.notify_binding(self.binding)
+            await asyncio.sleep(0.5)
+            self.assertTrue(swept.called, "the drain path must reach the sweep")
+        self.assertEqual(self.writes, [],
+                         "a read row must not draw a keystroke on its own")
+        self.assertIsNone(self.one("SELECT batch_id FROM planner_wake_batches"),
+                          "no batch may form for a row that cannot be batched")
+        self.assertEqual(
+            self.one("SELECT state FROM planner_wake_items"), "queued",
+            "the row survives for the next sweep — it is not lost")
+
     async def test_unread_row_still_drains_when_a_read_row_precedes_it(self):
         """The suppression is per-row: it must not swallow live work."""
         self.coord.start(asyncio.get_running_loop())
