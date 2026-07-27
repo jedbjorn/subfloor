@@ -732,6 +732,11 @@ def deliver_reconciliation_readings(
                 f"reconciler-alert|{alert_id}",
             ),
         ).lastrowid
+        # H-8: ONE eligibility ladder. This used to check `released_at IS
+        # NULL` alone and could queue an item no gate would ever pass — it
+        # went straight into a stall, invisibly. The alert still records the
+        # binding it belongs to whether or not a wake can ride it.
+        import interface_wake
         binding = con.execute(
             "SELECT binding_id FROM sprint_planner_bindings "
             "WHERE sprint_doc_id=? AND planner_shell_id=? "
@@ -744,11 +749,13 @@ def deliver_reconciliation_readings(
             "WHERE alert_id=?",
             (message_id, binding_id, alert_id),
         )
-        if binding_id is not None:
+        wakeable = interface_wake.eligible_binding(
+            con, sprint_doc_id, planner_shell_id)
+        if wakeable is not None:
             con.execute(
                 "INSERT OR IGNORE INTO planner_wake_items "
                 "(binding_id, message_id) VALUES (?,?)",
-                (binding_id, message_id),
+                (wakeable, message_id),
             )
         emitted.append(message_id)
     return emitted
@@ -1080,14 +1087,16 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     except sqlite3.IntegrityError:
         return None  # the dedupe index — already emitted
     message_id = cur.lastrowid
-    binding = con.execute(
-        "SELECT binding_id FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
-        (watch["sprint_doc_id"], watch["shell_id"])).fetchone()
-    if binding is not None:
+    # H-8: the same eligibility ladder the message ingress uses — an item the
+    # gate can never pass is not created, it is refused, and the condition
+    # behind the refusal is H-5/H-6's to report.
+    import interface_wake
+    binding_id = interface_wake.eligible_binding(
+        con, watch["sprint_doc_id"], watch["shell_id"])
+    if binding_id is not None:
         con.execute(
             "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
-            "VALUES (?, ?)", (binding[0], message_id))
+            "VALUES (?, ?)", (binding_id, message_id))
     return message_id
 
 

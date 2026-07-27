@@ -384,6 +384,64 @@ class DeafSprintAlertTest(WakeFixture):
         self.assertEqual(self.deaf(), [])
 
 
+# ── H-8: one eligibility ladder, two producers ───────────────────────────────
+
+class OneEligibilityLadderTest(WakeFixture):
+    """The poller checked `released_at IS NULL` alone and could queue an item
+    that no gate would ever pass — straight into a stall, invisibly. Both
+    producers now ask the same question, and these cases are exactly the ones
+    the two implementations disagreed on."""
+
+    def both(self):
+        """What each side decides for the CURRENT seat: the shipped ingress
+        path, and the shared ladder the poller now calls.
+
+        That the POLLER calls it is proved in tests/test_pr_poller.py against
+        the real emit path — asserting it here would only compare the ladder
+        with itself."""
+        mid = self.add_message("pr_event")
+        ingress = interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        ladder = interface_wake.eligible_binding(self.con, 1, 1)
+        return ingress is not None, ladder is not None
+
+    def test_a_healthy_seat_queues_from_both(self):
+        """The known-positive control: without it, every agreement below could
+        be two producers both refusing everything."""
+        self.assertEqual(self.both(), (True, True))
+
+    def test_a_capability_gap_refuses_both(self):
+        self.con.execute(
+            "UPDATE interface_sessions SET cli_version='kimi-code 0.1.0' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False),
+                         "the poller queued this one — an item that can never "
+                         "submit, into a stall nothing reported")
+
+    def test_a_replaced_generation_refuses_both(self):
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET generation=2 "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+    def test_an_ended_session_refuses_both(self):
+        interface_broker.close_session(self.con, self.sid, "operator_end")
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+    def test_a_frozen_sprint_refuses_both(self):
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+    def test_a_released_binding_refuses_both(self):
+        interface_broker.release_binding(self.con, self.binding, "test")
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+
 # ── H-6: binding release is an event, not an absence ─────────────────────────
 
 class BindingReleaseIsAnEventTest(WakeFixture):

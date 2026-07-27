@@ -360,9 +360,13 @@ class PollCycleTest(unittest.TestCase):
     def test_scoped_merge_emits_pr_event_queues_wake_and_retires(self):
         self.con.executescript(
             "INSERT INTO interface_generations (shell_id, generation) VALUES (1, 1);"
+            # H-8: the harness/version are load-bearing now — one
+            # eligibility ladder means the poller refuses a seat the arm
+            # route would have refused, and a session with no harness at all
+            # is exactly such a seat.
             "INSERT INTO interface_sessions "
-            "(shell_id, generation, occupancy, lifecycle) "
-            "VALUES (1, 1, 'occupied', 'idle');"
+            "(shell_id, generation, occupancy, lifecycle, harness, cli_version) "
+            "VALUES (1, 1, 'occupied', 'idle', 'kimi', 'kimi-code 0.27.0');"
             "INSERT INTO sprint_planner_bindings "
             "(sprint_doc_id, planner_shell_id, session_id, shell_id, generation) "
             "VALUES (100, 1, 1, 1, 1);"
@@ -470,8 +474,9 @@ class PollCycleTest(unittest.TestCase):
         # work in the same transaction — unique (binding_id, message_id).
         self.con.executescript(
             "INSERT INTO interface_generations (shell_id, generation) VALUES (1, 1);"
-            "INSERT INTO interface_sessions (shell_id, generation, occupancy, lifecycle) "
-            "VALUES (1, 1, 'occupied', 'idle');"
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle, harness, cli_version) "
+            "VALUES (1, 1, 'occupied', 'idle', 'kimi', 'kimi-code 0.27.0');"
             "INSERT INTO sprint_planner_bindings "
             "(sprint_doc_id, planner_shell_id, session_id, shell_id, generation) "
             "VALUES (100, 1, 1, 1, 1);")
@@ -489,6 +494,66 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(items[0]["state"], "queued")
         self.assertEqual(items[0]["kind"], "pr_event")
         self.assertEqual(items[0]["sprint_doc_id"], 100)
+
+    def _armed_seat(self, harness="kimi", cli_version="kimi-code 0.27.0",
+                    session_generation=1):
+        """An armed binding on generation 1. `session_generation=2` models the
+        seat restarting under a binding that still names the old one: the
+        session is live and occupied, and the binding is nonetheless stale —
+        which is the case the poller could not tell from a healthy one."""
+        self.con.execute(
+            "INSERT INTO interface_generations (shell_id, generation, ended_at)"
+            " VALUES (1, 1, ?)",
+            (None if session_generation == 1 else "2026-01-01 00:00:00",))
+        if session_generation != 1:
+            self.con.execute(
+                "INSERT INTO interface_generations (shell_id, generation) "
+                "VALUES (1, ?)", (session_generation,))
+        sid = self.con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle, harness, cli_version) VALUES (1,?,'occupied','idle',"
+            "?,?)", (session_generation, harness, cli_version)).lastrowid
+        self.con.execute(
+            "INSERT INTO sprint_planner_bindings (sprint_doc_id, "
+            "planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (100, 1, ?, 1, 1)", (sid,))
+        self.con.commit()
+
+    def _emit_and_count(self):
+        """Two real poll cycles — baseline then transition — and how many wake
+        items the poller's own emit path created."""
+        pr_poller.poll_cycle(self.con, fetch_ok(gh_node(checks="PENDING"),
+                                                gh_node(checks="PENDING")))
+        pr_poller.poll_cycle(self.con, fetch_ok(gh_node(checks="SUCCESS"),
+                                                gh_node(checks="PENDING")))
+        return self.con.execute(
+            "SELECT COUNT(*) FROM planner_wake_items").fetchone()[0]
+
+    def test_the_poller_refuses_a_seat_that_could_never_submit(self):
+        """H-8. The poller checked `released_at IS NULL` and nothing else, so
+        these three seats each got a wake item queued into a stall no surface
+        reported. It now asks the message ingress's own question.
+
+        The armed case above is the known positive for this instrument: every
+        zero here is measured against a path proven to produce a 1."""
+        cases = {
+            "hook-incapable harness": dict(harness="codex",
+                                           cli_version="codex-cli 0.1.0"),
+            "no harness recorded at all": dict(harness=None,
+                                               cli_version=None),
+            "generation moved on under the binding":
+                dict(session_generation=2),
+        }
+        for name, seat in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                self._armed_seat(**seat)
+                self.assertEqual(self._emit_and_count(), 0)
+                self.assertGreater(
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM shell_messages").fetchone()[0], 0,
+                    "the pr_event itself is still emitted and still durable — "
+                    "only the unusable wake item is refused")
 
 
 # ── migration 0080: the uniqueness rebuild ────────────────────────────────────

@@ -42,20 +42,55 @@ RETRY_DELAYS_S = (1.0, 5.0, 30.0)  # bounded pre-send retries (spec table)
 
 # ── Event ingress (in-transaction wake-item creation) ────────────────────────
 
+def eligible_binding(con, sprint_doc_id, planner_shell_id) -> "int | None":
+    """THE eligibility ladder for creating a wake item — one implementation,
+    every producer (H-8). Returns the binding_id that can actually carry a
+    wake for this planner on this sprint, or None.
+
+    A LIVE sprint (`sprint_state`: a sprint doc, unfrozen, holding a board);
+    an unreleased binding naming that planner; the binding's Interface session
+    still occupied on the binding's own generation (not ended, not replaced);
+    and a harness that supports the mandatory lifecycle hooks — a capability
+    gap refuses arming AND ingress, because the wake would be unverifiable.
+
+    The PR poller used to check only `released_at IS NULL` and could queue an
+    item that no gate would ever pass: it went straight into a stall, which is
+    the shape this sprint exists to remove. The condition behind a refusal is
+    now surfaced instead — H-5 for a live sprint with no binding, H-6 for a
+    binding released mid-sprint — rather than queued and forgotten."""
+    if sprint_doc_id is None or planner_shell_id is None:
+        return None
+    if not sprint_state.is_live_sprint(con, sprint_doc_id):
+        return None
+    binding = con.execute(
+        "SELECT binding_id, session_id, generation "
+        "FROM sprint_planner_bindings "
+        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
+        (sprint_doc_id, planner_shell_id)).fetchone()
+    if binding is None:
+        return None
+    sess = con.execute(
+        "SELECT occupancy, generation, harness, cli_version "
+        "FROM interface_sessions WHERE session_id=?", (binding[1],)).fetchone()
+    if sess is None or sess[0] != "occupied" or sess[1] != binding[2]:
+        return None  # session ended or generation replaced — binding is stale
+    if not interface_hooks.capability(sess[2], sess[3])["mandatory_ok"]:
+        return None
+    return binding[0]
+
+
 def maybe_create_wake_item(con, message_id: int) -> "int | None":
     """Create the wake item for one freshly inserted message iff it is
     eligible (spec #20 Sprint Scope) — same transaction as the message, so
     the pair is atomic. Returns the item_id, or None when ineligible.
 
-    Eligibility, exactly the spec's list: a typed sprint event (task /
-    result / pr_event — `shell` and legacy unscoped traffic NEVER wake),
-    carrying a sprint_doc_id naming a LIVE sprint (`sprint_state` — a sprint
-    doc, unfrozen, holding a board); an ACTIVE (unreleased) binding for that
-    sprint names this message's recipient as planner; the binding's Interface
-    session and generation are still live (not ended/replaced); and the
-    harness supports the mandatory lifecycle hooks (a capability gap
-    refuses arming AND ingress — the wake would be unverifiable). Message
-    bodies are never parsed for sprint identity.
+    Eligibility is TWO questions, and only the first belongs to this path:
+    is the message a typed sprint event (task / result / pr_event — `shell`
+    and legacy unscoped traffic NEVER wake) carrying a sprint_doc_id? The
+    rest — live sprint, unreleased binding, live session on the binding's own
+    generation, mandatory hooks — is `eligible_binding`, shared with the PR
+    poller so the two producers cannot drift (H-8). Message bodies are never
+    parsed for sprint identity.
 
     H-5: one of those refusals is a LOSS rather than a deferral and now says
     so. A `task`/`result` addressed into a LIVE sprint that has no unreleased
@@ -76,15 +111,11 @@ def maybe_create_wake_item(con, message_id: int) -> "int | None":
     if msg is None or msg[1] not in ELIGIBLE_KINDS or msg[2] is None:
         return None
     to_shell_id, kind, sprint_doc_id = msg
-    if not sprint_state.is_live_sprint(con, sprint_doc_id):
-        return None
-    binding = con.execute(
-        "SELECT binding_id, session_id, shell_id, generation "
-        "FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
-        (sprint_doc_id, to_shell_id)).fetchone()
-    if binding is None:
-        if kind in DEAF_SPRINT_KINDS:
+    binding_id = eligible_binding(con, sprint_doc_id, to_shell_id)
+    if binding_id is None:
+        if kind in DEAF_SPRINT_KINDS \
+                and sprint_state.is_live_sprint(con, sprint_doc_id) \
+                and _no_binding(con, sprint_doc_id, to_shell_id):
             # Deduped on the sprint doc: one open row per deaf sprint, no
             # matter how many senders discover it. The recipient is named in
             # the detail rather than the key — a sprint with two unbound
@@ -96,17 +127,21 @@ def maybe_create_wake_item(con, message_id: int) -> "int | None":
                         f"binding on this live sprint — the message will not "
                         f"be delivered by any later event"))
         return None
-    sess = con.execute(
-        "SELECT occupancy, generation, harness, cli_version "
-        "FROM interface_sessions WHERE session_id=?", (binding[1],)).fetchone()
-    if sess is None or sess[0] != "occupied" or sess[1] != binding[3]:
-        return None  # session ended or generation replaced — binding is stale
-    if not interface_hooks.capability(sess[2], sess[3])["mandatory_ok"]:
-        return None
     cur = con.execute(
         "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
-        "VALUES (?, ?)", (binding[0], message_id))
+        "VALUES (?, ?)", (binding_id, message_id))
     return cur.lastrowid if cur.rowcount else None
+
+
+def _no_binding(con, sprint_doc_id, planner_shell_id) -> bool:
+    """H-5's condition specifically: NO unreleased binding, as distinct from
+    a binding that exists and is merely unusable. The ladder collapses every
+    refusal to None, and only this one is a loss — a stale session or a
+    capability gap still has a binding, and both are H-6/H-26's to report."""
+    return con.execute(
+        "SELECT 1 FROM sprint_planner_bindings "
+        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL "
+        "LIMIT 1", (sprint_doc_id, planner_shell_id)).fetchone() is None
 
 
 # ── The coordinator ───────────────────────────────────────────────────────────
