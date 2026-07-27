@@ -30,10 +30,19 @@ Verified against the installed CLIs (2026-07-23):
   and AskUserQuestion has none — per spec a harness lacking distinct
   approval/user-input hooks stays `busy` during the wait (safe), so those
   events are deliberately not mapped.
-- codex 0.145.0: hooks feature stable+on; SessionStart (during session
-  init — pre-prompt), UserPromptSubmit, Stop, SessionEnd (present in the
-  binary, undocumented on the hooks page). No approval-result, user-input,
-  interrupt, or failure events.
+- codex 0.145.0: hooks feature stable+on; SessionStart, UserPromptSubmit,
+  Stop, SessionEnd (present in the binary, undocumented on the hooks page).
+  No approval-result, user-input, interrupt, or failure events.
+  CORRECTION (2026-07-27, flag #303, measured on a live 0.145.0 TUI seat):
+  codex does NOT fire SessionStart during session init. It DEFERS it to the
+  first user prompt submission — a turn-less seat emits nothing at all, and
+  the first turn then fires SessionStart, UserPromptSubmit and Stop together,
+  in that order. Config discovery and trust are NOT implicated: the project
+  `.codex/hooks.json` is discovered, parsed, validated (codex clamps our
+  SessionEnd timeout) and persisted into `[hooks.state]` regardless. The
+  `readiness` value below is therefore WRONG for codex and is left as-is
+  pending the sprint-84 U7 ruling on how to represent a first-turn-gated
+  harness; see the flag before trusting it.
 - kimi 0.27.0: full 16-event HookEngine; SessionStart is awaited as the
   FINAL step of session creation (the strongest readiness signal of the
   three), UserPromptSubmit, Stop, Interrupt, StopFailure, SessionEnd,
@@ -93,9 +102,14 @@ def _emitter_command(event: str) -> str:
 # readiness: how strong the harness's session_start is as a start-READY
 # proof — 'session_created' = fires after session construction completes
 # (kimi: awaited final step of createMain); 'startup_hook' = fires during
-# startup, before the interactive prompt is proven painted (claude/codex).
+# startup, before the interactive prompt is proven painted (claude).
 # Neither CLI offers a later native prompt-ready signal; the wake gate's
 # quiet debounce + submit-hook fence absorb the residual window.
+# A THIRD class is now known to exist and has no value here yet: codex 0.145.0
+# defers SessionStart to the first user turn, so its readiness never arrives
+# unbidden on a seat that is waiting to be woken (flag #303 — the wake path
+# would be waiting on a hook that only a human can trigger). Naming that class
+# and deciding what arms on it is the sprint-84 U7 ruling.
 
 CAPABILITIES = {
     "claude": {
@@ -111,10 +125,15 @@ CAPABILITIES = {
         "min_version": (0, 145, 0),
         "events": ("session_start", "prompt_submit", "turn_stop",
                    "session_end"),
+        # KNOWN WRONG (flag #303) — measured 0.145.0 behaviour is neither
+        # 'startup_hook' nor 'session_created': SessionStart is deferred to the
+        # first user prompt. Left unchanged pending the U7 ruling because the
+        # arming gate reads it; changing the value changes what "ready" means.
         "readiness": "startup_hook",
         "degraded": ("no approval, user-input, interrupt, or failure hook "
                      "events — approval waits stay busy (safe); SessionEnd "
-                     "is undocumented but present in 0.145.0"),
+                     "is undocumented but present in 0.145.0; SessionStart is "
+                     "NOT delivered until the first user turn (flag #303)"),
     },
     "kimi": {
         "min_version": (0, 14, 0),
