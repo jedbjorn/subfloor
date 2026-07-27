@@ -1329,7 +1329,11 @@ case "$cmd" in
       esac
     fi
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
-    docker run -d --name "$CNAME" --restart unless-stopped \
+    # Docker's init shim is PID 1 so orphaned harness/worker subprocesses are
+    # reaped. Without it the Python API server becomes PID 1, never wait()s on
+    # reparented children, and a long-running multi-shell sprint exhausts the
+    # container's PID limit with zombies (flag #323).
+    docker run -d --name "$CNAME" --restart unless-stopped --init \
       --network "$SC_NET" \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \

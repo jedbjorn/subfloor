@@ -268,7 +268,13 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.fx.calls()
         self.assertIn("docker image inspect super-coder-sandbox", calls)
-        self.assertTrue(any(line.startswith("docker run -d") for line in calls))
+        sandbox_run = next(
+            line
+            for line in calls
+            if line.startswith("docker run -d")
+            and f"--name sc-{self.fx.root.name}" in line
+        )
+        self.assertIn(" --init ", sandbox_run)
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
 
     def test_launch_no_build_missing_image_refuses_before_runtime_change(self):
