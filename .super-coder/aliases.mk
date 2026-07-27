@@ -19,7 +19,10 @@
 #   make dos-l   / dos-launch    build + start the docker sandbox (+ review GUI)
 #   make dos-r   / dos-restart   confirm (YES) + DB backup, then down + launch
 #   make dos-d   / dos-down      stop the sandbox
-#   make dos-u   / dos-update    fetch + materialize the engine, reconcile in place
+#   make dos-u   / dos-update    sync + materialize the engine, reconcile in place
+#                                (source repo: fast-forwards the checkout first —
+#                                 it reconciles FROM that tree, so a stale one
+#                                 would lay a stale floor. ARGS=--no-fetch opts out.)
 #   make dos-t   / dos-test      backend (pytest/unittest) + UI (vitest) suites
 #   make dos-url                 print the review GUI + dev-server URLs
 #   make dos-h                   list the commands

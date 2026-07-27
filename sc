@@ -1490,6 +1490,8 @@ super-coder — forkable shell substrate
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
                              live Interface state asks continue-or-rollback; headless discard requires --discard-live-state
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
+                             source repo: no materialize — fast-forwards the checkout first (ff-only; aborts if dirty or diverged),
+                             because the floor is reconciled FROM that tree
   ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
                              (they are baked, never mounted — so a running sandbox keeps the old ones until ./sc restart)
                              without docker, updates this host's CLIs instead — there the host IS the runtime
