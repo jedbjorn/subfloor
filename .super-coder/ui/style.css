@@ -577,6 +577,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 
 /* Active sprint flow boards — one self-contained, read-only graph per sprint. */
 #view-sprints, .sprint-board { min-width: 0; }
+#view-sprints { max-width: 1350px; }
 .sprint-board { overflow: hidden; }
 .sprint-header { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
 .sprint-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -588,7 +589,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   pointer-events: none; overflow: visible; }
 .sprint-cols { position: relative; z-index: 1; display: flex; gap: 1.35rem;
   align-items: flex-start; padding: 0 .15rem; }
-.sprint-col { flex: 1 0 150px; min-width: 150px; display: flex;
+.sprint-col { flex: 1 1 0; min-width: 150px; display: flex;
   flex-direction: column; gap: .65rem; }
 .sprint-col-head { display: flex; align-items: center; gap: .35rem;
   min-height: 1.6rem; padding-bottom: .3rem; border-bottom: 1px solid var(--line-soft);
@@ -597,7 +598,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .sprint-col-head .count { min-width: 1.3rem; padding: 0 .32rem;
   border: 1px solid var(--line); border-radius: 999px; color: var(--ink);
   font-size: .65rem; line-height: 1.25rem; text-align: center; }
-.sprint-unit { min-width: 0; padding: .55rem .6rem; border: 1px solid var(--line);
+.sprint-unit { width: 100%; min-width: 0; padding: .55rem .6rem; border: 1px solid var(--line);
   border-left: 3px solid var(--line); border-radius: 9px; background: var(--panel2);
   cursor: pointer; transition: opacity .12s, border-color .12s, box-shadow .12s; }
 .sprint-unit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
