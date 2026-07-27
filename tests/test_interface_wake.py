@@ -1086,6 +1086,246 @@ class HooksMissingAtSubmitTest(WakeFixture):
         self.assertIn("wake_hooks_missing_at_submit", reasons)
 
 
+# ── H-27: a declared hook is trusted only while it is OBSERVED ───────────────
+
+class _SilenceProbe(WakeFixture):
+    """Shared readings for the `hooks_declared_but_silent` measurements."""
+
+    def silent(self):
+        return self.con.execute(
+            "SELECT reason, detail, batch_id, session_id, severity "
+            "FROM planner_alerts "
+            "WHERE reason='hooks_declared_but_silent' AND resolved_at IS NULL "
+            "ORDER BY alert_id").fetchall()
+
+    def check(self, **kw):
+        out = interface_broker.hooks_silence_alert(self.con, self.binding, **kw)
+        self.con.commit()
+        return out
+
+
+class ReadinessSilenceTest(_SilenceProbe):
+    """A harness that declares session_start arrives at STARTUP and has not
+    stamped provider_ready_at is contradicting its own declaration. kimi
+    (`session_created`) stands in for that whole class."""
+
+    def age_session(self, seconds):
+        _age(self.con, "interface_sessions", "created_at", self.sid, seconds,
+             "session_id")
+        self.con.commit()
+
+    def test_declared_startup_readiness_unobserved_past_threshold_alerts(self):
+        self.age_session(400)
+        self.assertIsNone(self.check(),
+                          "an opened alert leaves no pending deadline")
+        rows = self.silent()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("names the unobserved event"):
+            self.assertIn("'session_start'", rows[0][1])
+        with self.subTest("names the harness verbatim"):
+            self.assertIn(self.HARNESS, rows[0][1])
+        with self.subTest("names the cli_version verbatim"):
+            self.assertIn(self.CLI_VERSION, rows[0][1])
+        with self.subTest("scoped to the session, not a batch"):
+            self.assertEqual(rows[0][2], None)
+            self.assertEqual(rows[0][3], self.sid)
+
+    def test_inside_the_threshold_stays_silent_and_reports_the_deadline(self):
+        self.age_session(30)
+        pending = self.check()
+        self.assertEqual(self.silent(), [],
+                         "a booting seat is not a silent one")
+        self.assertIsNotNone(pending)
+        self.assertAlmostEqual(
+            pending, interface_broker.HOOKS_READY_SILENT_S - 30, delta=2.0,
+            msg="the caller arms its one re-check from this number")
+
+    def test_the_alert_dedupes_while_open(self):
+        self.age_session(400)
+        self.check()
+        self.check()
+        self.assertEqual(len(self.silent()), 1)
+
+    def test_observed_readiness_resolves_the_alert(self):
+        self.age_session(400)
+        self.check()
+        self.assertEqual(len(self.silent()), 1)
+        interface_broker.record_hook(self.con, 1, 1, 7, "session_start",
+                                     source="provider")
+        self.con.commit()
+        self.assertEqual(self.silent(), [],
+                         "the promised hook arrived — the declaration is no "
+                         "longer contradicted")
+
+    def test_a_released_binding_is_not_measured(self):
+        self.age_session(400)
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now') "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+        self.assertIsNone(self.check())
+        self.assertEqual(self.silent(), [],
+                         "H-27 scopes to sessions under an ARMED binding")
+
+    def test_threshold_resolves_at_call_time(self):
+        """A default argument would bind the constant at import and leave the
+        module attribute a decoy that reads correctly and changes nothing."""
+        self.age_session(30)
+        with mock.patch.object(interface_broker, "HOOKS_READY_SILENT_S", 1.0):
+            self.check()
+        self.assertEqual(len(self.silent()), 1)
+
+
+class FirstTurnGatedSilenceTest(_SilenceProbe):
+    """THE decisive case for decisions #98/#99. On codex, readiness is gated
+    on a human submitting the first turn, so the delay is unbounded and a
+    healthy idle seat waiting to be woken is indistinguishable by elapsed
+    time from a broken one. A time-based readiness alert would fire on every
+    correct codex seat — the monitor lying that decision #76 forbids."""
+
+    HARNESS = "codex"
+    CLI_VERSION = "codex-cli 0.145.0"
+    LIFECYCLE = "starting"
+    COMPOSER = "unknown"
+
+    def test_a_healthy_idle_codex_seat_never_trips_the_readiness_clause(self):
+        _age(self.con, "interface_sessions", "created_at", self.sid, 86400,
+             "session_id")
+        self.con.commit()
+        self.assertIsNone(self.check(),
+                          "not even a pending deadline — the clause is not "
+                          "evaluated for a first_turn_gated harness at all")
+        self.assertEqual(self.silent(), [])
+
+    def test_the_same_seat_still_reports_submit_silence(self):
+        """Dropping clause 1 for codex must not make codex unmeasurable: the
+        submit-silence measurement has no readiness operand and applies to
+        every harness."""
+        interface_broker.record_hook(self.con, 1, 1, 1, "session_start",
+                                     source="entrypoint",
+                                     hooks_installed=True)
+        _age(self.con, "interface_sessions", "process_ready_at", self.sid, 60,
+             "session_id")
+        self.con.commit()
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch = self.form()
+        self.assertTrue(self.submit(batch, lambda n: None)["submitted"])
+        _age(self.con, "planner_wake_batches", "submitting_at", batch, 120,
+             "batch_id")
+        self.con.commit()
+        self.check()
+        rows = self.silent()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("'prompt_submit'", rows[0][1])
+
+
+class SubmitSilenceTest(_SilenceProbe):
+    """U7's F13 measurement, on the floor U7 laid: a live, trusted,
+    hooks-installed seat across which not one provider hook arrives. Post-U7
+    that seat no longer parks in `starting` where the arming gate could see
+    it — the wake goes out and the batch stops in `submitting`, where
+    `_drain_sync` returns early and nothing in flight ever looks again."""
+
+    def setUp(self):
+        super().setUp()
+        # A kimi seat that reached `idle` has by construction already had its
+        # provider session_start, so stamp it: without this the readiness
+        # clause is legitimately pending and every reading in this class
+        # carries two measurements at once.
+        self.con.execute(
+            "UPDATE interface_sessions "
+            "SET provider_ready_at=datetime('now','-60 seconds') "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+
+    def submitted_batch(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch = self.form()
+        self.assertTrue(self.submit(batch, lambda n: None)["submitted"])
+        return batch
+
+    def age_submit(self, batch, seconds):
+        _age(self.con, "planner_wake_batches", "submitting_at", batch,
+             seconds, "batch_id")
+        self.con.commit()
+
+    def test_the_submitting_transition_stamps_when_the_wait_began(self):
+        batch = self.submitted_batch()
+        stamped, answered = self.con.execute(
+            "SELECT submitting_at, submitted_at FROM planner_wake_batches "
+            "WHERE batch_id=?", (batch,)).fetchone()
+        with self.subTest("the wait has a start"):
+            self.assertIsNotNone(stamped)
+        with self.subTest("and it is not the hook's own stamp"):
+            self.assertIsNone(
+                answered,
+                "submitted_at is written BY the prompt_submit hook, so on a "
+                "silent seat it is NULL forever — it cannot time this wait")
+
+    def test_a_submit_hook_that_never_answers_alerts(self):
+        batch = self.submitted_batch()
+        self.age_submit(batch, 120)
+        self.assertIsNone(self.check())
+        rows = self.silent()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("names the unobserved event"):
+            self.assertIn("'prompt_submit'", rows[0][1])
+        with self.subTest("keyed on the batch"):
+            self.assertEqual(rows[0][2], batch)
+        with self.subTest("names harness and version verbatim"):
+            self.assertIn(self.HARNESS, rows[0][1])
+            self.assertIn(self.CLI_VERSION, rows[0][1])
+
+    def test_an_ordinary_submit_stays_silent(self):
+        self.submitted_batch()
+        pending = self.check()
+        self.assertEqual(self.silent(), [],
+                         "the hook has had a second, not a minute")
+        self.assertIsNotNone(pending)
+        self.assertLessEqual(pending, interface_broker.HOOKS_SUBMIT_SILENT_S)
+
+    def test_the_submit_hook_arriving_resolves_the_silence(self):
+        batch = self.submitted_batch()
+        self.age_submit(batch, 120)
+        self.check()
+        self.assertEqual(len(self.silent()), 1)
+        interface_broker.record_hook(self.con, 1, 1, 8, "prompt_submit")
+        self.con.commit()
+        with self.subTest("batch progressed"):
+            self.assertEqual(self.batch_state(batch), "running")
+        with self.subTest("alert resolved"):
+            self.assertEqual(self.silent(), [])
+
+    def test_a_batch_predating_the_stamp_is_unmeasured_not_silent(self):
+        """A NULL submitting_at is a row written before migration 0117, not a
+        batch submitted zero seconds ago. Reporting it as silent would invent
+        a measurement that was never taken."""
+        batch = self.submitted_batch()
+        self.con.execute(
+            "UPDATE planner_wake_batches SET submitting_at=NULL "
+            "WHERE batch_id=?", (batch,))
+        self.con.commit()
+        self.assertIsNone(self.check())
+        self.assertEqual(self.silent(), [])
+
+    def test_a_running_batch_is_not_measured_for_submit_silence(self):
+        """Once the submit hook has answered, the batch is waiting on the
+        MODEL, and a model turn has no honest upper bound. This is the
+        boundary of what H-27 measures — see hooks_silence_alert's docstring
+        for why the literal turn_stop clause is not implemented here."""
+        batch = self.submitted_batch()
+        interface_broker.record_hook(self.con, 1, 1, 8, "prompt_submit")
+        self.con.commit()
+        self.age_submit(batch, 86400)
+        self.assertIsNone(self.check())
+        self.assertEqual(self.silent(), [],
+                         "a long turn is not a silent hook")
+
+
 # ── The coordinator: event-driven drain, retries, parking non-bypass ─────────
 
 class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
@@ -1183,6 +1423,48 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
                          [len(interface_broker.WAKE_PROMPT) + 1])
         state = self.one("SELECT state FROM planner_wake_batches")
         self.assertEqual(state, "submitting")
+
+    async def test_a_submitted_batch_nobody_answers_becomes_an_alert(self):
+        """H-27 end to end, and the reason it had to reach the coordinator:
+        `_drain_sync` returns early on 'submitting' with "the hook evidence
+        drives it from here", and on a dead chain there IS no hook evidence.
+        Before this the batch sat there until a restart swept it."""
+        with mock.patch.object(interface_broker, "HOOKS_SUBMIT_SILENT_S", 0.2):
+            self.coord.start(asyncio.get_running_loop())
+            self.add_message("task")
+            self.coord.notify_binding(self.binding)
+            opened = await self.wait_for(lambda: self.one(
+                "SELECT COUNT(*) FROM planner_alerts "
+                "WHERE reason='hooks_declared_but_silent' "
+                "AND batch_id IS NOT NULL AND resolved_at IS NULL") == 1)
+        self.assertTrue(opened, "a submit no hook answers must become visible")
+        self.assertEqual(self.writes, [len(interface_broker.WAKE_PROMPT) + 1],
+                         "the wake still went out — this observes, never gates")
+        self.assertEqual(self.one("SELECT state FROM planner_wake_batches"),
+                         "submitting")
+        self.assertIn("'prompt_submit'", self.one(
+            "SELECT detail FROM planner_alerts "
+            "WHERE reason='hooks_declared_but_silent'"))
+
+    async def test_an_answered_submit_hook_leaves_the_coordinator_silent(self):
+        """The negative control for the test above, run on the SAME instrument
+        at the same threshold: the only difference is that the hook arrives."""
+        with mock.patch.object(interface_broker, "HOOKS_SUBMIT_SILENT_S", 0.2):
+            self.coord.start(asyncio.get_running_loop())
+            self.add_message("task")
+            self.coord.notify_binding(self.binding)
+            self.assertTrue(await self.wait_for(lambda: len(self.writes) == 1))
+            con = self.connect()
+            interface_broker.record_hook(con, 1, 1, 8, "prompt_submit")
+            con.commit()
+            con.close()
+            self.coord.notify_binding(self.binding)
+            fired = await self.wait_for(lambda: self.one(
+                "SELECT COUNT(*) FROM planner_alerts "
+                "WHERE reason='hooks_declared_but_silent'") > 0, timeout=1.5)
+        self.assertFalse(fired, "an observed hook is not a silent one")
+        self.assertEqual(self.one("SELECT state FROM planner_wake_batches"),
+                         "running")
 
     async def test_drained_inbox_forms_no_batch_and_writes_nothing(self):
         """H-4 end to end: every queued row read before the drain → no

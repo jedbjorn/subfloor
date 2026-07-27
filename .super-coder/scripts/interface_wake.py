@@ -207,6 +207,24 @@ class WakeCoordinator:
             if binding is None or binding[3] is not None:
                 return
             session_id = binding[0]
+            # H-27: check the DECLARED hook chain against what has actually
+            # arrived, before any of this tick's own work. It runs first
+            # because the early returns below are exactly where the silence
+            # used to become invisible — most of all the submitting/running
+            # one, whose comment ("the hook evidence drives it from here")
+            # is only true while the hooks are in fact delivering.
+            #
+            # The re-check shares the binding's single timer with H-26's
+            # stall check, which replaces rather than stacks. That is safe
+            # and deliberate: every timer fires a FULL re-drain, so the later
+            # of the two deadlines still runs both measurements — the
+            # observation can be deferred, never dropped. On the path that
+            # matters most (a batch stuck `submitting`) H-26 arms nothing at
+            # all, so this timer stands alone.
+            recheck = interface_broker.hooks_silence_alert(con, binding_id)
+            if recheck is not None:
+                self._schedule_retry(binding_id, recheck)
+
             live = con.execute(
                 "SELECT batch_id, state FROM planner_wake_batches "
                 "WHERE binding_id=? AND state IN ('queued','submitting',"
@@ -247,6 +265,15 @@ class WakeCoordinator:
                 return
             if out.get("submitted"):
                 self._pre_send_attempts.pop(batch_id, None)
+                # H-27: a submitted batch is now waiting on a hook that may
+                # never come, and this drain is the last thing scheduled to
+                # run — the submitting/running early return above is a return,
+                # not a re-check. Arm the one wakeup that turns that silence
+                # into an alert. It costs a single no-op drain per submitted
+                # batch on a healthy seat, which is what observing the hook
+                # rather than trusting its declaration is worth.
+                self._schedule_retry(
+                    binding_id, interface_broker.HOOKS_SUBMIT_SILENT_S)
             elif out.get("retry_after") is not None:
                 self._schedule_retry(binding_id, out["retry_after"])
             elif not out.get("cancelled"):

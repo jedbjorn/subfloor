@@ -37,6 +37,28 @@ MAX_COMPLETED_WAKES = 3  # unread after 3 completed wake turns → quarantined
 # cause. Five minutes is far outside any ordinary deferral (the debounce is
 # 3 seconds) and far inside the window where a stalled sprint still matters.
 WAKE_BATCH_STALL_S = 300.0
+# H-27: how long a DECLARED hook may go unobserved before the declaration is
+# reported as contradicted. Two measurements, two constants, because they
+# measure different silences.
+#
+# HOOKS_READY_SILENT_S — session creation to the harness's own session_start,
+# for a harness that declares it arrives at startup. Not a fitted number:
+# nothing in the deployment sample is a distribution to fit (claude 46/46 and
+# kimi 2/2 stamped; the codex readings are first-turn-gated and this clause is
+# not evaluated for them at all — decisions #98/#99). Three minutes is far
+# outside any harness boot and far inside the window where a deaf planner
+# still matters.
+#
+# HOOKS_SUBMIT_SILENT_S — the submitting -> running wait for the submit hook.
+# Much tighter, and it can be, because NO model latency sits inside it: the
+# engine wrote the bytes and pressed Enter, and UserPromptSubmit fires at that
+# keystroke. A minute is two orders of magnitude past the hook's own round
+# trip.
+#
+# Both bound INVISIBILITY, not delivery — nothing here hurries a hook, and
+# neither threshold is evaluated for a seat that has already been observed.
+HOOKS_READY_SILENT_S = 180.0
+HOOKS_SUBMIT_SILENT_S = 60.0
 
 
 class BrokerError(ValueError):
@@ -600,6 +622,13 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
             con.execute(
                 "UPDATE interface_sessions SET provider_ready_at=datetime('now') "
                 "WHERE session_id=?", (sess[0],))
+            # H-27: the declaration is no longer contradicted — the hook it
+            # promised has arrived. Only the readiness row (batch_id IS NULL);
+            # a batch's submit silence is its own condition and its own row.
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE session_id=? AND reason='hooks_declared_but_silent' "
+                "AND batch_id IS NULL AND resolved_at IS NULL", (sess[0],))
             istate = con.execute(
                 "SELECT composer, pending_seq, forwarded_seq "
                 "FROM interface_input_state WHERE session_id=?",
@@ -686,6 +715,9 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
                     con, "wake_batch", batch[0], "running",
                     extra_sets={"submit_hook_seq": hook_seq,
                                 "submitted_at": _now(con)})
+                # H-27: the submit hook answered, so this batch's silence is
+                # over — including an alert opened while it was pending.
+                resolve_batch_alerts(con, batch[0])
                 con.execute(
                     "UPDATE planner_wake_items SET state='running' "
                     "WHERE batch_id=? AND state='submitting'",
@@ -912,6 +944,121 @@ def stalled_batch_alert(con, batch_id: int, threshold_s=None) -> bool:
            binding_id=binding_id, batch_id=batch_id,
            detail=(gate_reason or "no gate attempt recorded"))
     return True
+
+
+def _silence_detail(harness, cli_version, unobserved: str,
+                    measured: str) -> str:
+    """The one sentence a `hooks_declared_but_silent` alert carries: which
+    harness at which version declared which event, and what was actually
+    seen. States the measurement and stops there — decision #76 forbids a
+    monitor that reports a verdict, and "which declared event never arrived"
+    is precisely the fact no other surface holds."""
+    return (f"harness={harness!r} cli_version={cli_version!r} "
+            f"declares {unobserved!r} — {measured}")
+
+
+def hooks_silence_alert(con, binding_id: int, ready_s=None,
+                        submit_s=None) -> "float | None":
+    """Check a declared hook chain against what has ACTUALLY arrived, for the
+    session under one armed binding (H-27). Opens a deduped
+    `hooks_declared_but_silent` naming the harness, its cli_version, and the
+    declared event that was never observed.
+
+    Returns the seconds until the nearest threshold falls due while one is
+    still pending, so the caller can arm a single bounded re-check; None when
+    nothing is pending. Thresholds resolve at CALL time, never in the
+    signature — a default argument would bind the constant at import and
+    leave the module attribute a decoy that reads correctly and changes
+    nothing (the same trap H-26's stall threshold sprang).
+
+    TWO MEASUREMENTS, AND THE ONE THIS DELIBERATELY DOES NOT MAKE.
+
+    1. Readiness. A harness that declares session_start arrives at startup
+       (claude `startup_hook`, kimi `session_created`) and has not stamped
+       `provider_ready_at` is contradicting its own declaration. NOT
+       evaluated for a `first_turn_gated` harness: there readiness is gated
+       on a human submitting the first turn, so the delay is unbounded and a
+       healthy idle codex seat waiting to be woken is indistinguishable by
+       elapsed time from a broken one. Alerting on it would fire on every
+       correct codex seat — the monitor lying that decision #76 forbids and
+       this sprint exists to remove (decisions #98/#99, U7 finding F8).
+
+    2. Submit silence. The engine itself wrote the bytes and pressed Enter,
+       so a batch that entered `submitting` and stayed there is a submit hook
+       that did not fire — no model latency sits inside that wait, and no
+       healthy shape produces it. This is where U7's F13 measurement lands on
+       the post-U7 floor: a live, trusted, hooks-installed seat is now
+       promoted on the weak process_ready_at proof and the wake goes out, so
+       a dead chain no longer parks in `starting` where the arming gate could
+       see it — it parks HERE, where `_drain_sync` returns early and nothing
+       in flight ever looks again.
+
+    NOT MEASURED: H-27's literal "a completed human turn produced no
+    turn_stop". In band, the only evidence that a turn completed IS
+    turn_stop. Every independent route fires on a healthy shape — a later
+    prompt_submit arriving while a batch runs is type-ahead exactly as much
+    as it is a silent stop (both land on lifecycle `busy`, and nothing in the
+    row tells them apart), and "the triggering rows were all read" is the
+    ordinary read-then-work-for-twenty-minutes planner turn. A session that
+    ends mid-batch is already covered: close_session parks it
+    delivery_unknown with a critical alert. The failure that clause aimed at
+    is caught strictly earlier and without confound by measurement 2 — a
+    chain that will not deliver turn_stop did not deliver prompt_submit
+    either.
+
+    Commits its own measurement. The coordinator calls this BEFORE any of the
+    drain's own writes and then returns down several paths that never reach a
+    commit — an observation that survives only one of them is not an
+    observation.
+    """
+    if ready_s is None:
+        ready_s = HOOKS_READY_SILENT_S
+    if submit_s is None:
+        submit_s = HOOKS_SUBMIT_SILENT_S
+    sess = con.execute(
+        "SELECT s.session_id, s.harness, s.cli_version, s.provider_ready_at, "
+        "       (julianday('now') - julianday(s.created_at)) * 86400.0 "
+        "FROM sprint_planner_bindings b "
+        "JOIN interface_sessions s ON s.session_id = b.session_id "
+        "WHERE b.binding_id=? AND b.released_at IS NULL "
+        "AND s.occupancy <> 'ended'", (binding_id,)).fetchone()
+    if sess is None:
+        return None  # H-27 scopes to an ARMED binding on a live session
+    session_id, harness, cli_version, ready_at, age_s = sess
+    pending = []
+
+    readiness = interface_hooks.capability(harness, cli_version)["readiness"]
+    if ready_at is None and readiness != interface_hooks.FIRST_TURN_GATED:
+        if age_s is not None and age_s >= ready_s:
+            _alert(con, severity="warning",
+                   reason="hooks_declared_but_silent", session_id=session_id,
+                   detail=_silence_detail(
+                       harness, cli_version, "session_start",
+                       f"unobserved {age_s:.0f}s after session creation"))
+        elif age_s is not None:
+            pending.append(ready_s - age_s)
+
+    batch = con.execute(
+        "SELECT batch_id, "
+        "       (julianday('now') - julianday(submitting_at)) * 86400.0 "
+        "FROM planner_wake_batches "
+        "WHERE binding_id=? AND state='submitting'", (binding_id,)).fetchone()
+    # A NULL submitting_at is a batch that predates migration 0117, not a
+    # batch submitted zero seconds ago: unmeasured, never reported as silent.
+    if batch is not None and batch[1] is not None:
+        if batch[1] >= submit_s:
+            _alert(con, severity="warning",
+                   reason="hooks_declared_but_silent", session_id=session_id,
+                   batch_id=batch[0],
+                   detail=_silence_detail(
+                       harness, cli_version, "prompt_submit",
+                       f"batch {batch[0]} submitted {batch[1]:.0f}s ago and "
+                       f"the submit hook has not answered"))
+        else:
+            pending.append(submit_s - batch[1])
+
+    con.commit()
+    return min(pending) if pending else None
 
 
 def resolve_batch_alerts(con, batch_id: int) -> None:
@@ -1311,7 +1458,11 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         fence = istate[3] + 1
         interface_state.transition(
             con, "wake_batch", batch_id, "submitting",
-            extra_sets={"input_seq_fence": fence})
+            extra_sets={"input_seq_fence": fence,
+                        # H-27: when the wait for the submit hook STARTED.
+                        # `submitted_at` cannot serve — it is written by that
+                        # very hook, so on a silent seat it never arrives.
+                        "submitting_at": _now(con)})
         # H-26: the gate passed — whatever was stalling this batch is over.
         resolve_batch_alerts(con, batch_id)
         # Items ride legal edges only: a first attempt's items are 'batched',
