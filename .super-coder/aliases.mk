@@ -20,9 +20,12 @@
 #   make dos-r   / dos-restart   confirm (YES) + DB backup, then down + launch
 #   make dos-d   / dos-down      stop the sandbox
 #   make dos-u   / dos-update    sync + materialize the engine, reconcile in place
-#                                (source repo: fast-forwards the checkout first —
-#                                 it reconciles FROM that tree, so a stale one
-#                                 would lay a stale floor. ARGS=--no-fetch opts out.)
+#                                (source repo: reconciles FROM the checkout, so it
+#                                 fast-forwards it first — being behind is the
+#                                 normal case and just pulls. It stops only when a
+#                                 fast-forward is impossible: commits to pull onto
+#                                 uncommitted work, or a diverged branch.
+#                                 ARGS=--no-fetch opts out.)
 #   make dos-t   / dos-test      backend (pytest/unittest) + UI (vitest) suites
 #   make dos-url                 print the review GUI + dev-server URLs
 #   make dos-h                   list the commands
