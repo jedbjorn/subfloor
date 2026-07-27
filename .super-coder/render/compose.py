@@ -117,7 +117,8 @@ PARTICIPANT_RULES = (
     "2. Send rulings and transitions to the planner as a scoped row: "
     "`./sc mem message send <planner> \"…\" --kind result --sprint <doc-id>`.\n"
     "3. When work remains, send a partial naming completed work, evidence, and "
-    "the next uncompleted action before ending the turn."
+    "the next uncompleted action before ending the turn.\n"
+    "4. Nothing found is a result. Send it."
 )
 
 
