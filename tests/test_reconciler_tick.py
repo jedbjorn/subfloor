@@ -8,10 +8,12 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
+MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import activity_readers as ar  # noqa: E402
@@ -58,6 +60,14 @@ def build_db() -> sqlite3.Connection:
         """
     )
     return con
+
+
+def add_quota_tables(con: sqlite3.Connection) -> None:
+    for name in (
+        "0096_harness_quota_accounts.sql",
+        "0097_quota_drop_account_identity.sql",
+    ):
+        con.executescript((MIGRATIONS / name).read_text())
 
 
 def add_unit(
@@ -244,6 +254,322 @@ class ClassificationPrecedenceTest(unittest.TestCase):
         self.assertEqual("reported", pr_poller.classify(item, NOW))
 
 
+class ExplanationTierTest(unittest.TestCase):
+    def setUp(self):
+        self.con = build_db()
+        self.addCleanup(self.con.close)
+
+    def test_transcript_explanation_carries_the_current_marker_time(self):
+        marker = datetime(2020, 1, 1, 0, 59, tzinfo=UTC)
+        parts = pr_poller._activity_explanation(evidence(marker_at=marker))
+
+        self.assertEqual(
+            "transcript mtime as of 2020-01-01T00:59:00+00:00",
+            parts[0],
+        )
+
+    def test_cpu_preserves_the_raw_launch_shape_pair(self):
+        interactive = pr_poller._activity_explanation(
+            evidence(
+                cpu_delta=12.5,
+                launch_shape="interactive",
+            )
+        )
+        headless = pr_poller._activity_explanation(
+            evidence(
+                cpu_delta=12.5,
+                launch_shape="headless",
+            )
+        )
+
+        self.assertEqual(
+            "cpu launch_shape=interactive delta_ticks=12.5",
+            interactive[1],
+        )
+        self.assertEqual(
+            "cpu launch_shape=headless delta_ticks=12.5",
+            headless[1],
+        )
+        self.assertNotEqual(
+            interactive[1],
+            headless[1],
+            "the measured interactive/headless inversion was collapsed",
+        )
+
+    def test_probe_fault_carries_the_probe_timestamp(self):
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={
+                "openai": ("error", "2020-01-01T00:58:30Z"),
+            },
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            [
+                "anthropic quota unavailable",
+                "anthropic probe status unavailable",
+                "openai quota unavailable",
+                "openai probe status=error as of 2020-01-01T00:58:30Z",
+                "moonshot quota unavailable",
+                "moonshot probe status unavailable",
+            ],
+            parts,
+        )
+
+    def test_fresh_process_probe_source_is_unavailable_never_ok(self):
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            [
+                "anthropic quota unavailable",
+                "anthropic probe status unavailable",
+                "openai quota unavailable",
+                "openai probe status unavailable",
+                "moonshot quota unavailable",
+                "moonshot probe status unavailable",
+            ],
+            parts,
+        )
+        self.assertNotIn("status=ok", " | ".join(parts))
+
+    def test_persisted_exhaustion_carries_resets_at(self):
+        add_quota_tables(self.con)
+        account_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('anthropic', 'acct-a')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used_percent, resets_at, captured_at) "
+            "VALUES (?, 'five_hour', 100, ?, ?)",
+            (
+                account_pk,
+                "2020-01-01T02:00:00Z",
+                "2020-01-01T00:55:00Z",
+            ),
+        )
+
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            "anthropic quota exhausted window=five_hour "
+            "resets_at=2020-01-01T02:00:00Z "
+            "as of 2020-01-01T00:55:00Z",
+            parts[0],
+        )
+
+    def test_persisted_exhaustion_and_ok_probe_both_render(self):
+        add_quota_tables(self.con)
+        account_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('anthropic', 'acct-a')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used_percent, resets_at, captured_at) "
+            "VALUES (?, 'five_hour', 100, ?, ?)",
+            (
+                account_pk,
+                "2020-01-01T02:00:00Z",
+                "2020-01-01T00:55:00Z",
+            ),
+        )
+
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={
+                "anthropic": ("ok", "2020-01-01T00:59:00Z"),
+            },
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(6, len(parts))
+        self.assertTrue(
+            parts[0].startswith(
+                "anthropic quota exhausted window=five_hour "
+            ),
+            parts[0],
+        )
+        self.assertTrue(
+            parts[0].endswith("as of 2020-01-01T00:55:00Z"),
+            parts[0],
+        )
+        self.assertEqual(
+            [
+                "anthropic probe status=ok as of 2020-01-01T00:59:00Z",
+                "openai quota unavailable",
+                "openai probe status unavailable",
+                "moonshot quota unavailable",
+                "moonshot probe status unavailable",
+            ],
+            parts[1:],
+        )
+
+    def test_unreadable_quota_value_degrades_to_unavailable(self):
+        add_quota_tables(self.con)
+        account_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('anthropic', 'acct-a')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used_percent, captured_at) "
+            "VALUES (?, 'weekly', 'not-a-number', ?)",
+            (account_pk, "2020-01-01T00:55:00Z"),
+        )
+
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            [
+                "anthropic quota unavailable window=weekly "
+                "as of 2020-01-01T00:55:00Z",
+                "anthropic probe status unavailable",
+                "openai quota unavailable",
+                "openai probe status unavailable",
+                "moonshot quota unavailable",
+                "moonshot probe status unavailable",
+            ],
+            parts,
+        )
+
+    def test_quota_limit_and_scope_branches_render_exactly(self):
+        add_quota_tables(self.con)
+        moonshot_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('moonshot', 'acct-m')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used, limit_value, captured_at) "
+            "VALUES (?, 'weekly', 5, 0, ?)",
+            (moonshot_pk, "2020-01-01T00:55:00Z"),
+        )
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, used, limit_value, captured_at) "
+            "VALUES (?, 'five_hour', 5, 10, ?)",
+            (moonshot_pk, "2020-01-01T00:55:00Z"),
+        )
+        openai_pk = self.con.execute(
+            "INSERT INTO harness_quota_account(provider, account_ref) "
+            "VALUES ('openai', 'acct-o')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk, window_kind, scope, used_percent, captured_at) "
+            "VALUES (?, 'weekly', 'codex', 25, ?)",
+            (openai_pk, "2020-01-01T00:55:00Z"),
+        )
+
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            parts = pr_poller._provider_explanation(self.con)
+
+        self.assertEqual(
+            [
+                "anthropic quota unavailable",
+                "anthropic probe status unavailable",
+                "openai quota not exhausted window=weekly:codex "
+                "as of 2020-01-01T00:55:00Z",
+                "openai probe status unavailable",
+                "moonshot quota not exhausted window=five_hour "
+                "as of 2020-01-01T00:55:00Z",
+                "moonshot quota unavailable window=weekly "
+                "as of 2020-01-01T00:55:00Z",
+                "moonshot probe status unavailable",
+            ],
+            parts,
+        )
+
+    def test_unreadable_explanation_signals_do_not_change_the_verdict(self):
+        add_unit(self.con, reviewer=None)
+        before_board = tuple(
+            self.con.execute(
+                "SELECT * FROM sprint_units ORDER BY unit_id"
+            ).fetchall()
+        )
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            readable = pr_poller.reconcile_tick(
+                self.con,
+                now=NOW,
+                reader=lambda shell, unit, now: evidence(
+                    marker_at=NOW,
+                    cpu_delta=7.0,
+                    launch_shape="headless",
+                ),
+                refresh=lambda worktree: True,
+            )[0]
+            unreadable = pr_poller.reconcile_tick(
+                self.con,
+                now=NOW,
+                reader=lambda shell, unit, now: evidence(
+                    unreadable=["marker", "process_binding"],
+                ),
+                refresh=lambda worktree: True,
+            )[0]
+
+        self.assertEqual(
+            ("checkup", NOW, 7.0, "headless", []),
+            (
+                readable.signal,
+                readable.evidence.marker_at,
+                readable.evidence.cpu_delta,
+                readable.evidence.launch_shape,
+                readable.evidence.unreadable,
+            ),
+        )
+        self.assertEqual(
+            (
+                "checkup",
+                None,
+                None,
+                None,
+                ["marker", "process_binding"],
+            ),
+            (
+                unreadable.signal,
+                unreadable.evidence.marker_at,
+                unreadable.evidence.cpu_delta,
+                unreadable.evidence.launch_shape,
+                unreadable.evidence.unreadable,
+            ),
+        )
+        self.assertEqual(
+            before_board,
+            tuple(
+                self.con.execute(
+                    "SELECT * FROM sprint_units ORDER BY unit_id"
+                ).fetchall()
+            ),
+        )
+
+
 class TickTest(unittest.TestCase):
     def setUp(self):
         self.con = build_db()
@@ -263,21 +589,32 @@ class TickTest(unittest.TestCase):
             ).fetchall()
         )
 
-        readings = pr_poller.reconcile_tick(
-            self.con,
-            now=NOW,
-            reader=lambda shell, unit, now: evidence(
-                branch_declared=unit["branch"]
-            ),
-            refresh=lambda worktree: True,
-        )
+        with mock.patch.object(
+            pr_poller.quota_dispatch,
+            "latest_statuses",
+            return_value={},
+        ):
+            readings = pr_poller.reconcile_tick(
+                self.con,
+                now=NOW,
+                reader=lambda shell, unit, now: evidence(
+                    branch_declared=unit["branch"]
+                ),
+                refresh=lambda worktree: True,
+            )
 
         self.assertEqual(["dev", "reviewer"], [
             reading.expectation.role for reading in readings
         ])
         for reading in readings:
             self.assertEqual(NOW, reading.observed_at)
-            self.assertIsNone(reading.explanation)
+            self.assertTrue(
+                reading.explanation.startswith(
+                "transcript mtime unavailable"
+                " | cpu launch_shape=unavailable delta_ticks=unavailable"
+                ),
+                reading.explanation,
+            )
             self.assertEqual(EPOCH.isoformat(), reading.measurement["epoch"])
             self.assertEqual(
                 int(pr_poller.NO_PROGRESS_WINDOW.total_seconds()),

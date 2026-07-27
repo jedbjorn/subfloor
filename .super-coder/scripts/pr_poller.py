@@ -50,6 +50,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
+from quota_probes import dispatch as quota_dispatch
 from sprint_units import TERMINAL_UNIT_STATES, board_writer
 
 CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
@@ -374,6 +375,112 @@ class ReconciliationReading:
     measurement: dict[str, object]
     observed_at: datetime
     explanation: "str | None"
+
+
+def _activity_explanation(evidence: activity_readers.Evidence) -> list[str]:
+    """Render WHY-tier activity facts without classifying either one."""
+    marker = _utc(evidence.marker_at)
+    transcript = (
+        f"transcript mtime as of {marker.isoformat()}"
+        if marker is not None
+        else "transcript mtime unavailable"
+    )
+    shape = evidence.launch_shape or "unavailable"
+    delta = (
+        f"{evidence.cpu_delta:g}"
+        if evidence.cpu_delta is not None
+        else "unavailable"
+    )
+    return [
+        transcript,
+        f"cpu launch_shape={shape} delta_ticks={delta}",
+    ]
+
+
+def _quota_exhausted(row) -> "bool | None":
+    percent = _row(row, "used_percent")
+    if percent is not None:
+        try:
+            return float(percent) >= 100
+        except (TypeError, ValueError):
+            return None
+
+    used = _row(row, "used")
+    limit = _row(row, "limit_value")
+    if used is None or limit is None:
+        return None
+    try:
+        limit_value = float(limit)
+        if limit_value <= 0:
+            return None
+        return float(used) >= limit_value
+    except (TypeError, ValueError):
+        return None
+
+
+def _provider_explanation(con) -> list[str]:
+    """Render durable quota facts beside process-local probe status."""
+    groups: dict[str, list[sqlite3.Row]] = {}
+    durable_available = True
+    try:
+        rows = con.execute(
+            "SELECT a.provider, w.window_kind, w.scope, w.used_percent, "
+            "w.used, w.limit_value, w.resets_at, w.captured_at "
+            "FROM harness_quota_window w "
+            "JOIN harness_quota_account a ON a.account_pk=w.account_pk "
+            "ORDER BY a.provider, w.captured_at, w.window_kind, w.scope"
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+        durable_available = False
+    for row in rows:
+        groups.setdefault(_row(row, "provider"), []).append(row)
+
+    latest_statuses = quota_dispatch.latest_statuses()
+    parts: list[str] = []
+    for provider in quota_dispatch.PROVIDERS:
+        windows = groups.get(provider, [])
+        if not durable_available or not windows:
+            parts.append(f"{provider} quota unavailable")
+        else:
+            captured_at = max(_row(row, "captured_at") for row in windows)
+            current = [
+                row
+                for row in windows
+                if _row(row, "captured_at") == captured_at
+            ]
+            for row in current:
+                scope = _row(row, "scope")
+                window = _row(row, "window_kind")
+                if scope:
+                    window += f":{scope}"
+                exhausted = _quota_exhausted(row)
+                if exhausted is None:
+                    parts.append(
+                        f"{provider} quota unavailable window={window} "
+                        f"as of {captured_at}"
+                    )
+                elif exhausted:
+                    reset = _row(row, "resets_at") or "unavailable"
+                    parts.append(
+                        f"{provider} quota exhausted window={window} "
+                        f"resets_at={reset} as of {captured_at}"
+                    )
+                else:
+                    parts.append(
+                        f"{provider} quota not exhausted window={window} "
+                        f"as of {captured_at}"
+                    )
+
+        status = latest_statuses.get(provider)
+        if status is None:
+            parts.append(f"{provider} probe status unavailable")
+        else:
+            value, captured_at = status
+            parts.append(
+                f"{provider} probe status={value} as of {captured_at}"
+            )
+    return parts
 
 
 def _measurement(evidence: activity_readers.Evidence) -> dict[str, object]:
@@ -757,6 +864,7 @@ def reconcile_tick(
 
     source = reader or activity_readers.read
     read_one = source.read if hasattr(source, "read") else source
+    provider_facts = _provider_explanation(con)
     cache: dict[tuple, activity_readers.Evidence] = {}
     readings: list[ReconciliationReading] = []
     seen: set[tuple] = set()
@@ -790,7 +898,9 @@ def reconcile_tick(
                 evidence=evidence,
                 measurement=_measurement(evidence),
                 observed_at=current,
-                explanation=None,
+                explanation=" | ".join(
+                    _activity_explanation(evidence) + provider_facts
+                ),
             )
         )
     state.retain(seen)

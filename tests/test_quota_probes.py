@@ -46,6 +46,7 @@ Run:
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -905,6 +906,63 @@ class CredentialSafetyTest(ProbeCase):
 
 
 class DispatchTest(ProbeCase):
+    def test_fresh_process_has_no_probe_status(self):
+        fresh = importlib.reload(dispatch)
+        self.addCleanup(importlib.reload, fresh)
+
+        self.assertEqual({}, fresh.latest_statuses())
+
+    def test_status_accessor_is_timestamped_narrow_and_read_only(self):
+        fresh = importlib.reload(dispatch)
+        self.addCleanup(importlib.reload, fresh)
+        rows = {
+            "anthropic": {
+                "provider": "anthropic",
+                "status": "ok",
+                "captured_at": "2020-01-01T00:59:00Z",
+                "detail": "must not cross the seam",
+                "windows": [{"used_percent": 10}],
+            },
+            "openai": {
+                "provider": "openai",
+                "status": "error",
+                "captured_at": "2020-01-01T00:58:30Z",
+                "detail": "must not cross the seam",
+                "windows": [],
+            },
+        }
+        with mock.patch.object(
+            fresh,
+            "_run",
+            side_effect=lambda name, log, timeout: [rows[name]],
+        ):
+            returned = fresh.probe_all(
+                self.log,
+                timeout=5,
+                providers=["anthropic", "openai"],
+            )
+
+        self.assertEqual(
+            [rows["anthropic"], rows["openai"]],
+            returned,
+        )
+        statuses = fresh.latest_statuses()
+        self.assertEqual(
+            {
+                "anthropic": ("ok", "2020-01-01T00:59:00Z"),
+                "openai": ("error", "2020-01-01T00:58:30Z"),
+            },
+            statuses,
+        )
+        statuses.pop("anthropic")
+        self.assertEqual(
+            {
+                "anthropic": ("ok", "2020-01-01T00:59:00Z"),
+                "openai": ("error", "2020-01-01T00:58:30Z"),
+            },
+            fresh.latest_statuses(),
+        )
+
     def test_one_provider_raising_is_contained(self):
         self.endpoint(p_anthropic, 200, fixture("anthropic_usage.json"))
         self.endpoint(p_moonshot, 200, fixture("moonshot_usages.json"))
