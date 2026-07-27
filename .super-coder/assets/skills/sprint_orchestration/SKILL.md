@@ -132,6 +132,9 @@ assignment and sequencing plan without reading prose.
 
 ## 4. Arm event-driven wake
 
+A confirmation that is not about the thing it appears to confirm is not a
+confirmation. Verify the durable artifact that governs the next action.
+
 Arm the planner binding from the Interface Sprint wake panel or
 `POST /api/interface/sprint-bindings` with:
 
@@ -159,9 +162,10 @@ and session-bound inbox waiters.
 
 When the sprint pauses, release its binding from the Interface Sprint wake panel
 or `DELETE /api/interface/sprint-bindings/<id>` with a caller-stable
-`Idempotency-Key` and `reason: pause`. Read `./sc sprint status` back and stop
-only when the binding reports released or disarmed. A paused sprint may remain
-ACTIVE and unfrozen; it must not remain armed.
+`Idempotency-Key` and `reason: pause`. Read `./sc sprint status --all` back and
+stop only when the binding reports released or disarmed. Plain status hides
+released bindings and cannot prove release. A paused sprint may remain ACTIVE
+and unfrozen; it must not remain armed.
 
 ## 5. Dispatch ready work
 
@@ -179,6 +183,10 @@ Send exact assignments:
 Quote every fact the worker needs in its own task row. A message ID addressed to
 another shell is provenance, never a fetch instruction; inbox IDs are
 recipient-scoped.
+
+A message you sent is not an instruction the recipient has received. Treat
+delivery and receipt as separate facts; do not infer receipt from the send
+result or from an unread row.
 
 The board reserves each reviewer. Dispatch the reviewer when a developer reports
 a green exact head:
@@ -223,10 +231,12 @@ On each wake:
 The reconciler runs independently of PR watches and returns a report-only
 reading for every live sprint expectation. Each reading carries `expectation`,
 `signal`, `confirmed`, `evidence`, `measurement`, `observed_at`, and
-`explanation`; classification never writes. After confirmation, actionable
-signals produce both a planner message and one `planner_alerts` row keyed
-`(sprint_doc_id, unit_id, role, signal)`; `shell_id` stays off-key. Open alerts
-dedupe, resolve when evidence returns, and re-arm after resolution.
+`explanation`; classification never writes. After confirmation, every
+actionable signal produces one `planner_alerts` row keyed
+`(sprint_doc_id, unit_id, role, signal)`; `shell_id` stays off-key. A planner
+message is only the push layer and is emitted only when `board_writer` resolves
+a recipient. Open alerts dedupe, resolve when evidence returns, and re-arm after
+resolution.
 
 Read `sc watch list` for the reconciler's own heartbeat. A stale `reconcile`
 line means the watchdog may be wedged; no alerts from a stale watchdog do not
@@ -259,6 +269,12 @@ Register each PR with the planner at PR open:
 
 Monitor before interrupting a worker. Send a new task when behavior must change,
 not to request generic progress.
+
+Never use a draft PR as a planner hold. A state the worker's own procedure
+teaches it to clear cannot carry a stop; record the hold in board state plus a
+scoped task. No reliable interrupt exists today, and flag #321 owns that gap.
+A stop signal indistinguishable from an obstacle is an instruction to proceed;
+this rule does not close flag #321.
 
 When a review ruling changes a unit's file surface, update the overlap record
 and re-send the surface notice to every affected concurrent planner before the

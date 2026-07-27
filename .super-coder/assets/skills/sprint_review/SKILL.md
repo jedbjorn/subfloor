@@ -29,9 +29,15 @@ SPRINT doc=<id> reviewing=<unit or conformance>
 Every review transition uses a durable scoped result:
 
 ```sh
-./sc mem message send <planner> "<review transition>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Send the
+file's content as one argument through task-specific `SC_MESSAGE_BODY_FILE`,
+then use `message sent` to read the stored row back and confirm its body.
 
 File findings and verdicts within the assignment. Send ruling requests to the
 planner with alternatives and evidence.
@@ -45,6 +51,10 @@ Confirm the target before an irreversible mutation. Refer to flags by `flag_id`
 plus a sprint-scoped label. Establish absence through a complete direct read,
 count, or exact-ID query. Before closing a flag by number, resolve and read back
 its exact `flag_id`; display names and flag IDs share an integer range.
+
+Validate every absence instrument against a known-positive target before
+reporting an empty result as absence. Inspect its exit status and stderr; a
+probe that cannot see the positive control leaves the claim unmeasured.
 
 The sprint reconciler compares the board's live expectations with positive work
 and result evidence. It reports confirmed divergences to the planner; it never
@@ -89,6 +99,10 @@ For a high-value property, mutate the implementation or condition, prove the
 relevant test fails, restore the source, and prove it passes. Record the
 property tested and result. Use a narrowed interference review after a rebase
 or hand-resolved hunk.
+
+Before reporting a mutation red set or empty set, validate the test-selection
+and result-counting instrument against a known-positive mutation. A selector
+that cannot detect its control leaves the set unmeasured.
 
 Require one property per test method, or `subTest` boundaries when setup must be
 shared. Sequential assertions for independent properties are not independent
@@ -158,9 +172,9 @@ Create a document titled `CONFORMANCE: <sprint title>`, kind `doc`, containing:
 Persist it with `./sc mem doc add`, then send one pointer:
 
 ```sh
-./sc mem message send <planner> \
-  "Conformance complete: doc <id>; <n> findings (<major>/<medium>/<low>)" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <sprint-doc-id>
+./sc mem message sent
 ```
 
 The planner owns finding disposition and close authority.

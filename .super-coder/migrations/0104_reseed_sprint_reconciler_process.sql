@@ -38,9 +38,15 @@ Every transition and ruling request goes to the planner as a durable scoped
 result:
 
 ```sh
-./sc mem message send <planner> "<unit>: <transition or ruling request>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Send the
+file''s content as one argument through task-specific `SC_MESSAGE_BODY_FILE`,
+then use `message sent` to read the stored row back and confirm its body.
 
 File findings, flags, PRs, and reports within your assigned authority. A question
 printed only in final output reaches no sprint actor.
@@ -55,6 +61,10 @@ flag by `flag_id` plus its sprint-scoped label, such as
 `#247 SC-S59-U8-ID-SPACES`. Establish absence through a complete direct read,
 count, or exact-ID query. Before closing a flag by number, resolve and read back
 its exact `flag_id`; display names and flag IDs share an integer range.
+
+Validate every absence instrument against a known-positive target before
+reporting an empty result as absence. Inspect its exit status and stderr; a
+probe that cannot see the positive control leaves the claim unmeasured.
 
 **Activation pass condition:** your reading of the task, board, and spec names
 one executable unit and one observable completion condition.
@@ -73,6 +83,9 @@ result closes the reconciler''s window for the current unit state.
 Treat `read_at` in one direction only: READ proves something marked the row
 read; UNREAD proves nothing about delivery, liveness, or work. Never infer a
 fault or safe action from an unread marker.
+
+Drain scoped messages immediately before every durable action you own, including
+a push or merge. An earlier inbox check does not satisfy this gate.
 
 ## Resolve ambiguity before building
 
@@ -121,25 +134,24 @@ merge-gating performance claims.
 When dependencies are on `main` and the planner has released the unit:
 
 1. Fetch and rebase onto `origin/main`.
-2. Drain scoped messages immediately before the push.
-3. Run the unit''s verification gate.
-4. Push and open the PR.
-5. Register the planner''s sprint watch.
-6. Report the exact PR and head.
+2. Run the unit''s verification gate.
+3. Push and open the PR.
+4. Register the planner''s sprint watch.
+5. Report the exact PR and head.
 
 ```sh
 ./sc watch pr <owner/repo> <pr-number> \
   --shell <planner> --sprint <doc-id>
-./sc mem message send <planner> \
-  "U1 pr-open: PR #123 head <sha>; verification <summary>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
 
 Update the board''s branch and PR through the planner. An unregistered PR has no
 event path back to orchestration.
 
-A draft PR is a planner HOLD. Never mark it ready as a mechanical step; ask the
-planner and wait for an explicit release.
+If a PR is unexpectedly in draft, ask the planner before marking it ready. This
+is a caution check, not a hold mechanism.
 
 ## Drive CI
 
@@ -196,9 +208,6 @@ Merge only when:
   carry-through across a disjoint rebase;
 - the planner''s merge order releases the unit.
 
-Drain scoped messages immediately before the merge. An earlier inbox check does
-not satisfy this gate.
-
 Merge with the repository''s `git` procedure, then send one structured result:
 
 ```text
@@ -213,8 +222,9 @@ follow-ups: <Low findings and deferred work, or none>
 Send it:
 
 ```sh
-./sc mem message send <planner> "<unit-report body>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
 
 Clean the local branch according to `git`. Remove the sprint current-state line
@@ -362,6 +372,9 @@ assignment and sequencing plan without reading prose.
 
 ## 4. Arm event-driven wake
 
+A confirmation that is not about the thing it appears to confirm is not a
+confirmation. Verify the durable artifact that governs the next action.
+
 Arm the planner binding from the Interface Sprint wake panel or
 `POST /api/interface/sprint-bindings` with:
 
@@ -389,9 +402,10 @@ and session-bound inbox waiters.
 
 When the sprint pauses, release its binding from the Interface Sprint wake panel
 or `DELETE /api/interface/sprint-bindings/<id>` with a caller-stable
-`Idempotency-Key` and `reason: pause`. Read `./sc sprint status` back and stop
-only when the binding reports released or disarmed. A paused sprint may remain
-ACTIVE and unfrozen; it must not remain armed.
+`Idempotency-Key` and `reason: pause`. Read `./sc sprint status --all` back and
+stop only when the binding reports released or disarmed. Plain status hides
+released bindings and cannot prove release. A paused sprint may remain ACTIVE
+and unfrozen; it must not remain armed.
 
 ## 5. Dispatch ready work
 
@@ -409,6 +423,10 @@ Send exact assignments:
 Quote every fact the worker needs in its own task row. A message ID addressed to
 another shell is provenance, never a fetch instruction; inbox IDs are
 recipient-scoped.
+
+A message you sent is not an instruction the recipient has received. Treat
+delivery and receipt as separate facts; do not infer receipt from the send
+result or from an unread row.
 
 The board reserves each reviewer. Dispatch the reviewer when a developer reports
 a green exact head:
@@ -453,10 +471,12 @@ On each wake:
 The reconciler runs independently of PR watches and returns a report-only
 reading for every live sprint expectation. Each reading carries `expectation`,
 `signal`, `confirmed`, `evidence`, `measurement`, `observed_at`, and
-`explanation`; classification never writes. After confirmation, actionable
-signals produce both a planner message and one `planner_alerts` row keyed
-`(sprint_doc_id, unit_id, role, signal)`; `shell_id` stays off-key. Open alerts
-dedupe, resolve when evidence returns, and re-arm after resolution.
+`explanation`; classification never writes. After confirmation, every
+actionable signal produces one `planner_alerts` row keyed
+`(sprint_doc_id, unit_id, role, signal)`; `shell_id` stays off-key. A planner
+message is only the push layer and is emitted only when `board_writer` resolves
+a recipient. Open alerts dedupe, resolve when evidence returns, and re-arm after
+resolution.
 
 Read `sc watch list` for the reconciler''s own heartbeat. A stale `reconcile`
 line means the watchdog may be wedged; no alerts from a stale watchdog do not
@@ -489,6 +509,12 @@ Register each PR with the planner at PR open:
 
 Monitor before interrupting a worker. Send a new task when behavior must change,
 not to request generic progress.
+
+Never use a draft PR as a planner hold. A state the worker''s own procedure
+teaches it to clear cannot carry a stop; record the hold in board state plus a
+scoped task. No reliable interrupt exists today, and flag #321 owns that gap.
+A stop signal indistinguishable from an obstacle is an instruction to proceed;
+this rule does not close flag #321.
 
 When a review ruling changes a unit''s file surface, update the overlap record
 and re-send the surface notice to every affected concurrent planner before the
@@ -860,9 +886,15 @@ SPRINT doc=<id> reviewing=<unit or conformance>
 Every review transition uses a durable scoped result:
 
 ```sh
-./sc mem message send <planner> "<review transition>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Send the
+file''s content as one argument through task-specific `SC_MESSAGE_BODY_FILE`,
+then use `message sent` to read the stored row back and confirm its body.
 
 File findings and verdicts within the assignment. Send ruling requests to the
 planner with alternatives and evidence.
@@ -876,6 +908,10 @@ Confirm the target before an irreversible mutation. Refer to flags by `flag_id`
 plus a sprint-scoped label. Establish absence through a complete direct read,
 count, or exact-ID query. Before closing a flag by number, resolve and read back
 its exact `flag_id`; display names and flag IDs share an integer range.
+
+Validate every absence instrument against a known-positive target before
+reporting an empty result as absence. Inspect its exit status and stderr; a
+probe that cannot see the positive control leaves the claim unmeasured.
 
 The sprint reconciler compares the board''s live expectations with positive work
 and result evidence. It reports confirmed divergences to the planner; it never
@@ -920,6 +956,10 @@ For a high-value property, mutate the implementation or condition, prove the
 relevant test fails, restore the source, and prove it passes. Record the
 property tested and result. Use a narrowed interference review after a rebase
 or hand-resolved hunk.
+
+Before reporting a mutation red set or empty set, validate the test-selection
+and result-counting instrument against a known-positive mutation. A selector
+that cannot detect its control leaves the set unmeasured.
 
 Require one property per test method, or `subTest` boundaries when setup must be
 shared. Sequential assertions for independent properties are not independent
@@ -989,9 +1029,9 @@ Create a document titled `CONFORMANCE: <sprint title>`, kind `doc`, containing:
 Persist it with `./sc mem doc add`, then send one pointer:
 
 ```sh
-./sc mem message send <planner> \
-  "Conformance complete: doc <id>; <n> findings (<major>/<medium>/<low>)" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <sprint-doc-id>
+./sc mem message sent
 ```
 
 The planner owns finding disposition and close authority.

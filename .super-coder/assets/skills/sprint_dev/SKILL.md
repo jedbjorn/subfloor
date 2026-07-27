@@ -33,9 +33,15 @@ Every transition and ruling request goes to the planner as a durable scoped
 result:
 
 ```sh
-./sc mem message send <planner> "<unit>: <transition or ruling request>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Send the
+file's content as one argument through task-specific `SC_MESSAGE_BODY_FILE`,
+then use `message sent` to read the stored row back and confirm its body.
 
 File findings, flags, PRs, and reports within your assigned authority. A question
 printed only in final output reaches no sprint actor.
@@ -50,6 +56,10 @@ flag by `flag_id` plus its sprint-scoped label, such as
 `#247 SC-S59-U8-ID-SPACES`. Establish absence through a complete direct read,
 count, or exact-ID query. Before closing a flag by number, resolve and read back
 its exact `flag_id`; display names and flag IDs share an integer range.
+
+Validate every absence instrument against a known-positive target before
+reporting an empty result as absence. Inspect its exit status and stderr; a
+probe that cannot see the positive control leaves the claim unmeasured.
 
 **Activation pass condition:** your reading of the task, board, and spec names
 one executable unit and one observable completion condition.
@@ -68,6 +78,9 @@ result closes the reconciler's window for the current unit state.
 Treat `read_at` in one direction only: READ proves something marked the row
 read; UNREAD proves nothing about delivery, liveness, or work. Never infer a
 fault or safe action from an unread marker.
+
+Drain scoped messages immediately before every durable action you own, including
+a push or merge. An earlier inbox check does not satisfy this gate.
 
 ## Resolve ambiguity before building
 
@@ -116,25 +129,24 @@ merge-gating performance claims.
 When dependencies are on `main` and the planner has released the unit:
 
 1. Fetch and rebase onto `origin/main`.
-2. Drain scoped messages immediately before the push.
-3. Run the unit's verification gate.
-4. Push and open the PR.
-5. Register the planner's sprint watch.
-6. Report the exact PR and head.
+2. Run the unit's verification gate.
+3. Push and open the PR.
+4. Register the planner's sprint watch.
+5. Report the exact PR and head.
 
 ```sh
 ./sc watch pr <owner/repo> <pr-number> \
   --shell <planner> --sprint <doc-id>
-./sc mem message send <planner> \
-  "U1 pr-open: PR #123 head <sha>; verification <summary>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
 
 Update the board's branch and PR through the planner. An unregistered PR has no
 event path back to orchestration.
 
-A draft PR is a planner HOLD. Never mark it ready as a mechanical step; ask the
-planner and wait for an explicit release.
+If a PR is unexpectedly in draft, ask the planner before marking it ready. This
+is a caution check, not a hold mechanism.
 
 ## Drive CI
 
@@ -191,9 +203,6 @@ Merge only when:
   carry-through across a disjoint rebase;
 - the planner's merge order releases the unit.
 
-Drain scoped messages immediately before the merge. An earlier inbox check does
-not satisfy this gate.
-
 Merge with the repository's `git` procedure, then send one structured result:
 
 ```text
@@ -208,8 +217,9 @@ follow-ups: <Low findings and deferred work, or none>
 Send it:
 
 ```sh
-./sc mem message send <planner> "<unit-report body>" \
+./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
 
 Clean the local branch according to `git`. Remove the sprint current-state line
