@@ -484,6 +484,65 @@ def check_local_edits(force: bool) -> None:
         "  - ./sc eject            one-way: stop tracking upstream and own the engine")
 
 
+def sync_source_checkout() -> None:
+    """Fast-forward the SOURCE repo's checkout before reconciling from it.
+
+    Here the engine is tracked, so the update skips fetch/materialize and lays
+    the floor FROM THE WORKING TREE. A checkout behind its upstream therefore
+    reconciles stale code and reports success — the operator's only defence was
+    remembering to pull first, with no signal on the runs they didn't.
+
+    Fast-forward ONLY. This never merges, rebases, resets, or changes branch,
+    and it never touches a tree with uncommitted work — the main checkout is the
+    running server's tree and may hold work in flight.
+
+    ADVISORY, NEVER BLOCKING (FnB ruling 2026-07-27). Anything that cannot be
+    fast-forwarded warns loudly, names the remedy, and lets the update proceed
+    from the current tree. An operator unable to update is a worse failure than
+    an operator updating one commit behind, and the warning is what the silent
+    version lacked. `--no-fetch` skips this step outright.
+    """
+    branch = git("rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+    if not branch or branch == "HEAD":
+        print("→ engine sync: detached HEAD — skipped (no branch to fast-forward)")
+        return
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
+                   check=False)
+    tracking = upstream.stdout.strip()
+    if upstream.returncode != 0 or not tracking:
+        print(f"→ engine sync: '{branch}' tracks no upstream — skipped")
+        return
+    if git("fetch", "--quiet", check=False).returncode != 0:
+        print(f"! engine sync: fetch failed (offline?) — reconciling against the "
+              f"current tree, which may be behind {tracking}")
+        return
+    behind = git("rev-list", "--count", f"HEAD..{tracking}",
+                 check=False).stdout.strip()
+    if behind in ("", "0"):
+        print(f"→ engine sync: {branch} already current with {tracking}")
+        return
+    if git("status", "--porcelain", check=False).stdout.strip():
+        print(f"! engine sync: {branch} is {behind} commit(s) behind {tracking}, but "
+              f"the checkout has uncommitted changes — not fast-forwarding a tree "
+              f"with work in flight.")
+        print(f"  Updating anyway from the CURRENT tree, so the floor will be "
+              f"{behind} commit(s) stale.")
+        print(f"  To take the newer floor: commit or stash in {REPO_ROOT}, re-run.")
+        return
+    before = git("rev-parse", "--short", "HEAD", check=False).stdout.strip()
+    pull = git("pull", "--ff-only", check=False)
+    if pull.returncode != 0:
+        print(f"! engine sync: cannot fast-forward {branch} to {tracking} "
+              f"({behind} commit(s) behind) — the branch has diverged.")
+        print(f"  {pull.stderr.strip().splitlines()[-1] if pull.stderr.strip() else ''}")
+        print(f"  Updating anyway from the CURRENT tree — update never merges, "
+              f"rebases or resets. Reconcile {REPO_ROOT} by hand for the newer floor.")
+        return
+    after = git("rev-parse", "--short", "HEAD", check=False).stdout.strip()
+    print(f"→ engine sync: fast-forwarded {branch} {before} → {after} "
+          f"({behind} commit(s) from {tracking})")
+
+
 def fetch_update_ref(branch: str, ref: str | None = None) -> str:
     """Refresh remote objects and resolve the engine ref without touching the
     installed floor. Git object refresh is the sole mutation allowed before
@@ -782,6 +841,11 @@ def main(argv: list[str]) -> int:
         # and must keep tracking .super-coder/. Reconcile its own tree only.
         print("→ super-coder SOURCE repo — engine is tracked here; "
               "skipping fetch/materialize/untrack (reconcile in place only)")
+        # Reconciling in place makes the WORKING TREE the floor's source, so it
+        # has to be current first. --no-fetch keeps its meaning (touch no
+        # network) and is the escape hatch for reconciling a tree deliberately.
+        if not no_fetch:
+            sync_source_checkout()
         no_fetch = True
     else:
         migrate_engine_untrack()  # one-time B7: untrack the engine (idempotent)
