@@ -1122,6 +1122,43 @@ class InterfaceApiTest(unittest.TestCase):
              "archive_id": 10, "pid": 4321, "start_ticks": 999})
         self.assertEqual(status, 409)
 
+    def test_hook_install_report_crosses_the_route(self):
+        """Flag #303/#366: a first_turn_gated seat is promoted on the
+        entrypoint's claim, so the claim's `hooks_installed` report is the
+        operand that keeps that promotion fail-closed. It is only useful if
+        it survives the route — an unknown field would be refused 422, and a
+        dropped one would silently withhold every codex promotion.
+
+        Both values are exercised on the same route with the same body shape;
+        the ONLY difference between the two seats is the report."""
+        for shell_id, installed, expected in ((1, False, "starting"),
+                                              (2, True, "idle")):
+            with self.subTest(hooks_installed=installed):
+                status, _, body = self.create_session(
+                    shell_id, key=f"k-codex-{shell_id}", harness="codex")
+                assert status == 201, body
+                sid = body["session_id"]
+                status, _, b = self.call(
+                    "POST", "/api/interface/hook-callbacks",
+                    ("Authorization: Bearer " + self.hook_token(sid),),
+                    {"shell_id": shell_id, "generation": 1, "hook_seq": 1,
+                     "event": "session_start", "source": "entrypoint",
+                     "archive_id": 10, "pid": 4321, "start_ticks": 999,
+                     "cli_version": "codex-cli 0.145.0",
+                     "hooks_installed": installed})
+                self.assertEqual(status, 200, b)
+                con = sqlite3.connect(self.db_path)
+                occ, life, proc = con.execute(
+                    "SELECT occupancy, lifecycle, process_ready_at "
+                    "FROM interface_sessions WHERE session_id=?",
+                    (sid,)).fetchone()
+                con.close()
+                self.assertEqual(occ, "occupied",
+                                 "the identity promotion is unconditional")
+                self.assertEqual(life, expected)
+                self.assertIsNotNone(
+                    proc, "the process stamp is true of both seats")
+
     def test_hook_contract_validation(self):
         self.create_session()
         tok = "Authorization: Bearer " + self.hook_token(1)

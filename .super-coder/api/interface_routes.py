@@ -2882,7 +2882,11 @@ def _hook_callback(headers, body):
     readiness. The entrypoint's claim proves the process is up (stamped
     separately, never into provider_ready_at), and on a 'first_turn_gated'
     harness — whose provider hook never arrives unbidden — that weaker proof
-    is what moves the session to idle (flag #303)."""
+    is what moves the session to idle, but ONLY when the same claim reports
+    `hooks_installed` true: the capability table says what the harness version
+    can deliver, never what this launch installed (flag #303). Anything but
+    literal true is not proof, so an absent or non-boolean field withholds the
+    promotion rather than granting it."""
     authz = headers.get("Authorization") or ""
     token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
     shell_id, generation = body.get("shell_id"), body.get("generation")
@@ -2897,7 +2901,7 @@ def _hook_callback(headers, body):
                     "bearer token + shell_id, generation, hook_seq, event")
     unknown = set(body) - {"shell_id", "generation", "hook_seq", "event",
                            "source", "pid", "start_ticks", "archive_id",
-                           "cli_version"}
+                           "cli_version", "hooks_installed"}
     if unknown:
         _log(f"hook rejected (422 unknown fields {sorted(unknown)}): "
              f"shell={shell_id} gen={generation} event={event!r}")
@@ -2972,7 +2976,8 @@ def _hook_callback(headers, body):
                                         body.get("start_ticks"),
                                     "cli_version": body.get("cli_version")})
             result = interface_broker.record_hook(
-                con, shell_id, generation, hook_seq, event, source=source)
+                con, shell_id, generation, hook_seq, event, source=source,
+                hooks_installed=body.get("hooks_installed") is True)
             con.commit()
             # A lifecycle event may make queued wake work submittable
             # (turn_stop → idle, provider session_start → ready+quiet

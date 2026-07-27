@@ -240,6 +240,11 @@ class InterfaceExecTest(unittest.TestCase):
                          "the pre-exec claim is identity, not readiness")
         self.assertIsInstance(body["start_ticks"], int)
         self.assertEqual(body["cli_version"], "test-cli 1.0")
+        self.assertIs(body["hooks_installed"], False,
+                      "the claim must REPORT the install outcome (flag #303 "
+                      "/ #366): 'test-cli 1.0' is below claude's floor so "
+                      "nothing installed, and the promoting path may not "
+                      "learn that from the static capability table")
         self.assertEqual(self.exec_calls[0][0], ["/bin/true"])
         self.assertEqual(self.plan_calls[0]["shell_id"], 1)
         self.assertEqual(self.plan_calls[0]["harness"], "claude")
@@ -272,6 +277,9 @@ class InterfaceExecTest(unittest.TestCase):
         self.assertEqual(self.exec_calls[0][0],
                          ["/bin/true", "--settings", "/x.json"])
         self.assertEqual(inst.call_args[0][0], "claude")
+        self.assertIs(self.server.requests[0]["body"]["hooks_installed"], True,
+                      "a successful install must be reported as such — the "
+                      "report tracks the installer, not a constant")
 
     # ── 4: fail closed ──────────────────────────────────────────────────
     def test_rejected_hook_never_execs(self):

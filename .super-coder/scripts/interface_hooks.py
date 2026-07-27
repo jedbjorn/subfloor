@@ -350,9 +350,27 @@ def install(harness: "str | None", work_dir: Path, *, run_dir: Path,
     Returns {"installed": bool, "argv": [...], "capability": capability()}.
     `argv` carries launch-flag additions (claude's --settings overlay).
     Installed=False means the harness is unversioned/unknown or the config
-    write failed: the chat still launches, the provider session_start
-    simply never arrives — lifecycle stays `starting`, sprint wake can
-    never arm on it (fail closed, ordinary chat unaffected).
+    write failed: the chat still launches, but the session can deliver NO
+    lifecycle hook to the engine at all.
+
+    The caller must REPORT that value on the entrypoint's session_start
+    claim (`hooks_installed`), because the two ways a seat is kept out of
+    the wake path differ by readiness class and only one of them is
+    self-enforcing:
+
+      claude / kimi  — the provider session_start is what moves
+                       starting → idle, and an uninstalled hook cannot send
+                       it. Fail-closed with no further help.
+      first_turn_gated (codex) — the seat is promoted on the ENTRYPOINT's
+                       claim instead (flag #303), and `capability()` is a
+                       static version lookup that still reads
+                       mandatory_ok=True for an install that wrote nothing.
+                       Without the report the promotion arms a seat with no
+                       prompt_submit fence and no turn_stop.
+
+    With the report, both classes end the same way: lifecycle stays
+    `starting` and sprint wake can never arm on the session (fail closed,
+    ordinary chat unaffected).
     """
     cap = capability(harness, cli_version)
     result = {"installed": False, "argv": [], "capability": cap}

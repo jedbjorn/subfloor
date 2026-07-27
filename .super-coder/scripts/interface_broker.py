@@ -492,7 +492,8 @@ def close_session(con, session_id: int, end_reason: str) -> dict:
 
 
 def record_hook(con, shell_id: int, generation: int, hook_seq: int,
-                event: str, source: str = "provider") -> dict:
+                event: str, source: str = "provider",
+                hooks_installed: bool = False) -> dict:
     """Record one authenticated harness hook with its durable sequence.
 
     Rejects replays (hook_seq <= last_hook_seq), stale generations, and
@@ -508,6 +509,16 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
     stamped into its own column. On a 'first_turn_gated' harness that weaker
     proof is nonetheless what moves starting → idle, because the provider hook
     never arrives unbidden (flag #303, decisions #98/#99).
+
+    `hooks_installed` is the entrypoint's report of whether this session's
+    hook config actually landed on disk (interface_hooks.install). It exists
+    because `capability()` is a STATIC table lookup — it says what the harness
+    version CAN deliver, never what this launch installed — so on the promoting
+    path it is not enough: a codex seat whose `.codex/hooks.json` is
+    unparseable installs nothing, yet its capability still reads
+    mandatory_ok=True. Promoting on the claim alone would arm a seat with ZERO
+    lifecycle hooks — no prompt_submit fence, no turn_stop — so the promotion
+    takes this operand and defaults to False (absent proof is not proof).
     """
     if event not in interface_hooks.EVENTS:
         raise BrokerError(f"unknown hook event {event!r} — rejected")
@@ -573,16 +584,18 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
         else:
             # source='entrypoint': the pre-exec identity claim (the route owns
             # the reserved → occupied move). It proves the PANE IS LIVE and
-            # interface_exec is about to exec the harness with its hooks
-            # installed — the PROCESS is up. It is NOT provider readiness, so
-            # it is stamped into its own column and never into
-            # provider_ready_at, which keeps meaning "the provider
-            # handshaked" for every reader (flag #303 condition 1).
+            # interface_exec is about to exec the harness — the PROCESS is up.
+            # It is NOT provider readiness, so it is stamped into its own
+            # column and never into provider_ready_at, which keeps meaning
+            # "the provider handshaked" for every reader (flag #303
+            # condition 1). The stamp is unconditional because it is true of
+            # every claim; only the PROMOTION below takes further operands.
             con.execute(
                 "UPDATE interface_sessions SET process_ready_at=datetime('now') "
                 "WHERE session_id=?", (sess[0],))
             cap = interface_hooks.capability(sess[2], sess[3])
-            if cap["readiness"] == interface_hooks.FIRST_TURN_GATED:
+            if cap["readiness"] == interface_hooks.FIRST_TURN_GATED \
+                    and hooks_installed:
                 # This harness's own session_start cannot arrive until a human
                 # submits the first turn (codex 0.145.0 — measured), so waiting
                 # for it deadlocks the very seat that exists to BE woken: no
@@ -591,6 +604,13 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
                 # hook never goes out. Promote on the weak proof instead; the
                 # first real turn still fires session_start and still upgrades
                 # the record to true provider readiness above.
+                #
+                # `hooks_installed` is the second operand and it is what keeps
+                # this fail-CLOSED: the promotion is only sound while the seat
+                # really has the lifecycle hooks its capability advertises. If
+                # the install failed, nothing here fires and the seat stays
+                # 'starting' — exactly the pre-fix disposition for a seat that
+                # can deliver no hooks at all.
                 if sess[1] == "starting":
                     interface_state.transition(
                         con, "lifecycle", sess[0], "idle")

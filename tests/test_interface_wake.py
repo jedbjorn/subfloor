@@ -10,6 +10,10 @@ Covers, without tmux or a live harness:
 - Flag #49 (decisions #28/#31): the quiet baseline keys off REAL provider
   readiness (provider session_start stamp), never the pre-exec
   occupied_at — a >3s boot can no longer submit into an unpainted TUI.
+  Flag #303 adds the one exception and it is not a loophole: on a
+  'first_turn_gated' harness the provider stamp cannot arrive unbidden, so
+  the baseline is the weaker process_ready_at stamp — a separately aged
+  column, still owed in full, and only for a seat whose hooks installed.
 - Gate hardening: mandatory-hook capability, unmanaged-writable probe
   (decision #15 disarm), PreSendError (definite pre-send failure → queued,
   never parked) vs ambiguous failure (parked, never auto-retried).
@@ -44,6 +48,7 @@ MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import interface_broker  # noqa: E402
 import interface_hook  # noqa: E402
+import interface_hooks  # noqa: E402
 import interface_wake  # noqa: E402
 
 QUIET = 0.2  # tight debounce for fast hermetic drains
@@ -338,9 +343,10 @@ class CodexFirstTurnGatedTest(WakeFixture):
             "SELECT composer FROM interface_input_state WHERE session_id=?",
             (self.sid,)).fetchone()[0]
 
-    def entrypoint_claim(self, seq=1):
+    def entrypoint_claim(self, seq=1, hooks_installed=True):
         interface_broker.record_hook(self.con, 1, 1, seq, "session_start",
-                                     source="entrypoint")
+                                     source="entrypoint",
+                                     hooks_installed=hooks_installed)
         self.con.commit()
 
     def test_entrypoint_claim_promotes_a_first_turn_gated_seat(self):
@@ -390,6 +396,66 @@ class CodexFirstTurnGatedTest(WakeFixture):
         self.assertIn("quiet", out["reason"])
         self.assertEqual(self.batch_state(batch_id), "queued")
 
+    def test_a_failed_hook_install_neither_promotes_nor_arms(self):
+        """Flag #366 (SC-354): promotion on the entrypoint's claim is only
+        sound while the seat really holds the hooks its capability
+        advertises. `capability()` is a STATIC version lookup — a codex seat
+        whose `.codex/hooks.json` is unparseable installs nothing and still
+        reads mandatory_ok=True — so without the install report the claim
+        would arm a seat with ZERO lifecycle hooks: no prompt_submit fence,
+        no turn_stop. That configuration was fail-CLOSED before this unit and
+        must stay that way.
+
+        The install result is CHAINED from the real installer rather than
+        written in as a literal False: a change that made the corrupt file
+        install cleanly has to turn this red too."""
+        work = self.tmp / "corrupt-seat"
+        (work / ".codex").mkdir(parents=True)
+        (work / ".codex" / "hooks.json").write_text("{ not json")
+        out = interface_hooks.install("codex", work, run_dir=self.tmp / "run",
+                                      session_id=self.sid,
+                                      cli_version=self.CLI_VERSION)
+        with self.subTest("install refuses the corrupt file"):
+            self.assertFalse(out["installed"])
+        with self.subTest("capability alone would have promoted"):
+            self.assertTrue(
+                out["capability"]["mandatory_ok"],
+                "the static table is exactly why the install report is "
+                "needed — if it ever fails closed on its own, this test is "
+                "no longer measuring the gap it was written for")
+
+        self.entrypoint_claim(hooks_installed=out["installed"])
+        lifecycle, provider, process = self.seat()
+        with self.subTest("not promoted"):
+            self.assertEqual(lifecycle, "starting")
+        with self.subTest("composer not certified"):
+            self.assertEqual(self.composer(), "unknown")
+        with self.subTest("provider stamp"):
+            self.assertIsNone(provider)
+        with self.subTest("process stamp is still recorded"):
+            self.assertIsNotNone(
+                process, "the process IS up — the weak proof is true and "
+                         "stays recorded; it is the PROMOTION that is "
+                         "withheld")
+
+        # ...and the wake gate refuses. The item and batch still form: the
+        # ingress check reads the same static capability, so the ONLY thing
+        # standing between this seat and a submit is the withheld promotion.
+        _age(self.con, "interface_sessions", "process_ready_at", self.sid,
+             60, "session_id")
+        mid = self.add_message("task")
+        self.assertIsNotNone(
+            interface_wake.maybe_create_wake_item(self.con, mid))
+        self.con.commit()
+        writes = []
+        out = self.submit(self.form(), writes.append)
+        with self.subTest("no submit"):
+            self.assertFalse(out["submitted"], out)
+        with self.subTest("refused on the unpromoted lifecycle"):
+            self.assertIn("starting", out["reason"])
+        with self.subTest("nothing was written to the pane"):
+            self.assertEqual(writes, [])
+
     def test_first_real_turn_upgrades_to_provider_readiness(self):
         """'Proceed on weak proof, upgrade to strong proof when it arrives.'
         The deferred provider hook still stamps the real column, and BOTH
@@ -421,9 +487,15 @@ class NativeReadinessSeatTest(WakeFixture):
         """kimi awaits SessionStart as the final step of session creation,
         so it has a real signal coming and nothing is deadlocked. The
         process stamp is still recorded (it is true of every harness); only
-        the PROMOTION is scoped to first_turn_gated."""
+        the PROMOTION is scoped to first_turn_gated.
+
+        The claim reports hooks_installed=True so that what is proved here is
+        the readiness-class scoping and nothing else — with the operand false
+        this seat would stay 'starting' for the other reason and the test
+        would pass while measuring nothing."""
         interface_broker.record_hook(self.con, 1, 1, 1, "session_start",
-                                     source="entrypoint")
+                                     source="entrypoint",
+                                     hooks_installed=True)
         self.con.commit()
         lifecycle, provider, process = self.con.execute(
             "SELECT lifecycle, provider_ready_at, process_ready_at "

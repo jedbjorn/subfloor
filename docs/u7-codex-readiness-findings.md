@@ -264,6 +264,52 @@ The eight:
 1–3 are the three PLN2 named. 4–8 are the fourth-and-beyond, and they matter
 because 6/7/8 are the *engine* path's own statements, not the adapter table's.
 
+**SWEEP 2 (2026-07-27, after REV2 SC-356) — the enumeration above was not
+complete, and its negative was not clean.** REV2 found a TENTH description in a
+file this unit had already corrected. Recorded as a finding rather than a
+footnote, because the sweep's own claim to completeness is what failed:
+
+| # | Site | What it claimed | Disposition |
+|---|---|---|---|
+| 10 | `interface_hooks.py:352-355` `install()` docstring | on a failed install "the provider session_start simply never arrives — lifecycle stays `starting`, sprint wake can never arm on it (fail closed)" | REWRITTEN. Both clauses were false for codex at `4f2b6f9`: the provider hook never arrives for a codex seat *whether or not* the install succeeded, and the entrypoint claim armed it anyway. The docstring now states the real behaviour and names the report the caller owes (`hooks_installed`). |
+
+**Why sweep 1 missed it.** Its phrase list (items 2 and 3 above) targeted the
+entrypoint/provider *split* — "real start-readiness", "is NOT provider
+readiness", "only the provider", "wake-armable". Site 10 asserts the same
+invariant in the vocabulary of its CONSEQUENCE — "can never arm on it", "stays
+`starting`" — which no phrase in the list matched. A sweep keyed on how a claim
+is worded misses every restatement of it that changes register.
+
+Sweep 2's list adds the consequence forms: `can never arm`, `never arm`,
+`cannot arm`, `arm on it`, `fail closed`, `fail-closed`, `stays \`starting\``,
+`stays 'starting'`, `stays starting`, `provider session_start`, `session_start
+simply never`, plus the sweep-1 terms — run case-insensitively over `*.py *.md
+*.json *.ts *.tsx *.js *.sql *.sh`, whole repo, `node_modules`/`.git`/`spikes/`
+excluded.
+
+**Sweep 2's stated negative (all hits triaged, nothing left silent):**
+
+- `.super-coder/scripts/interface_hooks.py:352-355` — site 10. Fixed.
+- `tests/test_interface_wake.py:10-12` — the module docstring's flag #49 line
+  ("the quiet baseline keys off REAL provider readiness … never the pre-exec
+  occupied_at") became incomplete when U7 added `process_ready_at` to the
+  baseline. AMENDED in the same commit — an eleventh, found by this sweep.
+- `tests/test_interface_api.py:1282` — "wake can never arm on it" describes a
+  seat with **no hook adapter at all** (`harness="ed"` → `mandatory_ok` False).
+  TRUE, and unrelated to readiness class. No change.
+- `tests/test_interface_api.py:1080` — "is NOT readiness: lifecycle stays
+  'starting'" describes the entrypoint claim on that test's own seat, which
+  runs the default harness (claude), not codex. TRUE of its subject. No change.
+- `tests/test_interface_wake_tmux.py:167` — describes the flag #49 e2e's own
+  `/bin/sh` fake harness. TRUE of its subject. No change.
+- `.super-coder/api/interface_routes.py:1702` — the binding-arm refusal on
+  `mandatory_ok` False. TRUE. No change.
+- `*.md`, `*.sql`, `*.js`, `*.ts`, `*.tsx`: **zero** hits describing codex
+  readiness outside this findings file. This is the same negative F11 item 4/5
+  reported for the UI, now measured over the whole doc/seed surface with the
+  augmented list. The frozen spec #20 sentence (the ninth) stands as reported —
+  ruled by PLN2, not silently edited.
+
 **And the ninth is spec #20 itself — frozen, and it contradicts direction (A)
 in terms:**
 
@@ -359,6 +405,53 @@ value above was already fixed by then, and the row is durable.
   U7's merge gate is suite green + renumbered migration + negative control
   recorded + review clean. The positive half needs merge → reconcile → restart
   and runs in the FnB's restart window before sprint close.
+
+### F15 — the promotion needed a SECOND operand: the install actually landing (REV2 SC-354)
+
+REV2 executed the hole at `4f2b6f9`: corrupt an existing `.codex/hooks.json` →
+`_codex_merge` returns False → `install()` reports `installed=False` → **but
+`capability()` is a static version lookup and still reads `mandatory_ok=True`**
+→ the entrypoint claim promoted the seat and the wake gate submitted into it.
+A seat with zero lifecycle hooks: no `prompt_submit` fence, no `turn_stop`.
+Pre-fix that configuration was fail-CLOSED (nothing promoted it at all), so U7
+had turned a fail-closed gate fail-OPEN on the exact surface this sprint is
+hardening.
+
+**The choice, stated.** Two fixes were available: couple `installed` into the
+promotion, or persist the install outcome in a new column the gate reads. I took
+the first. The promotion is a ONE-SHOT decision made at the moment the claim
+arrives, and the claim is the only actor that knows what it installed — so the
+operand belongs on the claim, not in a row a later reader would have to
+re-derive. A column would need a second migration to record a value with exactly
+one consumer, at one instant, and would still be written from the same claim.
+Withholding the promotion also needs no new gate logic: `lifecycle` stays
+`starting`, and every downstream refusal (wake ingress → batch → submit) already
+keys off that.
+
+Path: `interface_exec` posts `hooks_installed` on the entrypoint claim →
+`_hook_callback` whitelists and forwards it (`is True`, so a missing or
+non-boolean field withholds rather than grants) → `record_hook` requires it
+alongside the `first_turn_gated` class. `process_ready_at` is still stamped
+unconditionally: the process IS up, that stamp was never the thing at fault.
+
+Version skew is deliberate and safe in the one direction it can occur: an
+interface_exec predating this commit sends no field, so a codex seat it launches
+is not promoted — the flag #303 deadlock, which is the status quo, never the new
+fail-open.
+
+Proofs (all red-first against the unfixed predicate):
+- `test_a_failed_hook_install_neither_promotes_nor_arms` — chains the REAL
+  installer over a corrupt `.codex/hooks.json` rather than passing a literal
+  `False`, asserts `mandatory_ok` is still True (the gap is the premise), then
+  proves the seat stays `starting`, the composer uncertified, and the gate
+  refuses. With the operand removed it fails on 5 detectors and the gate writes
+  50 bytes into a hook-less pane — REV2's execution, reproduced.
+- `test_hook_install_report_crosses_the_route` — both values over the route with
+  one body shape. Probed twice: un-whitelisting the field reds both subtests
+  (422), hardcoding the forward to `True` reds the False subtest alone.
+- `test_session_start_post_contract` / `test_hook_install_argv_is_appended` —
+  the claim reports False on a refused install and True on a successful one, so
+  the report tracks the installer rather than a constant.
 
 ## Mechanism verdict (all three candidates resolved)
 - **CONFIG DISCOVERY — RULED OUT.** F2 + probe step 3/4: the project-layer file is
