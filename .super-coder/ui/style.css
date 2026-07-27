@@ -623,6 +623,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .sprint-unit-deps, .sprint-unit-overlap, .sprint-unit-delivery {
   margin-top: .35rem; color: var(--dim); font-size: .7rem;
 }
+.sprint-dep-warning { margin-left: .25rem; }
 .sprint-unit-delivery { display: flex; flex-direction: column; min-width: 0; }
 .sprint-unit-delivery > span { overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }

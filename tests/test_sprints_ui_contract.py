@@ -101,11 +101,18 @@ globalThis.document = {
 };
 const windowListeners = new Map();
 globalThis.window = {
-  addEventListener: (name, fn) => windowListeners.set(name, fn),
+  addEventListener: (name, fn) => {
+    if (!windowListeners.has(name)) windowListeners.set(name, new Set());
+    windowListeners.get(name).add(fn);
+  },
   removeEventListener: (name, fn) => {
-    if (windowListeners.get(name) === fn) windowListeners.delete(name);
+    const handlers = windowListeners.get(name);
+    if (!handlers) return;
+    handlers.delete(fn);
+    if (!handlers.size) windowListeners.delete(name);
   },
 };
+const windowListenerCount = (name) => windowListeners.get(name)?.size || 0;
 globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
 globalThis.setInterval = (fn, ms) => {
   const id = intervals.length + 1;
@@ -357,6 +364,99 @@ out({ headings: byClass(root, "sprint-col-head").map((node) => node.textContent)
     ]
 
 
+def test_projection_recognition_flag_overrides_known_ui_column_key():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const card = byClass(flow, "sprint-unit")[0];
+out({
+  headings: byClass(flow, "sprint-col-head").map((node) => node.textContent),
+  cardClass: card.className,
+  cardText: card.textContent,
+});
+""",
+        prelude="const DATA = " + json.dumps(
+            payload(units=[unit("U1", "done", recognized=False)])
+        ) + ";\n",
+    )
+    assert result["headings"] == [
+        "Waiting", "Dev", "Review", "Blocked", "Done", "Unrecognized1",
+    ]
+    assert "unrecognized" in result["cardClass"]
+    assert "done" in result["cardText"]
+
+
+def test_unrecognized_state_label_ignores_object_prototype():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const card = byClass(flow, "sprint-unit")[0];
+out({ text: card.textContent });
+""",
+        prelude="const DATA = " + json.dumps(
+            payload(units=[unit("U1", "constructor", recognized=False)])
+        ) + ";\n",
+    )
+    assert "constructor" in result["text"]
+    assert "function Object" not in result["text"]
+
+
+def test_unrecognized_column_does_not_mutate_shared_columns():
+    result = run_js(
+        """
+const unknown = sprintsBuildFlow(UNKNOWN.sprints[0]);
+const known = sprintsBuildFlow(KNOWN.sprints[0]);
+out({
+  unknown: byClass(unknown, "sprint-col-head").map((node) => node.textContent),
+  known: byClass(known, "sprint-col-head").map((node) => node.textContent),
+  shared: SPRINT_FLOW_COLUMNS.map((column) => column.label),
+});
+""",
+        prelude=(
+            "const UNKNOWN = " + json.dumps(payload(
+                units=[unit("U1", "mystery", recognized=False)]
+            )) + ";\n"
+            "const KNOWN = " + json.dumps(payload(
+                units=[unit("U1", "working")]
+            )) + ";\n"
+        ),
+    )
+    assert result["unknown"][-1] == "Unrecognized1"
+    assert result["known"] == ["Waiting", "Dev1", "Review", "Blocked", "Done"]
+    assert result["shared"] == ["Waiting", "Dev", "Review", "Blocked", "Done"]
+
+
+def test_unavailable_dependency_has_visible_warning_marker():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const marker = byClass(flow, "sprint-dep-warning")[0];
+out({ text: marker.textContent, className: marker.className });
+""",
+        prelude="const DATA = " + json.dumps(payload(
+            units=[unit("U1", "working", depends_on="U0")]
+        )) + ";\n",
+    )
+    assert result["text"] == "⚠"
+    assert "warn" in result["className"]
+
+
+def test_unavailable_dependency_warning_is_accessibly_named():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const marker = byClass(flow, "sprint-dep-warning")[0];
+out({ role: marker.role, name: marker.ariaLabel });
+""",
+        prelude="const DATA = " + json.dumps(payload(
+            units=[unit("U1", "working", depends_on="U0")]
+        )) + ";\n",
+    )
+    assert result == {
+        "role": "img", "name": "dependency unavailable: U0",
+    }
+
+
 def test_dependency_wires_are_sprint_scoped_and_bad_tokens_degrade_locally():
     data = payload(units=[
         unit("U1", "pending"),
@@ -371,6 +471,7 @@ def test_dependency_wires_are_sprint_scoped_and_bad_tokens_degrade_locally():
         "units": [
             unit("U1", "pending"),
             unit("U2", "in_review", depends_on="U1"),
+            unit("U9", "blocked"),
         ],
     })
     data["active_count"] = 2
@@ -396,8 +497,8 @@ out({
   wires: boards.map((board) => byClass(board, "sprint-wire").map(
     (wire) => [wire.dataset.from, wire.dataset.to])),
   markers: boards.map((board) => byTag(board, "marker")[0].getAttribute("id")),
-  unavailable: boards.map((board) => byClass(board, "sprint-unit-deps")
-    .map((node) => node.ariaLabel).filter(Boolean)),
+  unavailable: boards.map((board) => byClass(board, "sprint-dep-warning")
+    .map((node) => node.ariaLabel)),
   hover,
 });
 """,
@@ -412,6 +513,69 @@ out({
     assert "sprint-hover" in result["hover"]["flow"]
     assert result["hover"]["cards"] == ["U1", "U2"]
     assert result["hover"]["wires"] == 1
+
+
+def test_identical_refresh_reuses_dom_and_preserves_hover_and_scroll():
+    result = run_js(
+        """
+apiQueue = [DATA, JSON.parse(JSON.stringify(DATA))];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const flow = byClass(root, "sprint-flow")[0];
+const card = byClass(root, "sprint-unit")
+  .find((node) => node.dataset.seq === "U1");
+flow.scrollLeft = 240;
+card.onmouseenter();
+await sprintsRefresh();
+out({
+  flowReused: byClass(root, "sprint-flow")[0] === flow,
+  scrollLeft: flow.scrollLeft,
+  litCards: byClass(root, "sprint-unit")
+    .filter((node) => node.classList.contains("lit")).length,
+  resizeListeners: windowListenerCount("resize"),
+});
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending"),
+            unit("U2", "working", depends_on="U1"),
+        ])) + ";\n",
+    )
+    assert result == {
+        "flowReused": True,
+        "scrollLeft": 240,
+        "litCards": 2,
+        "resizeListeners": 1,
+    }
+
+
+def test_changed_refresh_replaces_dom_and_cleans_previous_resize_listener():
+    initial = payload(units=[unit("U1", "working")])
+    updated = payload(units=[
+        unit("U1", "working"),
+        unit("U2", "in_review", depends_on="U1"),
+    ])
+    result = run_js(
+        """
+apiQueue = [INITIAL, UPDATED];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const firstFlow = byClass(root, "sprint-flow")[0];
+const before = windowListenerCount("resize");
+await sprintsRefresh();
+out({
+  flowReused: byClass(root, "sprint-flow")[0] === firstFlow,
+  before,
+  after: windowListenerCount("resize"),
+});
+""",
+        prelude=(
+            "const INITIAL = " + json.dumps(initial) + ";\n"
+            "const UPDATED = " + json.dumps(updated) + ";\n"
+        ),
+    )
+    assert result == {"flowReused": False, "before": 1, "after": 1}
 
 
 def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():

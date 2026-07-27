@@ -4518,6 +4518,8 @@ const sprintsState = {
   inFlight: null,
   lastFetchAt: 0,
   flowCleanups: [],
+  renderedRoot: null,
+  renderedSignature: null,
 };
 
 function sprintsDuration(startedAt, now = Date.now()) {
@@ -4557,11 +4559,13 @@ function sprintsHeader(sprint) {
   if (sprint.started_at) {
     const started = new Date(sprint.started_at);
     const duration = sprintsDuration(sprint.started_at);
+    const durationNode = el("span", { className: "sprint-duration" },
+      `Running: ${duration}`);
+    durationNode.dataset.startedAt = sprint.started_at;
     meta.append(
       el("time", { dateTime: sprint.started_at, title: sprint.started_at },
         `Started: ${started.toLocaleString()}`),
-      el("span", { className: "sprint-duration" },
-        `Running: ${duration}`));
+      durationNode);
   }
   return [header, meta];
 }
@@ -4611,7 +4615,8 @@ function sprintsUnitCard(unit, columnKey, unavailable) {
       el("span", { className: "idnum" }, unit.seq), " ", unit.unit_title),
     el("div", { className: "sprint-unit-state" },
       el("span", { className: `pill ${columnKey}` },
-        SPRINT_STATE_LABELS[unit.state] || String(unit.state))));
+        Object.hasOwn(SPRINT_STATE_LABELS, unit.state)
+          ? SPRINT_STATE_LABELS[unit.state] : String(unit.state))));
 
   const roles = el("div", { className: "sprint-unit-roles" },
     sprintsRole(unit, "dev", columnKey === "working"),
@@ -4619,11 +4624,18 @@ function sprintsUnitCard(unit, columnKey, unavailable) {
   card.append(roles);
 
   if (unit.depends_on) {
-    card.append(el("div", {
-      className: "sprint-unit-deps",
-      ariaLabel: unavailable.length
-        ? `dependency unavailable: ${unavailable.join(", ")}` : "",
-    }, `Depends: ${unit.depends_on}`));
+    const deps = el("div", { className: "sprint-unit-deps" },
+      `Depends: ${unit.depends_on}`);
+    if (unavailable.length) {
+      const warning = `dependency unavailable: ${unavailable.join(", ")}`;
+      deps.append(" ", el("span", {
+        className: "pill warn sprint-dep-warning",
+        role: "img",
+        ariaLabel: warning,
+        title: warning,
+      }, "⚠"));
+    }
+    card.append(deps);
   }
   if (unit.overlap) {
     card.append(el("div", {
@@ -4788,6 +4800,14 @@ function sprintsBuildFlow(sprint) {
 function sprintsPaint() {
   const root = sprintsState.root;
   if (!sprintsState.active || !root || !root.isConnected) return;
+  const signature = JSON.stringify({
+    loaded: sprintsState.lastFetchAt !== 0,
+    payload: sprintsState.payload,
+    error: sprintsState.error,
+    stale: sprintsState.stale,
+  });
+  if (root === sprintsState.renderedRoot
+      && signature === sprintsState.renderedSignature) return;
   for (const cleanup of sprintsState.flowCleanups) cleanup();
   sprintsState.flowCleanups = [];
   if (!sprintsState.payload) {
@@ -4795,6 +4815,8 @@ function sprintsPaint() {
       ? "error: " + (sprintsState.error || "request failed")
       : "Loading active sprints…";
     root.replaceChildren(el("div", { className: "card" }, message));
+    sprintsState.renderedRoot = root;
+    sprintsState.renderedSignature = signature;
     return;
   }
 
@@ -4811,6 +4833,17 @@ function sprintsPaint() {
       ...sprintsHeader(sprint), sprintsBuildFlow(sprint)));
   }
   root.replaceChildren(...nodes);
+  sprintsState.renderedRoot = root;
+  sprintsState.renderedSignature = signature;
+}
+
+function sprintsUpdateDurations() {
+  const root = sprintsState.root;
+  if (!sprintsState.active || !root || !root.isConnected) return;
+  for (const duration of root.querySelectorAll(".sprint-duration")) {
+    duration.textContent =
+      `Running: ${sprintsDuration(duration.dataset.startedAt)}`;
+  }
 }
 
 async function sprintsRefresh({ render = true } = {}) {
@@ -4873,6 +4906,8 @@ function sprintsStopRender() {
   sprintsState.active = false;
   sprintsState.root = null;
   sprintsState.durationTimer = null;
+  sprintsState.renderedRoot = null;
+  sprintsState.renderedSignature = null;
 }
 
 async function renderSprints(root) {
@@ -4880,7 +4915,8 @@ async function renderSprints(root) {
   sprintsState.active = true;
   sprintsState.root = root;
   sprintsPaint();
-  sprintsState.durationTimer = setInterval(sprintsPaint, SPRINTS_DURATION_MS);
+  sprintsState.durationTimer =
+    setInterval(sprintsUpdateDurations, SPRINTS_DURATION_MS);
 }
 
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
