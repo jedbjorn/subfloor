@@ -61,6 +61,27 @@ def _build_tracked_db(path: Path) -> None:
         con.close()
 
 
+def _active_content() -> Path:
+    """The content file `_build_tracked_db` will actually read."""
+    return CONTENT if CONTENT.exists() else CONTENT_LEGACY
+
+
+def _target_lines() -> list[str]:
+    """The paths this verdict is ABOUT (spec #68 req 1).
+
+    `./sc render-check` runs the CALLER's engine, so "✓ matches" is a claim about
+    one specific checkout — and it used to be the main one, whichever worktree
+    you typed it in. Printed BEFORE the work, so a crash mid-render leaves the
+    same attribution a success or a drift report does.
+    """
+    return [
+        f"  source root : {REPO_ROOT}",
+        f"  engine      : {ENGINE}",
+        f"  content     : {_active_content()}",
+        f"  mirror      : {ACTIVE_ROOT}",
+    ]
+
+
 def _rel_files(base: Path) -> set[str]:
     """Tracked-mirror files present under `base`, as repo-relative paths."""
     found: set[str] = set()
@@ -74,6 +95,9 @@ def _rel_files(base: Path) -> set[str]:
 
 
 def main() -> int:
+    print("render-check: verifying the tracked sources of this checkout")
+    for line in _target_lines():
+        print(line)
     artifact_policy.prepare_local_state()
     if not artifact_policy.tracks_local_artifacts() and not ACTIVE_ROOT.exists():
         print("✓ render-check: local artifact mode has no rendered instance state yet")
@@ -105,7 +129,9 @@ def main() -> int:
                 "✗ render drift: the active flat _sc mirror does not match the\n"
                 "  mirror rendered from the active sources (schema + migrations +\n"
                 f"  {CONTENT.relative_to(REPO_ROOT)}). A source edit was made without\n"
-                "  re-rendering the mirror.\n\n  drifted:\n"
+                "  re-rendering the mirror.\n\n"
+                + "".join(f"{line}\n" for line in _target_lines())
+                + "\n  drifted:\n"
                 + "".join(f"    {p}\n" for p in drifted)
                 + "\n  fix:  ./sc rebuild && ./sc render flat"
                 + (" && git add " + " ".join(RENDERED)

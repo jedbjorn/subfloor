@@ -89,22 +89,59 @@ def apply(con, path: Path) -> None:
 
 
 def migrate(db_path: str) -> int:
+    # Spec #68 req 5: name the two targets — WHICH database, and WHICH migration
+    # source — before opening either, and again on the outcome. `./sc migrate`
+    # run from a linked worktree used to maintain the main checkout's live DB and
+    # print "nothing pending" without ever saying whose DB was current. The
+    # disclosure goes first because a crash mid-chain must still leave the
+    # operator knowing what was being changed.
+    target = Path(db_path).resolve()
+    print(f"migrate: db         {target}")
+    print(f"migrate: migrations {MIGRATIONS_DIR}")
     con = db_driver.connect(db_path)
     try:
         todo = pending(con)
         if not todo:
-            print("migrate: nothing pending — DB is current.")
+            print(f"migrate: nothing pending — {target} is current.")
             return 0
         for path in todo:
             apply(con, path)  # each file self-commits atomically with its stamp
             print(f"migrate: applied {path.name}")
-        print(f"migrate: {len(todo)} migration(s) applied.")
+        print(f"migrate: {len(todo)} migration(s) applied to {target}.")
     finally:
         con.close()
     return 0
 
 
+USAGE = "usage: ./sc migrate  ·  python3 .super-coder/scripts/migrate.py <path-to-db>"
+
+HELP = f"""{USAGE}
+
+Apply every unstamped migration in {MIGRATIONS_DIR.name}/ to the named DB, in
+filename order, recording each in the schema_migrations ledger. Reports the
+absolute DB path and migration source directory before touching either.
+
+Takes exactly one argument: the path to the database.
+"""
+
+
+def parse_args(argv: list[str]) -> str:
+    """Return the DB path, print help, or reject — WITHOUT connecting.
+
+    Help wins over every other token, including a bad one, so no help form can
+    reach a database (`./sc migrate --help` used to run the real migration
+    against the shared live DB). Same shape as rebuild's preflight (spec #67) —
+    the argument contract is settled before any state is opened.
+    """
+    if "-h" in argv or "--help" in argv:
+        print(HELP)
+        raise SystemExit(0)
+    if len(argv) != 1:
+        subject = f"unknown argument '{argv[1]}'" if len(argv) > 1 else "needs a DB path"
+        print(f"migrate: {subject} ({USAGE})", file=sys.stderr)
+        raise SystemExit(2)
+    return argv[0]
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit(f"usage: {Path(sys.argv[0]).name} <path-to-db>")
-    sys.exit(migrate(sys.argv[1]))
+    sys.exit(migrate(parse_args(sys.argv[1:])))

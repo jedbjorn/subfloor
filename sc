@@ -8,22 +8,78 @@ set -e
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$here"
 
-# The engine (`.super-coder/`) and its gitignored live DB sit at the MAIN worktree
-# root. A linked worktree (a shell's `.sc-worktrees/<name>/`) has a tracked copy of
-# THIS script — and, in the canonical repo where `.super-coder/` is tracked, even a
-# DB-less engine copy — but never the live DB. So always resolve the engine at the
-# main root via git's common dir (its parent is the main worktree), so `./sc` works
-# from any worktree. We do NOT cd there: cwd stays the caller's worktree so git ops
-# + shell inference see it. Fall back to $here outside a git checkout.
-ROOT="$here"
-_root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || true)"
-[ -n "$_root" ] && [ -d "$_root/.super-coder" ] && ROOT="$_root"
+# FOUR identities, never one ROOT (spec #68). The CALLER is the checkout holding
+# the `sc` that was invoked; the LIVE instance is the MAIN worktree root, which
+# owns `.super-coder/` and its gitignored DB. A linked worktree (a shell's
+# `.sc-worktrees/<name>/`) has a tracked copy of THIS script — and, in the
+# canonical repo where `.super-coder/` is tracked, even a DB-less engine copy —
+# but never the live DB, map or runtime identity. Resolving the live root via
+# git's common dir (its parent is the main worktree) is what makes `./sc mem`
+# work from any worktree; it is ALSO what used to make `./sc migrate` silently
+# maintain the shared instance from a worktree. So both values are kept, commands
+# are CLASSIFIED against them below, and neither is a default for the other.
+#
+# We do NOT cd to the live root: cwd stays the caller's worktree so git ops +
+# shell inference see it. `pwd -P` on both sides so a symlinked or relatively
+# invoked caller compares as itself rather than as a second identity. If the
+# git-common-dir resolution fails (no checkout, no engine there), the caller is a
+# STANDALONE root — one identity, and we never guess a second target.
+CALLER_ROOT="$(CDPATH= cd -- "$here" && pwd -P)"
+CALLER_ENGINE="$CALLER_ROOT/.super-coder"
+LIVE_ROOT="$CALLER_ROOT"
+_root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd -P || true)"
+[ -n "$_root" ] && [ -d "$_root/.super-coder" ] && LIVE_ROOT="$_root"
 
+# LINKED=1 means caller != live: this invocation can reach shared state it does
+# not own. Compared as normalized paths — never a branch name, never the
+# `.sc-worktrees` spelling (req 7), so a fork that keeps worktrees anywhere (or
+# none at all) is judged by the same test.
+LINKED=0
+[ "$CALLER_ROOT" != "$LIVE_ROOT" ] && LINKED=1
+
+ROOT="$LIVE_ROOT"          # every path below this line is the LIVE instance's
 ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
 MAPDB="$("$PY" "$S/artifact_policy.py" path map-db)"
+
+# --- linked-worktree target safety (spec #68, decision #81) -------------------
+# A command whose subject is the SHARED live instance refuses from a linked
+# worktree, BEFORE it opens or deletes anything. The worktree has no DB, map,
+# instance config or runtime identity of its own, so there is nothing local to
+# act on instead: decision #81 declined a worktree-local runtime mode, because a
+# partial instance replaces one ambiguity with another. A named refusal is the
+# whole fix — `./sc migrate` from a worktree used to maintain the main
+# checkout's live DB and say nothing about which DB it meant.
+#
+# `-h`/`--help` is not an action and must work from any checkout (sprint ruling
+# R1): parse first, refuse second, act third. Only the commands whose target
+# actually implements help consult sc_help_form; for the rest every form is an
+# action form and refuses.
+sc_help_form() {
+  for _a in "$@"; do
+    case "$_a" in -h|--help) return 0 ;; esac
+  done
+  return 1
+}
+
+# $1 = the command as the operator typed it · $2 = the live target declined.
+# stderr + exit 1: nothing ran, so nothing may read as having run.
+sc_refuse_linked() {
+  [ "$LINKED" -eq 1 ] || return 0
+  {
+    echo "✗ ./sc $1 refused: this is a linked worktree, not the live instance."
+    echo "    caller worktree : $CALLER_ROOT"
+    echo "    live instance   : $LIVE_ROOT"
+    echo "    declined target : $2"
+    echo "  ./sc $1 acts on the shared live instance above, which this worktree"
+    echo "  does not own. Nothing was opened, written or deleted."
+    echo "  For live maintenance, run it from the main checkout:"
+    echo "      cd $LIVE_ROOT && ./sc $1"
+  } >&2
+  exit 1
+}
 
 # Python for the Interface verbs: PREFER an interpreter with `websockets`
 # (baked into the sandbox image's own python and pinned in requirements.txt
@@ -1131,9 +1187,21 @@ case "$cmd" in
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
   eject)        exec "$PY" "$S/eject.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
-  rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
-  migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
-  snapshot)     exec "$PY" "$S/snapshot.py" ;;
+  # rebuild/migrate: the script owns the whole argument contract (help, unknown
+  # tokens), so the dispatcher forwards VERBATIM and only inserts the refusal —
+  # after the help question, before the action.
+  rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$DB"
+                exec "$PY" "$S/rebuild.py" "$@" ;;
+  migrate)      sc_help_form "$@" || sc_refuse_linked migrate "$DB"
+                exec "$PY" "$S/migrate.py" "$DB" "$@" ;;
+  # snapshot/render name the artifact they would overwrite as well as the DB
+  # they read; resolving that path costs a subprocess, so only the refusing
+  # branch pays for it.
+  snapshot)     if [ "$LINKED" -eq 1 ]; then
+                  sc_refuse_linked snapshot \
+                    "$DB -> $("$PY" "$S/artifact_policy.py" path content)"
+                fi
+                exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
@@ -1163,8 +1231,24 @@ case "$cmd" in
   map-sql)      exec sqlite3 -readonly "$MAPDB" "$@" ;;
   sql-rw)       exec sqlite3 "$DB" "$@" ;;
   map-sql-rw)   exec sqlite3 "$MAPDB" "$@" ;;
-  render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
-  render-check) exec "$PY" "$S/render_check.py" ;;
+  render)       if [ "$LINKED" -eq 1 ]; then
+                  sc_refuse_linked render \
+                    "$DB -> $("$PY" "$S/artifact_policy.py" path renders)"
+                fi
+                [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
+  # render-check is SOURCE-PURE: it builds a throwaway DB from tracked text and
+  # diffs the mirror, touching no live state. So it runs the CALLER's engine —
+  # that is the source the caller is about to commit, and running the main
+  # checkout's copy verified the wrong tree from every worktree. A missing caller
+  # engine fails naming that path; falling back to live source would answer a
+  # question nobody asked.
+  render-check) if [ ! -f "$CALLER_ENGINE/scripts/render_check.py" ]; then
+                  echo "✗ ./sc render-check: no engine source at $CALLER_ENGINE" >&2
+                  echo "  render-check verifies THIS checkout's tracked sources; it does not" >&2
+                  echo "  fall back to the live instance at $LIVE_ROOT." >&2
+                  exit 1
+                fi
+                exec "$PY" "$CALLER_ENGINE/scripts/render_check.py" ;;
   map)          case "${1:-}" in
                   -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue ($MAPDB); takes no arguments"
                              exit 0 ;;
@@ -1453,6 +1537,13 @@ case "$cmd" in
     dbuild ;;
   logs)         exec docker logs -f "$CNAME" ;;
   verify)
+    sc_refuse_linked verify "$DB"
+    # Destructive by design: rebuild.py REPLACES the DB below. Say which DB and
+    # which source before that happens — a footer printed after the fact is a
+    # disclosure a crash can skip, and this is the command that eats unsnapshotted
+    # memory when it is pointed at an instance the caller did not mean.
+    echo "→ verify: about to REBUILD $DB"
+    echo "          from engine source $ENGINE"
     "$PY" "$S/rebuild.py"
     # The engine source intentionally carries no per-instance snapshot in local
     # artifact mode. Exercise the real fresh-fork initialization path before
@@ -1479,7 +1570,8 @@ PY
     SC_ADMIN=1 "$PY" "$S/render.py" flat
     RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
-  clean-db)     rm -f "$DB" "$DB-wal" "$DB-shm" && echo "removed $DB (rebuild with: ./sc rebuild)" ;;
+  clean-db)     sc_refuse_linked clean-db "$DB"
+                rm -f "$DB" "$DB-wal" "$DB-shm" && echo "removed $DB (rebuild with: ./sc rebuild)" ;;
   help|-h|--help)
     cat <<'EOF'
 super-coder — forkable shell substrate
@@ -1506,6 +1598,10 @@ super-coder — forkable shell substrate
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables under the active artifact policy
+                             live-state commands (rebuild · migrate · verify · snapshot · render · clean-db) act on the SHARED live
+                             instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming
+                             the target declined (decision #81); -h/--help still answers from any checkout. render-check is the
+                             source-pure one: it verifies the CALLER's tracked sources and names the checkout it read.
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
