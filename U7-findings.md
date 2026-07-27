@@ -197,6 +197,37 @@ my own gate. H-27 must key on *"a completed human turn produced no `turn_stop`"*
 "`provider_ready_at` unset N seconds after creation" for harnesses whose
 readiness is first-turn-gated.
 
+### F9 — option (C) "observe the codex rollout file instead of the hook" is DEAD
+Worth pricing because the engine ALREADY reads codex rollouts
+(`activity_readers.py:684-696`, `_codex_marker`), so a readiness signal there
+would need no new machinery. It does not work:
+
+- Direct experiment: rollout-file count in `~/.codex/sessions/2026/07/27/` was
+  **37 before and 37 after** a full turn-less codex TUI session (launched,
+  18s alive, killed). **No rollout file is created until the first turn.**
+- `_codex_marker` is in any case doubly first-turn-gated: it matches on
+  `type == "turn_context"` records, which by definition do not exist before a
+  turn.
+
+So the rollout surface is gated on exactly the same event as the hook. There is
+no human-free codex liveness signal on disk today. This strengthens direction (A).
+
+Method note (rejected an earlier misreading): five rollouts at 11:10–11:16 with
+`session_meta` written ~0.5s after init initially looked like proof that
+turn-less sessions do write rollouts. Their cwds are `/tmp/hk/{plain,b,b/sub,wt,
+main/.sc-worktrees/inner}` — probe dirs left by my own process before the 529
+killed it (it was testing the same root-vs-worktree hypothesis I re-derived).
+The 0.5s gap is consistent with those runs having been given a prompt at launch
+(`codex [PROMPT]` is a positional arg that submits immediately), not with a
+turn-less session. The controlled 37→37 count above is the measurement I trust,
+because it is the only one where I controlled the input.
+
+### F10 — incidental: `codex [PROMPT]` submits a first turn at launch
+Relevant only because it makes direction (B) cheaper than I assumed — priming
+needs no tmux keystroke race, just a positional argument. It still costs a model
+call per codex seat and still puts a synthetic turn in the transcript, so it does
+not change my recommendation.
+
 ## Mechanism verdict (all three candidates resolved)
 - **CONFIG DISCOVERY — RULED OUT.** F2 + probe step 3/4: the project-layer file is
   found, parsed, validated and registered, in worktrees and in probes alike.
