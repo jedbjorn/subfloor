@@ -27,6 +27,20 @@ column role expectation derives from, so it moves in its own call and
 `state_changed_at` has exactly one writer. The API refuses a state move that
 carries other edits — the separation is a property, not a convention.
 
+The states are a MACHINE, not a vocabulary (migration 0108): pending →
+working → in_review ⇄ working, blocked in and out of working/in_review,
+merged from working/in_review, cancelled from anything not already terminal.
+`merged` and `cancelled` are terminal and have no exits — there is no force
+verb here because there is no such move to force. A unit declared terminal in
+error is corrected by declaring a SUCCESSOR UNIT at a new seq that redoes or
+disposes of the work; the terminal row stands as the record of what was
+declared.
+
+`--review-head` records the head a reviewer returned `review-clean` at, set as
+the planner moves the unit out of `in_review`. Freezing the sprint doc checks
+that every MERGED unit has one — presence only, since judging the verdict is
+the planner's job. Cancelled units never had a clean review and are exempt.
+
 `board` RENDERS the unit table from the record and prints it. It does not
 write it back into the document: the document keeps its prose, the record is
 the source, and a stored copy would state the board twice.
@@ -168,6 +182,8 @@ def _unit_body(args, *, creating: bool) -> dict:
         body["branch"] = _field(args.branch)
     if args.pr is not None:
         body["pr_number"] = None if args.pr < 0 else args.pr
+    if args.review_head is not None:
+        body["review_head"] = _field(args.review_head)
     return body
 
 
@@ -190,7 +206,8 @@ def _print_unit(u: dict) -> None:
             f"depends={_depends_cell(u)}"
             if (u.get("depends_on") or u.get("overlap")) else "",
             f"branch={u['branch']}" if u.get("branch") else "",
-            f"pr=#{u['pr_number']}" if u.get("pr_number") else "")
+            f"pr=#{u['pr_number']}" if u.get("pr_number") else "",
+            f"review_head={u['review_head']}" if u.get("review_head") else "")
         if p)
     print(f"{u['seq']:<5} [{u['state']}] {u['unit_title']} · {roles}"
           + (f" · {extra}" if extra else ""))
@@ -221,7 +238,7 @@ def cmd_unit_set(args) -> int:
     body = _unit_body(args, creating=False)
     if len(body) == 2:
         raise _die("nothing to set — pass at least one of --title, --dev, "
-                   "--reviewer, --depends-on, --branch, --pr "
+                   "--reviewer, --depends-on, --branch, --pr, --review-head "
                    "(state moves with `unit state`)")
     r = _api("PATCH", "/api/sprint-units", body,
              f"unit-set|{args.sprint}|{args.seq}|{uuid.uuid4()}")
@@ -419,6 +436,11 @@ def main(argv: "list[str] | None" = None) -> int:
         sp.add_argument("--branch", default=None, help="('none' to clear)")
         sp.add_argument("--pr", type=int, default=None,
                         help="PR number (-1 to clear)")
+        sp.add_argument("--review-head", default=None, metavar="SHA",
+                        help="the head the reviewer returned review-clean at, "
+                             "recorded as the unit leaves in_review; close "
+                             "checks it is PRESENT on every merged unit "
+                             "('none' to clear)")
 
     ua = usub.add_parser("add", help="declare a unit on the board (never an "
                                      "upsert — an existing seq is a 409)")

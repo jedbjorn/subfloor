@@ -940,6 +940,276 @@ class SprintCloseTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["released_bindings"], 0)
 
+    # ── H-12: close cleans its WHOLE footprint ──────────────────────────────
+    #
+    # Driven through FREEZE rather than the `status: CLOSED` doc edit. Both
+    # reach the same `_close_sprint_wake` today, but U1 is deleting the
+    # status-line trigger under H-1 (the status line becomes display prose that
+    # nothing executable reads, and closing a sprint IS freezing its doc).
+    # Pinning this behaviour to the path being deleted would hand U1 a set of
+    # failures that look like its own regression.
+
+    def sprint_doc(self, doc_id, status_line="ACTIVE"):
+        """An ACTIVE sprint doc with NO planner binding.
+
+        Deliberate for the H-12 tests: `_close_sprint_wake` used to return
+        early when the sprint had no unreleased binding, so a sprint whose
+        planner had already stood down cleaned up NOTHING. Arming a binding
+        here would route every assertion below around that exact defect.
+        (It also keeps these tests off the one-live-binding-per-planner
+        fixture, which a REFUSED freeze would otherwise leave occupied for
+        whichever test runs next.)
+        """
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "INSERT INTO documents (document_id, kind, title, body) "
+                "VALUES (?,'doc','SPRINT: close',?)",
+                (doc_id, f"# SPRINT: close\nstatus: {status_line}"))
+            con.commit()
+        finally:
+            con.close()
+
+    def watch(self, doc_id, pr, *, reasons=(), closed=False):
+        """A live watch on `doc_id` plus the watch-scoped alerts it opened.
+        Returns the watch id."""
+        con = sqlite3.connect(self.db)
+        try:
+            wid = con.execute(
+                "INSERT INTO watched_prs (repo, pr_number, shell_id,"
+                " sprint_doc_id, last_seen, closed_at) "
+                "VALUES ('o/r',?,1,?,'{}',?)",
+                (pr, doc_id, "2026-01-01" if closed else None)).lastrowid
+            for reason in reasons:
+                con.execute(
+                    "INSERT INTO planner_alerts (watch_id, severity, reason,"
+                    " dedupe_key) VALUES (?,'critical',?,?)",
+                    (wid, reason, f"-|-|{wid}|-|{reason}"))
+            con.commit()
+            return wid
+        finally:
+            con.close()
+
+    def open_watch_alerts(self, doc_id):
+        con = sqlite3.connect(self.db)
+        try:
+            return con.execute(
+                "SELECT COUNT(*) FROM planner_alerts a "
+                "JOIN watched_prs w ON w.watch_id=a.watch_id "
+                "WHERE w.sprint_doc_id=? AND a.resolved_at IS NULL",
+                (doc_id,)).fetchone()[0]
+        finally:
+            con.close()
+
+    def live_watches(self, doc_id):
+        con = sqlite3.connect(self.db)
+        try:
+            return con.execute(
+                "SELECT COUNT(*) FROM watched_prs "
+                "WHERE sprint_doc_id=? AND closed_at IS NULL",
+                (doc_id,)).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_close_retires_the_sprints_watches_and_their_alerts(self):
+        """Before H-12 the close path released bindings and stopped. The
+        sprint's watches kept polling GitHub for a sprint that was over, and
+        their alerts — resolved on the REBIND path only — stayed open forever,
+        so `sc sprint alerts` grew a permanent floor of rows about finished
+        sprints."""
+        self.sprint_doc(110)
+        w1 = self.watch(110, 901, reasons=("pr_poll_failure",))
+        w2 = self.watch(110, 902, reasons=("pr_poll_backoff_escalated",
+                                           "pr_watch_unscoped"))
+        self.assertEqual(self.live_watches(110), 2)
+        self.assertEqual(self.open_watch_alerts(110), 3)
+
+        status, body = self.freeze(110)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["retired_watches"], 2)
+        self.assertEqual(body["resolved_watch_alerts"], 3)
+        self.assertEqual(self.live_watches(110), 0)
+        self.assertEqual(self.open_watch_alerts(110), 0)
+        for wid in (w1, w2):
+            self.assertIsNotNone(self.q(
+                "SELECT closed_at FROM watched_prs WHERE watch_id=?",
+                (wid,))[0])
+
+    def test_close_leaves_another_sprints_watches_alone(self):
+        """The scope is the SPRINT. A close that retired every live watch
+        would take down a concurrent sprint's eventing, and the symptom —
+        a planner that simply stops being woken — names no cause."""
+        self.sprint_doc(111)
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO documents (document_id, kind, title, body) "
+            "VALUES (112,'doc','SPRINT: other','# S\nstatus: ACTIVE')")
+        con.commit()
+        con.close()
+        mine = self.watch(111, 903, reasons=("pr_poll_failure",))
+        theirs = self.watch(112, 904, reasons=("pr_poll_failure",))
+
+        self.freeze(111)
+
+        self.assertIsNotNone(self.q(
+            "SELECT closed_at FROM watched_prs WHERE watch_id=?", (mine,))[0])
+        self.assertIsNone(self.q(
+            "SELECT closed_at FROM watched_prs WHERE watch_id=?",
+            (theirs,))[0])
+        self.assertEqual(self.open_watch_alerts(112), 1)
+
+    def test_close_does_not_resurrect_an_already_retired_watch(self):
+        """`closed_at` is set once. Re-stamping it on close would rewrite the
+        retirement time of a watch that ended days earlier for another
+        reason, and the counts would over-report what this close did."""
+        self.sprint_doc(113)
+        old = self.watch(113, 905, closed=True)
+        self.watch(113, 906)
+        status, body = self.freeze(113)
+        self.assertEqual(body["retired_watches"], 1)
+        self.assertEqual(
+            self.q("SELECT closed_at FROM watched_prs WHERE watch_id=?",
+                   (old,))[0], "2026-01-01")
+
+    def test_close_leaves_an_unrelated_alert_reason_open(self):
+        """Enumerated reasons, not "every alert with a watch_id": a reason
+        this close does not understand is not a reason it may silently
+        declare handled."""
+        self.sprint_doc(114)
+        self.watch(114, 907, reasons=("pr_poll_failure", "something_else"))
+        self.freeze(114)
+        self.assertEqual(self.open_watch_alerts(114), 1)
+        self.assertEqual(self.q(
+            "SELECT reason FROM planner_alerts a JOIN watched_prs w "
+            "ON w.watch_id=a.watch_id WHERE w.sprint_doc_id=114 "
+            "AND a.resolved_at IS NULL")[0], "something_else")
+
+    # ── H-12/H-14: freeze refuses on a board that is not finished ───────────
+
+    def unit(self, doc_id, seq, state, *, review_head=None, pr=None):
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title,"
+                " state, review_head, pr_number) VALUES (?,?,?,?,?,?)",
+                (doc_id, seq, f"unit {seq}", state, review_head, pr))
+            con.commit()
+        finally:
+            con.close()
+
+    def freeze(self, doc_id):
+        try:
+            return self.patch(f"/_sc/mem/docs/{doc_id}/freeze", {})
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def frozen(self, doc_id):
+        return self.q("SELECT frozen FROM documents WHERE document_id=?",
+                      (doc_id,))[0]
+
+    def test_freeze_refuses_while_a_unit_is_non_terminal_and_names_it(self):
+        self.sprint_doc(120)
+        self.unit(120, "U1", "merged", review_head="abc1234")
+        self.unit(120, "U2", "working")
+        self.unit(120, "U10", "blocked")
+
+        status, err = self.freeze(120)
+
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["code"], "sprint_not_finished")
+        # NAMING the units is the requirement: "some unit is not done" sends
+        # the planner to read the whole board to find out which.
+        self.assertEqual(err["non_terminal_units"], ["U2", "U10"])
+        self.assertIn("U2 (working)", err["error"])
+        self.assertIn("U10 (blocked)", err["error"])
+        self.assertNotIn("U1", err["non_terminal_units"])
+        self.assertEqual(self.frozen(120), 0, "the refused freeze still froze")
+
+    def test_freeze_refuses_a_merged_unit_with_no_review_head(self):
+        self.sprint_doc(121)
+        self.unit(121, "U1", "merged", review_head="abc1234")
+        self.unit(121, "U2", "merged")
+        self.unit(121, "U3", "merged", review_head="   ")
+
+        status, err = self.freeze(121)
+
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["code"], "sprint_not_finished")
+        self.assertEqual(err["units_without_review_head"], ["U2", "U3"])
+        self.assertEqual(err["non_terminal_units"], [])
+        self.assertEqual(self.frozen(121), 0)
+
+    def test_a_cancelled_unit_needs_no_review_head(self):
+        """The exemption, alone. A cancelled unit never had a clean review,
+        so requiring a head for one asks the planner to invent a SHA — and a
+        check that demanded it would make cancelling a unit a reason the
+        sprint can never be closed."""
+        self.sprint_doc(122)
+        self.unit(122, "U1", "cancelled")
+        self.unit(122, "U2", "merged", review_head="abc1234")
+
+        status, body = self.freeze(122)
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.frozen(122), 1)
+
+    def test_freeze_reports_both_reasons_at_once(self):
+        """A planner fixing a close wants the whole list. Refusing serially
+        makes it re-run the close to discover the second reason."""
+        self.sprint_doc(123)
+        self.unit(123, "U1", "working")
+        self.unit(123, "U2", "merged")
+
+        status, err = self.freeze(123)
+
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["non_terminal_units"], ["U1"])
+        self.assertEqual(err["units_without_review_head"], ["U2"])
+
+    def test_a_finished_board_freezes_and_the_refusal_is_not_a_wall(self):
+        """The permissive half — and the proof that the two H-12 halves run
+        in the right order: a refused freeze must not have cleaned up, or a
+        planner would repair its board on a sprint whose watches were already
+        retired."""
+        self.sprint_doc(124)
+        self.unit(124, "U1", "working")
+        self.watch(124, 908, reasons=("pr_poll_failure",))
+
+        self.assertEqual(self.freeze(124)[0], 409)
+        self.assertEqual(self.live_watches(124), 1,
+                         "a REFUSED freeze retired the sprint's watches")
+        self.assertEqual(self.open_watch_alerts(124), 1)
+
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE sprint_units SET state='merged', "
+                    "review_head='abc1234' WHERE sprint_doc_id=124")
+        con.commit()
+        con.close()
+
+        status, body = self.freeze(124)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.frozen(124), 1)
+        self.assertEqual(body["retired_watches"], 1)
+        self.assertEqual(self.live_watches(124), 0)
+        self.assertEqual(self.open_watch_alerts(124), 0)
+
+    def test_an_already_frozen_sprint_is_still_idempotent(self):
+        """The retry-after-a-lost-response path predates this gate and must
+        survive it: re-freezing reads as the success it was, and does not
+        re-derive a refusal from a board it already froze."""
+        self.sprint_doc(125)
+        self.unit(125, "U1", "merged", review_head="abc1234")
+        self.assertEqual(self.freeze(125)[0], 200)
+        # Dirty the frozen board by DECLARING a unit on it, not by walking the
+        # merged one back — the transition machine refuses that at the DB, and
+        # a test that tried would be asserting against 0108 rather than
+        # against the idempotent-freeze path it names.
+        self.unit(125, "U2", "working")
+        status, body = self.freeze(125)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["already_frozen"])
+
 
 if __name__ == "__main__":
     unittest.main()

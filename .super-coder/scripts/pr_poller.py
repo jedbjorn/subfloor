@@ -160,7 +160,8 @@ def baseline_read(repo: str, pr_number: int, fetch=None) -> "tuple[dict | None, 
     return fp, None
 
 
-def transitions(prev: "dict | None", cur: dict, repo: str, number: int) -> "tuple[list[dict], bool]":
+def transitions(prev: "dict | None", cur: dict, repo: str, number: int,
+                unit: "str | None" = None) -> "tuple[list[dict], bool]":
     """The poller's core: (events, terminal?) for one PR transition.
 
     Each event is {"key", "body"}: key is the semantic transition key
@@ -187,7 +188,13 @@ def transitions(prev: "dict | None", cur: dict, repo: str, number: int) -> "tupl
     cancelled, no conclusion is coming."""
     events: list[dict] = []
     sha7 = (cur.get("sha") or "")[:7]
-    tag = f"{repo}#{number}"
+    # `unit=U3` in the header is the structured ref made visible (H-13): the
+    # watch knows which unit its PR belongs to, so the planner reading the row
+    # — and the reconciler's prose fallback — both get the answer instead of
+    # inferring it. Omitted entirely when the watch carries no unit, because a
+    # header that says `unit=None` is a claim, and an unlinked watch is making
+    # none.
+    tag = f"{repo}#{number}" + (f" unit={unit}" if unit else "")
 
     merged = cur.get("state") == "MERGED"
     checks = cur.get("checks")
@@ -938,9 +945,16 @@ def armed_watches(con) -> list:
         return []
     marks = ",".join("?" for _ in active)
     return con.execute(
-        "SELECT watch_id, repo, pr_number, shell_id, last_seen, sprint_doc_id "
-        f"FROM watched_prs WHERE closed_at IS NULL AND sprint_doc_id IN ({marks}) "
-        "ORDER BY repo, pr_number, watch_id", tuple(sorted(active))).fetchall()
+        "SELECT w.watch_id, w.repo, w.pr_number, w.shell_id, w.last_seen, "
+        "w.sprint_doc_id, w.unit_id, u.seq AS unit_seq "
+        "FROM watched_prs w "
+        # LEFT, not INNER: an unlinked watch is a first-class row (H-13's link
+        # is nullable), and an inner join would silently stop polling every
+        # watch registered without --unit.
+        "LEFT JOIN sprint_units u ON u.unit_id = w.unit_id "
+        f"WHERE w.closed_at IS NULL AND w.sprint_doc_id IN ({marks}) "
+        "ORDER BY w.repo, w.pr_number, w.watch_id",
+        tuple(sorted(active))).fetchall()
 
 
 def live_unscoped_watch_ids(con) -> list[int]:
@@ -1002,12 +1016,28 @@ def beat(con, interval: int, *, name: str = "watch") -> None:
 
 def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
     """Raise an alert, deduplicated while open (partial unique index). Local
-    helper — interface_broker._alert predates watch-scoped alerts."""
+    helper — interface_broker._alert predates watch-scoped alerts.
+
+    The sprint and unit are read off the watch rather than left NULL (H-13):
+    0102 gave planner_alerts structured identity columns, and a watch is the
+    one alert source that KNOWS both. Leaving them NULL forced every reader
+    back to parsing `dedupe_key` or grepping prose for "U3" — the guess this
+    linkage exists to delete. `dedupe_key` is unchanged, so an already-open
+    alert stays the same open alert and no re-alert storm follows.
+    """
     dedupe = f"-|-|{watch_id or '-'}|-|{reason}"
+    sprint_doc_id = unit_id = None
+    if watch_id is not None:
+        row = con.execute(
+            "SELECT sprint_doc_id, unit_id FROM watched_prs WHERE watch_id=?",
+            (watch_id,)).fetchone()
+        if row is not None:
+            sprint_doc_id, unit_id = row["sprint_doc_id"], row["unit_id"]
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
-        "(watch_id, severity, reason, dedupe_key) VALUES (?,?,?,?)",
-        (watch_id, severity, reason, dedupe))
+        "(watch_id, sprint_doc_id, unit_id, severity, reason, dedupe_key) "
+        "VALUES (?,?,?,?,?,?)",
+        (watch_id, sprint_doc_id, unit_id, severity, reason, dedupe))
 
 
 def surface_unscoped_watches(con) -> int:
@@ -1116,7 +1146,8 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
             if cur is None:
                 continue  # unreadable this poll — keep the watch, try next cycle
             prev = json.loads(w["last_seen"]) if w["last_seen"] else None
-            events, terminal = transitions(prev, cur, w["repo"], w["pr_number"])
+            events, terminal = transitions(prev, cur, w["repo"],
+                                           w["pr_number"], w["unit_seq"])
             # Durable only with a transition or a blind-window marker (the
             # snapshot row filter); a quiet successful poll is noise.
             if events or blind:

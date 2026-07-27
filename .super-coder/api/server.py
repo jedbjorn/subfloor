@@ -87,6 +87,7 @@ import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 from sprint_units import UNIT_COLUMNS as _SPRINT_UNIT_COLUMNS  # noqa: E402
+from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 from sprint_units import UNIT_STATES  # noqa: E402
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
@@ -606,6 +607,7 @@ def get_active_sprints(con) -> dict:
         "unit.state AS unit_state, unit.depends_on AS unit_depends_on, "
         "unit.overlap AS unit_overlap, unit.branch AS unit_branch, "
         "unit.pr_number AS unit_pr_number, "
+        "unit.review_head AS unit_review_head, "
         "unit.assigned_at AS unit_assigned_at, "
         "unit.state_changed_at AS unit_state_changed_at, "
         "unit.updated_at AS unit_updated_at, "
@@ -1243,21 +1245,119 @@ def _sprint_doc_status(con, doc_id) -> "str | None":
     return None
 
 
-def _close_sprint_wake(con, doc_id) -> int:
-    """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10):
-    closing (status: CLOSED) or freezing a sprint doc releases its wake
-    bindings and cancels their queued wake work in the SAME transaction —
-    no orphan armed binding or stranded queued batch survives the close
-    (the frozen-CANCEL in the submit gate is the in-flight backstop, not
-    the cleanup). Messages stay unread; the Interface chat is untouched.
-    Returns the number of bindings released."""
+# The alert reasons a WATCH carries, as opposed to a binding. Until H-12 these
+# were resolved on exactly one path — a watch being rebound to a sprint — so a
+# sprint that closed with a failing or unscoped watch left them open forever,
+# and `sc sprint alerts` grew a permanent floor of alerts about sprints nobody
+# was running. Enumerated rather than "every alert with a watch_id" so a future
+# reason has to be classified deliberately.
+_WATCH_ALERT_REASONS = ("pr_watch_unscoped", "pr_poll_failure",
+                        "pr_poll_backoff_escalated")
+
+
+def _link_watch_unit(con, watch_id: int, unit_id) -> bool:
+    """Point a live watch at a board unit (H-13). True when the row changed.
+
+    Called on the idempotent re-registration paths, where the watch already
+    exists: `sc watch pr … --unit U3` on an unlinked watch has to LINK it, not
+    report "already watched" and drop the flag. Re-pointing an already-linked
+    watch is allowed — a PR moving between units is a planner decision, and
+    the alternative is an operator with no way to correct a typo'd --unit.
+    Caller owns the commit.
+    """
+    if unit_id is None:
+        return False
+    return con.execute(
+        "UPDATE watched_prs SET unit_id=? "
+        "WHERE watch_id=? AND (unit_id IS NULL OR unit_id<>?)",
+        (unit_id, watch_id, unit_id)).rowcount > 0
+
+
+def _freeze_board_refusal(con, doc_id) -> "dict | None":
+    """Refuse to freeze a sprint whose own board says it is not finished
+    (spec #76 H-12, H-14). Returns an error body, or None to let the freeze
+    proceed.
+
+    Two conditions, reported TOGETHER rather than one per attempt: a planner
+    fixing a freeze wants the whole list, and refusing serially would make it
+    re-run the close to discover the second reason.
+
+    - every unit terminal (merged or cancelled). A non-terminal unit under a
+      frozen doc is a worker directive with nothing left to move it.
+    - every MERGED unit carries a review_head. Cancelled units are exempt by
+      construction: they never had a clean review, so requiring a head for one
+      would ask the planner to invent a SHA.
+
+    PRESENCE, not correctness — nothing here judges whether the SHA is the one
+    the reviewer read (decision #76). A board with no units at all freezes
+    freely; that is a sprint declared and abandoned before any unit existed,
+    and it has no worker to strand.
+    """
+    marks = ",".join("?" for _ in TERMINAL_UNIT_STATES)
+    live = [
+        (r["seq"], r["state"]) for r in con.execute(
+            "SELECT seq, state FROM sprint_units WHERE sprint_doc_id=? "
+            f"AND state NOT IN ({marks}) ORDER BY LENGTH(seq), seq",
+            (doc_id, *TERMINAL_UNIT_STATES)).fetchall()]
+    headless = [
+        r["seq"] for r in con.execute(
+            "SELECT seq FROM sprint_units WHERE sprint_doc_id=? "
+            "AND state='merged' AND (review_head IS NULL OR "
+            "TRIM(review_head)='') ORDER BY LENGTH(seq), seq",
+            (doc_id,)).fetchall()]
+    if not live and not headless:
+        return None
+    parts = []
+    if live:
+        parts.append("non-terminal: "
+                     + ", ".join(f"{seq} ({state})" for seq, state in live))
+    if headless:
+        parts.append("merged with no review_head: " + ", ".join(headless))
+    return {
+        "error": f"sprint {doc_id} is not finished — {'; '.join(parts)}. "
+                 "Freeze records that the sprint is over; move each unit to "
+                 "merged or cancelled first, and set --review-head on every "
+                 "merged unit from its reviewer's review-clean verdict.",
+        "code": "sprint_not_finished",
+        "non_terminal_units": [seq for seq, _ in live],
+        "units_without_review_head": headless,
+    }
+
+
+def _close_sprint_wake(con, doc_id) -> dict:
+    """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10;
+    spec #76 H-12): closing (status: CLOSED) or freezing a sprint doc retires
+    the sprint's WHOLE live footprint in the SAME transaction — its wake
+    bindings and their queued wake work, its live PR watches, and the
+    watch-scoped alerts those watches opened. No orphan armed binding, no
+    stranded queued batch, no watch still polling GitHub for a sprint that
+    ended, and no permanently-open alert about either (the frozen-CANCEL in
+    the submit gate is the in-flight backstop, not the cleanup). Messages stay
+    unread; the Interface chat is untouched.
+
+    Returns the three counts, because a cleanup nobody can see is
+    indistinguishable from one that did not run — the close response reports
+    what it retired.
+    """
+    retired = con.execute(
+        "UPDATE watched_prs SET closed_at=datetime('now') "
+        "WHERE sprint_doc_id=? AND closed_at IS NULL", (doc_id,)).rowcount
+    marks = ",".join("?" for _ in _WATCH_ALERT_REASONS)
+    resolved = con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        f"WHERE resolved_at IS NULL AND reason IN ({marks}) "
+        "AND watch_id IN (SELECT watch_id FROM watched_prs "
+        "                 WHERE sprint_doc_id=?)",
+        (*_WATCH_ALERT_REASONS, doc_id)).rowcount
+    released = 0
     if con.execute(
             "SELECT 1 FROM sprint_planner_bindings "
             "WHERE sprint_doc_id=? AND released_at IS NULL LIMIT 1",
-            (doc_id,)).fetchone() is None:
-        return 0
-    return len(interface_broker.release_bindings_for_sprint(
-        con, doc_id, "sprint closed"))
+            (doc_id,)).fetchone() is not None:
+        released = len(interface_broker.release_bindings_for_sprint(
+            con, doc_id, "sprint closed"))
+    return {"released_bindings": released, "retired_watches": retired,
+            "resolved_watch_alerts": resolved}
 
 
 def create_flag(con, body):
@@ -2660,15 +2760,23 @@ class Handler(BaseHTTPRequestHandler):
                     # heals any drift a lost post-freeze serialize left behind.
                     return self._send(200, {"ok": True, "already_frozen": True,
                                             "serialize": serialize_doc_write()})
+                # H-12/H-14: the close skill already REQUIRES every unit
+                # terminal and every merged unit review-clean at a known head.
+                # Until now that was procedure only — a freeze went through on
+                # a board still showing `working` units, and the record then
+                # said the sprint was over while its own units said otherwise.
+                refusal = _freeze_board_refusal(con, did)
+                if refusal is not None:
+                    return self._send(409, refusal)
                 con.execute(
                     "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
                     (did,))
                 # Sprint close integration (seq 10): freezing the board
-                # releases its wake bindings + cancels queued wake work.
-                released = _close_sprint_wake(con, did)
+                # releases its wake bindings + cancels queued wake work, and
+                # retires the sprint's watches + watch-scoped alerts (H-12).
+                closed = _close_sprint_wake(con, did)
                 con.commit()
-                return self._send(200, {"ok": True,
-                                        "released_bindings": released,
+                return self._send(200, {"ok": True, **closed,
                                         "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/docs/{id}
@@ -2687,12 +2795,12 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = patch_document(con, did, body, commit=False)
                 if not ok:
                     return self._send(400, {"ok": ok, "error": err})
-                released = 0
+                closed = {"released_bindings": 0, "retired_watches": 0,
+                          "resolved_watch_alerts": 0}
                 if _sprint_doc_status(con, did) == "CLOSED":
-                    released = _close_sprint_wake(con, did)
+                    closed = _close_sprint_wake(con, did)
                 con.commit()
-                return self._send(200, {"ok": ok,
-                                        "released_bindings": released,
+                return self._send(200, {"ok": ok, **closed,
                                         "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/messages/{id}/read
@@ -2765,9 +2873,11 @@ class Handler(BaseHTTPRequestHandler):
             include_closed = q.get("all", ["0"])[0] in ("1", "true", "yes")
             active = pr_poller.active_sprint_doc_ids(con)
             sql = ("SELECT w.watch_id, w.repo, w.pr_number, w.shell_id, "
-                   "s.shortname, w.created_at, w.closed_at, w.sprint_doc_id "
+                   "s.shortname, w.created_at, w.closed_at, w.sprint_doc_id, "
+                   "w.unit_id, u.seq AS unit_seq "
                    "FROM watched_prs w "
-                   "JOIN shells s ON s.shell_id = w.shell_id")
+                   "JOIN shells s ON s.shell_id = w.shell_id "
+                   "LEFT JOIN sprint_units u ON u.unit_id = w.unit_id")
             if not include_closed:
                 sql += " WHERE w.closed_at IS NULL"
             sql += " ORDER BY w.repo, w.pr_number, w.watch_id"
@@ -2808,6 +2918,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, {"error":
                     f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
                     "SPRINT doc — watches arm only to active sprints"})
+            # H-13: the unit this PR belongs to, named the way every message
+            # names it ("U3") and resolved against THIS sprint's board. Two
+            # free integers that nothing joined is what made the reconciler
+            # regex message prose for the answer.
+            unit_id = None
+            if body.get("unit"):
+                seq = str(body["unit"]).strip()
+                r = con.execute(
+                    "SELECT unit_id FROM sprint_units "
+                    "WHERE sprint_doc_id=? AND seq=?",
+                    (sprint_doc_id, seq)).fetchone()
+                if r is None:
+                    return self._send(404, {"error":
+                        f"sprint {sprint_doc_id} has no unit '{seq}' — a watch "
+                        "links to a unit the board already declares; check "
+                        "`sc sprint board --sprint " f"{sprint_doc_id}`"})
+                unit_id = r["unit_id"]
             target = sid
             if body.get("shell"):
                 r = con.execute(
@@ -2829,8 +2956,15 @@ class Handler(BaseHTTPRequestHandler):
                 (repo, pr, target, sprint_doc_id)).fetchone()
             daemon = self._daemon_state(con)
             if existing is not None:
+                # A re-registration that NAMES a unit links the live watch even
+                # though the watch itself already existed. Returning "already
+                # watched" while silently dropping --unit would leave the
+                # operator believing a link they can see no trace of.
+                linked = _link_watch_unit(con, existing["watch_id"], unit_id)
+                con.commit()
                 return self._send(200, {"watch_id": existing["watch_id"],
-                                        "existing": True, "daemon": daemon})
+                                        "existing": True, "linked": linked,
+                                        "daemon": daemon})
             # Registration baseline (spec: an immediate GitHub read, normalized
             # and stored BEFORE arming; a failed baseline creates no armed
             # watch and returns a retryable sanitized error). The gh call
@@ -2856,9 +2990,11 @@ class Handler(BaseHTTPRequestHandler):
                 "AND closed_at IS NULL AND sprint_doc_id=?",
                 (repo, pr, target, sprint_doc_id)).fetchone()
             if existing is not None:
-                con.rollback()
+                linked = _link_watch_unit(con, existing["watch_id"], unit_id)
+                con.commit()
                 return self._send(200, {"watch_id": existing["watch_id"],
-                                        "existing": True, "daemon": daemon})
+                                        "existing": True, "linked": linked,
+                                        "daemon": daemon})
             unscoped = con.execute(
                 "SELECT watch_id FROM watched_prs "
                 "WHERE repo=? AND pr_number=? AND shell_id=? "
@@ -2866,9 +3002,10 @@ class Handler(BaseHTTPRequestHandler):
                 (repo, pr, target)).fetchone()
             if unscoped is not None:
                 con.execute(
-                    "UPDATE watched_prs SET sprint_doc_id=?, last_seen=? "
-                    "WHERE watch_id=?",
-                    (sprint_doc_id, json.dumps(fp), unscoped["watch_id"]))
+                    "UPDATE watched_prs SET sprint_doc_id=?, last_seen=?, "
+                    "unit_id=COALESCE(?, unit_id) WHERE watch_id=?",
+                    (sprint_doc_id, json.dumps(fp), unit_id,
+                     unscoped["watch_id"]))
                 con.execute(
                     "UPDATE planner_alerts SET resolved_at=datetime('now') "
                     "WHERE watch_id=? AND reason='pr_watch_unscoped' "
@@ -2879,8 +3016,8 @@ class Handler(BaseHTTPRequestHandler):
                                         "rebound": True, "daemon": daemon})
             cur = con.execute(
                 "INSERT INTO watched_prs (repo, pr_number, shell_id, last_seen, "
-                "sprint_doc_id) VALUES (?, ?, ?, ?, ?)",
-                (repo, pr, target, json.dumps(fp), sprint_doc_id))
+                "sprint_doc_id, unit_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (repo, pr, target, json.dumps(fp), sprint_doc_id, unit_id))
             con.commit()
             return self._send(201, {"watch_id": cur.lastrowid, "daemon": daemon})
         except Exception as e:
