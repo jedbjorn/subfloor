@@ -342,6 +342,69 @@ class SprintOpsRoutesTest(unittest.TestCase):
                                  (SHELL2,))
         self.assertEqual(body["alerts"], [])
 
+    def test_the_measurement_reaches_the_operator_surface(self):
+        """H-26/H-27 have the alert carry WHAT WAS MEASURED — which gate
+        refused, which declared hook never arrived. The projection dropped
+        both `detail` and `batch_id`, so the surface named a condition and
+        still could not say what was observed, which is the gap those
+        requirements exist to close."""
+        _, body = self.arm()
+        con = sqlite3.connect(self.db_path)
+        batch_id = interface_broker.form_batch(con, body["binding_id"])
+        interface_broker._alert(
+            con, severity="warning", reason="wake_batch_stalled",
+            binding_id=body["binding_id"], batch_id=batch_id,
+            sprint_doc_id=1, detail="session not occupied+idle (occupied/busy)")
+        con.commit()
+        con.close()
+        _, out = self.call("GET", "/api/interface/sprint-alerts", (OP,))
+        alert = out["alerts"][0]
+        with self.subTest("the measurement"):
+            self.assertEqual(alert["detail"],
+                             "session not occupied+idle (occupied/busy)")
+        with self.subTest("the batch it was measured on"):
+            self.assertEqual(alert["batch_id"], batch_id)
+        with self.subTest("the sprint it belongs to"):
+            self.assertEqual(alert["sprint_doc_id"], 1)
+        with self.subTest("and copy of its own, not the generic fallback"):
+            self.assertIn("stall threshold", alert["meaning"])
+
+    def test_a_deaf_sprint_alerts_and_arming_resolves_it(self):
+        """H-5 through the routes: a task addressed into a live sprint with no
+        unreleased binding is a LOSS — nothing re-runs ingress for a message
+        already inserted — and arming is the one thing that cures it."""
+        con = sqlite3.connect(self.db_path)
+        mid = con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'x','task',1)").lastrowid
+        self.assertIsNone(interface_wake.maybe_create_wake_item(con, mid))
+        con.commit()
+        con.close()
+        _, out = self.call(
+            "GET", "/api/interface/sprint-alerts?sprint_doc_id=1", (OP,))
+        self.assertEqual([a["reason"] for a in out["alerts"]],
+                         ["sprint_no_armed_planner"])
+        self.arm()
+        _, out = self.call(
+            "GET", "/api/interface/sprint-alerts?sprint_doc_id=1", (OP,))
+        self.assertEqual(out["alerts"], [],
+                         "arming cures the condition, so it closes the alert")
+
+    def test_the_bindings_answer_names_the_scope_it_queried(self):
+        """Flag #176 at its source: the route narrows a shell actor to its own
+        bindings, so the ANSWER carries that fact rather than leaving every
+        client to re-derive it (and PLN2 to guess wrong)."""
+        _, shell = self.call("GET", "/api/interface/sprint-bindings", (SHELL2,))
+        with self.subTest("shell scope is declared"):
+            self.assertEqual(shell["scope"]["actor"], "shell")
+            self.assertEqual(shell["scope"]["planner_shell_id"], 2)
+            self.assertEqual(shell["scope"]["shortname"], "s2")
+        _, op = self.call("GET", "/api/interface/sprint-bindings", (OP,))
+        with self.subTest("operator scope is not narrowed"):
+            self.assertEqual(op["scope"]["actor"], "operator")
+            self.assertIsNone(op["scope"]["planner_shell_id"])
+            self.assertNotIn("shortname", op["scope"])
+
     def test_structured_reconciler_alert_is_sprint_scoped_and_filterable(self):
         self.arm()
         con = sqlite3.connect(self.db_path)

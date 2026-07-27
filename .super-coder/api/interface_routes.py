@@ -1748,6 +1748,13 @@ def _arm_binding(actor, headers, body):
                 return 409, _err_obj(
                     "already_armed",
                     "planner or sprint already has an ACTIVE binding")
+            # H-5: arming is the one thing that cures a deaf sprint, so it is
+            # where the alert closes. Same transaction as the binding — the
+            # condition and its resolution can never disagree.
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE sprint_doc_id=? AND reason='sprint_no_armed_planner' "
+                "AND resolved_at IS NULL", (doc_id,))
             con.commit()
             _log(f"sprint binding {cur.lastrowid} armed: doc={doc_id} "
                  f"planner={planner} session={sess[0]} gen={sess[2]}")
@@ -1949,8 +1956,22 @@ def _binding_status(actor, query: dict):
     con = _db()
     try:
         rows = con.execute(sql, params).fetchall()
+        # Flag #176: the answer says WHOSE bindings it is. A shell actor is
+        # silently narrowed to its own above, and an empty list then reads as
+        # "no binding armed anywhere" to a caller that cannot see the filter
+        # — which is how a planner nearly merged into a live sprint's
+        # migration sequence. The scope travels with the result rather than
+        # being re-derived by every client.
+        scope = {"actor": actor.kind, "planner_shell_id": planner,
+                 "sprint_doc_id": doc_id,
+                 "includes_released": include_released}
+        if actor.kind == "shell":
+            scope["shortname"] = con.execute(
+                "SELECT shortname FROM shells WHERE shell_id=?",
+                (actor.shell_id,)).fetchone()[0]
         return _json(200, {"bindings":
-                           [_project_binding(con, r) for r in rows]})
+                           [_project_binding(con, r) for r in rows],
+                           "scope": scope})
     finally:
         con.close()
 
@@ -2062,6 +2083,36 @@ _ALERT_COPY = {
         "Arm the sprint's real planner binding; do not synthesize a recipient.",
         "warning",
     ),
+    "wake_batch_stalled": (
+        "A wake batch has been queued past the stall threshold under an armed "
+        "binding; `detail` names the gate that refused it most recently.",
+        "Clear the gate named in the detail — the batch submits on the next "
+        "event, with no operator action needed once it passes.",
+        "warning",
+    ),
+    "wake_hooks_missing_at_submit": (
+        "The seat passed the hook-capability check when the binding was armed "
+        "and fails it now; `detail` carries harness, cli_version and the "
+        "missing events verbatim.",
+        "Read the detail before acting: an absent or unparseable cli_version "
+        "is a metadata-capture miss, not an incapable harness, and the two "
+        "need different fixes.",
+        "capability",
+    ),
+    "hooks_declared_but_silent": (
+        "A lifecycle hook this harness DECLARES it delivers has not been "
+        "observed; `detail` names the harness, its version, and which event.",
+        "Verify the harness's hook config actually installed on this seat. "
+        "Waiting does not clear it — the declaration is what is wrong.",
+        "capability",
+    ),
+    "sprint_no_armed_planner": (
+        "A task or result was addressed into this live sprint while it had no "
+        "unreleased planner binding, so nothing will deliver it.",
+        "Arm the sprint's planner binding (`sc sprint arm --sprint <doc-id>`); "
+        "the sender's message is durable and waits in the inbox.",
+        "warning",
+    ),
 }
 
 
@@ -2070,6 +2121,7 @@ def _alert_projection(row) -> dict:
         "alert_id", "session_id", "binding_id", "message_id", "watch_id",
         "severity", "reason", "opened_at", "resolved_at", "acknowledged_at",
         "acknowledged_by", "sprint_doc_id", "unit_id", "role", "signal",
+        "batch_id", "detail",
         "shell_id", "generation",
     )
     alert = dict(zip(cols, row))
@@ -2113,6 +2165,11 @@ def _sprint_alerts(actor, query: dict):
         "a.watch_id, a.severity, a.reason, a.opened_at, a.resolved_at, "
         "a.acknowledged_at, a.acknowledged_by, "
         "a.sprint_doc_id, a.unit_id, a.role, a.signal, "
+        # H-26/H-27: the MEASUREMENT the alert carries. Without it the
+        # operator surface names a condition and still cannot say what was
+        # observed — which is the gap those requirements exist to close, so
+        # projecting it is part of them, not polish.
+        "a.batch_id, a.detail, "
         "COALESCE(a.shell_id, s.shell_id, b.shell_id), "
         "COALESCE(s.generation, b.generation) "
         "FROM planner_alerts a "

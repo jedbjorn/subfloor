@@ -1316,5 +1316,145 @@ class LiveUpgradeTest(_BoardCase):
             con.close()
 
 
+class ArmDisarmVerbsTest(_BoardCase):
+    """H-7. Arming was a raw authenticated POST written out in skill prose and
+    re-arming after a generation change had no written procedure anywhere — a
+    recovery step that exists only as prose is a step that gets improvised.
+
+    Driven through `cli()` rather than `_api` spies: the token, the headers and
+    above all the Idempotency-Key that reach the route are the ones the shipped
+    code assembles, which is the only place the key strategy is visible."""
+
+    def seat(self, shell_id=9):
+        """An occupied, hook-capable session for that planner — the arm route's
+        precondition, and deliberately NOT a binding."""
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(
+                "INSERT INTO interface_generations (shell_id, generation) "
+                "VALUES (?,1)", (shell_id,))
+            sid = con.execute(
+                "INSERT INTO interface_sessions (shell_id, generation, "
+                "occupancy, lifecycle, harness, cli_version) "
+                "VALUES (?,1,'occupied','idle','kimi','kimi-code 0.27.0')",
+                (shell_id,)).lastrowid
+            con.commit()
+            return sid
+        finally:
+            con.close()
+
+    def test_arm_then_disarm_through_the_shipped_verbs(self):
+        self.add()   # a sprint is not LIVE until its board is declared
+        self.seat()
+        with self.cli(), redirect_stdout(io.StringIO()):
+            sprint_cli.cmd_arm(mock.Mock(sprint=1, planner=9))
+            binding = self.sql_one(
+                "SELECT binding_id FROM sprint_planner_bindings")
+            sprint_cli.cmd_disarm(
+                mock.Mock(sprint=1, binding=None, reason="re-arm"))
+        with self.subTest("armed"):
+            self.assertIsNotNone(binding)
+        with self.subTest("disarm resolves the binding from the sprint"):
+            self.assertIsNotNone(self.sql_one(
+                "SELECT released_at FROM sprint_planner_bindings "
+                "WHERE binding_id=?", (binding,)))
+        with self.subTest("the audit reason is recorded"):
+            self.assertEqual(self.sql_one(
+                "SELECT release_reason FROM sprint_planner_bindings "
+                "WHERE binding_id=?", (binding,)), "re-arm")
+
+    def test_a_refused_arm_does_not_poison_its_own_retry(self):
+        """Decision #102 / flag #380: the idempotency layer caches ERROR
+        responses. With the deterministic `sprint_binding_arm|<doc>|<planner>`
+        key the requirement suggests, the ordinary "armed before the session
+        was up" 409 would be replayed to the corrected retry for the key's
+        full TTL — the operator fixes the cause and the command keeps
+        refusing. This test fails on that key and passes on a fresh one."""
+        self.add()
+        with self.cli(), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sprint_cli.cmd_arm(mock.Mock(sprint=1, planner=9))
+            self.seat()                      # the cause is now fixed
+            sprint_cli.cmd_arm(mock.Mock(sprint=1, planner=9))
+        self.assertEqual(
+            self.sql_one("SELECT COUNT(*) FROM sprint_planner_bindings"), 1,
+            "the corrected retry must arm, not replay the cached refusal")
+
+    def test_a_shell_is_not_asked_for_an_id_it_cannot_choose(self):
+        """The route refuses any planner but the caller's own, so making a
+        shell retype its shell_id is only a way to get it wrong."""
+        seen = []
+
+        def spy(method, path, payload=None, idem=None):
+            seen.append((method, path))
+            if path.endswith("/whoami"):
+                return {"shell_id": 9, "shortname": "PLN1"}
+            return {"binding_id": 3, "sprint_doc_id": 1,
+                    "planner_shell_id": payload["planner_shell_id"],
+                    "session_id": 5, "generation": 1, "wake_state": "armed"}
+
+        with mock.patch.object(sprint_cli, "_api", spy), \
+                redirect_stdout(io.StringIO()):
+            sprint_cli.cmd_arm(mock.Mock(sprint=1, planner=None))
+        self.assertIn(("GET", "/_sc/mem/whoami"), seen)
+
+    def test_disarm_needs_a_target(self):
+        with self.assertRaises(SystemExit):
+            sprint_cli.cmd_disarm(
+                mock.Mock(sprint=None, binding=None, reason=None))
+
+
+class ScopeSilentEmptyCopyTest(_BoardCase):
+    """Flag #176. `sc sprint status` narrows a shell actor to its OWN bindings
+    at the route and then printed a global-sounding "no bindings". PLN2 read
+    that as "no binding armed anywhere" while binding #2 was armed, and nearly
+    merged into a live sprint's migration sequence on that basis."""
+
+    def status(self, token, sprint=None):
+        with self.cli(token=token), redirect_stdout(io.StringIO()) as out:
+            sprint_cli.cmd_status(mock.Mock(sprint=sprint, all=False))
+        return out.getvalue()
+
+    def test_a_shell_is_told_whose_bindings_it_just_searched(self):
+        text = self.status("plntok")
+        with self.subTest("names the actor it queried for"):
+            self.assertIn("PLN1", text)
+        with self.subTest("says the answer is not global"):
+            self.assertIn("OWN", text)
+        with self.subTest("the global-sounding line is gone"):
+            self.assertNotIn("no bindings (arm one", text)
+
+    def test_the_operator_is_told_its_answer_IS_global(self):
+        """The symmetric half, and the one that keeps the copy honest: an
+        operator's empty result really does mean nothing is armed anywhere,
+        so saying "you may not be seeing everything" there would be a second
+        wrong answer rather than a cautious one."""
+        text = self.status("optok")
+        with self.subTest("no false narrowing"):
+            self.assertNotIn("OWN", text)
+        with self.subTest("names the scope it did query"):
+            self.assertIn("operator scope", text)
+
+    def test_the_sprint_filter_is_named_when_one_was_applied(self):
+        self.assertIn("#7", self.status("plntok", sprint=7))
+
+    def test_the_next_step_is_the_shipped_verb(self):
+        """H-7 landed the verb; the empty case must stop teaching the raw
+        POST it replaced."""
+        text = self.status("plntok")
+        with self.subTest("names the verb"):
+            self.assertIn("sc sprint arm --sprint", text)
+        with self.subTest("no longer teaches the raw endpoint"):
+            self.assertNotIn("POST /api/interface/sprint-bindings", text)
+
+    def test_a_populated_status_is_unchanged(self):
+        """The scope line is the EMPTY case only — a listing that answers the
+        question does not need to explain the question."""
+        self.arm_binding(planner_shell_id=9)
+        text = self.status("plntok")
+        self.assertIn("binding #", text)
+        self.assertNotIn("OWN", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
