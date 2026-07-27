@@ -28,6 +28,13 @@ Confirm:
 - all required checks on `main` are green;
 - the sprint document remains unfrozen.
 
+Confirm the conformance reviewer and its conflict set were declared at sprint
+setup. The set names units authored, unit reviews performed, rulings supplied,
+and any other overlap with conformance scope. Do not choose a reviewer at the
+freeze gate after every available shell has reviewed its own evidence; return to
+orchestration until an independent reviewer is reserved or the FnB explicitly
+disposes each conflict.
+
 If any condition fails, return to `sprint_orchestration` or
 `sprint_orchestration_recover`.
 
@@ -69,6 +76,9 @@ Route findings while the sprint is ACTIVE:
 finding has a disposition.
 
 ## Revoke sprint authority
+
+Drain the scoped inbox immediately before editing or freezing the sprint
+document. An earlier inbox check does not satisfy this gate.
 
 Edit the sprint document body to `status: CLOSED`, preserving its declaration
 fields, then freeze:
@@ -122,6 +132,9 @@ Add a shared copy only when the fork's artifact policy or FnB requests one.
 
 ## Settle bookkeeping
 
+- Before closing a flag by number, resolve and read back its exact `flag_id`.
+  Display names and flag IDs share an integer range; never infer one from the
+  other.
 - Close flags resolved by the sprint with how-they-were-resolved notes.
 - Advance the linked roadmap feature to its earned state.
 - Open flags for actionable deferred work.

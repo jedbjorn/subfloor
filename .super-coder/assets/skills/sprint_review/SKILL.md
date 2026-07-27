@@ -36,10 +36,25 @@ Every review transition uses a durable scoped result:
 File findings and verdicts within the assignment. Send ruling requests to the
 planner with alternatives and evidence.
 
+Message IDs are scoped to their recipient. Treat an ID from another actor's
+inbox as provenance, never as a fetch instruction; the task row must quote the
+substance you need. Ask the planner for that substance when it is absent.
+
 Use IDs returned by creating writes for documents, tasks, flags, and messages.
 Confirm the target before an irreversible mutation. Refer to flags by `flag_id`
 plus a sprint-scoped label. Establish absence through a complete direct read,
-count, or exact-ID query.
+count, or exact-ID query. Before closing a flag by number, resolve and read back
+its exact `flag_id`; display names and flag IDs share an integer range.
+
+The sprint reconciler compares the board's live expectations with positive work
+and result evidence. It reports confirmed divergences to the planner; it never
+changes the board or supervises the reviewer. Send a scoped partial before a
+turn ends with review unfinished, naming completed checks, evidence, and the
+next untouched action. "Nothing found" becomes the explicit clean verdict.
+
+Treat `read_at` in one direction only: READ proves something marked the row
+read; UNREAD proves nothing about delivery, liveness, or work. Never infer a
+fault or safe action from an unread marker.
 
 ## Review a unit
 
@@ -56,6 +71,10 @@ If `main` advanced, compare intervening changes with the PR's files:
 For a superseded, force-pushed, or unverified head, send a scoped correction
 request and wait for a pinned target.
 
+Drain scoped messages immediately before every durable action you own, including
+a verdict, pushed review artifact, or conformance document write. An earlier
+inbox check does not satisfy this gate.
+
 ### Review adversarially
 
 Trace behavior against:
@@ -71,13 +90,18 @@ relevant test fails, restore the source, and prove it passes. Record the
 property tested and result. Use a narrowed interference review after a rebase
 or hand-resolved hunk.
 
+Require one property per test method, or `subTest` boundaries when setup must be
+shared. Sequential assertions for independent properties are not independent
+detectors: an early failure masks every later one.
+
 ### Classify and hand off
 
 - Major: wrong behavior, security/data risk, or material spec violation.
 - Medium: likely production defect or incomplete required path.
 - Low: non-blocking clarity, cleanup, or improvement.
 
-Send findings and the recommendation to the planner. Include location,
+Send the verdict to the planner immediately. The planner is the gate; delivering
+a completed verdict needs no additional permission. Include location,
 consequence, required behavior, and severity. The planner routes fix work or
 merge authority to the developer.
 
