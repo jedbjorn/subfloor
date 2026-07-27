@@ -214,9 +214,16 @@ class WakeCoordinator:
             if live is not None and live[1] in ("submitting", "running"):
                 return  # the hook evidence drives it from here
             if live is None:
+                # H-4: rows the planner has already read wake nobody. Retire
+                # them before probing, so an inbox drained by hand costs no
+                # wake turn at all.
+                if interface_broker.sweep_read_queued(con, binding_id):
+                    con.commit()
                 queued = con.execute(
-                    "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
-                    "AND state='queued' AND batch_id IS NULL LIMIT 1",
+                    "SELECT 1 FROM planner_wake_items i "
+                    "JOIN shell_messages m ON m.message_id = i.message_id "
+                    "WHERE i.binding_id=? AND i.state='queued' "
+                    "AND i.batch_id IS NULL AND m.read_at IS NULL LIMIT 1",
                     (binding_id,)).fetchone()
                 if queued is None:
                     return

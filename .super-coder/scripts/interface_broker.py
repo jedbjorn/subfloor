@@ -836,10 +836,38 @@ def _reconcile_item(con, item_id: int, message_id: int,
         interface_state.transition(con, "wake_item", item_id, "queued")
 
 
+def sweep_read_queued(con, binding_id: int) -> int:
+    """Complete a binding's queued items whose message is ALREADY READ (H-4).
+
+    A planner that drained its inbox by hand — or was woken first by the
+    harness's own task notification — has already handled those rows; a wake
+    turn for them delivers nothing and trains the planner to dismiss wake
+    prompts. They complete as `done` with no batch, which is the disposition
+    `_complete_batch` already gives a row read during another batch's turn.
+    Returns how many were swept, for the caller's batch record."""
+    items = con.execute(
+        "SELECT i.item_id FROM planner_wake_items i "
+        "JOIN shell_messages m ON m.message_id = i.message_id "
+        "WHERE i.binding_id=? AND i.state='queued' AND i.batch_id IS NULL "
+        "AND m.read_at IS NOT NULL "
+        "ORDER BY i.item_id",
+        (binding_id,)).fetchall()
+    for (item_id,) in items:
+        interface_state.transition(
+            con, "wake_item", item_id, "done",
+            extra_sets={"done_at": _now(con)})
+    return len(items)
+
+
 def form_batch(con, binding_id: int) -> int:
-    """Coalesce a binding's currently queued items into one batch (the
+    """Coalesce a binding's currently queued UNREAD items into one batch (the
     fixed-prompt submission unit). The partial unique index backstops the
-    one-live-batch invariant; items join oldest first."""
+    one-live-batch invariant; items join oldest first.
+
+    An item whose message was read between queueing and here never joins the
+    batch (H-4) — `sweep_read_queued` completes it instead. The join is the
+    load-bearing half of that rule: the sweep can lose a race with a planner
+    reading a row, this cannot."""
     binding = con.execute(
         "SELECT shell_id, generation FROM sprint_planner_bindings "
         "WHERE binding_id=? AND released_at IS NULL",
@@ -852,9 +880,11 @@ def form_batch(con, binding_id: int) -> int:
         (binding_id, binding[0], binding[1]))
     batch_id = cur.lastrowid
     items = con.execute(
-        "SELECT item_id FROM planner_wake_items "
-        "WHERE binding_id=? AND state='queued' AND batch_id IS NULL "
-        "ORDER BY item_id",
+        "SELECT i.item_id FROM planner_wake_items i "
+        "JOIN shell_messages m ON m.message_id = i.message_id "
+        "WHERE i.binding_id=? AND i.state='queued' AND i.batch_id IS NULL "
+        "AND m.read_at IS NULL "
+        "ORDER BY i.item_id",
         (binding_id,)).fetchall()
     for (item_id,) in items:
         interface_state.transition(

@@ -832,6 +832,58 @@ class BatchReconcileTest(WakeFixture):
         self.assertEqual(self.item_states()[0][2], "done")
 
 
+# ── H-4: a row the planner already read wakes nobody ─────────────────────────
+
+class AlreadyReadNeverWakesTest(WakeFixture):
+    """The planner drained its inbox by hand (or a faster channel woke it
+    first) BEFORE the batch formed. Delivering those rows costs a no-op
+    planner turn and trains the planner to dismiss wake prompts."""
+
+    def _queued(self, read=False):
+        mid = self.add_message("task", read=read)
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return mid
+
+    def test_already_read_row_never_joins_a_batch(self):
+        mid = self._queued(read=True)
+        self.form()
+        states = {r[1]: (r[2], r[4]) for r in self.item_states()}
+        self.assertEqual(states[mid][0], "queued",
+                         "form_batch must leave it alone, not batch it")
+        self.assertIsNone(states[mid][1], "it must carry no batch_id")
+
+    def test_sweep_completes_an_already_read_row_without_a_batch(self):
+        mid = self._queued(read=True)
+        swept = interface_broker.sweep_read_queued(self.con, self.binding)
+        self.con.commit()
+        self.assertEqual(swept, 1)
+        states = {r[1]: r[2] for r in self.item_states()}
+        self.assertEqual(states[mid], "done")
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT batch_id FROM planner_wake_batches").fetchone(),
+            "no batch may be formed for work that needs no wake")
+
+    def test_sweep_leaves_an_unread_row_queued(self):
+        mid = self._queued(read=False)
+        self.assertEqual(
+            interface_broker.sweep_read_queued(self.con, self.binding), 0)
+        self.con.commit()
+        self.assertEqual({r[1]: r[2] for r in self.item_states()}[mid],
+                         "queued")
+
+    def test_unread_sibling_still_batches_when_one_row_was_read(self):
+        read_mid = self._queued(read=True)
+        unread_mid = self._queued(read=False)
+        interface_broker.sweep_read_queued(self.con, self.binding)
+        batch_id = self.form()
+        states = {r[1]: (r[2], r[4]) for r in self.item_states()}
+        self.assertEqual(states[read_mid][0], "done")
+        self.assertEqual(states[unread_mid], ("batched", batch_id),
+                         "a drained sibling must not suppress live work")
+
+
 # ── The coordinator: event-driven drain, retries, parking non-bypass ─────────
 
 class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
@@ -929,6 +981,35 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
                          [len(interface_broker.WAKE_PROMPT) + 1])
         state = self.one("SELECT state FROM planner_wake_batches")
         self.assertEqual(state, "submitting")
+
+    async def test_drained_inbox_forms_no_batch_and_writes_nothing(self):
+        """H-4 end to end: every queued row read before the drain → no
+        batch, no keystroke, and the items retire as done."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        self.add_message("result", read=True)
+        self.coord.notify_binding(self.binding)
+        done = await self.wait_for(
+            lambda: self.one("SELECT COUNT(*) FROM planner_wake_items "
+                             "WHERE state='done'") == 2)
+        self.assertTrue(done, "read rows must complete, not sit queued")
+        self.assertEqual(self.writes, [], "a drained inbox costs no wake turn")
+        self.assertIsNone(self.one("SELECT batch_id FROM planner_wake_batches"))
+
+    async def test_unread_row_still_drains_when_a_read_row_precedes_it(self):
+        """The suppression is per-row: it must not swallow live work."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        unread = self.add_message("result", read=False)
+        self.coord.notify_binding(self.binding)
+        ok = await self.wait_for(lambda: len(self.writes) == 1)
+        self.assertTrue(ok, "the unread row must still drive a submission")
+        batched = self.one(
+            "SELECT COUNT(*) FROM planner_wake_items WHERE batch_id IS NOT NULL")
+        self.assertEqual(batched, 1, "only the unread row rides the batch")
+        self.assertEqual(
+            self.one("SELECT state FROM planner_wake_items WHERE message_id=?",
+                     (unread,)), "submitting")
 
     async def test_busy_lifecycle_awaits_events_no_poll(self):
         con = self.connect()
