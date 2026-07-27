@@ -936,12 +936,16 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
    terminal viewport, becomes the scroll surface. */
 .if-picker { display: none; }
 @media (max-width: 760px) {
-  body.interface-view header {
+  body.interface-view header,
+  body.sprints-view header {
     max-width: 100vw; overflow-x: auto; gap: .75rem;
   }
   body.interface-view header h1,
-  body.interface-view header .tools { display: none; }
-  body.interface-view header nav { flex: 0 0 max-content; }
+  body.interface-view header .tools,
+  body.sprints-view header h1,
+  body.sprints-view header .tools { display: none; }
+  body.interface-view header nav,
+  body.sprints-view header nav { flex: 0 0 max-content; }
   .if-wrap { flex-direction: column; }
   .if-rail { display: none; }
   .if-picker { display: block; width: 100%; background: var(--panel);

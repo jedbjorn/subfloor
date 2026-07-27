@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import unittest
 from pathlib import Path
 
 import pytest
@@ -282,7 +283,10 @@ def test_flow_columns_cards_and_active_role_emphasis():
     long_title = "Dependency rendering " + ("with a long title " * 8)
     long_overlap = "Same-file overlap " + ("must stay on one line " * 8)
     units = [
-        unit("U1", "pending", dev=None, reviewer=None),
+        unit(
+            "U1", "pending",
+            dev_id=None, dev=None, reviewer_id=29, reviewer=None,
+        ),
         unit("U2", "working", title=long_title, overlap=long_overlap,
              branch="feat/sprints-flow-boards", pr=640),
         unit("U3", "in_review"),
@@ -335,6 +339,10 @@ out({
     assert result["u2"]["detailsHidden"] is True
     assert "Branch: feat/sprints-flow-boards" in result["u2"]["text"]
     assert "PR #640" in result["u2"]["text"]
+    assert result["u1Roles"] == [
+        {"text": "Dev: Unassigned", "className": "sprint-role warn"},
+        {"text": "Reviewer: Shell #29", "className": "sprint-role warn"},
+    ]
     assert all("active" not in role["className"] for role in result["u1Roles"])
     assert "active" in result["u2Roles"][0]["className"]
     assert "active" not in result["u2Roles"][1]["className"]
@@ -345,6 +353,24 @@ out({
     assert "Cancelled" in result["done"][1]
     assert "mystery" in result["unknown"]
     assert "must not leak" not in result["unknown"]
+
+
+def test_roles_resolve_independently_to_their_own_shortnames():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const roles = byClass(flow, "sprint-role").map(
+  (role) => ({ text: role.textContent, className: role.className }));
+out(roles);
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending", dev_id=None, dev=None)
+        ])) + ";\n",
+    )
+    assert result == [
+        {"text": "Dev: Unassigned", "className": "sprint-role warn"},
+        {"text": "Reviewer: REV2", "className": "sprint-role"},
+    ]
 
 
 def test_unrecognized_column_is_omitted_when_empty():
@@ -689,6 +715,155 @@ out({
         "litCards": 2,
         "resizeListeners": 1,
     }
+
+
+def test_transport_only_refresh_reuses_rendered_dom():
+    initial = payload(units=[
+        {
+            **unit("U1", "working", overlap="visible detail"),
+            "unit_id": 41,
+            "sprint_doc_id": 77,
+            "assigned_at": "2026-07-27T06:00:00Z",
+            "state_changed_at": "2026-07-27T06:00:00Z",
+            "updated_at": "2026-07-27T06:00:00Z",
+            "updated_by_shell_id": 11,
+        },
+    ])
+    updated = json.loads(json.dumps(initial))
+    changed_unit = updated["sprints"][0]["units"][0]
+    changed_unit["updated_at"] = "2026-07-27T06:01:00Z"
+    changed_unit["updated_by_shell_id"] = 7
+    result = run_js(
+        """
+apiQueue = [INITIAL, UPDATED];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const flow = byClass(root, "sprint-flow")[0];
+const card = byClass(root, "sprint-unit")[0];
+flow.scrollLeft = 240;
+card.onclick({ stopPropagation: () => {} });
+await sprintsRefresh();
+out({
+  flowReused: byClass(root, "sprint-flow")[0] === flow,
+  scrollLeft: flow.scrollLeft,
+  selectedCards: byClass(root, "sprint-unit")
+    .filter((node) => node.classList.contains("selected")).length,
+});
+""",
+        prelude=(
+            "const INITIAL = " + json.dumps(initial) + ";\n"
+            "const UPDATED = " + json.dumps(updated) + ";\n"
+        ),
+    )
+    assert result == {
+        "flowReused": True,
+        "scrollLeft": 240,
+        "selectedCards": 1,
+    }
+
+
+class TestRenderedProjectionInvalidation(unittest.TestCase):
+    def test_each_rendered_field_invalidates_the_dom(self):
+        cases = [
+            ("document_id", 78),
+            ("title", "SPRINT: Renamed"),
+            ("started_at", "2026-07-26T21:00:00Z"),
+            ("planner.shortname", "PLN9"),
+            ("feature.feature_id", 44),
+            ("feature.title", "Renamed feature"),
+            ("units.0.seq", "U4"),
+            ("units.0.unit_title", "Renamed unit"),
+            ("units.0.state", "cancelled"),
+            ("units.0.state_recognized", False),
+            ("units.0.dev_shell_id", 99),
+            ("units.0.dev_shortname", "DEV9"),
+            ("units.0.reviewer_shell_id", 98),
+            ("units.0.reviewer_shortname", "REV9"),
+            ("units.0.depends_on", "U9"),
+            ("units.0.overlap", "changed overlap"),
+            ("units.0.branch", "feat/changed"),
+            ("units.0.pr_number", 700),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field):
+                initial = payload()
+                updated = json.loads(json.dumps(initial))
+                target = updated["sprints"][0]
+                parts = field.split(".")
+                for part in parts[:-1]:
+                    target = (
+                        target[int(part)] if part.isdigit() else target[part]
+                    )
+                target[parts[-1]] = value
+                result = run_js(
+                    """
+apiQueue = [INITIAL, UPDATED];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const flow = byClass(root, "sprint-flow")[0];
+await sprintsRefresh();
+out({ flowReused: byClass(root, "sprint-flow")[0] === flow });
+""",
+                    prelude=(
+                        "const INITIAL = " + json.dumps(initial) + ";\n"
+                        "const UPDATED = " + json.dumps(updated) + ";\n"
+                    ),
+                )
+                self.assertFalse(result["flowReused"])
+
+
+def test_freezing_one_of_two_boards_removes_only_that_board():
+    initial = payload()
+    initial["sprints"].append({
+        "document_id": 78,
+        "title": "SPRINT: Frozen after this payload",
+        "started_at": "2026-07-26T21:00:00Z",
+        "planner": None,
+        "feature": None,
+        "units": [unit("U8", "working")],
+    })
+    initial["active_count"] = 2
+    updated = json.loads(json.dumps(initial))
+    updated["active_count"] = 1
+    updated["sprints"] = updated["sprints"][:1]
+    result = run_js(
+        """
+apiQueue = [INITIAL, UPDATED];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const survivor = byClass(root, "sprint-unit")[0];
+survivor.onclick({ stopPropagation: () => {} });
+await sprintsRefresh();
+const boards = byClass(root, "sprint-board");
+out({
+  nav: navButton.textContent,
+  warn: navButton.classList.contains("warn"),
+  boardCount: boards.length,
+  boardText: boards.map((board) => board.textContent),
+  selected: byClass(root, "sprint-unit")
+    .filter((card) => card.classList.contains("selected"))
+    .map((card) => card.dataset.seq),
+});
+""",
+        prelude=(
+            "const INITIAL = " + json.dumps(initial) + ";\n"
+            "const UPDATED = " + json.dumps(updated) + ";\n"
+        ),
+    )
+    assert {
+        key: result[key]
+        for key in ("nav", "warn", "boardCount", "selected")
+    } == {
+        "nav": "Sprints 1",
+        "warn": True,
+        "boardCount": 1,
+        "selected": ["U3"],
+    }
+    assert "SPRINT: Active sprint flow board" in result["boardText"][0]
+    assert "SPRINT: Frozen after this payload" not in result["boardText"][0]
 
 
 def test_changed_refresh_replaces_dom_preserves_selection_and_cleans_listener():

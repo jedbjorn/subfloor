@@ -33,9 +33,9 @@ jobs:
       - name: Run the suite
         run: pytest tests/ -q
 
-  # The Interface unit's contract is rendered geometry, not the presence of
-  # CSS/JS strings. Exercise the real page in Chromium and retain the two
-  # viewport captures required by spec #33 / visual QA feature #19.
+  # The Interface and Sprints contracts are rendered geometry, not the presence
+  # of CSS/JS strings. Exercise the real page in Chromium and retain their
+  # required viewport captures.
   interface-rendered:
     runs-on: ubuntu-latest
     steps:
@@ -47,15 +47,15 @@ jobs:
         run: |
           python -m pip install pytest playwright==1.54.0
           python -m playwright install --with-deps chromium
-      - name: Exercise Interface layout and capture viewports
+      - name: Exercise rendered UI and capture viewports
         run: pytest tests/test_interface_ui_rendered.py -q
         env:
           INTERFACE_VISUAL_ARTIFACTS: artifacts/interface-ui
-      - name: Upload Interface tall/short screenshots
+      - name: Upload rendered UI screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: interface-ui-tall-short
+          name: rendered-ui-viewports
           path: artifacts/interface-ui/
           if-no-files-found: error
           retention-days: 14

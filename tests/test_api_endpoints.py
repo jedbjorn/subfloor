@@ -324,6 +324,16 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
 
         self.assertEqual(self._projected_ids(), [active_id])
 
+    def test_lowercase_sprint_prefix_projects_and_renders_verbatim(self) -> None:
+        doc_id = self._doc("sprint: lowercase declaration")
+        self._unit(doc_id, "U1")
+        self.con.commit()
+
+        sprint = server.get_active_sprints(self.con)["sprints"][0]
+
+        self.assertEqual(sprint["document_id"], doc_id)
+        self.assertEqual(sprint["title"], "sprint: lowercase declaration")
+
     def test_sprint_unit_columns_match_interface_projection(self) -> None:
         self.assertIs(server._SPRINT_UNIT_COLUMNS, sprint_units.UNIT_COLUMNS)
         self.assertEqual(
