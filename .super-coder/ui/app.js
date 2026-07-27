@@ -4841,12 +4841,40 @@ function sprintsBuildFlow(sprint) {
   return wrap;
 }
 
+function sprintsRenderedProjection(payload) {
+  return (payload?.sprints || []).map((sprint) => ({
+    document_id: sprint.document_id,
+    title: sprint.title,
+    started_at: sprint.started_at,
+    planner: sprint.planner
+      ? { shortname: sprint.planner.shortname } : null,
+    feature: sprint.feature ? {
+      feature_id: sprint.feature.feature_id,
+      title: sprint.feature.title,
+    } : null,
+    units: (sprint.units || []).map((unit) => ({
+      seq: unit.seq,
+      unit_title: unit.unit_title,
+      state: unit.state,
+      state_recognized: unit.state_recognized,
+      dev_shell_id: unit.dev_shell_id,
+      dev_shortname: unit.dev_shortname,
+      reviewer_shell_id: unit.reviewer_shell_id,
+      reviewer_shortname: unit.reviewer_shortname,
+      depends_on: unit.depends_on,
+      overlap: unit.overlap,
+      branch: unit.branch,
+      pr_number: unit.pr_number,
+    })),
+  }));
+}
+
 function sprintsPaint() {
   const root = sprintsState.root;
   if (!sprintsState.active || !root || !root.isConnected) return;
   const signature = JSON.stringify({
     loaded: sprintsState.lastFetchAt !== 0,
-    payload: sprintsState.payload,
+    projection: sprintsRenderedProjection(sprintsState.payload),
     error: sprintsState.error,
     stale: sprintsState.stale,
   });
@@ -4999,6 +5027,7 @@ function show(tab) {
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
+  document.body.classList.toggle("sprints-view", tab === "sprints");
   if (tab !== "interface") { ifDetach(); ifStopRailPoll(); }   // leaving drops stream + lease + poll
   if (tab !== "sprints") sprintsStopRender();
   setDocumentTitle(tab);

@@ -135,6 +135,139 @@ BINDING = {
     "retry": {"applicable": True, "needs_outcome": True},
 }
 
+# Two active documents present in the live engine at S77-U5 kickoff, represented
+# through the public projection so the browser gate stays hermetic and repeatable.
+SPRINTS = {
+    "active_count": 2,
+    "sprints": [
+        {
+            "document_id": 59,
+            "title": "SPRINT: Worker expectation reconciler",
+            "started_at": "2026-07-25T23:36:37Z",
+            "planner": {"shell_id": 9, "shortname": "PLN1"},
+            "feature": {
+                "feature_id": 27,
+                "title": "Worker expectation reconciler",
+            },
+            "units": [
+                {
+                    "seq": "U1",
+                    "unit_title": "Observe worker expectations",
+                    "state": "merged",
+                    "state_recognized": True,
+                    "dev_shell_id": 5,
+                    "dev_shortname": "DEV3",
+                    "reviewer_shell_id": 6,
+                    "reviewer_shortname": "REV1",
+                    "depends_on": None,
+                    "overlap": "activity readers and projection tests",
+                    "branch": "feat/reconciler-observation",
+                    "pr_number": 630,
+                },
+                {
+                    "seq": "U9f",
+                    "unit_title": "Boot-directive duty-4 stamp",
+                    "state": "in_review",
+                    "state_recognized": True,
+                    "dev_shell_id": 5,
+                    "dev_shortname": "DEV3",
+                    "reviewer_shell_id": 7,
+                    "reviewer_shortname": "REV2",
+                    "depends_on": "U8b",
+                    "overlap": "boot directive renderer and contract test",
+                    "branch": "fix/boot-directive-duty4",
+                    "pr_number": 649,
+                },
+            ],
+        },
+        {
+            "document_id": 77,
+            "title": "sprint: Active sprint flow board",
+            "started_at": "2026-07-26T18:44:00Z",
+            "planner": {"shell_id": 10, "shortname": "PLN2"},
+            "feature": {
+                "feature_id": 33,
+                "title": "Active sprint flow board",
+            },
+            "units": [
+                {
+                    "seq": "U1",
+                    "unit_title": "Active-sprint aggregate read projection",
+                    "state": "merged",
+                    "state_recognized": True,
+                    "dev_shell_id": 5,
+                    "dev_shortname": "DEV3",
+                    "reviewer_shell_id": 7,
+                    "reviewer_shortname": "REV2",
+                    "depends_on": None,
+                    "overlap": "API projection and endpoint coverage",
+                    "branch": "feat/sprints-projection",
+                    "pr_number": 637,
+                },
+                {
+                    "seq": "U2",
+                    "unit_title": "Structured sprint feature linkage",
+                    "state": "merged",
+                    "state_recognized": True,
+                    "dev_shell_id": 8,
+                    "dev_shortname": "DEV4",
+                    "reviewer_shell_id": 7,
+                    "reviewer_shortname": "REV2",
+                    "depends_on": None,
+                    "overlap": "sprint declaration guidance",
+                    "branch": "feat/sprint-feature-linkage",
+                    "pr_number": 647,
+                },
+                {
+                    "seq": "U4",
+                    "unit_title": "Per-sprint flow boards",
+                    "state": "merged",
+                    "state_recognized": True,
+                    "dev_shell_id": 11,
+                    "dev_shortname": "DEV5",
+                    "reviewer_shell_id": 7,
+                    "reviewer_shortname": "REV2",
+                    "depends_on": "U3",
+                    "overlap": "UI cards, lanes, and dependency wires",
+                    "branch": "feat/sprints-flow-boards",
+                    "pr_number": 642,
+                },
+                {
+                    "seq": "U5",
+                    "unit_title": "Adversarial read-only invariant and visual gate",
+                    "state": "working",
+                    "state_recognized": True,
+                    "dev_shell_id": 5,
+                    "dev_shortname": "DEV3",
+                    "reviewer_shell_id": 7,
+                    "reviewer_shortname": "REV2",
+                    "depends_on": "U2, U4, U99",
+                    "overlap": (
+                        "rendered browser assertions and selected-card "
+                        "viewport screenshots"
+                    ),
+                    "branch": "feat/s77-readonly-visual-gate",
+                    "pr_number": None,
+                },
+                {
+                    "seq": "U2f",
+                    "unit_title": "Durable declaration guidance pins",
+                    "state": "working",
+                    "state_recognized": True,
+                    "dev_shell_id": 8,
+                    "dev_shortname": "DEV4",
+                    "reviewer_shell_id": 7,
+                    "reviewer_shortname": "REV2",
+                    "depends_on": "U2",
+                    "overlap": None,
+                    "branch": None,
+                    "pr_number": None,
+                },
+            ],
+        },
+    ],
+}
+
 
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, _format: str, *_args: object) -> None:
@@ -424,6 +557,109 @@ def test_tall_fit_short_floor_and_visual_qa(browser, ui_url, tmp_path):
         assert short["pageScrolls"] is True
         page.screenshot(path=str(_artifact(tmp_path, "interface-short.png")),
                         full_page=True)
+    finally:
+        context.close()
+
+
+def test_sprints_multi_board_read_only_visual_gate(
+    browser, ui_url, tmp_path
+):
+    api_requests = []
+
+    def sprints_api(route):
+        request = route.request
+        path = request.url.split("/api", 1)[-1]
+        api_requests.append((request.method, path))
+        if path == "/sprints?status=active":
+            return _json(route, SPRINTS)
+        return _mock_api(route)
+
+    context = browser.new_context(viewport={"width": 1600, "height": 1000})
+    page = context.new_page()
+    page.route("**/api/**", sprints_api)
+    try:
+        page.goto(f"{ui_url}/#sprints", wait_until="networkidle")
+        boards = page.locator("#view-sprints .sprint-board")
+        assert boards.count() == 2
+        assert page.locator(
+            'nav button[data-tab="sprints"]'
+        ).inner_text() == "SPRINTS 2"
+        assert boards.nth(0).locator(".sprint-wire").count() == 0
+        assert boards.nth(1).locator(".sprint-wire").count() == 3
+        assert boards.nth(1).locator(
+            '[aria-label="dependency unavailable: U99"]'
+        ).count() == 1
+
+        view = page.locator("#view-sprints")
+        assert view.locator(
+            "button, input, select, textarea, form, a, "
+            '[contenteditable="true"], [draggable="true"]'
+        ).count() == 0
+        cards = view.locator('.sprint-unit[role="button"]')
+        assert cards.count() == view.locator(".sprint-unit").count() == 7
+
+        before_card_interactions = len(api_requests)
+        for index in range(cards.count()):
+            card = cards.nth(index)
+            card.click()
+            assert card.get_attribute("aria-pressed") == "true"
+            card.press("Enter")
+            assert card.get_attribute("aria-pressed") == "false"
+            card.press(" ")
+            assert card.get_attribute("aria-pressed") == "true"
+            card.press(" ")
+            assert card.get_attribute("aria-pressed") == "false"
+        assert len(api_requests) == before_card_interactions
+        assert {method for method, _path in api_requests} == {"GET"}
+
+        selected = boards.nth(1).locator('.sprint-unit[data-seq="U5"]')
+        selected.click()
+        assert selected.get_attribute("aria-pressed") == "true"
+        assert selected.locator(".sprint-unit-details").is_visible()
+        page.screenshot(
+            path=str(_artifact(
+                tmp_path, "sprints-multi-board-selected.png"
+            )),
+            full_page=True,
+        )
+
+        page.set_viewport_size({"width": 390, "height": 844})
+        geometry = page.evaluate(
+            """() => ({
+              viewport: window.innerWidth,
+              documentWidth: document.documentElement.scrollWidth,
+              boards: Array.from(document.querySelectorAll(
+                "#view-sprints .sprint-board"
+              )).map((board) => {
+                const flow = board.querySelector(".sprint-flow");
+                return {
+                  right: board.getBoundingClientRect().right,
+                  clientWidth: flow.clientWidth,
+                  scrollWidth: flow.scrollWidth,
+                  overflowX: getComputedStyle(flow).overflowX,
+                };
+              }),
+            })"""
+        )
+        assert geometry["documentWidth"] <= geometry["viewport"]
+        assert all(
+            board["right"] <= geometry["viewport"] + 1
+            for board in geometry["boards"]
+        )
+        assert all(
+            board["scrollWidth"] > board["clientWidth"]
+            and board["overflowX"] == "auto"
+            for board in geometry["boards"]
+        )
+        assert selected.get_attribute("aria-pressed") == "true"
+        page.screenshot(
+            path=str(_artifact(tmp_path, "sprints-narrow-selected.png")),
+            full_page=True,
+        )
+        assert not {
+            method for method, _path in api_requests
+            if method in {"POST", "PUT", "PATCH", "DELETE"}
+        }
     finally:
         context.close()
 

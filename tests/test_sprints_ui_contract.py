@@ -691,6 +691,52 @@ out({
     }
 
 
+def test_transport_only_refresh_reuses_rendered_dom():
+    initial = payload(units=[
+        {
+            **unit("U1", "working", overlap="visible detail"),
+            "unit_id": 41,
+            "sprint_doc_id": 77,
+            "assigned_at": "2026-07-27T06:00:00Z",
+            "state_changed_at": "2026-07-27T06:00:00Z",
+            "updated_at": "2026-07-27T06:00:00Z",
+            "updated_by_shell_id": 11,
+        },
+    ])
+    updated = json.loads(json.dumps(initial))
+    changed_unit = updated["sprints"][0]["units"][0]
+    changed_unit["updated_at"] = "2026-07-27T06:01:00Z"
+    changed_unit["updated_by_shell_id"] = 7
+    result = run_js(
+        """
+apiQueue = [INITIAL, UPDATED];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const flow = byClass(root, "sprint-flow")[0];
+const card = byClass(root, "sprint-unit")[0];
+flow.scrollLeft = 240;
+card.onclick({ stopPropagation: () => {} });
+await sprintsRefresh();
+out({
+  flowReused: byClass(root, "sprint-flow")[0] === flow,
+  scrollLeft: flow.scrollLeft,
+  selectedCards: byClass(root, "sprint-unit")
+    .filter((node) => node.classList.contains("selected")).length,
+});
+""",
+        prelude=(
+            "const INITIAL = " + json.dumps(initial) + ";\n"
+            "const UPDATED = " + json.dumps(updated) + ";\n"
+        ),
+    )
+    assert result == {
+        "flowReused": True,
+        "scrollLeft": 240,
+        "selectedCards": 1,
+    }
+
+
 def test_changed_refresh_replaces_dom_preserves_selection_and_cleans_listener():
     initial = payload(units=[
         unit("U1", "working", overlap="initial overlap"),

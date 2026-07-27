@@ -627,11 +627,9 @@ def get_active_sprints(con) -> dict:
         "  ON reviewer.shell_id=unit.reviewer_shell_id "
         "WHERE d.kind='doc' AND d.frozen=0 "
         "  AND d.title LIKE 'SPRINT:%' "
-        # The parser check is separate from the shape gate: either failure
-        # makes the timestamp corrupt, sorted after every valid instant.
-        "ORDER BY CASE WHEN d.created_at LIKE '____-__-__%' "
-        "    AND strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) IS NOT NULL "
-        "  THEN 0 ELSE 1 END, started_at, d.document_id, "
+        # started_at is the single definition of a valid projected timestamp.
+        # Sorting by its NULL state keeps the shape/parser gate from drifting.
+        "ORDER BY started_at IS NULL, started_at, d.document_id, "
         "  LENGTH(unit.seq), unit.seq"
     ))
 
