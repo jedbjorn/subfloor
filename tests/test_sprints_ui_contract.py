@@ -330,7 +330,7 @@ out({
         prelude="const DATA = " + json.dumps(payload(units=units)) + ";\n",
     )
     assert result["headings"] == [
-        "Waiting1", "Done2", "Dev1", "Review1", "Blocked1", "Unrecognized1",
+        "Done2", "Review1", "Dev1", "Waiting1", "Blocked1", "Unrecognized1",
     ]
     assert result["cards"] == 7
     assert long_title in result["u2"]["text"]
@@ -387,7 +387,7 @@ out({ headings: byClass(root, "sprint-col-head").map((node) => node.textContent)
         ) + ";\n",
     )
     assert result["headings"] == [
-        "Waiting", "Done", "Dev1", "Review", "Blocked",
+        "Done", "Review", "Dev1", "Waiting", "Blocked",
     ]
 
 
@@ -407,7 +407,7 @@ out({
         ) + ";\n",
     )
     assert result["headings"] == [
-        "Waiting", "Done", "Dev", "Review", "Blocked", "Unrecognized1",
+        "Done", "Review", "Dev", "Waiting", "Blocked", "Unrecognized1",
     ]
     assert "unrecognized" in result["cardClass"]
     assert "done" in result["cardText"]
@@ -449,8 +449,8 @@ out({
         ),
     )
     assert result["unknown"][-1] == "Unrecognized1"
-    assert result["known"] == ["Waiting", "Done", "Dev1", "Review", "Blocked"]
-    assert result["shared"] == ["Waiting", "Done", "Dev", "Review", "Blocked"]
+    assert result["known"] == ["Done", "Review", "Dev1", "Waiting", "Blocked"]
+    assert result["shared"] == ["Done", "Review", "Dev", "Waiting", "Blocked"]
 
 
 def test_unavailable_dependency_has_visible_warning_marker():
@@ -538,8 +538,83 @@ out({
     ]
     assert result["unavailable"][1] == []
     assert "sprint-spotlight" in result["hover"]["flow"]
-    assert result["hover"]["cards"] == ["U1", "U2"]
+    assert result["hover"]["cards"] == ["U2", "U1"]
     assert result["hover"]["wires"] == 1
+
+
+def test_satisfied_dependencies_draw_no_wire_but_stay_named():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const card = byClass(flow, "sprint-unit").find(
+  (node) => node.dataset.seq === "U3");
+out({
+  wires: byClass(flow, "sprint-wire").map(
+    (wire) => [wire.dataset.from, wire.dataset.to]),
+  depends: byClass(card, "sprint-unit-deps")[0].textContent,
+  warnings: byClass(flow, "sprint-dep-warning").length,
+});
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "merged"),
+            unit("U2", "cancelled"),
+            unit("U4", "pending"),
+            unit("U3", "working", depends_on="U1, U2, U4"),
+        ])) + ";\n",
+    )
+    assert result["wires"] == [["U4", "U3"]]
+    assert result["depends"] == "Depends: U1, U2, U4"
+    assert result["warnings"] == 0
+
+
+def test_rows_follow_wires_to_reduce_crossings():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const cols = byClass(flow, "sprint-col");
+const order = (key) => byClass(
+  cols.find((col) => col.classList.contains(key)), "sprint-unit")
+  .map((node) => node.dataset.seq);
+out({ dev: order("working"), waiting: order("pending") });
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending"),
+            unit("U2", "pending"),
+            unit("U5", "working", depends_on="U2"),
+            unit("U6", "working", depends_on="U1"),
+        ])) + ";\n",
+    )
+    assert result["dev"] == ["U6", "U5"]
+    assert result["waiting"] == ["U1", "U2"]
+
+
+def test_wires_anchor_on_near_edges_by_direction():
+    # The harness derives each card's rect from its seq digits, so U1→U2 is a
+    # forward wire, U5→U2 a backward one, and U3→X3 (equal digits, identical
+    # rects) exercises the same-column gutter branch.
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+out(byClass(flow, "sprint-wire").map((wire) => (
+  { from: wire.dataset.from, to: wire.dataset.to,
+    d: wire.getAttribute("d") })));
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending"),
+            unit("U5", "in_review"),
+            unit("U2", "working", depends_on="U1, U5"),
+            unit("U3", "pending"),
+            unit("X3", "pending", depends_on="U3"),
+        ])) + ";\n",
+    )
+    assert result == [
+        {"from": "U1", "to": "U2",
+         "d": "M 310 60 C 350 60, 300 85, 340 85"},
+        {"from": "U5", "to": "U2",
+         "d": "M 850 160 C 702 160, 628 85, 480 85"},
+        {"from": "U3", "to": "X3",
+         "d": "M 650 110 C 674 110, 674 110, 650 110"},
+    ]
 
 
 def test_click_expands_details_pins_wires_and_blank_space_clears_selection():
@@ -596,7 +671,7 @@ out({
         "stopped": 1,
         "flow": "sprint-flow sprint-spotlight",
         "cards": ["U2"],
-        "litCards": ["U1", "U2"],
+        "litCards": ["U2", "U1"],
         "litWires": 1,
         "detailsHidden": False,
         "detailsText": (
