@@ -606,6 +606,29 @@ def test_sprints_multi_board_read_only_visual_gate(
         cards = view.locator('.sprint-unit[role="button"]')
         assert cards.count() == view.locator(".sprint-unit").count() == 7
 
+        geometry = view.evaluate(
+            """(node) => ({
+              viewWidth: node.getBoundingClientRect().width,
+              boards: Array.from(node.querySelectorAll(".sprint-board"))
+                .map((board) => ({
+                  columns: Array.from(board.querySelectorAll(".sprint-col"))
+                    .map((column) => column.getBoundingClientRect().width),
+                  cards: Array.from(board.querySelectorAll(".sprint-unit"))
+                    .map((card) => ({
+                      card: card.getBoundingClientRect().width,
+                      column: card.parentElement.getBoundingClientRect().width,
+                    })),
+                })),
+            })"""
+        )
+        assert geometry["viewWidth"] == 1350
+        for board in geometry["boards"]:
+            assert max(board["columns"]) - min(board["columns"]) < 1
+            assert all(
+                abs(card["card"] - card["column"]) < 1
+                for card in board["cards"]
+            )
+
         for index in range(cards.count()):
             card = cards.nth(index)
             card.click()

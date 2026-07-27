@@ -916,7 +916,10 @@ def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
     sprint_css = STYLE[STYLE.index("/* Active sprint flow boards"):
                        STYLE.index("/* Roadmap Flow view")]
     assert "#view-sprints, .sprint-board { min-width: 0; }" in sprint_css
+    assert "#view-sprints { max-width: 1350px; }" in sprint_css
     assert ".sprint-board { overflow: hidden; }" in sprint_css
+    assert ".sprint-col { flex: 1 1 0;" in sprint_css
+    assert ".sprint-unit { width: 100%;" in sprint_css
     assert "overflow-x: auto" in sprint_css
     assert "text-overflow: ellipsis" in sprint_css
     assert "white-space: nowrap" in sprint_css
