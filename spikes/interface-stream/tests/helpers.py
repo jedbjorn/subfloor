@@ -127,13 +127,47 @@ class WSClient:
         with self.lock:
             return len(self.out)
 
-    def wait_len(self, n: int, timeout: float = 30.0) -> bytes:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.out_len() >= n:
+    def wait_len(self, n: int, stall_timeout: float = 30.0) -> bytes:
+        """Wait for `n` bytes, failing only on a genuine STALL.
+
+        Flag #67: the previous form was `while monotonic() < deadline` over a
+        total-duration budget, and it produced the flake's two DIFFERENT shapes
+        from one line each.
+
+        Shape 2 — "timed out AFTER the broker had pumped all 5,065,000 bytes" —
+        was this loop's exit race, not contention: the predicate was tested
+        BEFORE `sleep(0.05)` and never again, so bytes that completed during
+        that final sleep were never seen. The loop re-read `monotonic()`, found
+        the deadline gone, and raised while the buffer already held everything
+        asked of it. Reading a fresh length before every failure decision, as
+        below, makes that shape unreachable rather than unlikely.
+
+        Shape 1 — "stalled at 5,007,670 / 5,065,000", i.e. 98.9% delivered —
+        was a real but load-induced slowdown, and no total-duration budget can
+        separate that from a hang: the same 120s is generous on an idle host and
+        tight under five concurrent shells, which is the self-inflicted
+        parallelism the flag describes. So the budget now measures the wrong
+        thing deliberately no longer — it bounds time WITHOUT PROGRESS. A host
+        ten times slower still passes while bytes keep arriving; a pump that
+        genuinely wedges still fails, and reports where it stopped. This is the
+        flag's preferred remedy (make it load-independent) and specifically not
+        its rejected one (raise the timeout, hiding the sensitivity).
+        """
+        last_len = -1
+        last_progress = time.monotonic()
+        while True:
+            have = self.out_len()
+            if have >= n:
                 return self.output()
+            if have != last_len:
+                last_len = have
+                last_progress = time.monotonic()
+            elif time.monotonic() - last_progress > stall_timeout:
+                raise TimeoutError(
+                    f"stream stalled at {have}/{n} bytes — no progress for "
+                    f"{stall_timeout:g}s"
+                )
             time.sleep(0.05)
-        raise TimeoutError(f"length predicate not met (have {self.out_len()} bytes)")
 
     def wait_redraw(self, timeout: float = 10.0) -> bytes:
         deadline = time.monotonic() + timeout
