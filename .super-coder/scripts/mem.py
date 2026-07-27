@@ -1004,13 +1004,16 @@ def build_parser() -> argparse.ArgumentParser:
     ms = msub.add_parser("send")
     ms.add_argument("to")
     ms.add_argument("body")
-    # 'pr_event' is deliberately not offered — it is the daemon's kind; a shell
-    # forging PR transitions would poison the wake loop's ground truth.
+    # 'pr_event' is deliberately not offered — it is the poller's kind; a shell
+    # forging PR transitions would poison the wake loop's ground truth. The API
+    # refuses it at shell-token ingress too (H-3), so this is a friendly early
+    # refusal rather than the only fence.
     ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
                     help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
     ms.add_argument("--sprint", type=int, default=None, metavar="DOC_ID",
-                    help="scope a task/result event to an ACTIVE sprint doc — "
-                         "wake-eligible when the recipient is the bound planner")
+                    help="scope a task/result event to a sprint doc (validated "
+                         "server-side) — wake-eligible when the sprint is live "
+                         "and the recipient is its bound planner")
     mm = msub.add_parser("mark-read")
     mm.add_argument("message_id", type=int)
     sp.set_defaults(fn=cmd_message)

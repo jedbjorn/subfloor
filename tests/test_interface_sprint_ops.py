@@ -68,6 +68,11 @@ def build_engine_db(path: Path) -> None:
     con.execute(
         "INSERT INTO documents (document_id, kind, title, body) "
         "VALUES (1,'doc','SPRINT: test','# SPRINT: test\nstatus: ACTIVE')")
+    # A declared board is what makes the sprint LIVE (H-1); the body's
+    # `status:` line above is display prose that nothing reads.
+    con.execute(
+        "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+        "VALUES (1,'U1','the unit')")
     con.commit()
     con.close()
 
@@ -844,6 +849,11 @@ class SprintCloseTest(unittest.TestCase):
             "INSERT INTO documents (document_id, kind, title, body) "
             "VALUES (?,'doc','SPRINT: close',?)",
             (doc_id, f"# SPRINT: close\nstatus: {status_line}"))
+        # A declared board is what makes the sprint live and the wake item
+        # eligible (H-1). The `status:` line above is display prose.
+        con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (?,'U1','the unit')", (doc_id,))
         binding = con.execute(
             "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation) "
@@ -860,47 +870,52 @@ class SprintCloseTest(unittest.TestCase):
         con.close()
         return binding, mid
 
-    def test_status_closed_releases_binding_and_cancels_queue(self):
+    def test_status_closed_line_alone_closes_nothing(self):
+        """H-1's delivered half at the close seam: closing a sprint IS
+        freezing its doc, so a body edit that writes `status: CLOSED` releases
+        no binding and cancels no wake work. The close skill keeps writing
+        that line for the human reader; nothing executable reads it back.
+
+        Before H-1 this edit performed the close, which made a prose line
+        load-bearing in both directions — reformat it and the close silently
+        did not happen.
+        """
         binding, mid = self.arm_sprint(101)
         status, body = self.patch(
             "/_sc/mem/docs/101",
             {"body": "# SPRINT: close\nstatus: CLOSED"})
         self.assertEqual(status, 200)
-        self.assertEqual(body["released_bindings"], 1)
-        row = self.q("SELECT released_at, release_reason FROM "
-                     "sprint_planner_bindings WHERE binding_id=?", (binding,))
-        self.assertIsNotNone(row[0])
-        self.assertEqual(row[1], "sprint closed")
-        item = self.q("SELECT state, error FROM planner_wake_items "
-                      "WHERE message_id=?", (mid,))
-        self.assertEqual(item[0], "cancelled")
-        self.assertIn("sprint closed", item[1])
-        # Messages stay unread (spec Sprint Scope).
-        self.assertIsNone(self.q("SELECT read_at FROM shell_messages "
-                                 "WHERE message_id=?", (mid,))[0])
-        # The released binding's open alerts resolve — no longer actionable.
+        self.assertEqual(body["released_bindings"], 0)
         self.assertIsNone(self.q(
-            "SELECT 1 FROM planner_alerts WHERE binding_id=? "
-            "AND resolved_at IS NULL", (binding,)))
+            "SELECT released_at FROM sprint_planner_bindings "
+            "WHERE binding_id=?", (binding,))[0])
+        self.assertEqual(self.q("SELECT state FROM planner_wake_items "
+                                "WHERE message_id=?", (mid,))[0], "queued")
+        # Stand down: the binding is still armed, and one live binding per
+        # planner is a structural constraint the sibling close tests need.
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now'),"
+            " release_reason='test teardown' WHERE binding_id=?", (binding,))
+        con.commit()
+        con.close()
 
-    def test_closed_close_is_atomic_under_fault(self):
-        """SC-016: a fault between the column patch and the wake close
-        leaves NO partial state — the status: CLOSED edit and the binding
-        release + queue cancel land in ONE transaction, edge-identical to
-        the freeze path."""
+    def test_freeze_close_is_atomic_under_fault(self):
+        """SC-016, now anchored where the close lives: a fault between the
+        freeze column write and the wake close leaves NO partial state — both
+        land in ONE transaction."""
         binding, mid = self.arm_sprint(104)
         with mock.patch.object(server, "_close_sprint_wake",
                                side_effect=RuntimeError("injected fault")):
             try:
-                self.patch("/_sc/mem/docs/104",
-                           {"body": "# SPRINT: close\nstatus: CLOSED"})
+                self.patch("/_sc/mem/docs/104/freeze", {})
                 self.fail("the injected fault should surface as a 500")
             except urllib.error.HTTPError as e:
                 self.assertEqual(e.code, 500)
-        # NEITHER side landed: doc still ACTIVE, binding still armed, wake
-        # item still queued, alert still open.
-        self.assertIn("status: ACTIVE", self.q(
-            "SELECT body FROM documents WHERE document_id=104")[0])
+        # NEITHER side landed: doc still unfrozen (still live), binding still
+        # armed, wake item still queued, alert still open.
+        self.assertEqual(self.q(
+            "SELECT frozen FROM documents WHERE document_id=104")[0], 0)
         self.assertIsNone(self.q(
             "SELECT released_at FROM sprint_planner_bindings "
             "WHERE binding_id=?", (binding,))[0])
@@ -919,15 +934,85 @@ class SprintCloseTest(unittest.TestCase):
         con.close()
 
     def test_freeze_releases_binding_and_cancels_queue(self):
+        """The whole close, at the one route that performs it."""
         binding, mid = self.arm_sprint(102)
         status, body = self.patch("/_sc/mem/docs/102/freeze", {})
         self.assertEqual(status, 200)
         self.assertEqual(body["released_bindings"], 1)
-        self.assertIsNotNone(self.q(
-            "SELECT released_at FROM sprint_planner_bindings "
-            "WHERE binding_id=?", (binding,))[0])
-        self.assertEqual(self.q("SELECT state FROM planner_wake_items "
-                                "WHERE message_id=?", (mid,))[0], "cancelled")
+        row = self.q("SELECT released_at, release_reason FROM "
+                     "sprint_planner_bindings WHERE binding_id=?", (binding,))
+        self.assertIsNotNone(row[0])
+        self.assertEqual(row[1], "sprint closed")
+        item = self.q("SELECT state, error FROM planner_wake_items "
+                      "WHERE message_id=?", (mid,))
+        self.assertEqual(item[0], "cancelled")
+        self.assertIn("sprint closed", item[1])
+        # Messages stay unread (spec Sprint Scope).
+        self.assertIsNone(self.q("SELECT read_at FROM shell_messages "
+                                 "WHERE message_id=?", (mid,))[0])
+        # The released binding's open alerts resolve — no longer actionable.
+        self.assertIsNone(self.q(
+            "SELECT 1 FROM planner_alerts WHERE binding_id=? "
+            "AND resolved_at IS NULL", (binding,)))
+
+    def test_retitle_is_refused_while_the_doc_holds_a_board(self):
+        """H-1 moved liveness onto structure, and the title is one of its
+        operands — so `doc edit` stops treating the title as free prose while
+        the doc holds a board. Without this the defect just moves one field
+        over: a mid-sprint retitle drops the doc out of `SPRINT:%` and every
+        participant goes deaf with nothing said.
+
+        The body stays editable in the same call shape, which is the point —
+        this fences ONE field, not the document.
+        """
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO documents (document_id, kind, title, body) "
+            "VALUES (105,'doc','SPRINT: fenced','# SPRINT: fenced')")
+        con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (105,'U1','the unit')")
+        con.commit()
+        con.close()
+
+        for title in ("Retro notes", None, "  "):
+            with self.subTest(title=title):
+                try:
+                    self.patch("/_sc/mem/docs/105", {"title": title})
+                    self.fail("a retitle on a board doc must be refused")
+                except urllib.error.HTTPError as e:
+                    self.assertEqual(e.code, 400)
+                    detail = json.loads(e.read())["error"]
+                    self.assertIn("SPRINT: fenced", detail)
+                self.assertEqual(
+                    self.q("SELECT title FROM documents WHERE document_id=105")[0],
+                    "SPRINT: fenced")
+
+        # the body is untouched by the fence
+        status, _ = self.patch("/_sc/mem/docs/105", {"body": "# edited"})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            self.q("SELECT body FROM documents WHERE document_id=105")[0],
+            "# edited")
+        # a no-op title (the same string) is not a change and passes
+        status, _ = self.patch("/_sc/mem/docs/105",
+                               {"title": "SPRINT: fenced"})
+        self.assertEqual(status, 200)
+
+    def test_a_doc_without_a_board_retitles_freely(self):
+        """The fence is scoped to documents that hold units — every other doc
+        in the fork keeps an editable title."""
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO documents (document_id, kind, title, body) "
+            "VALUES (106,'doc','SPRINT: no board','x')")
+        con.commit()
+        con.close()
+        status, _ = self.patch("/_sc/mem/docs/106", {"title": "Renamed"})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            self.q("SELECT title FROM documents WHERE document_id=106")[0],
+            "Renamed")
 
     def test_close_without_bindings_is_a_noop(self):
         con = sqlite3.connect(self.db)

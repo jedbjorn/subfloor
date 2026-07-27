@@ -65,6 +65,7 @@ import interface_wake  # noqa: E402
 import live_model  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
+import sprint_state  # noqa: E402
 from sprint_units import TERMINAL_UNIT_STATES as _TERMINAL_UNIT_STATES  # noqa: E402,E501
 from sprint_units import UNIT_STATES as _UNIT_STATES  # noqa: E402
 from sprint_units import board_writer as _board_writer  # noqa: E402
@@ -1659,12 +1660,14 @@ def _err_obj(code: str, message: str, details=None) -> dict:
 
 
 def _arm_binding(actor, headers, body):
-    """POST /api/interface/sprint-bindings — arm one ACTIVE sprint document
+    """POST /api/interface/sprint-bindings — arm one LIVE sprint document
     to one planner generation (spec #20 API Resources / Sprint Scope). A
     shell actor may arm only ITSELF; the operator may arm any planner.
-    Fail-closed refusals: doc missing/frozen/not ACTIVE, no occupied
-    planner session, a mandatory-hook gap (an unverifiable wake must never
-    arm), or a second ACTIVE binding (the partial unique indexes backstop).
+    Fail-closed refusals: the doc is not a live sprint per `sprint_state`
+    (missing, not a sprint doc, frozen, or holding no units — so the board is
+    declared BEFORE the binding is armed), no occupied planner session, a
+    mandatory-hook gap (an unverifiable wake must never arm), or a second
+    ACTIVE binding (the partial unique indexes backstop).
     """
     doc_id = body.get("sprint_doc_id")
     planner = body.get("planner_shell_id")
@@ -1677,14 +1680,11 @@ def _arm_binding(actor, headers, body):
     con = _db()
     try:
         def produce():
-            doc = con.execute(
-                "SELECT frozen FROM documents WHERE document_id=?",
-                (doc_id,)).fetchone()
-            if doc is None or doc[0] or not interface_broker._sprint_active(
-                    con, doc_id):
+            if not sprint_state.is_live_sprint(con, doc_id):
                 return 409, _err_obj(
                     "sprint_not_active",
-                    "sprint document is missing, frozen, or not ACTIVE")
+                    "sprint document is missing, frozen, retitled, or holds "
+                    "no units — declare the board before arming the binding")
             sess = con.execute(
                 "SELECT session_id, shell_id, generation, harness, "
                 "cli_version FROM interface_sessions "
@@ -1814,7 +1814,7 @@ def _project_binding(con, row) -> dict:
             "document_id": doc_id,
             "title": doc[0] if doc else None,
             "frozen": bool(doc[1]) if doc else None,
-            "active": interface_broker._sprint_active(con, doc_id),
+            "active": sprint_state.is_live_sprint(con, doc_id),
         },
         "wake_state": ("disarmed" if released_at is not None else
                        _wake_state(con, planner_shell_id=planner)),
@@ -2556,7 +2556,7 @@ def _emit_assignment_notice(con, actor, doc_id: int, seq: str,
                             before: dict, after: dict) -> int:
     """The remainder of retired feature #29 (spec doc 58, decision #74): one
     row per shell whose relationship to the unit changed, only on change, only
-    while the sprint is ACTIVE. Returns the number of rows written.
+    while the sprint is LIVE. Returns the number of rows written.
 
     THE INVARIANT IS "AT MOST ONE ROW PER SHELL PER WRITE", not a row count.
     The spec's "at most three" was a proxy for it and is wrong at the edge: a
@@ -2582,7 +2582,7 @@ def _emit_assignment_notice(con, actor, doc_id: int, seq: str,
     inert by construction. The sprint scope is still stamped so the rows
     filter with the rest of the sprint's traffic.
     """
-    if not interface_broker._sprint_active(con, doc_id):
+    if not sprint_state.is_live_sprint(con, doc_id):
         return 0
     parties = _assignment_parties(before, after)
     if actor.kind == "shell":
@@ -2683,13 +2683,15 @@ def _add_sprint_unit(actor, headers, body):
             return refusal
 
         def produce():
-            # "A sprint document" already has a definition in this engine —
-            # pr_poller's `kind='doc' AND frozen=0 AND title LIKE 'SPRINT:%'`
-            # — and the same clause is used here rather than a second one that
-            # can drift from it. MINUS `frozen=0`, deliberately: whether a
-            # frozen board stays mutable is a separate parked question, and
-            # folding it in here would decide it as a side effect of a typo
-            # guard.
+            # "A sprint document" has ONE definition in this engine —
+            # `sprint_state` — and this route uses it rather than a second
+            # clause that can drift from it.
+            #
+            # `is_writable_sprint_board`, not `is_live_sprint`: a frozen board
+            # is not mutable (H-1 answers the question this site used to park),
+            # but the unit-count clause cannot appear here, because this is the
+            # route that CREATES the first unit. Declare the board, then arm
+            # the binding.
             #
             # The typo this catches is adjacent-integer, not exotic: a sprint
             # doc and its spec are consecutive ids (59 and 58 for this very
@@ -2697,12 +2699,17 @@ def _add_sprint_unit(actor, headers, body):
             # participant — they read the sprint doc — while the rows exist
             # and the reconciler watches them.
             doc = con.execute(
-                "SELECT title, kind='doc' AND title LIKE 'SPRINT:%' "
-                "FROM documents WHERE document_id=?", (doc_id,)).fetchone()
+                "SELECT title, frozen FROM documents WHERE document_id=?",
+                (doc_id,)).fetchone()
             if doc is None:
                 return 404, _err_obj("no_such_sprint",
                                      f"no document {doc_id} to hold a board")
-            if not doc[1]:
+            if not sprint_state.is_writable_sprint_board(con, doc_id):
+                if doc[1] and sprint_state.is_sprint_doc(con, doc_id):
+                    return 409, _err_obj(
+                        "sprint_frozen",
+                        f"sprint {doc_id} ({doc[0]!r}) is frozen — a frozen "
+                        "sprint is closed, and a closed board takes no writes")
                 return 422, _err_obj(
                     "not_a_sprint_doc",
                     f"document {doc_id} is {doc[0]!r}, not a sprint board — "

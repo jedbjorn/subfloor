@@ -64,6 +64,11 @@ def build_engine_db(path: Path) -> None:
     con.execute(
         "INSERT INTO documents (document_id, kind, title, body) "
         "VALUES (1,'doc','SPRINT: test','# SPRINT: test\nstatus: ACTIVE')")
+    # A declared board is what makes the sprint LIVE (H-1); the body's
+    # `status:` line above is display prose that nothing reads.
+    con.execute(
+        "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+        "VALUES (1,'U1','the unit')")
     con.commit()
     con.close()
 
@@ -182,12 +187,44 @@ class WakeIngressTest(WakeFixture):
         mid = self.add_message("task", to_shell_id=2)  # not the planner
         self.assertIsNone(interface_wake.maybe_create_wake_item(self.con, mid))
 
-    def test_closed_sprint_never_wakes(self):
+    def test_a_closed_status_line_alone_still_wakes(self):
+        """H-1's delivered half at the ingress gate: the body's `status:` line
+        is display prose. It said CLOSED here and the wake item is created
+        anyway, because closing a sprint is freezing its doc — see
+        test_frozen_sprint_never_wakes for the structural half. Before H-1 a
+        planner who reformatted this one line went silently deaf."""
         self.con.execute(
             "UPDATE documents SET body='# SPRINT: test\nstatus: CLOSED' "
             "WHERE document_id=1")
         mid = self.add_message("task")
+        self.assertIsNotNone(
+            interface_wake.maybe_create_wake_item(self.con, mid))
+
+    def test_undeclared_board_never_wakes(self):
+        """The unit-count operand on its own: unfrozen, correctly titled, and
+        not live because no board has been declared yet."""
+        self.con.execute("DELETE FROM sprint_units WHERE sprint_doc_id=1")
+        mid = self.add_message("task")
         self.assertIsNone(interface_wake.maybe_create_wake_item(self.con, mid))
+
+    def test_retitled_sprint_never_wakes(self):
+        """The title operand on its own — the field `doc edit` now refuses to
+        change on a doc holding a board, for exactly this reason.
+
+        The lower-case case pins that `LIKE` is ASCII-case-insensitive in
+        SQLite, which is the inherited behaviour: swapping the predicate to
+        GLOB or a case-sensitive compare would silently un-live every sprint
+        whose title was typed in mixed case, and nothing else would notice.
+        """
+        for title, wakes in (("Retro notes", False),
+                             ("sprint: test", True)):
+            with self.subTest(title=title):
+                self.con.execute(
+                    "UPDATE documents SET title=? WHERE document_id=1",
+                    (title,))
+                mid = self.add_message("task")
+                item = interface_wake.maybe_create_wake_item(self.con, mid)
+                self.assertIs(item is not None, wakes)
 
     def test_frozen_sprint_never_wakes(self):
         self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
@@ -880,6 +917,9 @@ class WakeRoutesTest(unittest.TestCase):
         for p in self.patches:
             p.start()
         (run_dir / "operator.token").write_text("optok")
+        self._seed()
+
+    def _seed(self):
         con = sqlite3.connect(self.db_path)
         con.execute("UPDATE shells SET api_key='shelltok1' WHERE shell_id=1")
         con.execute("UPDATE shells SET api_key='shelltok2' WHERE shell_id=2")
@@ -895,6 +935,13 @@ class WakeRoutesTest(unittest.TestCase):
             " generation, composer) VALUES (?,1,1,'clean')", (self.sid,))
         con.commit()
         con.close()
+
+    def _rebuild(self):
+        """A fresh DB at the same path, so one test can run several
+        independent gate cases without their mutations composing."""
+        self.db_path.unlink()
+        build_engine_db(self.db_path)
+        self._seed()
 
     def tearDown(self):
         for p in self.patches:
@@ -946,15 +993,36 @@ class WakeRoutesTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "already_armed")
 
-    def test_arm_requires_active_unfrozen_sprint(self):
-        con = sqlite3.connect(self.db_path)
-        con.execute("UPDATE documents SET body='# S\nstatus: CLOSED' "
-                    "WHERE document_id=1")
-        con.commit()
-        con.close()
-        status, body = self.arm()
-        self.assertEqual(status, 409)
-        self.assertEqual(body["error"]["code"], "sprint_not_active")
+    def test_arm_requires_a_live_sprint(self):
+        """H-1 at the arm gate: each operand refuses ALONE, and the prose line
+        refuses nothing. The undeclared-board case is the ordering the spec
+        creates — declare the board, then arm — and it was previously armable,
+        which is how a planner ended up bound to a sprint with no units.
+        """
+        cases = (
+            ("frozen", "UPDATE documents SET frozen=1 WHERE document_id=1",
+             False),
+            ("retitled", "UPDATE documents SET title='Retro' "
+                         "WHERE document_id=1", False),
+            ("no board declared", "DELETE FROM sprint_units "
+                                  "WHERE sprint_doc_id=1", False),
+            ("status line says CLOSED",
+             "UPDATE documents SET body='# S\nstatus: CLOSED' "
+             "WHERE document_id=1", True),
+        )
+        for i, (label, mutation, arms) in enumerate(cases):
+            with self.subTest(case=label):
+                self._rebuild()
+                con = sqlite3.connect(self.db_path)
+                con.execute(mutation)
+                con.commit()
+                con.close()
+                status, body = self.arm(key=f"k-live-{i}")
+                if arms:
+                    self.assertEqual(status, 201, body)
+                else:
+                    self.assertEqual(status, 409, body)
+                    self.assertEqual(body["error"]["code"], "sprint_not_active")
 
     def test_arm_requires_mandatory_hooks(self):
         con = sqlite3.connect(self.db_path)

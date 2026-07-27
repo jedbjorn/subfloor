@@ -28,6 +28,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import pr_poller  # noqa: E402
+import sprint_state  # noqa: E402
 import watch  # noqa: E402  (retired daemon verb)
 
 
@@ -54,11 +55,22 @@ def seed_shells(con: sqlite3.Connection) -> None:
 
 
 def seed_sprint_doc(con, doc_id: int, status: str = "ACTIVE", frozen: int = 0,
-                    title: str = "SPRINT: T", kind: str = "doc") -> None:
+                    title: str = "SPRINT: T", kind: str = "doc",
+                    units: int = 1) -> None:
+    """A sprint doc, live by default.
+
+    `units` is what makes it live (H-1) — a doc with a declared board. `status`
+    writes the body's prose line, which nothing executable reads any more; it
+    stays a parameter precisely so a test can prove that.
+    """
     con.execute(
         "INSERT INTO documents (document_id, kind, title, body, frozen) "
         "VALUES (?, ?, ?, ?, ?)",
         (doc_id, kind, title, f"# {title}\nstatus: {status}\ndeclared: today\n", frozen))
+    for i in range(units):
+        con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (?, ?, ?)", (doc_id, f"U{i + 1}", f"unit {i + 1}"))
     con.commit()
 
 
@@ -94,31 +106,51 @@ class SprintScopingTest(unittest.TestCase):
     def tearDown(self):
         self.con.close()
 
-    def test_only_active_unfrozen_sprint_docs_count(self):
-        seed_sprint_doc(self.con, 100)                                # ACTIVE
-        seed_sprint_doc(self.con, 101, status="CLOSED")               # closed
-        seed_sprint_doc(self.con, 102, frozen=1)                      # frozen
+    def test_poller_scope_is_structural_liveness_never_the_status_line(self):
+        """The predicate this module used to parse out of prose (H-1).
+
+        Both halves matter. The DELIVERED half: 101's body says CLOSED and it
+        is live anyway, because the `status:` line is display prose now — that
+        assertion turns red the moment anything reads it back. The PREVENTED
+        half: frozen, not-a-sprint-title, not-a-doc, and no-board-declared are
+        each excluded on their own.
+        """
+        seed_sprint_doc(self.con, 100)                                # live
+        seed_sprint_doc(self.con, 101, status="CLOSED")               # prose lies — still live
+        seed_sprint_doc(self.con, 102, frozen=1)                      # frozen → closed
         seed_sprint_doc(self.con, 103, title="SPRINT REPORT: T")      # not a board
         seed_sprint_doc(self.con, 104, kind="spec")                   # not a doc
-        seed_sprint_doc(self.con, 105, status="active")               # case matters
-        self.assertEqual(pr_poller.active_sprint_doc_ids(self.con), {100})
+        seed_sprint_doc(self.con, 105, units=0)                       # board not declared yet
+        self.assertEqual(sprint_state.live_sprint_doc_ids(self.con), {100, 101})
+        for doc_id, live in ((100, True), (101, True), (102, False),
+                             (103, False), (104, False), (105, False),
+                             (999, False)):
+            with self.subTest(doc_id=doc_id):
+                self.assertIs(sprint_state.is_live_sprint(self.con, doc_id), live)
 
-    def test_is_active_sprint(self):
-        seed_sprint_doc(self.con, 100)
-        seed_sprint_doc(self.con, 101, status="CLOSED")
-        self.assertTrue(pr_poller.is_active_sprint(self.con, 100))
-        self.assertFalse(pr_poller.is_active_sprint(self.con, 101))
-        self.assertFalse(pr_poller.is_active_sprint(self.con, 999))
+    def test_declaring_the_first_unit_is_what_makes_a_sprint_live(self):
+        """The ordering H-1 creates: board first, then arm. A unit-less sprint
+        doc is a real document that simply is not live yet, and the poller must
+        read it that way rather than as a missing one."""
+        seed_sprint_doc(self.con, 100, units=0)
+        self.assertFalse(sprint_state.is_live_sprint(self.con, 100))
+        self.assertTrue(sprint_state.is_sprint_doc(self.con, 100))
+        self.assertTrue(sprint_state.is_writable_sprint_board(self.con, 100))
+        self.con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (100, 'U1', 'first')")
+        self.con.commit()
+        self.assertTrue(sprint_state.is_live_sprint(self.con, 100))
 
     def test_armed_watches_excludes_unscoped_and_inactive(self):
         seed_shells(self.con)
         seed_sprint_doc(self.con, 100)
-        seed_sprint_doc(self.con, 101, status="CLOSED")
+        seed_sprint_doc(self.con, 101, frozen=1)
         self.con.executescript(
             "INSERT INTO watched_prs (repo, pr_number, shell_id, sprint_doc_id) VALUES "
             "('o/r', 1, 1, 100),"     # armed
             "('o/r', 2, 1, NULL),"    # unscoped → dormant
-            "('o/r', 3, 1, 101);"     # closed sprint → dormant
+            "('o/r', 3, 1, 101);"     # frozen sprint → dormant
             "UPDATE watched_prs SET closed_at=datetime('now') WHERE pr_number=3;")
         self.con.execute(
             "INSERT INTO watched_prs (repo, pr_number, shell_id, sprint_doc_id, closed_at) "

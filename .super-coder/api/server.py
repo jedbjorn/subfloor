@@ -80,6 +80,7 @@ except ImportError as _exc:  # websockets/tmux stack absent → review UI still 
     _INTERFACE_IMPORT_ERROR = _exc
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
+import sprint_state  # noqa: E402  (the one structural sprint-liveness predicate)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
@@ -268,9 +269,10 @@ FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "feature_id", "p
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
 # Typed traffic on the shell_messages bus (migration 0059). Shells send the
-# first three via `sc mem message send --kind`; 'pr_event' is emitted by the
-# GitHub watcher daemon (scripts/watch.py), which writes the DB directly —
-# accepted here too so a replayed/manual event isn't rejected on kind alone.
+# first three via `sc mem message send --kind`; 'pr_event' belongs to the PR
+# poller, which writes the DB directly. It stays in this vocabulary because
+# reads and filters use it, but shell-token ingress REFUSES it (H-3) — see the
+# POST /_sc/mem/messages handler.
 MESSAGE_KINDS = {"shell", "task", "result", "pr_event"}
 # spec_tasks lifecycle — 'cancelled' (#342) closes a task whose work moved in
 # a feature split/re-scope without lying that it was built. Validated here so
@@ -581,9 +583,17 @@ def get_docs(con) -> dict:
 def get_active_sprints(con) -> dict:
     """Build the active-sprint board from one consistent read snapshot.
 
-    One SELECT reads active documents, latest planner bindings, feature and
-    role labels, and units. The document body is deliberately absent from
+    One SELECT reads open sprint documents, latest planner bindings, feature
+    and role labels, and units. The document body is deliberately absent from
     both the projection and predicate.
+
+    The predicate comes from `sprint_state` rather than being inlined here, so
+    it cannot drift from the one the wake path enforces. It is
+    `writable_board_clause`, NOT `live_sprint_clause`: the unit-count operand
+    is deliberately absent, because a sprint declared seconds ago has no units
+    yet and this is the operator's window onto exactly that moment
+    (`test_zero_unit_sprint_still_projects` pins it). Liveness gates what the
+    engine ACTS on; this view shows the operator what exists.
     """
     result = rows(con.execute(
         "WITH latest_bindings AS ("
@@ -627,8 +637,7 @@ def get_active_sprints(con) -> dict:
         "LEFT JOIN shells dev ON dev.shell_id=unit.dev_shell_id "
         "LEFT JOIN shells reviewer "
         "  ON reviewer.shell_id=unit.reviewer_shell_id "
-        "WHERE d.kind='doc' AND d.frozen=0 "
-        "  AND d.title LIKE 'SPRINT:%' "
+        f"WHERE {sprint_state.writable_board_clause('d')} "
         # started_at is the single definition of a valid projected timestamp.
         # Sorting by its NULL state keeps the shape/parser gate from drifting.
         "ORDER BY started_at IS NULL, started_at, d.document_id, "
@@ -1220,29 +1229,35 @@ def patch_shell(con, shell_id, body):
 
 
 def patch_document(con, doc_id, body, commit=True):
-    r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
+    r = con.execute("SELECT frozen, title FROM documents WHERE document_id=?",
                     (doc_id,)).fetchone()
     if r is None:
         return False, "no such document"
     if r["frozen"]:
         return False, "document is frozen — open the next spec, don't edit this one"
+    # The title is part of the liveness predicate (H-1), so it stops being a
+    # mutable prose surface for as long as the doc holds a board: a mid-sprint
+    # retitle would silently drop the sprint out of `SPRINT:%` and turn every
+    # participant deaf, which is the exact defect class the structural
+    # predicate exists to close, moved one field over. Freezing the doc — i.e.
+    # closing the sprint — lifts nothing here: a frozen doc refuses all edits
+    # one branch above.
+    # Compared RAW, exactly as `patch_columns` would write it — a normalized
+    # comparison would wave through the whitespace and NULL forms that break
+    # `LIKE 'SPRINT:%'` just as thoroughly as a rename.
+    if "title" in body and body["title"] != r["title"]:
+        if sprint_state.has_units(con, doc_id):
+            return False, (
+                f"document {doc_id} is the board of sprint {r['title']!r} "
+                f"and its title is load-bearing — a live sprint is identified "
+                f"by 'SPRINT:%', so retitling it would silently disarm the "
+                f"wake path and every watch. Close the sprint (freeze the "
+                f"doc) before any retitle.")
     # render_path is editable (#312): a doc authored without one could never
     # be made publishable — `doc edit --render-path` advertised the option
     # and silently dropped it, and `doc add` always INSERTs a new row.
     return patch_columns(con, "documents", "document_id", doc_id, body,
                          {"body", "title", "render_path"}, commit=commit)
-
-
-def _sprint_doc_status(con, doc_id) -> "str | None":
-    """The sprint board's `status:` line (the planner is its only writer)."""
-    r = con.execute("SELECT body FROM documents WHERE document_id=?",
-                    (doc_id,)).fetchone()
-    if r is None or r[0] is None:
-        return None
-    for line in r[0].splitlines():
-        if line.startswith("status:"):
-            return line.split(":", 1)[1].strip()
-    return None
 
 
 # The alert reasons a WATCH carries, as opposed to a binding. Until H-12 these
@@ -1326,8 +1341,8 @@ def _freeze_board_refusal(con, doc_id) -> "dict | None":
 
 def _close_sprint_wake(con, doc_id) -> dict:
     """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10;
-    spec #76 H-12): closing (status: CLOSED) or freezing a sprint doc retires
-    the sprint's WHOLE live footprint in the SAME transaction — its wake
+    spec #76 H-12; H-1): closing a sprint IS freezing its doc, and the freeze
+    retires the sprint's WHOLE live footprint in the SAME transaction — its wake
     bindings and their queued wake work, its live PR watches, and the
     watch-scoped alerts those watches opened. No orphan armed binding, no
     stranded queued batch, no watch still polling GitHub for a sprint that
@@ -2540,6 +2555,44 @@ class Handler(BaseHTTPRequestHandler):
                 kind = (body.get("kind") or "shell").strip()
                 if kind not in MESSAGE_KINDS:
                     return self._send(400, {"error": f"kind must be one of {', '.join(sorted(MESSAGE_KINDS))}"})
+                if kind == "pr_event":
+                    # Kind parity with the CLI (H-3), which has refused
+                    # `--kind pr_event` since 0059. This whole surface is
+                    # shell-token ingress (`_require_shell_auth`), and a shell
+                    # that can mint a PR event can wake a planner with a
+                    # transition GitHub never reported — the wake loop's ground
+                    # truth, forgeable by any holder of any shell key.
+                    #
+                    # The poller is unaffected BECAUSE it emits by direct DB
+                    # insert rather than through this route. That is contract,
+                    # not accident: if the poller is ever moved onto the API it
+                    # needs a system credential, not a carve-out here.
+                    return self._send(403, {"error":
+                        "kind 'pr_event' is emitted by the PR poller, which "
+                        "writes the DB directly — a shell may not mint one. "
+                        "Send --kind result to report a PR transition."})
+                sprint_doc_id = body.get("sprint_doc_id")
+                if sprint_doc_id is not None:
+                    # Scope validation at the write boundary (H-2). This route
+                    # took any integer, so a typo'd --sprint produced a message
+                    # scoped to nothing: it never woke, never filtered with the
+                    # sprint's traffic, and reported success.
+                    #
+                    # SPRINT-DOC IDENTITY ONLY, deliberately — not liveness.
+                    # Declaration-window coordination (board declared, units
+                    # not yet) and post-close result rows are both legal
+                    # traffic; liveness gates the WAKE path, one layer down in
+                    # `interface_wake.maybe_create_wake_item`, and must never
+                    # gate acceptance of the message itself.
+                    if isinstance(sprint_doc_id, bool) or not isinstance(sprint_doc_id, int):
+                        return self._send(400, {"error":
+                            "sprint_doc_id must be an int (a sprint document id)"})
+                    if not sprint_state.is_sprint_doc(con, sprint_doc_id):
+                        return self._send(422, {"error":
+                            f"document {sprint_doc_id} is not a SPRINT doc — "
+                            "a scoped message tagged to anything else is "
+                            "invisible to the sprint and never wakes its "
+                            "planner; check the --sprint id"})
                 to_sid = body.get("to_shell_id")
                 if to_sid is None and body.get("to"):
                     r = con.execute(
@@ -2582,8 +2635,7 @@ class Handler(BaseHTTPRequestHandler):
                     cur = con.execute(
                         "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind, sprint_doc_id, dedupe_key) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
-                        (sid, int(to_sid), msg, kind,
-                         body.get("sprint_doc_id"), dk))
+                        (sid, int(to_sid), msg, kind, sprint_doc_id, dk))
                     message_id = cur.lastrowid
                     # Transactional wake ingress (spec #20 Event Ingress, seq
                     # 8): the wake item rides the SAME transaction as the
@@ -2786,21 +2838,24 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT 1 FROM documents WHERE document_id=?",
                         (did,)).fetchone():
                     return self._send(404, {"error": "no such document"})
-                # Sprint close integration (seq 10): the planner closes the
-                # board by setting status: CLOSED — the doc edit and the wake
-                # close (binding release + queue cancel) land in ONE
-                # transaction, edge-identical to the freeze path above: a
-                # crash mid-close leaves neither a CLOSED doc with an armed
-                # binding nor a released binding under an ACTIVE doc.
+                # NO sprint-close trigger here (H-1). A body edit used to
+                # release bindings when it happened to leave a `status: CLOSED`
+                # line, which made a prose line executable and made the close
+                # depend on formatting. Closing a sprint IS freezing its doc —
+                # the freeze route above owns the release, atomically. The
+                # `status:` line the close skill still writes is display prose
+                # for the human reader and nothing reads it back.
                 ok, err = patch_document(con, did, body, commit=False)
                 if not ok:
                     return self._send(400, {"ok": ok, "error": err})
-                closed = {"released_bindings": 0, "retired_watches": 0,
-                          "resolved_watch_alerts": 0}
-                if _sprint_doc_status(con, did) == "CLOSED":
-                    closed = _close_sprint_wake(con, did)
                 con.commit()
-                return self._send(200, {"ok": ok, **closed,
+                # Zeros, not an absent key: the counts stay in the response
+                # shape the freeze route reports (U3), so a reader parsing a
+                # doc write never has to branch on which route answered.
+                return self._send(200, {"ok": ok,
+                                        "released_bindings": 0,
+                                        "retired_watches": 0,
+                                        "resolved_watch_alerts": 0,
                                         "serialize": serialize_doc_write()})
 
             # PATCH /_sc/mem/messages/{id}/read
@@ -2833,7 +2888,8 @@ class Handler(BaseHTTPRequestHandler):
     # the whole board. Since the polling cutover (spec #20 task #85, decision
     # #19) the service's own scheduler is the sole poller and DB writer:
     # registration takes an immediate GitHub baseline (no baseline, no armed
-    # watch), `--sprint` scopes a watch to an ACTIVE sprint document, and
+    # watch), `--sprint` scopes a watch to a sprint document (validated as a
+    # sprint doc, not for liveness — the poller arms on liveness), and
     # /_sc/watches/reconcile is the operator's explicit one-shot poll.
 
     def _daemon_state(self, con) -> "dict | None":
@@ -2871,7 +2927,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             q = parse_qs(urlparse(self.path).query)
             include_closed = q.get("all", ["0"])[0] in ("1", "true", "yes")
-            active = pr_poller.active_sprint_doc_ids(con)
+            active = sprint_state.live_sprint_doc_ids(con)
             sql = ("SELECT w.watch_id, w.repo, w.pr_number, w.shell_id, "
                    "s.shortname, w.created_at, w.closed_at, w.sprint_doc_id, "
                    "w.unit_id, u.seq AS unit_seq "
@@ -2914,10 +2970,17 @@ class Handler(BaseHTTPRequestHandler):
                 sprint_doc_id = int(sprint_doc_id)
             except (TypeError, ValueError):
                 return self._send(400, {"error": "sprint_doc_id must be an int"})
-            if not pr_poller.is_active_sprint(con, sprint_doc_id):
+            # Registration validates SPRINT-DOC IDENTITY only, not liveness
+            # (H-2): a watch registered in the declaration window — board
+            # declared, units not yet — must be legal, and liveness is the
+            # poller's arming predicate, not the write boundary. A watch on a
+            # sprint that is not live is inert by construction: `armed_watches`
+            # scopes every poll to `sprint_state.live_sprint_doc_ids`.
+            if not sprint_state.is_sprint_doc(con, sprint_doc_id):
                 return self._send(409, {"error":
-                    f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
-                    "SPRINT doc — watches arm only to active sprints"})
+                    f"document {sprint_doc_id} is not a SPRINT doc — a watch "
+                    "scopes to a sprint board, and one registered anywhere "
+                    "else is never polled; check the --sprint id"})
             # H-13: the unit this PR belongs to, named the way every message
             # names it ("U3") and resolved against THIS sprint's board. Two
             # free integers that nothing joined is what made the reconciler
@@ -2976,14 +3039,16 @@ class Handler(BaseHTTPRequestHandler):
                     "retryable": True, "daemon": daemon})
             # The baseline is an external read and cannot hold a DB writer
             # reservation. Revalidate scope after it, under the same
-            # transaction that arms or rebinds the watch, so sprint closure
-            # cannot land between the ACTIVE decision and its write.
+            # transaction that arms or rebinds the watch, so a doc that stops
+            # being a sprint board cannot land between the decision and its
+            # write.
             con.execute("BEGIN IMMEDIATE")
-            if not pr_poller.is_active_sprint(con, sprint_doc_id):
+            if not sprint_state.is_sprint_doc(con, sprint_doc_id):
                 con.rollback()
                 return self._send(409, {"error":
-                    f"document {sprint_doc_id} is not an ACTIVE, unfrozen "
-                    "SPRINT doc — watches arm only to active sprints"})
+                    f"document {sprint_doc_id} is not a SPRINT doc — a watch "
+                    "scopes to a sprint board, and one registered anywhere "
+                    "else is never polled; check the --sprint id"})
             existing = con.execute(
                 "SELECT watch_id FROM watched_prs "
                 "WHERE repo=? AND pr_number=? AND shell_id=? "

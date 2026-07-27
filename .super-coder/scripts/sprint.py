@@ -55,7 +55,7 @@ Only then is the message marked read. Informational messages need no
 receipt.
 
 status / alerts are the read-only wake ops surfaces: binding armed/released,
-sprint doc ACTIVE/frozen, batch state, park/quarantine reason, last wake
+sprint doc live/frozen, batch state, park/quarantine reason, last wake
 outcome, and the open wake alerts (session-loss, retry-exhausted,
 quarantine, unmanaged-writer). retry is the operator recovery path for a
 PARKED/stalled batch: the parked batch is NEVER resubmitted — it resolves

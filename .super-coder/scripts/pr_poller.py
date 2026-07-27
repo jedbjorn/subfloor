@@ -15,7 +15,7 @@ What lives here:
 - `baseline_read()` — registration's immediate GitHub read: no normalized
   baseline stored, no armed watch (the caller fails retryable).
 - `poll_cycle()` — one bounded pass over ARMED watches only (live rows whose
-  sprint_doc_id names an ACTIVE, unfrozen SPRINT document; unscoped legacy
+  sprint_doc_id names a LIVE sprint per `sprint_state`; unscoped legacy
   watches stay dormant until rebound). Per cycle: a `pr_poll_runs` audit row
   per repo, durable `pr_poll_observations` for transitions and blind windows,
   idempotent `pr_event` messages (dedupe_key) plus same-transaction wake items
@@ -39,7 +39,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -50,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
+import sprint_state
 from quota_probes import dispatch as quota_dispatch
 from sprint_units import TERMINAL_UNIT_STATES, board_writer
 
@@ -63,8 +63,6 @@ JITTER_FRACTION = 0.25          # sleep interval + uniform(0, 25%) — herd spre
 BACKOFF_CAP_S = 900             # per-repo failure backoff ceiling (15 min)
 NO_PROGRESS_WINDOW = timedelta(minutes=20)
 START_GRACE = timedelta(minutes=20)
-
-_STATUS_ACTIVE = re.compile(r"^status:\s*ACTIVE\s*$", re.MULTILINE)
 
 
 # ── GitHub read (the only network seam — injectable for tests) ───────────────
@@ -916,31 +914,14 @@ def reconcile_tick(
 
 # ── Sprint scoping ────────────────────────────────────────────────────────────
 
-def active_sprint_doc_ids(con) -> "set[int]":
-    """The unfrozen SPRINT documents declaring `status: ACTIVE` — the only
-    scopes whose watches the poller arms (spec: GitHub polling is limited to
-    active sprint watches)."""
-    ids: set[int] = set()
-    rows = con.execute(
-        "SELECT document_id, body FROM documents "
-        "WHERE kind='doc' AND frozen=0 AND title LIKE 'SPRINT:%'").fetchall()
-    for doc_id, body in rows:
-        if body and _STATUS_ACTIVE.search(body):
-            ids.add(doc_id)
-    return ids
-
-
-def is_active_sprint(con, doc_id: int) -> bool:
-    r = con.execute(
-        "SELECT body FROM documents WHERE document_id=? AND kind='doc' "
-        "AND frozen=0 AND title LIKE 'SPRINT:%'", (doc_id,)).fetchone()
-    return bool(r and r[0] and _STATUS_ACTIVE.search(r[0]))
-
-
 def armed_watches(con) -> list:
-    """Live watches scoped to an ACTIVE sprint — the poller's whole world.
-    Unscoped legacy watches stay dormant until explicitly rebound."""
-    active = active_sprint_doc_ids(con)
+    """Live watches scoped to a LIVE sprint — the poller's whole world.
+    Unscoped legacy watches stay dormant until explicitly rebound.
+
+    Liveness is `sprint_state`'s structural predicate, never the body's prose
+    (H-1): this module's own `status: ACTIVE` regex was one of the two divergent
+    parsers that made a reformatted line silently disarm every watch."""
+    active = sprint_state.live_sprint_doc_ids(con)
     if not active:
         return []
     marks = ",".join("?" for _ in active)
