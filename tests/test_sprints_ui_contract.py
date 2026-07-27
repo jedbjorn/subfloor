@@ -918,6 +918,7 @@ def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
     assert "#view-sprints, .sprint-board { min-width: 0; }" in sprint_css
     assert "#view-sprints { max-width: 1350px; }" in sprint_css
     assert ".sprint-board { overflow: hidden; }" in sprint_css
+    assert "display: flex; gap: 35px;" in sprint_css
     assert ".sprint-col { flex: 1 1 0;" in sprint_css
     assert ".sprint-unit { width: 100%;" in sprint_css
     assert "overflow-x: auto" in sprint_css
