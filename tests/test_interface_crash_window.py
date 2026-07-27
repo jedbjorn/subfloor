@@ -285,6 +285,38 @@ class CrashWindowTest(unittest.TestCase):
             (batch,)).fetchone()[0]
         self.assertEqual(bstate, "complete")
 
+    def test_a_dirty_browser_composer_is_reset_when_its_client_is_gone(self):
+        """H-9. `browser_composer='dirty'` blocks the wake gate with no alert
+        and no owner: it describes a draft in a browser tab that the restart
+        just proved gone, and nobody can certify it clean because nobody holds
+        the writer. The gate then refuses forever.
+
+        Deliberately supersedes the earlier spec's "dirty survives
+        disconnect" intent for the BROWSER composer only — the harness
+        composer describes bytes in a TUI that outlived the restart, which a
+        disconnect proves nothing about, and it is asserted unchanged here."""
+        self.con.execute(
+            "UPDATE interface_input_state SET browser_composer='dirty', "
+            "composer='dirty' WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        self._reconnect()
+        counts = interface_reconcile.startup_reconcile(self.con)
+        row = self.con.execute(
+            "SELECT browser_composer, composer FROM interface_input_state "
+            "WHERE session_id=?", (self.sid,)).fetchone()
+        with self.subTest("the unownable state is cleared"):
+            self.assertEqual(row[0], "clean")
+            self.assertEqual(counts["browser_composers_cleared"], 1)
+        with self.subTest("the harness composer is NOT"):
+            self.assertEqual(row[1], "dirty")
+
+    def test_a_clean_browser_composer_is_left_alone(self):
+        """The known-negative for the sweep above: it must not report work it
+        did not do."""
+        self._reconnect()
+        counts = interface_reconcile.startup_reconcile(self.con)
+        self.assertEqual(counts["browser_composers_cleared"], 0)
+
     def test_submitting_batch_with_submit_hook_proven_running(self):
         batch, _ = self._arm_and_submit()
         # The submit hook landed durably before the crash.

@@ -371,6 +371,12 @@ def cmd_status(args) -> int:
             print(f"  quarantined: item #{qi['item_id']} msg "
                   f"#{qi['message_id']} after {qi['completed_wakes']} wakes"
                   + (f" — {qi['error']}" if qi.get("error") else ""))
+        # H-9: `reconcile` had no surface at all, and its `ambiguity` — written
+        # on every reconcile transition — was read by nothing.
+        for ri in b.get("reconcile") or []:
+            print(f"  reconcile: item #{ri['item_id']} msg "
+                  f"#{ri['message_id']}"
+                  + (f" — {ri['ambiguity']}" if ri.get("ambiguity") else ""))
         if b.get("released_at"):
             print(f"  released {b['released_at']} — "
                   f"{b.get('release_reason') or '—'}")
@@ -379,7 +385,9 @@ def cmd_status(args) -> int:
             print(f"  → recovery: ./sc sprint retry --binding "
                   f"{b['binding_id']}"
                   + (" --outcome delivered|not_delivered"
-                     if retry.get("needs_outcome") else ""))
+                     if retry.get("needs_outcome") else "")
+                  + (" --stuck both --stuck-outcome requeue|cancel"
+                     if (b.get("quarantined") or b.get("reconcile")) else ""))
     return 0
 
 
@@ -414,6 +422,10 @@ def cmd_retry(args) -> int:
     payload = {}
     if args.outcome:
         payload["outcome"] = args.outcome
+    if args.stuck:
+        payload["stuck"] = (["reconcile", "quarantined"]
+                            if args.stuck == "both" else [args.stuck])
+        payload["stuck_outcome"] = args.stuck_outcome
     r = _api("POST", f"/api/interface/sprint-bindings/{args.binding}/retry",
              payload, f"retry|{args.binding}|{uuid.uuid4()}")
     print(f"sc sprint: binding #{r['binding_id']} retried — "
@@ -574,6 +586,14 @@ def main(argv: "list[str] | None" = None) -> int:
                     default=None,
                     help="required when the session's input is parked: did "
                          "the parked frame reach the planner?")
+    rt.add_argument("--stuck", choices=("reconcile", "quarantined", "both"),
+                    default=None,
+                    help="also move items stuck in these states (H-9): they "
+                         "have legal exits no code performs")
+    rt.add_argument("--stuck-outcome", dest="stuck_outcome",
+                    choices=("requeue", "cancel"), default=None,
+                    help="required with --stuck: requeue for another wake, or "
+                         "cancel outright")
     ar = sub.add_parser("arm", help="arm this sprint's planner wake binding "
                                     "(the board must be declared first)")
     ar.add_argument("--sprint", type=int, required=True)

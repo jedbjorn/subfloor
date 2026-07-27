@@ -495,6 +495,45 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(items[0]["kind"], "pr_event")
         self.assertEqual(items[0]["sprint_doc_id"], 100)
 
+    def test_startup_sweeps_runs_stranded_by_a_crash(self):
+        """H-9. A run row is committed before the fetch and closed after it,
+        so a process that dies mid-fetch leaves `running` with no writer that
+        could ever finish it — a poller that keeps crashing then looks like a
+        poller that is still working."""
+        self.con.execute(
+            "INSERT INTO pr_poll_runs (repo, source, watch_count) "
+            "VALUES ('o/r','scheduler',2)")
+        self.con.commit()
+        n = pr_poller.poll_cycle(
+            self.con, fetch_ok(gh_node(checks="PENDING"),
+                               gh_node(checks="PENDING")),
+            source="startup")
+        self.assertEqual(n["stranded_runs"], 1)
+        row = self.con.execute(
+            "SELECT status, finished_at, error FROM pr_poll_runs "
+            "WHERE run_id=1").fetchone()
+        with self.subTest("terminal"):
+            self.assertEqual(row["status"], "error")
+            self.assertIsNotNone(row["finished_at"])
+        with self.subTest("says what was observed"):
+            self.assertIn("stranded", row["error"])
+
+    def test_an_ordinary_cycle_never_closes_a_live_run(self):
+        """The bound on the sweep, and the reason it is startup-only:
+        `running` is the CORRECT state for the cycle in flight, so a sweep on
+        any other tick would close a live run out from under itself."""
+        self.con.execute(
+            "INSERT INTO pr_poll_runs (repo, source, watch_count) "
+            "VALUES ('o/r','scheduler',2)")
+        self.con.commit()
+        n = pr_poller.poll_cycle(
+            self.con, fetch_ok(gh_node(checks="PENDING"),
+                               gh_node(checks="PENDING")))
+        self.assertEqual(n["stranded_runs"], 0)
+        self.assertEqual(
+            self.con.execute("SELECT status FROM pr_poll_runs WHERE run_id=1")
+            .fetchone()["status"], "running")
+
     def _armed_seat(self, harness="kimi", cli_version="kimi-code 0.27.0",
                     session_generation=1):
         """An armed binding on generation 1. `session_generation=2` models the

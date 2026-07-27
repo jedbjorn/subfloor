@@ -1893,6 +1893,16 @@ def _project_binding(con, row) -> dict:
     out["quarantined"] = [
         {"item_id": q[0], "message_id": q[1], "error": q[2],
          "completed_wakes": q[3]} for q in quarantined]
+    # H-9: `reconcile` was invisible here — the projection exposed a
+    # quarantined bucket only, and `ambiguity`, written on every reconcile
+    # transition, was read by nothing at all. An item parked for an ambiguous
+    # action receipt therefore had no surface and no operator path.
+    out["reconcile"] = [
+        {"item_id": r[0], "message_id": r[1], "ambiguity": r[2]}
+        for r in con.execute(
+            "SELECT item_id, message_id, ambiguity FROM planner_wake_items "
+            "WHERE binding_id=? AND state='reconcile' ORDER BY item_id",
+            (binding_id,)).fetchall()]
     if released_at is not None:
         return out
     input_park = con.execute(
@@ -1924,7 +1934,11 @@ def _project_binding(con, row) -> dict:
         "AND (binding_id=? OR session_id=?) LIMIT 1",
         (binding_id, session_id)).fetchone()
     out["retry"] = {
-        "applicable": bool(parked or input_park or stalled),
+        # H-9: stuck reconcile/quarantined items have trigger-legal exits that
+        # no code performed, so retry is applicable to them too — they are the
+        # states an operator most needs a way out of.
+        "applicable": bool(parked or input_park or stalled
+                           or out["quarantined"] or out["reconcile"]),
         "needs_outcome": input_park,
     }
     return out
@@ -2366,6 +2380,48 @@ def _retry_binding(actor, headers, body, binding_id: int):
                 actions.append(
                     f"parked batch {parked_id} resolved as audit — its "
                     "items requeue for a NEW batch")
+            # H-9: `reconcile` and `quarantined` have trigger-legal exits
+            # (schema.sql) that NO code performed — the only writer that could
+            # move them was the destructive update-discard sweep, which is
+            # collateral of an engine update and not an operator path. This is
+            # that path, and it is explicit: `stuck` names which states to move
+            # and `stuck_outcome` whether they requeue or cancel. Neither is
+            # implied by a bare retry, because requeuing a quarantined item
+            # sends the planner back into the loop that quarantined it.
+            stuck = body.get("stuck")
+            if stuck is not None:
+                if not isinstance(stuck, list) or not stuck or any(
+                        s not in ("reconcile", "quarantined") for s in stuck):
+                    return 422, _err_obj(
+                        "validation",
+                        "stuck must be a non-empty list of "
+                        "'reconcile' and/or 'quarantined'")
+                stuck_outcome = (body.get("stuck_outcome") or "").strip()
+                if stuck_outcome not in ("requeue", "cancel"):
+                    return 422, _err_obj(
+                        "stuck_outcome_required",
+                        "moving a stuck wake item needs "
+                        "stuck_outcome=requeue|cancel")
+                target = "queued" if stuck_outcome == "requeue" else "cancelled"
+                marks = ",".join("?" * len(stuck))
+                items = con.execute(
+                    f"SELECT item_id, state FROM planner_wake_items "
+                    f"WHERE binding_id=? AND state IN ({marks}) "
+                    "ORDER BY item_id", (binding_id, *stuck)).fetchall()
+                for item_id, state in items:
+                    extra = {"error": f"operator {stuck_outcome} from {state}"}
+                    if target == "queued":
+                        # A requeued item starts its wake budget over: it kept
+                        # the count that quarantined it, so the next batch
+                        # would re-quarantine it on the first unread turn.
+                        extra["completed_wakes"] = 0
+                    interface_state.transition(
+                        con, "wake_item", item_id, target, extra_sets=extra)
+                if items:
+                    actions.append(
+                        f"{len(items)} stuck item(s) "
+                        f"{'requeued' if target == 'queued' else 'cancelled'} "
+                        f"from {'/'.join(stuck)}")
             resignalled = False
             if con.execute(
                     "SELECT 1 FROM planner_wake_batches WHERE binding_id=? "
@@ -2393,6 +2449,14 @@ def _retry_binding(actor, headers, body, binding_id: int):
                 clears.append("crash_window_delivery_unknown")
             if resignalled:
                 clears.append("wake_presend_retries_exhausted")
+            if stuck is not None and "quarantined" in stuck and not con.execute(
+                    "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
+                    "AND state='quarantined' LIMIT 1",
+                    (binding_id,)).fetchone():
+                # Only once the LAST one is gone: dedupe-while-open means one
+                # row stands for the condition, so clearing it while another
+                # item is still quarantined would hide the rest.
+                clears.append("wake_item_quarantined")
             if clears:
                 con.execute(
                     "UPDATE planner_alerts SET resolved_at=datetime('now') "

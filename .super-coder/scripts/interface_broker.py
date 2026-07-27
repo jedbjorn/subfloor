@@ -373,6 +373,12 @@ def set_browser_composer(con, session_id: int, client_id: str,
     deliberate: clearing a browser textarea must not certify the harness/tmux
     composer clean. BEGIN IMMEDIATE serializes this state with the planner wake
     gate so whichever action commits first is observed by the other.
+
+    It rides the writer lease in both directions: only the current writer may
+    set it, and a restart that revokes every lease resets it to clean
+    (H-9, `interface_reconcile.startup_reconcile`). A dirty draft whose client
+    is provably gone is unownable by construction — nobody can certify it, and
+    it would block the wake gate with no alert and no owner.
     """
     if state not in ("clean", "dirty"):
         raise BrokerError(f"invalid browser composer state {state!r}")

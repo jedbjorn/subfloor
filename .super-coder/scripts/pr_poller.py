@@ -1100,6 +1100,27 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     return message_id
 
 
+def sweep_stranded_runs(con) -> int:
+    """Close pr_poll_runs rows left `running` by a crash (H-9).
+
+    A run row is opened and committed before the fetch, and closed after it —
+    so a process that dies mid-fetch leaves `running` forever, with no writer
+    that could ever finish it and nothing that reports it. That makes the
+    audit trail lie in the one direction that matters: a poller that keeps
+    crashing looks like a poller that is still working.
+
+    Swept at STARTUP only, and that bound is deliberate: `running` is the
+    correct state for the cycle currently in flight, so a sweep on any other
+    tick would close a live run out from under itself. A process that has
+    just started has no run of its own in flight yet, so every `running` row
+    it can see belongs to a process that is gone."""
+    return con.execute(
+        "UPDATE pr_poll_runs SET status='error', "
+        "finished_at=datetime('now'), "
+        "error='stranded: the poller process ended before this run finished' "
+        "WHERE status='running'").rowcount
+
+
 def poll_cycle(con, fetch=None, source: str = "scheduler",
                state: "PollerState | None" = None,
                interval: int = DEFAULT_INTERVAL, now: "float | None" = None) -> dict:
@@ -1112,7 +1133,9 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
     now = now if now is not None else time.monotonic()
     summary = {"watches": 0, "repos": 0, "skipped_backoff": 0,
                "events": 0, "errors": 0, "retired": 0,
-               "unscoped_alerts": surface_unscoped_watches(con)}
+               "unscoped_alerts": surface_unscoped_watches(con),
+               "stranded_runs": (sweep_stranded_runs(con)
+                                 if source == "startup" else 0)}
     emitted_ids: list[int] = []
     watches = armed_watches(con)
     summary["watches"] = len(watches)
