@@ -1,11 +1,21 @@
----
-name: sprint_orchestration_close
-description: Close a sprint after every unit is terminal and main is green. Run an independent spec-to-main conformance pass, route findings while authority remains active, close and freeze the sprint document, verify wake and PR-watch cleanup, synthesize the report, and settle flags and roadmap state. Load only at the close trigger.
-category: craft
-common: false
----
+-- 0112 — reseed sprint_orchestration_close: the board is a record, not a source.
+-- Sprint 84 U6 (spec #76, H-23/H-24). Generated from
+-- assets/skills/sprint_orchestration_close/SKILL.md; full-body upsert so
+-- existing installations converge on the asset.
+--
+-- Single-skill reseed by planner ruling: U5's full-chain reseed (0114) is
+-- authored later and is idempotent over this one. Editing the asset without
+-- this migration is exactly the drift tests/test_skills_freshness.py detects.
 
-# sprint_orchestration_close
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_orchestration_close',
+  'Close a sprint after every unit is terminal and main is green. Run an independent spec-to-main conformance pass, route findings while authority remains active, close and freeze the sprint document, verify wake and PR-watch cleanup, synthesize the report, and settle flags and roadmap state. Load only at the close trigger.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_orchestration_close
 
 Close from integrated evidence. Keep the sprint ACTIVE until conformance
 findings are ruled.
@@ -103,7 +113,7 @@ Closing a sprint **is** freezing its doc. Freeze it, and edit nothing:
 ```
 
 NEVER close a sprint by editing its body to `status: CLOSED`. A sprint is live
-iff its `documents` row has `kind='doc'`, a `SPRINT:%` title, `frozen = 0`, and
+iff its `documents` row has `kind=''doc''`, a `SPRINT:%` title, `frozen = 0`, and
 at least one `sprint_units` row — the `status:` line is display prose that no
 liveness reader consults. A body edit therefore releases no binding, cancels no
 wake queue and retires no watch, while reading to a human as a closed sprint.
@@ -145,7 +155,7 @@ Build `Final Board` from the `sprint_units` rows, one row per unit, columns
 board file exists on disk, so the frozen report is the only durable copy of the
 board -> a unit missing from this table has no record anywhere.
 
-NEVER assemble that table from a board render, a draft report or a unit report's
+NEVER assemble that table from a board render, a draft report or a unit report''s
 prose. Those are display; the rows are the record, and the two diverge exactly
 when a late board write lands after someone copied the display.
 
@@ -159,7 +169,7 @@ Persist the report:
 ./sc mem doc add "SPRINT REPORT: <title>" --kind doc --body-file <report.md>
 ```
 
-Add a shared copy only when the fork's artifact policy or FnB requests one.
+Add a shared copy only when the fork''s artifact policy or FnB requests one.
 
 ## Settle bookkeeping
 
@@ -178,4 +188,11 @@ Add a shared copy only when the fork's artifact policy or FnB requests one.
 
 **Close completion:** the sprint doc is frozen, bindings are released, watches
 are retired, the report exists, and every finding or follow-up has an owner or
-explicit disposition.
+explicit disposition.',
+  0)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
