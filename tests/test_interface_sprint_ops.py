@@ -342,6 +342,69 @@ class SprintOpsRoutesTest(unittest.TestCase):
                                  (SHELL2,))
         self.assertEqual(body["alerts"], [])
 
+    def test_the_measurement_reaches_the_operator_surface(self):
+        """H-26/H-27 have the alert carry WHAT WAS MEASURED — which gate
+        refused, which declared hook never arrived. The projection dropped
+        both `detail` and `batch_id`, so the surface named a condition and
+        still could not say what was observed, which is the gap those
+        requirements exist to close."""
+        _, body = self.arm()
+        con = sqlite3.connect(self.db_path)
+        batch_id = interface_broker.form_batch(con, body["binding_id"])
+        interface_broker._alert(
+            con, severity="warning", reason="wake_batch_stalled",
+            binding_id=body["binding_id"], batch_id=batch_id,
+            sprint_doc_id=1, detail="session not occupied+idle (occupied/busy)")
+        con.commit()
+        con.close()
+        _, out = self.call("GET", "/api/interface/sprint-alerts", (OP,))
+        alert = out["alerts"][0]
+        with self.subTest("the measurement"):
+            self.assertEqual(alert["detail"],
+                             "session not occupied+idle (occupied/busy)")
+        with self.subTest("the batch it was measured on"):
+            self.assertEqual(alert["batch_id"], batch_id)
+        with self.subTest("the sprint it belongs to"):
+            self.assertEqual(alert["sprint_doc_id"], 1)
+        with self.subTest("and copy of its own, not the generic fallback"):
+            self.assertIn("stall threshold", alert["meaning"])
+
+    def test_a_deaf_sprint_alerts_and_arming_resolves_it(self):
+        """H-5 through the routes: a task addressed into a live sprint with no
+        unreleased binding is a LOSS — nothing re-runs ingress for a message
+        already inserted — and arming is the one thing that cures it."""
+        con = sqlite3.connect(self.db_path)
+        mid = con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'x','task',1)").lastrowid
+        self.assertIsNone(interface_wake.maybe_create_wake_item(con, mid))
+        con.commit()
+        con.close()
+        _, out = self.call(
+            "GET", "/api/interface/sprint-alerts?sprint_doc_id=1", (OP,))
+        self.assertEqual([a["reason"] for a in out["alerts"]],
+                         ["sprint_no_armed_planner"])
+        self.arm()
+        _, out = self.call(
+            "GET", "/api/interface/sprint-alerts?sprint_doc_id=1", (OP,))
+        self.assertEqual(out["alerts"], [],
+                         "arming cures the condition, so it closes the alert")
+
+    def test_the_bindings_answer_names_the_scope_it_queried(self):
+        """Flag #176 at its source: the route narrows a shell actor to its own
+        bindings, so the ANSWER carries that fact rather than leaving every
+        client to re-derive it (and PLN2 to guess wrong)."""
+        _, shell = self.call("GET", "/api/interface/sprint-bindings", (SHELL2,))
+        with self.subTest("shell scope is declared"):
+            self.assertEqual(shell["scope"]["actor"], "shell")
+            self.assertEqual(shell["scope"]["planner_shell_id"], 2)
+            self.assertEqual(shell["scope"]["shortname"], "s2")
+        _, op = self.call("GET", "/api/interface/sprint-bindings", (OP,))
+        with self.subTest("operator scope is not narrowed"):
+            self.assertEqual(op["scope"]["actor"], "operator")
+            self.assertIsNone(op["scope"]["planner_shell_id"])
+            self.assertNotIn("shortname", op["scope"])
+
     def test_structured_reconciler_alert_is_sprint_scoped_and_filterable(self):
         self.arm()
         con = sqlite3.connect(self.db_path)
@@ -743,6 +806,139 @@ class SprintOpsRoutesTest(unittest.TestCase):
             (OP, "Idempotency-Key: k-retry-3"), {})
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["code"], "nothing_to_retry")
+
+    # -- H-9: exits for stuck states ------------------------------------------
+
+    def _stuck_item(self, binding_id, state, ambiguity=None):
+        con = sqlite3.connect(self.db_path)
+        mid = con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'stuck','task',1)").lastrowid
+        con.execute(
+            "INSERT INTO planner_wake_items (binding_id, message_id, state,"
+            " completed_wakes, ambiguity) VALUES (?,?,?,?,?)",
+            (binding_id, mid, state, 3 if state == "quarantined" else 0,
+             ambiguity))
+        con.commit()
+        con.close()
+        return mid
+
+    def _retry(self, binding_id, key, **body):
+        return self.call(
+            "POST", f"/api/interface/sprint-bindings/{binding_id}/retry",
+            (OP, f"Idempotency-Key: {key}"), body)
+
+    def test_reconcile_items_are_visible_with_their_ambiguity(self):
+        """`reconcile` had no surface at all: the projection exposed a
+        quarantined bucket only, and `ambiguity` — written on every reconcile
+        transition — was read by nothing."""
+        _, body = self.arm()
+        self._stuck_item(body["binding_id"], "reconcile",
+                         ambiguity="receipt 7 still intent")
+        _, out = self.call("GET", "/api/interface/sprint-bindings", (OP,))
+        b = out["bindings"][0]
+        self.assertEqual(len(b["reconcile"]), 1)
+        self.assertEqual(b["reconcile"][0]["ambiguity"],
+                         "receipt 7 still intent")
+        self.assertTrue(b["retry"]["applicable"],
+                        "a state with no exit is exactly where the operator "
+                        "needs one offered")
+
+    def test_retry_requeues_stuck_items_on_request(self):
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        rmid = self._stuck_item(binding_id, "reconcile")
+        qmid = self._stuck_item(binding_id, "quarantined")
+        status, body = self._retry(
+            binding_id, "k-stuck-1", stuck=["reconcile", "quarantined"],
+            stuck_outcome="requeue")
+        self.assertEqual(status, 200, body)
+        for mid in (rmid, qmid):
+            with self.subTest(mid=mid):
+                self.assertEqual(
+                    self.q("SELECT state FROM planner_wake_items "
+                           "WHERE message_id=?", (mid,))[0], "queued")
+        self.assertEqual(
+            self.q("SELECT completed_wakes FROM planner_wake_items "
+                   "WHERE message_id=?", (qmid,))[0], 0,
+            "a requeued item that kept its wake count would be quarantined "
+            "again on the first unread turn")
+
+    def test_retry_cancels_stuck_items_on_request(self):
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        qmid = self._stuck_item(binding_id, "quarantined")
+        status, body = self._retry(binding_id, "k-stuck-2",
+                                   stuck=["quarantined"],
+                                   stuck_outcome="cancel")
+        self.assertEqual(status, 200, body)
+        state, error = self.q(
+            "SELECT state, error FROM planner_wake_items WHERE message_id=?",
+            (qmid,))
+        self.assertEqual(state, "cancelled")
+        self.assertIn("operator cancel", error)
+
+    def test_moving_a_stuck_item_demands_an_explicit_outcome(self):
+        """Neither requeue nor cancel is implied by a bare retry: requeuing a
+        quarantined item sends the planner back into the loop that
+        quarantined it, and cancelling drops the wake outright."""
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        self._stuck_item(binding_id, "quarantined")
+        status, body = self._retry(binding_id, "k-stuck-3",
+                                   stuck=["quarantined"])
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "stuck_outcome_required")
+        status, body = self._retry(binding_id, "k-stuck-4", stuck=["nonsense"],
+                                   stuck_outcome="cancel")
+        self.assertEqual(status, 422)
+        self.assertEqual(
+            self.q("SELECT state FROM planner_wake_items")[0], "quarantined",
+            "a refused request moves nothing")
+
+    def test_a_bare_retry_leaves_stuck_items_alone(self):
+        """The exits are opt-in. An operator retrying a parked batch must not
+        silently resurrect items that were quarantined for cause."""
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        qmid = self._stuck_item(binding_id, "quarantined")
+        self.queue_message()
+        status, body = self._retry(binding_id, "k-stuck-5")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            self.q("SELECT state FROM planner_wake_items WHERE message_id=?",
+                   (qmid,))[0], "quarantined")
+
+    def test_the_quarantine_alert_clears_only_when_the_last_one_is_gone(self):
+        """Dedupe-while-open means one row stands for the whole condition, so
+        clearing it while another item is still quarantined hides the rest."""
+        _, body = self.arm()
+        binding_id = body["binding_id"]
+        self._stuck_item(binding_id, "quarantined")
+        self._stuck_item(binding_id, "quarantined")
+        con = sqlite3.connect(self.db_path)
+        interface_broker._alert(con, severity="warning",
+                                reason="wake_item_quarantined",
+                                binding_id=binding_id)
+        con.commit()
+        con.close()
+        open_now = ("SELECT 1 FROM planner_alerts WHERE resolved_at IS NULL "
+                    "AND reason='wake_item_quarantined'")
+        # Cancel one of the two by id: the condition still holds.
+        one = self.q("SELECT item_id FROM planner_wake_items "
+                     "WHERE state='quarantined' ORDER BY item_id")[0]
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE planner_wake_items SET state='cancelled' "
+                    "WHERE item_id=?", (one,))
+        con.commit()
+        con.close()
+        self._retry(binding_id, "k-stuck-6", stuck=["reconcile"],
+                    stuck_outcome="cancel")
+        self.assertIsNotNone(self.q(open_now),
+                             "one item still quarantined — the alert stands")
+        self._retry(binding_id, "k-stuck-7", stuck=["quarantined"],
+                    stuck_outcome="cancel")
+        self.assertIsNone(self.q(open_now))
 
     def test_retry_authority(self):
         _, body = self.arm()

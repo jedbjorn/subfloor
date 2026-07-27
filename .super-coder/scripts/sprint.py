@@ -11,6 +11,8 @@ sprint 25 seq 8 task #84; wake ops seq 10 task #86).
     ./sc sprint unit state --sprint <doc-id> --seq U1 <state>
     ./sc sprint unit list  [--sprint <doc-id>]
     ./sc sprint board      --sprint <doc-id>
+    ./sc sprint arm     --sprint <doc-id> [--planner <shell-id>]
+    ./sc sprint disarm  (--sprint <doc-id> | --binding <id>) [--reason "…"]
     ./sc sprint status  [--sprint <doc-id>] [--all]
     ./sc sprint alerts  [--all]
     ./sc sprint retry   --binding <id> [--outcome delivered|not_delivered]
@@ -53,6 +55,12 @@ duplicate. After the side effect it records the observed result
 requeuing blind), and an operator later resolves the park (reconcile).
 Only then is the message marked read. Informational messages need no
 receipt.
+
+arm / disarm are the binding's own verbs (H-7). Arming was a raw authenticated
+POST written out in skill prose, and re-arming after a generation change had no
+written procedure at all — a recovery step that exists only as prose is a step
+that gets improvised. A shell arms only itself and resolves its own id from its
+token; the operator may name a planner.
 
 status / alerts are the read-only wake ops surfaces: binding armed/released,
 sprint doc live/frozen, batch state, park/quarantine reason, last wake
@@ -312,8 +320,27 @@ def cmd_status(args) -> int:
     r = _api("GET", path)
     bindings = r.get("bindings", [])
     if not bindings:
-        print("sc sprint: no bindings (arm one before the sprint — "
-              "POST /api/interface/sprint-bindings)")
+        # Flag #176: this line used to read "no bindings", which SOUNDS
+        # global and is not — a shell actor is scoped to its own bindings by
+        # the route, and PLN2 once read it as "no binding armed anywhere"
+        # while binding #2 was armed, nearly merging into a live sprint's
+        # migration sequence on that basis. The empty case now names the
+        # question it actually asked.
+        scope = r.get("scope") or {}
+        where = f" for sprint #{args.sprint}" if args.sprint is not None else ""
+        # Branch on the ACTOR KIND, never on "did a name come back" — the
+        # operator's scope carries a name too, and treating that as the
+        # narrowed case would print the reassurance backwards: the exact
+        # shape of the defect this fixes, one layer up.
+        if scope.get("actor") == "shell":
+            who = scope.get("shortname") or "this shell"
+            print(f"sc sprint: no bindings visible to {who}{where} — a shell "
+                  "sees only its OWN bindings; the operator's and other "
+                  "planners' are not in this answer")
+        else:
+            print(f"sc sprint: no bindings{where} (operator scope — every "
+                  "planner's bindings are in this answer)")
+        print("  arm one before the sprint: ./sc sprint arm --sprint <doc-id>")
         return 0
     for b in bindings:
         doc = b.get("sprint") or {}
@@ -344,6 +371,12 @@ def cmd_status(args) -> int:
             print(f"  quarantined: item #{qi['item_id']} msg "
                   f"#{qi['message_id']} after {qi['completed_wakes']} wakes"
                   + (f" — {qi['error']}" if qi.get("error") else ""))
+        # H-9: `reconcile` had no surface at all, and its `ambiguity` — written
+        # on every reconcile transition — was read by nothing.
+        for ri in b.get("reconcile") or []:
+            print(f"  reconcile: item #{ri['item_id']} msg "
+                  f"#{ri['message_id']}"
+                  + (f" — {ri['ambiguity']}" if ri.get("ambiguity") else ""))
         if b.get("released_at"):
             print(f"  released {b['released_at']} — "
                   f"{b.get('release_reason') or '—'}")
@@ -352,7 +385,9 @@ def cmd_status(args) -> int:
             print(f"  → recovery: ./sc sprint retry --binding "
                   f"{b['binding_id']}"
                   + (" --outcome delivered|not_delivered"
-                     if retry.get("needs_outcome") else ""))
+                     if retry.get("needs_outcome") else "")
+                  + (" --stuck both --stuck-outcome requeue|cancel"
+                     if (b.get("quarantined") or b.get("reconcile")) else ""))
     return 0
 
 
@@ -369,10 +404,17 @@ def cmd_alerts(args) -> int:
         state = "resolved " + (a["resolved_at"] or "") if a.get(
             "resolved_at") else "OPEN"
         refs = " ".join(f"{k}#{a[k]}" for k in
-                        ("session_id", "binding_id", "message_id", "watch_id")
+                        ("session_id", "binding_id", "message_id", "watch_id",
+                         "batch_id", "sprint_doc_id")
                         if a.get(k) is not None)
         print(f"[{a['severity']}] {a['reason']} · {state} · "
               f"opened {a['opened_at']}" + (f" · {refs}" if refs else ""))
+        # H-26/H-27: the reason names the CONDITION; the detail is the
+        # measurement — which gate refused, which declared hook never
+        # arrived. Printing one without the other is the surface those
+        # requirements found wanting.
+        if a.get("detail"):
+            print(f"    {a['detail']}")
     return 0
 
 
@@ -380,6 +422,10 @@ def cmd_retry(args) -> int:
     payload = {}
     if args.outcome:
         payload["outcome"] = args.outcome
+    if args.stuck:
+        payload["stuck"] = (["reconcile", "quarantined"]
+                            if args.stuck == "both" else [args.stuck])
+        payload["stuck_outcome"] = args.stuck_outcome
     r = _api("POST", f"/api/interface/sprint-bindings/{args.binding}/retry",
              payload, f"retry|{args.binding}|{uuid.uuid4()}")
     print(f"sc sprint: binding #{r['binding_id']} retried — "
@@ -389,6 +435,64 @@ def cmd_retry(args) -> int:
     print("  the coordinator re-gates from live state — the parked batch is "
           "never resubmitted; a NEW batch forms through the broker-owned "
           "writer")
+    return 0
+
+
+def _me() -> int:
+    """This shell's own id, from the token the API already resolves. Arming
+    is self-service for a shell actor (the route refuses any other planner),
+    so making the caller retype an id it cannot choose freely is just a way
+    to get it wrong."""
+    shell_id = _api("GET", "/_sc/mem/whoami").get("shell_id")
+    if shell_id is None:
+        raise _die("the API did not resolve a shell for this token — pass "
+                   "--planner <shell_id> explicitly")
+    return shell_id
+
+
+def _binding_for_sprint(doc_id: int) -> dict:
+    r = _api("GET", f"/api/interface/sprint-bindings?sprint_doc_id={doc_id}")
+    live = [b for b in r.get("bindings", []) if not b.get("released_at")]
+    if not live:
+        raise _die(f"sprint #{doc_id} has no armed binding visible to you "
+                   "(a shell actor sees only its own)")
+    return live[0]
+
+
+def cmd_arm(args) -> int:
+    planner = args.planner if args.planner is not None else _me()
+    # Fresh key per invocation, deliberately, and NOT the deterministic
+    # `sprint_binding_arm|<doc>|<planner>` the requirement suggests: the
+    # idempotency layer caches ERROR responses (decision #102, flag #380), so
+    # a deterministic key turns the ordinary "arm before the session is up"
+    # 409 into a refusal that survives the fix for the full 24-hour TTL. The
+    # partial unique index — not the key — is what makes a double arm
+    # impossible, and it answers 409 already_armed on its own.
+    r = _api("POST", "/api/interface/sprint-bindings",
+             {"sprint_doc_id": args.sprint, "planner_shell_id": planner},
+             f"sprint_binding_arm|{args.sprint}|{planner}|{uuid.uuid4()}")
+    print(f"sc sprint: binding #{r['binding_id']} armed · sprint "
+          f"#{r['sprint_doc_id']} · planner shell {r['planner_shell_id']} · "
+          f"session {r['session_id']} gen {r['generation']} · wake "
+          f"{r['wake_state']}")
+    return 0
+
+
+def cmd_disarm(args) -> int:
+    binding_id = args.binding
+    if binding_id is None:
+        if args.sprint is None:
+            raise _die("disarm needs --sprint <doc-id> or --binding <id>")
+        binding_id = _binding_for_sprint(args.sprint)["binding_id"]
+    payload = {"reason": args.reason} if args.reason else {}
+    r = _api("DELETE", f"/api/interface/sprint-bindings/{binding_id}",
+             payload, f"sprint_binding_release|{binding_id}|{uuid.uuid4()}")
+    if r.get("already_released"):
+        print(f"sc sprint: binding #{binding_id} was already released")
+        return 0
+    print(f"sc sprint: binding #{binding_id} disarmed · "
+          f"{r.get('cancelled_items', 0)} queued wake item(s) cancelled · "
+          "messages stay UNREAD")
     return 0
 
 
@@ -482,6 +586,29 @@ def main(argv: "list[str] | None" = None) -> int:
                     default=None,
                     help="required when the session's input is parked: did "
                          "the parked frame reach the planner?")
+    rt.add_argument("--stuck", choices=("reconcile", "quarantined", "both"),
+                    default=None,
+                    help="also move items stuck in these states (H-9): they "
+                         "have legal exits no code performs")
+    rt.add_argument("--stuck-outcome", dest="stuck_outcome",
+                    choices=("requeue", "cancel"), default=None,
+                    help="required with --stuck: requeue for another wake, or "
+                         "cancel outright")
+    ar = sub.add_parser("arm", help="arm this sprint's planner wake binding "
+                                    "(the board must be declared first)")
+    ar.add_argument("--sprint", type=int, required=True)
+    ar.add_argument("--planner", type=int, default=None,
+                    help="operator only — a shell may arm only itself, and "
+                         "resolves its own id from its token")
+    dis = sub.add_parser("disarm", help="release the binding and cancel its "
+                                        "queued wake work (messages stay "
+                                        "UNREAD)")
+    dis.add_argument("--sprint", type=int, default=None,
+                     help="resolve the armed binding from the sprint doc")
+    dis.add_argument("--binding", type=int, default=None,
+                     help="release one binding by id")
+    dis.add_argument("--reason", default=None,
+                     help="audit reason recorded on the release")
     args = p.parse_args(argv)
     if args.cmd == "action":
         if args.action_cmd == "begin":
@@ -497,6 +624,10 @@ def main(argv: "list[str] | None" = None) -> int:
         return cmd_status(args)
     if args.cmd == "alerts":
         return cmd_alerts(args)
+    if args.cmd == "arm":
+        return cmd_arm(args)
+    if args.cmd == "disarm":
+        return cmd_disarm(args)
     return cmd_retry(args)
 
 

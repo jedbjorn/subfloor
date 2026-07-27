@@ -1748,14 +1748,28 @@ def _arm_binding(actor, headers, body):
                 return 409, _err_obj(
                     "already_armed",
                     "planner or sprint already has an ACTIVE binding")
+            # H-5: arming is the one thing that cures a deaf sprint, so it is
+            # where the alert closes. Same transaction as the binding — the
+            # condition and its resolution can never disagree.
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE sprint_doc_id=? AND reason='sprint_no_armed_planner' "
+                "AND resolved_at IS NULL", (doc_id,))
+            # H-6: adopt the items held behind this sprint's released
+            # bindings, and close the deaf alert they were held under.
+            reparented = interface_broker.reparent_wake_items(
+                con, cur.lastrowid, doc_id)
             con.commit()
             _log(f"sprint binding {cur.lastrowid} armed: doc={doc_id} "
-                 f"planner={planner} session={sess[0]} gen={sess[2]}")
+                 f"planner={planner} session={sess[0]} gen={sess[2]}"
+                 + (f"; adopted {reparented} held wake item(s)"
+                    if reparented else ""))
             return 201, {"binding_id": cur.lastrowid,
                          "sprint_doc_id": doc_id,
                          "planner_shell_id": planner,
                          "session_id": sess[0], "generation": sess[2],
-                         "wake_state": "armed"}
+                         "wake_state": "armed",
+                         "adopted_items": reparented}
         resp = _idempotent(con, actor, "sprint_binding_arm", headers, body,
                            produce)
         if resp[0] == 201:
@@ -1879,6 +1893,16 @@ def _project_binding(con, row) -> dict:
     out["quarantined"] = [
         {"item_id": q[0], "message_id": q[1], "error": q[2],
          "completed_wakes": q[3]} for q in quarantined]
+    # H-9: `reconcile` was invisible here — the projection exposed a
+    # quarantined bucket only, and `ambiguity`, written on every reconcile
+    # transition, was read by nothing at all. An item parked for an ambiguous
+    # action receipt therefore had no surface and no operator path.
+    out["reconcile"] = [
+        {"item_id": r[0], "message_id": r[1], "ambiguity": r[2]}
+        for r in con.execute(
+            "SELECT item_id, message_id, ambiguity FROM planner_wake_items "
+            "WHERE binding_id=? AND state='reconcile' ORDER BY item_id",
+            (binding_id,)).fetchall()]
     if released_at is not None:
         return out
     input_park = con.execute(
@@ -1910,7 +1934,11 @@ def _project_binding(con, row) -> dict:
         "AND (binding_id=? OR session_id=?) LIMIT 1",
         (binding_id, session_id)).fetchone()
     out["retry"] = {
-        "applicable": bool(parked or input_park or stalled),
+        # H-9: stuck reconcile/quarantined items have trigger-legal exits that
+        # no code performed, so retry is applicable to them too — they are the
+        # states an operator most needs a way out of.
+        "applicable": bool(parked or input_park or stalled
+                           or out["quarantined"] or out["reconcile"]),
         "needs_outcome": input_park,
     }
     return out
@@ -1949,8 +1977,22 @@ def _binding_status(actor, query: dict):
     con = _db()
     try:
         rows = con.execute(sql, params).fetchall()
+        # Flag #176: the answer says WHOSE bindings it is. A shell actor is
+        # silently narrowed to its own above, and an empty list then reads as
+        # "no binding armed anywhere" to a caller that cannot see the filter
+        # — which is how a planner nearly merged into a live sprint's
+        # migration sequence. The scope travels with the result rather than
+        # being re-derived by every client.
+        scope = {"actor": actor.kind, "planner_shell_id": planner,
+                 "sprint_doc_id": doc_id,
+                 "includes_released": include_released}
+        if actor.kind == "shell":
+            scope["shortname"] = con.execute(
+                "SELECT shortname FROM shells WHERE shell_id=?",
+                (actor.shell_id,)).fetchone()[0]
         return _json(200, {"bindings":
-                           [_project_binding(con, r) for r in rows]})
+                           [_project_binding(con, r) for r in rows],
+                           "scope": scope})
     finally:
         con.close()
 
@@ -2062,6 +2104,44 @@ _ALERT_COPY = {
         "Arm the sprint's real planner binding; do not synthesize a recipient.",
         "warning",
     ),
+    "wake_batch_stalled": (
+        "A wake batch has been queued past the stall threshold under an armed "
+        "binding; `detail` names the gate that refused it most recently.",
+        "Clear the gate named in the detail — the batch submits on the next "
+        "event, with no operator action needed once it passes.",
+        "warning",
+    ),
+    "wake_hooks_missing_at_submit": (
+        "The seat passed the hook-capability check when the binding was armed "
+        "and fails it now; `detail` carries harness, cli_version and the "
+        "missing events verbatim.",
+        "Read the detail before acting: an absent or unparseable cli_version "
+        "is a metadata-capture miss, not an incapable harness, and the two "
+        "need different fixes.",
+        "capability",
+    ),
+    "hooks_declared_but_silent": (
+        "A lifecycle hook this harness DECLARES it delivers has not been "
+        "observed; `detail` names the harness, its version, and which event.",
+        "Verify the harness's hook config actually installed on this seat. "
+        "Waiting does not clear it — the declaration is what is wrong.",
+        "capability",
+    ),
+    "binding_released_live_sprint": (
+        "The planner binding was released while this sprint still has "
+        "non-terminal units, so nothing is listening for its wake events.",
+        "Arm a new binding for the sprint (`sc sprint arm --sprint <doc-id>`) "
+        "— it adopts the wake items held since the release. This does not "
+        "clear until a binding is armed or the sprint closes.",
+        "warning",
+    ),
+    "sprint_no_armed_planner": (
+        "A task or result was addressed into this live sprint while it had no "
+        "unreleased planner binding, so nothing will deliver it.",
+        "Arm the sprint's planner binding (`sc sprint arm --sprint <doc-id>`); "
+        "the sender's message is durable and waits in the inbox.",
+        "warning",
+    ),
 }
 
 
@@ -2070,6 +2150,7 @@ def _alert_projection(row) -> dict:
         "alert_id", "session_id", "binding_id", "message_id", "watch_id",
         "severity", "reason", "opened_at", "resolved_at", "acknowledged_at",
         "acknowledged_by", "sprint_doc_id", "unit_id", "role", "signal",
+        "batch_id", "detail",
         "shell_id", "generation",
     )
     alert = dict(zip(cols, row))
@@ -2113,6 +2194,11 @@ def _sprint_alerts(actor, query: dict):
         "a.watch_id, a.severity, a.reason, a.opened_at, a.resolved_at, "
         "a.acknowledged_at, a.acknowledged_by, "
         "a.sprint_doc_id, a.unit_id, a.role, a.signal, "
+        # H-26/H-27: the MEASUREMENT the alert carries. Without it the
+        # operator surface names a condition and still cannot say what was
+        # observed — which is the gap those requirements exist to close, so
+        # projecting it is part of them, not polish.
+        "a.batch_id, a.detail, "
         "COALESCE(a.shell_id, s.shell_id, b.shell_id), "
         "COALESCE(s.generation, b.generation) "
         "FROM planner_alerts a "
@@ -2294,6 +2380,48 @@ def _retry_binding(actor, headers, body, binding_id: int):
                 actions.append(
                     f"parked batch {parked_id} resolved as audit — its "
                     "items requeue for a NEW batch")
+            # H-9: `reconcile` and `quarantined` have trigger-legal exits
+            # (schema.sql) that NO code performed — the only writer that could
+            # move them was the destructive update-discard sweep, which is
+            # collateral of an engine update and not an operator path. This is
+            # that path, and it is explicit: `stuck` names which states to move
+            # and `stuck_outcome` whether they requeue or cancel. Neither is
+            # implied by a bare retry, because requeuing a quarantined item
+            # sends the planner back into the loop that quarantined it.
+            stuck = body.get("stuck")
+            if stuck is not None:
+                if not isinstance(stuck, list) or not stuck or any(
+                        s not in ("reconcile", "quarantined") for s in stuck):
+                    return 422, _err_obj(
+                        "validation",
+                        "stuck must be a non-empty list of "
+                        "'reconcile' and/or 'quarantined'")
+                stuck_outcome = (body.get("stuck_outcome") or "").strip()
+                if stuck_outcome not in ("requeue", "cancel"):
+                    return 422, _err_obj(
+                        "stuck_outcome_required",
+                        "moving a stuck wake item needs "
+                        "stuck_outcome=requeue|cancel")
+                target = "queued" if stuck_outcome == "requeue" else "cancelled"
+                marks = ",".join("?" * len(stuck))
+                items = con.execute(
+                    f"SELECT item_id, state FROM planner_wake_items "
+                    f"WHERE binding_id=? AND state IN ({marks}) "
+                    "ORDER BY item_id", (binding_id, *stuck)).fetchall()
+                for item_id, state in items:
+                    extra = {"error": f"operator {stuck_outcome} from {state}"}
+                    if target == "queued":
+                        # A requeued item starts its wake budget over: it kept
+                        # the count that quarantined it, so the next batch
+                        # would re-quarantine it on the first unread turn.
+                        extra["completed_wakes"] = 0
+                    interface_state.transition(
+                        con, "wake_item", item_id, target, extra_sets=extra)
+                if items:
+                    actions.append(
+                        f"{len(items)} stuck item(s) "
+                        f"{'requeued' if target == 'queued' else 'cancelled'} "
+                        f"from {'/'.join(stuck)}")
             resignalled = False
             if con.execute(
                     "SELECT 1 FROM planner_wake_batches WHERE binding_id=? "
@@ -2321,6 +2449,14 @@ def _retry_binding(actor, headers, body, binding_id: int):
                 clears.append("crash_window_delivery_unknown")
             if resignalled:
                 clears.append("wake_presend_retries_exhausted")
+            if stuck is not None and "quarantined" in stuck and not con.execute(
+                    "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
+                    "AND state='quarantined' LIMIT 1",
+                    (binding_id,)).fetchone():
+                # Only once the LAST one is gone: dedupe-while-open means one
+                # row stands for the condition, so clearing it while another
+                # item is still quarantined would hide the rest.
+                clears.append("wake_item_quarantined")
             if clears:
                 con.execute(
                     "UPDATE planner_alerts SET resolved_at=datetime('now') "

@@ -732,6 +732,11 @@ def deliver_reconciliation_readings(
                 f"reconciler-alert|{alert_id}",
             ),
         ).lastrowid
+        # H-8: ONE eligibility ladder. This used to check `released_at IS
+        # NULL` alone and could queue an item no gate would ever pass — it
+        # went straight into a stall, invisibly. The alert still records the
+        # binding it belongs to whether or not a wake can ride it.
+        import interface_wake
         binding = con.execute(
             "SELECT binding_id FROM sprint_planner_bindings "
             "WHERE sprint_doc_id=? AND planner_shell_id=? "
@@ -744,11 +749,13 @@ def deliver_reconciliation_readings(
             "WHERE alert_id=?",
             (message_id, binding_id, alert_id),
         )
-        if binding_id is not None:
+        wakeable = interface_wake.eligible_binding(
+            con, sprint_doc_id, planner_shell_id)
+        if wakeable is not None:
             con.execute(
                 "INSERT OR IGNORE INTO planner_wake_items "
                 "(binding_id, message_id) VALUES (?,?)",
-                (binding_id, message_id),
+                (wakeable, message_id),
             )
         emitted.append(message_id)
     return emitted
@@ -1080,15 +1087,38 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     except sqlite3.IntegrityError:
         return None  # the dedupe index — already emitted
     message_id = cur.lastrowid
-    binding = con.execute(
-        "SELECT binding_id FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
-        (watch["sprint_doc_id"], watch["shell_id"])).fetchone()
-    if binding is not None:
+    # H-8: the same eligibility ladder the message ingress uses — an item the
+    # gate can never pass is not created, it is refused, and the condition
+    # behind the refusal is H-5/H-6's to report.
+    import interface_wake
+    binding_id = interface_wake.eligible_binding(
+        con, watch["sprint_doc_id"], watch["shell_id"])
+    if binding_id is not None:
         con.execute(
             "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
-            "VALUES (?, ?)", (binding[0], message_id))
+            "VALUES (?, ?)", (binding_id, message_id))
     return message_id
+
+
+def sweep_stranded_runs(con) -> int:
+    """Close pr_poll_runs rows left `running` by a crash (H-9).
+
+    A run row is opened and committed before the fetch, and closed after it —
+    so a process that dies mid-fetch leaves `running` forever, with no writer
+    that could ever finish it and nothing that reports it. That makes the
+    audit trail lie in the one direction that matters: a poller that keeps
+    crashing looks like a poller that is still working.
+
+    Swept at STARTUP only, and that bound is deliberate: `running` is the
+    correct state for the cycle currently in flight, so a sweep on any other
+    tick would close a live run out from under itself. A process that has
+    just started has no run of its own in flight yet, so every `running` row
+    it can see belongs to a process that is gone."""
+    return con.execute(
+        "UPDATE pr_poll_runs SET status='error', "
+        "finished_at=datetime('now'), "
+        "error='stranded: the poller process ended before this run finished' "
+        "WHERE status='running'").rowcount
 
 
 def poll_cycle(con, fetch=None, source: str = "scheduler",
@@ -1103,7 +1133,9 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
     now = now if now is not None else time.monotonic()
     summary = {"watches": 0, "repos": 0, "skipped_backoff": 0,
                "events": 0, "errors": 0, "retired": 0,
-               "unscoped_alerts": surface_unscoped_watches(con)}
+               "unscoped_alerts": surface_unscoped_watches(con),
+               "stranded_runs": (sweep_stranded_runs(con)
+                                 if source == "startup" else 0)}
     emitted_ids: list[int] = []
     watches = armed_watches(con)
     summary["watches"] = len(watches)

@@ -29,6 +29,36 @@ MAX_INPUT_BYTES = 64 * 1024  # one human frame, per the pinned spike protocol
 WAKE_PROMPT = "Check your inbox and act on unread sprint events."
 DEFAULT_QUIET_S = 3.0  # debounce, never proof of an empty composer
 MAX_COMPLETED_WAKES = 3  # unread after 3 completed wake turns → quarantined
+# H-26: how long a batch may sit `queued` under an armed binding before the
+# stall becomes an alert. GENEROUS BY DESIGN — it bounds INVISIBILITY, not
+# delivery: a batch legitimately waits out a busy planner, and nothing here
+# hurries it. What it forbids is issue #638's shape, where a batch was
+# invisible for 33 minutes across 11 accumulated items with no way to see the
+# cause. Five minutes is far outside any ordinary deferral (the debounce is
+# 3 seconds) and far inside the window where a stalled sprint still matters.
+WAKE_BATCH_STALL_S = 300.0
+# H-27: how long a DECLARED hook may go unobserved before the declaration is
+# reported as contradicted. Two measurements, two constants, because they
+# measure different silences.
+#
+# HOOKS_READY_SILENT_S — session creation to the harness's own session_start,
+# for a harness that declares it arrives at startup. Not a fitted number:
+# nothing in the deployment sample is a distribution to fit (claude 46/46 and
+# kimi 2/2 stamped; the codex readings are first-turn-gated and this clause is
+# not evaluated for them at all — decisions #98/#99). Three minutes is far
+# outside any harness boot and far inside the window where a deaf planner
+# still matters.
+#
+# HOOKS_SUBMIT_SILENT_S — the submitting -> running wait for the submit hook.
+# Much tighter, and it can be, because NO model latency sits inside it: the
+# engine wrote the bytes and pressed Enter, and UserPromptSubmit fires at that
+# keystroke. A minute is two orders of magnitude past the hook's own round
+# trip.
+#
+# Both bound INVISIBILITY, not delivery — nothing here hurries a hook, and
+# neither threshold is evaluated for a seat that has already been observed.
+HOOKS_READY_SILENT_S = 180.0
+HOOKS_SUBMIT_SILENT_S = 60.0
 
 
 class BrokerError(ValueError):
@@ -74,15 +104,40 @@ def _session(con, session_id: int):
 
 
 def _alert(con, *, severity: str, reason: str, session_id=None,
-           binding_id=None, message_id=None) -> None:
+           binding_id=None, message_id=None, batch_id=None,
+           sprint_doc_id=None, detail=None) -> None:
     """Raise an alert, deduplicated while open (partial unique index).
 
     A session-scoped alert takes the write lock before reading terminal state.
     That makes the read + write atomic with durable closure: closure either
     lands first and this row is resolved audit, or lands second and resolves
     the row itself. The caller still owns the surrounding transaction.
+
+    `detail` carries the MEASUREMENT (a verbatim gate reason, a capability
+    gap) and is deliberately outside the dedupe key: one open row per
+    condition, whose detail REFRESHES to the most recent observation rather
+    than minting a new alert per distinct string. Per decision #76 it states
+    what was measured, never a verdict.
+
+    `sprint_doc_id` is the post-0102 reconciliation column (with `unit_id`,
+    `role`, `signal`) — sprint-flow alerts carry the sprint they belong to
+    rather than encoding it into `dedupe_key` alone, so
+    `idx_planner_alerts_reconciliation` can find them.
+
+    BOTH NEW SCOPES APPEND; neither widens the key. The obvious edit — splicing
+    batch_id in beside the other refs — rewrites the key of EVERY alert,
+    including the ones carrying neither new scope. Nothing new would then
+    collide with a row already open in a live DB, and each open alert would
+    mint one duplicate at deploy. Appending only when set leaves every existing
+    key byte-identical, and it cannot merge two rows that should be distinct,
+    because a batch determines its binding and a binding its sprint.
     """
-    dedupe = f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}|{reason}"
+    dedupe = (f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}"
+              f"|{reason}")
+    if batch_id is not None:
+        dedupe += f"|batch{batch_id}"
+    if sprint_doc_id is not None:
+        dedupe += f"|sprint{sprint_doc_id}"
     if session_id is not None:
         _begin_immediate(con)
         session = con.execute(
@@ -103,23 +158,35 @@ def _alert(con, *, severity: str, reason: str, session_id=None,
             exists = con.execute(
                 "SELECT 1 FROM planner_alerts "
                 "WHERE session_id=? AND binding_id IS ? AND message_id IS ? "
-                "AND reason=? LIMIT 1",
-                (session_id, binding_id, message_id, reason),
+                "AND batch_id IS ? AND sprint_doc_id IS ? AND reason=? "
+                "LIMIT 1",
+                (session_id, binding_id, message_id, batch_id, sprint_doc_id,
+                 reason),
             ).fetchone()
             if exists is None:
                 con.execute(
                     "INSERT INTO planner_alerts "
-                    "(session_id, binding_id, message_id, severity, reason, "
-                    "dedupe_key, resolved_at) VALUES (?,?,?,?,?,?,?)",
-                    (session_id, binding_id, message_id, severity, reason,
-                     dedupe, ended_at),
+                    "(session_id, binding_id, message_id, batch_id, "
+                    "sprint_doc_id, severity, reason, detail, dedupe_key, "
+                    "resolved_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (session_id, binding_id, message_id, batch_id,
+                     sprint_doc_id, severity, reason, detail, dedupe,
+                     ended_at),
                 )
             return
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
-        "(session_id, binding_id, message_id, severity, reason, dedupe_key) "
-        "VALUES (?,?,?,?,?,?)",
-        (session_id, binding_id, message_id, severity, reason, dedupe))
+        "(session_id, binding_id, message_id, batch_id, sprint_doc_id, "
+        "severity, reason, detail, dedupe_key) VALUES (?,?,?,?,?,?,?,?,?)",
+        (session_id, binding_id, message_id, batch_id, sprint_doc_id,
+         severity, reason, detail, dedupe))
+    if detail is not None:
+        # The row may already have been open (INSERT OR IGNORE did nothing):
+        # refresh its measurement so a reader sees the LATEST failing gate,
+        # not the one that happened to open the alert.
+        con.execute(
+            "UPDATE planner_alerts SET detail=? "
+            "WHERE dedupe_key=? AND resolved_at IS NULL", (detail, dedupe))
 
 
 def park_delivery_unknown(con, session_id: int, *,
@@ -313,6 +380,12 @@ def set_browser_composer(con, session_id: int, client_id: str,
     deliberate: clearing a browser textarea must not certify the harness/tmux
     composer clean. BEGIN IMMEDIATE serializes this state with the planner wake
     gate so whichever action commits first is observed by the other.
+
+    It rides the writer lease in both directions: only the current writer may
+    set it, and a restart that revokes every lease resets it to clean
+    (H-9, `interface_reconcile.startup_reconcile`). A dirty draft whose client
+    is provably gone is unownable by construction — nobody can certify it, and
+    it would block the wake gate with no alert and no owner.
     """
     if state not in ("clean", "dirty"):
         raise BrokerError(f"invalid browser composer state {state!r}")
@@ -575,6 +648,13 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
             con.execute(
                 "UPDATE interface_sessions SET provider_ready_at=datetime('now') "
                 "WHERE session_id=?", (sess[0],))
+            # H-27: the declaration is no longer contradicted — the hook it
+            # promised has arrived. Only the readiness row (batch_id IS NULL);
+            # a batch's submit silence is its own condition and its own row.
+            con.execute(
+                "UPDATE planner_alerts SET resolved_at=datetime('now') "
+                "WHERE session_id=? AND reason='hooks_declared_but_silent' "
+                "AND batch_id IS NULL AND resolved_at IS NULL", (sess[0],))
             istate = con.execute(
                 "SELECT composer, pending_seq, forwarded_seq "
                 "FROM interface_input_state WHERE session_id=?",
@@ -661,6 +741,9 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
                     con, "wake_batch", batch[0], "running",
                     extra_sets={"submit_hook_seq": hook_seq,
                                 "submitted_at": _now(con)})
+                # H-27: the submit hook answered, so this batch's silence is
+                # over — including an alert opened while it was pending.
+                resolve_batch_alerts(con, batch[0])
                 con.execute(
                     "UPDATE planner_wake_items SET state='running' "
                     "WHERE batch_id=? AND state='submitting'",
@@ -836,10 +919,224 @@ def _reconcile_item(con, item_id: int, message_id: int,
         interface_state.transition(con, "wake_item", item_id, "queued")
 
 
-def form_batch(con, binding_id: int) -> int:
-    """Coalesce a binding's currently queued items into one batch (the
+def note_gate_failure(con, batch_id: int, reason: str) -> None:
+    """Record the gate reason that just refused this batch, verbatim (H-26).
+
+    Written on EVERY failed attempt, including the ones long before the stall
+    threshold, so that when the alert finally opens it names the gate that has
+    actually been failing — not whichever one happened to fail last. Those
+    differ exactly when a seat is flapping, which is the case a reader most
+    needs the truth about.
+
+    Its own transaction: the caller has just rolled the gate read back, and
+    this measurement must outlive that rollback."""
+    con.execute(
+        "UPDATE planner_wake_batches "
+        "SET last_gate_reason=?, last_gate_at=datetime('now') "
+        "WHERE batch_id=?", (reason, batch_id))
+    con.commit()
+
+
+def stalled_batch_alert(con, batch_id: int, threshold_s=None) -> bool:
+    """Open the deduped `wake_batch_stalled` alert if this batch has been
+    queued past the threshold under a still-armed binding (H-26). Returns
+    True when the batch qualifies as stalled.
+
+    threshold_s resolves at CALL time, not in the signature: a default of
+    `WAKE_BATCH_STALL_S` would bind the constant once at import and leave
+    the module attribute a decoy that reads correctly and changes nothing.
+
+    Carries the last failing gate verbatim in `detail`. States what was
+    measured and nothing more — decision #76 forbids a monitor that reports a
+    verdict, and "which gate said no" is exactly the fact the operator cannot
+    otherwise obtain."""
+    if threshold_s is None:
+        threshold_s = WAKE_BATCH_STALL_S
+    row = con.execute(
+        "SELECT b.binding_id, b.state, b.last_gate_reason, "
+        "       (julianday('now') - julianday(b.created_at)) * 86400.0, "
+        "       p.released_at, p.sprint_doc_id "
+        "FROM planner_wake_batches b "
+        "JOIN sprint_planner_bindings p ON p.binding_id = b.binding_id "
+        "WHERE b.batch_id=?", (batch_id,)).fetchone()
+    if row is None:
+        return False
+    binding_id, state, gate_reason, queued_s, released_at, doc_id = row
+    if state != "queued" or released_at is not None:
+        return False
+    if queued_s is None or queued_s < threshold_s:
+        return False
+    _alert(con, severity="warning", reason="wake_batch_stalled",
+           binding_id=binding_id, batch_id=batch_id, sprint_doc_id=doc_id,
+           detail=(gate_reason or "no gate attempt recorded"))
+    return True
+
+
+def _silence_detail(harness, cli_version, unobserved: str,
+                    measured: str) -> str:
+    """The one sentence a `hooks_declared_but_silent` alert carries: which
+    harness at which version declared which event, and what was actually
+    seen. States the measurement and stops there — decision #76 forbids a
+    monitor that reports a verdict, and "which declared event never arrived"
+    is precisely the fact no other surface holds."""
+    return (f"harness={harness!r} cli_version={cli_version!r} "
+            f"declares {unobserved!r} — {measured}")
+
+
+def hooks_silence_alert(con, binding_id: int, ready_s=None,
+                        submit_s=None) -> "float | None":
+    """Check a declared hook chain against what has ACTUALLY arrived, for the
+    session under one armed binding (H-27). Opens a deduped
+    `hooks_declared_but_silent` naming the harness, its cli_version, and the
+    declared event that was never observed.
+
+    Returns the seconds until the nearest threshold falls due while one is
+    still pending, so the caller can arm a single bounded re-check; None when
+    nothing is pending. Thresholds resolve at CALL time, never in the
+    signature — a default argument would bind the constant at import and
+    leave the module attribute a decoy that reads correctly and changes
+    nothing (the same trap H-26's stall threshold sprang).
+
+    TWO MEASUREMENTS, AND THE ONE THIS DELIBERATELY DOES NOT MAKE.
+
+    1. Readiness. A harness that declares session_start arrives at startup
+       (claude `startup_hook`, kimi `session_created`) and has not stamped
+       `provider_ready_at` is contradicting its own declaration. NOT
+       evaluated for a `first_turn_gated` harness: there readiness is gated
+       on a human submitting the first turn, so the delay is unbounded and a
+       healthy idle codex seat waiting to be woken is indistinguishable by
+       elapsed time from a broken one. Alerting on it would fire on every
+       correct codex seat — the monitor lying that decision #76 forbids and
+       this sprint exists to remove (decisions #98/#99, U7 finding F8).
+
+    2. Submit silence. The engine itself wrote the bytes and pressed Enter,
+       so a batch that entered `submitting` and stayed there is a submit hook
+       that did not fire — no model latency sits inside that wait, and no
+       healthy shape produces it. This is where U7's F13 measurement lands on
+       the post-U7 floor: a live, trusted, hooks-installed seat is now
+       promoted on the weak process_ready_at proof and the wake goes out, so
+       a dead chain no longer parks in `starting` where the arming gate could
+       see it — it parks HERE, where `_drain_sync` returns early and nothing
+       in flight ever looks again.
+
+    NOT MEASURED: H-27's literal "a completed human turn produced no
+    turn_stop". In band, the only evidence that a turn completed IS
+    turn_stop. Every independent route fires on a healthy shape — a later
+    prompt_submit arriving while a batch runs is type-ahead exactly as much
+    as it is a silent stop (both land on lifecycle `busy`, and nothing in the
+    row tells them apart), and "the triggering rows were all read" is the
+    ordinary read-then-work-for-twenty-minutes planner turn. A session that
+    ends mid-batch is already covered: close_session parks it
+    delivery_unknown with a critical alert. The failure that clause aimed at
+    is caught strictly earlier and without confound by measurement 2 — a
+    chain that will not deliver turn_stop did not deliver prompt_submit
+    either.
+
+    Commits its own measurement. The coordinator calls this BEFORE any of the
+    drain's own writes and then returns down several paths that never reach a
+    commit — an observation that survives only one of them is not an
+    observation.
+    """
+    if ready_s is None:
+        ready_s = HOOKS_READY_SILENT_S
+    if submit_s is None:
+        submit_s = HOOKS_SUBMIT_SILENT_S
+    sess = con.execute(
+        "SELECT s.session_id, s.harness, s.cli_version, s.provider_ready_at, "
+        "       (julianday('now') - julianday(s.created_at)) * 86400.0, "
+        "       b.sprint_doc_id "
+        "FROM sprint_planner_bindings b "
+        "JOIN interface_sessions s ON s.session_id = b.session_id "
+        "WHERE b.binding_id=? AND b.released_at IS NULL "
+        "AND s.occupancy <> 'ended'", (binding_id,)).fetchone()
+    if sess is None:
+        return None  # H-27 scopes to an ARMED binding on a live session
+    session_id, harness, cli_version, ready_at, age_s, doc_id = sess
+    pending = []
+
+    readiness = interface_hooks.capability(harness, cli_version)["readiness"]
+    if ready_at is None and readiness != interface_hooks.FIRST_TURN_GATED:
+        if age_s is not None and age_s >= ready_s:
+            _alert(con, severity="warning",
+                   reason="hooks_declared_but_silent", session_id=session_id,
+                   sprint_doc_id=doc_id,
+                   detail=_silence_detail(
+                       harness, cli_version, "session_start",
+                       f"unobserved {age_s:.0f}s after session creation"))
+        elif age_s is not None:
+            pending.append(ready_s - age_s)
+
+    batch = con.execute(
+        "SELECT batch_id, "
+        "       (julianday('now') - julianday(submitting_at)) * 86400.0 "
+        "FROM planner_wake_batches "
+        "WHERE binding_id=? AND state='submitting'", (binding_id,)).fetchone()
+    # A NULL submitting_at is a batch that predates migration 0117, not a
+    # batch submitted zero seconds ago: unmeasured, never reported as silent.
+    if batch is not None and batch[1] is not None:
+        if batch[1] >= submit_s:
+            _alert(con, severity="warning",
+                   reason="hooks_declared_but_silent", session_id=session_id,
+                   batch_id=batch[0], sprint_doc_id=doc_id,
+                   detail=_silence_detail(
+                       harness, cli_version, "prompt_submit",
+                       f"batch {batch[0]} submitted {batch[1]:.0f}s ago and "
+                       f"the submit hook has not answered"))
+        else:
+            pending.append(submit_s - batch[1])
+
+    con.commit()
+    return min(pending) if pending else None
+
+
+def resolve_batch_alerts(con, batch_id: int) -> None:
+    """A batch that submitted or cancelled is no longer stalled (H-26).
+
+    Keyed on the batch, so this resolves that batch's rows and nothing else's
+    — a second binding stalled on the same seat keeps its own alert open."""
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE batch_id=? AND resolved_at IS NULL", (batch_id,))
+
+
+def sweep_read_queued(con, binding_id: int) -> int:
+    """Complete a binding's queued items whose message is ALREADY READ (H-4).
+
+    A planner that drained its inbox by hand — or was woken first by the
+    harness's own task notification — has already handled those rows; a wake
+    turn for them delivers nothing and trains the planner to dismiss wake
+    prompts. They complete as `done` with no batch, which is the disposition
+    `_complete_batch` already gives a row read during another batch's turn.
+    Returns how many were swept, for the caller's batch record."""
+    items = con.execute(
+        "SELECT i.item_id FROM planner_wake_items i "
+        "JOIN shell_messages m ON m.message_id = i.message_id "
+        "WHERE i.binding_id=? AND i.state='queued' AND i.batch_id IS NULL "
+        "AND m.read_at IS NOT NULL "
+        "ORDER BY i.item_id",
+        (binding_id,)).fetchall()
+    for (item_id,) in items:
+        interface_state.transition(
+            con, "wake_item", item_id, "done",
+            extra_sets={"done_at": _now(con)})
+    return len(items)
+
+
+def form_batch(con, binding_id: int, skipped_read: int = 0) -> int:
+    """Coalesce a binding's currently queued UNREAD items into one batch (the
     fixed-prompt submission unit). The partial unique index backstops the
-    one-live-batch invariant; items join oldest first."""
+    one-live-batch invariant; items join oldest first.
+
+    An item whose message was read between queueing and here never joins the
+    batch (H-4) — `sweep_read_queued` completes it instead. The join is the
+    load-bearing half of that rule: the sweep can lose a race with a planner
+    reading a row, this cannot.
+
+    `skipped_read` records how many rows the sweep retired on the way to this
+    batch (H-28). Suppression must itself be observable — this spec's own
+    monitor rule — or a queue that went quiet because rows were correctly
+    skipped reads identically to one that went quiet because nothing
+    arrived."""
     binding = con.execute(
         "SELECT shell_id, generation FROM sprint_planner_bindings "
         "WHERE binding_id=? AND released_at IS NULL",
@@ -847,14 +1144,16 @@ def form_batch(con, binding_id: int) -> int:
     if binding is None:
         raise BrokerError(f"binding {binding_id} not found or released")
     cur = con.execute(
-        "INSERT INTO planner_wake_batches (binding_id, shell_id, generation) "
-        "VALUES (?,?,?)",
-        (binding_id, binding[0], binding[1]))
+        "INSERT INTO planner_wake_batches "
+        "(binding_id, shell_id, generation, skipped_read) VALUES (?,?,?,?)",
+        (binding_id, binding[0], binding[1], skipped_read))
     batch_id = cur.lastrowid
     items = con.execute(
-        "SELECT item_id FROM planner_wake_items "
-        "WHERE binding_id=? AND state='queued' AND batch_id IS NULL "
-        "ORDER BY item_id",
+        "SELECT i.item_id FROM planner_wake_items i "
+        "JOIN shell_messages m ON m.message_id = i.message_id "
+        "WHERE i.binding_id=? AND i.state='queued' AND i.batch_id IS NULL "
+        "AND m.read_at IS NULL "
+        "ORDER BY i.item_id",
         (binding_id,)).fetchall()
     for (item_id,) in items:
         interface_state.transition(
@@ -891,20 +1190,60 @@ def resolve_batch(con, batch_id: int) -> None:
     con.commit()
 
 
+def sprint_still_running(con, sprint_doc_id) -> bool:
+    """Is this sprint LIVE and still holding work? (H-6.) A live sprint whose
+    every unit is merged or cancelled is finished in all but the freeze, and
+    a release there is the ordinary end of a sprint — not a planner going
+    deaf mid-flight."""
+    if sprint_doc_id is None or not sprint_state.is_live_sprint(
+            con, sprint_doc_id):
+        return False
+    return con.execute(
+        "SELECT 1 FROM sprint_units "
+        "WHERE sprint_doc_id=? AND state NOT IN ('merged','cancelled') "
+        "LIMIT 1", (sprint_doc_id,)).fetchone() is not None
+
+
 def release_binding(con, binding_id: int, reason: str) -> "int | None":
-    """Release one binding and cancel its queued wake work with an audit
+    """Release one binding and dispose of its queued wake work with an audit
     reason (spec Sprint Scope): messages stay UNREAD; a live submitting/
     running batch is left for hook reconciliation — its fenced evidence
     still resolves it. Returns the cancelled-item count, or None when the
     binding does not exist. An already-released binding is a no-op (0).
-    The caller owns the transaction (commit)."""
+    The caller owns the transaction (commit).
+
+    H-6 — RELEASE IS AN EVENT, NOT AN ABSENCE, and it changes what happens to
+    the queued items in exactly one case. When the sprint is still running
+    (live, with non-terminal units), a release means the planner has gone
+    deaf mid-sprint: a generation change is the common cause and nothing said
+    so. Two consequences here:
+
+    - a critical `binding_released_live_sprint` opens, scoped to the SPRINT
+      and to nothing else. binding_id and session_id are deliberately NULL,
+      because every caller of this function follows it with a binding- or
+      session-scoped resolve sweep — being inside that set is exactly how the
+      old alerts vanished at the moment they became true. It resolves only
+      when a new binding is armed for this sprint, or the sprint closes.
+
+    - the queued items are HELD rather than cancelled. Cancelling them was
+      right while nothing could ever reach them again; H-6's re-parent at arm
+      time is what makes them reachable, and `cancelled` is a terminal state
+      with no way back. They stay `queued` on the released binding, where no
+      drain path can see them — every one requires `released_at IS NULL` —
+      until arming re-parents them. Returns 0 cancelled in that case, which
+      is the truth: nothing was cancelled.
+
+    A sprint that is closed, frozen, or has no unit left running takes the
+    original path unchanged — cancel, because nothing will ever arm again."""
     row = con.execute(
-        "SELECT released_at FROM sprint_planner_bindings WHERE binding_id=?",
-        (binding_id,)).fetchone()
+        "SELECT released_at, sprint_doc_id FROM sprint_planner_bindings "
+        "WHERE binding_id=?", (binding_id,)).fetchone()
     if row is None:
         return None
     if row[0] is not None:
         return 0
+    sprint_doc_id = row[1]
+    hold = sprint_still_running(con, sprint_doc_id)
     con.execute(
         "UPDATE sprint_planner_bindings "
         "SET released_at=datetime('now'), release_reason=? "
@@ -918,17 +1257,80 @@ def release_binding(con, binding_id: int, reason: str) -> "int | None":
             "SELECT COUNT(*) FROM planner_wake_items "
             "WHERE batch_id=? AND state='batched'",
             (batch_id_,)).fetchone()[0]
-        _cancel_batch(con, batch_id_)
-        cancelled += batched
+        # The BATCH always closes either way: it is generation-bound
+        # (shell_id, generation) and can never submit under a new one.
+        _close_batch_unsent(con, batch_id_, hold_items=hold)
+        if not hold:
+            cancelled += batched
     items = con.execute(
         "SELECT item_id FROM planner_wake_items "
         "WHERE binding_id=? AND state='queued'", (binding_id,)).fetchall()
+    if not hold:
+        for (item_id,) in items:
+            interface_state.transition(
+                con, "wake_item", item_id, "cancelled",
+                extra_sets={"error": f"binding released: {reason}"})
+            cancelled += 1
+    if hold:
+        held = con.execute(
+            "SELECT COUNT(*) FROM planner_wake_items "
+            "WHERE binding_id=? AND state='queued'",
+            (binding_id,)).fetchone()[0]
+        _alert(con, severity="critical",
+               reason="binding_released_live_sprint",
+               sprint_doc_id=sprint_doc_id,
+               detail=(f"binding {binding_id} released ({reason}) while the "
+                       f"sprint still has non-terminal units; {held} queued "
+                       f"wake item(s) held for the next binding armed here"))
+    return cancelled
+
+
+def reparent_wake_items(con, binding_id: int, sprint_doc_id) -> int:
+    """Adopt the wake items held by this sprint's RELEASED bindings (H-6).
+
+    Items scope only through `binding_id`, so a release strands them behind a
+    binding no drain will ever look at again; the sprint is recovered by
+    joining the released rows' `sprint_doc_id`, across EVERY released
+    generation — a sprint that lost two planner generations in a row has
+    items behind both.
+
+    Only unbatched queued items move: a batch is generation-bound and was
+    closed at release, and its items were returned to `queued` there."""
+    reparented = con.execute(
+        "UPDATE planner_wake_items SET binding_id=? "
+        "WHERE state='queued' AND batch_id IS NULL AND binding_id IN "
+        "(SELECT binding_id FROM sprint_planner_bindings "
+        " WHERE sprint_doc_id=? AND released_at IS NOT NULL)",
+        (binding_id, sprint_doc_id)).rowcount
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE sprint_doc_id=? AND reason='binding_released_live_sprint' "
+        "AND resolved_at IS NULL", (sprint_doc_id,))
+    return reparented
+
+
+def close_sprint_wake_work(con, sprint_doc_id, reason: str) -> int:
+    """Sprint close: cancel the items H-6 held behind released bindings and
+    close the deaf-sprint alert.
+
+    Runs even when the sprint has NO unreleased binding left, which is the
+    case that needs it: `release_bindings_for_sprint` is guarded on one
+    existing, so a sprint that lost its planner and was then closed would
+    otherwise leave held items queued forever behind a released binding."""
+    items = con.execute(
+        "SELECT i.item_id FROM planner_wake_items i "
+        "JOIN sprint_planner_bindings b ON b.binding_id = i.binding_id "
+        "WHERE b.sprint_doc_id=? AND b.released_at IS NOT NULL "
+        "AND i.state='queued'", (sprint_doc_id,)).fetchall()
     for (item_id,) in items:
         interface_state.transition(
             con, "wake_item", item_id, "cancelled",
-            extra_sets={"error": f"binding released: {reason}"})
-        cancelled += 1
-    return cancelled
+            extra_sets={"error": f"sprint closed: {reason}"})
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE sprint_doc_id=? AND reason='binding_released_live_sprint' "
+        "AND resolved_at IS NULL", (sprint_doc_id,))
+    return len(items)
 
 
 def release_bindings_for_sprint(con, sprint_doc_id: int,
@@ -953,19 +1355,35 @@ def release_bindings_for_sprint(con, sprint_doc_id: int,
     return ids
 
 
-def _cancel_batch(con, batch_id: int) -> None:
+def _close_batch_unsent(con, batch_id: int, hold_items: bool = False) -> None:
     """Close a still-queued batch without sending a byte (the binding was
     released or the sprint stopped being live between form and submit): the
-    batch completes empty and its batched items are cancelled — a wake must
-    never fire for a sprint that is no longer armed."""
+    batch completes empty — a wake must never fire for a sprint that is no
+    longer armed.
+
+    Its batched items are cancelled, EXCEPT when `hold_items` (H-6: the
+    sprint is still running, so a future binding will adopt them). Then they
+    ride the legal batched -> queued edge back and drop their batch_id: the
+    batch is generation-bound and dead, the items are not."""
     interface_state.transition(
         con, "wake_batch", batch_id, "complete",
         extra_sets={"completed_at": _now(con)})
+    resolve_batch_alerts(con, batch_id)   # H-26: a cancelled batch is not stalled
     items = con.execute(
         "SELECT item_id FROM planner_wake_items "
         "WHERE batch_id=? AND state='batched'", (batch_id,)).fetchall()
     for (item_id,) in items:
-        interface_state.transition(con, "wake_item", item_id, "cancelled")
+        if hold_items:
+            interface_state.transition(con, "wake_item", item_id, "queued",
+                                       extra_sets={"batch_id": None})
+        else:
+            interface_state.transition(con, "wake_item", item_id, "cancelled")
+
+
+def _cancel_batch(con, batch_id: int) -> None:
+    """Cancel a batch outright — every item terminal. The submit gate's
+    sprint-no-longer-live path, where nothing will adopt them."""
+    _close_batch_unsent(con, batch_id, hold_items=False)
 
 
 def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
@@ -1089,6 +1507,11 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         def gate_fail(reason, **extra):
             if began:
                 con.rollback()
+            # H-26: record WHICH gate refused, verbatim, on every attempt.
+            # Without this a persistent gate failure is indistinguishable
+            # from a transient deferral — the batch shows depth and never
+            # cause, which is issue #638's whole shape.
+            note_gate_failure(con, batch_id, reason)
             return {"submitted": False, "reason": reason, **extra}
 
         if sess[1] != "occupied" or sess[2] != "idle":
@@ -1102,10 +1525,43 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             return gate_fail("a human frame is pending")
         cap = interface_hooks.capability(sess[6], sess[7])
         if not cap["mandatory_ok"]:
-            return gate_fail(
+            reason = (
                 f"harness {sess[6]!r} lacks mandatory lifecycle hooks "
                 f"(missing: {', '.join(cap['missing_mandatory']) or 'version'})"
                 " — wake cannot submit")
+            # H-26: this one is NOT a deferral. Waiting cannot clear it — the
+            # arm-path check passed a harness that has since degraded or
+            # changed — so it alerts on the first refusal instead of aging
+            # into the stall threshold like a gate that might yet pass.
+            #
+            # Detail carries harness, cli_version and missing_mandatory
+            # VERBATIM because capability() fails mandatory_ok identically on
+            # a missing-or-unparseable cli_version and on a genuinely
+            # unsupported harness. A metadata-capture miss and a real
+            # capability gap need completely different fixes, and only these
+            # three fields tell them apart.
+            #
+            # Deliberate departure from the requirement's letter, stated
+            # here and in the unit report: the reason key is distinct from
+            # the arm path's `wake_not_armable` rather than reusing it. The
+            # arm-path alert is session-scoped, so reusing the key would let
+            # an already-open arm-time row swallow this one by dedupe — a
+            # degradation-since-arming would then be silent, which is the
+            # exact failure class this requirement exists to close.
+            if began:
+                con.rollback()
+                began = False
+            _alert(con, severity="critical",
+                   reason="wake_hooks_missing_at_submit",
+                   binding_id=binding_id, batch_id=batch_id,
+                   sprint_doc_id=binding[0],
+                   detail=(f"harness={sess[6]!r} "
+                           f"cli_version={sess[7]!r} "
+                           f"missing_mandatory="
+                           f"{list(cap['missing_mandatory'])!r}"))
+            con.commit()
+            note_gate_failure(con, batch_id, reason)
+            return {"submitted": False, "reason": reason}
         if unmanaged:
             # Decision #15: an unmanaged writable client bypasses the ordered
             # input boundary — detection sets composer unknown (which disarms
@@ -1149,7 +1605,13 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         fence = istate[3] + 1
         interface_state.transition(
             con, "wake_batch", batch_id, "submitting",
-            extra_sets={"input_seq_fence": fence})
+            extra_sets={"input_seq_fence": fence,
+                        # H-27: when the wait for the submit hook STARTED.
+                        # `submitted_at` cannot serve — it is written by that
+                        # very hook, so on a silent seat it never arrives.
+                        "submitting_at": _now(con)})
+        # H-26: the gate passed — whatever was stalling this batch is over.
+        resolve_batch_alerts(con, batch_id)
         # Items ride legal edges only: a first attempt's items are 'batched',
         # a bounded-retry re-attempt's were returned to 'queued' with the
         # batch — walk those through 'batched' before 'submitting'.

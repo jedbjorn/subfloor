@@ -278,6 +278,357 @@ class WakeIngressTest(WakeFixture):
         self.assertEqual(len(self.item_states()), 1)
 
 
+# ── H-5: the one ingress refusal that is a LOSS says so ──────────────────────
+
+class DeafSprintAlertTest(WakeFixture):
+    """`maybe_create_wake_item` returned None on every gate and the sender
+    learned nothing. Most of those gates are deferrals — a later event still
+    delivers. "No unreleased binding on a live sprint" is not: nothing re-runs
+    ingress for an already-inserted message, so that one is a loss."""
+
+    def unbind(self):
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now') "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+
+    def deaf(self):
+        return self.con.execute(
+            "SELECT sprint_doc_id, severity, detail, session_id, binding_id "
+            "FROM planner_alerts "
+            "WHERE reason='sprint_no_armed_planner' AND resolved_at IS NULL "
+            "ORDER BY alert_id").fetchall()
+
+    def ingest(self, kind="task", **kw):
+        mid = self.add_message(kind, **kw)
+        item = interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return item
+
+    def test_a_task_into_a_sprint_with_no_binding_alerts(self):
+        self.unbind()
+        self.assertIsNone(self.ingest("task"))
+        rows = self.deaf()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("keyed on the sprint doc"):
+            self.assertEqual(rows[0][0], 1)
+        with self.subTest("carries no session or binding scope"):
+            self.assertEqual((rows[0][3], rows[0][4]), (None, None))
+        with self.subTest("names the recipient in the measurement"):
+            self.assertIn("shell 1", rows[0][2])
+
+    def test_a_result_alerts_too(self):
+        self.unbind()
+        self.assertIsNone(self.ingest("result"))
+        self.assertEqual(len(self.deaf()), 1)
+
+    def test_many_senders_open_one_row(self):
+        """Deduped on the sprint doc: a deaf sprint is one condition however
+        many shells discover it."""
+        self.unbind()
+        for kind in ("task", "result", "task"):
+            self.ingest(kind)
+        self.assertEqual(len(self.deaf()), 1)
+
+    def test_a_pr_event_is_not_news_about_a_deaf_sprint(self):
+        """Requirement names task/result and the omission is kept: a pr_event
+        is daemon-emitted and re-derivable from the poller's own state."""
+        self.unbind()
+        self.assertIsNone(self.ingest("pr_event"))
+        self.assertEqual(self.deaf(), [])
+
+    def test_a_deferral_stays_silent(self):
+        """The binding is armed and the seat is merely unusable — a later
+        event still delivers, so this is not a loss. Its invisibility is
+        bounded by H-26, not by an alert per attempt."""
+        self.con.execute(
+            "UPDATE interface_sessions SET cli_version='kimi-code 0.1.0' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        self.assertIsNone(self.ingest("task"))
+        self.assertEqual(self.deaf(), [],
+                         "a deferral must not be reported as a loss")
+
+    def test_an_unscoped_or_untyped_message_is_not_a_deaf_sprint(self):
+        self.unbind()
+        with self.subTest("shell kind"):
+            self.assertIsNone(self.ingest("shell"))
+        with self.subTest("no sprint scope"):
+            self.assertIsNone(self.ingest("task", sprint_doc_id=None))
+        self.assertEqual(self.deaf(), [])
+
+    def test_a_frozen_sprint_is_not_a_deaf_sprint(self):
+        """Freezing IS closing (H-1). A closed sprint has no planner by
+        design, and reporting that as a fault would be the monitor lying."""
+        self.unbind()
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        self.assertIsNone(self.ingest("task"))
+        self.assertEqual(self.deaf(), [])
+
+    def test_an_armed_sprint_never_alerts(self):
+        """The instrument's known-positive control runs in the same class
+        (test_a_task_into_a_sprint_with_no_binding_alerts) — this is the
+        negative half on the same corpus."""
+        item = self.ingest("task")
+        self.assertIsNotNone(item)
+        self.assertEqual(self.deaf(), [])
+
+    def test_the_alert_rolls_back_with_its_message(self):
+        """Written inside the message's own transaction: a message that never
+        commits must not leave an alert claiming it arrived."""
+        self.unbind()
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.rollback()
+        self.assertEqual(self.deaf(), [])
+
+
+# ── H-8: one eligibility ladder, two producers ───────────────────────────────
+
+class OneEligibilityLadderTest(WakeFixture):
+    """The poller checked `released_at IS NULL` alone and could queue an item
+    that no gate would ever pass — straight into a stall, invisibly. Both
+    producers now ask the same question, and these cases are exactly the ones
+    the two implementations disagreed on."""
+
+    def both(self):
+        """What each side decides for the CURRENT seat: the shipped ingress
+        path, and the shared ladder the poller now calls.
+
+        That the POLLER calls it is proved in tests/test_pr_poller.py against
+        the real emit path — asserting it here would only compare the ladder
+        with itself."""
+        mid = self.add_message("pr_event")
+        ingress = interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        ladder = interface_wake.eligible_binding(self.con, 1, 1)
+        return ingress is not None, ladder is not None
+
+    def test_a_healthy_seat_queues_from_both(self):
+        """The known-positive control: without it, every agreement below could
+        be two producers both refusing everything."""
+        self.assertEqual(self.both(), (True, True))
+
+    def test_a_capability_gap_refuses_both(self):
+        self.con.execute(
+            "UPDATE interface_sessions SET cli_version='kimi-code 0.1.0' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False),
+                         "the poller queued this one — an item that can never "
+                         "submit, into a stall nothing reported")
+
+    def test_a_replaced_generation_refuses_both(self):
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET generation=2 "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+    def test_an_ended_session_refuses_both(self):
+        interface_broker.close_session(self.con, self.sid, "operator_end")
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+    def test_a_frozen_sprint_refuses_both(self):
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+    def test_a_released_binding_refuses_both(self):
+        interface_broker.release_binding(self.con, self.binding, "test")
+        self.con.commit()
+        self.assertEqual(self.both(), (False, False))
+
+
+# ── H-6: binding release is an event, not an absence ─────────────────────────
+
+class BindingReleaseIsAnEventTest(WakeFixture):
+    """A generation change releases the binding AND resolves its open alerts;
+    from then on the planner is deaf and nothing said so. The resolve sweep is
+    binding-scoped, so an alert that lived inside it would vanish at the exact
+    moment it became true."""
+
+    def queued_item(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return mid
+
+    def deaf(self, resolved=False):
+        return self.con.execute(
+            "SELECT sprint_doc_id, severity, detail, binding_id, session_id "
+            "FROM planner_alerts WHERE reason='binding_released_live_sprint' "
+            + ("" if resolved else "AND resolved_at IS NULL ")
+            + "ORDER BY alert_id").fetchall()
+
+    def release(self, reason="shell_recovery"):
+        out = interface_broker.release_binding(self.con, self.binding, reason)
+        self.con.commit()
+        return out
+
+    def arm_next(self, generation=2):
+        """The next generation's binding for the same sprint. Ends the old
+        generation first — `idx_interface_generations_live` allows exactly one
+        non-ended generation per shell, which is the constraint that makes a
+        generation CHANGE the thing H-6 is about."""
+        # Through the ENGINE's own closure path, not a hand-written UPDATE:
+        # the lifecycle trigger refuses idle -> ended directly, and a test
+        # that walked around it would be staging a state the product cannot
+        # reach.
+        for (old_sid,) in self.con.execute(
+                "SELECT session_id FROM interface_sessions "
+                "WHERE shell_id=1 AND occupancy <> 'ended'").fetchall():
+            interface_broker.close_session(self.con, old_sid, "operator_end")
+        self.con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now') "
+            "WHERE shell_id=1 AND ended_at IS NULL")
+        self.con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (1,?)", (generation,))
+        sid = self.con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle, harness, cli_version) VALUES (1,?,'occupied','idle',"
+            "?,?)", (generation, self.HARNESS, self.CLI_VERSION)).lastrowid
+        binding = self.con.execute(
+            "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
+            " planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (1,1,?,1,?)", (sid, generation)).lastrowid
+        adopted = interface_broker.reparent_wake_items(self.con, binding, 1)
+        self.con.commit()
+        return binding, adopted
+
+    def test_release_mid_sprint_is_reported(self):
+        self.queued_item()
+        self.release()
+        rows = self.deaf()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("critical"):
+            self.assertEqual(rows[0][1], "critical")
+        with self.subTest("keyed on the sprint"):
+            self.assertEqual(rows[0][0], 1)
+        with self.subTest("names the release reason"):
+            self.assertIn("shell_recovery", rows[0][2])
+
+    def test_the_alert_is_outside_the_binding_and_session_resolve_sets(self):
+        """The whole requirement in one assertion: every caller of
+        release_binding follows it with one of these sweeps."""
+        self.queued_item()
+        self.release()
+        self.con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE binding_id=? AND resolved_at IS NULL", (self.binding,))
+        self.con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE session_id=? AND resolved_at IS NULL", (self.sid,))
+        self.con.commit()
+        self.assertEqual(len(self.deaf()), 1,
+                         "a deaf-sprint alert that resolves with its own "
+                         "binding vanishes exactly when it becomes true")
+
+    def test_held_items_are_not_cancelled_while_the_sprint_runs(self):
+        self.queued_item()
+        self.assertEqual(self.release(), 0,
+                         "nothing was cancelled, so nothing is reported as "
+                         "cancelled")
+        self.assertEqual([r[2] for r in self.item_states()], ["queued"])
+
+    def test_a_held_item_is_reachable_by_no_drain_until_it_is_adopted(self):
+        """Held, not live: every drain path requires released_at IS NULL, so
+        the item cannot fire for a sprint that is no longer armed."""
+        self.queued_item()
+        self.release()
+        coord = interface_wake.WakeCoordinator(
+            str(self.db), writer_factory=lambda s: (lambda n: None),
+            unmanaged_probe=lambda s: False, quiet_s=QUIET)
+        coord._drain_sync(self.binding)
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT batch_id FROM planner_wake_batches").fetchone())
+
+    def test_arming_the_next_generation_adopts_them(self):
+        self.queued_item()
+        self.release()
+        binding2, adopted = self.arm_next()
+        self.assertEqual(adopted, 1)
+        with self.subTest("re-parented"):
+            self.assertEqual(
+                self.con.execute(
+                    "SELECT binding_id, state FROM planner_wake_items"
+                ).fetchall(), [(binding2, "queued")])
+        with self.subTest("and the alert closes on the arm"):
+            self.assertEqual(self.deaf(), [])
+
+    def test_items_behind_TWO_lost_generations_are_all_adopted(self):
+        """Items scope only through binding_id; the sprint is recovered by
+        joining the released rows' sprint_doc_id across EVERY released
+        generation, not just the most recent."""
+        self.queued_item()
+        self.release()
+        gen2, _ = self.arm_next()
+        mid = self.add_message("result")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        interface_broker.release_binding(self.con, gen2, "shell_recovery")
+        self.con.commit()
+        _binding3, adopted = self.arm_next(generation=3)
+        self.assertEqual(adopted, 2,
+                         "one item behind each lost generation")
+
+    def test_a_batched_item_rides_home_and_drops_its_batch(self):
+        """The batch is generation-bound and dies with the generation; its
+        items are not."""
+        self.queued_item()
+        batch = self.form()
+        self.release()
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state, batch_id FROM planner_wake_items").fetchall(),
+            [("queued", None)])
+        self.assertEqual(self.batch_state(batch), "complete")
+
+    def test_a_finished_sprint_cancels_as_before(self):
+        """Every unit terminal: the release is the ordinary end of a sprint,
+        not a planner going deaf, so nothing is held and nothing alerts.
+
+        Walked pending -> working -> merged because the board is a MACHINE
+        (migration 0108's trigger) — a direct UPDATE to 'merged' aborts, and a
+        test that sidestepped the trigger would be asserting against a state
+        the product cannot reach."""
+        self.queued_item()
+        self.con.execute("UPDATE sprint_units SET state='working'")
+        self.con.execute("UPDATE sprint_units SET state='merged'")
+        self.con.commit()
+        self.assertEqual(self.release(), 1)
+        with self.subTest("cancelled"):
+            self.assertEqual([r[2] for r in self.item_states()], ["cancelled"])
+        with self.subTest("silent"):
+            self.assertEqual(self.deaf(), [])
+
+    def test_a_frozen_sprint_cancels_as_before(self):
+        self.queued_item()
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        self.assertEqual(self.release(), 1)
+        self.assertEqual(self.deaf(), [])
+
+    def test_closing_the_sprint_cancels_what_was_held(self):
+        """The close sweep exists for the sprint whose planner was lost and
+        never re-armed — it has no unreleased binding, so the close path's
+        release loop never runs at all."""
+        self.queued_item()
+        self.release()
+        cancelled = interface_broker.close_sprint_wake_work(
+            self.con, 1, "sprint closed")
+        self.con.commit()
+        with self.subTest("held items are terminal"):
+            self.assertEqual(cancelled, 1)
+            self.assertEqual([r[2] for r in self.item_states()], ["cancelled"])
+        with self.subTest("and the alert closes"):
+            self.assertEqual(self.deaf(), [])
+
+
 # ── Flag #49: quiet baseline keys off REAL provider readiness ─────────────────
 
 class WakeReadinessTest(WakeFixture):
@@ -832,6 +1183,500 @@ class BatchReconcileTest(WakeFixture):
         self.assertEqual(self.item_states()[0][2], "done")
 
 
+# ── H-4: a row the planner already read wakes nobody ─────────────────────────
+
+class AlreadyReadNeverWakesTest(WakeFixture):
+    """The planner drained its inbox by hand (or a faster channel woke it
+    first) BEFORE the batch formed. Delivering those rows costs a no-op
+    planner turn and trains the planner to dismiss wake prompts."""
+
+    def _queued(self, read=False):
+        mid = self.add_message("task", read=read)
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return mid
+
+    def test_already_read_row_never_joins_a_batch(self):
+        mid = self._queued(read=True)
+        self.form()
+        states = {r[1]: (r[2], r[4]) for r in self.item_states()}
+        self.assertEqual(states[mid][0], "queued",
+                         "form_batch must leave it alone, not batch it")
+        self.assertIsNone(states[mid][1], "it must carry no batch_id")
+
+    def test_sweep_completes_an_already_read_row_without_a_batch(self):
+        mid = self._queued(read=True)
+        swept = interface_broker.sweep_read_queued(self.con, self.binding)
+        self.con.commit()
+        self.assertEqual(swept, 1)
+        states = {r[1]: r[2] for r in self.item_states()}
+        self.assertEqual(states[mid], "done")
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT batch_id FROM planner_wake_batches").fetchone(),
+            "no batch may be formed for work that needs no wake")
+
+    def test_sweep_leaves_an_unread_row_queued(self):
+        mid = self._queued(read=False)
+        self.assertEqual(
+            interface_broker.sweep_read_queued(self.con, self.binding), 0)
+        self.con.commit()
+        self.assertEqual({r[1]: r[2] for r in self.item_states()}[mid],
+                         "queued")
+
+    def test_unread_sibling_still_batches_when_one_row_was_read(self):
+        read_mid = self._queued(read=True)
+        unread_mid = self._queued(read=False)
+        interface_broker.sweep_read_queued(self.con, self.binding)
+        batch_id = self.form()
+        states = {r[1]: (r[2], r[4]) for r in self.item_states()}
+        self.assertEqual(states[read_mid][0], "done")
+        self.assertEqual(states[unread_mid], ("batched", batch_id),
+                         "a drained sibling must not suppress live work")
+
+
+# ── H-26: a stalled batch becomes visible, with its reason ───────────────────
+
+class StalledBatchVisibilityTest(WakeFixture):
+    """Issue #638's shape: an armed binding, a batch queued 33+ minutes
+    through 11 accumulated items, `sc sprint status` showing depth but never
+    cause, and `sc sprint alerts` showing nothing at all."""
+
+    def _queued_batch(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return self.form()
+
+    def _make_gate_fail(self, reason="busy"):
+        """Refuse the gate the way a real deferral does."""
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle=? WHERE session_id=?",
+            ("busy" if reason == "busy" else "idle", self.sid))
+        if reason != "busy":
+            self.con.execute(
+                "UPDATE interface_input_state SET composer='dirty' "
+                "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+
+    def _age_batch(self, batch_id, seconds):
+        _age(self.con, "planner_wake_batches", "created_at", batch_id,
+             seconds, "batch_id")
+        self.con.commit()
+
+    def open_alerts(self):
+        return self.con.execute(
+            "SELECT reason, detail, batch_id, severity FROM planner_alerts "
+            "WHERE resolved_at IS NULL ORDER BY alert_id").fetchall()
+
+    def test_gate_failure_records_which_gate_refused(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        out = self.submit(batch, lambda n: None)
+        self.assertFalse(out["submitted"])
+        recorded = self.con.execute(
+            "SELECT last_gate_reason FROM planner_wake_batches "
+            "WHERE batch_id=?", (batch,)).fetchone()[0]
+        self.assertEqual(recorded, out["reason"],
+                         "the batch must carry the gate's own words")
+        self.assertIn("occupied+idle", recorded)
+
+    def test_batch_queued_past_threshold_alerts_with_the_gate_reason(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        gate = self.submit(batch, lambda n: None)["reason"]
+        self._age_batch(batch, 400)
+        self.assertTrue(
+            interface_broker.stalled_batch_alert(self.con, batch))
+        self.con.commit()
+        alerts = self.open_alerts()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0][0], "wake_batch_stalled")
+        self.assertEqual(alerts[0][1], gate,
+                         "detail states what was measured, verbatim")
+        self.assertEqual(alerts[0][2], batch, "the alert keys on the batch")
+
+    def test_batch_inside_the_threshold_stays_silent(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self.assertFalse(
+            interface_broker.stalled_batch_alert(self.con, batch),
+            "an ordinary deferral is not a stall — the monitor must not lie")
+        self.con.commit()
+        self.assertEqual(self.open_alerts(), [])
+
+    def test_released_binding_is_not_reported_as_a_stall(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now') "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+        self.assertFalse(
+            interface_broker.stalled_batch_alert(self.con, batch),
+            "H-26 scopes the stall to an ARMED binding; a released one is H-6")
+
+    def test_repeated_evaluation_keeps_one_open_row_and_refreshes_detail(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        # The seat flaps: a different gate now refuses.
+        self._make_gate_fail("dirty")
+        second = self.submit(batch, lambda n: None)["reason"]
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        alerts = self.open_alerts()
+        self.assertEqual(len(alerts), 1, "deduped while open")
+        self.assertEqual(alerts[0][1], second,
+                         "detail tracks the LATEST failing gate, not the first")
+
+    def test_submitting_resolves_the_stall_alert(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        self.assertEqual(len(self.open_alerts()), 1)
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle='idle' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        out = self.submit(batch, lambda n: None)
+        self.assertTrue(out["submitted"], out)
+        self.assertEqual(
+            [a for a in self.open_alerts() if a[0] == "wake_batch_stalled"],
+            [], "a batch that submitted is no longer stalled")
+
+    def test_cancelled_batch_resolves_the_stall_alert(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        # Freezing the sprint cancels the batch at the submit gate.
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle='idle' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        out = self.submit(batch, lambda n: None)
+        self.assertTrue(out.get("cancelled"), out)
+        self.assertEqual(
+            [a for a in self.open_alerts() if a[0] == "wake_batch_stalled"],
+            [], "a cancelled batch is not stalled either")
+
+
+class HooksMissingAtSubmitTest(WakeFixture):
+    """A capability gap at SUBMIT is not a deferral: waiting cannot clear it,
+    because the arm-path check already passed a harness that has since
+    degraded or changed."""
+
+    def _degrade(self, harness="codex", cli_version=None):
+        self.con.execute(
+            "UPDATE interface_sessions SET harness=?, cli_version=? "
+            "WHERE session_id=?", (harness, cli_version, self.sid))
+        self.con.commit()
+
+    def _queued_batch(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return self.form()
+
+    def test_capability_gap_alerts_on_the_first_refusal(self):
+        batch = self._queued_batch()
+        self._degrade(cli_version=None)
+        out = self.submit(batch, lambda n: None)
+        self.assertFalse(out["submitted"])
+        rows = self.con.execute(
+            "SELECT reason, detail, batch_id, severity FROM planner_alerts "
+            "WHERE resolved_at IS NULL AND reason='wake_hooks_missing_at_submit'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1,
+                         "no threshold applies — waiting cannot clear this")
+        self.assertEqual(rows[0][2], batch)
+        self.assertEqual(rows[0][3], "critical")
+
+    def test_alert_detail_tells_a_metadata_miss_from_a_real_gap(self):
+        """capability() fails mandatory_ok identically on an unparseable
+        cli_version and on an unsupported harness. These need completely
+        different fixes, so all three fields ride the alert verbatim."""
+        batch = self._queued_batch()
+        self._degrade(harness="codex", cli_version=None)
+        self.submit(batch, lambda n: None)
+        detail = self.con.execute(
+            "SELECT detail FROM planner_alerts "
+            "WHERE reason='wake_hooks_missing_at_submit'").fetchone()[0]
+        self.assertIn("harness='codex'", detail)
+        self.assertIn("cli_version=None", detail)
+        self.assertIn("missing_mandatory=", detail)
+
+    def test_capability_gap_does_not_reuse_the_arm_path_dedupe_row(self):
+        """Deliberate departure from the requirement's letter. The arm-path
+        alert is SESSION-scoped; reusing `wake_not_armable` would let an
+        already-open arm-time row swallow this one by dedupe, and a
+        degradation-since-arming would be silent — the exact failure class
+        this requirement closes."""
+        batch = self._queued_batch()
+        self._degrade(cli_version=None)
+        interface_broker._hook_capability_alerts(self.con, self.sid)
+        self.con.commit()
+        self.submit(batch, lambda n: None)
+        reasons = [r[0] for r in self.con.execute(
+            "SELECT reason FROM planner_alerts WHERE resolved_at IS NULL"
+        ).fetchall()]
+        self.assertIn("wake_not_armable", reasons)
+        self.assertIn("wake_hooks_missing_at_submit", reasons)
+
+
+# ── H-27: a declared hook is trusted only while it is OBSERVED ───────────────
+
+class _SilenceProbe(WakeFixture):
+    """Shared readings for the `hooks_declared_but_silent` measurements."""
+
+    def silent(self):
+        return self.con.execute(
+            "SELECT reason, detail, batch_id, session_id, severity "
+            "FROM planner_alerts "
+            "WHERE reason='hooks_declared_but_silent' AND resolved_at IS NULL "
+            "ORDER BY alert_id").fetchall()
+
+    def check(self, **kw):
+        out = interface_broker.hooks_silence_alert(self.con, self.binding, **kw)
+        self.con.commit()
+        return out
+
+
+class ReadinessSilenceTest(_SilenceProbe):
+    """A harness that declares session_start arrives at STARTUP and has not
+    stamped provider_ready_at is contradicting its own declaration. kimi
+    (`session_created`) stands in for that whole class."""
+
+    def age_session(self, seconds):
+        _age(self.con, "interface_sessions", "created_at", self.sid, seconds,
+             "session_id")
+        self.con.commit()
+
+    def test_declared_startup_readiness_unobserved_past_threshold_alerts(self):
+        self.age_session(400)
+        self.assertIsNone(self.check(),
+                          "an opened alert leaves no pending deadline")
+        rows = self.silent()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("names the unobserved event"):
+            self.assertIn("'session_start'", rows[0][1])
+        with self.subTest("names the harness verbatim"):
+            self.assertIn(self.HARNESS, rows[0][1])
+        with self.subTest("names the cli_version verbatim"):
+            self.assertIn(self.CLI_VERSION, rows[0][1])
+        with self.subTest("scoped to the session, not a batch"):
+            self.assertEqual(rows[0][2], None)
+            self.assertEqual(rows[0][3], self.sid)
+
+    def test_inside_the_threshold_stays_silent_and_reports_the_deadline(self):
+        self.age_session(30)
+        pending = self.check()
+        self.assertEqual(self.silent(), [],
+                         "a booting seat is not a silent one")
+        self.assertIsNotNone(pending)
+        self.assertAlmostEqual(
+            pending, interface_broker.HOOKS_READY_SILENT_S - 30, delta=2.0,
+            msg="the caller arms its one re-check from this number")
+
+    def test_the_alert_dedupes_while_open(self):
+        self.age_session(400)
+        self.check()
+        self.check()
+        self.assertEqual(len(self.silent()), 1)
+
+    def test_observed_readiness_resolves_the_alert(self):
+        self.age_session(400)
+        self.check()
+        self.assertEqual(len(self.silent()), 1)
+        interface_broker.record_hook(self.con, 1, 1, 7, "session_start",
+                                     source="provider")
+        self.con.commit()
+        self.assertEqual(self.silent(), [],
+                         "the promised hook arrived — the declaration is no "
+                         "longer contradicted")
+
+    def test_a_released_binding_is_not_measured(self):
+        self.age_session(400)
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now') "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+        self.assertIsNone(self.check())
+        self.assertEqual(self.silent(), [],
+                         "H-27 scopes to sessions under an ARMED binding")
+
+    def test_threshold_resolves_at_call_time(self):
+        """A default argument would bind the constant at import and leave the
+        module attribute a decoy that reads correctly and changes nothing."""
+        self.age_session(30)
+        with mock.patch.object(interface_broker, "HOOKS_READY_SILENT_S", 1.0):
+            self.check()
+        self.assertEqual(len(self.silent()), 1)
+
+
+class FirstTurnGatedSilenceTest(_SilenceProbe):
+    """THE decisive case for decisions #98/#99. On codex, readiness is gated
+    on a human submitting the first turn, so the delay is unbounded and a
+    healthy idle seat waiting to be woken is indistinguishable by elapsed
+    time from a broken one. A time-based readiness alert would fire on every
+    correct codex seat — the monitor lying that decision #76 forbids."""
+
+    HARNESS = "codex"
+    CLI_VERSION = "codex-cli 0.145.0"
+    LIFECYCLE = "starting"
+    COMPOSER = "unknown"
+
+    def test_a_healthy_idle_codex_seat_never_trips_the_readiness_clause(self):
+        _age(self.con, "interface_sessions", "created_at", self.sid, 86400,
+             "session_id")
+        self.con.commit()
+        self.assertIsNone(self.check(),
+                          "not even a pending deadline — the clause is not "
+                          "evaluated for a first_turn_gated harness at all")
+        self.assertEqual(self.silent(), [])
+
+    def test_the_same_seat_still_reports_submit_silence(self):
+        """Dropping clause 1 for codex must not make codex unmeasurable: the
+        submit-silence measurement has no readiness operand and applies to
+        every harness."""
+        interface_broker.record_hook(self.con, 1, 1, 1, "session_start",
+                                     source="entrypoint",
+                                     hooks_installed=True)
+        _age(self.con, "interface_sessions", "process_ready_at", self.sid, 60,
+             "session_id")
+        self.con.commit()
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch = self.form()
+        self.assertTrue(self.submit(batch, lambda n: None)["submitted"])
+        _age(self.con, "planner_wake_batches", "submitting_at", batch, 120,
+             "batch_id")
+        self.con.commit()
+        self.check()
+        rows = self.silent()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("'prompt_submit'", rows[0][1])
+
+
+class SubmitSilenceTest(_SilenceProbe):
+    """U7's F13 measurement, on the floor U7 laid: a live, trusted,
+    hooks-installed seat across which not one provider hook arrives. Post-U7
+    that seat no longer parks in `starting` where the arming gate could see
+    it — the wake goes out and the batch stops in `submitting`, where
+    `_drain_sync` returns early and nothing in flight ever looks again."""
+
+    def setUp(self):
+        super().setUp()
+        # A kimi seat that reached `idle` has by construction already had its
+        # provider session_start, so stamp it: without this the readiness
+        # clause is legitimately pending and every reading in this class
+        # carries two measurements at once.
+        self.con.execute(
+            "UPDATE interface_sessions "
+            "SET provider_ready_at=datetime('now','-60 seconds') "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+
+    def submitted_batch(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch = self.form()
+        self.assertTrue(self.submit(batch, lambda n: None)["submitted"])
+        return batch
+
+    def age_submit(self, batch, seconds):
+        _age(self.con, "planner_wake_batches", "submitting_at", batch,
+             seconds, "batch_id")
+        self.con.commit()
+
+    def test_the_submitting_transition_stamps_when_the_wait_began(self):
+        batch = self.submitted_batch()
+        stamped, answered = self.con.execute(
+            "SELECT submitting_at, submitted_at FROM planner_wake_batches "
+            "WHERE batch_id=?", (batch,)).fetchone()
+        with self.subTest("the wait has a start"):
+            self.assertIsNotNone(stamped)
+        with self.subTest("and it is not the hook's own stamp"):
+            self.assertIsNone(
+                answered,
+                "submitted_at is written BY the prompt_submit hook, so on a "
+                "silent seat it is NULL forever — it cannot time this wait")
+
+    def test_a_submit_hook_that_never_answers_alerts(self):
+        batch = self.submitted_batch()
+        self.age_submit(batch, 120)
+        self.assertIsNone(self.check())
+        rows = self.silent()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("names the unobserved event"):
+            self.assertIn("'prompt_submit'", rows[0][1])
+        with self.subTest("keyed on the batch"):
+            self.assertEqual(rows[0][2], batch)
+        with self.subTest("names harness and version verbatim"):
+            self.assertIn(self.HARNESS, rows[0][1])
+            self.assertIn(self.CLI_VERSION, rows[0][1])
+
+    def test_an_ordinary_submit_stays_silent(self):
+        self.submitted_batch()
+        pending = self.check()
+        self.assertEqual(self.silent(), [],
+                         "the hook has had a second, not a minute")
+        self.assertIsNotNone(pending)
+        self.assertLessEqual(pending, interface_broker.HOOKS_SUBMIT_SILENT_S)
+
+    def test_the_submit_hook_arriving_resolves_the_silence(self):
+        batch = self.submitted_batch()
+        self.age_submit(batch, 120)
+        self.check()
+        self.assertEqual(len(self.silent()), 1)
+        interface_broker.record_hook(self.con, 1, 1, 8, "prompt_submit")
+        self.con.commit()
+        with self.subTest("batch progressed"):
+            self.assertEqual(self.batch_state(batch), "running")
+        with self.subTest("alert resolved"):
+            self.assertEqual(self.silent(), [])
+
+    def test_a_batch_predating_the_stamp_is_unmeasured_not_silent(self):
+        """A NULL submitting_at is a row written before migration 0117, not a
+        batch submitted zero seconds ago. Reporting it as silent would invent
+        a measurement that was never taken."""
+        batch = self.submitted_batch()
+        self.con.execute(
+            "UPDATE planner_wake_batches SET submitting_at=NULL "
+            "WHERE batch_id=?", (batch,))
+        self.con.commit()
+        self.assertIsNone(self.check())
+        self.assertEqual(self.silent(), [])
+
+    def test_a_running_batch_is_not_measured_for_submit_silence(self):
+        """Once the submit hook has answered, the batch is waiting on the
+        MODEL, and a model turn has no honest upper bound. This is the
+        boundary of what H-27 measures — see hooks_silence_alert's docstring
+        for why the literal turn_stop clause is not implemented here."""
+        batch = self.submitted_batch()
+        interface_broker.record_hook(self.con, 1, 1, 8, "prompt_submit")
+        self.con.commit()
+        self.age_submit(batch, 86400)
+        self.assertIsNone(self.check())
+        self.assertEqual(self.silent(), [],
+                         "a long turn is not a silent hook")
+
+
 # ── The coordinator: event-driven drain, retries, parking non-bypass ─────────
 
 class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
@@ -929,6 +1774,170 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
                          [len(interface_broker.WAKE_PROMPT) + 1])
         state = self.one("SELECT state FROM planner_wake_batches")
         self.assertEqual(state, "submitting")
+
+    async def test_a_submitted_batch_nobody_answers_becomes_an_alert(self):
+        """H-27 end to end, and the reason it had to reach the coordinator:
+        `_drain_sync` returns early on 'submitting' with "the hook evidence
+        drives it from here", and on a dead chain there IS no hook evidence.
+        Before this the batch sat there until a restart swept it."""
+        with mock.patch.object(interface_broker, "HOOKS_SUBMIT_SILENT_S", 0.2):
+            self.coord.start(asyncio.get_running_loop())
+            self.add_message("task")
+            self.coord.notify_binding(self.binding)
+            opened = await self.wait_for(lambda: self.one(
+                "SELECT COUNT(*) FROM planner_alerts "
+                "WHERE reason='hooks_declared_but_silent' "
+                "AND batch_id IS NOT NULL AND resolved_at IS NULL") == 1)
+        self.assertTrue(opened, "a submit no hook answers must become visible")
+        self.assertEqual(self.writes, [len(interface_broker.WAKE_PROMPT) + 1],
+                         "the wake still went out — this observes, never gates")
+        self.assertEqual(self.one("SELECT state FROM planner_wake_batches"),
+                         "submitting")
+        self.assertIn("'prompt_submit'", self.one(
+            "SELECT detail FROM planner_alerts "
+            "WHERE reason='hooks_declared_but_silent'"))
+
+    async def test_an_answered_submit_hook_leaves_the_coordinator_silent(self):
+        """The negative control for the test above, run on the SAME instrument
+        at the same threshold: the only difference is that the hook arrives."""
+        with mock.patch.object(interface_broker, "HOOKS_SUBMIT_SILENT_S", 0.2):
+            self.coord.start(asyncio.get_running_loop())
+            self.add_message("task")
+            self.coord.notify_binding(self.binding)
+            self.assertTrue(await self.wait_for(lambda: len(self.writes) == 1))
+            con = self.connect()
+            interface_broker.record_hook(con, 1, 1, 8, "prompt_submit")
+            con.commit()
+            con.close()
+            self.coord.notify_binding(self.binding)
+            fired = await self.wait_for(lambda: self.one(
+                "SELECT COUNT(*) FROM planner_alerts "
+                "WHERE reason='hooks_declared_but_silent'") > 0, timeout=1.5)
+        self.assertFalse(fired, "an observed hook is not a silent one")
+        self.assertEqual(self.one("SELECT state FROM planner_wake_batches"),
+                         "running")
+
+    async def test_drained_inbox_forms_no_batch_and_writes_nothing(self):
+        """H-4 end to end: every queued row read before the drain → no
+        batch, no keystroke, and the items retire as done."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        self.add_message("result", read=True)
+        self.coord.notify_binding(self.binding)
+        done = await self.wait_for(
+            lambda: self.one("SELECT COUNT(*) FROM planner_wake_items "
+                             "WHERE state='done'") == 2)
+        self.assertTrue(done, "read rows must complete, not sit queued")
+        self.assertEqual(self.writes, [], "a drained inbox costs no wake turn")
+        self.assertIsNone(self.one("SELECT batch_id FROM planner_wake_batches"))
+
+    async def test_persistent_gate_failure_alerts_without_any_further_event(self):
+        """H-26 end to end, and the whole of issue #638.
+
+        The gate refuses for a reason that is not the quiet debounce, and
+        then NOTHING else happens — no new message, no hook, no operator.
+        Before this unit the batch sat queued and invisible indefinitely,
+        because a non-quiet gate failure armed no timer. It must now surface
+        on its own, carrying which gate refused."""
+        con = self.connect()
+        con.execute("UPDATE interface_sessions SET lifecycle='busy' "
+                    "WHERE session_id=?", (self.sid,))
+        con.commit()
+        con.close()
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task")
+        with mock.patch.object(interface_broker, "WAKE_BATCH_STALL_S", 0.3):
+            self.coord.notify_binding(self.binding)
+            opened = await self.wait_for(
+                lambda: self.one(
+                    "SELECT COUNT(*) FROM planner_alerts WHERE "
+                    "reason='wake_batch_stalled' AND resolved_at IS NULL") == 1,
+                timeout=6.0)
+        self.assertTrue(opened, "a persistent stall must not stay invisible")
+        self.assertEqual(self.writes, [], "and no byte may have moved")
+        detail = self.one(
+            "SELECT detail FROM planner_alerts WHERE reason='wake_batch_stalled'")
+        self.assertIn("occupied+idle", detail,
+                      "the alert names the gate that actually refused")
+
+    async def test_gate_that_clears_before_the_deadline_never_alerts(self):
+        """The re-check must not become a monitor that cries wolf: a batch
+        whose gate clears in time submits, and no stall is ever reported."""
+        con = self.connect()
+        con.execute("UPDATE interface_sessions SET lifecycle='busy' "
+                    "WHERE session_id=?", (self.sid,))
+        con.commit()
+        con.close()
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task")
+        with mock.patch.object(interface_broker, "WAKE_BATCH_STALL_S", 2.0):
+            self.coord.notify_binding(self.binding)
+            await asyncio.sleep(0.2)
+            con = self.connect()
+            con.execute("UPDATE interface_sessions SET lifecycle='idle' "
+                        "WHERE session_id=?", (self.sid,))
+            con.commit()
+            con.close()
+            self.coord.notify_binding(self.binding)
+            ok = await self.wait_for(lambda: len(self.writes) == 1)
+        self.assertTrue(ok, "the batch must submit once the gate clears")
+        self.assertEqual(
+            self.one("SELECT COUNT(*) FROM planner_alerts WHERE "
+                     "reason='wake_batch_stalled'"), 0)
+
+    async def test_probe_still_suppresses_when_the_sweep_loses_the_race(self):
+        """The drain probe's own read_at filter, isolated.
+
+        In the ordinary path the sweep retires read rows first, so the
+        probe's filter never decides anything — remove it and nothing goes
+        red. It exists for the window where a planner reads a row AFTER the
+        sweep commits: neutering the sweep reproduces exactly that state.
+        Without the filter the probe would form a batch and submit a prompt
+        for a row form_batch then refuses to include — a wake for nothing."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        with mock.patch.object(interface_broker, "sweep_read_queued",
+                               return_value=0) as swept:
+            self.coord.notify_binding(self.binding)
+            await asyncio.sleep(0.5)
+            self.assertTrue(swept.called, "the drain path must reach the sweep")
+        self.assertEqual(self.writes, [],
+                         "a read row must not draw a keystroke on its own")
+        self.assertIsNone(self.one("SELECT batch_id FROM planner_wake_batches"),
+                          "no batch may form for a row that cannot be batched")
+        self.assertEqual(
+            self.one("SELECT state FROM planner_wake_items"), "queued",
+            "the row survives for the next sweep — it is not lost")
+
+    async def test_batch_records_how_many_rows_were_skipped_as_read(self):
+        """H-28: the suppression is itself observable. Without the count, a
+        queue that went quiet because rows were correctly skipped reads
+        exactly like one that went quiet because nothing arrived."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        self.add_message("task", read=True)
+        self.add_message("result", read=False)
+        self.coord.notify_binding(self.binding)
+        ok = await self.wait_for(lambda: len(self.writes) == 1)
+        self.assertTrue(ok)
+        self.assertEqual(
+            self.one("SELECT skipped_read FROM planner_wake_batches"), 2,
+            "the batch must name how much it suppressed")
+
+    async def test_unread_row_still_drains_when_a_read_row_precedes_it(self):
+        """The suppression is per-row: it must not swallow live work."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        unread = self.add_message("result", read=False)
+        self.coord.notify_binding(self.binding)
+        ok = await self.wait_for(lambda: len(self.writes) == 1)
+        self.assertTrue(ok, "the unread row must still drive a submission")
+        batched = self.one(
+            "SELECT COUNT(*) FROM planner_wake_items WHERE batch_id IS NOT NULL")
+        self.assertEqual(batched, 1, "only the unread row rides the batch")
+        self.assertEqual(
+            self.one("SELECT state FROM planner_wake_items WHERE message_id=?",
+                     (unread,)), "submitting")
 
     async def test_busy_lifecycle_awaits_events_no_poll(self):
         con = self.connect()
@@ -1266,6 +2275,13 @@ class WakeRoutesTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "shell_scope")
 
     def test_release_cancels_queued_work_messages_stay_unread(self):
+        """H-6 REVISED THIS TEST'S FIRST HALF, deliberately. Release used to
+        cancel the queued items outright; while the sprint is still running
+        they are now HELD for the next binding armed on it, because H-6's
+        re-parent is what makes them reachable and `cancelled` is terminal.
+        The unchanged half is the one that was always load-bearing: release
+        leaves the MESSAGES unread. Cancellation is pinned by
+        test_release_after_the_sprint_is_finished_still_cancels below."""
         status, body = self.arm()
         self.assertEqual(status, 201)
         binding_id = body["binding_id"]
@@ -1281,12 +2297,13 @@ class WakeRoutesTest(unittest.TestCase):
             "DELETE", f"/api/interface/sprint-bindings/{binding_id}",
             (OP, "Idempotency-Key: k-rel"), {"reason": "sprint closed"})
         self.assertEqual(status, 200, body)
-        self.assertEqual(body["cancelled_items"], 1)
+        self.assertEqual(body["cancelled_items"], 0,
+                         "nothing was cancelled, so nothing is reported as "
+                         "cancelled — the item is held, not lost")
         con = sqlite3.connect(self.db_path)
         item = con.execute(
             "SELECT state, error FROM planner_wake_items").fetchone()
-        self.assertEqual(item[0], "cancelled")
-        self.assertIn("sprint closed", item[1])
+        self.assertEqual(item[0], "queued")
         read = con.execute(
             "SELECT read_at FROM shell_messages WHERE message_id=?",
             (mid,)).fetchone()[0]
@@ -1297,6 +2314,32 @@ class WakeRoutesTest(unittest.TestCase):
         self.assertIsNotNone(released[0])
         self.assertEqual(released[1], "sprint closed")
         con.close()
+
+    def test_release_after_the_sprint_is_finished_still_cancels(self):
+        """The half H-6 did NOT change, pinned separately so the change above
+        cannot quietly widen: with no unit left running, nothing will ever arm
+        again and holding the item would strand it forever."""
+        status, body = self.arm()
+        self.assertEqual(status, 201)
+        con = sqlite3.connect(self.db_path)
+        mid = con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'x','task',1)").lastrowid
+        import interface_wake
+        interface_wake.maybe_create_wake_item(con, mid)
+        con.execute("UPDATE sprint_units SET state='cancelled'")
+        con.commit()
+        con.close()
+        status, body = self.call(
+            "DELETE", f"/api/interface/sprint-bindings/{body['binding_id']}",
+            (OP, "Idempotency-Key: k-rel2"), {"reason": "sprint closed"})
+        self.assertEqual(body["cancelled_items"], 1, body)
+        con = sqlite3.connect(self.db_path)
+        item = con.execute(
+            "SELECT state, error FROM planner_wake_items").fetchone()
+        con.close()
+        self.assertEqual(item[0], "cancelled")
+        self.assertIn("sprint closed", item[1])
 
     # -- action receipts -----------------------------------------------------------
 

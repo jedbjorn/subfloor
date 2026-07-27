@@ -226,6 +226,7 @@ def startup_reconcile(con) -> dict:
     counts = {"reservations_unreconciled": 0, "parks": 0,
               "batches_delivery_unknown": 0, "batches_proven_running": 0,
               "batches_completed": 0, "leases_revoked": 0,
+              "browser_composers_cleared": 0,
               "terminal_inputs_removed": 0,
               "terminal_input_parks": 0,
               "terminal_leases_revoked": 0,
@@ -328,13 +329,35 @@ def startup_reconcile(con) -> dict:
         counts["reservations_unreconciled"] += 1
 
     # 4. A restart dropped every client — revoke all current writer leases.
-    #    Composer/dirty state is preserved (spec: dirty survives disconnect).
+    #    The HARNESS composer's dirty state is preserved: it describes bytes
+    #    sitting in a TUI that outlived the restart, and a disconnect proves
+    #    nothing about them (spec: dirty survives disconnect).
+    #
+    #    H-9 SUPERSEDES THAT INTENT FOR browser_composer SPECIFICALLY, and
+    #    only for the no-client case. `browser_composer='dirty'` blocks the
+    #    wake gate with no alert and no owner once the lease is revoked: it
+    #    describes a draft in a browser tab that is, by construction, gone —
+    #    the lease we just revoked WAS the client. Nobody can certify it clean
+    #    because nobody holds the writer, so the gate refuses forever and the
+    #    only exit is an operator who knows to look. Reset it with the revoke,
+    #    in the same statement's scope, so the two can never disagree.
+    revoked = [r[0] for r in con.execute(
+        "SELECT session_id FROM interface_writer_leases "
+        "WHERE revoked_at IS NULL AND session_id IN "
+        f"(SELECT s.session_id FROM interface_sessions s WHERE {active_session})"
+    ).fetchall()]
     cur = con.execute(
         "UPDATE interface_writer_leases SET revoked_at=datetime('now'), "
         "revoke_reason='service_restart' WHERE revoked_at IS NULL "
         "AND session_id IN (SELECT s.session_id FROM interface_sessions s "
         f"WHERE {active_session})")
     counts["leases_revoked"] = cur.rowcount
+    if revoked:
+        marks = ",".join("?" * len(revoked))
+        counts["browser_composers_cleared"] = con.execute(
+            f"UPDATE interface_input_state SET browser_composer='clean' "
+            f"WHERE browser_composer='dirty' AND session_id IN ({marks})",
+            revoked).rowcount
 
     con.commit()
     return counts

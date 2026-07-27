@@ -31,52 +31,117 @@ import interface_hooks
 import sprint_state
 
 ELIGIBLE_KINDS = ("task", "result", "pr_event")
+# H-5 names `task` / `result` and stops there, and the omission is the
+# requirement's, kept deliberately rather than tidied: those two are what one
+# shell sends another expecting it to act, so their loss is a sprint stalling
+# on a message a human can name. `pr_event` is daemon-emitted and re-derivable
+# from the poller's own state, so a deaf sprint is not news about it.
+DEAF_SPRINT_KINDS = ("task", "result")
 RETRY_DELAYS_S = (1.0, 5.0, 30.0)  # bounded pre-send retries (spec table)
 
 
 # ── Event ingress (in-transaction wake-item creation) ────────────────────────
+
+def eligible_binding(con, sprint_doc_id, planner_shell_id) -> "int | None":
+    """THE eligibility ladder for creating a wake item — one implementation,
+    every producer (H-8). Returns the binding_id that can actually carry a
+    wake for this planner on this sprint, or None.
+
+    A LIVE sprint (`sprint_state`: a sprint doc, unfrozen, holding a board);
+    an unreleased binding naming that planner; the binding's Interface session
+    still occupied on the binding's own generation (not ended, not replaced);
+    and a harness that supports the mandatory lifecycle hooks — a capability
+    gap refuses arming AND ingress, because the wake would be unverifiable.
+
+    The PR poller used to check only `released_at IS NULL` and could queue an
+    item that no gate would ever pass: it went straight into a stall, which is
+    the shape this sprint exists to remove. The condition behind a refusal is
+    now surfaced instead — H-5 for a live sprint with no binding, H-6 for a
+    binding released mid-sprint — rather than queued and forgotten."""
+    if sprint_doc_id is None or planner_shell_id is None:
+        return None
+    if not sprint_state.is_live_sprint(con, sprint_doc_id):
+        return None
+    binding = con.execute(
+        "SELECT binding_id, session_id, generation "
+        "FROM sprint_planner_bindings "
+        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
+        (sprint_doc_id, planner_shell_id)).fetchone()
+    if binding is None:
+        return None
+    sess = con.execute(
+        "SELECT occupancy, generation, harness, cli_version "
+        "FROM interface_sessions WHERE session_id=?", (binding[1],)).fetchone()
+    if sess is None or sess[0] != "occupied" or sess[1] != binding[2]:
+        return None  # session ended or generation replaced — binding is stale
+    if not interface_hooks.capability(sess[2], sess[3])["mandatory_ok"]:
+        return None
+    return binding[0]
+
 
 def maybe_create_wake_item(con, message_id: int) -> "int | None":
     """Create the wake item for one freshly inserted message iff it is
     eligible (spec #20 Sprint Scope) — same transaction as the message, so
     the pair is atomic. Returns the item_id, or None when ineligible.
 
-    Eligibility, exactly the spec's list: a typed sprint event (task /
-    result / pr_event — `shell` and legacy unscoped traffic NEVER wake),
-    carrying a sprint_doc_id naming a LIVE sprint (`sprint_state` — a sprint
-    doc, unfrozen, holding a board); an ACTIVE (unreleased) binding for that
-    sprint names this message's recipient as planner; the binding's Interface
-    session and generation are still live (not ended/replaced); and the
-    harness supports the mandatory lifecycle hooks (a capability gap
-    refuses arming AND ingress — the wake would be unverifiable). Message
-    bodies are never parsed for sprint identity.
+    Eligibility is TWO questions, and only the first belongs to this path:
+    is the message a typed sprint event (task / result / pr_event — `shell`
+    and legacy unscoped traffic NEVER wake) carrying a sprint_doc_id? The
+    rest — live sprint, unreleased binding, live session on the binding's own
+    generation, mandatory hooks — is `eligible_binding`, shared with the PR
+    poller so the two producers cannot drift (H-8). Message bodies are never
+    parsed for sprint identity.
+
+    H-5: one of those refusals is a LOSS rather than a deferral and now says
+    so. A `task`/`result` addressed into a LIVE sprint that has no unreleased
+    binding will never be delivered by any later event — nothing re-runs
+    ingress for an already-inserted message — and until now the sender simply
+    learned nothing. That opens a deduped `sprint_no_armed_planner` keyed on
+    the sprint doc, so `sc sprint alerts` and the GUI can see a sprint whose
+    planner is not listening. The other refusals stay silent per attempt:
+    session busy, quiet window, generation replaced are all deferrals, and a
+    deferral's invisibility is bounded by H-26 instead.
+
+    Written INSIDE the message's own transaction, like the wake item: a
+    message that rolls back must not leave an alert claiming it arrived.
     """
     msg = con.execute(
         "SELECT to_shell_id, kind, sprint_doc_id FROM shell_messages "
         "WHERE message_id=?", (message_id,)).fetchone()
     if msg is None or msg[1] not in ELIGIBLE_KINDS or msg[2] is None:
         return None
-    to_shell_id, _, sprint_doc_id = msg
-    if not sprint_state.is_live_sprint(con, sprint_doc_id):
-        return None
-    binding = con.execute(
-        "SELECT binding_id, session_id, shell_id, generation "
-        "FROM sprint_planner_bindings "
-        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
-        (sprint_doc_id, to_shell_id)).fetchone()
-    if binding is None:
-        return None
-    sess = con.execute(
-        "SELECT occupancy, generation, harness, cli_version "
-        "FROM interface_sessions WHERE session_id=?", (binding[1],)).fetchone()
-    if sess is None or sess[0] != "occupied" or sess[1] != binding[3]:
-        return None  # session ended or generation replaced — binding is stale
-    if not interface_hooks.capability(sess[2], sess[3])["mandatory_ok"]:
+    to_shell_id, kind, sprint_doc_id = msg
+    binding_id = eligible_binding(con, sprint_doc_id, to_shell_id)
+    if binding_id is None:
+        if kind in DEAF_SPRINT_KINDS \
+                and sprint_state.is_live_sprint(con, sprint_doc_id) \
+                and _no_binding(con, sprint_doc_id, to_shell_id):
+            # Deduped on the sprint doc: one open row per deaf sprint, no
+            # matter how many senders discover it. The recipient is named in
+            # the detail rather than the key — a sprint with two unbound
+            # planners is one condition, not two.
+            interface_broker._alert(
+                con, severity="warning", reason="sprint_no_armed_planner",
+                sprint_doc_id=sprint_doc_id,
+                detail=(f"{kind} for shell {to_shell_id} found no unreleased "
+                        f"binding on this live sprint — the message will not "
+                        f"be delivered by any later event"))
         return None
     cur = con.execute(
         "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
-        "VALUES (?, ?)", (binding[0], message_id))
+        "VALUES (?, ?)", (binding_id, message_id))
     return cur.lastrowid if cur.rowcount else None
+
+
+def _no_binding(con, sprint_doc_id, planner_shell_id) -> bool:
+    """H-5's condition specifically: NO unreleased binding, as distinct from
+    a binding that exists and is merely unusable. The ladder collapses every
+    refusal to None, and only this one is a loss — a stale session or a
+    capability gap still has a binding, and both are H-6/H-26's to report."""
+    return con.execute(
+        "SELECT 1 FROM sprint_planner_bindings "
+        "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL "
+        "LIMIT 1", (sprint_doc_id, planner_shell_id)).fetchone() is None
 
 
 # ── The coordinator ───────────────────────────────────────────────────────────
@@ -207,6 +272,24 @@ class WakeCoordinator:
             if binding is None or binding[3] is not None:
                 return
             session_id = binding[0]
+            # H-27: check the DECLARED hook chain against what has actually
+            # arrived, before any of this tick's own work. It runs first
+            # because the early returns below are exactly where the silence
+            # used to become invisible — most of all the submitting/running
+            # one, whose comment ("the hook evidence drives it from here")
+            # is only true while the hooks are in fact delivering.
+            #
+            # The re-check shares the binding's single timer with H-26's
+            # stall check, which replaces rather than stacks. That is safe
+            # and deliberate: every timer fires a FULL re-drain, so the later
+            # of the two deadlines still runs both measurements — the
+            # observation can be deferred, never dropped. On the path that
+            # matters most (a batch stuck `submitting`) H-26 arms nothing at
+            # all, so this timer stands alone.
+            recheck = interface_broker.hooks_silence_alert(con, binding_id)
+            if recheck is not None:
+                self._schedule_retry(binding_id, recheck)
+
             live = con.execute(
                 "SELECT batch_id, state FROM planner_wake_batches "
                 "WHERE binding_id=? AND state IN ('queued','submitting',"
@@ -214,13 +297,24 @@ class WakeCoordinator:
             if live is not None and live[1] in ("submitting", "running"):
                 return  # the hook evidence drives it from here
             if live is None:
+                # H-4: rows the planner has already read wake nobody. Retire
+                # them before probing, so an inbox drained by hand costs no
+                # wake turn at all.
+                skipped = interface_broker.sweep_read_queued(con, binding_id)
+                if skipped:
+                    con.commit()
                 queued = con.execute(
-                    "SELECT 1 FROM planner_wake_items WHERE binding_id=? "
-                    "AND state='queued' AND batch_id IS NULL LIMIT 1",
+                    "SELECT 1 FROM planner_wake_items i "
+                    "JOIN shell_messages m ON m.message_id = i.message_id "
+                    "WHERE i.binding_id=? AND i.state='queued' "
+                    "AND i.batch_id IS NULL AND m.read_at IS NULL LIMIT 1",
                     (binding_id,)).fetchone()
                 if queued is None:
                     return
-                batch_id = interface_broker.form_batch(con, binding_id)
+                # H-28: carry the skip count onto the batch, so suppression is
+                # observable rather than merely correct.
+                batch_id = interface_broker.form_batch(
+                    con, binding_id, skipped_read=skipped)
                 con.commit()
             else:
                 batch_id = live[0]
@@ -236,12 +330,45 @@ class WakeCoordinator:
                 return
             if out.get("submitted"):
                 self._pre_send_attempts.pop(batch_id, None)
+                # H-27: a submitted batch is now waiting on a hook that may
+                # never come, and this drain is the last thing scheduled to
+                # run — the submitting/running early return above is a return,
+                # not a re-check. Arm the one wakeup that turns that silence
+                # into an alert. It costs a single no-op drain per submitted
+                # batch on a healthy seat, which is what observing the hook
+                # rather than trusting its declaration is worth.
+                self._schedule_retry(
+                    binding_id, interface_broker.HOOKS_SUBMIT_SILENT_S)
             elif out.get("retry_after") is not None:
                 self._schedule_retry(binding_id, out["retry_after"])
-            # any other gate failure (busy/dirty/pending/disarmed/cancelled)
-            # awaits the next event — no timer, no poll.
+            elif not out.get("cancelled"):
+                # H-26. A gate failure that is not the quiet debounce awaits
+                # the next event — but "the next event" may never come, and
+                # that is precisely issue #638: a batch invisible for 33
+                # minutes because nothing re-evaluated it.
+                #
+                # So arm ONE bounded re-check at the stall deadline. This is
+                # not a poll and not a daemon: it is the same single-timer
+                # mechanism the quiet debounce already uses, it is per
+                # binding (_arm_timer replaces, never stacks), and it stops
+                # arming the moment the alert is open — a stalled batch
+                # costs exactly one extra wakeup, ever.
+                if not interface_broker.stalled_batch_alert(con, batch_id):
+                    self._arm_stall_check(con, binding_id, batch_id)
+                con.commit()
         finally:
             con.close()
+
+    def _arm_stall_check(self, con, binding_id: int, batch_id: int) -> None:
+        """Schedule the single re-evaluation that turns a silent stall into
+        an alert (H-26). Fires at the batch's stall deadline; by then the
+        gate has either cleared on its own or the alert opens."""
+        age_s = con.execute(
+            "SELECT (julianday('now') - julianday(created_at)) * 86400.0 "
+            "FROM planner_wake_batches WHERE batch_id=?",
+            (batch_id,)).fetchone()[0]
+        remaining = interface_broker.WAKE_BATCH_STALL_S - (age_s or 0.0)
+        self._schedule_retry(binding_id, max(remaining, 0.1))
 
     def _pre_send_failed(self, con, binding_id: int, batch_id: int) -> None:
         """Bounded pre-send retries (spec Retry Policy): one definite
