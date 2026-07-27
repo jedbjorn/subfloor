@@ -99,35 +99,52 @@ class SourceSyncCase(unittest.TestCase):
         self.assertEqual(self.head(), before)
         self.assertIn("already current", out)
 
-    # ── the refusals ─────────────────────────────────────────────────────────
+    # ── the declines: warn, leave the tree alone, let the update through ─────
+    #
+    # ADVISORY, NEVER BLOCKING (FnB ruling 2026-07-27): an operator who cannot
+    # update is a worse failure than one updating a commit behind. Each leg
+    # asserts BOTH halves — the tree is untouched AND the update is not stopped.
 
-    def test_behind_with_uncommitted_work_aborts_untouched(self):
-        """The main checkout is the running server's tree; never fast-forward
-        one holding work in flight, and never reconcile from a stale one."""
+    def test_uncommitted_work_warns_and_does_not_block(self):
+        """The main checkout is the running server's tree — never fast-forward
+        one holding work in flight. But never refuse the update over it."""
         tip = self.fall_behind()
         (self.work / "scratch.txt").write_text("operator work in flight\n")
         before = self.head()
-        with self.assertRaises(SystemExit) as raised:
-            self.sync()
-        self.assertEqual(self.head(), before, "aborted run still moved HEAD")
+        out = self.sync()   # must NOT raise — SystemExit would fail the test here
+        self.assertEqual(self.head(), before, "fast-forwarded over work in flight")
         self.assertNotEqual(self.head(), tip)
-        self.assertIn("uncommitted changes", str(raised.exception))
         self.assertTrue((self.work / "scratch.txt").exists(),
                         "the operator's file was discarded")
+        self.assertIn("uncommitted changes", out)
+        self.assertIn("stale", out, "the warning must say the floor will be stale")
 
-    def test_diverged_aborts_without_merging_or_resetting(self):
+    def test_diverged_warns_without_merging_resetting_or_blocking(self):
         tip = self.fall_behind()
         (self.work / "local.txt").write_text("local\n")
         git(self.work, "add", "local.txt")
         git(self.work, "commit", "-m", "local only")
         before = self.head()
-        with self.assertRaises(SystemExit) as raised:
-            self.sync()
+        out = self.sync()   # must NOT raise
         self.assertEqual(self.head(), before, "diverged branch was moved")
-        self.assertIn("diverged", str(raised.exception))
+        self.assertIn("diverged", out)
         # the upstream commit must NOT have been merged in
         merged = git(self.work, "branch", "--contains", tip, "--format=%(refname)")
         self.assertEqual(merged, "", "upstream commit was merged despite divergence")
+
+    def test_no_git_state_can_stop_the_update(self):
+        """The ruling as one property: whatever the checkout looks like, the
+        sync returns and the update proceeds. Positive control — the same
+        harness DOES fast-forward when it can (first test above)."""
+        self.fall_behind()
+        (self.work / "scratch.txt").write_text("untracked work\n")
+        (self.work / "a.txt").write_text("tracked edit\n")
+        for label, setup in (("dirty", lambda: None),
+                             ("detached", lambda: git(self.work, "checkout",
+                                                      "--detach"))):
+            with self.subTest(state=label):
+                setup()
+                self.sync()   # any SystemExit escaping here fails the leg
 
     # ── the skips ────────────────────────────────────────────────────────────
 
