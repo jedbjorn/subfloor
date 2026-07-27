@@ -27,6 +27,7 @@ import textwrap
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -189,6 +190,9 @@ class ScFixture:
             exit 0
             """)
         self.env = os.environ.copy()
+        # This fixture exercises host-side Docker orchestration even when the
+        # test runner itself lives inside a super-coder sandbox.
+        self.env.pop("SC_SANDBOX", None)
         self.env.update({
             "PATH": f"{self.fakebin}:{self.env['PATH']}",
             "SC_PYTHON": sys.executable,
@@ -248,7 +252,10 @@ class ScFixture:
 
 class ScHarnessCommands(unittest.TestCase):
     def setUp(self) -> None:
-        self.fx = ScFixture()
+        # Pin the ambient condition that exposed the leak; CI usually runs
+        # outside the sandbox and would otherwise miss this regression.
+        with mock.patch.dict(os.environ, {"SC_SANDBOX": "1"}):
+            self.fx = ScFixture()
         self.addCleanup(self.fx.close)
 
     def test_build_passes_the_stored_epoch(self):
@@ -299,7 +306,16 @@ class ScHarnessCommands(unittest.TestCase):
     def test_harness_status_reports_the_versions_inside_the_sandbox(self):
         result = self.fx.run("harness-status")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("harness CLIs (in the sandbox — what shells run):",
+                      result.stdout)
         self.assertIn("9.9.9 (Claude Code)", result.stdout)
+        self.assertNotIn("harness CLIs (this runtime):", result.stdout)
+        self.assertEqual(
+            [call for call in self.fx.calls()
+             if call.startswith("docker exec ")],
+            [f"docker exec sc-fork python3 "
+             f"{self.fx.scripts / 'harness_versions.py'}"],
+        )
 
     def test_harness_status_flags_an_image_that_owes_a_rebuild(self):
         self.fx.run("build", "--harnesses")          # epoch rolled to today…
