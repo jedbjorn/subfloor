@@ -1,4 +1,4 @@
--- 0114 — a stalled wake batch becomes visible, with its reason (spec #76 H-26)
+-- 0116 — a stalled wake batch becomes visible, with its reason (spec #76 H-26)
 --
 -- Six gates stand between a formed batch and submission and only two of them
 -- alert. The rest return gate_fail silently and retry on the next event, so a
