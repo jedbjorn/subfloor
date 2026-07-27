@@ -587,7 +587,7 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .sprint-flow-inner { position: relative; min-width: 850px; }
 .sprint-wires { position: absolute; inset: 0 auto auto 0; z-index: 0;
   pointer-events: none; overflow: visible; }
-.sprint-cols { position: relative; z-index: 1; display: flex; gap: 1.35rem;
+.sprint-cols { position: relative; z-index: 1; display: flex; gap: 35px;
   align-items: flex-start; padding: 0 .15rem; }
 .sprint-col { flex: 1 1 0; min-width: 150px; display: flex;
   flex-direction: column; gap: .65rem; }

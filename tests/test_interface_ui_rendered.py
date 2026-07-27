@@ -611,6 +611,8 @@ def test_sprints_multi_board_read_only_visual_gate(
               viewWidth: node.getBoundingClientRect().width,
               boards: Array.from(node.querySelectorAll(".sprint-board"))
                 .map((board) => ({
+                  gap: parseFloat(getComputedStyle(
+                    board.querySelector(".sprint-cols")).columnGap),
                   columns: Array.from(board.querySelectorAll(".sprint-col"))
                     .map((column) => column.getBoundingClientRect().width),
                   cards: Array.from(board.querySelectorAll(".sprint-unit"))
@@ -623,6 +625,7 @@ def test_sprints_multi_board_read_only_visual_gate(
         )
         assert geometry["viewWidth"] == 1350
         for board in geometry["boards"]:
+            assert board["gap"] == 35
             assert max(board["columns"]) - min(board["columns"]) < 1
             assert all(
                 abs(card["card"] - card["column"]) < 1
