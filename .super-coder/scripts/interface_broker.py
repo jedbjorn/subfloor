@@ -105,7 +105,7 @@ def _session(con, session_id: int):
 
 def _alert(con, *, severity: str, reason: str, session_id=None,
            binding_id=None, message_id=None, batch_id=None,
-           detail=None) -> None:
+           sprint_doc_id=None, detail=None) -> None:
     """Raise an alert, deduplicated while open (partial unique index).
 
     A session-scoped alert takes the write lock before reading terminal state.
@@ -118,9 +118,19 @@ def _alert(con, *, severity: str, reason: str, session_id=None,
     condition, whose detail REFRESHES to the most recent observation rather
     than minting a new alert per distinct string. Per decision #76 it states
     what was measured, never a verdict.
+
+    `sprint_doc_id` is the post-0102 reconciliation column (with `unit_id`,
+    `role`, `signal`) — sprint-flow alerts carry the sprint they belong to
+    rather than encoding it into `dedupe_key` alone, so
+    `idx_planner_alerts_reconciliation` can find them. It joins the dedupe
+    key ONLY when set, which leaves every existing key byte-identical: a
+    format change here would stop new inserts colliding with alerts already
+    open in a live DB and mint one duplicate apiece.
     """
     dedupe = (f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}"
               f"|{batch_id or '-'}|{reason}")
+    if sprint_doc_id is not None:
+        dedupe += f"|sprint{sprint_doc_id}"
     if session_id is not None:
         _begin_immediate(con)
         session = con.execute(
@@ -141,25 +151,28 @@ def _alert(con, *, severity: str, reason: str, session_id=None,
             exists = con.execute(
                 "SELECT 1 FROM planner_alerts "
                 "WHERE session_id=? AND binding_id IS ? AND message_id IS ? "
-                "AND batch_id IS ? AND reason=? LIMIT 1",
-                (session_id, binding_id, message_id, batch_id, reason),
+                "AND batch_id IS ? AND sprint_doc_id IS ? AND reason=? "
+                "LIMIT 1",
+                (session_id, binding_id, message_id, batch_id, sprint_doc_id,
+                 reason),
             ).fetchone()
             if exists is None:
                 con.execute(
                     "INSERT INTO planner_alerts "
-                    "(session_id, binding_id, message_id, batch_id, severity, "
-                    "reason, detail, dedupe_key, resolved_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (session_id, binding_id, message_id, batch_id, severity,
-                     reason, detail, dedupe, ended_at),
+                    "(session_id, binding_id, message_id, batch_id, "
+                    "sprint_doc_id, severity, reason, detail, dedupe_key, "
+                    "resolved_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (session_id, binding_id, message_id, batch_id,
+                     sprint_doc_id, severity, reason, detail, dedupe,
+                     ended_at),
                 )
             return
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
-        "(session_id, binding_id, message_id, batch_id, severity, reason, "
-        "detail, dedupe_key) VALUES (?,?,?,?,?,?,?,?)",
-        (session_id, binding_id, message_id, batch_id, severity, reason,
-         detail, dedupe))
+        "(session_id, binding_id, message_id, batch_id, sprint_doc_id, "
+        "severity, reason, detail, dedupe_key) VALUES (?,?,?,?,?,?,?,?,?)",
+        (session_id, binding_id, message_id, batch_id, sprint_doc_id,
+         severity, reason, detail, dedupe))
     if detail is not None:
         # The row may already have been open (INSERT OR IGNORE did nothing):
         # refresh its measurement so a reader sees the LATEST failing gate,
@@ -929,19 +942,19 @@ def stalled_batch_alert(con, batch_id: int, threshold_s=None) -> bool:
     row = con.execute(
         "SELECT b.binding_id, b.state, b.last_gate_reason, "
         "       (julianday('now') - julianday(b.created_at)) * 86400.0, "
-        "       p.released_at "
+        "       p.released_at, p.sprint_doc_id "
         "FROM planner_wake_batches b "
         "JOIN sprint_planner_bindings p ON p.binding_id = b.binding_id "
         "WHERE b.batch_id=?", (batch_id,)).fetchone()
     if row is None:
         return False
-    binding_id, state, gate_reason, queued_s, released_at = row
+    binding_id, state, gate_reason, queued_s, released_at, doc_id = row
     if state != "queued" or released_at is not None:
         return False
     if queued_s is None or queued_s < threshold_s:
         return False
     _alert(con, severity="warning", reason="wake_batch_stalled",
-           binding_id=binding_id, batch_id=batch_id,
+           binding_id=binding_id, batch_id=batch_id, sprint_doc_id=doc_id,
            detail=(gate_reason or "no gate attempt recorded"))
     return True
 
@@ -1017,14 +1030,15 @@ def hooks_silence_alert(con, binding_id: int, ready_s=None,
         submit_s = HOOKS_SUBMIT_SILENT_S
     sess = con.execute(
         "SELECT s.session_id, s.harness, s.cli_version, s.provider_ready_at, "
-        "       (julianday('now') - julianday(s.created_at)) * 86400.0 "
+        "       (julianday('now') - julianday(s.created_at)) * 86400.0, "
+        "       b.sprint_doc_id "
         "FROM sprint_planner_bindings b "
         "JOIN interface_sessions s ON s.session_id = b.session_id "
         "WHERE b.binding_id=? AND b.released_at IS NULL "
         "AND s.occupancy <> 'ended'", (binding_id,)).fetchone()
     if sess is None:
         return None  # H-27 scopes to an ARMED binding on a live session
-    session_id, harness, cli_version, ready_at, age_s = sess
+    session_id, harness, cli_version, ready_at, age_s, doc_id = sess
     pending = []
 
     readiness = interface_hooks.capability(harness, cli_version)["readiness"]
@@ -1032,6 +1046,7 @@ def hooks_silence_alert(con, binding_id: int, ready_s=None,
         if age_s is not None and age_s >= ready_s:
             _alert(con, severity="warning",
                    reason="hooks_declared_but_silent", session_id=session_id,
+                   sprint_doc_id=doc_id,
                    detail=_silence_detail(
                        harness, cli_version, "session_start",
                        f"unobserved {age_s:.0f}s after session creation"))
@@ -1049,7 +1064,7 @@ def hooks_silence_alert(con, binding_id: int, ready_s=None,
         if batch[1] >= submit_s:
             _alert(con, severity="warning",
                    reason="hooks_declared_but_silent", session_id=session_id,
-                   batch_id=batch[0],
+                   batch_id=batch[0], sprint_doc_id=doc_id,
                    detail=_silence_detail(
                        harness, cli_version, "prompt_submit",
                        f"batch {batch[0]} submitted {batch[1]:.0f}s ago and "
@@ -1408,6 +1423,7 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             _alert(con, severity="critical",
                    reason="wake_hooks_missing_at_submit",
                    binding_id=binding_id, batch_id=batch_id,
+                   sprint_doc_id=binding[0],
                    detail=(f"harness={sess[6]!r} "
                            f"cli_version={sess[7]!r} "
                            f"missing_mandatory="

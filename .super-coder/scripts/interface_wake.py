@@ -31,6 +31,12 @@ import interface_hooks
 import sprint_state
 
 ELIGIBLE_KINDS = ("task", "result", "pr_event")
+# H-5 names `task` / `result` and stops there, and the omission is the
+# requirement's, kept deliberately rather than tidied: those two are what one
+# shell sends another expecting it to act, so their loss is a sprint stalling
+# on a message a human can name. `pr_event` is daemon-emitted and re-derivable
+# from the poller's own state, so a deaf sprint is not news about it.
+DEAF_SPRINT_KINDS = ("task", "result")
 RETRY_DELAYS_S = (1.0, 5.0, 30.0)  # bounded pre-send retries (spec table)
 
 
@@ -50,13 +56,26 @@ def maybe_create_wake_item(con, message_id: int) -> "int | None":
     harness supports the mandatory lifecycle hooks (a capability gap
     refuses arming AND ingress — the wake would be unverifiable). Message
     bodies are never parsed for sprint identity.
+
+    H-5: one of those refusals is a LOSS rather than a deferral and now says
+    so. A `task`/`result` addressed into a LIVE sprint that has no unreleased
+    binding will never be delivered by any later event — nothing re-runs
+    ingress for an already-inserted message — and until now the sender simply
+    learned nothing. That opens a deduped `sprint_no_armed_planner` keyed on
+    the sprint doc, so `sc sprint alerts` and the GUI can see a sprint whose
+    planner is not listening. The other refusals stay silent per attempt:
+    session busy, quiet window, generation replaced are all deferrals, and a
+    deferral's invisibility is bounded by H-26 instead.
+
+    Written INSIDE the message's own transaction, like the wake item: a
+    message that rolls back must not leave an alert claiming it arrived.
     """
     msg = con.execute(
         "SELECT to_shell_id, kind, sprint_doc_id FROM shell_messages "
         "WHERE message_id=?", (message_id,)).fetchone()
     if msg is None or msg[1] not in ELIGIBLE_KINDS or msg[2] is None:
         return None
-    to_shell_id, _, sprint_doc_id = msg
+    to_shell_id, kind, sprint_doc_id = msg
     if not sprint_state.is_live_sprint(con, sprint_doc_id):
         return None
     binding = con.execute(
@@ -65,6 +84,17 @@ def maybe_create_wake_item(con, message_id: int) -> "int | None":
         "WHERE sprint_doc_id=? AND planner_shell_id=? AND released_at IS NULL",
         (sprint_doc_id, to_shell_id)).fetchone()
     if binding is None:
+        if kind in DEAF_SPRINT_KINDS:
+            # Deduped on the sprint doc: one open row per deaf sprint, no
+            # matter how many senders discover it. The recipient is named in
+            # the detail rather than the key — a sprint with two unbound
+            # planners is one condition, not two.
+            interface_broker._alert(
+                con, severity="warning", reason="sprint_no_armed_planner",
+                sprint_doc_id=sprint_doc_id,
+                detail=(f"{kind} for shell {to_shell_id} found no unreleased "
+                        f"binding on this live sprint — the message will not "
+                        f"be delivered by any later event"))
         return None
     sess = con.execute(
         "SELECT occupancy, generation, harness, cli_version "

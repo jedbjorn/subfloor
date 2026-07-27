@@ -278,6 +278,112 @@ class WakeIngressTest(WakeFixture):
         self.assertEqual(len(self.item_states()), 1)
 
 
+# ── H-5: the one ingress refusal that is a LOSS says so ──────────────────────
+
+class DeafSprintAlertTest(WakeFixture):
+    """`maybe_create_wake_item` returned None on every gate and the sender
+    learned nothing. Most of those gates are deferrals — a later event still
+    delivers. "No unreleased binding on a live sprint" is not: nothing re-runs
+    ingress for an already-inserted message, so that one is a loss."""
+
+    def unbind(self):
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now') "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+
+    def deaf(self):
+        return self.con.execute(
+            "SELECT sprint_doc_id, severity, detail, session_id, binding_id "
+            "FROM planner_alerts "
+            "WHERE reason='sprint_no_armed_planner' AND resolved_at IS NULL "
+            "ORDER BY alert_id").fetchall()
+
+    def ingest(self, kind="task", **kw):
+        mid = self.add_message(kind, **kw)
+        item = interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return item
+
+    def test_a_task_into_a_sprint_with_no_binding_alerts(self):
+        self.unbind()
+        self.assertIsNone(self.ingest("task"))
+        rows = self.deaf()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("keyed on the sprint doc"):
+            self.assertEqual(rows[0][0], 1)
+        with self.subTest("carries no session or binding scope"):
+            self.assertEqual((rows[0][3], rows[0][4]), (None, None))
+        with self.subTest("names the recipient in the measurement"):
+            self.assertIn("shell 1", rows[0][2])
+
+    def test_a_result_alerts_too(self):
+        self.unbind()
+        self.assertIsNone(self.ingest("result"))
+        self.assertEqual(len(self.deaf()), 1)
+
+    def test_many_senders_open_one_row(self):
+        """Deduped on the sprint doc: a deaf sprint is one condition however
+        many shells discover it."""
+        self.unbind()
+        for kind in ("task", "result", "task"):
+            self.ingest(kind)
+        self.assertEqual(len(self.deaf()), 1)
+
+    def test_a_pr_event_is_not_news_about_a_deaf_sprint(self):
+        """Requirement names task/result and the omission is kept: a pr_event
+        is daemon-emitted and re-derivable from the poller's own state."""
+        self.unbind()
+        self.assertIsNone(self.ingest("pr_event"))
+        self.assertEqual(self.deaf(), [])
+
+    def test_a_deferral_stays_silent(self):
+        """The binding is armed and the seat is merely unusable — a later
+        event still delivers, so this is not a loss. Its invisibility is
+        bounded by H-26, not by an alert per attempt."""
+        self.con.execute(
+            "UPDATE interface_sessions SET cli_version='kimi-code 0.1.0' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        self.assertIsNone(self.ingest("task"))
+        self.assertEqual(self.deaf(), [],
+                         "a deferral must not be reported as a loss")
+
+    def test_an_unscoped_or_untyped_message_is_not_a_deaf_sprint(self):
+        self.unbind()
+        with self.subTest("shell kind"):
+            self.assertIsNone(self.ingest("shell"))
+        with self.subTest("no sprint scope"):
+            self.assertIsNone(self.ingest("task", sprint_doc_id=None))
+        self.assertEqual(self.deaf(), [])
+
+    def test_a_frozen_sprint_is_not_a_deaf_sprint(self):
+        """Freezing IS closing (H-1). A closed sprint has no planner by
+        design, and reporting that as a fault would be the monitor lying."""
+        self.unbind()
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        self.assertIsNone(self.ingest("task"))
+        self.assertEqual(self.deaf(), [])
+
+    def test_an_armed_sprint_never_alerts(self):
+        """The instrument's known-positive control runs in the same class
+        (test_a_task_into_a_sprint_with_no_binding_alerts) — this is the
+        negative half on the same corpus."""
+        item = self.ingest("task")
+        self.assertIsNotNone(item)
+        self.assertEqual(self.deaf(), [])
+
+    def test_the_alert_rolls_back_with_its_message(self):
+        """Written inside the message's own transaction: a message that never
+        commits must not leave an alert claiming it arrived."""
+        self.unbind()
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.rollback()
+        self.assertEqual(self.deaf(), [])
+
+
 # ── Flag #49: quiet baseline keys off REAL provider readiness ─────────────────
 
 class WakeReadinessTest(WakeFixture):
