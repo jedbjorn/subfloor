@@ -231,7 +231,7 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertIn("SPRINT: the other one", out)
         self.assertIn("Act on every role listed above", out)
 
-    def test_the_three_participant_rules_are_in_the_section_itself(self):
+    def test_the_four_participant_rules_are_in_the_section_itself(self):
         # They render as prose because the failure mode IS a skill body that
         # never loads — a pointer to the skill would reproduce the bug.
         add_doc(self.con, 59)
@@ -240,6 +240,7 @@ class SprintDirectiveTest(unittest.TestCase):
         self.assertIn("File findings, flags, verdicts", out)
         self.assertIn("--kind result --sprint <doc-id>", out)
         self.assertIn("send a partial", out)
+        self.assertIn("Nothing found is a result. Send it.", out)
 
     # ── the absences, each with its positive control ────────────────────────
 
