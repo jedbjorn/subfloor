@@ -534,7 +534,7 @@ def test_each_card_links_out_to_its_own_providers_usage_page():
     """, payload(all_three()))
     assert r["hrefs"] == ["https://claude.ai/settings/usage",
                           "https://chatgpt.com/codex/settings/usage",
-                          "https://www.kimi.com/code"]
+                          "https://www.kimi.com/code/console"]
 
 
 def test_refresh_forces_a_probe_and_redraws_from_its_response():
