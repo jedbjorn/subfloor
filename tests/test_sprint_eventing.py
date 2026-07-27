@@ -15,6 +15,7 @@ Run:
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -129,17 +130,68 @@ class SchemaTest(unittest.TestCase):
         body = self.con.execute(
             "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
         self.assertEqual(body, asset)
-        declaration = body.split("## 3. Declare the sprint", 1)[1].split(
-            "## 4. Arm event-driven wake", 1)[0]
-        self.assertEqual([
-            line.strip() for line in declaration.splitlines()
-            if "./sc mem doc add" in line
-        ], [
-            './sc mem doc add "SPRINT: <title>" --kind doc '
-            '--feature <feature-id> \\'
-        ])
+
+    def _sprint_orchestration_declaration(self) -> str:
+        body = self.con.execute(
+            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
+        start = "## 3. Declare the sprint"
+        end = "## 4. Arm event-driven wake"
+        self.assertEqual(body.count(start), 1)
+        self.assertEqual(body.count(end), 1)
+        return body.split(start, 1)[1].split(end, 1)[0]
+
+    def test_sprint_declaration_normatively_requires_feature_link(self):
+        declaration = " ".join(self._sprint_orchestration_declaration().split())
         self.assertIn(
-            "./sc mem get documents --doc <doc-id>",
+            "linked to its governing roadmap feature with "
+            "`--feature <feature-id>`",
+            declaration,
+        )
+
+    def test_sprint_declaration_doc_add_carries_feature_link(self):
+        declaration = self._sprint_orchestration_declaration()
+        lines = declaration.splitlines()
+        invocations = []
+        for index, line in enumerate(lines):
+            if not line.strip().startswith("./sc mem doc add"):
+                continue
+            invocation = line.strip()
+            while invocation.endswith("\\"):
+                index += 1
+                invocation = f"{invocation[:-1]} {lines[index].strip()}"
+            invocations.append(shlex.split(invocation))
+
+        self.assertEqual(len(invocations), 1)
+        tokens = invocations[0]
+        self.assertEqual(
+            tokens[:5],
+            ["./sc", "mem", "doc", "add", "SPRINT: <title>"],
+        )
+        for option, value in (
+            ("--kind", "doc"),
+            ("--feature", "<feature-id>"),
+            ("--body-file", "<draft.md>"),
+        ):
+            with self.subTest(option=option):
+                self.assertEqual(tokens.count(option), 1)
+                self.assertEqual(tokens[tokens.index(option) + 1], value)
+
+    def test_sprint_declaration_readback_resolves_feature_link(self):
+        declaration = self._sprint_orchestration_declaration()
+        invocations = [
+            shlex.split(line.strip())
+            for line in declaration.splitlines()
+            if line.strip().startswith("./sc mem get documents")
+        ]
+        self.assertEqual(invocations, [[
+            "./sc", "mem", "get", "documents", "--feature", "<feature-id>",
+        ]])
+
+    def test_sprint_declaration_pass_condition_requires_resolved_link(self):
+        declaration = " ".join(self._sprint_orchestration_declaration().split())
+        self.assertIn(
+            "**Pass condition:** the `<feature-id>` document read-back names "
+            "the sprint document, and",
             declaration,
         )
 
