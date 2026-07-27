@@ -34,23 +34,36 @@ Quiet is a symptom. Declare a stall only when an expected transition is absent
 and positive evidence shows no active process, job, review, CI run, or queued
 wake that can produce it.
 
+Validate every absence instrument against a known-positive target before using
+its empty output. A missing command, rejected predicate, non-zero probe, or
+positive control it cannot see makes the claim unmeasured, not absent. Inspect
+the probe's exit status and stderr; never translate empty stdout alone into
+"nothing is running."
+
 A reconciler finding requests a checkup. For a headless shell:
 
 1. Resolve the assigned subject from the sprint board, scoped task, launching
    planner, and worktree.
 2. Find the harness process whose `/proc/<pid>/cwd` is that worktree.
-3. Sample `/proc/<pid>/stat` twice over a bounded interval and compare
+3. Read `/proc/<pid>/stat` and reject state `Z`; a zombie directory and stat
+   file are not liveness.
+4. Sample `/proc/<pid>/stat` twice over a bounded interval and compare
    `utime + stime`.
-4. Treat a positive CPU delta as active work.
-5. Treat process presence with no delta as indeterminate until the task,
+5. Treat a positive CPU delta as active work.
+6. Treat process presence with no delta as indeterminate until the task,
    artifacts, and another bounded sample establish progress or fault.
-6. Treat no matching process, combined with no live job or producing external
-   operation, as positive stop evidence.
+7. Treat no matching non-zombie process, combined with no live job or producing
+   external operation, as positive stop evidence.
 
 Interface availability, a missing Interface session row, and an open archive
 describe session bookkeeping. Use them as context. `/proc` proves process
 activity; the board and scoped task prove which sprint and unit that activity
 belongs to.
+
+Use reconciler explanations only to explain the reading. Transcript mtime, raw
+`launch_shape` plus `cpu_delta`, persisted quota exhaustion with `resets_at`,
+and process-local provider fault with its probe timestamp never decide whether
+the worker is active.
 
 **Diagnosis pass condition:** name the missing transition and the evidence that
 its producer is inactive or unable to deliver it.
@@ -75,15 +88,28 @@ its producer is inactive or unable to deliver it.
 | Assignment or scope conflicts across parallel sprints | Stop the affected unit, resolve the hard-resource owner, update both boards, then resume one owner. |
 | Product meaning or scope is ambiguous | Ask the FnB with the alternatives and downstream effect. |
 
+If a timeout, bounded background task, or exiting shell wrapped `./sc run`, the
+wrapper owns the worker's lifetime because `./sc run` executes the harness over
+its own process. When the harness is still healthy, send SIGKILL to the wrapper
+PID alone, never its process group. Recovery passes only when the harness PID
+remains non-zombie and its parent becomes PID 1; otherwise preserve artifacts
+and use the applicable stopped-worker row above.
+
 Every continuation, reassignment, fix request, and recovery result uses
 `--sprint <doc-id>`.
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
 
 Record assignment changes before boot:
 
 ```sh
 ./sc sprint unit set --sprint <doc-id> --seq <unit> --dev <dev> --reviewer <rev>
-./sc mem message send <worker> "<exact continuation>" \
+./sc mem message send <worker> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ```
 
 Use `blocked` while the unit has no active path:

@@ -71,6 +71,12 @@ Predict each unit's file surface and compare intersections:
 Assign one developer and one reviewer to every unit. Balance reviewer load
 against the dependency graph.
 
+Reserve the close-time conformance reviewer now, while reviewer independence is
+still available. Record that shell's conflict set: units authored, unit reviews
+performed, rulings supplied, and any other reason it would grade its own work.
+Pass only with a named reviewer whose recorded set is disjoint from conformance
+scope, or an explicit FnB disposition for every unavoidable conflict.
+
 Define the merge rule at kickoff:
 
 - A verdict is bound to the reviewed head SHA.
@@ -126,6 +132,9 @@ assignment and sequencing plan without reading prose.
 
 ## 4. Arm event-driven wake
 
+A confirmation that is not about the thing it appears to confirm is not a
+confirmation. Verify the durable artifact that governs the next action.
+
 Arm the planner binding from the Interface Sprint wake panel or
 `POST /api/interface/sprint-bindings` with:
 
@@ -151,26 +160,46 @@ boot.
 PR events and scoped task/result rows drive the loop. Avoid scheduled trackers
 and session-bound inbox waiters.
 
+When the sprint pauses, release its binding from the Interface Sprint wake panel
+or `DELETE /api/interface/sprint-bindings/<id>` with a caller-stable
+`Idempotency-Key` and `reason: pause`. Read `./sc sprint status --all` back and
+stop only when the binding reports released or disarmed. Plain status hides
+released bindings and cannot prove release. A paused sprint may remain ACTIVE
+and unfrozen; it must not remain armed.
+
 ## 5. Dispatch ready work
 
 Every sprint `task` and `result` row carries `--sprint <doc-id>`. This makes the
 event wake-eligible and keeps parallel sprints separable.
 
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
+
 Send exact assignments:
 
 ```sh
-./sc mem message send <dev> \
-  "Unit U1: <scope>. Spec <id>. Dependencies <list>. Reviewer <rev>. Start <now|after U0>. Load sprint_dev." \
+./sc mem message send <dev> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ```
+
+Quote every fact the worker needs in its own task row. A message ID addressed to
+another shell is provenance, never a fetch instruction; inbox IDs are
+recipient-scoped.
+
+A message you sent is not an instruction the recipient has received. Treat
+delivery and receipt as separate facts; do not infer receipt from the send
+result or from an unread row.
 
 The board reserves each reviewer. Dispatch the reviewer when a developer reports
 a green exact head:
 
 ```sh
-./sc mem message send <reviewer> \
-  "Review U1 at PR #123 head <sha>. Major/Medium block; Low informs. Return the verdict to me. Load sprint_review." \
+./sc mem message send <reviewer> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ```
 
 Boot only the actor that owns the next transition:
@@ -178,6 +207,14 @@ Boot only the actor that owns the next transition:
 ```sh
 ./sc run <dev> --harness <harness> -m <model> --effort high
 ```
+
+Run `./sc run` from a durable interactive planner process. It executes the
+harness over its own process, so a timeout, bounded background task, or exiting
+wrapper becomes the worker's lifetime. If a wrapper already owns a live harness,
+load `sprint_orchestration_recover` and unwrap it there.
+
+Dispatch passes when the harness PID is non-zombie at the assigned worktree and
+no temporary launcher bounds its lifetime.
 
 Treat the board as assignment truth and the task row as the current instruction.
 Update both before a reassignment or scope change.
@@ -195,6 +232,25 @@ On each wake:
 3. Read `./sc sprint status` and `./sc sprint alerts`.
 4. Apply the smallest state transition supported by the event.
 5. Dispatch newly ready work.
+
+The reconciler runs independently of PR watches and returns a report-only
+reading for every live sprint expectation. Each reading carries `expectation`,
+`signal`, `confirmed`, `evidence`, `measurement`, `observed_at`, and
+`explanation`; classification never writes. After confirmation, every
+actionable signal produces one `planner_alerts` row keyed
+`(sprint_doc_id, unit_id, role, signal)`; `shell_id` stays off-key. A planner
+message is only the push layer and is emitted only when `board_writer` resolves
+a recipient. Open alerts dedupe, resolve when evidence returns, and re-arm after
+resolution.
+
+Read `sc watch list` for the reconciler's own heartbeat. A stale `reconcile`
+line means the watchdog may be wedged; no alerts from a stale watchdog do not
+prove a quiet sprint.
+
+Treat the explanation tier as WHY, never WHETHER: transcript mtime, the raw
+argv-derived `launch_shape` plus `cpu_delta`, persisted quota exhaustion with
+`resets_at`, and process-local provider fault with its probe timestamp may
+explain a reading but never change its classification.
 
 Use this routing table:
 
@@ -218,6 +274,16 @@ Register each PR with the planner at PR open:
 
 Monitor before interrupting a worker. Send a new task when behavior must change,
 not to request generic progress.
+
+Never use a draft PR as a planner hold. A state the worker's own procedure
+teaches it to clear cannot carry a stop; record the hold in board state plus a
+scoped task. No reliable interrupt exists today, and flag #321 owns that gap.
+A stop signal indistinguishable from an obstacle is an instruction to proceed;
+this rule does not close flag #321.
+
+When a review ruling changes a unit's file surface, update the overlap record
+and re-send the surface notice to every affected concurrent planner before the
+next durable action. The ruling that widens the surface triggers the notice.
 
 At each merge, resolve the merge base and compare the executed file surface with
 every concurrent sprint. Send surface deviations to the affected planner.

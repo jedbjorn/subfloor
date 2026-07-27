@@ -29,17 +29,42 @@ SPRINT doc=<id> reviewing=<unit or conformance>
 Every review transition uses a durable scoped result:
 
 ```sh
-./sc mem message send <planner> "<review transition>" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <doc-id>
+./sc mem message sent
 ```
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
 
 File findings and verdicts within the assignment. Send ruling requests to the
 planner with alternatives and evidence.
 
+Message IDs are scoped to their recipient. Treat an ID from another actor's
+inbox as provenance, never as a fetch instruction; the task row must quote the
+substance you need. Ask the planner for that substance when it is absent.
+
 Use IDs returned by creating writes for documents, tasks, flags, and messages.
 Confirm the target before an irreversible mutation. Refer to flags by `flag_id`
 plus a sprint-scoped label. Establish absence through a complete direct read,
-count, or exact-ID query.
+count, or exact-ID query. Before closing a flag by number, resolve and read back
+its exact `flag_id`; display names and flag IDs share an integer range.
+
+Validate every absence instrument against a known-positive target before
+reporting an empty result as absence. Inspect its exit status and stderr; a
+probe that cannot see the positive control leaves the claim unmeasured.
+
+The sprint reconciler compares the board's live expectations with positive work
+and result evidence. It reports confirmed divergences to the planner; it never
+changes the board or supervises the reviewer. Send a scoped partial before a
+turn ends with review unfinished, naming completed checks, evidence, and the
+next untouched action. "Nothing found" becomes the explicit clean verdict.
+
+Treat `read_at` in one direction only: READ proves something marked the row
+read; UNREAD proves nothing about delivery, liveness, or work. Never infer a
+fault or safe action from an unread marker.
 
 ## Review a unit
 
@@ -56,6 +81,10 @@ If `main` advanced, compare intervening changes with the PR's files:
 For a superseded, force-pushed, or unverified head, send a scoped correction
 request and wait for a pinned target.
 
+Drain scoped messages immediately before every durable action you own, including
+a verdict, pushed review artifact, or conformance document write. An earlier
+inbox check does not satisfy this gate.
+
 ### Review adversarially
 
 Trace behavior against:
@@ -71,14 +100,28 @@ relevant test fails, restore the source, and prove it passes. Record the
 property tested and result. Use a narrowed interference review after a rebase
 or hand-resolved hunk.
 
+Before reporting a mutation red set or empty set, validate the test-selection
+and result-counting instrument against a known-positive mutation. A selector
+that cannot detect its control leaves the set unmeasured.
+
+Require one property per test method, or `subTest` boundaries when setup must be
+shared. Sequential assertions for independent properties are not independent
+detectors: an early failure masks every later one.
+
 ### Classify and hand off
 
 - Major: wrong behavior, security/data risk, or material spec violation.
 - Medium: likely production defect or incomplete required path.
 - Low: non-blocking clarity, cleanup, or improvement.
 
-Send findings and the recommendation to the planner. Include location,
-consequence, required behavior, and severity. The planner routes fix work or
+Under an ACTIVE sprint document the planner holds the FnB's delegated approval
+for your sprint-scoped sends to the planner. Sending them SATISFIES the
+outbound-handoff approval gate — whether that gate reaches you from the base
+`review` skill or from your own system prompt — rather than bypassing it. The
+gate reverts to the FnB when the sprint document freezes.
+
+Each finding includes location, consequence, required behavior, and severity.
+The planner routes fix work or
 merge authority to the developer.
 
 On a clean pass, explicitly send the planner:
@@ -97,6 +140,8 @@ review head, with every blocking finding named.
 ## Run close-time conformance
 
 Use this procedure when the task says `Conformance`.
+
+The sprint-scoped send approval rule in **Classify and hand off** applies here.
 
 Read the governing spec and integrated code on `main` at the supplied SHA.
 Treat ratified deviations from the task as the complete intentional-deviation
@@ -134,9 +179,9 @@ Create a document titled `CONFORMANCE: <sprint title>`, kind `doc`, containing:
 Persist it with `./sc mem doc add`, then send one pointer:
 
 ```sh
-./sc mem message send <planner> \
-  "Conformance complete: doc <id>; <n> findings (<major>/<medium>/<low>)" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <sprint-doc-id>
+./sc mem message sent
 ```
 
 The planner owns finding disposition and close authority.
