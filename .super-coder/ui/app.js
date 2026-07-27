@@ -4520,6 +4520,7 @@ const sprintsState = {
   flowCleanups: [],
   renderedRoot: null,
   renderedSignature: null,
+  selectedByDocument: new Map(),
 };
 
 function sprintsDuration(startedAt, now = Date.now()) {
@@ -4608,6 +4609,9 @@ function sprintsUnitCard(unit, columnKey, unavailable) {
   const card = el("article", {
     className: `sprint-unit ${columnKey}`,
     title: `${unit.seq} ${unit.unit_title}`,
+    role: "button",
+    tabIndex: 0,
+    ariaPressed: "false",
   });
   card.dataset.seq = String(unit.seq);
   card.append(
@@ -4637,8 +4641,12 @@ function sprintsUnitCard(unit, columnKey, unavailable) {
     }
     card.append(deps);
   }
+  const details = el("div", {
+    className: "sprint-unit-details",
+    hidden: true,
+  });
   if (unit.overlap) {
-    card.append(el("div", {
+    details.append(el("div", {
       className: "sprint-unit-overlap",
       title: unit.overlap,
     }, unit.overlap));
@@ -4649,8 +4657,9 @@ function sprintsUnitCard(unit, columnKey, unavailable) {
       delivery.append(el("span", { title: unit.branch }, `Branch: ${unit.branch}`));
     if (unit.pr_number != null)
       delivery.append(el("span", {}, `PR #${unit.pr_number}`));
-    card.append(delivery);
+    details.append(delivery);
   }
+  if (details.children.length) card.append(details);
   return card;
 }
 
@@ -4772,28 +4781,64 @@ function sprintsBuildFlow(sprint) {
   sprintsState.flowCleanups.push(
     () => window.removeEventListener("resize", onResize));
 
+  let selectedSeq = sprintsState.selectedByDocument.get(sprint.document_id) || null;
+  if (selectedSeq && !cardOf.has(selectedSeq)) {
+    sprintsState.selectedByDocument.delete(sprint.document_id);
+    selectedSeq = null;
+  }
+
+  const spotlight = (seq) => {
+    const lit = new Set(seq ? [seq] : []);
+    wrap.classList.toggle("sprint-spotlight", Boolean(seq));
+    for (const wire of svg.querySelectorAll(".sprint-wire")) {
+      const incident = seq
+        && (wire.dataset.from === seq || wire.dataset.to === seq);
+      wire.classList.toggle("lit", Boolean(incident));
+      if (incident) {
+        lit.add(wire.dataset.from);
+        lit.add(wire.dataset.to);
+      }
+    }
+    for (const [otherSeq, other] of cardOf)
+      other.classList.toggle("lit", lit.has(otherSeq));
+  };
+
+  const select = (seq) => {
+    selectedSeq = seq;
+    if (seq) sprintsState.selectedByDocument.set(sprint.document_id, seq);
+    else sprintsState.selectedByDocument.delete(sprint.document_id);
+    for (const [otherSeq, other] of cardOf) {
+      const selected = otherSeq === seq;
+      const details = other.querySelectorAll(".sprint-unit-details")[0];
+      other.classList.toggle("selected", selected);
+      other.ariaPressed = String(selected);
+      if (details) {
+        details.hidden = !selected;
+        other.ariaExpanded = String(selected);
+      }
+    }
+    spotlight(seq);
+  };
+
   for (const [seq, card] of cardOf) {
     card.onmouseenter = () => {
-      const lit = new Set([seq]);
-      wrap.classList.add("sprint-hover");
-      for (const wire of svg.querySelectorAll(".sprint-wire")) {
-        const incident = wire.dataset.from === seq || wire.dataset.to === seq;
-        wire.classList.toggle("lit", incident);
-        if (incident) {
-          lit.add(wire.dataset.from);
-          lit.add(wire.dataset.to);
-        }
-      }
-      for (const [otherSeq, other] of cardOf)
-        other.classList.toggle("lit", lit.has(otherSeq));
+      if (!selectedSeq) spotlight(seq);
     };
     card.onmouseleave = () => {
-      wrap.classList.remove("sprint-hover");
-      for (const wire of svg.querySelectorAll(".sprint-wire"))
-        wire.classList.remove("lit");
-      for (const other of cardOf.values()) other.classList.remove("lit");
+      if (!selectedSeq) spotlight(null);
+    };
+    card.onclick = (event) => {
+      event.stopPropagation();
+      select(selectedSeq === seq ? null : seq);
+    };
+    card.onkeydown = (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      select(selectedSeq === seq ? null : seq);
     };
   }
+  wrap.onclick = () => select(null);
+  select(selectedSeq);
   return wrap;
 }
 

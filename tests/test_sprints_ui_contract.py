@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
@@ -314,6 +313,7 @@ out({
     text: card("U2").textContent,
     title: byClass(card("U2"), "sprint-unit-title")[0].title,
     overlap: byClass(card("U2"), "sprint-unit-overlap")[0].title,
+    detailsHidden: byClass(card("U2"), "sprint-unit-details")[0].hidden,
   },
   u1Roles: roles("U1"),
   u2Roles: roles("U2"),
@@ -332,6 +332,7 @@ out({
     assert long_title in result["u2"]["text"]
     assert result["u2"]["title"] == long_title
     assert result["u2"]["overlap"] == long_overlap
+    assert result["u2"]["detailsHidden"] is True
     assert "Branch: feat/sprints-flow-boards" in result["u2"]["text"]
     assert "PR #640" in result["u2"]["text"]
     assert all("active" not in role["className"] for role in result["u1Roles"])
@@ -510,12 +511,149 @@ out({
         "dependency unavailable: U9, U2, S59-U1, (empty), (empty)"
     ]
     assert result["unavailable"][1] == []
-    assert "sprint-hover" in result["hover"]["flow"]
+    assert "sprint-spotlight" in result["hover"]["flow"]
     assert result["hover"]["cards"] == ["U1", "U2"]
     assert result["hover"]["wires"] == 1
 
 
-def test_identical_refresh_reuses_dom_and_preserves_hover_and_scroll():
+def test_click_expands_details_pins_wires_and_blank_space_clears_selection():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const cards = byClass(flow, "sprint-unit");
+const card = (seq) => cards.find((node) => node.dataset.seq === seq);
+const details = byClass(card("U2"), "sprint-unit-details")[0];
+let stopped = 0;
+card("U2").onclick({ stopPropagation: () => { stopped += 1; } });
+card("U2").onmouseleave();
+const selected = {
+  stopped,
+  flow: flow.className,
+  cards: cards.filter((node) => node.classList.contains("selected"))
+    .map((node) => node.dataset.seq),
+  litCards: cards.filter((node) => node.classList.contains("lit"))
+    .map((node) => node.dataset.seq),
+  litWires: byClass(flow, "sprint-wire")
+    .filter((wire) => wire.classList.contains("lit")).length,
+  detailsHidden: details.hidden,
+  detailsText: details.textContent,
+  pressed: card("U2").ariaPressed,
+  expanded: card("U2").ariaExpanded,
+};
+flow.onclick();
+out({
+  selected,
+  cleared: {
+    flow: flow.className,
+    selectedCards: cards.filter(
+      (node) => node.classList.contains("selected")).length,
+    litCards: cards.filter((node) => node.classList.contains("lit")).length,
+    litWires: byClass(flow, "sprint-wire")
+      .filter((wire) => wire.classList.contains("lit")).length,
+    detailsHidden: details.hidden,
+    pressed: card("U2").ariaPressed,
+    expanded: card("U2").ariaExpanded,
+  },
+});
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending"),
+            unit(
+                "U2", "working", depends_on="U1",
+                overlap="shares scripts/sprint.py",
+                branch="feat/sprint-details", pr=650,
+            ),
+            unit("U3", "blocked"),
+        ])) + ";\n",
+    )
+    assert result["selected"] == {
+        "stopped": 1,
+        "flow": "sprint-flow sprint-spotlight",
+        "cards": ["U2"],
+        "litCards": ["U1", "U2"],
+        "litWires": 1,
+        "detailsHidden": False,
+        "detailsText": (
+            "shares scripts/sprint.py"
+            "Branch: feat/sprint-details"
+            "PR #650"
+        ),
+        "pressed": "true",
+        "expanded": "true",
+    }
+    assert result["cleared"] == {
+        "flow": "sprint-flow",
+        "selectedCards": 0,
+        "litCards": 0,
+        "litWires": 0,
+        "detailsHidden": True,
+        "pressed": "false",
+        "expanded": "false",
+    }
+
+
+def test_keyboard_toggles_selection_without_hijacking_other_keys():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const card = byClass(flow, "sprint-unit")[0];
+const details = byClass(card, "sprint-unit-details")[0];
+let prevented = 0;
+const key = (value) => ({
+  key: value,
+  preventDefault: () => { prevented += 1; },
+});
+card.onkeydown(key("ArrowDown"));
+const ignored = {
+  selected: card.classList.contains("selected"),
+  detailsHidden: details.hidden,
+  prevented,
+};
+card.onkeydown(key("Enter"));
+const selected = {
+  selected: card.classList.contains("selected"),
+  detailsHidden: details.hidden,
+  prevented,
+};
+card.onkeydown(key(" "));
+out({
+  role: card.role,
+  tabIndex: card.tabIndex,
+  ignored,
+  selected,
+  cleared: {
+    selected: card.classList.contains("selected"),
+    detailsHidden: details.hidden,
+    prevented,
+  },
+});
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "working", overlap="detail"),
+        ])) + ";\n",
+    )
+    assert result == {
+        "role": "button",
+        "tabIndex": 0,
+        "ignored": {
+            "selected": False,
+            "detailsHidden": True,
+            "prevented": 0,
+        },
+        "selected": {
+            "selected": True,
+            "detailsHidden": False,
+            "prevented": 1,
+        },
+        "cleared": {
+            "selected": False,
+            "detailsHidden": True,
+            "prevented": 2,
+        },
+    }
+
+
+def test_identical_refresh_reuses_dom_and_preserves_selection_and_scroll():
     result = run_js(
         """
 apiQueue = [DATA, JSON.parse(JSON.stringify(DATA))];
@@ -526,11 +664,14 @@ const flow = byClass(root, "sprint-flow")[0];
 const card = byClass(root, "sprint-unit")
   .find((node) => node.dataset.seq === "U1");
 flow.scrollLeft = 240;
-card.onmouseenter();
+card.onclick({ stopPropagation: () => {} });
+card.onmouseleave();
 await sprintsRefresh();
 out({
   flowReused: byClass(root, "sprint-flow")[0] === flow,
   scrollLeft: flow.scrollLeft,
+  selectedCards: byClass(root, "sprint-unit")
+    .filter((node) => node.classList.contains("selected")).length,
   litCards: byClass(root, "sprint-unit")
     .filter((node) => node.classList.contains("lit")).length,
   resizeListeners: windowListenerCount("resize"),
@@ -544,15 +685,18 @@ out({
     assert result == {
         "flowReused": True,
         "scrollLeft": 240,
+        "selectedCards": 1,
         "litCards": 2,
         "resizeListeners": 1,
     }
 
 
-def test_changed_refresh_replaces_dom_and_cleans_previous_resize_listener():
-    initial = payload(units=[unit("U1", "working")])
+def test_changed_refresh_replaces_dom_preserves_selection_and_cleans_listener():
+    initial = payload(units=[
+        unit("U1", "working", overlap="initial overlap"),
+    ])
     updated = payload(units=[
-        unit("U1", "working"),
+        unit("U1", "working", overlap="updated overlap"),
         unit("U2", "in_review", depends_on="U1"),
     ])
     result = run_js(
@@ -562,12 +706,20 @@ await sprintsRefresh({ render: false });
 const root = makeRoot();
 await renderSprints(root);
 const firstFlow = byClass(root, "sprint-flow")[0];
+const firstCard = byClass(firstFlow, "sprint-unit")[0];
+firstCard.onclick({ stopPropagation: () => {} });
 const before = windowListenerCount("resize");
 await sprintsRefresh();
+const nextFlow = byClass(root, "sprint-flow")[0];
+const selected = byClass(nextFlow, "sprint-unit")
+  .filter((node) => node.classList.contains("selected"));
 out({
-  flowReused: byClass(root, "sprint-flow")[0] === firstFlow,
+  flowReused: nextFlow === firstFlow,
   before,
   after: windowListenerCount("resize"),
+  selected: selected.map((node) => node.dataset.seq),
+  detailsHidden: byClass(selected[0], "sprint-unit-details")[0].hidden,
+  detailsText: byClass(selected[0], "sprint-unit-details")[0].textContent,
 });
 """,
         prelude=(
@@ -575,7 +727,14 @@ out({
             "const UPDATED = " + json.dumps(updated) + ";\n"
         ),
     )
-    assert result == {"flowReused": False, "before": 1, "after": 1}
+    assert result == {
+        "flowReused": False,
+        "before": 1,
+        "after": 1,
+        "selected": ["U1"],
+        "detailsHidden": False,
+        "detailsText": "updated overlap",
+    }
 
 
 def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
@@ -586,7 +745,8 @@ def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
     assert "overflow-x: auto" in sprint_css
     assert "text-overflow: ellipsis" in sprint_css
     assert "white-space: nowrap" in sprint_css
-    assert "cursor: pointer" not in sprint_css
+    assert "cursor: pointer" in sprint_css
+    assert ".sprint-unit:focus-visible" in sprint_css
 
 
 def test_zero_state_and_initial_failure_are_distinct():

@@ -599,7 +599,8 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   font-size: .65rem; line-height: 1.25rem; text-align: center; }
 .sprint-unit { min-width: 0; padding: .55rem .6rem; border: 1px solid var(--line);
   border-left: 3px solid var(--line); border-radius: 9px; background: var(--panel2);
-  transition: opacity .12s, border-color .12s, box-shadow .12s; }
+  cursor: pointer; transition: opacity .12s, border-color .12s, box-shadow .12s; }
+.sprint-unit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .sprint-unit.pending { border-left-color: var(--lock); }
 .sprint-unit.working { border-left-color: var(--task-open); }
 .sprint-unit.in_review { border-left-color: var(--accent); }
@@ -624,15 +625,18 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   margin-top: .35rem; color: var(--dim); font-size: .7rem;
 }
 .sprint-dep-warning { margin-left: .25rem; }
+.sprint-unit-details { min-width: 0; }
 .sprint-unit-delivery { display: flex; flex-direction: column; min-width: 0; }
 .sprint-unit-delivery > span { overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
 .sprint-wire { fill: none; stroke: rgba(110,168,254,.42); stroke-width: 1.6px; }
-.sprint-flow.sprint-hover .sprint-unit { opacity: .38; }
-.sprint-flow.sprint-hover .sprint-unit.lit { opacity: 1; border-color: var(--accent);
+.sprint-flow.sprint-spotlight .sprint-unit { opacity: .38; }
+.sprint-flow.sprint-spotlight .sprint-unit.lit { opacity: 1; border-color: var(--accent);
   box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
-.sprint-flow.sprint-hover .sprint-wire { stroke: rgba(110,168,254,.1); }
-.sprint-flow.sprint-hover .sprint-wire.lit { stroke: var(--accent); stroke-width: 2px; }
+.sprint-flow.sprint-spotlight .sprint-unit.selected {
+  box-shadow: 0 0 0 2px rgba(110,168,254,.58); }
+.sprint-flow.sprint-spotlight .sprint-wire { stroke: rgba(110,168,254,.1); }
+.sprint-flow.sprint-spotlight .sprint-wire.lit { stroke: var(--accent); stroke-width: 2px; }
 
 /* Roadmap Flow view — feature dependency graph: cards in stage columns with an
    SVG wire overlay (blocker → blocked). Replaces the old mermaid flowchart. */
