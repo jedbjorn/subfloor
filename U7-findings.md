@@ -228,6 +228,79 @@ needs no tmux keystroke race, just a positional argument. It still costs a model
 call per codex seat and still puts a synthetic turn in the transcript, so it does
 not change my recommendation.
 
+### F11 — CONDITION-2 ENUMERATION: there is a FOURTH description, and it is the frozen spec
+
+PLN2's condition 2 asked me to enumerate every description of codex readiness
+BEFORE editing, and to say how I looked if I found more than the three
+`interface_hooks.py` claims. I found **eight** descriptions across five files,
+and one of them is not a comment.
+
+How I looked (stated so the negative is evidence, not silence):
+1. `grep -rn "readiness\|startup_hook\|session_created"` over `*.py *.md *.json
+   *.ts *.tsx`, whole repo, node_modules excluded.
+2. `grep -rn "real start-readiness\|is NOT provider readiness\|only the
+   provider\|wake-armable\|never becomes wake"` — the phrasings that assert the
+   entrypoint/provider split without using the word "readiness".
+3. `grep -rn -i "session_start\|SessionStart\|provider readiness"` over `docs/`,
+   `*.md`, `.super-coder/adapters/`.
+4. `.super-coder/ui/app.js` — searched for `provider_ready`/`readiness`: **no
+   hits.** The UI renders `lifecycle` only; it holds no readiness description.
+5. The DB `documents` surface — spec #20 (the governing frozen spec), grepped
+   for the same terms.
+
+The eight:
+
+| # | Site | What it claims |
+|---|---|---|
+| 1 | `interface_hooks.py` module docstring | codex SessionStart "during session init — pre-prompt" |
+| 2 | `interface_hooks.py` readiness comment | two classes only; codex grouped with claude |
+| 3 | `CAPABILITIES["codex"]["readiness"]` | `"startup_hook"` |
+| 4 | `interface_hooks.py:75-80` SOURCES comment | "provider … session_start is the real readiness signal that moves starting→idle" |
+| 5 | `interface_hooks.py:63` EVENTS comment | session_start = "provider readiness" |
+| 6 | `interface_broker.py:505-507` `record_hook` docstring | "only the provider's session_start is real start-readiness" |
+| 7 | `interface_routes.py:2881` `_hook_callback` docstring | "only the provider's session_start is readiness" |
+| 8 | `interface_exec.py:194` | "without the provider session_start the session simply never becomes wake-armable" |
+
+1–3 are the three PLN2 named. 4–8 are the fourth-and-beyond, and they matter
+because 6/7/8 are the *engine* path's own statements, not the adapter table's.
+
+**And the ninth is spec #20 itself — frozen, and it contradicts direction (A)
+in terms:**
+
+> "A provider event that fires before its interactive prompt is ready does not
+> satisfy start-ready; **without a later native readiness signal that harness
+> cannot arm sprint wake.**"
+
+Codex has no later native readiness signal that arrives unbidden (F5, F9), so
+that sentence forbids arming a codex seat at all. (A) arms it on entrypoint
+evidence. That is a real departure from frozen spec text and it is a planner's
+call, not mine — reported to PLN2 rather than silently overridden.
+
+**But the sentence is already-violated text, not a live constraint.** Claude's
+`readiness` is `"startup_hook"`, which the code's own comment defines as
+"fires during startup, **before the interactive prompt is proven painted**" —
+precisely the class the spec says does not satisfy start-ready. The next
+sentence of that same comment states the deployed answer outright: *"Neither CLI
+offers a later native prompt-ready signal; the wake gate's quiet debounce +
+submit-hook fence absorb the residual window."* Claude arms today (46/46
+stamped) on exactly that reasoning. So the engine adopted "weak proof + debounce
++ fence" for claude long ago, in written tension with the spec sentence.
+
+(A) is therefore not a new exception — it extends an already-deployed principle
+to the one harness whose weak proof arrives from the entrypoint instead of from
+a native hook. Recommendation to PLN2: amend spec #20's sentence, or record
+decision #98 as superseding it. I have built (A) as ruled and flagged the text.
+
+### F12 — probe process disposition (PLN2 msg #3213 item 1)
+pid 66150 (`codex`, cwd `/tmp/u7probe`, started 11:38:24) — **killed, not
+reused.** Two reasons, both disqualifying: (a) it is post-first-turn, so its
+`SessionStart` has already fired and it can no longer exhibit the turn-less
+state that is the whole object of study; (b) it carries no engine hook
+credentials (`SC_INTERFACE_HOOK_TOKEN`/shell/generation), so it cannot exercise
+the entrypoint → broker path the fix changes. Verification needs an
+Interface-managed seat, which is what I am requesting from PLN2.
+`~/.codex/config.toml` was re-checked: zero `u7probe` references remain.
+
 ## Mechanism verdict (all three candidates resolved)
 - **CONFIG DISCOVERY — RULED OUT.** F2 + probe step 3/4: the project-layer file is
   found, parsed, validated and registered, in worktrees and in probes alike.
