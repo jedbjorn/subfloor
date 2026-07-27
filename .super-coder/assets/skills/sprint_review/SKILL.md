@@ -114,11 +114,12 @@ detectors: an early failure masks every later one.
 - Medium: likely production defect or incomplete required path.
 - Low: non-blocking clarity, cleanup, or improvement.
 
-Send the verdict to the planner immediately. The planner is the gate; delivering
-a completed verdict needs no additional permission. This displaces the base
-`review` skill's FnB approval gate for sprint-scoped verdicts; the FnB gate
-resumes when the sprint document freezes. Include location, consequence,
-required behavior, and severity. The planner routes fix work or
+Under an ACTIVE sprint document the planner holds the FnB's delegated approval
+for sprint-scoped verdicts. Sending your verdict to the planner SATISFIES the
+outbound-handoff approval gate — whether that gate reaches you from the base
+`review` skill or from your own system prompt — rather than bypassing it. The
+gate reverts to the FnB when the sprint document freezes. Include location,
+consequence, required behavior, and severity. The planner routes fix work or
 merge authority to the developer.
 
 On a clean pass, explicitly send the planner:

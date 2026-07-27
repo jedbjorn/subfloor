@@ -63,6 +63,7 @@
 # backups predate this rule and stay tracked; gitignore doesn't affect them.
 /db_backups/
 /shared/
+/sprint-result.md
 
 # The live_model opencode fixture is a real WAL-mode database, so even a
 # READ-ONLY open re-creates these two side files on every test run. The .db

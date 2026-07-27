@@ -102,8 +102,9 @@ Record assignment changes before boot:
 
 ```sh
 ./sc sprint unit set --sprint <doc-id> --seq <unit> --dev <dev> --reviewer <rev>
-./sc mem message send <worker> "<exact continuation>" \
+./sc mem message send <worker> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ```
 
 Use `blocked` while the unit has no active path:

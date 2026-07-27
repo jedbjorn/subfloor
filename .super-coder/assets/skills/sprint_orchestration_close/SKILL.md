@@ -44,9 +44,9 @@ Assign an independent reviewer to compare the governing spec with integrated
 `main` at one recorded SHA. Send:
 
 ```sh
-./sc mem message send <reviewer> \
-  "Conformance for sprint <doc-id>: spec <spec-id>, main <sha>, scope <sections>. Ratified deviations: <list>. Load sprint_review and run its conformance procedure." \
+./sc mem message send <reviewer> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ./sc run <reviewer> --harness <review-harness> -m <review-model> --effort high
 ```
 

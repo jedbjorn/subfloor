@@ -172,12 +172,17 @@ and unfrozen; it must not remain armed.
 Every sprint `task` and `result` row carries `--sprint <doc-id>`. This makes the
 event wake-eligible and keeps parallel sprints separable.
 
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
+
 Send exact assignments:
 
 ```sh
-./sc mem message send <dev> \
-  "Unit U1: <scope>. Spec <id>. Dependencies <list>. Reviewer <rev>. Start <now|after U0>. Load sprint_dev." \
+./sc mem message send <dev> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ```
 
 Quote every fact the worker needs in its own task row. A message ID addressed to
@@ -192,9 +197,9 @@ The board reserves each reviewer. Dispatch the reviewer when a developer reports
 a green exact head:
 
 ```sh
-./sc mem message send <reviewer> \
-  "Review U1 at PR #123 head <sha>. Major/Medium block; Low informs. Return the verdict to me. Load sprint_review." \
+./sc mem message send <reviewer> "$(<./sprint-result.md)" \
   --kind task --sprint <doc-id>
+./sc mem message sent
 ```
 
 Boot only the actor that owns the next transition:
