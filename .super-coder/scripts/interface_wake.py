@@ -217,7 +217,8 @@ class WakeCoordinator:
                 # H-4: rows the planner has already read wake nobody. Retire
                 # them before probing, so an inbox drained by hand costs no
                 # wake turn at all.
-                if interface_broker.sweep_read_queued(con, binding_id):
+                skipped = interface_broker.sweep_read_queued(con, binding_id)
+                if skipped:
                     con.commit()
                 queued = con.execute(
                     "SELECT 1 FROM planner_wake_items i "
@@ -227,7 +228,10 @@ class WakeCoordinator:
                     (binding_id,)).fetchone()
                 if queued is None:
                     return
-                batch_id = interface_broker.form_batch(con, binding_id)
+                # H-28: carry the skip count onto the batch, so suppression is
+                # observable rather than merely correct.
+                batch_id = interface_broker.form_batch(
+                    con, binding_id, skipped_read=skipped)
                 con.commit()
             else:
                 batch_id = live[0]

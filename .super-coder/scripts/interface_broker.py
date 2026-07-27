@@ -947,7 +947,7 @@ def sweep_read_queued(con, binding_id: int) -> int:
     return len(items)
 
 
-def form_batch(con, binding_id: int) -> int:
+def form_batch(con, binding_id: int, skipped_read: int = 0) -> int:
     """Coalesce a binding's currently queued UNREAD items into one batch (the
     fixed-prompt submission unit). The partial unique index backstops the
     one-live-batch invariant; items join oldest first.
@@ -955,7 +955,13 @@ def form_batch(con, binding_id: int) -> int:
     An item whose message was read between queueing and here never joins the
     batch (H-4) — `sweep_read_queued` completes it instead. The join is the
     load-bearing half of that rule: the sweep can lose a race with a planner
-    reading a row, this cannot."""
+    reading a row, this cannot.
+
+    `skipped_read` records how many rows the sweep retired on the way to this
+    batch (H-28). Suppression must itself be observable — this spec's own
+    monitor rule — or a queue that went quiet because rows were correctly
+    skipped reads identically to one that went quiet because nothing
+    arrived."""
     binding = con.execute(
         "SELECT shell_id, generation FROM sprint_planner_bindings "
         "WHERE binding_id=? AND released_at IS NULL",
@@ -963,9 +969,9 @@ def form_batch(con, binding_id: int) -> int:
     if binding is None:
         raise BrokerError(f"binding {binding_id} not found or released")
     cur = con.execute(
-        "INSERT INTO planner_wake_batches (binding_id, shell_id, generation) "
-        "VALUES (?,?,?)",
-        (binding_id, binding[0], binding[1]))
+        "INSERT INTO planner_wake_batches "
+        "(binding_id, shell_id, generation, skipped_read) VALUES (?,?,?,?)",
+        (binding_id, binding[0], binding[1], skipped_read))
     batch_id = cur.lastrowid
     items = con.execute(
         "SELECT i.item_id FROM planner_wake_items i "

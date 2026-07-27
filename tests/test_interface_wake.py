@@ -1276,6 +1276,21 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
             self.one("SELECT state FROM planner_wake_items"), "queued",
             "the row survives for the next sweep — it is not lost")
 
+    async def test_batch_records_how_many_rows_were_skipped_as_read(self):
+        """H-28: the suppression is itself observable. Without the count, a
+        queue that went quiet because rows were correctly skipped reads
+        exactly like one that went quiet because nothing arrived."""
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task", read=True)
+        self.add_message("task", read=True)
+        self.add_message("result", read=False)
+        self.coord.notify_binding(self.binding)
+        ok = await self.wait_for(lambda: len(self.writes) == 1)
+        self.assertTrue(ok)
+        self.assertEqual(
+            self.one("SELECT skipped_read FROM planner_wake_batches"), 2,
+            "the batch must name how much it suppressed")
+
     async def test_unread_row_still_drains_when_a_read_row_precedes_it(self):
         """The suppression is per-row: it must not swallow live work."""
         self.coord.start(asyncio.get_running_loop())
