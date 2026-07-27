@@ -78,8 +78,16 @@ def add_binding(
         "INSERT INTO interface_generations (shell_id, generation) VALUES (?,?)",
         (planner, generation),
     )
+    # An ARMED seat, not merely a row: occupied, on the binding's own
+    # generation, running a harness whose mandatory lifecycle hooks exist.
+    # S84 H-8 gave the poller the message ingress's eligibility ladder, so a
+    # session with no harness and a default 'reserved' occupancy is now
+    # correctly refused a wake item — it could never have submitted one. This
+    # fixture meant an armed planner and only looked like one.
     session_id = con.execute(
-        "INSERT INTO interface_sessions (shell_id, generation) VALUES (?,?)",
+        "INSERT INTO interface_sessions (shell_id, generation, occupancy, "
+        "lifecycle, harness, cli_version) "
+        "VALUES (?,?,'occupied','idle','kimi','kimi-code 0.27.0')",
         (planner, generation),
     ).lastrowid
     binding_id = con.execute(
@@ -737,11 +745,17 @@ class ReconcilerDeliveryTest(unittest.TestCase):
         migration_name = "0102_reconciler_alert_keys.sql"
         legacy = build_db(skip={migration_name})
         self.addCleanup(legacy.close)
-        interface_broker._alert(
-            legacy,
-            severity="warning",
-            reason="legacy_open",
-        )
+        # Seeded with a direct INSERT, not through `_alert`. This DB is a
+        # deliberately PRE-0102 table, and `_alert` is shipped code that names
+        # the post-0102 columns — the engine only ever runs schema.sql plus
+        # every migration, so calling it against a half-applied schema tests a
+        # state that cannot exist and breaks the moment any later migration
+        # adds a column (S84 H-5 added sprint_doc_id to the insert). The
+        # subject here is the MIGRATION's expand-without-rewrite, and a
+        # literal legacy row states that more directly.
+        legacy.execute(
+            "INSERT INTO planner_alerts (severity, reason, dedupe_key) "
+            "VALUES ('warning','legacy_open','-|-|-|legacy_open')")
         legacy.commit()
         before = legacy.execute(
             "SELECT alert_id, severity, reason, dedupe_key, resolved_at "

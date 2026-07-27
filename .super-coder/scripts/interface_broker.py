@@ -122,13 +122,20 @@ def _alert(con, *, severity: str, reason: str, session_id=None,
     `sprint_doc_id` is the post-0102 reconciliation column (with `unit_id`,
     `role`, `signal`) — sprint-flow alerts carry the sprint they belong to
     rather than encoding it into `dedupe_key` alone, so
-    `idx_planner_alerts_reconciliation` can find them. It joins the dedupe
-    key ONLY when set, which leaves every existing key byte-identical: a
-    format change here would stop new inserts colliding with alerts already
-    open in a live DB and mint one duplicate apiece.
+    `idx_planner_alerts_reconciliation` can find them.
+
+    BOTH NEW SCOPES APPEND; neither widens the key. The obvious edit — splicing
+    batch_id in beside the other refs — rewrites the key of EVERY alert,
+    including the ones carrying neither new scope. Nothing new would then
+    collide with a row already open in a live DB, and each open alert would
+    mint one duplicate at deploy. Appending only when set leaves every existing
+    key byte-identical, and it cannot merge two rows that should be distinct,
+    because a batch determines its binding and a binding its sprint.
     """
     dedupe = (f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}"
-              f"|{batch_id or '-'}|{reason}")
+              f"|{reason}")
+    if batch_id is not None:
+        dedupe += f"|batch{batch_id}"
     if sprint_doc_id is not None:
         dedupe += f"|sprint{sprint_doc_id}"
     if session_id is not None:
