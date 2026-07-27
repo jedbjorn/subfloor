@@ -120,7 +120,7 @@ outbound-handoff approval gate — whether that gate reaches you from the base
 `review` skill or from your own system prompt — rather than bypassing it. The
 gate reverts to the FnB when the sprint document freezes.
 
-Each verdict includes location, consequence, required behavior, and severity.
+Each finding includes location, consequence, required behavior, and severity.
 The planner routes fix work or
 merge authority to the developer.
 
