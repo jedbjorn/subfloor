@@ -45,6 +45,17 @@ ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 MIGRATION = MIGRATIONS / "0098_sprint_units.sql"
+# 0098 declared the board; later deltas reshape it. A fork upgrading runs the
+# CHAIN, so the fixture below must skip and then re-apply all of it — pinning
+# only 0098 would compare "the board as first declared" against "the baseline
+# plus every delta" and fail on the first ALTER anyone ever adds, while
+# proving nothing about whether the upgrade path reaches the same table.
+# Append to this tuple whenever a migration touches sprint_units.
+BOARD_MIGRATIONS = (
+    MIGRATION,
+    MIGRATIONS / "0108_sprint_unit_transitions.sql",
+    MIGRATIONS / "0109_sprint_pr_unit_linkage.sql",
+)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
@@ -95,7 +106,7 @@ def build_pre_migration_db(path: Path) -> None:
     con = sqlite3.connect(path)
     con.executescript(SCHEMA.read_text())
     for p in sorted(MIGRATIONS.glob("*.sql")):
-        if p != MIGRATION:
+        if p not in BOARD_MIGRATIONS:
             con.executescript(p.read_text())
     con.execute("DROP TABLE IF EXISTS sprint_units")   # drops its index too
     seed_fixtures(con)
@@ -132,7 +143,7 @@ def _unit_args(**over):
     difference between "absent" and "explicitly cleared"."""
     args = dict(sprint=1, seq="U1", title="board record", dev=None,
                 reviewer=None, depends_on=None, overlap=None, branch=None,
-                pr=None, state=None)
+                pr=None, review_head=None, state=None)
     args.update(over)
     return mock.Mock(**args)
 
@@ -646,6 +657,9 @@ class BoardRecordTest(_BoardCase):
         the record says — both roles — not what a document body remembers."""
         self.add(seq="U1", unit_title="board record", dev="DEV5",
                  reviewer="REV2", depends_on="U0", branch="feat/b", pr_number=7)
+        # in_review is reached THROUGH working — the board is a machine, and
+        # pending -> in_review is not one of its edges (0108).
+        self.patch(seq="U1", state="working")
         self.patch(seq="U1", state="in_review")
         _s, out = self.call("GET", "/api/sprint-units?sprint_doc_id=1", (OP,))
         buf = io.StringIO()
@@ -978,6 +992,146 @@ class BoardRecordTest(_BoardCase):
         self.assertEqual([u["sprint_doc_id"] for u in out["units"]], [1])
 
 
+class BoardTransitionRouteTest(_BoardCase):
+    """The transition machine AS THE ROUTE SERVES IT (spec #76 H-11).
+
+    test_interface_transitions.py already walks the whole matrix against both
+    enforcement layers. What it cannot see is the layer a planner actually
+    meets: whether the API answers a refused move with a status and a sentence
+    it can act on, or with a 500 carrying an IntegrityError — and whether the
+    refused move left the row alone.
+    """
+
+    def test_every_legal_edge_is_served(self):
+        """The permissive half. A machine tested only by what it refuses
+        passes just as well when it refuses everything, and a board that
+        cannot reach in_review is worse than one that can be walked back."""
+        for path in (("working", "in_review", "working", "blocked", "working",
+                      "merged"),
+                     ("working", "in_review", "blocked", "working",
+                      "in_review", "merged"),
+                     ("working", "blocked", "cancelled"),
+                     ("cancelled",),
+                     ("working", "in_review", "cancelled")):
+            with self.subTest(path=path):
+                seq = "U" + "".join(s[0] for s in path)
+                self.add(seq=seq)
+                for state in path:
+                    status, out = self.patch(seq=seq, state=state)
+                    self.assertEqual(status, 200, out)
+                    self.assertEqual(out["state"], state)
+                self.assertEqual(self.row(seq)["state"], path[-1])
+
+    def test_an_illegal_move_is_refused_by_name_and_changes_nothing(self):
+        self.add(seq="U1")
+        before = self.row("U1")
+        status, err = self.patch(seq="U1", state="in_review")
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "illegal_unit_transition")
+        # The message has to name the move AND what IS reachable — "illegal
+        # transition" alone sends the planner back to the migration to find
+        # out what to type instead.
+        self.assertIn("pending -> in_review", err["error"]["message"])
+        self.assertIn("working", err["error"]["message"])
+        after = self.row("U1")
+        self.assertEqual(after["state"], "pending")
+        self.assertEqual(after["state_changed_at"], before["state_changed_at"])
+        self.assertEqual(after["updated_at"], before["updated_at"])
+
+    def test_terminal_is_terminal_through_the_route(self):
+        """Both terminals, every exit, through the API — and the refusal has
+        to teach the remedy, because "no" without "declare a successor unit"
+        is what makes an operator go looking for a --force flag."""
+        for terminal in ("merged", "cancelled"):
+            seq = f"U{terminal[:3]}"
+            self.add(seq=seq)
+            self.patch(seq=seq, state="working")
+            self.assertEqual(
+                self.patch(seq=seq, state=terminal)[0], 200)
+            for target in ("pending", "working", "in_review", "blocked",
+                           "merged", "cancelled"):
+                if target == terminal:
+                    continue      # a same-state re-assert is a legal no-op
+                with self.subTest(edge=f"{terminal}->{target}"):
+                    status, err = self.patch(seq=seq, state=target)
+                    self.assertEqual(status, 409, err)
+                    self.assertEqual(err["error"]["code"],
+                                     "illegal_unit_transition")
+                    self.assertIn("SUCCESSOR UNIT", err["error"]["message"])
+                    self.assertEqual(self.row(seq)["state"], terminal)
+
+    def test_a_terminal_unit_still_accepts_its_own_state(self):
+        """A re-assert is how an idempotent retry lands after an ambiguous
+        timeout. Refusing it would turn "the response was lost" into "the
+        sprint cannot be closed"."""
+        self.add(seq="U1")
+        self.patch(seq="U1", state="working")
+        self.patch(seq="U1", state="merged")
+        moved = self.row("U1")["state_changed_at"]
+        status, out = self.patch(seq="U1", state="merged")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(self.row("U1")["state"], "merged")
+        self.assertEqual(self.row("U1")["state_changed_at"], moved,
+                         "a no-op re-assert restamped the clock")
+
+    def test_one_pr_belongs_to_one_unit(self):
+        """H-13's board half. Two units claiming one PR makes every structured
+        answer to "which unit is this event about" depend on read order."""
+        self.add(seq="U1", pr_number=658)
+        self.add(seq="U2")
+        status, err = self.patch(seq="U2", pr_number=658)
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "pr_already_claimed")
+        self.assertIn("U1", err["error"]["message"])
+        self.assertIsNone(self.row("U2")["pr_number"])
+        # Declaring the collision is refused the same way an edit is — the
+        # constraint is the board's, not one route's.
+        status, err = self.add(seq="U3", pr_number=658)
+        self.assertEqual(status, 409, err)
+        self.assertEqual(err["error"]["code"], "pr_already_claimed")
+        self.assertIsNone(self.row("U3"))
+        # and the claim is releasable, so a mis-typed PR is not permanent
+        self.assertEqual(self.patch(seq="U1", pr_number=None)[0], 200)
+        self.assertEqual(self.patch(seq="U2", pr_number=658)[0], 200)
+        self.assertEqual(self.row("U2")["pr_number"], 658)
+
+    def test_two_units_may_both_have_no_pr(self):
+        """The index is PARTIAL. A board's normal state is many units with no
+        PR yet, and a plain UNIQUE would have refused the second one."""
+        self.assertEqual(self.add(seq="U1")[0], 201)
+        self.assertEqual(self.add(seq="U2")[0], 201)
+        self.assertEqual(self.add(seq="U3")[0], 201)
+
+    def test_review_head_is_recorded_and_projected(self):
+        """H-14: the reviewer's verdict head becomes a column the record
+        carries, not a sentence in a message body."""
+        self.add(seq="U1")
+        self.patch(seq="U1", state="working")
+        self.patch(seq="U1", state="in_review")
+        status, out = self.patch(seq="U1", review_head="963dc8c3")
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["review_head"], "963dc8c3")
+        self.assertEqual(self.row("U1")["review_head"], "963dc8c3")
+        # PRESENCE, not correctness — the route stores what the planner read
+        # off the verdict and judges none of it (decision #76).
+        self.assertEqual(
+            self.patch(seq="U1", review_head="not-a-sha")[0], 200)
+        # blank is not a value; null retracts
+        self.assertEqual(self.patch(seq="U1", review_head="  ")[0], 422)
+        self.assertEqual(self.patch(seq="U1", review_head=None)[0], 200)
+        self.assertIsNone(self.row("U1")["review_head"])
+
+    def test_review_head_cannot_ride_a_state_move(self):
+        """`state_changed_at` has exactly one writer, and H-14 does not buy a
+        second door into the state column."""
+        self.add(seq="U1")
+        status, err = self.patch(seq="U1", state="working",
+                                 review_head="963dc8c3")
+        self.assertEqual(status, 422, err)
+        self.assertEqual(err["error"]["code"], "state_moves_alone")
+        self.assertEqual(self.row("U1")["state"], "pending")
+
+
 class LiveUpgradeTest(_BoardCase):
     """Migration 0098 as the thing under test, rather than as a file that
     happens to run on the way to a fixture.
@@ -996,7 +1150,8 @@ class LiveUpgradeTest(_BoardCase):
     def upgrade(self):
         con = sqlite3.connect(self.db_path)
         try:
-            migrate.apply(con, MIGRATION)
+            for migration in BOARD_MIGRATIONS:
+                migrate.apply(con, migration)
         finally:
             con.close()
 

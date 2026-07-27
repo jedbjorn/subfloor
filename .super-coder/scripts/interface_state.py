@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Interface state machines — app-level transition validation (spec #20).
 
-The DB triggers in migrations/0078_interface_sessions.sql are the backstop
-(RAISE(ABORT)); these maps mirror them so the API/broker can pre-check and
-fail with a friendly error instead of an IntegrityError. KEEP THE TWO IN
-SYNC — tests/test_interface_transitions.py walks every (old, new) pair of
-every machine against BOTH layers and fails on any drift.
+The DB triggers are the backstop (RAISE(ABORT)); these maps mirror them so the
+API/broker can pre-check and fail with a friendly error instead of an
+IntegrityError. KEEP THE TWO IN SYNC — tests/test_interface_transitions.py
+walks every (old, new) pair of every machine against BOTH layers and fails on
+any drift.
+
+Triggers live in migrations/0078_interface_sessions.sql (the Interface
+machines) and migrations/0108_sprint_unit_transitions.sql (the sprint board).
 
 Edge rationales trace to spec #20's Occupancy Model / Input Broker / Wake
 Delivery sections. Two deliberate readings of the spec's edge lists:
@@ -98,7 +101,31 @@ RECEIPT_EDGES = {
     "reconciled": set(),
 }
 
+# The sprint board's own lifecycle (spec #76 H-11, migration 0108). Mirrors
+# trg_sprint_units_state.
+#
+# merged and cancelled map to the empty set and that is the whole point: a
+# terminal unit has no exit. A mis-declared one is corrected by declaring a
+# SUCCESSOR UNIT at a new seq, never by re-opening the row — the terminal row
+# stands as the record of what was declared (decision #82's shape). There is
+# deliberately no override edge, no admin escape and no force verb to add one.
+SPRINT_UNIT_EDGES = {
+    "pending": {"working", "cancelled"},
+    "working": {"in_review", "blocked", "merged", "cancelled"},
+    "in_review": {"working", "blocked", "merged", "cancelled"},
+    "blocked": {"working", "cancelled"},
+    "merged": set(),
+    "cancelled": set(),
+}
+
 # (table, pk column, state column, edge map) — one entry per machine.
+#
+# `sprint_unit` is registered here so the drift walker covers it, but its state
+# is NOT moved through transition(): the board's PATCH route pre-checks with
+# check() and then writes state, state_changed_at, updated_at and
+# updated_by_shell_id in ONE update, so the move stays attributable to the
+# planner that made it. Call check() for that machine, not transition(), or the
+# row loses its provenance columns.
 MACHINES = {
     "occupancy": ("interface_sessions", "session_id", "occupancy", OCCUPANCY_EDGES),
     "lifecycle": ("interface_sessions", "session_id", "lifecycle", LIFECYCLE_EDGES),
@@ -107,6 +134,7 @@ MACHINES = {
     "wake_item": ("planner_wake_items", "item_id", "state", WAKE_ITEM_EDGES),
     "wake_batch": ("planner_wake_batches", "batch_id", "state", WAKE_BATCH_EDGES),
     "receipt": ("planner_action_receipts", "receipt_id", "state", RECEIPT_EDGES),
+    "sprint_unit": ("sprint_units", "unit_id", "state", SPRINT_UNIT_EDGES),
 }
 
 # State tables carrying an updated_at column, touched on every transition.

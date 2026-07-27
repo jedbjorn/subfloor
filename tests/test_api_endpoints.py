@@ -187,6 +187,7 @@ class AssemblerSmokeTest(unittest.TestCase):
 class ActiveSprintsProjectionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.con = build_db()
+        self._next_pr = 100
         self.planner_old = self._shell("PLN-OLD")
         self.planner_new = self._shell("PLN-NEW")
         self.dev = self._shell("DEV")
@@ -220,13 +221,17 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
             (feature_id, kind, seq, title, frozen, body, created_at)).lastrowid
 
     def _unit(self, doc_id: int, seq: str, *, state="pending") -> int:
+        # A distinct PR per unit: one PR belongs to one unit (0109's partial
+        # unique index), so a fixture reusing 42 for every row now describes a
+        # board no planner could have declared.
+        self._next_pr += 1
         return self.con.execute(
             "INSERT INTO sprint_units "
             "(sprint_doc_id, seq, unit_title, dev_shell_id, "
             "reviewer_shell_id, state, depends_on, overlap, branch, pr_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'U0', 'server.py', 'feat/unit', 42)",
+            "VALUES (?, ?, ?, ?, ?, ?, 'U0', 'server.py', 'feat/unit', ?)",
             (doc_id, seq, f"Unit {seq}", self.dev, self.reviewer,
-             state)).lastrowid
+             state, self._next_pr)).lastrowid
 
     def _binding(self, doc_id: int, planner_id: int, *,
                  released=False) -> int:

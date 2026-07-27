@@ -131,6 +131,14 @@ class TransitionMatrixTest(unittest.TestCase):
         self.con.commit()
         return cur.lastrowid
 
+    def _unit_row(self, state, n):
+        self.con.execute("DELETE FROM sprint_units")
+        cur = self.con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title, state)"
+            " VALUES (1,?,'unit',?)", (f"U{n}", state))
+        self.con.commit()
+        return cur.lastrowid
+
     def _receipt_row(self, state, n):
         self.con.execute("DELETE FROM planner_action_receipts")
         cur = self.con.execute(
@@ -205,6 +213,55 @@ class TransitionMatrixTest(unittest.TestCase):
             return self._receipt_row(old, n[0])
 
         self._walk("receipt", factory)
+
+    def test_sprint_unit_machine(self):
+        n = [0]
+
+        def factory(old, _new):
+            n[0] += 1
+            return self._unit_row(old, n[0])
+
+        self._walk("sprint_unit", factory)
+
+    def test_the_board_has_no_way_out_of_terminal(self):
+        """The matrix walk above proves merged/cancelled refuse every named
+        move. This asks the narrower question the walk cannot: that the
+        refusal is a property of the SOURCE state rather than a list of
+        destinations someone remembered to enumerate.
+
+        Both layers, independently — a machine whose app map is closed while
+        its trigger is open reads as safe from every test that goes through
+        the API, and the DB is where the board actually lives.
+        """
+        states = set(interface_state.SPRINT_UNIT_EDGES)
+        self.assertEqual({"merged", "cancelled"},
+                         {s for s in states
+                          if not interface_state.SPRINT_UNIT_EDGES[s]},
+                         "the terminal set drifted from merged+cancelled")
+        n = 0
+        for terminal in ("merged", "cancelled"):
+            for target in sorted(states - {terminal}):
+                n += 1
+                with self.subTest(edge=f"{terminal}->{target}"):
+                    row_id = self._unit_row(terminal, n)
+                    with self.assertRaises(
+                            interface_state.InterfaceTransitionError):
+                        interface_state.transition(
+                            self.con, "sprint_unit", row_id, target)
+                    n += 1
+                    row_id = self._unit_row(terminal, n)
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        self.con.execute(
+                            "UPDATE sprint_units SET state=? WHERE unit_id=?",
+                            (target, row_id))
+                        self.con.commit()
+                    self.con.rollback()
+                    self.assertEqual(
+                        self.con.execute(
+                            "SELECT state FROM sprint_units WHERE unit_id=?",
+                            (row_id,)).fetchone()[0], terminal)
+        self.assertEqual(n, 20, "the terminal sweep stopped covering the "
+                                "whole vocabulary")
 
 
 if __name__ == "__main__":

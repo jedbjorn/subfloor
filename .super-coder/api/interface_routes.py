@@ -65,6 +65,7 @@ import interface_wake  # noqa: E402
 import live_model  # noqa: E402
 import ports as ports_mod  # noqa: E402
 import shell_liveness  # noqa: E402
+from sprint_units import TERMINAL_UNIT_STATES as _TERMINAL_UNIT_STATES  # noqa: E402,E501
 from sprint_units import UNIT_STATES as _UNIT_STATES  # noqa: E402
 from sprint_units import board_writer as _board_writer  # noqa: E402
 
@@ -2322,6 +2323,12 @@ _UNIT_FIELDS = {
     "overlap": (str, True),
     "branch": (str, True),
     "pr_number": (int, True),
+    # The reviewer's `review-clean head=<sha>` verdict, as the planner records
+    # it when moving a unit out of in_review (H-14). Free text on purpose:
+    # close checks PRESENCE, never correctness — judging whether that SHA is
+    # the head that was reviewed is the planner's call (decision #76), and a
+    # format check here would only teach a planner to type past it.
+    "review_head": (str, True),
 }
 _UNIT_ROLES = {"dev": "dev_shell_id", "reviewer": "reviewer_shell_id"}
 
@@ -2364,6 +2371,49 @@ def _bad_unit_field(body):
                         f"{field} cannot be blank"
                         + (" — pass null to clear it" if clearable else ""))
     return None
+
+
+def _no_such_move(doc_id, seq: str, was: str, now: str) -> str:
+    """The refusal a planner reads when it asks the board for a move the
+    machine does not have (H-11). Terminal gets its own sentence because the
+    remedy is different in kind: every other illegal move is a typo to retype,
+    while a wrong `merged`/`cancelled` is a declaration that has to be
+    superseded rather than undone."""
+    if was in _TERMINAL_UNIT_STATES:
+        return (f"sprint {doc_id} unit {seq} is {was} — terminal, and terminal "
+                f"has no exits. The row is the record of what was declared, so "
+                f"a mis-declared {was} is corrected by declaring a SUCCESSOR "
+                f"UNIT at a new seq that redoes or disposes of the work, not "
+                f"by re-opening this one")
+    legal = sorted(interface_state.SPRINT_UNIT_EDGES.get(was, ()))
+    return (f"sprint {doc_id} unit {seq} cannot go {was} -> {now}; from {was} "
+            f"the board admits {', '.join(legal)}")
+
+
+def _pr_claimed_by(con, doc_id, pr_number, seq: str):
+    """The partial unique index idx_sprint_units_pr_claim (0109) fires as a
+    bare IntegrityError, which reads to a planner as "the write failed" and
+    names neither the PR nor the unit already holding it. Translate it: return
+    an error object when some OTHER unit on this board already claims
+    `pr_number`, else None so the caller reports its own conflict.
+
+    Re-derived by query rather than parsed out of the driver's message —
+    every driver phrases a constraint violation differently, and the answer a
+    planner needs (WHICH unit) is not in that string on any of them.
+    """
+    if pr_number is None:
+        return None
+    row = con.execute(
+        "SELECT seq FROM sprint_units "
+        "WHERE sprint_doc_id=? AND pr_number=? AND seq<>?",
+        (doc_id, pr_number, seq)).fetchone()
+    if row is None:
+        return None
+    return _err_obj(
+        "pr_already_claimed",
+        f"PR #{pr_number} is already unit {row[0]}'s on sprint {doc_id} — one "
+        f"PR belongs to one unit, and pointing {seq} at it too would leave "
+        "the reconciler resolving its events to whichever row it read first")
 
 
 def _may_write_board(con, actor, sprint_doc_id: int):
@@ -2425,8 +2475,8 @@ class _BadShell(Exception):
 _UNIT_COLS = (
     "unit_id", "sprint_doc_id", "seq", "unit_title", "dev_shell_id",
     "reviewer_shell_id", "state", "depends_on", "overlap", "branch",
-    "pr_number", "assigned_at", "state_changed_at", "updated_at",
-    "updated_by_shell_id")
+    "pr_number", "review_head", "assigned_at", "state_changed_at",
+    "updated_at", "updated_by_shell_id")
 
 
 def _unit_projection(con, unit_id: int) -> dict:
@@ -2669,15 +2719,21 @@ def _add_sprint_unit(actor, headers, body):
                     "INSERT INTO sprint_units "
                     "(sprint_doc_id, seq, unit_title, dev_shell_id, "
                     " reviewer_shell_id, state, depends_on, overlap, branch, "
-                    " pr_number, assigned_at, updated_by_shell_id) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " pr_number, review_head, assigned_at, "
+                    " updated_by_shell_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (doc_id, seq, title, roles["dev_shell_id"],
                      roles["reviewer_shell_id"], state,
                      body.get("depends_on"), body.get("overlap"),
                      body.get("branch"), body.get("pr_number"),
+                     body.get("review_head"),
                      _now(con) if any(roles.values()) else None,
                      actor.shell_id))
             except db_driver.IntegrityError:
+                claimed = _pr_claimed_by(con, doc_id, body.get("pr_number"),
+                                         seq)
+                if claimed is not None:
+                    return 409, claimed
                 return 409, _err_obj(
                     "unit_exists",
                     f"sprint {doc_id} already has unit {seq} — edit it with "
@@ -2755,6 +2811,13 @@ def _patch_sprint_unit(actor, headers, body):
             unit_id, was_state, was_dev, was_rev = row
             sets, params = [], []
             if state is not None:
+                try:
+                    interface_state.check(
+                        interface_state.SPRINT_UNIT_EDGES, was_state, state)
+                except interface_state.InterfaceTransitionError:
+                    return 409, _err_obj(
+                        "illegal_unit_transition", _no_such_move(
+                            doc_id, seq, was_state, state))
                 sets.append("state=?")
                 params.append(state)
                 if state != was_state:
@@ -2781,9 +2844,16 @@ def _patch_sprint_unit(actor, headers, body):
             sets.append("updated_at=datetime('now')")
             sets.append("updated_by_shell_id=?")
             params.append(actor.shell_id)
-            con.execute(
-                f"UPDATE sprint_units SET {', '.join(sets)} WHERE unit_id=?",
-                (*params, unit_id))
+            try:
+                con.execute(
+                    f"UPDATE sprint_units SET {', '.join(sets)} "
+                    "WHERE unit_id=?", (*params, unit_id))
+            except db_driver.IntegrityError:
+                claimed = _pr_claimed_by(con, doc_id, edits.get("pr_number"),
+                                         seq)
+                if claimed is not None:
+                    return 409, claimed
+                raise
             # A role omitted from the body is left alone, so `after` is the
             # row as it now reads — not the request. The counterpart the
             # notice names has to be the board's, not the caller's subset.

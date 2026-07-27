@@ -7,11 +7,13 @@ one vantage — everything shell-side rides the engine API (token identity,
 the `sc mem` doctrine):
 
     ./sc watch pr <owner/repo> <n> [--shell <shortname>] --sprint <doc-id>
-                                                           register a watch
+                                   [--unit U3]             register a watch
                                                            (defaults to the
                                                            calling shell;
                                                            scope is required
-                                                           and must be ACTIVE)
+                                                           and must be ACTIVE;
+                                                           --unit links the PR
+                                                           to a board unit)
     ./sc watch list [--all]                                live watches
     ./sc watch inbox [--interval 30] [--timeout 21600]     block until this
                                                            shell has unread
@@ -36,8 +38,12 @@ ACTIVE sprint. The poller only ever writes message rows + its own registry
 state: it never boots shells, never marks anything read, never touches git,
 never injects terminal input.
 
-A `pr_event` body is one line — repo, PR, what changed, head SHA. Detail
-lives in `gh`; the message is the wake-up, not the payload.
+A `pr_event` body is one line — repo, PR, the unit when the watch names one
+(`unit=U3`), what changed, head SHA. Detail lives in `gh`; the message is the
+wake-up, not the payload. The unit comes from `--unit` at registration and is
+the structured answer to "which unit is this about" — the reconciler's regex
+over message prose stays only as the fallback for traffic that carries no
+link.
 
 `inbox` is the planner-side replacement for scheduled polling: it loops a
 cheap local API read (zero harness turns, zero tokens) and exits the moment
@@ -159,15 +165,21 @@ def cmd_pr(args) -> int:
     if args.shell:
         payload["shell"] = args.shell
     payload["sprint_doc_id"] = args.sprint
+    if args.unit:
+        payload["unit"] = args.unit
     r = _api("POST", "/_sc/watches", payload)
     who = args.shell or "you"
+    unit = f" → unit {args.unit}" if args.unit else ""
     if r.get("existing"):
-        print(f"watch: {repo}#{args.number} already watched for {who} (watch #{r['watch_id']})")
+        linked = f", linked{unit}" if r.get("linked") else ""
+        print(f"watch: {repo}#{args.number} already watched for {who} "
+              f"(watch #{r['watch_id']}{linked})")
     elif r.get("rebound"):
-        print(f"watch: {repo}#{args.number} rebound to sprint doc {args.sprint} for {who} "
-              f"(watch #{r['watch_id']}, baseline armed)")
+        print(f"watch: {repo}#{args.number} rebound to sprint doc {args.sprint}{unit} "
+              f"for {who} (watch #{r['watch_id']}, baseline armed)")
     else:
-        print(f"watch: {repo}#{args.number} registered for {who} (watch #{r['watch_id']}, baseline armed)")
+        print(f"watch: {repo}#{args.number} registered for {who}{unit} "
+              f"(watch #{r['watch_id']}, baseline armed)")
         print("  (pr_event rows land in the shell's inbox as the service poller sees transitions)")
     d = r.get("daemon")
     if not d or not d.get("beat_at") or d.get("stale"):
@@ -199,6 +211,8 @@ def cmd_list(args) -> int:
         if not w.get("closed_at"):
             if w.get("sprint_doc_id"):
                 state += f", sprint #{w['sprint_doc_id']}"
+                if w.get("unit_seq"):
+                    state += f" unit {w['unit_seq']}"
                 state += " (armed)" if w.get("armed") else " (dormant — sprint not ACTIVE)"
             else:
                 state += ", dormant (unscoped — rebind with `sc watch pr … --sprint <doc>`)"
@@ -287,6 +301,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--shell", help="subscribe another shell (e.g. the planner) instead of you")
     sp.add_argument("--sprint", type=int, required=True, metavar="DOC_ID",
                     help="required ACTIVE sprint document scope")
+    sp.add_argument("--unit", metavar="SEQ",
+                    help="the sprint unit this PR is for, as the board writes "
+                         "it (U3) — carries onto every pr_event so readers "
+                         "resolve the unit structurally instead of by regex")
     sp.set_defaults(fn=cmd_pr)
 
     sp = sub.add_parser("list", help="live watches (--all includes retired)")

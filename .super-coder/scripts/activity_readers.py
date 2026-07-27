@@ -13,6 +13,13 @@ unattributed surfaces are excluded rather than guessed.
 ``read()`` observes integration refs exactly as they currently are.  Ref
 freshness is the caller's responsibility because one reconciler tick reads
 many worktrees but must fetch the shared integration ref only once.
+
+"Which unit is this row about" is answered STRUCTURALLY where a row carries a
+link (``watched_prs.unit_id``, reached through the poller's ``pr-event|``
+dedupe key) and by regex over prose where it does not — see
+``_row_names_unit``.  The regex is the fallback for unscoped traffic, not the
+primary answer, and it is deliberately kept: a dev's ``result`` row has no
+link and never will.
 """
 from __future__ import annotations
 
@@ -321,7 +328,7 @@ class ActivityReader:
 
             try:
                 rows = con.execute(
-                    "SELECT body, created_at FROM shell_messages "
+                    "SELECT body, created_at, dedupe_key FROM shell_messages "
                     "WHERE from_shell_id=? AND sprint_doc_id=? AND kind='result' "
                     "ORDER BY created_at DESC, message_id DESC",
                     (shell_id, sprint_doc_id),
@@ -344,10 +351,11 @@ class ActivityReader:
                     ).fetchone()[0]
                     if active_count != 1:
                         seq = str(_value(unit, "seq", ""))
+                        unit_id = _value(unit, "unit_id")
                         rows = [
                             row
                             for row in rows
-                            if self._names_unit(row["body"], seq)
+                            if self._row_names_unit(con, row, seq, unit_id)
                         ]
                 evidence.last_result_row_at = _timestamp(
                     rows[0]["created_at"] if rows else None
@@ -356,6 +364,51 @@ class ActivityReader:
                 self._mark(evidence, "result_row")
         con.close()
         return harness
+
+    @classmethod
+    def _row_names_unit(cls, con, row, seq: str, unit_id=None) -> bool:
+        """Is this message row about `seq`? STRUCTURE FIRST, prose second
+        (spec #76 H-13).
+
+        A row that carries a structured unit ref is answered by that ref alone
+        — including when the ref says NO. Falling through to the regex after a
+        structured mismatch would let a body that happens to mention "U3"
+        override the link that states which unit the row is actually about,
+        which is the inversion this requirement exists to remove.
+
+        Rows with no link (a dev's `result` prose is the whole population
+        today) fall back to the regex, which is why it is kept rather than
+        deleted. `watched_prs.unit_id` is nullable, so an unlinked watch is
+        unscoped traffic too and takes the same fallback.
+        """
+        linked = cls._linked_unit_id(con, _value(row, "dedupe_key"))
+        if linked is not None and unit_id is not None:
+            return linked == unit_id
+        return cls._names_unit(_value(row, "body"), seq)
+
+    @staticmethod
+    def _linked_unit_id(con, dedupe_key) -> "int | None":
+        """The unit a row is bound to through the PR watch that emitted it.
+
+        `pr-event|<watch_id>|<transition>|<sha>` is the poller's dedupe
+        identity (pr_poller._emit_event) and the only structured back-reference
+        a message row carries today. Returns None for every other row, for a
+        malformed key, and for a watch with no unit — all three mean "no
+        structured answer", not "no".
+        """
+        if not dedupe_key or not str(dedupe_key).startswith("pr-event|"):
+            return None
+        parts = str(dedupe_key).split("|")
+        if len(parts) < 2 or not parts[1].isdigit():
+            return None
+        try:
+            row = con.execute(
+                "SELECT unit_id FROM watched_prs WHERE watch_id=?",
+                (int(parts[1]),),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return None if row is None else row[0]
 
     @staticmethod
     def _names_unit(body: str, seq: str) -> bool:

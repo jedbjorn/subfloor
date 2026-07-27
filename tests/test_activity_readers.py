@@ -52,7 +52,14 @@ def make_db(path: Path) -> None:
         );
         CREATE TABLE shell_messages (
           message_id INTEGER PRIMARY KEY, from_shell_id INTEGER,
-          sprint_doc_id INTEGER, created_at TEXT, kind TEXT, body TEXT
+          sprint_doc_id INTEGER, created_at TEXT, kind TEXT, body TEXT,
+          -- the poller's `pr-event|<watch_id>|…` identity: the only
+          -- structured back-reference a message row carries (H-13)
+          dedupe_key TEXT
+        );
+        CREATE TABLE watched_prs (
+          watch_id INTEGER PRIMARY KEY, sprint_doc_id INTEGER,
+          unit_id INTEGER
         );
         CREATE TABLE sprint_units (
           unit_id INTEGER PRIMARY KEY, sprint_doc_id INTEGER, seq TEXT,
@@ -84,7 +91,7 @@ def make_db(path: Path) -> None:
         "'operator_end','codex')"
     )
     con.execute(
-        "INSERT INTO shell_messages VALUES "
+        "INSERT INTO shell_messages (message_id, from_shell_id, sprint_doc_id, created_at, kind, body) VALUES "
         "(1,1,59,'2020-01-02T00:00:00Z','result',"
         "'sprint 59: unit U3 fixing')"
     )
@@ -92,7 +99,7 @@ def make_db(path: Path) -> None:
     # than the qualifying row so deleting any one SQL predicate turns the
     # contract assertion red.
     con.executemany(
-        "INSERT INTO shell_messages VALUES (?,?,?,?,?,?)",
+        "INSERT INTO shell_messages (message_id, from_shell_id, sprint_doc_id, created_at, kind, body) VALUES (?,?,?,?,?,?)",
         [
             (
                 2,
@@ -301,7 +308,7 @@ class DatabaseContractTest(ReaderCase):
             "'2020-01-03T00:00:00Z',1,1,3)"
         )
         con.executemany(
-            "INSERT INTO shell_messages VALUES (?,?,?,?,?,?)",
+            "INSERT INTO shell_messages (message_id, from_shell_id, sprint_doc_id, created_at, kind, body) VALUES (?,?,?,?,?,?)",
             [
                 (
                     5,
@@ -334,6 +341,78 @@ class DatabaseContractTest(ReaderCase):
             datetime(2020, 1, 6, tzinfo=UTC),
             evidence.last_durable_write_at,
         )
+
+    def test_a_structured_link_beats_the_prose_that_contradicts_it(self):
+        """H-13: the reconciler stops guessing which unit a row is about when
+        the row carries a link.
+
+        The body deliberately names the WRONG unit. Under the regex alone this
+        row is U3's, because "U3" appears in it; under the link it is U4's,
+        because that is what the watch says. The whole point of the structured
+        ref is that it wins — a reader that consulted prose first would keep
+        the defect and merely add a column nobody reads.
+        """
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO watched_prs VALUES (77,59,404)")
+        con.execute(
+            "INSERT INTO shell_messages (message_id, from_shell_id, "
+            "sprint_doc_id, created_at, kind, body, dedupe_key) VALUES "
+            "(90,1,59,'2020-01-06T00:00:00Z','result',"
+            "'pr_event o/r#7 unit=U3: checks green','pr-event|77|checks|abc')"
+        )
+        con.commit()
+        con.close()
+
+        self.assertFalse(self._names(90, seq="U3", unit_id=303),
+                         "prose overrode the structured link")
+        self.assertTrue(self._names(90, seq="U3", unit_id=404),
+                        "the structured link did not attribute the row")
+
+    def test_rows_with_no_link_still_fall_back_to_the_regex(self):
+        """The fallback is not decoration: a dev's `result` row has no watch
+        and never will, so deleting the regex would make every one of them
+        unattributable."""
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO shell_messages (message_id, from_shell_id, "
+            "sprint_doc_id, created_at, kind, body) VALUES "
+            "(91,1,59,'2020-01-06T00:00:00Z','result','U3 is ready')")
+        con.commit()
+        con.close()
+        self.assertTrue(self._names(91, seq="U3", unit_id=303))
+        self.assertFalse(self._names(91, seq="U4", unit_id=404))
+
+    def test_an_unlinked_or_unreadable_watch_is_not_an_answer(self):
+        """Three ways a structured ref can be ABSENT rather than negative — an
+        unlinked watch, a watch that is gone, and a malformed key. Each must
+        fall through to prose, not silently answer "not this unit" and drop a
+        row of real evidence."""
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO watched_prs VALUES (78,59,NULL)")
+        for mid, key in ((92, "pr-event|78|checks|abc"),
+                         (93, "pr-event|999|checks|abc"),
+                         (94, "pr-event|not-a-number|checks|abc")):
+            con.execute(
+                "INSERT INTO shell_messages (message_id, from_shell_id, "
+                "sprint_doc_id, created_at, kind, body, dedupe_key) VALUES "
+                "(?,1,59,'2020-01-06T00:00:00Z','result','U3 ready',?)",
+                (mid, key))
+        con.commit()
+        con.close()
+        for mid in (92, 93, 94):
+            with self.subTest(message_id=mid):
+                self.assertTrue(self._names(mid, seq="U3", unit_id=303))
+
+    def _names(self, message_id, *, seq, unit_id):
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT body, dedupe_key FROM shell_messages "
+                "WHERE message_id=?", (message_id,)).fetchone()
+            return ar.ActivityReader._row_names_unit(con, row, seq, unit_id)
+        finally:
+            con.close()
 
     def test_unit_name_boundaries_pin_the_real_dotted_family(self):
         names = ar.ActivityReader._names_unit

@@ -265,10 +265,15 @@ class SprintDirectiveTest(unittest.TestCase):
         arm_binding(self.con, 59, PLANNER_SHELL)
         self.assertEqual(self.render(DEV_SHELL), "")
         self.assertIn("PLANNER", self.render(PLANNER_SHELL))
-        # control: the SAME rows, one moved off a terminal state — the dev's
-        # directive comes back, so the absence above was about the state and
-        # not about an empty board
-        self.con.execute("UPDATE sprint_units SET state='working' WHERE seq='U9'")
+        # control: the SAME board plus ONE non-terminal unit for the same dev —
+        # the dev's directive comes back, so the absence above was about the
+        # state and not about an empty board.
+        #
+        # This used to walk U9 from merged back to working. Migration 0108 made
+        # that a refused transition (terminal has no exits), so the control is
+        # declared at a non-terminal state instead of reached by an edit no
+        # planner could make either.
+        add_unit(self.con, 59, "U7", dev=DEV_SHELL, state="working")
         self.con.commit()
         self.assertNotEqual(self.render(DEV_SHELL), "")
         self.assertIn("PLANNER", self.render(PLANNER_SHELL))

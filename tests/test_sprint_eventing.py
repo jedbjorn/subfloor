@@ -364,9 +364,114 @@ def snap(state="OPEN", sha="abc1234def", checks=None, reviews=0, review_state=No
             "reviews": reviews, "review_state": review_state}
 
 
+class WatchAlertIdentityTest(unittest.TestCase):
+    """H-13's other half: an alert about a watch says WHICH UNIT structurally.
+
+    0102 gave planner_alerts `sprint_doc_id`/`unit_id` and the watch path left
+    both NULL, so every reader was pushed back to parsing `dedupe_key` or
+    grepping prose. The watch is the one alert source that knows the answer.
+    """
+
+    def setUp(self):
+        self.con = build_db()
+        seed_shells(self.con)
+        seed_sprint_doc(self.con)
+        self.unit = self.con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (100,'U3','unit')").lastrowid
+        self.con.commit()
+
+    def tearDown(self):
+        self.con.close()
+
+    def _watch(self, pr, unit_id, doc_id=100):
+        wid = self.con.execute(
+            "INSERT INTO watched_prs (repo, pr_number, shell_id, "
+            "sprint_doc_id, unit_id) VALUES ('o/r',?,1,?,?)",
+            (pr, doc_id, unit_id)).lastrowid
+        self.con.commit()
+        return wid
+
+    def _alert_row(self, wid):
+        return self.con.execute(
+            "SELECT sprint_doc_id, unit_id, dedupe_key FROM planner_alerts "
+            "WHERE watch_id=?", (wid,)).fetchone()
+
+    def test_an_alert_on_a_linked_watch_names_the_unit(self):
+        wid = self._watch(41, self.unit)
+        pr_poller._alert(self.con, severity="critical",
+                         reason="pr_poll_failure", watch_id=wid)
+        self.con.commit()
+        row = self._alert_row(wid)
+        self.assertEqual(row["sprint_doc_id"], 100)
+        self.assertEqual(row["unit_id"], self.unit)
+
+    def test_an_unlinked_watch_still_scopes_the_sprint(self):
+        """Partial structure beats none: the sprint is known even when the
+        unit is not, and claiming a unit here would be a guess."""
+        wid = self._watch(42, None)
+        pr_poller._alert(self.con, severity="critical",
+                         reason="pr_poll_failure", watch_id=wid)
+        self.con.commit()
+        row = self._alert_row(wid)
+        self.assertEqual(row["sprint_doc_id"], 100)
+        self.assertIsNone(row["unit_id"])
+
+    def test_the_dedupe_identity_did_not_move(self):
+        """The structured columns are ADDITIVE. If dedupe_key changed shape,
+        every alert already open would re-raise as a new row the moment this
+        shipped — a fleet-wide alert storm on upgrade."""
+        wid = self._watch(43, self.unit)
+        for _ in range(3):
+            pr_poller._alert(self.con, severity="critical",
+                             reason="pr_poll_failure", watch_id=wid)
+        self.con.commit()
+        rows = self.con.execute(
+            "SELECT dedupe_key FROM planner_alerts WHERE watch_id=?",
+            (wid,)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["dedupe_key"], f"-|-|{wid}|-|pr_poll_failure")
+
+
 class DiffEventsTest(unittest.TestCase):
     def diff(self, prev, cur):
         return watch.diff_events(prev, cur, "o/r", 7)
+
+    def test_the_unit_rides_the_event_header_when_the_watch_names_one(self):
+        """H-13: the structured ref made visible. The watch knows the unit, so
+        the row the planner reads says which unit it is about instead of
+        leaving every reader to infer it from the PR number."""
+        events, _ = pr_poller.transitions(
+            snap(checks="PENDING"), snap(checks="SUCCESS"), "o/r", 7, "U3")
+        self.assertEqual(len(events), 1)
+        self.assertIn("o/r#7 unit=U3:", events[0]["body"])
+
+    def test_an_unlinked_watch_makes_no_claim_in_the_header(self):
+        """Omitted, not `unit=None`. A header that names a unit is a claim,
+        and an unlinked watch is not making one — the regex fallback is for
+        exactly this traffic."""
+        events, _ = pr_poller.transitions(
+            snap(checks="PENDING"), snap(checks="SUCCESS"), "o/r", 7)
+        self.assertIn("o/r#7:", events[0]["body"])
+        self.assertNotIn("unit=", events[0]["body"])
+
+    def test_every_event_kind_carries_the_unit(self):
+        """One transition kind carrying the ref while the others drop it is
+        the drift shape: the merge event is the one close reads, and it is
+        built on a different branch from the checks event."""
+        cases = {
+            "checks": (snap(checks="PENDING"), snap(checks="SUCCESS")),
+            "review": (snap(reviews=0), snap(reviews=1,
+                                             review_state="APPROVED")),
+            "merged": (snap(), snap(state="MERGED", checks="SUCCESS")),
+            "closed": (snap(), snap(state="CLOSED")),
+        }
+        for kind, (prev, cur) in cases.items():
+            with self.subTest(kind=kind):
+                events, _ = pr_poller.transitions(prev, cur, "o/r", 7, "U3")
+                self.assertTrue(events, f"{kind} emitted nothing to check")
+                for e in events:
+                    self.assertIn("unit=U3", e["body"])
 
     def test_baseline_pending_is_silent(self):
         events, terminal = self.diff(None, snap(checks="PENDING"))
@@ -612,6 +717,83 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shell_id"], 1)   # the token shell (plan1)
         self.assertEqual(rows[0]["sprint_doc_id"], 100)
+
+    # ── H-13: structured PR↔unit linkage ────────────────────────────────────
+
+    def unit(self, seq, doc_id=100):
+        con = sqlite3.connect(self.db)
+        try:
+            uid = con.execute(
+                "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+                "VALUES (?,?,?)", (doc_id, seq, f"unit {seq}")).lastrowid
+            con.commit()
+            return uid
+        finally:
+            con.close()
+
+    def test_register_links_the_watch_to_a_board_unit(self):
+        uid = self.unit("U3")
+        self.assertEqual(watch.main(
+            ["pr", "own/repo", "31", "--sprint", "100", "--unit", "U3"]), 0)
+        rows = self.q("SELECT unit_id FROM watched_prs WHERE pr_number=31")
+        self.assertEqual(rows[0]["unit_id"], uid)
+
+    def test_registering_without_a_unit_leaves_the_link_null(self):
+        """The link is NULLABLE and stays that way. Unscoped traffic is what
+        the reconciler's regex fallback exists for; inventing a unit here
+        would make every watch claim one."""
+        watch.main(["pr", "own/repo", "32", "--sprint", "100"])
+        self.assertIsNone(
+            self.q("SELECT unit_id FROM watched_prs WHERE pr_number=32")[0][
+                "unit_id"])
+
+    def test_an_undeclared_unit_is_refused_not_silently_dropped(self):
+        """A typo'd --unit that registered an UNLINKED watch would report
+        success and leave the planner believing in a link that is not there —
+        the reconciler would then answer by regex and nobody would know."""
+        with self.assertRaises(SystemExit):
+            watch.main(["pr", "own/repo", "33", "--sprint", "100",
+                        "--unit", "U99"])
+        self.assertEqual(
+            self.q("SELECT 1 FROM watched_prs WHERE pr_number=33"), [])
+
+    def test_a_unit_on_another_sprints_board_is_not_this_sprints_unit(self):
+        """`seq` is unique per sprint, not globally: U3 exists on most boards.
+        Resolving it without the sprint would link a watch to a stranger."""
+        con = sqlite3.connect(self.db)
+        seed_sprint_doc(con, 200)
+        con.close()
+        self.unit("U7", doc_id=200)
+        with self.assertRaises(SystemExit):
+            watch.main(["pr", "own/repo", "34", "--sprint", "100",
+                        "--unit", "U7"])
+
+    def test_re_registering_with_a_unit_links_the_live_watch(self):
+        """The idempotent path must not swallow --unit: "already watched" plus
+        a dropped flag is a link the operator has no way to see is missing."""
+        watch.main(["pr", "own/repo", "35", "--sprint", "100"])
+        uid = self.unit("U4")
+        watch.main(["pr", "own/repo", "35", "--sprint", "100", "--unit", "U4"])
+        rows = self.q("SELECT unit_id FROM watched_prs WHERE pr_number=35")
+        self.assertEqual(len(rows), 1, "the re-registration minted a row")
+        self.assertEqual(rows[0]["unit_id"], uid)
+
+    def test_the_link_is_correctable(self):
+        """A mis-typed --unit has to be fixable in place. The alternative is
+        retiring the watch and losing its baseline to repair a typo."""
+        watch.main(["pr", "own/repo", "36", "--sprint", "100", "--unit", "U3"])
+        right = self.unit("U5")
+        watch.main(["pr", "own/repo", "36", "--sprint", "100", "--unit", "U5"])
+        self.assertEqual(
+            self.q("SELECT unit_id FROM watched_prs WHERE pr_number=36")[0][
+                "unit_id"], right)
+
+    def test_the_watch_list_reports_the_unit(self):
+        self.unit("U6")
+        watch.main(["pr", "own/repo", "37", "--sprint", "100", "--unit", "U6"])
+        r = watch._api("GET", "/_sc/watches")
+        row = [w for w in r["watches"] if w["pr_number"] == 37][0]
+        self.assertEqual(row["unit_seq"], "U6")
 
     def test_register_for_another_shell(self):
         watch.main(["pr", "own/repo", "12", "--shell", "dev1",
