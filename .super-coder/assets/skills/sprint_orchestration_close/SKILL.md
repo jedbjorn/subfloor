@@ -41,7 +41,14 @@ If any condition fails, return to `sprint_orchestration` or
 ## Run conformance
 
 Assign an independent reviewer to compare the governing spec with integrated
-`main` at one recorded SHA. Send:
+`main` at one recorded SHA.
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
+
+Send:
 
 ```sh
 ./sc mem message send <reviewer> "$(<./sprint-result.md)" \
@@ -49,8 +56,6 @@ Assign an independent reviewer to compare the governing spec with integrated
 ./sc mem message sent
 ./sc run <reviewer> --harness <review-harness> -m <review-model> --effort high
 ```
-
-Before sending, write the complete task body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
 
 State the sections and units included. For decision-driven units without a spec,
 name the alternate evidence: unit report, exact-head review, and mutation check.

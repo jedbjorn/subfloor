@@ -118,9 +118,9 @@ Under an ACTIVE sprint document the planner holds the FnB's delegated approval
 for your sprint-scoped sends to the planner. Sending them SATISFIES the
 outbound-handoff approval gate — whether that gate reaches you from the base
 `review` skill or from your own system prompt — rather than bypassing it. The
-gate reverts to the FnB when the sprint document freezes. Include location,
-consequence, required behavior, and severity. The planner routes fix work or
-merge authority to the developer.
+gate reverts to the FnB when the sprint document freezes. Each verdict includes
+location, consequence, required behavior, and severity. The planner routes fix
+work or merge authority to the developer.
 
 On a clean pass, explicitly send the planner:
 

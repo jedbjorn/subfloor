@@ -98,6 +98,11 @@ and use the applicable stopped-worker row above.
 Every continuation, reassignment, fix request, and recovery result uses
 `--sprint <doc-id>`.
 
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
+
 Record assignment changes before boot:
 
 ```sh
@@ -106,8 +111,6 @@ Record assignment changes before boot:
   --kind task --sprint <doc-id>
 ./sc mem message sent
 ```
-
-Before sending, write the complete continuation body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
 
 Use `blocked` while the unit has no active path:
 

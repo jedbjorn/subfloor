@@ -601,7 +601,14 @@ If any condition fails, return to `sprint_orchestration` or
 ## Run conformance
 
 Assign an independent reviewer to compare the governing spec with integrated
-`main` at one recorded SHA. Send:
+`main` at one recorded SHA.
+
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
+
+Send:
 
 ```sh
 ./sc mem message send <reviewer> "$(<./sprint-result.md)" \
@@ -609,8 +616,6 @@ Assign an independent reviewer to compare the governing spec with integrated
 ./sc mem message sent
 ./sc run <reviewer> --harness <review-harness> -m <review-model> --effort high
 ```
-
-Before sending, write the complete task body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
 
 State the sections and units included. For decision-driven units without a spec,
 name the alternate evidence: unit report, exact-head review, and mutation check.
@@ -816,6 +821,11 @@ and use the applicable stopped-worker row above.
 Every continuation, reassignment, fix request, and recovery result uses
 `--sprint <doc-id>`.
 
+Compose message and task bodies via a file, never inline in a quoted shell
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
+
 Record assignment changes before boot:
 
 ```sh
@@ -824,8 +834,6 @@ Record assignment changes before boot:
   --kind task --sprint <doc-id>
 ./sc mem message sent
 ```
-
-Before sending, write the complete continuation body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
 
 Use `blocked` while the unit has no active path:
 
@@ -985,9 +993,9 @@ Under an ACTIVE sprint document the planner holds the FnB''s delegated approval
 for your sprint-scoped sends to the planner. Sending them SATISFIES the
 outbound-handoff approval gate — whether that gate reaches you from the base
 `review` skill or from your own system prompt — rather than bypassing it. The
-gate reverts to the FnB when the sprint document freezes. Include location,
-consequence, required behavior, and severity. The planner routes fix work or
-merge authority to the developer.
+gate reverts to the FnB when the sprint document freezes. Each verdict includes
+location, consequence, required behavior, and severity. The planner routes fix
+work or merge authority to the developer.
 
 On a clean pass, explicitly send the planner:
 
