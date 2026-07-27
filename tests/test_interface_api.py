@@ -931,6 +931,60 @@ class InterfaceApiTest(unittest.TestCase):
         self.assertEqual(self.rail(1)["availability"], "working")
         self.assertEqual(self.rail(2)["availability"], "available")
 
+    # -- H-25: the launch record, not the launcher's lineage ------------------
+
+    def claimed(self, *, live=None, absent=(), processes=()):
+        """Point the liveness scan at a snapshot carrying launch claims."""
+        self.liveness.stop()
+        self.liveness = mock.patch.object(
+            routes.shell_liveness, "compute",
+            return_value={"supported": True, "processes": list(processes),
+                          "claimed_pids": dict(live or {}),
+                          "claimed_absent": list(absent)})
+        self.liveness.start()
+
+    def _sprint_archive(self):
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            con.execute(
+                "INSERT INTO documents (document_id, kind, title, body) "
+                "VALUES (38,'doc','SPRINT: Launcher operator surface','x')")
+            con.execute("UPDATE shell_memory_archives SET sprint_ref='38' "
+                        "WHERE archive_id=10")
+            con.execute("UPDATE shells SET active_archive_id=10 "
+                        "WHERE shell_id=1")
+            con.commit()
+
+    def test_detached_worker_the_scan_missed_is_working_from_its_claim(self):
+        """The claim is comm-blind, so a harness that renamed itself out of the
+        expected set — or any process the scan did not match — still projects
+        `working` with its sprint, instead of vanishing into `available`."""
+        self._sprint_archive()
+        self.claimed(live={"s1": 777})
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "working")
+        self.assertEqual(shell["sprint_ref"], "38")
+
+    def test_relaunch_gap_is_expected_absent_never_a_bare_available(self):
+        """Spec #76 H-25's second rail consequence. Between two work items no
+        process holds the worktree at all; the record still claims the shell, so
+        the absence is reported as evidence rather than as idleness. This is the
+        row feature #27's compare consumes."""
+        self._sprint_archive()
+        self.claimed(absent=["s1"])
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "expected_absent")
+        self.assertEqual(shell["sprint_ref"], "38")
+        self.assertIsNone(shell["session_id"])
+
+    def test_a_shell_no_launch_ever_claimed_is_still_available(self):
+        """The positive control: the rule adds a verdict, it does not replace
+        `available` for every dormant shell."""
+        self._sprint_archive()
+        self.claimed()
+        shell = self.rail()
+        self.assertEqual(shell["availability"], "available")
+        self.assertIsNone(shell["sprint_ref"])
+
     def test_shell_occupied_race(self):
         status, _, _ = self.create_session()
         self.assertEqual(status, 201)

@@ -614,7 +614,7 @@ class CutoverTest(unittest.TestCase):
         refreshes = []
 
         class Reader:
-            def read(self, shell, unit, now):
+            def read(self, shell, unit, now, role=None):
                 reads.append((shell["shell_id"], unit["seq"]))
                 return pr_poller.activity_readers.Evidence(
                     epoch="2020-01-01T00:00:00Z",
@@ -760,7 +760,7 @@ class CutoverTest(unittest.TestCase):
         con.close()
 
         class RaisingReader:
-            def read(self, shell, unit, now):
+            def read(self, shell, unit, now, role=None):
                 raise RuntimeError("mid-tick sentinel")
 
         out = io.StringIO()

@@ -2,6 +2,7 @@
 """Regression tests for atomic, contention-safe launcher session opening."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -364,6 +365,99 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         ensure_worktree.assert_not_called()
         atomic_write.assert_not_called()
         execvpe.assert_not_called()
+
+
+LAUNCH_RECORDS = """
+CREATE TABLE shell_launch_records (
+    shell_id    INTEGER PRIMARY KEY,
+    pid         INTEGER NOT NULL,
+    start_ticks INTEGER NOT NULL,
+    worktree    TEXT    NOT NULL,
+    harness     TEXT,
+    launched_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+"""
+
+
+class RecordLaunchTest(unittest.TestCase):
+    """Spec #76 H-25: the launch claims the pid it is about to become."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.worktree = self.root / ".sc-worktrees" / "dev6"
+        self.worktree.mkdir(parents=True)
+        self.db = self.root / "shell.db"
+        seed = sqlite3.connect(self.db)
+        seed.executescript(LAUNCH_RECORDS)
+        seed.commit()
+        seed.close()
+        # A stat line whose comm carries a space and parens, so the reader
+        # cannot pass by splitting naively.
+        rest = ["0"] * 30
+        rest[19] = "5150"                      # field 22 — starttime
+        self.stat = self.root / "stat"
+        self.stat.write_text("42 (co dex (x)) " + " ".join(rest) + "\n")
+
+    def _rows(self, sql: str = "SELECT shell_id, pid, start_ticks, worktree, "
+                                "harness FROM shell_launch_records"):
+        con = sqlite3.connect(self.db)
+        try:
+            return con.execute(sql).fetchall()
+        finally:
+            con.close()
+
+    def _record(self, *, headless: bool = True):
+        # record_launch owns the connection it opens, so every call gets a fresh one.
+        with mock.patch.object(
+                run, "open_db",
+                side_effect=lambda: sqlite3.connect(self.db)), \
+                mock.patch.object(run, "PROC_SELF_STAT", self.stat):
+            run.record_launch(1, self.worktree, "codex", headless=headless)
+        return self._rows()
+
+    def test_headless_launch_claims_this_pid_and_its_start_ticks(self):
+        rows = self._record()
+        self.assertEqual(
+            [(1, os.getpid(), 5150, str(self.worktree), "codex")], rows)
+
+    def test_an_interactive_boot_makes_no_claim(self):
+        # Recording one would arrive pre-claimed on a closed terminal's
+        # survivor and suppress the orphan verdict the operator needs.
+        self.assertEqual([], self._record(headless=False))
+
+    def test_relaunch_restamps_one_row_rather_than_accumulating(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO shell_launch_records "
+            "(shell_id, pid, start_ticks, worktree, harness) "
+            "VALUES (1, 999, 1, ?, 'claude')", (str(self.worktree),))
+        con.commit()
+        con.close()
+        rows = self._record()
+        self.assertEqual(1, len(rows))
+        self.assertEqual((os.getpid(), 5150, "codex"), rows[0][1:3] + rows[0][4:])
+
+    def test_an_unmigrated_fork_does_not_fail_the_boot(self):
+        con = sqlite3.connect(self.db)
+        con.execute("DROP TABLE shell_launch_records")
+        con.commit()
+        con.close()
+        with mock.patch.object(
+                run, "open_db",
+                side_effect=lambda: sqlite3.connect(self.db)), \
+                mock.patch.object(run, "PROC_SELF_STAT", self.stat):
+            run.record_launch(1, self.worktree, "codex", headless=True)
+
+    def test_unreadable_start_ticks_makes_no_claim(self):
+        missing = self.root / "absent"
+        with mock.patch.object(
+                run, "open_db",
+                side_effect=lambda: sqlite3.connect(self.db)), \
+                mock.patch.object(run, "PROC_SELF_STAT", missing):
+            run.record_launch(1, self.worktree, "codex", headless=True)
+        self.assertEqual([], self._rows())
 
 
 if __name__ == "__main__":

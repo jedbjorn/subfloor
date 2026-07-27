@@ -267,7 +267,9 @@ def classify(
     - result evidence compares with the unit/binding state clock;
     - recent work compares with ``now``;
     - durable completion and branch grace use the boot epoch;
-    - the no-progress window starts at the newest boot, state, or work event.
+    - the no-progress window starts at the newest boot, state, work, or
+      durable-write event — the last of these being the only signal a role
+      with no code surface can produce.
     """
     current = _utc(now) or datetime.now(timezone.utc)
     epoch = _utc(evidence.epoch)
@@ -322,18 +324,36 @@ def classify(
     if session_over and durable_at is not None and durable_at >= epoch:
         return "work_complete_unreported"
 
-    # Rule 5 — BOOT clock and the 20-minute grace floor.
+    # Rule 5 — BOOT clock and the 20-minute grace floor.  `edits_code` is
+    # explicit here: only a code expectation can be `not_started`, so a reviewer
+    # is never graded on whether the dev has pushed yet (H-16).
     if (
-        evidence.branch_declared is not None
+        evidence.edits_code
+        and evidence.branch_declared is not None
         and evidence.branch_present is False
         and current > epoch + max(grace, START_GRACE)
     ):
         return "not_started"
 
-    # Rule 6 — newest BOOT, STATE, or WORK-EVENT clock.  Explanation-tier
-    # marker/CPU observations never enter this maximum.
+    # Rule 6 — newest BOOT, STATE, WORK-EVENT, or DURABLE-WRITE clock.
+    # Explanation-tier marker/CPU observations never enter this maximum.
+    #
+    # The durable write is here — and ONLY here — because this floor measures
+    # SILENCE, and a durable write is not silence (spec #76 H-16, flag #364
+    # defect b).  `last_durable_write_at` was read on every tick and consulted
+    # at exactly one place: Rule 4, behind `session_over`.  A live planner emits
+    # `task` rows and never `result`, and has no branch, so it walked past
+    # Rules 2, 3 and 5 into this floor measured from a boot clock it had long
+    # since spoken past, and stuck at `checkup` for the rest of the sprint where
+    # no healthy signal could resolve it.  A separate "recent durable write is
+    # working" rule above Rule 5 was drafted and DELETED: it decided nothing
+    # this maximum does not already decide, except to convert a dev's
+    # declared-but-absent branch from `not_started` into `working`, which is a
+    # semantic change no requirement here asks for.
     last_evidence = max(
-        stamp for stamp in (epoch, state_clock, last_work) if stamp is not None
+        stamp
+        for stamp in (epoch, state_clock, last_work, durable_at)
+        if stamp is not None
     )
     if current > last_evidence + max(window, NO_PROGRESS_WINDOW):
         return "checkup"
@@ -874,13 +894,21 @@ def reconcile_tick(
     readings: list[ReconciliationReading] = []
     seen: set[tuple] = set()
     for expectation in expectations:
-        evidence_key = (expectation.shell_id, expectation.unit_id)
+        # Role is part of the cache identity, not decoration: a dev and a
+        # reviewer on the same unit are now read differently (H-15/H-16), so
+        # keying on (shell, unit) alone would serve one role the other's answer.
+        evidence_key = (
+            expectation.shell_id,
+            expectation.unit_id,
+            expectation.role,
+        )
         evidence = cache.get(evidence_key)
         if evidence is None:
             evidence = read_one(
                 expectation.shell,
                 expectation.unit,
                 current,
+                role=expectation.role,
             )
             if (
                 not refs_fresh

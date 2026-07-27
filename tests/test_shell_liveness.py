@@ -443,6 +443,221 @@ class ZombieHarnessTest(unittest.TestCase):
         self.assertFalse(snap["safe_to_clean_all"])
 
 
+def _stat_line(*, state: str = "S", ppid: int = 1, tty_nr: int = 0,
+               start_ticks: int = 5150) -> str:
+    """A /proc/<pid>/stat line with the four fields this module reads.
+    The comm deliberately carries a space and parens — the parser must survive
+    it, and a fixture that never exercises that is a fixture that agrees with a
+    naive split()."""
+    rest = ["0"] * 30
+    rest[0] = state                    # field 3  — state
+    rest[1] = str(ppid)                # field 4  — ppid
+    rest[4] = str(tty_nr)              # field 7  — tty_nr
+    rest[19] = str(start_ticks)        # field 22 — starttime
+    return "42 (co dex (x)) " + " ".join(rest) + "\n"
+
+
+def _proc_entry(proc: Path, pid: int, *, cwd: "Path | None" = None,
+                comm: str = "codex", **stat) -> Path:
+    entry = proc / str(pid)
+    entry.mkdir()
+    (entry / "comm").write_text(comm + "\n")
+    (entry / "stat").write_text(_stat_line(**stat))
+    if cwd is not None:
+        (entry / "cwd").symlink_to(cwd)
+    return entry
+
+
+class ClaimLiveTest(unittest.TestCase):
+    """H-25: identity is pid + start ticks + worktree hold. Parentage never."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.worktree = self.root / ".sc-worktrees" / "dev6"
+        self.worktree.mkdir(parents=True)
+        self.claim = {"pid": 700, "start_ticks": 5150,
+                      "worktree": str(self.worktree)}
+        patch = mock.patch.object(shell_liveness, "PROC", self.proc)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_detached_worker_reparented_to_init_is_live(self):
+        # The exact process H-25 exists for: tty_nr 0, ppid 1 — 'detached' by
+        # every lineage read, and working.
+        _proc_entry(self.proc, 700, cwd=self.worktree, ppid=1, tty_nr=0)
+        self.assertTrue(shell_liveness.claim_live(self.claim))
+
+    def test_recycled_pid_does_not_inherit_the_claim(self):
+        # Same pid number, different process. Without start_ticks this is a
+        # false "working" that resolves the reconciler's alert on a stranger.
+        _proc_entry(self.proc, 700, cwd=self.worktree, start_ticks=99999)
+        self.assertFalse(shell_liveness.claim_live(self.claim))
+
+    def test_zombie_keeps_its_ticks_but_holds_nothing(self):
+        _proc_entry(self.proc, 700, cwd=self.worktree, state="Z")
+        self.assertFalse(shell_liveness.claim_live(self.claim))
+
+    def test_pid_that_is_simply_gone_is_not_live(self):
+        self.assertFalse(shell_liveness.claim_live(self.claim))
+
+    def test_cwd_outside_the_worktree_refutes_the_hold(self):
+        elsewhere = self.root / "somewhere-else"
+        elsewhere.mkdir()
+        _proc_entry(self.proc, 700, cwd=elsewhere)
+        self.assertFalse(shell_liveness.claim_live(self.claim))
+
+    def test_subdirectory_of_the_worktree_still_holds_it(self):
+        nested = self.worktree / "src"
+        nested.mkdir()
+        _proc_entry(self.proc, 700, cwd=nested)
+        self.assertTrue(shell_liveness.claim_live(self.claim))
+
+    def test_unreadable_cwd_does_not_refute(self):
+        # Missing data must never become "the worker is gone" — that is the
+        # failure direction this requirement removes.
+        _proc_entry(self.proc, 700, cwd=None)
+        self.assertTrue(shell_liveness.claim_live(self.claim))
+
+
+class RecordStateTest(unittest.TestCase):
+    """The launch record's verdict, asked after the process scan found none."""
+
+    SNAP = {
+        "supported": True,
+        "claimed_pids": {"dev6": 700},
+        "claimed_absent": ["dev5"],
+    }
+
+    def test_live_claim_is_working(self):
+        self.assertEqual("working",
+                         shell_liveness.record_state("DEV6", self.SNAP))
+
+    def test_dead_claim_is_expected_absent_not_available(self):
+        self.assertEqual("expected_absent",
+                         shell_liveness.record_state("dev5", self.SNAP))
+
+    def test_unclaimed_shell_has_no_record_verdict(self):
+        self.assertIsNone(shell_liveness.record_state("dev1", self.SNAP))
+
+    def test_unsupported_snapshot_is_none(self):
+        self.assertIsNone(shell_liveness.record_state(
+            "dev5", {**self.SNAP, "supported": False}))
+
+
+class ClaimedOrphanTest(unittest.TestCase):
+    """A claimed pid is never advised for killing, however it was launched."""
+
+    SNAP = {
+        "supported": True,
+        "processes": [
+            {"pid": 700, "shortname": "dev6", "orphaned": "detached",
+             "claimed": True},
+            {"pid": 800, "shortname": "dev5", "orphaned": "detached",
+             "claimed": False},
+        ],
+    }
+
+    def test_claimed_detached_worker_is_not_in_the_orphan_half(self):
+        pids, orphans = shell_liveness.orphan_split("dev6", self.SNAP)
+        self.assertEqual([700], pids)
+        self.assertEqual([], orphans)
+
+    def test_claimed_detached_worker_reads_busy_not_orphan(self):
+        self.assertEqual("busy", shell_liveness.session_state("dev6", self.SNAP))
+
+    def test_unclaimed_detached_remnant_is_still_an_orphan(self):
+        # The positive control: the rule narrows the orphan verdict, it does
+        # not delete it.
+        self.assertEqual([800],
+                         shell_liveness.orphan_split("dev5", self.SNAP)[1])
+        self.assertEqual("orphan",
+                         shell_liveness.session_state("dev5", self.SNAP))
+
+
+class ComputeWithClaimsTest(unittest.TestCase):
+    """compute() end to end over a fake /proc plus a launch record."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.worktree = self.root / ".sc-worktrees" / "dev6"
+        self.worktree.mkdir(parents=True)
+        for patch in (
+            mock.patch.object(shell_liveness, "PROC", self.proc),
+            mock.patch.object(shell_liveness, "REPO_ROOT", self.root),
+            mock.patch.object(shell_liveness, "harness_binaries",
+                              return_value={"codex"}),
+            mock.patch.object(shell_liveness, "_shell_labels", return_value={}),
+            mock.patch.object(shell_liveness, "_self_harness_pid",
+                              return_value=None),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _claims(self, claims):
+        patch = mock.patch.object(shell_liveness, "_launch_claims",
+                                  return_value=claims)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_claimed_detached_worker_is_working_not_unreconciled(self):
+        _proc_entry(self.proc, 700, cwd=self.worktree, ppid=1, tty_nr=0)
+        self._claims({"dev6": {"pid": 700, "start_ticks": 5150,
+                               "worktree": str(self.worktree)}})
+
+        snap = shell_liveness.compute()
+
+        self.assertEqual({"dev6": 700}, snap["claimed_pids"])
+        self.assertEqual([], snap["claimed_absent"])
+        self.assertEqual([], snap["orphaned_pids"])
+        self.assertTrue(snap["processes"][0]["claimed"])
+        # Lineage is still REPORTED — it is just no longer the verdict.
+        self.assertEqual("detached", snap["processes"][0]["orphaned"])
+        self.assertEqual("busy", shell_liveness.session_state("dev6", snap))
+
+    def test_relaunch_gap_is_expected_absent_not_available(self):
+        # No process at all: the shell between two work items. Before the
+        # record this projected a bare "available" and the fleet read as idle.
+        self._claims({"dev6": {"pid": 700, "start_ticks": 5150,
+                               "worktree": str(self.worktree)}})
+
+        snap = shell_liveness.compute()
+
+        self.assertEqual({}, snap["claimed_pids"])
+        self.assertEqual(["dev6"], snap["claimed_absent"])
+        self.assertIsNone(shell_liveness.session_state("dev6", snap))
+        self.assertEqual("expected_absent",
+                         shell_liveness.record_state("dev6", snap))
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            shell_liveness._print_text(snap)
+        self.assertIn("EXPECTED BUT ABSENT", output.getvalue())
+
+    def test_unclaimed_detached_process_keeps_the_orphan_verdict(self):
+        _proc_entry(self.proc, 800, cwd=self.worktree, ppid=1, tty_nr=0)
+        self._claims({})
+
+        snap = shell_liveness.compute()
+
+        self.assertEqual([800], snap["orphaned_pids"])
+        self.assertFalse(snap["processes"][0]["claimed"])
+        self.assertEqual("orphan", shell_liveness.session_state("dev6", snap))
+
+    def test_a_shell_with_no_record_and_no_process_stays_available(self):
+        self._claims({})
+        snap = shell_liveness.compute()
+        self.assertIsNone(shell_liveness.session_state("dev6", snap))
+        self.assertIsNone(shell_liveness.record_state("dev6", snap))
+
+
 class ComputeSmokeTest(unittest.TestCase):
     """compute() against the real /proc: shape only, no liveness assumptions."""
 
