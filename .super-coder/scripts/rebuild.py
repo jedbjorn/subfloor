@@ -182,7 +182,45 @@ def validate_foreign_keys(path: Path) -> None:
         con.close()
 
 
+USAGE = "usage: ./sc rebuild [--no-backup]"
+
+HELP = f"""{USAGE}
+
+Rebuild the engine DB from schema.sql + migrations/ + the active snapshot.
+The outgoing DB is backed up first, then atomically replaced by a validated
+candidate.
+
+  --no-backup  skip the pre-rebuild backup of the outgoing DB
+  -h, --help   print this help and exit without reading or writing any state"""
+
+
+def parse_args(argv: list[str]) -> bool:
+    """Return no_backup, print help, or reject — touching NO state.
+
+    Spec #67: rebuild used to interpret arguments only after it had read the
+    schema, carried the outgoing keys, probed live Interface state and taken a
+    backup, so `./sc rebuild --help` and every typo ran a real rebuild. The
+    whole argument contract lives here, ahead of all of it, and this function
+    opens no database and touches no path.
+
+    Help wins over any action flag and over an unknown token (req 7): it
+    asserts nothing about the instance, so there is no state in which it can
+    fail — and nothing it prints can degrade into a rebuild.
+    """
+    if "-h" in argv or "--help" in argv:
+        print(HELP)
+        raise SystemExit(0)
+    unknown = [arg for arg in argv if arg != "--no-backup"]
+    if unknown:
+        print(f"rebuild: unknown argument '{unknown[0]}' ({USAGE})",
+              file=sys.stderr)
+        raise SystemExit(2)
+    return "--no-backup" in argv
+
+
 def main(argv: list[str]) -> int:
+    no_backup = parse_args(argv)
+
     schema = SCHEMA_SQLITE
     if not schema.exists():
         sys.exit(f"rebuild: missing {schema}")
@@ -198,7 +236,7 @@ def main(argv: list[str]) -> int:
             "rebuild: refusing — live Interface state exists; the clean "
             "operator drain path is required first:\n  - "
             + "\n  - ".join(reasons))
-    if "--no-backup" not in argv:
+    if not no_backup:
         backup_existing()
 
     candidate = Path(str(DB_PATH) + ".rebuild")
