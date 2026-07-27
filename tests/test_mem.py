@@ -247,6 +247,66 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("flag", "close", str(fid), "--notes", "fixed")
         self.assertEqual(self.q("SELECT resolved FROM flags WHERE flag_id=?", fid)[0], 1)
 
+    # ── #149: close names the row it is about to resolve, and never twice ─────
+    def test_flag_close_names_the_target_before_it_writes(self):
+        """flag_id and the SC-### display_name are both small integers from two
+        counters that drift through the same range, so a wrong number resolves
+        to a different real row rather than failing. The one thing that lets a
+        caller SEE it holds the wrong record is the row itself, echoed by the
+        command that is about to resolve it."""
+        self.run_mem("flag", "open", "[x] the wrong one | Blocker for: nothing",
+                     "--name", "SC-149-A", "--priority", "High")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-149-A'")[0]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.run_mem("flag", "close", str(fid), "--notes", "done")
+        out = buf.getvalue()
+        self.assertIn("SC-149-A", out)          # the name, not just the number
+        self.assertIn("the wrong one", out)     # and enough body to recognise it
+        self.assertIn("High", out)
+
+    def test_flag_close_refuses_to_overwrite_an_existing_resolution(self):
+        """A redundant close is not a no-op: it replaces the resolution notes
+        of whoever verified the flag with the closer's. The first writer's
+        evidence must survive the second close attempt."""
+        self.run_mem("flag", "open", "[x] verified | Blocker for: y",
+                     "--name", "SC-149-B")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-149-B'")[0]
+        self.run_mem("flag", "close", str(fid),
+                     "--notes", "REV1 verified at head f7f687c")
+        with self.assertRaises(SystemExit):
+            self.run_mem("flag", "close", str(fid), "--notes", "closed per sprint")
+        row = self.q("SELECT resolution_notes, resolved FROM flags WHERE flag_id=?",
+                     fid)
+        self.assertEqual(row["resolution_notes"], "REV1 verified at head f7f687c")
+        self.assertEqual(row["resolved"], 1)
+
+    # ── #288: a flag opened unnamed can be given a name; --append never eats ──
+    def test_flag_edit_sets_a_display_name_a_flag_was_opened_without(self):
+        self.run_mem("flag", "open", "[x] unnamed | Blocker for: naming")
+        fid = self.q("SELECT flag_id FROM flags WHERE description LIKE '%unnamed%'")[0]
+        self.assertIsNone(
+            self.q("SELECT display_name FROM flags WHERE flag_id=?", fid)[0])
+        self.run_mem("flag", "edit", str(fid), "--name", "SC-288")
+        self.assertEqual(
+            self.q("SELECT display_name FROM flags WHERE flag_id=?", fid)[0],
+            "SC-288")
+
+    def test_flag_edit_append_extends_the_body_instead_of_replacing_it(self):
+        self.run_mem("flag", "open", "[x] tracker gate 1 | Blocker for: arc",
+                     "--name", "SC-288-B")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-288-B'")[0]
+        self.run_mem("flag", "edit", str(fid), "--append", "\n\nGATE 2 CLEARED.")
+        desc = self.q("SELECT description FROM flags WHERE flag_id=?", fid)[0]
+        self.assertIn("tracker gate 1", desc)      # the original body survives
+        self.assertIn("GATE 2 CLEARED.", desc)
+        with self.assertRaises(SystemExit):        # replace and append conflict
+            self.run_mem("flag", "edit", str(fid), "--description", "new",
+                         "--append", "more")
+        self.assertIn("tracker gate 1",
+                      self.q("SELECT description FROM flags WHERE flag_id=?",
+                             fid)[0])
+
     # ── roadmap: add / status / work-stream / deps + cycle ────────────────────
     def test_roadmap_lifecycle_and_cycle(self):
         self.run_mem("project", "add", "ws1", "Work Stream 1")

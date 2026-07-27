@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import secrets
@@ -192,19 +193,41 @@ def _authority_host(authority: str) -> str:
     hardening rather than a live exploit — but the fence's whole job is that
     an authority which is not exactly an allowed one is refused, and
     tightening the IPv6 branch while leaving that in place is just the next
-    finding."""
+    finding.
+
+    Flag #158 asked for the malformed cases to be enumerated rather than
+    patched one at a time, and two survived the SC-150 pass:
+
+    * Brackets were accepted around ANYTHING, so `[127.0.0.1]` and
+      `[localhost]` reached the allowlist as bare `127.0.0.1` / `localhost`
+      and passed. Brackets are legal only around an IP-literal (RFC 3986
+      §3.2.2), so the content is now parsed as one — a bracketed reg-name is
+      malformed, and malformed fails closed.
+    * `str.isdigit()` is true for the Latin-1 superscripts `¹²³`, which the
+      header decode admits, so `127.0.0.1:80²` was a trailing-junk authority
+      that parsed clean. The port test is ASCII digits only.
+
+    An empty port (`127.0.0.1:`) stays accepted: RFC 3986 `port = *DIGIT`
+    permits it, and the host is still exactly an allowed one. Authority length
+    is not capped here — the header line is already bounded by the HTTP
+    server's own limit, and an oversized authority fails the allowlist
+    anyway."""
     authority = (authority or "").strip()
     if authority.startswith("["):
         end = authority.find("]")
         if end < 0:
             return ""
         host, rest = authority[1:end], authority[end + 1:]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return ""
         if rest and not rest.startswith(":"):
             return ""
         port = rest[1:]
     else:
         host, _, port = authority.partition(":")
-    if port and not port.isdigit():
+    if port and not (port.isascii() and port.isdigit()):
         return ""
     return host.lower()
 

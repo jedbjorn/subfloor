@@ -41,7 +41,7 @@ Run from the repo root, like every engine command:
     ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--feature ID] [--doc ID]
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID]
     ./sc mem flag close <flag_id>    [--notes "…"]
-    ./sc mem flag edit  <flag_id>    [--description "…"] [--priority P] [--feature ID]
+    ./sc mem flag edit  <flag_id>    [--name SC-002] [--description "…"] [--append "…"] [--priority P] [--feature ID]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>]
     ./sc mem roadmap status <feature_id> <status>
     ./sc mem roadmap edit <feature_id> [--title "…"] [--summary "…"]   # revise a feature's title/summary
@@ -398,9 +398,15 @@ def _render_get(surface: str, data: dict) -> int:
             print("mem: no open flags")
             return 0
         for f in fs:
-            nm = f.get("display_name") or f"#{f['flag_id']}"
+            # id AND label, always both (#149): a named flag used to print its
+            # name alone, so the id needed to close it had to be guessed — and
+            # SC-### names and flag_ids are drawn from two counters drifting
+            # through the same integer range, so a guess resolves to a real
+            # row rather than failing.
+            nm = f.get("display_name") or "unnamed"
             who = f" @{f['owner']}" if f.get("owner") else ""
-            print(f"[{nm}]{who} ({f.get('priority') or 'Medium'}) {f.get('description') or ''}")
+            print(f"#{f['flag_id']} [{nm}]{who} ({f.get('priority') or 'Medium'}) "
+                  f"{f.get('description') or ''}")
         return 0
     if surface == "roadmap":
         rm = data.get("roadmap", [])
@@ -604,6 +610,12 @@ def cmd_decision(args) -> int:
     return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded{link}")
 
 
+def _one_line(text: "str | None", limit: int = 240) -> str:
+    """A long body as one readable line — enough of it to recognise the row."""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
 def cmd_flag(args) -> int:
     if args.flag_cmd == "open":
         r = _api("POST", "/_sc/mem/flags",
@@ -616,20 +628,48 @@ def cmd_flag(args) -> int:
     if args.flag_cmd == "edit":
         # Long-lived tracker flags update their description progressively
         # (#316) — the API always supported the PATCH; this exposes it.
+        if args.description is not None and args.append is not None:
+            die("--description replaces the body and --append adds to it — pick one")
         payload: dict = {}
+        if args.name is not None:
+            payload["display_name"] = args.name
         if args.description is not None:
             payload["description"] = args.description
+        if args.append is not None:
+            payload["append_description"] = args.append
         if args.priority is not None:
             payload["priority"] = args.priority
         if args.feature is not None:
             payload["feature_id"] = args.feature
         if not payload:
-            die("nothing to edit — pass at least one of --description / --priority / --feature")
+            die("nothing to edit — pass at least one of "
+                "--name / --description / --append / --priority / --feature")
         _api("PATCH", f"/_sc/mem/flags/{args.flag_id}", payload)
         return _finish_api(f"mem: flag #{args.flag_id} edited ({' + '.join(payload)})")
+    # close. Read the row and NAME THE TARGET BEFORE THE WRITE (#149): flag_id
+    # and the SC-### display_name are both small integers drawn from two
+    # counters that drift through the same range, so a stale or mistranscribed
+    # reference does not fail loudly — it resolves to a different real record
+    # and resolves THAT. Printing the row first is what lets a caller see it
+    # holds the wrong record while the record still exists.
+    row = _api("GET", f"/_sc/mem/flags/{args.flag_id}").get("flag") or {}
+    name = row.get("display_name") or ""
+    label = f" ({name})" if name else " (unnamed)"
+    print(f"mem: closing flag #{args.flag_id}{label} "
+          f"[{row.get('priority') or '?'}, opened {row.get('created_date') or '?'}"
+          f" by {row.get('owner') or '?'}]")
+    print(f"    {_one_line(row.get('description'))}")
+    if row.get("resolved"):
+        # Closing an already-closed flag is not a no-op: it OVERWRITES the
+        # resolution notes of whoever verified it with the closer's. Refuse,
+        # and print what that write would have destroyed.
+        die(f"flag #{args.flag_id}{label} is already closed "
+            f"({row.get('resolved_date') or 'no date'}) — closing it again would "
+            f"overwrite its resolution notes: "
+            f"{_one_line(row.get('resolution_notes')) or '(none recorded)'}")
     _api("PATCH", f"/_sc/mem/flags/{args.flag_id}",
          {"resolved": True, "resolution_notes": args.notes})
-    return _finish_api(f"mem: flag #{args.flag_id} closed")
+    return _finish_api(f"mem: flag #{args.flag_id}{label} closed")
 
 
 def cmd_roadmap(args) -> int:
@@ -896,9 +936,11 @@ def build_parser() -> argparse.ArgumentParser:
     fo.add_argument("--name")
     fo.add_argument("--priority", default="Medium", choices=["High", "Medium", "Low"])
     fo.add_argument("--feature", type=int)
-    fe = fsub.add_parser("edit", help="update an open flag's description/priority/feature")
+    fe = fsub.add_parser("edit", help="update an open flag's name/description/priority/feature")
     fe.add_argument("flag_id", type=int)
-    fe.add_argument("--description")
+    fe.add_argument("--name", help="set or correct the display_name (#288)")
+    fe.add_argument("--description", help="REPLACES the whole body — see --append")
+    fe.add_argument("--append", help="append to the description instead of replacing it")
     fe.add_argument("--priority", choices=["High", "Medium", "Low"])
     fe.add_argument("--feature", type=int)
     fc = fsub.add_parser("close")
