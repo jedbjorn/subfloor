@@ -301,6 +301,65 @@ the entrypoint → broker path the fix changes. Verification needs an
 Interface-managed seat, which is what I am requesting from PLN2.
 `~/.codex/config.toml` was re-checked: zero `u7probe` references remain.
 
+### F13 — NEGATIVE CONTROL on a live Interface-managed codex seat (OBSERVED)
+
+PLN2 ran my invocation verbatim from the main checkout at 12:40:35 — so on
+**pre-fix code**, which is what makes this a negative control rather than a
+verification. Nothing was typed into it, no writer attached.
+
+    ./sc interface start ADM1 --harness codex --json
+
+Readings from the live DB (`interface_sessions` 68, shell 14 / generation 8),
+observed, not predicted:
+
+| field | value |
+|---|---|
+| `harness` / `cli_version` | `codex` / `codex-cli 0.145.0` |
+| `created_at` / `occupied_at` | `12:40:35` / `12:40:35` |
+| `provider_ready_at` | **NULL** — for the seat's entire 4m40s life |
+| `last_hook_seq` | **1** |
+| `lifecycle` | never `idle`; `starting` → `ended` |
+| `end_reason` / `ended_at` | `operator_end` / `12:45:15` |
+| `pane_pid` / `harness_pid` | 138236 / 138236 — the process was alive |
+
+`last_hook_seq = 1` is decisive: seq 1 is *by construction* the entrypoint's own
+pre-exec claim (`interface_hook.py` starts the counter at 1; the first
+harness-side hook issues 2). So across 4m40s of a live, trusted, hooks-installed
+codex process, **not one provider hook arrived**. The seat was promoted to
+`occupied` (occupied_at stamped) and then sat in `starting` until it was ended.
+
+Pre-fix, only a provider `session_start` or a `turn_stop` can move
+`starting → idle`, and seq 1 proves neither arrived — so the seat could not have
+armed a wake at any point in its life. That is flag #303's deadlock, reproduced
+under engine control on a real Interface-managed seat, which is what my `/tmp`
+probe could not do.
+
+Note for accuracy, not interpretation: PLN2 said they would leave the seat up
+until I released it, and it ended at 12:45:15 with `end_reason=operator_end`. I
+did not end it and do not know who did. It does not affect the reading — every
+value above was already fixed by then, and the row is durable.
+
+### F14 — dispositions of the ruled items (PLN2 #3222)
+- **Ninth description (spec #20's frozen sentence): decision #100.** The frozen
+  text stays — a frozen doc is the permanent ship-time record and is never
+  edited — and #100 (citing #98/#99) supersedes it. Close-time conformance reads
+  spec #20 and #100 together. My reading was ratified: the sentence was already
+  dead in deployment, killed by claude's own `startup_hook` class arming
+  pre-paint with the debounce + fence absorbing the window.
+- **Migration number: 0108 → 0113.** The sprint reserved 0108-0109 for U3,
+  0110-0111 for U4, 0112 for U5. My read-back of `origin/main` showed 0107 as
+  head and 0108 free, which was true of main and useless: main cannot show
+  in-flight numbers on unmerged branches. The read-back rule gives you the floor;
+  the reservation gives you your slot, and I used one of the two. Worth
+  recording as PLN2 asked: the same collision fired **three ways in one hour**
+  (U3, me, and the FnB's own PR #660 from outside the sprint), which is evidence
+  that migration allocation is a table in a doc plus discipline and nothing
+  structural. Not a fix for this unit.
+- **Positive verification: a sprint-close acceptance gate, not a U7 merge gate.**
+  U7's merge gate is suite green + renumbered migration + negative control
+  recorded + review clean. The positive half needs merge → reconcile → restart
+  and runs in the FnB's restart window before sprint close.
+
 ## Mechanism verdict (all three candidates resolved)
 - **CONFIG DISCOVERY — RULED OUT.** F2 + probe step 3/4: the project-layer file is
   found, parsed, validated and registered, in worktrees and in probes alike.

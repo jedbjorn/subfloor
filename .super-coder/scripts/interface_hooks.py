@@ -122,7 +122,7 @@ def _emitter_command(event: str) -> str:
 # silent (flag #303). Such a harness is instead promoted starting -> idle on
 # the ENTRYPOINT's pre-exec claim, which proves the PROCESS is up and nothing
 # more. That weaker proof is recorded in its OWN column (process_ready_at,
-# migration 0108) and never aliased into provider_ready_at, so no reader that
+# migration 0113) and never aliased into provider_ready_at, so no reader that
 # trusts provider_ready_at as "the provider handshaked" becomes wrong.
 #
 # Read that as "proceed on weak proof, upgrade to strong proof when it

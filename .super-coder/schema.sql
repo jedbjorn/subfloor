@@ -383,7 +383,7 @@ CREATE TABLE interface_sessions (
     -- session_start hook; the wake gate's quiet baseline, flag #49),
     -- migration 0081. process_ready_at TEXT — the strictly WEAKER proof:
     -- the entrypoint's pre-exec claim, i.e. the PROCESS is up but the
-    -- provider is unproven (migration 0108, flag #303). Never conflate the
+    -- provider is unproven (migration 0113, flag #303). Never conflate the
     -- two: provider_ready_at set = provider handshaked; process_ready_at set
     -- with provider_ready_at NULL = process ready, provider UNPROVEN.
     -- These ride the migration-only ADD COLUMN precedent
