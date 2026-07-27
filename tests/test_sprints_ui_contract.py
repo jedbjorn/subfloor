@@ -326,7 +326,7 @@ out({
         prelude="const DATA = " + json.dumps(payload(units=units)) + ";\n",
     )
     assert result["headings"] == [
-        "Waiting1", "Dev1", "Review1", "Blocked1", "Done2", "Unrecognized1",
+        "Waiting1", "Done2", "Dev1", "Review1", "Blocked1", "Unrecognized1",
     ]
     assert result["cards"] == 7
     assert long_title in result["u2"]["text"]
@@ -361,7 +361,7 @@ out({ headings: byClass(root, "sprint-col-head").map((node) => node.textContent)
         ) + ";\n",
     )
     assert result["headings"] == [
-        "Waiting", "Dev1", "Review", "Blocked", "Done",
+        "Waiting", "Done", "Dev1", "Review", "Blocked",
     ]
 
 
@@ -381,7 +381,7 @@ out({
         ) + ";\n",
     )
     assert result["headings"] == [
-        "Waiting", "Dev", "Review", "Blocked", "Done", "Unrecognized1",
+        "Waiting", "Done", "Dev", "Review", "Blocked", "Unrecognized1",
     ]
     assert "unrecognized" in result["cardClass"]
     assert "done" in result["cardText"]
@@ -423,8 +423,8 @@ out({
         ),
     )
     assert result["unknown"][-1] == "Unrecognized1"
-    assert result["known"] == ["Waiting", "Dev1", "Review", "Blocked", "Done"]
-    assert result["shared"] == ["Waiting", "Dev", "Review", "Blocked", "Done"]
+    assert result["known"] == ["Waiting", "Done", "Dev1", "Review", "Blocked"]
+    assert result["shared"] == ["Waiting", "Done", "Dev", "Review", "Blocked"]
 
 
 def test_unavailable_dependency_has_visible_warning_marker():

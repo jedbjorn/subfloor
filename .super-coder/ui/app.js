@@ -4572,10 +4572,10 @@ function sprintsHeader(sprint) {
 
 const SPRINT_FLOW_COLUMNS = [
   { key: "pending", label: "Waiting" },
+  { key: "done", label: "Done" },
   { key: "working", label: "Dev" },
   { key: "in_review", label: "Review" },
   { key: "blocked", label: "Blocked" },
-  { key: "done", label: "Done" },
 ];
 const SPRINT_STATE_LABELS = {
   pending: "Pending",
