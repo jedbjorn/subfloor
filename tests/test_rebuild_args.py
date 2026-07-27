@@ -272,12 +272,19 @@ class RebuildDispatchParityTest(unittest.TestCase):
     script's own end-to-end behavior in a fresh interpreter."""
 
     def test_dispatcher_forwards_every_argument_verbatim(self):
-        line = next(
-            ln.strip() for ln in (REPO / "sc").read_text().splitlines()
-            if ln.strip().startswith("rebuild)")
-        )
+        # Spec #68 (U10) put a linked-worktree refusal in front of the forward,
+        # so the case is two lines now — pinned as two lines, deliberately. The
+        # requirement is unchanged and is what the second line still says: the
+        # dispatcher adds nothing to argv and removes nothing from it. The first
+        # line is pinned too because ORDER is the contract: the help question is
+        # asked before the refusal, which is asked before the exec.
+        lines = [ln.strip() for ln in (REPO / "sc").read_text().splitlines()]
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("rebuild)"))
         self.assertEqual(
-            line, 'rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;')
+            lines[start],
+            'rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$DB"')
+        self.assertEqual(
+            lines[start + 1], 'exec "$PY" "$S/rebuild.py" "$@" ;;')
 
     def test_script_invocation_handles_help_and_rejection_end_to_end(self):
         # A COPY of the engine scripts, deliberately without schema.sql: this
