@@ -29,6 +29,14 @@ MAX_INPUT_BYTES = 64 * 1024  # one human frame, per the pinned spike protocol
 WAKE_PROMPT = "Check your inbox and act on unread sprint events."
 DEFAULT_QUIET_S = 3.0  # debounce, never proof of an empty composer
 MAX_COMPLETED_WAKES = 3  # unread after 3 completed wake turns → quarantined
+# H-26: how long a batch may sit `queued` under an armed binding before the
+# stall becomes an alert. GENEROUS BY DESIGN — it bounds INVISIBILITY, not
+# delivery: a batch legitimately waits out a busy planner, and nothing here
+# hurries it. What it forbids is issue #638's shape, where a batch was
+# invisible for 33 minutes across 11 accumulated items with no way to see the
+# cause. Five minutes is far outside any ordinary deferral (the debounce is
+# 3 seconds) and far inside the window where a stalled sprint still matters.
+WAKE_BATCH_STALL_S = 300.0
 
 
 class BrokerError(ValueError):
@@ -74,15 +82,23 @@ def _session(con, session_id: int):
 
 
 def _alert(con, *, severity: str, reason: str, session_id=None,
-           binding_id=None, message_id=None) -> None:
+           binding_id=None, message_id=None, batch_id=None,
+           detail=None) -> None:
     """Raise an alert, deduplicated while open (partial unique index).
 
     A session-scoped alert takes the write lock before reading terminal state.
     That makes the read + write atomic with durable closure: closure either
     lands first and this row is resolved audit, or lands second and resolves
     the row itself. The caller still owns the surrounding transaction.
+
+    `detail` carries the MEASUREMENT (a verbatim gate reason, a capability
+    gap) and is deliberately outside the dedupe key: one open row per
+    condition, whose detail REFRESHES to the most recent observation rather
+    than minting a new alert per distinct string. Per decision #76 it states
+    what was measured, never a verdict.
     """
-    dedupe = f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}|{reason}"
+    dedupe = (f"{session_id or '-'}|{binding_id or '-'}|{message_id or '-'}"
+              f"|{batch_id or '-'}|{reason}")
     if session_id is not None:
         _begin_immediate(con)
         session = con.execute(
@@ -103,23 +119,32 @@ def _alert(con, *, severity: str, reason: str, session_id=None,
             exists = con.execute(
                 "SELECT 1 FROM planner_alerts "
                 "WHERE session_id=? AND binding_id IS ? AND message_id IS ? "
-                "AND reason=? LIMIT 1",
-                (session_id, binding_id, message_id, reason),
+                "AND batch_id IS ? AND reason=? LIMIT 1",
+                (session_id, binding_id, message_id, batch_id, reason),
             ).fetchone()
             if exists is None:
                 con.execute(
                     "INSERT INTO planner_alerts "
-                    "(session_id, binding_id, message_id, severity, reason, "
-                    "dedupe_key, resolved_at) VALUES (?,?,?,?,?,?,?)",
-                    (session_id, binding_id, message_id, severity, reason,
-                     dedupe, ended_at),
+                    "(session_id, binding_id, message_id, batch_id, severity, "
+                    "reason, detail, dedupe_key, resolved_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (session_id, binding_id, message_id, batch_id, severity,
+                     reason, detail, dedupe, ended_at),
                 )
             return
     con.execute(
         "INSERT OR IGNORE INTO planner_alerts "
-        "(session_id, binding_id, message_id, severity, reason, dedupe_key) "
-        "VALUES (?,?,?,?,?,?)",
-        (session_id, binding_id, message_id, severity, reason, dedupe))
+        "(session_id, binding_id, message_id, batch_id, severity, reason, "
+        "detail, dedupe_key) VALUES (?,?,?,?,?,?,?,?)",
+        (session_id, binding_id, message_id, batch_id, severity, reason,
+         detail, dedupe))
+    if detail is not None:
+        # The row may already have been open (INSERT OR IGNORE did nothing):
+        # refresh its measurement so a reader sees the LATEST failing gate,
+        # not the one that happened to open the alert.
+        con.execute(
+            "UPDATE planner_alerts SET detail=? "
+            "WHERE dedupe_key=? AND resolved_at IS NULL", (detail, dedupe))
 
 
 def park_delivery_unknown(con, session_id: int, *,
@@ -836,6 +861,69 @@ def _reconcile_item(con, item_id: int, message_id: int,
         interface_state.transition(con, "wake_item", item_id, "queued")
 
 
+def note_gate_failure(con, batch_id: int, reason: str) -> None:
+    """Record the gate reason that just refused this batch, verbatim (H-26).
+
+    Written on EVERY failed attempt, including the ones long before the stall
+    threshold, so that when the alert finally opens it names the gate that has
+    actually been failing — not whichever one happened to fail last. Those
+    differ exactly when a seat is flapping, which is the case a reader most
+    needs the truth about.
+
+    Its own transaction: the caller has just rolled the gate read back, and
+    this measurement must outlive that rollback."""
+    con.execute(
+        "UPDATE planner_wake_batches "
+        "SET last_gate_reason=?, last_gate_at=datetime('now') "
+        "WHERE batch_id=?", (reason, batch_id))
+    con.commit()
+
+
+def stalled_batch_alert(con, batch_id: int, threshold_s=None) -> bool:
+    """Open the deduped `wake_batch_stalled` alert if this batch has been
+    queued past the threshold under a still-armed binding (H-26). Returns
+    True when the batch qualifies as stalled.
+
+    threshold_s resolves at CALL time, not in the signature: a default of
+    `WAKE_BATCH_STALL_S` would bind the constant once at import and leave
+    the module attribute a decoy that reads correctly and changes nothing.
+
+    Carries the last failing gate verbatim in `detail`. States what was
+    measured and nothing more — decision #76 forbids a monitor that reports a
+    verdict, and "which gate said no" is exactly the fact the operator cannot
+    otherwise obtain."""
+    if threshold_s is None:
+        threshold_s = WAKE_BATCH_STALL_S
+    row = con.execute(
+        "SELECT b.binding_id, b.state, b.last_gate_reason, "
+        "       (julianday('now') - julianday(b.created_at)) * 86400.0, "
+        "       p.released_at "
+        "FROM planner_wake_batches b "
+        "JOIN sprint_planner_bindings p ON p.binding_id = b.binding_id "
+        "WHERE b.batch_id=?", (batch_id,)).fetchone()
+    if row is None:
+        return False
+    binding_id, state, gate_reason, queued_s, released_at = row
+    if state != "queued" or released_at is not None:
+        return False
+    if queued_s is None or queued_s < threshold_s:
+        return False
+    _alert(con, severity="warning", reason="wake_batch_stalled",
+           binding_id=binding_id, batch_id=batch_id,
+           detail=(gate_reason or "no gate attempt recorded"))
+    return True
+
+
+def resolve_batch_alerts(con, batch_id: int) -> None:
+    """A batch that submitted or cancelled is no longer stalled (H-26).
+
+    Keyed on the batch, so this resolves that batch's rows and nothing else's
+    — a second binding stalled on the same seat keeps its own alert open."""
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE batch_id=? AND resolved_at IS NULL", (batch_id,))
+
+
 def sweep_read_queued(con, binding_id: int) -> int:
     """Complete a binding's queued items whose message is ALREADY READ (H-4).
 
@@ -991,6 +1079,7 @@ def _cancel_batch(con, batch_id: int) -> None:
     interface_state.transition(
         con, "wake_batch", batch_id, "complete",
         extra_sets={"completed_at": _now(con)})
+    resolve_batch_alerts(con, batch_id)   # H-26: a cancelled batch is not stalled
     items = con.execute(
         "SELECT item_id FROM planner_wake_items "
         "WHERE batch_id=? AND state='batched'", (batch_id,)).fetchall()
@@ -1119,6 +1208,11 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         def gate_fail(reason, **extra):
             if began:
                 con.rollback()
+            # H-26: record WHICH gate refused, verbatim, on every attempt.
+            # Without this a persistent gate failure is indistinguishable
+            # from a transient deferral — the batch shows depth and never
+            # cause, which is issue #638's whole shape.
+            note_gate_failure(con, batch_id, reason)
             return {"submitted": False, "reason": reason, **extra}
 
         if sess[1] != "occupied" or sess[2] != "idle":
@@ -1132,10 +1226,42 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             return gate_fail("a human frame is pending")
         cap = interface_hooks.capability(sess[6], sess[7])
         if not cap["mandatory_ok"]:
-            return gate_fail(
+            reason = (
                 f"harness {sess[6]!r} lacks mandatory lifecycle hooks "
                 f"(missing: {', '.join(cap['missing_mandatory']) or 'version'})"
                 " — wake cannot submit")
+            # H-26: this one is NOT a deferral. Waiting cannot clear it — the
+            # arm-path check passed a harness that has since degraded or
+            # changed — so it alerts on the first refusal instead of aging
+            # into the stall threshold like a gate that might yet pass.
+            #
+            # Detail carries harness, cli_version and missing_mandatory
+            # VERBATIM because capability() fails mandatory_ok identically on
+            # a missing-or-unparseable cli_version and on a genuinely
+            # unsupported harness. A metadata-capture miss and a real
+            # capability gap need completely different fixes, and only these
+            # three fields tell them apart.
+            #
+            # Deliberate departure from the requirement's letter, stated
+            # here and in the unit report: the reason key is distinct from
+            # the arm path's `wake_not_armable` rather than reusing it. The
+            # arm-path alert is session-scoped, so reusing the key would let
+            # an already-open arm-time row swallow this one by dedupe — a
+            # degradation-since-arming would then be silent, which is the
+            # exact failure class this requirement exists to close.
+            if began:
+                con.rollback()
+                began = False
+            _alert(con, severity="critical",
+                   reason="wake_hooks_missing_at_submit",
+                   binding_id=binding_id, batch_id=batch_id,
+                   detail=(f"harness={sess[6]!r} "
+                           f"cli_version={sess[7]!r} "
+                           f"missing_mandatory="
+                           f"{list(cap['missing_mandatory'])!r}"))
+            con.commit()
+            note_gate_failure(con, batch_id, reason)
+            return {"submitted": False, "reason": reason}
         if unmanaged:
             # Decision #15: an unmanaged writable client bypasses the ordered
             # input boundary — detection sets composer unknown (which disarms
@@ -1180,6 +1306,8 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
         interface_state.transition(
             con, "wake_batch", batch_id, "submitting",
             extra_sets={"input_seq_fence": fence})
+        # H-26: the gate passed — whatever was stalling this batch is over.
+        resolve_batch_alerts(con, batch_id)
         # Items ride legal edges only: a first attempt's items are 'batched',
         # a bounded-retry re-attempt's were returned to 'queued' with the
         # batch — walk those through 'batched' before 'submitting'.

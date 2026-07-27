@@ -245,10 +245,34 @@ class WakeCoordinator:
                 self._pre_send_attempts.pop(batch_id, None)
             elif out.get("retry_after") is not None:
                 self._schedule_retry(binding_id, out["retry_after"])
-            # any other gate failure (busy/dirty/pending/disarmed/cancelled)
-            # awaits the next event — no timer, no poll.
+            elif not out.get("cancelled"):
+                # H-26. A gate failure that is not the quiet debounce awaits
+                # the next event — but "the next event" may never come, and
+                # that is precisely issue #638: a batch invisible for 33
+                # minutes because nothing re-evaluated it.
+                #
+                # So arm ONE bounded re-check at the stall deadline. This is
+                # not a poll and not a daemon: it is the same single-timer
+                # mechanism the quiet debounce already uses, it is per
+                # binding (_arm_timer replaces, never stacks), and it stops
+                # arming the moment the alert is open — a stalled batch
+                # costs exactly one extra wakeup, ever.
+                if not interface_broker.stalled_batch_alert(con, batch_id):
+                    self._arm_stall_check(con, binding_id, batch_id)
+                con.commit()
         finally:
             con.close()
+
+    def _arm_stall_check(self, con, binding_id: int, batch_id: int) -> None:
+        """Schedule the single re-evaluation that turns a silent stall into
+        an alert (H-26). Fires at the batch's stall deadline; by then the
+        gate has either cleared on its own or the alert opens."""
+        age_s = con.execute(
+            "SELECT (julianday('now') - julianday(created_at)) * 86400.0 "
+            "FROM planner_wake_batches WHERE batch_id=?",
+            (batch_id,)).fetchone()[0]
+        remaining = interface_broker.WAKE_BATCH_STALL_S - (age_s or 0.0)
+        self._schedule_retry(binding_id, max(remaining, 0.1))
 
     def _pre_send_failed(self, con, binding_id: int, batch_id: int) -> None:
         """Bounded pre-send retries (spec Retry Policy): one definite

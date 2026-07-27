@@ -884,6 +884,208 @@ class AlreadyReadNeverWakesTest(WakeFixture):
                          "a drained sibling must not suppress live work")
 
 
+# ── H-26: a stalled batch becomes visible, with its reason ───────────────────
+
+class StalledBatchVisibilityTest(WakeFixture):
+    """Issue #638's shape: an armed binding, a batch queued 33+ minutes
+    through 11 accumulated items, `sc sprint status` showing depth but never
+    cause, and `sc sprint alerts` showing nothing at all."""
+
+    def _queued_batch(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return self.form()
+
+    def _make_gate_fail(self, reason="busy"):
+        """Refuse the gate the way a real deferral does."""
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle=? WHERE session_id=?",
+            ("busy" if reason == "busy" else "idle", self.sid))
+        if reason != "busy":
+            self.con.execute(
+                "UPDATE interface_input_state SET composer='dirty' "
+                "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+
+    def _age_batch(self, batch_id, seconds):
+        _age(self.con, "planner_wake_batches", "created_at", batch_id,
+             seconds, "batch_id")
+        self.con.commit()
+
+    def open_alerts(self):
+        return self.con.execute(
+            "SELECT reason, detail, batch_id, severity FROM planner_alerts "
+            "WHERE resolved_at IS NULL ORDER BY alert_id").fetchall()
+
+    def test_gate_failure_records_which_gate_refused(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        out = self.submit(batch, lambda n: None)
+        self.assertFalse(out["submitted"])
+        recorded = self.con.execute(
+            "SELECT last_gate_reason FROM planner_wake_batches "
+            "WHERE batch_id=?", (batch,)).fetchone()[0]
+        self.assertEqual(recorded, out["reason"],
+                         "the batch must carry the gate's own words")
+        self.assertIn("occupied+idle", recorded)
+
+    def test_batch_queued_past_threshold_alerts_with_the_gate_reason(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        gate = self.submit(batch, lambda n: None)["reason"]
+        self._age_batch(batch, 400)
+        self.assertTrue(
+            interface_broker.stalled_batch_alert(self.con, batch))
+        self.con.commit()
+        alerts = self.open_alerts()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0][0], "wake_batch_stalled")
+        self.assertEqual(alerts[0][1], gate,
+                         "detail states what was measured, verbatim")
+        self.assertEqual(alerts[0][2], batch, "the alert keys on the batch")
+
+    def test_batch_inside_the_threshold_stays_silent(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self.assertFalse(
+            interface_broker.stalled_batch_alert(self.con, batch),
+            "an ordinary deferral is not a stall — the monitor must not lie")
+        self.con.commit()
+        self.assertEqual(self.open_alerts(), [])
+
+    def test_released_binding_is_not_reported_as_a_stall(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        self.con.execute(
+            "UPDATE sprint_planner_bindings SET released_at=datetime('now') "
+            "WHERE binding_id=?", (self.binding,))
+        self.con.commit()
+        self.assertFalse(
+            interface_broker.stalled_batch_alert(self.con, batch),
+            "H-26 scopes the stall to an ARMED binding; a released one is H-6")
+
+    def test_repeated_evaluation_keeps_one_open_row_and_refreshes_detail(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        # The seat flaps: a different gate now refuses.
+        self._make_gate_fail("dirty")
+        second = self.submit(batch, lambda n: None)["reason"]
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        alerts = self.open_alerts()
+        self.assertEqual(len(alerts), 1, "deduped while open")
+        self.assertEqual(alerts[0][1], second,
+                         "detail tracks the LATEST failing gate, not the first")
+
+    def test_submitting_resolves_the_stall_alert(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        self.assertEqual(len(self.open_alerts()), 1)
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle='idle' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        out = self.submit(batch, lambda n: None)
+        self.assertTrue(out["submitted"], out)
+        self.assertEqual(
+            [a for a in self.open_alerts() if a[0] == "wake_batch_stalled"],
+            [], "a batch that submitted is no longer stalled")
+
+    def test_cancelled_batch_resolves_the_stall_alert(self):
+        batch = self._queued_batch()
+        self._make_gate_fail("busy")
+        self.submit(batch, lambda n: None)
+        self._age_batch(batch, 400)
+        interface_broker.stalled_batch_alert(self.con, batch)
+        self.con.commit()
+        # Freezing the sprint cancels the batch at the submit gate.
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.execute(
+            "UPDATE interface_sessions SET lifecycle='idle' "
+            "WHERE session_id=?", (self.sid,))
+        self.con.commit()
+        out = self.submit(batch, lambda n: None)
+        self.assertTrue(out.get("cancelled"), out)
+        self.assertEqual(
+            [a for a in self.open_alerts() if a[0] == "wake_batch_stalled"],
+            [], "a cancelled batch is not stalled either")
+
+
+class HooksMissingAtSubmitTest(WakeFixture):
+    """A capability gap at SUBMIT is not a deferral: waiting cannot clear it,
+    because the arm-path check already passed a harness that has since
+    degraded or changed."""
+
+    def _degrade(self, harness="codex", cli_version=None):
+        self.con.execute(
+            "UPDATE interface_sessions SET harness=?, cli_version=? "
+            "WHERE session_id=?", (harness, cli_version, self.sid))
+        self.con.commit()
+
+    def _queued_batch(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return self.form()
+
+    def test_capability_gap_alerts_on_the_first_refusal(self):
+        batch = self._queued_batch()
+        self._degrade(cli_version=None)
+        out = self.submit(batch, lambda n: None)
+        self.assertFalse(out["submitted"])
+        rows = self.con.execute(
+            "SELECT reason, detail, batch_id, severity FROM planner_alerts "
+            "WHERE resolved_at IS NULL AND reason='wake_hooks_missing_at_submit'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1,
+                         "no threshold applies — waiting cannot clear this")
+        self.assertEqual(rows[0][2], batch)
+        self.assertEqual(rows[0][3], "critical")
+
+    def test_alert_detail_tells_a_metadata_miss_from_a_real_gap(self):
+        """capability() fails mandatory_ok identically on an unparseable
+        cli_version and on an unsupported harness. These need completely
+        different fixes, so all three fields ride the alert verbatim."""
+        batch = self._queued_batch()
+        self._degrade(harness="codex", cli_version=None)
+        self.submit(batch, lambda n: None)
+        detail = self.con.execute(
+            "SELECT detail FROM planner_alerts "
+            "WHERE reason='wake_hooks_missing_at_submit'").fetchone()[0]
+        self.assertIn("harness='codex'", detail)
+        self.assertIn("cli_version=None", detail)
+        self.assertIn("missing_mandatory=", detail)
+
+    def test_capability_gap_does_not_reuse_the_arm_path_dedupe_row(self):
+        """Deliberate departure from the requirement's letter. The arm-path
+        alert is SESSION-scoped; reusing `wake_not_armable` would let an
+        already-open arm-time row swallow this one by dedupe, and a
+        degradation-since-arming would be silent — the exact failure class
+        this requirement closes."""
+        batch = self._queued_batch()
+        self._degrade(cli_version=None)
+        interface_broker._hook_capability_alerts(self.con, self.sid)
+        self.con.commit()
+        self.submit(batch, lambda n: None)
+        reasons = [r[0] for r in self.con.execute(
+            "SELECT reason FROM planner_alerts WHERE resolved_at IS NULL"
+        ).fetchall()]
+        self.assertIn("wake_not_armable", reasons)
+        self.assertIn("wake_hooks_missing_at_submit", reasons)
+
+
 # ── The coordinator: event-driven drain, retries, parking non-bypass ─────────
 
 class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
@@ -995,6 +1197,60 @@ class WakeCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(done, "read rows must complete, not sit queued")
         self.assertEqual(self.writes, [], "a drained inbox costs no wake turn")
         self.assertIsNone(self.one("SELECT batch_id FROM planner_wake_batches"))
+
+    async def test_persistent_gate_failure_alerts_without_any_further_event(self):
+        """H-26 end to end, and the whole of issue #638.
+
+        The gate refuses for a reason that is not the quiet debounce, and
+        then NOTHING else happens — no new message, no hook, no operator.
+        Before this unit the batch sat queued and invisible indefinitely,
+        because a non-quiet gate failure armed no timer. It must now surface
+        on its own, carrying which gate refused."""
+        con = self.connect()
+        con.execute("UPDATE interface_sessions SET lifecycle='busy' "
+                    "WHERE session_id=?", (self.sid,))
+        con.commit()
+        con.close()
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task")
+        with mock.patch.object(interface_broker, "WAKE_BATCH_STALL_S", 0.3):
+            self.coord.notify_binding(self.binding)
+            opened = await self.wait_for(
+                lambda: self.one(
+                    "SELECT COUNT(*) FROM planner_alerts WHERE "
+                    "reason='wake_batch_stalled' AND resolved_at IS NULL") == 1,
+                timeout=6.0)
+        self.assertTrue(opened, "a persistent stall must not stay invisible")
+        self.assertEqual(self.writes, [], "and no byte may have moved")
+        detail = self.one(
+            "SELECT detail FROM planner_alerts WHERE reason='wake_batch_stalled'")
+        self.assertIn("occupied+idle", detail,
+                      "the alert names the gate that actually refused")
+
+    async def test_gate_that_clears_before_the_deadline_never_alerts(self):
+        """The re-check must not become a monitor that cries wolf: a batch
+        whose gate clears in time submits, and no stall is ever reported."""
+        con = self.connect()
+        con.execute("UPDATE interface_sessions SET lifecycle='busy' "
+                    "WHERE session_id=?", (self.sid,))
+        con.commit()
+        con.close()
+        self.coord.start(asyncio.get_running_loop())
+        self.add_message("task")
+        with mock.patch.object(interface_broker, "WAKE_BATCH_STALL_S", 2.0):
+            self.coord.notify_binding(self.binding)
+            await asyncio.sleep(0.2)
+            con = self.connect()
+            con.execute("UPDATE interface_sessions SET lifecycle='idle' "
+                        "WHERE session_id=?", (self.sid,))
+            con.commit()
+            con.close()
+            self.coord.notify_binding(self.binding)
+            ok = await self.wait_for(lambda: len(self.writes) == 1)
+        self.assertTrue(ok, "the batch must submit once the gate clears")
+        self.assertEqual(
+            self.one("SELECT COUNT(*) FROM planner_alerts WHERE "
+                     "reason='wake_batch_stalled'"), 0)
 
     async def test_probe_still_suppresses_when_the_sweep_loses_the_race(self):
         """The drain probe's own read_at filter, isolated.
