@@ -4570,11 +4570,14 @@ function sprintsHeader(sprint) {
   return [header, meta];
 }
 
+// Most-advanced state first: dependency wires run prerequisite → dependent,
+// and a prerequisite is almost always further along the pipeline than what
+// waits on it, so this order makes the dominant wire direction left→right.
 const SPRINT_FLOW_COLUMNS = [
-  { key: "pending", label: "Waiting" },
   { key: "done", label: "Done" },
-  { key: "working", label: "Dev" },
   { key: "in_review", label: "Review" },
+  { key: "working", label: "Dev" },
+  { key: "pending", label: "Waiting" },
   { key: "blocked", label: "Blocked" },
 ];
 const SPRINT_STATE_LABELS = {
@@ -4686,6 +4689,9 @@ function sprintsBuildFlow(sprint) {
         unavailable.push(token || "(empty)");
         continue;
       }
+      // A discharged prerequisite (Done column) no longer constrains anything;
+      // its wire would be pure ink. The card's Depends: line still names it.
+      if (sprintsColumnKey(bySeq.get(token)) === "done") continue;
       const edgeKey = `${token}\u0000${unit.seq}`;
       if (!seenEdges.has(edgeKey)) {
         seenEdges.add(edgeKey);
@@ -4705,9 +4711,39 @@ function sprintsBuildFlow(sprint) {
   if (units.some((unit) => sprintsColumnKey(unit) === "unrecognized"))
     columns.push({ key: "unrecognized", label: "Unrecognized" });
 
+  // Row order inside a column follows the wires, not declaration order: two
+  // barycenter sweeps pull each card level with its graph neighbours, which
+  // removes most wire crossings without changing what any column contains.
+  // Cards with no live dependencies keep their relative declaration order.
+  const columnUnits = new Map(columns.map((column) => [column.key,
+    units.filter((unit) => sprintsColumnKey(unit) === column.key)]));
+  const neighbors = new Map();
+  for (const [from, to] of edges) {
+    if (!neighbors.has(from)) neighbors.set(from, []);
+    if (!neighbors.has(to)) neighbors.set(to, []);
+    neighbors.get(from).push(to);
+    neighbors.get(to).push(from);
+  }
+  const rowOf = new Map();
+  for (const inColumn of columnUnits.values())
+    inColumn.forEach((unit, row) => rowOf.set(String(unit.seq), row));
+  for (let sweep = 0; sweep < 2; sweep += 1) {
+    for (const inColumn of columnUnits.values()) {
+      const keys = new Map(inColumn.map((unit) => {
+        const seq = String(unit.seq);
+        const near = neighbors.get(seq);
+        return [seq, near && near.length
+          ? near.reduce((sum, other) => sum + rowOf.get(other), 0) / near.length
+          : rowOf.get(seq)];
+      }));
+      inColumn.sort((a, b) =>
+        keys.get(String(a.seq)) - keys.get(String(b.seq)));
+      inColumn.forEach((unit, row) => rowOf.set(String(unit.seq), row));
+    }
+  }
+
   for (const column of columns) {
-    const inColumn = units.filter(
-      (unit) => sprintsColumnKey(unit) === column.key);
+    const inColumn = columnUnits.get(column.key);
     const heading = el("div", { className: "sprint-col-head" }, column.label);
     if (inColumn.length)
       heading.append(el("span", { className: "count" }, String(inColumn.length)));
@@ -4755,14 +4791,29 @@ function sprintsBuildFlow(sprint) {
       if (!source || !target) continue;
       const a = source.getBoundingClientRect();
       const z = target.getBoundingClientRect();
-      const x1 = a.right - base.left;
       const y1 = a.top - base.top + a.height / 2;
-      const x2 = z.left - base.left;
       const y2 = z.top - base.top + z.height / 2;
-      const dx = Math.max(40, Math.abs(x2 - x1) * 0.4);
+      // Anchor on the near edges: a backward wire exits left and enters right
+      // instead of looping the full board width, and a same-column wire takes
+      // a short lap through the gutter beside its own column.
+      let d;
+      if (z.left >= a.right) {
+        const x1 = a.right - base.left;
+        const x2 = z.left - base.left;
+        const dx = Math.max(40, (x2 - x1) * 0.4);
+        d = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+      } else if (z.right <= a.left) {
+        const x1 = a.left - base.left;
+        const x2 = z.right - base.left;
+        const dx = Math.max(40, (x1 - x2) * 0.4);
+        d = `M ${x1} ${y1} C ${x1 - dx} ${y1}, ${x2 + dx} ${y2}, ${x2} ${y2}`;
+      } else {
+        const x1 = a.right - base.left;
+        const x2 = z.right - base.left;
+        d = `M ${x1} ${y1} C ${x1 + 24} ${y1}, ${x2 + 24} ${y2}, ${x2} ${y2}`;
+      }
       const path = document.createElementNS(SPRINTS_SVG_NS, "path");
-      path.setAttribute(
-        "d", `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
+      path.setAttribute("d", d);
       path.setAttribute("class", "sprint-wire");
       path.setAttribute("marker-end", `url(#${markerId})`);
       path.dataset.from = from;

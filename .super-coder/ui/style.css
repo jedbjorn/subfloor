@@ -630,7 +630,10 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .sprint-unit-delivery { display: flex; flex-direction: column; min-width: 0; }
 .sprint-unit-delivery > span { overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
-.sprint-wire { fill: none; stroke: rgba(110,168,254,.42); stroke-width: 1.6px; }
+/* Wires are ink-on-demand: invisible at rest (each card's Depends: line
+   carries the standing signal), revealed by the spotlight rules below when a
+   card is hovered or selected. */
+.sprint-wire { fill: none; stroke: transparent; stroke-width: 1.6px; }
 .sprint-flow.sprint-spotlight .sprint-unit { opacity: .38; }
 .sprint-flow.sprint-spotlight .sprint-unit.lit { opacity: 1; border-color: var(--accent);
   box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
