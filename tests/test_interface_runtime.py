@@ -342,14 +342,23 @@ class ShadowSidecarTest(unittest.TestCase):
             "require('readline').createInterface"
             "({input: process.stdin}).on('line', () => {});\n")
 
+        # Same flag #106 correction as its dead-sidecar sibling below, applied
+        # to the whole class rather than only the instance that reddened: the
+        # `elapsed < 5` line was a wall-clock budget with a quiet-machine
+        # assumption baked in. The property is that an unanswering sidecar
+        # RAISES rather than hanging a caller forever, and the injected 0.5s
+        # timeout — not the wall clock — is what bounds this test's runtime.
+        # Asserting the timeout's own message proves the raise came from
+        # wait_for expiring, which is the path this test exists to cover.
         async def flow():
             sidecar = interface_runtime.ShadowSidecar(script)
-            with mock.patch.object(interface_runtime,
-                                   "SHADOW_REQUEST_TIMEOUT_S", 0.5):
-                t0 = time.monotonic()
-                with self.assertRaises(RuntimeError):
-                    await sidecar.start()   # the boot probe times out
-                self.assertLess(time.monotonic() - t0, 5)
+            with (
+                mock.patch.object(
+                    interface_runtime, "SHADOW_REQUEST_TIMEOUT_S", 0.5),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                await sidecar.start()   # the boot probe times out
+            self.assertIn("timed out", str(caught.exception))
             await sidecar.stop()
         asyncio.run(flow())
 
@@ -357,14 +366,33 @@ class ShadowSidecarTest(unittest.TestCase):
         # Dies instantly (what a missing @xterm/headless require does).
         script = self._script("process.exit(1)\n")
 
+        # Flag #106: this test used to inject a 5s timeout and assert the probe
+        # returned in under 5s — the budget and the timeout were the SAME
+        # number, so it carried no headroom and reddened twice under sprint
+        # load at 5.027s while the code was correct. "Fast" here does not mean
+        # "under N seconds on a quiet machine"; it means the failure comes from
+        # NOTICING THE PROCESS DIED rather than from waiting the request out.
+        # Those are two different code paths raising two different messages, so
+        # the discriminator is the message, and no clock enters the assertion:
+        #   dead     -> _reader hits EOF -> "shadow sidecar exited"
+        #   wedged   -> asyncio.wait_for -> "... timed out after Ns ..."
+        # The injected timeout is deliberately far LARGER than any plausible
+        # death-detection time, which is what makes the two outcomes
+        # unmistakable: correct code never reaches it under any load, and a
+        # regression that waits it out is reported as a wrong-path failure
+        # rather than a slow pass.
         async def flow():
             sidecar = interface_runtime.ShadowSidecar(script)
-            with mock.patch.object(interface_runtime,
-                                   "SHADOW_REQUEST_TIMEOUT_S", 5):
-                t0 = time.monotonic()
-                with self.assertRaises(RuntimeError):
-                    await sidecar.start()
-                self.assertLess(time.monotonic() - t0, 5)
+            with (
+                mock.patch.object(
+                    interface_runtime, "SHADOW_REQUEST_TIMEOUT_S", 30),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                await sidecar.start()
+            self.assertIn("exited", str(caught.exception))
+            self.assertNotIn("timed out", str(caught.exception),
+                             "the probe waited out the request timeout instead "
+                             "of failing on the sidecar's death")
             await sidecar.stop()
         asyncio.run(flow())
 

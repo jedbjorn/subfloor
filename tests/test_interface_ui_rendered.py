@@ -7,16 +7,62 @@ pinned browser stack as visual QA and uploads the tall/short screenshots.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
+import sys
 import threading
+import warnings
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
 
-sync_api = pytest.importorskip("playwright.sync_api")
+def _browser_stack_note() -> str:
+    """What this interpreter has, for a skip or launch failure to name.
+
+    Flag #169's cost was never the missing browser — it was that the reader
+    could not tell WHICH of the two halves had drifted. So report both: the
+    playwright the interpreter imports, and the builds actually on disk.
+    """
+    try:
+        version = importlib.metadata.version("playwright")
+    except importlib.metadata.PackageNotFoundError:
+        version = "not installed"
+    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if root and Path(root).is_dir():
+        builds = ", ".join(sorted(p.name for p in Path(root).iterdir())) or "empty"
+    else:
+        builds = f"{root or '<unset>'} is not a directory"
+    return (
+        f"playwright={version} under {sys.executable}\n"
+        f"    PLAYWRIGHT_BROWSERS_PATH={root or '<unset>'} carries: {builds}"
+    )
+
+
+# Flag #169: this module used to be guarded by a bare `importorskip`, which in a
+# sandbox whose .venv has no playwright reports the whole file as "1 skipped" —
+# twenty rendered assertions silently not running, reading exactly like a green
+# run with coverage. A skip is the right OUTCOME for a dependency-light suite;
+# a skip nobody can see is not. So the reason names the stack and the remedy,
+# and it is raised as a warning too, because a warning survives `-q` in the
+# run summary where a skip count does not.
+try:
+    from playwright import sync_api
+except ImportError:  # pragma: no cover - depends on the interpreter
+    _RENDERED_SKIP = (
+        "playwright is not importable, so the 20 rendered assertions in this "
+        "module DID NOT RUN — this is zero rendered coverage, not a pass.\n"
+        f"    {_browser_stack_note()}\n"
+        "    Run this file under an interpreter that has playwright and a "
+        "matching browser build (in the super-coder sandbox that is the system "
+        "`python3`, not .venv/bin/python), or install a playwright whose build "
+        "number matches PLAYWRIGHT_BROWSERS_PATH."
+    )
+    warnings.warn(f"rendered UI suite skipped — {_RENDERED_SKIP}", stacklevel=1)
+    pytest.skip(_RENDERED_SKIP, allow_module_level=True)
+
 sync_playwright = sync_api.sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -293,7 +339,26 @@ def ui_url():
 @pytest.fixture(scope="module")
 def browser():
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        # Flag #169's other half: playwright imports but the build it wants is
+        # not the build the image carries, and a raw launch failure reports that
+        # as twenty identical errors about an executable path — which reads as a
+        # broken suite rather than a mismatched environment. Convert it into one
+        # skip that names both sides. Deliberately NOT a blanket guard around
+        # the test body: only the launch is environmental, and a failure inside
+        # a test must stay a failure.
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:  # noqa: BLE001 - reported, then re-raised as skip
+            reason = (
+                "playwright is installed but cannot launch chromium, so the 20 "
+                "rendered assertions DID NOT RUN — zero rendered coverage, not "
+                f"a pass.\n    {_browser_stack_note()}\n"
+                f"    launch error: {type(exc).__name__}: {exc}\n"
+                "    The package and the baked browsers have drifted apart; "
+                "align the two in one place rather than shimming a path."
+            )
+            warnings.warn(f"rendered UI suite skipped — {reason}", stacklevel=1)
+            pytest.skip(reason)
         try:
             yield browser
         finally:
@@ -1382,6 +1447,19 @@ HEADER_LINES = """() => {
                     / 10;
   }
   const width = (node) => Math.round(node.getBoundingClientRect().width);
+  // The identity's own content width, measured under the identity's OWN
+  // computed font. This is the reference the no-overgrowth assert needs and
+  // the one `scrollWidth` cannot supply: scrollWidth clamps up to clientWidth,
+  // so an identity that has absorbed 341px of free space reports
+  // scrollWidth 341 and compares equal to itself. Measuring the text instead
+  // keeps the comparison SELF-RELATIVE — layout box against the same string
+  // under the same resolved family — so it carries across hosts that resolve
+  // the generic stack differently, unlike any px budget in the table above.
+  const identityStyle = getComputedStyle(identity);
+  pen.font = `${identityStyle.fontStyle} ${identityStyle.fontWeight} ` +
+             `${identityStyle.fontSize} ${identityStyle.fontFamily}`;
+  const identityNatural =
+    Math.round(pen.measureText(identity.textContent).width * 10) / 10;
   return {
     lines: new Set([dataBox, ...controls].map(centre)).size,
     truncated: context.scrollWidth > context.clientWidth,
@@ -1408,6 +1486,8 @@ HEADER_LINES = """() => {
       data: Math.round(dataBox.width),
       badge: width(badge),
       identity: width(identity),
+      identityBox: Math.round(identity.getBoundingClientRect().width * 10) / 10,
+      identityNatural: identityNatural,
       controls: controls.reduce((sum, rect) => sum + rect.width, 0),
       fontSize: style.fontSize,
       fontFamily: style.fontFamily,
@@ -1428,7 +1508,8 @@ def _header_report(label: str, metrics: dict) -> str:
         f"({metrics['cap'] - metrics['need']:+}px spare) slot={metrics['slot']}px · "
         f"head={metrics['head']}px controls={round(metrics['controls'])}px "
         f"data={metrics['data']}px badge={metrics['badge']}px "
-        f"identity={metrics['identity']}px · font={metrics['fontSize']} "
+        f"identity={metrics['identityBox']}px "
+        f"(content {metrics['identityNatural']}px) · font={metrics['fontSize']} "
         f"{metrics['fontFamily']} · rulers {rulers}"
     )
 
@@ -1529,6 +1610,19 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_pat
         assert narrow["badge"] == "Sprint 31"
         assert narrow["identity"] == "Code-01 | DEV3"
         assert narrow["context"].startswith("Interface corrective hardening · ")
+        # Flag #177: `lines == 1` is satisfied by an identity that never wraps
+        # AND by one that refuses to shrink and squeezes its neighbours to
+        # nothing instead, so it cannot distinguish them. At a viewport this
+        # over-subscribed the identity must be YIELDING — its box narrower than
+        # its own text — which is the half of `.if-identity`'s contract
+        # (`flex: 0 1 auto; min-width: 0`) that shrinking expresses.
+        assert narrow["metrics"]["identityBox"] < narrow["metrics"]["identityNatural"], (
+            "the identity held its full width at 700px instead of truncating: "
+            f"box={narrow['metrics']['identityBox']}px is not under its own "
+            f"content width {narrow['metrics']['identityNatural']}px. The work "
+            "context absorbs the whole shortfall — check `flex-shrink` and "
+            f"`min-width` on .if-identity\n{report[-1]}"
+        )
 
         # With room to spare the same hierarchy remains one line, right aligned.
         page.set_viewport_size({"width": 1600, "height": 1000})
@@ -1547,6 +1641,24 @@ def test_header_keeps_controls_left_and_work_data_right(browser, ui_url, tmp_pat
         )
         assert wide["controlsRight"] <= wide["dataLeft"], report[-1]
         assert wide["rightInset"] <= 14, report[-1]
+        # Flag #177, the property the retired `gapToControls` assert claimed to
+        # pin and did not: with room to spare the identity is sized to its
+        # CONTENT and does not absorb the free space. Every other assert here
+        # survives an identity grown to 3.6x its text — it still occupies one
+        # line, still sits right of the controls, still keeps its inset — so
+        # this is the only one that fails when the cap goes. Compared against
+        # the identity's own measured text rather than a px budget, which is
+        # what makes it host-independent; the 25% allowance covers
+        # measureText-vs-layout subpixel drift, not a second element's width.
+        overgrowth = wide["metrics"]["identityNatural"] * 1.25 + 4
+        assert wide["metrics"]["identityBox"] <= overgrowth, (
+            f"the identity grew to {wide['metrics']['identityBox']}px at 1600px "
+            f"against {wide['metrics']['identityNatural']}px of text "
+            f"(ceiling {round(overgrowth, 1)}px): it is absorbing the header's "
+            "free space instead of staying at its content width, which pushes "
+            "the work context's slot down as the viewport grows"
+            f"\n{report[-1]}"
+        )
     finally:
         # Written on pass as well as failure: an instrumented run that goes
         # green still has to hand back the numbers it measured.

@@ -54,7 +54,10 @@ def test_bounded_buffers(spike, make_session, writer, ws_factory, tmp_path):
     t0 = time.monotonic()
     go.touch()
     try:
-        out = good.wait_len(len(corpus), timeout=120)
+        # Flag #67: a no-progress budget, not a total-duration one — the pump is
+        # allowed to take as long as the host makes it take, provided it is
+        # still moving bytes. 30s of complete silence mid-burst is a wedge.
+        out = good.wait_len(len(corpus), stall_timeout=30)
     except TimeoutError:
         st, info = spike.api("GET", f"/api/interface/sessions/{sid}")
         raise TimeoutError(
