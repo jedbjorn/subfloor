@@ -384,6 +384,193 @@ class DeafSprintAlertTest(WakeFixture):
         self.assertEqual(self.deaf(), [])
 
 
+# ── H-6: binding release is an event, not an absence ─────────────────────────
+
+class BindingReleaseIsAnEventTest(WakeFixture):
+    """A generation change releases the binding AND resolves its open alerts;
+    from then on the planner is deaf and nothing said so. The resolve sweep is
+    binding-scoped, so an alert that lived inside it would vanish at the exact
+    moment it became true."""
+
+    def queued_item(self):
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        return mid
+
+    def deaf(self, resolved=False):
+        return self.con.execute(
+            "SELECT sprint_doc_id, severity, detail, binding_id, session_id "
+            "FROM planner_alerts WHERE reason='binding_released_live_sprint' "
+            + ("" if resolved else "AND resolved_at IS NULL ")
+            + "ORDER BY alert_id").fetchall()
+
+    def release(self, reason="shell_recovery"):
+        out = interface_broker.release_binding(self.con, self.binding, reason)
+        self.con.commit()
+        return out
+
+    def arm_next(self, generation=2):
+        """The next generation's binding for the same sprint. Ends the old
+        generation first — `idx_interface_generations_live` allows exactly one
+        non-ended generation per shell, which is the constraint that makes a
+        generation CHANGE the thing H-6 is about."""
+        # Through the ENGINE's own closure path, not a hand-written UPDATE:
+        # the lifecycle trigger refuses idle -> ended directly, and a test
+        # that walked around it would be staging a state the product cannot
+        # reach.
+        for (old_sid,) in self.con.execute(
+                "SELECT session_id FROM interface_sessions "
+                "WHERE shell_id=1 AND occupancy <> 'ended'").fetchall():
+            interface_broker.close_session(self.con, old_sid, "operator_end")
+        self.con.execute(
+            "UPDATE interface_generations SET ended_at=datetime('now') "
+            "WHERE shell_id=1 AND ended_at IS NULL")
+        self.con.execute(
+            "INSERT INTO interface_generations (shell_id, generation) "
+            "VALUES (1,?)", (generation,))
+        sid = self.con.execute(
+            "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
+            " lifecycle, harness, cli_version) VALUES (1,?,'occupied','idle',"
+            "?,?)", (generation, self.HARNESS, self.CLI_VERSION)).lastrowid
+        binding = self.con.execute(
+            "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
+            " planner_shell_id, session_id, shell_id, generation) "
+            "VALUES (1,1,?,1,?)", (sid, generation)).lastrowid
+        adopted = interface_broker.reparent_wake_items(self.con, binding, 1)
+        self.con.commit()
+        return binding, adopted
+
+    def test_release_mid_sprint_is_reported(self):
+        self.queued_item()
+        self.release()
+        rows = self.deaf()
+        self.assertEqual(len(rows), 1)
+        with self.subTest("critical"):
+            self.assertEqual(rows[0][1], "critical")
+        with self.subTest("keyed on the sprint"):
+            self.assertEqual(rows[0][0], 1)
+        with self.subTest("names the release reason"):
+            self.assertIn("shell_recovery", rows[0][2])
+
+    def test_the_alert_is_outside_the_binding_and_session_resolve_sets(self):
+        """The whole requirement in one assertion: every caller of
+        release_binding follows it with one of these sweeps."""
+        self.queued_item()
+        self.release()
+        self.con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE binding_id=? AND resolved_at IS NULL", (self.binding,))
+        self.con.execute(
+            "UPDATE planner_alerts SET resolved_at=datetime('now') "
+            "WHERE session_id=? AND resolved_at IS NULL", (self.sid,))
+        self.con.commit()
+        self.assertEqual(len(self.deaf()), 1,
+                         "a deaf-sprint alert that resolves with its own "
+                         "binding vanishes exactly when it becomes true")
+
+    def test_held_items_are_not_cancelled_while_the_sprint_runs(self):
+        self.queued_item()
+        self.assertEqual(self.release(), 0,
+                         "nothing was cancelled, so nothing is reported as "
+                         "cancelled")
+        self.assertEqual([r[2] for r in self.item_states()], ["queued"])
+
+    def test_a_held_item_is_reachable_by_no_drain_until_it_is_adopted(self):
+        """Held, not live: every drain path requires released_at IS NULL, so
+        the item cannot fire for a sprint that is no longer armed."""
+        self.queued_item()
+        self.release()
+        coord = interface_wake.WakeCoordinator(
+            str(self.db), writer_factory=lambda s: (lambda n: None),
+            unmanaged_probe=lambda s: False, quiet_s=QUIET)
+        coord._drain_sync(self.binding)
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT batch_id FROM planner_wake_batches").fetchone())
+
+    def test_arming_the_next_generation_adopts_them(self):
+        self.queued_item()
+        self.release()
+        binding2, adopted = self.arm_next()
+        self.assertEqual(adopted, 1)
+        with self.subTest("re-parented"):
+            self.assertEqual(
+                self.con.execute(
+                    "SELECT binding_id, state FROM planner_wake_items"
+                ).fetchall(), [(binding2, "queued")])
+        with self.subTest("and the alert closes on the arm"):
+            self.assertEqual(self.deaf(), [])
+
+    def test_items_behind_TWO_lost_generations_are_all_adopted(self):
+        """Items scope only through binding_id; the sprint is recovered by
+        joining the released rows' sprint_doc_id across EVERY released
+        generation, not just the most recent."""
+        self.queued_item()
+        self.release()
+        gen2, _ = self.arm_next()
+        mid = self.add_message("result")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        interface_broker.release_binding(self.con, gen2, "shell_recovery")
+        self.con.commit()
+        _binding3, adopted = self.arm_next(generation=3)
+        self.assertEqual(adopted, 2,
+                         "one item behind each lost generation")
+
+    def test_a_batched_item_rides_home_and_drops_its_batch(self):
+        """The batch is generation-bound and dies with the generation; its
+        items are not."""
+        self.queued_item()
+        batch = self.form()
+        self.release()
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state, batch_id FROM planner_wake_items").fetchall(),
+            [("queued", None)])
+        self.assertEqual(self.batch_state(batch), "complete")
+
+    def test_a_finished_sprint_cancels_as_before(self):
+        """Every unit terminal: the release is the ordinary end of a sprint,
+        not a planner going deaf, so nothing is held and nothing alerts.
+
+        Walked pending -> working -> merged because the board is a MACHINE
+        (migration 0108's trigger) — a direct UPDATE to 'merged' aborts, and a
+        test that sidestepped the trigger would be asserting against a state
+        the product cannot reach."""
+        self.queued_item()
+        self.con.execute("UPDATE sprint_units SET state='working'")
+        self.con.execute("UPDATE sprint_units SET state='merged'")
+        self.con.commit()
+        self.assertEqual(self.release(), 1)
+        with self.subTest("cancelled"):
+            self.assertEqual([r[2] for r in self.item_states()], ["cancelled"])
+        with self.subTest("silent"):
+            self.assertEqual(self.deaf(), [])
+
+    def test_a_frozen_sprint_cancels_as_before(self):
+        self.queued_item()
+        self.con.execute("UPDATE documents SET frozen=1 WHERE document_id=1")
+        self.con.commit()
+        self.assertEqual(self.release(), 1)
+        self.assertEqual(self.deaf(), [])
+
+    def test_closing_the_sprint_cancels_what_was_held(self):
+        """The close sweep exists for the sprint whose planner was lost and
+        never re-armed — it has no unreleased binding, so the close path's
+        release loop never runs at all."""
+        self.queued_item()
+        self.release()
+        cancelled = interface_broker.close_sprint_wake_work(
+            self.con, 1, "sprint closed")
+        self.con.commit()
+        with self.subTest("held items are terminal"):
+            self.assertEqual(cancelled, 1)
+            self.assertEqual([r[2] for r in self.item_states()], ["cancelled"])
+        with self.subTest("and the alert closes"):
+            self.assertEqual(self.deaf(), [])
+
+
 # ── Flag #49: quiet baseline keys off REAL provider readiness ─────────────────
 
 class WakeReadinessTest(WakeFixture):
@@ -2030,6 +2217,13 @@ class WakeRoutesTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "shell_scope")
 
     def test_release_cancels_queued_work_messages_stay_unread(self):
+        """H-6 REVISED THIS TEST'S FIRST HALF, deliberately. Release used to
+        cancel the queued items outright; while the sprint is still running
+        they are now HELD for the next binding armed on it, because H-6's
+        re-parent is what makes them reachable and `cancelled` is terminal.
+        The unchanged half is the one that was always load-bearing: release
+        leaves the MESSAGES unread. Cancellation is pinned by
+        test_release_after_the_sprint_is_finished_still_cancels below."""
         status, body = self.arm()
         self.assertEqual(status, 201)
         binding_id = body["binding_id"]
@@ -2045,12 +2239,13 @@ class WakeRoutesTest(unittest.TestCase):
             "DELETE", f"/api/interface/sprint-bindings/{binding_id}",
             (OP, "Idempotency-Key: k-rel"), {"reason": "sprint closed"})
         self.assertEqual(status, 200, body)
-        self.assertEqual(body["cancelled_items"], 1)
+        self.assertEqual(body["cancelled_items"], 0,
+                         "nothing was cancelled, so nothing is reported as "
+                         "cancelled — the item is held, not lost")
         con = sqlite3.connect(self.db_path)
         item = con.execute(
             "SELECT state, error FROM planner_wake_items").fetchone()
-        self.assertEqual(item[0], "cancelled")
-        self.assertIn("sprint closed", item[1])
+        self.assertEqual(item[0], "queued")
         read = con.execute(
             "SELECT read_at FROM shell_messages WHERE message_id=?",
             (mid,)).fetchone()[0]
@@ -2061,6 +2256,32 @@ class WakeRoutesTest(unittest.TestCase):
         self.assertIsNotNone(released[0])
         self.assertEqual(released[1], "sprint closed")
         con.close()
+
+    def test_release_after_the_sprint_is_finished_still_cancels(self):
+        """The half H-6 did NOT change, pinned separately so the change above
+        cannot quietly widen: with no unit left running, nothing will ever arm
+        again and holding the item would strand it forever."""
+        status, body = self.arm()
+        self.assertEqual(status, 201)
+        con = sqlite3.connect(self.db_path)
+        mid = con.execute(
+            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+            " kind, sprint_doc_id) VALUES (2,1,'x','task',1)").lastrowid
+        import interface_wake
+        interface_wake.maybe_create_wake_item(con, mid)
+        con.execute("UPDATE sprint_units SET state='cancelled'")
+        con.commit()
+        con.close()
+        status, body = self.call(
+            "DELETE", f"/api/interface/sprint-bindings/{body['binding_id']}",
+            (OP, "Idempotency-Key: k-rel2"), {"reason": "sprint closed"})
+        self.assertEqual(body["cancelled_items"], 1, body)
+        con = sqlite3.connect(self.db_path)
+        item = con.execute(
+            "SELECT state, error FROM planner_wake_items").fetchone()
+        con.close()
+        self.assertEqual(item[0], "cancelled")
+        self.assertIn("sprint closed", item[1])
 
     # -- action receipts -----------------------------------------------------------
 

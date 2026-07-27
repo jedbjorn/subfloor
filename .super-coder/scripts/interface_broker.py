@@ -1177,20 +1177,60 @@ def resolve_batch(con, batch_id: int) -> None:
     con.commit()
 
 
+def sprint_still_running(con, sprint_doc_id) -> bool:
+    """Is this sprint LIVE and still holding work? (H-6.) A live sprint whose
+    every unit is merged or cancelled is finished in all but the freeze, and
+    a release there is the ordinary end of a sprint — not a planner going
+    deaf mid-flight."""
+    if sprint_doc_id is None or not sprint_state.is_live_sprint(
+            con, sprint_doc_id):
+        return False
+    return con.execute(
+        "SELECT 1 FROM sprint_units "
+        "WHERE sprint_doc_id=? AND state NOT IN ('merged','cancelled') "
+        "LIMIT 1", (sprint_doc_id,)).fetchone() is not None
+
+
 def release_binding(con, binding_id: int, reason: str) -> "int | None":
-    """Release one binding and cancel its queued wake work with an audit
+    """Release one binding and dispose of its queued wake work with an audit
     reason (spec Sprint Scope): messages stay UNREAD; a live submitting/
     running batch is left for hook reconciliation — its fenced evidence
     still resolves it. Returns the cancelled-item count, or None when the
     binding does not exist. An already-released binding is a no-op (0).
-    The caller owns the transaction (commit)."""
+    The caller owns the transaction (commit).
+
+    H-6 — RELEASE IS AN EVENT, NOT AN ABSENCE, and it changes what happens to
+    the queued items in exactly one case. When the sprint is still running
+    (live, with non-terminal units), a release means the planner has gone
+    deaf mid-sprint: a generation change is the common cause and nothing said
+    so. Two consequences here:
+
+    - a critical `binding_released_live_sprint` opens, scoped to the SPRINT
+      and to nothing else. binding_id and session_id are deliberately NULL,
+      because every caller of this function follows it with a binding- or
+      session-scoped resolve sweep — being inside that set is exactly how the
+      old alerts vanished at the moment they became true. It resolves only
+      when a new binding is armed for this sprint, or the sprint closes.
+
+    - the queued items are HELD rather than cancelled. Cancelling them was
+      right while nothing could ever reach them again; H-6's re-parent at arm
+      time is what makes them reachable, and `cancelled` is a terminal state
+      with no way back. They stay `queued` on the released binding, where no
+      drain path can see them — every one requires `released_at IS NULL` —
+      until arming re-parents them. Returns 0 cancelled in that case, which
+      is the truth: nothing was cancelled.
+
+    A sprint that is closed, frozen, or has no unit left running takes the
+    original path unchanged — cancel, because nothing will ever arm again."""
     row = con.execute(
-        "SELECT released_at FROM sprint_planner_bindings WHERE binding_id=?",
-        (binding_id,)).fetchone()
+        "SELECT released_at, sprint_doc_id FROM sprint_planner_bindings "
+        "WHERE binding_id=?", (binding_id,)).fetchone()
     if row is None:
         return None
     if row[0] is not None:
         return 0
+    sprint_doc_id = row[1]
+    hold = sprint_still_running(con, sprint_doc_id)
     con.execute(
         "UPDATE sprint_planner_bindings "
         "SET released_at=datetime('now'), release_reason=? "
@@ -1204,17 +1244,80 @@ def release_binding(con, binding_id: int, reason: str) -> "int | None":
             "SELECT COUNT(*) FROM planner_wake_items "
             "WHERE batch_id=? AND state='batched'",
             (batch_id_,)).fetchone()[0]
-        _cancel_batch(con, batch_id_)
-        cancelled += batched
+        # The BATCH always closes either way: it is generation-bound
+        # (shell_id, generation) and can never submit under a new one.
+        _close_batch_unsent(con, batch_id_, hold_items=hold)
+        if not hold:
+            cancelled += batched
     items = con.execute(
         "SELECT item_id FROM planner_wake_items "
         "WHERE binding_id=? AND state='queued'", (binding_id,)).fetchall()
+    if not hold:
+        for (item_id,) in items:
+            interface_state.transition(
+                con, "wake_item", item_id, "cancelled",
+                extra_sets={"error": f"binding released: {reason}"})
+            cancelled += 1
+    if hold:
+        held = con.execute(
+            "SELECT COUNT(*) FROM planner_wake_items "
+            "WHERE binding_id=? AND state='queued'",
+            (binding_id,)).fetchone()[0]
+        _alert(con, severity="critical",
+               reason="binding_released_live_sprint",
+               sprint_doc_id=sprint_doc_id,
+               detail=(f"binding {binding_id} released ({reason}) while the "
+                       f"sprint still has non-terminal units; {held} queued "
+                       f"wake item(s) held for the next binding armed here"))
+    return cancelled
+
+
+def reparent_wake_items(con, binding_id: int, sprint_doc_id) -> int:
+    """Adopt the wake items held by this sprint's RELEASED bindings (H-6).
+
+    Items scope only through `binding_id`, so a release strands them behind a
+    binding no drain will ever look at again; the sprint is recovered by
+    joining the released rows' `sprint_doc_id`, across EVERY released
+    generation — a sprint that lost two planner generations in a row has
+    items behind both.
+
+    Only unbatched queued items move: a batch is generation-bound and was
+    closed at release, and its items were returned to `queued` there."""
+    reparented = con.execute(
+        "UPDATE planner_wake_items SET binding_id=? "
+        "WHERE state='queued' AND batch_id IS NULL AND binding_id IN "
+        "(SELECT binding_id FROM sprint_planner_bindings "
+        " WHERE sprint_doc_id=? AND released_at IS NOT NULL)",
+        (binding_id, sprint_doc_id)).rowcount
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE sprint_doc_id=? AND reason='binding_released_live_sprint' "
+        "AND resolved_at IS NULL", (sprint_doc_id,))
+    return reparented
+
+
+def close_sprint_wake_work(con, sprint_doc_id, reason: str) -> int:
+    """Sprint close: cancel the items H-6 held behind released bindings and
+    close the deaf-sprint alert.
+
+    Runs even when the sprint has NO unreleased binding left, which is the
+    case that needs it: `release_bindings_for_sprint` is guarded on one
+    existing, so a sprint that lost its planner and was then closed would
+    otherwise leave held items queued forever behind a released binding."""
+    items = con.execute(
+        "SELECT i.item_id FROM planner_wake_items i "
+        "JOIN sprint_planner_bindings b ON b.binding_id = i.binding_id "
+        "WHERE b.sprint_doc_id=? AND b.released_at IS NOT NULL "
+        "AND i.state='queued'", (sprint_doc_id,)).fetchall()
     for (item_id,) in items:
         interface_state.transition(
             con, "wake_item", item_id, "cancelled",
-            extra_sets={"error": f"binding released: {reason}"})
-        cancelled += 1
-    return cancelled
+            extra_sets={"error": f"sprint closed: {reason}"})
+    con.execute(
+        "UPDATE planner_alerts SET resolved_at=datetime('now') "
+        "WHERE sprint_doc_id=? AND reason='binding_released_live_sprint' "
+        "AND resolved_at IS NULL", (sprint_doc_id,))
+    return len(items)
 
 
 def release_bindings_for_sprint(con, sprint_doc_id: int,
@@ -1239,11 +1342,16 @@ def release_bindings_for_sprint(con, sprint_doc_id: int,
     return ids
 
 
-def _cancel_batch(con, batch_id: int) -> None:
+def _close_batch_unsent(con, batch_id: int, hold_items: bool = False) -> None:
     """Close a still-queued batch without sending a byte (the binding was
     released or the sprint stopped being live between form and submit): the
-    batch completes empty and its batched items are cancelled — a wake must
-    never fire for a sprint that is no longer armed."""
+    batch completes empty — a wake must never fire for a sprint that is no
+    longer armed.
+
+    Its batched items are cancelled, EXCEPT when `hold_items` (H-6: the
+    sprint is still running, so a future binding will adopt them). Then they
+    ride the legal batched -> queued edge back and drop their batch_id: the
+    batch is generation-bound and dead, the items are not."""
     interface_state.transition(
         con, "wake_batch", batch_id, "complete",
         extra_sets={"completed_at": _now(con)})
@@ -1252,7 +1360,17 @@ def _cancel_batch(con, batch_id: int) -> None:
         "SELECT item_id FROM planner_wake_items "
         "WHERE batch_id=? AND state='batched'", (batch_id,)).fetchall()
     for (item_id,) in items:
-        interface_state.transition(con, "wake_item", item_id, "cancelled")
+        if hold_items:
+            interface_state.transition(con, "wake_item", item_id, "queued",
+                                       extra_sets={"batch_id": None})
+        else:
+            interface_state.transition(con, "wake_item", item_id, "cancelled")
+
+
+def _cancel_batch(con, batch_id: int) -> None:
+    """Cancel a batch outright — every item terminal. The submit gate's
+    sprint-no-longer-live path, where nothing will adopt them."""
+    _close_batch_unsent(con, batch_id, hold_items=False)
 
 
 def submit_wake_batch(con, batch_id: int, writer, now_iso: str,

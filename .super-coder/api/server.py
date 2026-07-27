@@ -1376,8 +1376,15 @@ def _close_sprint_wake(con, doc_id) -> dict:
             (doc_id,)).fetchone() is not None:
         released = len(interface_broker.release_bindings_for_sprint(
             con, doc_id, "sprint closed"))
+    # H-6: items held behind ALREADY-released bindings, plus the deaf-sprint
+    # alert. Deliberately outside the guard above — the sprint that most
+    # needs this is the one whose planner was lost and never re-armed, which
+    # has no unreleased binding for that guard to find.
+    cancelled = interface_broker.close_sprint_wake_work(
+        con, doc_id, "sprint closed")
     return {"released_bindings": released, "retired_watches": retired,
-            "resolved_watch_alerts": resolved}
+            "resolved_watch_alerts": resolved,
+            "cancelled_held_items": cancelled}
 
 
 def create_flag(con, body):

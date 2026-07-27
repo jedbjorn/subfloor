@@ -1755,14 +1755,21 @@ def _arm_binding(actor, headers, body):
                 "UPDATE planner_alerts SET resolved_at=datetime('now') "
                 "WHERE sprint_doc_id=? AND reason='sprint_no_armed_planner' "
                 "AND resolved_at IS NULL", (doc_id,))
+            # H-6: adopt the items held behind this sprint's released
+            # bindings, and close the deaf alert they were held under.
+            reparented = interface_broker.reparent_wake_items(
+                con, cur.lastrowid, doc_id)
             con.commit()
             _log(f"sprint binding {cur.lastrowid} armed: doc={doc_id} "
-                 f"planner={planner} session={sess[0]} gen={sess[2]}")
+                 f"planner={planner} session={sess[0]} gen={sess[2]}"
+                 + (f"; adopted {reparented} held wake item(s)"
+                    if reparented else ""))
             return 201, {"binding_id": cur.lastrowid,
                          "sprint_doc_id": doc_id,
                          "planner_shell_id": planner,
                          "session_id": sess[0], "generation": sess[2],
-                         "wake_state": "armed"}
+                         "wake_state": "armed",
+                         "adopted_items": reparented}
         resp = _idempotent(con, actor, "sprint_binding_arm", headers, body,
                            produce)
         if resp[0] == 201:
@@ -2105,6 +2112,14 @@ _ALERT_COPY = {
         "Verify the harness's hook config actually installed on this seat. "
         "Waiting does not clear it — the declaration is what is wrong.",
         "capability",
+    ),
+    "binding_released_live_sprint": (
+        "The planner binding was released while this sprint still has "
+        "non-terminal units, so nothing is listening for its wake events.",
+        "Arm a new binding for the sprint (`sc sprint arm --sprint <doc-id>`) "
+        "— it adopts the wake items held since the release. This does not "
+        "clear until a binding is armed or the sprint closes.",
+        "warning",
     ),
     "sprint_no_armed_planner": (
         "A task or result was addressed into this live sprint while it had no "
