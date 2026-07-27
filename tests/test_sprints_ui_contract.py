@@ -35,7 +35,8 @@ class FakeElement {
     this.tagName = tag; this.nodeType = 1; this.children = [];
     this._text = ""; this.className = ""; this.title = "";
     this.dateTime = ""; this.isConnected = true; this.hidden = false;
-    this.dataset = {};
+    this.dataset = {}; this.attributes = {};
+    this.scrollWidth = 1000; this.scrollHeight = 500;
     this.classList = {
       add: (name) => this._setClass(name, true),
       remove: (name) => this._setClass(name, false),
@@ -55,6 +56,23 @@ class FakeElement {
   }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = [...nodes]; this._text = ""; }
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+    if (name === "class") this.className = String(value);
+  }
+  getAttribute(name) { return this.attributes[name] ?? null; }
+  querySelectorAll(selector) {
+    if (!selector.startsWith(".")) return [];
+    const name = selector.slice(1);
+    return all(this, (node) =>
+      String(node.className || "").split(" ").filter(Boolean).includes(name));
+  }
+  getBoundingClientRect() {
+    const index = Number(String(this.dataset.seq || "").replace(/\D/g, "")) || 0;
+    const left = index * 170;
+    return { left, right: left + 140, top: index * 25,
+             height: 70, width: 140, bottom: index * 25 + 70 };
+  }
   set textContent(value) { this._text = String(value ?? ""); this.children = []; }
   get textContent() {
     return this._text + this.children.map(
@@ -72,6 +90,7 @@ const cleared = [];
 globalThis.document = {
   hidden: false,
   createElement: (tag) => new FakeElement(tag),
+  createElementNS: (_ns, tag) => new FakeElement(tag),
   createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
   querySelector: (selector) =>
     selector === 'nav button[data-tab="sprints"]' ? navButton : null,
@@ -80,6 +99,21 @@ globalThis.document = {
     if (listeners.get(name) === fn) listeners.delete(name);
   },
 };
+const windowListeners = new Map();
+globalThis.window = {
+  addEventListener: (name, fn) => {
+    if (!windowListeners.has(name)) windowListeners.set(name, new Set());
+    windowListeners.get(name).add(fn);
+  },
+  removeEventListener: (name, fn) => {
+    const handlers = windowListeners.get(name);
+    if (!handlers) return;
+    handlers.delete(fn);
+    if (!handlers.size) windowListeners.delete(name);
+  },
+};
+const windowListenerCount = (name) => windowListeners.get(name)?.size || 0;
+globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
 globalThis.setInterval = (fn, ms) => {
   const id = intervals.length + 1;
   intervals.push({ id, fn, ms });
@@ -117,8 +151,40 @@ def payload(*, count=1, started_at="2026-07-26T20:00:00Z", units=None):
             "started_at": started_at,
             "planner": {"shell_id": 10, "shortname": "PLN2"},
             "feature": {"feature_id": 33, "title": "Active sprint flow board"},
-            "units": [{"seq": "U3"}] if units is None else units,
+            "units": [{
+                "seq": "U3",
+                "unit_title": "Sprints route and nav signal",
+                "state": "merged",
+                "state_recognized": True,
+                "dev_shell_id": 11,
+                "dev_shortname": "DEV5",
+                "reviewer_shell_id": 7,
+                "reviewer_shortname": "REV2",
+                "depends_on": "U1",
+                "overlap": None,
+                "branch": "feat/sprints-page",
+                "pr_number": 639,
+            }] if units is None else units,
         }],
+    }
+
+
+def unit(seq, state, *, title=None, depends_on=None, overlap=None,
+         dev_id=11, dev="DEV5", reviewer_id=7, reviewer="REV2",
+         branch=None, pr=None, recognized=True):
+    return {
+        "seq": seq,
+        "unit_title": title or f"Unit {seq}",
+        "state": state,
+        "state_recognized": recognized,
+        "dev_shell_id": dev_id,
+        "dev_shortname": dev,
+        "reviewer_shell_id": reviewer_id,
+        "reviewer_shortname": reviewer,
+        "depends_on": depends_on,
+        "overlap": overlap,
+        "branch": branch,
+        "pr_number": pr,
     }
 
 
@@ -211,6 +277,316 @@ out({
     assert result["titles"][1].startswith("SPRINT: second board")
     assert result["controls"] == 0
     assert result["utc"] == "2026-07-26T20:00:00Z"
+
+
+def test_flow_columns_cards_and_active_role_emphasis():
+    long_title = "Dependency rendering " + ("with a long title " * 8)
+    long_overlap = "Same-file overlap " + ("must stay on one line " * 8)
+    units = [
+        unit("U1", "pending", dev=None, reviewer=None),
+        unit("U2", "working", title=long_title, overlap=long_overlap,
+             branch="feat/sprints-flow-boards", pr=640),
+        unit("U3", "in_review"),
+        unit("U4", "blocked"),
+        unit("U5", "merged"),
+        unit("U6", "cancelled"),
+        {
+            **unit("U7", "mystery", recognized=False),
+            "task_body": "must not leak task body",
+            "messages": ["must not leak messages"],
+            "checks": "must not leak checks",
+        },
+    ]
+    result = run_js(
+        """
+apiQueue = [DATA];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const cards = byClass(root, "sprint-unit");
+const card = (seq) => cards.find((node) => node.dataset.seq === seq);
+const roles = (seq) => byClass(card(seq), "sprint-role").map(
+  (role) => ({ text: role.textContent, className: role.className }));
+out({
+  headings: byClass(root, "sprint-col-head").map((node) => node.textContent),
+  cards: cards.length,
+  u2: {
+    text: card("U2").textContent,
+    title: byClass(card("U2"), "sprint-unit-title")[0].title,
+    overlap: byClass(card("U2"), "sprint-unit-overlap")[0].title,
+  },
+  u1Roles: roles("U1"),
+  u2Roles: roles("U2"),
+  u3Roles: roles("U3"),
+  u4Roles: roles("U4"),
+  done: [card("U5").textContent, card("U6").textContent],
+  unknown: card("U7").textContent,
+});
+""",
+        prelude="const DATA = " + json.dumps(payload(units=units)) + ";\n",
+    )
+    assert result["headings"] == [
+        "Waiting1", "Dev1", "Review1", "Blocked1", "Done2", "Unrecognized1",
+    ]
+    assert result["cards"] == 7
+    assert long_title in result["u2"]["text"]
+    assert result["u2"]["title"] == long_title
+    assert result["u2"]["overlap"] == long_overlap
+    assert "Branch: feat/sprints-flow-boards" in result["u2"]["text"]
+    assert "PR #640" in result["u2"]["text"]
+    assert all("active" not in role["className"] for role in result["u1Roles"])
+    assert "active" in result["u2Roles"][0]["className"]
+    assert "active" not in result["u2Roles"][1]["className"]
+    assert "active" not in result["u3Roles"][0]["className"]
+    assert "active" in result["u3Roles"][1]["className"]
+    assert all("active" not in role["className"] for role in result["u4Roles"])
+    assert "Merged" in result["done"][0]
+    assert "Cancelled" in result["done"][1]
+    assert "mystery" in result["unknown"]
+    assert "must not leak" not in result["unknown"]
+
+
+def test_unrecognized_column_is_omitted_when_empty():
+    result = run_js(
+        """
+apiQueue = [DATA];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+out({ headings: byClass(root, "sprint-col-head").map((node) => node.textContent) });
+""",
+        prelude="const DATA = " + json.dumps(
+            payload(units=[unit("U1", "working")])
+        ) + ";\n",
+    )
+    assert result["headings"] == [
+        "Waiting", "Dev1", "Review", "Blocked", "Done",
+    ]
+
+
+def test_projection_recognition_flag_overrides_known_ui_column_key():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const card = byClass(flow, "sprint-unit")[0];
+out({
+  headings: byClass(flow, "sprint-col-head").map((node) => node.textContent),
+  cardClass: card.className,
+  cardText: card.textContent,
+});
+""",
+        prelude="const DATA = " + json.dumps(
+            payload(units=[unit("U1", "done", recognized=False)])
+        ) + ";\n",
+    )
+    assert result["headings"] == [
+        "Waiting", "Dev", "Review", "Blocked", "Done", "Unrecognized1",
+    ]
+    assert "unrecognized" in result["cardClass"]
+    assert "done" in result["cardText"]
+
+
+def test_unrecognized_state_label_ignores_object_prototype():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const card = byClass(flow, "sprint-unit")[0];
+out({ text: card.textContent });
+""",
+        prelude="const DATA = " + json.dumps(
+            payload(units=[unit("U1", "constructor", recognized=False)])
+        ) + ";\n",
+    )
+    assert "constructor" in result["text"]
+    assert "function Object" not in result["text"]
+
+
+def test_unrecognized_column_does_not_mutate_shared_columns():
+    result = run_js(
+        """
+const unknown = sprintsBuildFlow(UNKNOWN.sprints[0]);
+const known = sprintsBuildFlow(KNOWN.sprints[0]);
+out({
+  unknown: byClass(unknown, "sprint-col-head").map((node) => node.textContent),
+  known: byClass(known, "sprint-col-head").map((node) => node.textContent),
+  shared: SPRINT_FLOW_COLUMNS.map((column) => column.label),
+});
+""",
+        prelude=(
+            "const UNKNOWN = " + json.dumps(payload(
+                units=[unit("U1", "mystery", recognized=False)]
+            )) + ";\n"
+            "const KNOWN = " + json.dumps(payload(
+                units=[unit("U1", "working")]
+            )) + ";\n"
+        ),
+    )
+    assert result["unknown"][-1] == "Unrecognized1"
+    assert result["known"] == ["Waiting", "Dev1", "Review", "Blocked", "Done"]
+    assert result["shared"] == ["Waiting", "Dev", "Review", "Blocked", "Done"]
+
+
+def test_unavailable_dependency_has_visible_warning_marker():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const marker = byClass(flow, "sprint-dep-warning")[0];
+out({ text: marker.textContent, className: marker.className });
+""",
+        prelude="const DATA = " + json.dumps(payload(
+            units=[unit("U1", "working", depends_on="U0")]
+        )) + ";\n",
+    )
+    assert result["text"] == "⚠"
+    assert "warn" in result["className"]
+
+
+def test_unavailable_dependency_warning_is_accessibly_named():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const marker = byClass(flow, "sprint-dep-warning")[0];
+out({ role: marker.role, name: marker.ariaLabel });
+""",
+        prelude="const DATA = " + json.dumps(payload(
+            units=[unit("U1", "working", depends_on="U0")]
+        )) + ";\n",
+    )
+    assert result == {
+        "role": "img", "name": "dependency unavailable: U0",
+    }
+
+
+def test_dependency_wires_are_sprint_scoped_and_bad_tokens_degrade_locally():
+    data = payload(units=[
+        unit("U1", "pending"),
+        unit("U2", "working", depends_on="U1, U9, U2, S59-U1,,"),
+    ])
+    data["sprints"].append({
+        "document_id": 78,
+        "title": "SPRINT: Other graph",
+        "started_at": "2026-07-26T21:00:00Z",
+        "planner": None,
+        "feature": None,
+        "units": [
+            unit("U1", "pending"),
+            unit("U2", "in_review", depends_on="U1"),
+            unit("U9", "blocked"),
+        ],
+    })
+    data["active_count"] = 2
+    result = run_js(
+        """
+apiQueue = [DATA];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const boards = byClass(root, "sprint-board");
+const firstCards = byClass(boards[0], "sprint-unit");
+const source = firstCards.find((card) => card.dataset.seq === "U1");
+source.onmouseenter();
+const hover = {
+  flow: byClass(boards[0], "sprint-flow")[0].className,
+  cards: firstCards.filter((card) => card.classList.contains("lit"))
+    .map((card) => card.dataset.seq),
+  wires: byClass(boards[0], "sprint-wire")
+    .filter((wire) => wire.classList.contains("lit")).length,
+};
+source.onmouseleave();
+out({
+  wires: boards.map((board) => byClass(board, "sprint-wire").map(
+    (wire) => [wire.dataset.from, wire.dataset.to])),
+  markers: boards.map((board) => byTag(board, "marker")[0].getAttribute("id")),
+  unavailable: boards.map((board) => byClass(board, "sprint-dep-warning")
+    .map((node) => node.ariaLabel)),
+  hover,
+});
+""",
+        prelude="const DATA = " + json.dumps(data) + ";\n",
+    )
+    assert result["wires"] == [[["U1", "U2"]], [["U1", "U2"]]]
+    assert result["markers"] == ["sprint-arrow-77", "sprint-arrow-78"]
+    assert result["unavailable"][0] == [
+        "dependency unavailable: U9, U2, S59-U1, (empty), (empty)"
+    ]
+    assert result["unavailable"][1] == []
+    assert "sprint-hover" in result["hover"]["flow"]
+    assert result["hover"]["cards"] == ["U1", "U2"]
+    assert result["hover"]["wires"] == 1
+
+
+def test_identical_refresh_reuses_dom_and_preserves_hover_and_scroll():
+    result = run_js(
+        """
+apiQueue = [DATA, JSON.parse(JSON.stringify(DATA))];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const flow = byClass(root, "sprint-flow")[0];
+const card = byClass(root, "sprint-unit")
+  .find((node) => node.dataset.seq === "U1");
+flow.scrollLeft = 240;
+card.onmouseenter();
+await sprintsRefresh();
+out({
+  flowReused: byClass(root, "sprint-flow")[0] === flow,
+  scrollLeft: flow.scrollLeft,
+  litCards: byClass(root, "sprint-unit")
+    .filter((node) => node.classList.contains("lit")).length,
+  resizeListeners: windowListenerCount("resize"),
+});
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending"),
+            unit("U2", "working", depends_on="U1"),
+        ])) + ";\n",
+    )
+    assert result == {
+        "flowReused": True,
+        "scrollLeft": 240,
+        "litCards": 2,
+        "resizeListeners": 1,
+    }
+
+
+def test_changed_refresh_replaces_dom_and_cleans_previous_resize_listener():
+    initial = payload(units=[unit("U1", "working")])
+    updated = payload(units=[
+        unit("U1", "working"),
+        unit("U2", "in_review", depends_on="U1"),
+    ])
+    result = run_js(
+        """
+apiQueue = [INITIAL, UPDATED];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const firstFlow = byClass(root, "sprint-flow")[0];
+const before = windowListenerCount("resize");
+await sprintsRefresh();
+out({
+  flowReused: byClass(root, "sprint-flow")[0] === firstFlow,
+  before,
+  after: windowListenerCount("resize"),
+});
+""",
+        prelude=(
+            "const INITIAL = " + json.dumps(initial) + ";\n"
+            "const UPDATED = " + json.dumps(updated) + ";\n"
+        ),
+    )
+    assert result == {"flowReused": False, "before": 1, "after": 1}
+
+
+def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
+    sprint_css = STYLE[STYLE.index("/* Active sprint flow boards"):
+                       STYLE.index("/* Roadmap Flow view")]
+    assert "#view-sprints, .sprint-board { min-width: 0; }" in sprint_css
+    assert ".sprint-board { overflow: hidden; }" in sprint_css
+    assert "overflow-x: auto" in sprint_css
+    assert "text-overflow: ellipsis" in sprint_css
+    assert "white-space: nowrap" in sprint_css
+    assert "cursor: pointer" not in sprint_css
 
 
 def test_zero_state_and_initial_failure_are_distinct():
@@ -362,6 +738,7 @@ const routeExit = {
   refreshTimer: sprintsState.refreshTimer,
   durationTimer: sprintsState.durationTimer,
   listenerPresent: listeners.has("visibilitychange"),
+  resizeListenerPresent: windowListeners.has("resize"),
   cleared: [...cleared],
 };
 await intervals.find((entry) => entry.ms === SPRINTS_REFRESH_MS).fn();
@@ -412,6 +789,7 @@ function load() {}
         "refreshTimer": 1,
         "durationTimer": None,
         "listenerPresent": True,
+        "resizeListenerPresent": False,
         "cleared": [2],
     }
     assert result["afterExitTick"] == result["afterNetworkTick"] + 1

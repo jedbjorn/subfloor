@@ -575,6 +575,65 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
 
+/* Active sprint flow boards — one self-contained, read-only graph per sprint. */
+#view-sprints, .sprint-board { min-width: 0; }
+.sprint-board { overflow: hidden; }
+.sprint-header { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
+.sprint-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.sprint-meta { color: var(--dim); font-size: .78rem; margin-bottom: .7rem; }
+.sprint-flow { width: 100%; min-width: 0; overflow-x: auto; padding: .2rem 0 .35rem; }
+.sprint-flow-inner { position: relative; min-width: 850px; }
+.sprint-wires { position: absolute; inset: 0 auto auto 0; z-index: 0;
+  pointer-events: none; overflow: visible; }
+.sprint-cols { position: relative; z-index: 1; display: flex; gap: 1.35rem;
+  align-items: flex-start; padding: 0 .15rem; }
+.sprint-col { flex: 1 0 150px; min-width: 150px; display: flex;
+  flex-direction: column; gap: .65rem; }
+.sprint-col-head { display: flex; align-items: center; gap: .35rem;
+  min-height: 1.6rem; padding-bottom: .3rem; border-bottom: 1px solid var(--line-soft);
+  color: var(--dim); font-size: .7rem; font-weight: 650; letter-spacing: .08em;
+  text-transform: uppercase; }
+.sprint-col-head .count { min-width: 1.3rem; padding: 0 .32rem;
+  border: 1px solid var(--line); border-radius: 999px; color: var(--ink);
+  font-size: .65rem; line-height: 1.25rem; text-align: center; }
+.sprint-unit { min-width: 0; padding: .55rem .6rem; border: 1px solid var(--line);
+  border-left: 3px solid var(--line); border-radius: 9px; background: var(--panel2);
+  transition: opacity .12s, border-color .12s, box-shadow .12s; }
+.sprint-unit.pending { border-left-color: var(--lock); }
+.sprint-unit.working { border-left-color: var(--task-open); }
+.sprint-unit.in_review { border-left-color: var(--accent); }
+.sprint-unit.blocked, .sprint-unit.unrecognized { border-left-color: var(--warn); }
+.sprint-unit.done { border-left-color: var(--ok); }
+.sprint-unit-title, .sprint-unit-overlap {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sprint-unit-title { font-size: .82rem; font-weight: 600; }
+.sprint-unit-title .idnum { color: var(--accent); }
+.sprint-unit-state { margin-top: .35rem; }
+.sprint-unit-state .pill.working { color: var(--task-open); }
+.sprint-unit-state .pill.in_review { color: var(--accent); }
+.sprint-unit-state .pill.blocked,
+.sprint-unit-state .pill.unrecognized { color: var(--warn); }
+.sprint-unit-state .pill.done { color: var(--ok); }
+.sprint-unit-roles { display: flex; flex-direction: column; gap: .05rem;
+  margin-top: .35rem; color: var(--dim); font-size: .72rem; }
+.sprint-role.active { color: var(--accent); font-weight: 650; }
+.sprint-role.warn { color: var(--warn); }
+.sprint-unit-deps, .sprint-unit-overlap, .sprint-unit-delivery {
+  margin-top: .35rem; color: var(--dim); font-size: .7rem;
+}
+.sprint-dep-warning { margin-left: .25rem; }
+.sprint-unit-delivery { display: flex; flex-direction: column; min-width: 0; }
+.sprint-unit-delivery > span { overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.sprint-wire { fill: none; stroke: rgba(110,168,254,.42); stroke-width: 1.6px; }
+.sprint-flow.sprint-hover .sprint-unit { opacity: .38; }
+.sprint-flow.sprint-hover .sprint-unit.lit { opacity: 1; border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
+.sprint-flow.sprint-hover .sprint-wire { stroke: rgba(110,168,254,.1); }
+.sprint-flow.sprint-hover .sprint-wire.lit { stroke: var(--accent); stroke-width: 2px; }
+
 /* Roadmap Flow view — feature dependency graph: cards in stage columns with an
    SVG wire overlay (blocker → blocked). Replaces the old mermaid flowchart. */
 .view-toggle { margin-bottom: .6rem; }

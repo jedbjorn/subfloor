@@ -4506,6 +4506,7 @@ function ifControl(a, m) {
 // retention.
 const SPRINTS_REFRESH_MS = 15000;
 const SPRINTS_DURATION_MS = 60000;
+const SPRINTS_SVG_NS = "http://www.w3.org/2000/svg";
 const sprintsState = {
   payload: null,
   error: null,
@@ -4516,6 +4517,9 @@ const sprintsState = {
   durationTimer: null,
   inFlight: null,
   lastFetchAt: 0,
+  flowCleanups: [],
+  renderedRoot: null,
+  renderedSignature: null,
 };
 
 function sprintsDuration(startedAt, now = Date.now()) {
@@ -4555,23 +4559,264 @@ function sprintsHeader(sprint) {
   if (sprint.started_at) {
     const started = new Date(sprint.started_at);
     const duration = sprintsDuration(sprint.started_at);
+    const durationNode = el("span", { className: "sprint-duration" },
+      `Running: ${duration}`);
+    durationNode.dataset.startedAt = sprint.started_at;
     meta.append(
       el("time", { dateTime: sprint.started_at, title: sprint.started_at },
         `Started: ${started.toLocaleString()}`),
-      el("span", { className: "sprint-duration" },
-        `Running: ${duration}`));
+      durationNode);
   }
   return [header, meta];
+}
+
+const SPRINT_FLOW_COLUMNS = [
+  { key: "pending", label: "Waiting" },
+  { key: "working", label: "Dev" },
+  { key: "in_review", label: "Review" },
+  { key: "blocked", label: "Blocked" },
+  { key: "done", label: "Done" },
+];
+const SPRINT_STATE_LABELS = {
+  pending: "Pending",
+  working: "Working",
+  in_review: "In Review",
+  blocked: "Blocked",
+  merged: "Merged",
+  cancelled: "Cancelled",
+};
+
+function sprintsColumnKey(unit) {
+  if (unit.state_recognized === false) return "unrecognized";
+  if (unit.state === "merged" || unit.state === "cancelled") return "done";
+  return SPRINT_FLOW_COLUMNS.some((column) => column.key === unit.state)
+    ? unit.state : "unrecognized";
+}
+
+function sprintsRole(unit, role, emphasized) {
+  const shellId = unit[`${role}_shell_id`];
+  const shortname = unit[`${role}_shortname`];
+  const label = shortname || (shellId == null ? "Unassigned" : `Shell #${shellId}`);
+  const classes = ["sprint-role"];
+  if (emphasized) classes.push("active");
+  if (!shortname) classes.push("warn");
+  return el("span", { className: classes.join(" ") },
+    `${role === "dev" ? "Dev" : "Reviewer"}: ${label}`);
+}
+
+function sprintsUnitCard(unit, columnKey, unavailable) {
+  const card = el("article", {
+    className: `sprint-unit ${columnKey}`,
+    title: `${unit.seq} ${unit.unit_title}`,
+  });
+  card.dataset.seq = String(unit.seq);
+  card.append(
+    el("div", { className: "sprint-unit-title", title: unit.unit_title },
+      el("span", { className: "idnum" }, unit.seq), " ", unit.unit_title),
+    el("div", { className: "sprint-unit-state" },
+      el("span", { className: `pill ${columnKey}` },
+        Object.hasOwn(SPRINT_STATE_LABELS, unit.state)
+          ? SPRINT_STATE_LABELS[unit.state] : String(unit.state))));
+
+  const roles = el("div", { className: "sprint-unit-roles" },
+    sprintsRole(unit, "dev", columnKey === "working"),
+    sprintsRole(unit, "reviewer", columnKey === "in_review"));
+  card.append(roles);
+
+  if (unit.depends_on) {
+    const deps = el("div", { className: "sprint-unit-deps" },
+      `Depends: ${unit.depends_on}`);
+    if (unavailable.length) {
+      const warning = `dependency unavailable: ${unavailable.join(", ")}`;
+      deps.append(" ", el("span", {
+        className: "pill warn sprint-dep-warning",
+        role: "img",
+        ariaLabel: warning,
+        title: warning,
+      }, "⚠"));
+    }
+    card.append(deps);
+  }
+  if (unit.overlap) {
+    card.append(el("div", {
+      className: "sprint-unit-overlap",
+      title: unit.overlap,
+    }, unit.overlap));
+  }
+  if (unit.branch || unit.pr_number != null) {
+    const delivery = el("div", { className: "sprint-unit-delivery" });
+    if (unit.branch)
+      delivery.append(el("span", { title: unit.branch }, `Branch: ${unit.branch}`));
+    if (unit.pr_number != null)
+      delivery.append(el("span", {}, `PR #${unit.pr_number}`));
+    card.append(delivery);
+  }
+  return card;
+}
+
+// One graph per sprint. Resolving dependencies against this function's unit map
+// makes a cross-sprint edge impossible by construction.
+function sprintsBuildFlow(sprint) {
+  const units = sprint.units || [];
+  const wrap = el("div", { className: "sprint-flow" });
+  if (!units.length) {
+    wrap.append(el("div", { className: "muted" }, "No units declared"));
+    return wrap;
+  }
+
+  const bySeq = new Map(units.map((unit) => [String(unit.seq), unit]));
+  const edges = [];
+  const unavailableBySeq = new Map();
+  const seenEdges = new Set();
+  for (const unit of units) {
+    const raw = String(unit.depends_on || "");
+    if (!raw) continue;
+    const unavailable = [];
+    for (const part of raw.split(",")) {
+      const token = part.trim();
+      if (!token || token === String(unit.seq) || !bySeq.has(token)) {
+        unavailable.push(token || "(empty)");
+        continue;
+      }
+      const edgeKey = `${token}\u0000${unit.seq}`;
+      if (!seenEdges.has(edgeKey)) {
+        seenEdges.add(edgeKey);
+        edges.push([token, String(unit.seq)]);
+      }
+    }
+    if (unavailable.length) unavailableBySeq.set(String(unit.seq), unavailable);
+  }
+
+  const inner = el("div", { className: "sprint-flow-inner" });
+  const svg = document.createElementNS(SPRINTS_SVG_NS, "svg");
+  svg.setAttribute("class", "sprint-wires");
+  svg.setAttribute("aria-hidden", "true");
+  const cols = el("div", { className: "sprint-cols" });
+  const cardOf = new Map();
+  const columns = [...SPRINT_FLOW_COLUMNS];
+  if (units.some((unit) => sprintsColumnKey(unit) === "unrecognized"))
+    columns.push({ key: "unrecognized", label: "Unrecognized" });
+
+  for (const column of columns) {
+    const inColumn = units.filter(
+      (unit) => sprintsColumnKey(unit) === column.key);
+    const heading = el("div", { className: "sprint-col-head" }, column.label);
+    if (inColumn.length)
+      heading.append(el("span", { className: "count" }, String(inColumn.length)));
+    const col = el("div", { className: `sprint-col ${column.key}` }, heading);
+    for (const unit of inColumn) {
+      const seq = String(unit.seq);
+      const card = sprintsUnitCard(
+        unit, column.key, unavailableBySeq.get(seq) || []);
+      col.append(card);
+      cardOf.set(seq, card);
+    }
+    cols.append(col);
+  }
+  inner.append(svg, cols);
+  wrap.append(inner);
+
+  const markerId = `sprint-arrow-${sprint.document_id}`;
+  const draw = () => {
+    if (!inner.isConnected) return;
+    const base = inner.getBoundingClientRect();
+    const width = inner.scrollWidth;
+    const height = inner.scrollHeight;
+    svg.setAttribute("width", width);
+    svg.setAttribute("height", height);
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    const marker = document.createElementNS(SPRINTS_SVG_NS, "marker");
+    marker.setAttribute("id", markerId);
+    marker.setAttribute("viewBox", "0 0 8 8");
+    marker.setAttribute("refX", "7");
+    marker.setAttribute("refY", "4");
+    marker.setAttribute("markerWidth", "6");
+    marker.setAttribute("markerHeight", "6");
+    marker.setAttribute("orient", "auto-start-reverse");
+    const arrow = document.createElementNS(SPRINTS_SVG_NS, "path");
+    arrow.setAttribute("d", "M0 0 L8 4 L0 8 z");
+    arrow.setAttribute("fill", "context-stroke");
+    marker.append(arrow);
+    const defs = document.createElementNS(SPRINTS_SVG_NS, "defs");
+    defs.append(marker);
+    svg.replaceChildren(defs);
+
+    for (const [from, to] of edges) {
+      const source = cardOf.get(from);
+      const target = cardOf.get(to);
+      if (!source || !target) continue;
+      const a = source.getBoundingClientRect();
+      const z = target.getBoundingClientRect();
+      const x1 = a.right - base.left;
+      const y1 = a.top - base.top + a.height / 2;
+      const x2 = z.left - base.left;
+      const y2 = z.top - base.top + z.height / 2;
+      const dx = Math.max(40, Math.abs(x2 - x1) * 0.4);
+      const path = document.createElementNS(SPRINTS_SVG_NS, "path");
+      path.setAttribute(
+        "d", `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
+      path.setAttribute("class", "sprint-wire");
+      path.setAttribute("marker-end", `url(#${markerId})`);
+      path.dataset.from = from;
+      path.dataset.to = to;
+      svg.append(path);
+    }
+  };
+  requestAnimationFrame(draw);
+
+  const onResize = () => {
+    if (inner.isConnected) draw();
+    else window.removeEventListener("resize", onResize);
+  };
+  window.addEventListener("resize", onResize);
+  sprintsState.flowCleanups.push(
+    () => window.removeEventListener("resize", onResize));
+
+  for (const [seq, card] of cardOf) {
+    card.onmouseenter = () => {
+      const lit = new Set([seq]);
+      wrap.classList.add("sprint-hover");
+      for (const wire of svg.querySelectorAll(".sprint-wire")) {
+        const incident = wire.dataset.from === seq || wire.dataset.to === seq;
+        wire.classList.toggle("lit", incident);
+        if (incident) {
+          lit.add(wire.dataset.from);
+          lit.add(wire.dataset.to);
+        }
+      }
+      for (const [otherSeq, other] of cardOf)
+        other.classList.toggle("lit", lit.has(otherSeq));
+    };
+    card.onmouseleave = () => {
+      wrap.classList.remove("sprint-hover");
+      for (const wire of svg.querySelectorAll(".sprint-wire"))
+        wire.classList.remove("lit");
+      for (const other of cardOf.values()) other.classList.remove("lit");
+    };
+  }
+  return wrap;
 }
 
 function sprintsPaint() {
   const root = sprintsState.root;
   if (!sprintsState.active || !root || !root.isConnected) return;
+  const signature = JSON.stringify({
+    loaded: sprintsState.lastFetchAt !== 0,
+    payload: sprintsState.payload,
+    error: sprintsState.error,
+    stale: sprintsState.stale,
+  });
+  if (root === sprintsState.renderedRoot
+      && signature === sprintsState.renderedSignature) return;
+  for (const cleanup of sprintsState.flowCleanups) cleanup();
+  sprintsState.flowCleanups = [];
   if (!sprintsState.payload) {
     const message = sprintsState.lastFetchAt
       ? "error: " + (sprintsState.error || "request failed")
       : "Loading active sprints…";
     root.replaceChildren(el("div", { className: "card" }, message));
+    sprintsState.renderedRoot = root;
+    sprintsState.renderedSignature = signature;
     return;
   }
 
@@ -4584,13 +4829,21 @@ function sprintsPaint() {
   if (!sprints.length)
     nodes.push(el("div", { className: "card" }, "No active sprints."));
   for (const sprint of sprints) {
-    const flow = el("div", { className: "sprint-flow" });
-    if (!(sprint.units || []).length)
-      flow.append(el("div", { className: "muted" }, "No units declared"));
     nodes.push(el("section", { className: "card sprint-board" },
-      ...sprintsHeader(sprint), flow));
+      ...sprintsHeader(sprint), sprintsBuildFlow(sprint)));
   }
   root.replaceChildren(...nodes);
+  sprintsState.renderedRoot = root;
+  sprintsState.renderedSignature = signature;
+}
+
+function sprintsUpdateDurations() {
+  const root = sprintsState.root;
+  if (!sprintsState.active || !root || !root.isConnected) return;
+  for (const duration of root.querySelectorAll(".sprint-duration")) {
+    duration.textContent =
+      `Running: ${sprintsDuration(duration.dataset.startedAt)}`;
+  }
 }
 
 async function sprintsRefresh({ render = true } = {}) {
@@ -4648,9 +4901,13 @@ function sprintsStartPoll() {
 function sprintsStopRender() {
   if (sprintsState.durationTimer !== null)
     clearInterval(sprintsState.durationTimer);
+  for (const cleanup of sprintsState.flowCleanups) cleanup();
+  sprintsState.flowCleanups = [];
   sprintsState.active = false;
   sprintsState.root = null;
   sprintsState.durationTimer = null;
+  sprintsState.renderedRoot = null;
+  sprintsState.renderedSignature = null;
 }
 
 async function renderSprints(root) {
@@ -4658,7 +4915,8 @@ async function renderSprints(root) {
   sprintsState.active = true;
   sprintsState.root = root;
   sprintsPaint();
-  sprintsState.durationTimer = setInterval(sprintsPaint, SPRINTS_DURATION_MS);
+  sprintsState.durationTimer =
+    setInterval(sprintsUpdateDurations, SPRINTS_DURATION_MS);
 }
 
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
@@ -4688,7 +4946,8 @@ async function load(tab) {
 let forkName = "";
 function setDocumentTitle(tab) {
   const label = (tab === "interface" && ifSelected) ? ifSelected
-    : (document.querySelector(`nav button[data-tab="${tab}"]`)?.textContent
+    : (tab === "sprints" ? "Sprints"
+       : document.querySelector(`nav button[data-tab="${tab}"]`)?.textContent
        || tab);
   document.title = forkName ? `${label} · ${forkName}` : label;
 }
