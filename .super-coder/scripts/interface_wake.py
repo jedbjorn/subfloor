@@ -28,6 +28,7 @@ import threading
 import db_driver
 import interface_broker
 import interface_hooks
+import sprint_state
 
 ELIGIBLE_KINDS = ("task", "result", "pr_event")
 RETRY_DELAYS_S = (1.0, 5.0, 30.0)  # bounded pre-send retries (spec table)
@@ -42,9 +43,9 @@ def maybe_create_wake_item(con, message_id: int) -> "int | None":
 
     Eligibility, exactly the spec's list: a typed sprint event (task /
     result / pr_event — `shell` and legacy unscoped traffic NEVER wake),
-    carrying a sprint_doc_id whose document exists, is unfrozen, and
-    declares status ACTIVE; an ACTIVE (unreleased) binding for that sprint
-    names this message's recipient as planner; the binding's Interface
+    carrying a sprint_doc_id naming a LIVE sprint (`sprint_state` — a sprint
+    doc, unfrozen, holding a board); an ACTIVE (unreleased) binding for that
+    sprint names this message's recipient as planner; the binding's Interface
     session and generation are still live (not ended/replaced); and the
     harness supports the mandatory lifecycle hooks (a capability gap
     refuses arming AND ingress — the wake would be unverifiable). Message
@@ -56,11 +57,7 @@ def maybe_create_wake_item(con, message_id: int) -> "int | None":
     if msg is None or msg[1] not in ELIGIBLE_KINDS or msg[2] is None:
         return None
     to_shell_id, _, sprint_doc_id = msg
-    doc = con.execute(
-        "SELECT frozen FROM documents WHERE document_id=?",
-        (sprint_doc_id,)).fetchone()
-    if doc is None or doc[0] or not interface_broker._sprint_active(
-            con, sprint_doc_id):
+    if not sprint_state.is_live_sprint(con, sprint_doc_id):
         return None
     binding = con.execute(
         "SELECT binding_id, session_id, shell_id, generation "

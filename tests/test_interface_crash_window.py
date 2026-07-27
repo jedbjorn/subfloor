@@ -80,6 +80,15 @@ def build_engine_db(path: Path) -> None:
     con.execute(
         "INSERT INTO documents (document_id, kind, title, body) "
         "VALUES (1,'doc','SPRINT: test','# SPRINT: test\nstatus: ACTIVE')")
+    # A DECLARED BOARD is what makes the sprint live (H-1) — the `status:` line
+    # above is display prose nothing executable reads. Every binding below is
+    # inserted by raw SQL, bypassing the arm route, and that route refuses to
+    # arm a boardless sprint ("declare the board before arming the binding").
+    # Without this row these fixtures build a state the engine cannot produce,
+    # and submit-time revalidation correctly cancels every batch.
+    con.execute(
+        "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+        "VALUES (1,'U1','the unit')")
     con.commit()
     con.close()
 
@@ -777,6 +786,9 @@ class CloseSessionMatrixTest(unittest.TestCase):
             "INSERT INTO documents (kind, title, body) VALUES "
             "('doc','SPRINT: t','# SPRINT: t\nstatus: ACTIVE')")
         doc = self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.con.execute(                       # its board — see build_engine_db
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (?,'U1','the unit')", (doc,))
         self.con.execute(
             "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation) "

@@ -136,14 +136,41 @@ class AssignmentNoticeTest(_BoardCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.notices(), [])
 
-    def test_a_closed_sprint_emits_nothing_but_still_writes_the_board(self):
-        """The ACTIVE gate is on the NOTICE, never on the record. A planner
-        must still be able to correct a closed sprint's board."""
+    def test_a_prose_closed_sprint_still_emits_because_prose_closes_nothing(self):
+        """H-1's ratified consequence, at the notice surface.
+
+        This test used to assert the opposite — that a `status: CLOSED` body
+        silenced the emitter while the board still took the write — and that
+        was the prose-liveness defect stated as a guarantee: liveness read off
+        a formatted line, so reflowing it re-armed a closed sprint's notices.
+
+        Closing a sprint is now freezing its doc. A body edit that writes
+        `status: CLOSED` closes NOTHING, so the sprint is still live and the
+        notice fires. The line remains for the human reader; nothing
+        executable reads it back.
+        """
         self.sql("UPDATE documents SET body=? WHERE document_id=1",
                  ("# SPRINT: test\nstatus: CLOSED\n",))
         status, _ = self.patch(seq="U1", reviewer=REV2)
         self.assertEqual(status, 200)
         self.assertEqual(self.row("U1")["reviewer_shell_id"], REV2)
+        self.assertEqual(self.told(), [REV1, REV2, DEV5])
+
+    def test_a_frozen_sprint_emits_nothing_but_still_writes_the_board(self):
+        """The gate is on the NOTICE, never on the record — the property the
+        old prose test claimed, re-anchored to the structural close.
+
+        A planner must still be able to correct a closed sprint's board, so
+        PATCH is deliberately not gated on the freeze (unlike unit CREATE,
+        which refuses: you may correct history, not extend it). The emitter's
+        own `is_live_sprint` check is what stays silent, and `frozen=1` is the
+        operand that now trips it.
+        """
+        self.sql("UPDATE documents SET frozen=1 WHERE document_id=1")
+        status, _ = self.patch(seq="U1", reviewer=REV2)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.row("U1")["reviewer_shell_id"], REV2,
+                         "the record still takes the correction")
         self.assertEqual(self.notices(), [])
 
     def test_a_refused_write_tells_nobody(self):

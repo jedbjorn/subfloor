@@ -23,6 +23,7 @@ import hashlib
 
 import interface_hooks
 import interface_state
+import sprint_state
 
 MAX_INPUT_BYTES = 64 * 1024  # one human frame, per the pinned spike protocol
 WAKE_PROMPT = "Check your inbox and act on unread sprint events."
@@ -952,25 +953,11 @@ def release_bindings_for_sprint(con, sprint_doc_id: int,
     return ids
 
 
-def _sprint_active(con, sprint_doc_id: int) -> bool:
-    """The sprint doc's body contract carries a `status: ACTIVE|CLOSED` line
-    (the planner is its only writer); a wake may submit only while ACTIVE."""
-    row = con.execute(
-        "SELECT body FROM documents WHERE document_id=?",
-        (sprint_doc_id,)).fetchone()
-    if row is None or row[0] is None:
-        return False
-    for line in row[0].splitlines():
-        if line.startswith("status:"):
-            return line.split(":", 1)[1].strip() == "ACTIVE"
-    return False
-
-
 def _cancel_batch(con, batch_id: int) -> None:
     """Close a still-queued batch without sending a byte (the binding was
-    released or the sprint left ACTIVE between form and submit): the batch
-    completes empty and its batched items are cancelled — a wake must never
-    fire for a sprint that is no longer armed."""
+    released or the sprint stopped being live between form and submit): the
+    batch completes empty and its batched items are cancelled — a wake must
+    never fire for a sprint that is no longer armed."""
     interface_state.transition(
         con, "wake_batch", batch_id, "complete",
         extra_sets={"completed_at": _now(con)})
@@ -987,9 +974,9 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     """Gate + submit one coalesced fixed-prompt batch under the input lock.
 
     Revalidates everything the spec requires before a byte moves: the binding
-    still armed and its sprint still ACTIVE AND unfrozen (a close or freeze
-    between form_batch and submit CANCELS the batch — freeze is how sprint
-    authority is revoked, so a post-freeze wake is exactly what must not
+    still armed and its sprint still LIVE per `sprint_state` (a close, freeze
+    or retitle between form_batch and submit CANCELS the batch — freeze is how
+    sprint authority is revoked, so a post-freeze wake is exactly what must not
     fire), a live occupied session (an ended session gate-fails with an
     ALERT and the batch stays queued for a future generation — End chat
     deliberately does not release the sprint binding, so this gate must
@@ -1064,16 +1051,13 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
             began = False
             return {"submitted": False, "cancelled": True,
                     "reason": "binding released — sprint no longer armed"}
-        frozen = con.execute(
-            "SELECT frozen FROM documents WHERE document_id=?",
-            (binding[0],)).fetchone()
-        if (frozen is None or frozen[0]
-                or not _sprint_active(con, binding[0])):
+        if not sprint_state.is_live_sprint(con, binding[0]):
             _cancel_batch(con, batch_id)
             con.commit()
             began = False
             return {"submitted": False, "cancelled": True,
-                    "reason": "sprint doc is frozen or not ACTIVE"}
+                    "reason": "sprint is no longer live (frozen, retitled, "
+                              "or its board was emptied)"}
 
         sess = con.execute(
             "SELECT session_id, occupancy, lifecycle, occupied_at, "

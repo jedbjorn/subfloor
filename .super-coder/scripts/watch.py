@@ -11,9 +11,10 @@ the `sc mem` doctrine):
                                                            (defaults to the
                                                            calling shell;
                                                            scope is required
-                                                           and must be ACTIVE;
-                                                           --unit links the PR
-                                                           to a board unit)
+                                                           and must name a
+                                                           sprint doc; --unit
+                                                           links the PR to a
+                                                           board unit)
     ./sc watch list [--all]                                live watches
     ./sc watch inbox [--interval 30] [--timeout 21600]     block until this
                                                            shell has unread
@@ -27,16 +28,16 @@ direct-DB writer) is RETIRED: the `daemon` verb here now prints the retirement
 notice and exits clean so legacy nohup/systemd supervision stops instead of
 racing the service. Registration performs an immediate GitHub read and stores
 the normalized baseline before arming; the service then polls armed watches
-(live, scoped to an ACTIVE sprint) on a bounded interval, and every semantic
+(live, scoped to a LIVE sprint) on a bounded interval, and every semantic
 transition becomes an idempotent `pr_event` row (+ wake item when a binding is
 armed) addressed to the watch's shell. Events: checks concluded (green or
 red), review submitted, merged, closed. On close — and on merge with no
 checks still running — the final event is emitted and `closed_at` set: the
 watch retires itself. A merge with checks still PENDING retains the watch
-(#375). Unscoped legacy watches stay readable but dormant until rebound to an
-ACTIVE sprint. The poller only ever writes message rows + its own registry
-state: it never boots shells, never marks anything read, never touches git,
-never injects terminal input.
+(#375). Unscoped legacy watches stay readable but dormant until rebound to a
+sprint doc; a scoped watch is polled only while that sprint is LIVE. The poller
+only ever writes message rows + its own registry state: it never boots shells,
+never marks anything read, never touches git, never injects terminal input.
 
 A `pr_event` body is one line — repo, PR, the unit when the watch names one
 (`unit=U3`), what changed, head SHA. Detail lives in `gh`; the message is the
@@ -213,7 +214,8 @@ def cmd_list(args) -> int:
                 state += f", sprint #{w['sprint_doc_id']}"
                 if w.get("unit_seq"):
                     state += f" unit {w['unit_seq']}"
-                state += " (armed)" if w.get("armed") else " (dormant — sprint not ACTIVE)"
+                state += (" (armed)" if w.get("armed")
+                          else " (dormant — sprint not live)")
             else:
                 state += ", dormant (unscoped — rebind with `sc watch pr … --sprint <doc>`)"
         print(f"  #{w['watch_id']} {w['repo']}#{w['pr_number']} → {w['shortname']} "
@@ -300,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("number", type=int, help="PR number")
     sp.add_argument("--shell", help="subscribe another shell (e.g. the planner) instead of you")
     sp.add_argument("--sprint", type=int, required=True, metavar="DOC_ID",
-                    help="required ACTIVE sprint document scope")
+                    help="required sprint document scope — polled while that sprint is live")
     sp.add_argument("--unit", metavar="SEQ",
                     help="the sprint unit this PR is for, as the board writes "
                          "it (U3) — carries onto every pr_event so readers "

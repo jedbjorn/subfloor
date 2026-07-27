@@ -241,6 +241,13 @@ class _BoardCase(unittest.TestCase):
         finally:
             con.close()
 
+    def sql_one(self, stmt, params=()):
+        con = sqlite3.connect(self.db_path)
+        try:
+            return con.execute(stmt, params).fetchone()[0]
+        finally:
+            con.close()
+
     def sql(self, stmt, params=()):
         con = sqlite3.connect(self.db_path)
         try:
@@ -908,10 +915,12 @@ class BoardRecordTest(_BoardCase):
         exist and the reconciler watches them. The seq axis of this same typo
         class is already defended (PATCH never creates); this is the doc axis.
 
-        Deliberately NOT asserted here: whether a FROZEN sprint doc still
-        accepts units. That is a live question parked for the FnB, and the
-        engine's predicate carries a `frozen=0` clause this check omits on
-        purpose — pinning it either way would decide it by side effect."""
+        The frozen case is a SEPARATE refusal now — see
+        test_a_frozen_board_takes_no_writes. This route used to omit the
+        `frozen=0` clause deliberately, with a comment parking "whether a
+        frozen board stays mutable"; H-1 answers it (a frozen sprint doc is
+        not live, so it is closed) and the parked comment went with the
+        clause."""
         self.sql("INSERT INTO documents (document_id, kind, title, body) "
                  "VALUES (2,'spec','Worker expectation reconciler','x')")
         status, err = self.call("POST", "/api/sprint-units", (OP,),
@@ -932,6 +941,38 @@ class BoardRecordTest(_BoardCase):
         self.assertEqual(status, 404)
         self.assertEqual(err["error"]["code"], "no_such_sprint")
         self.assertEqual(self.add()[0], 201, "the real sprint doc was refused")
+
+    def test_a_frozen_board_takes_no_writes(self):
+        """The parked question, answered (H-1 + H-12). Freezing the sprint doc
+        IS closing the sprint, so its board stops being mutable — the unit
+        route and the shared liveness predicate agree instead of the route
+        carrying its own carve-out.
+
+        The refusal is asserted with the row UNWRITTEN: a 409 that still
+        inserted would satisfy a status-code-only test.
+        """
+        self.sql("UPDATE documents SET frozen=1 WHERE document_id=1")
+        status, err = self.call("POST", "/api/sprint-units", (OP,),
+                                {"sprint_doc_id": 1, "seq": "U1",
+                                 "unit_title": "posthumous unit"})
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "sprint_frozen")
+        self.assertIsNone(self.row("U1"))
+        # and thawing it makes the same call succeed — so the refusal is the
+        # freeze and nothing else about this fixture
+        self.sql("UPDATE documents SET frozen=0 WHERE document_id=1")
+        self.assertEqual(self.add()[0], 201)
+
+    def test_declaring_the_first_unit_is_not_gated_on_liveness(self):
+        """The ordering H-1 creates, from the other side. A sprint is live only
+        once it holds a unit, so gating THIS route on liveness would make the
+        first unit — and therefore every board — undeclarable. Board first,
+        then arm the binding.
+        """
+        self.assertEqual(
+            self.sql_one("SELECT COUNT(*) FROM sprint_units"), 0,
+            "the fixture starts with no board")
+        self.assertEqual(self.add()[0], 201)
 
     def test_the_board_reads_back_in_work_order_not_lexicographic_order(self):
         """`seq` is TEXT, so `ORDER BY seq` puts U10 and U11 between U1 and

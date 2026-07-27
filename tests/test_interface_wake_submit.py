@@ -55,11 +55,19 @@ def build_engine_db(path: Path) -> None:
         "VALUES (1,'doc','SPRINT: live',?)",
         (ACTIVE_BODY,),
     )
+    # Doc 2 is the CLOSED sprint, and closing a sprint IS freezing its doc
+    # (H-1). Its body still says `status: CLOSED` for the human reader, and
+    # that line is not what the gate reads — `frozen=1` is. Both docs carry a
+    # unit row, so the freeze is the ONLY difference between them.
     con.execute(
-        "INSERT INTO documents (document_id, kind, title, body) "
-        "VALUES (2,'doc','SPRINT: done',?)",
+        "INSERT INTO documents (document_id, kind, title, body, frozen) "
+        "VALUES (2,'doc','SPRINT: done',?,1)",
         (CLOSED_BODY,),
     )
+    for doc_id in (1, 2):
+        con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (?,'U1','the unit')", (doc_id,))
     con.commit()
     con.close()
 
@@ -169,6 +177,31 @@ class WakeSubmitGateTest(unittest.TestCase):
         self.assertTrue(out["cancelled"])
         self.assertEqual(writes, [])
         self.assertEqual(self._batch_state(batch), "complete")
+
+    def test_a_closed_status_line_alone_does_not_cancel(self):
+        """The delivered half of H-1 at this gate. Doc 1's body is rewritten
+        to say `status: CLOSED` and the sprint stays live, because the gate
+        reads structure. Before H-1 this batch was cancelled by prose alone —
+        so a planner reformatting that line silently killed its own wakes."""
+        self.con.execute(
+            "UPDATE documents SET body=? WHERE document_id=1", (CLOSED_BODY,))
+        self.con.commit()
+        _, _, batch = self._arm()
+        out, writes = self._submit(batch, "2030-01-01 00:00:10")
+        self.assertFalse(out.get("cancelled"), out)
+        self.assertTrue(out["submitted"], out)
+        self.assertEqual(len(writes), 1)
+
+    def test_emptying_the_board_cancels_the_batch(self):
+        """Liveness needs a declared board, so a sprint whose units are gone
+        is not live even unfrozen — the other operand of the predicate."""
+        _, _, batch = self._arm()
+        self.con.execute("DELETE FROM sprint_units WHERE sprint_doc_id=1")
+        self.con.commit()
+        out, writes = self._submit(batch, "2030-01-01 00:00:10")
+        self.assertFalse(out["submitted"])
+        self.assertTrue(out["cancelled"])
+        self.assertEqual(writes, [])
 
     # ── post-restart debounce (flag #37) ────────────────────────────────
     def test_null_last_human_input_still_owes_full_debounce(self):

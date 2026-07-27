@@ -68,11 +68,17 @@ def seed_shells(con: sqlite3.Connection) -> None:
     con.commit()
 
 
-def seed_sprint_doc(con: sqlite3.Connection, doc_id: int = 100) -> None:
+def seed_sprint_doc(con: sqlite3.Connection, doc_id: int = 100,
+                    units: int = 1) -> None:
     con.execute(
         "INSERT INTO documents (document_id, kind, title, body, frozen) "
         "VALUES (?, 'doc', 'SPRINT: T', '# SPRINT: T\nstatus: ACTIVE\n', 0)",
         (doc_id,))
+    # `units` is what makes it live (H-1) — the `status:` line is prose.
+    for i in range(units):
+        con.execute(
+            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
+            "VALUES (?, ?, ?)", (doc_id, f"U{i + 1}", f"unit {i + 1}"))
     con.commit()
 
 
@@ -850,26 +856,31 @@ class ApiTest(unittest.TestCase):
         self.assertIn('"state": "OPEN"', row["last_seen"])
         self.assertIn('"sha": "abc1234def"', row["last_seen"])
 
-    def test_registration_refuses_scope_closed_during_baseline(self):
+    def test_registration_refuses_scope_unmade_during_baseline(self):
+        """The TOCTOU window the BEGIN IMMEDIATE revalidation exists to close.
+
+        Registration validates SPRINT-DOC IDENTITY (H-2), not liveness, so the
+        mutation that must lose the race is one that stops the target being a
+        sprint board at all — here a retitle mid-baseline."""
         con = sqlite3.connect(self.db)
         seed_sprint_doc(con, 101)
         con.close()
         real = pr_poller.baseline_read
 
-        def close_scope(repo, pr):
+        def unmake_scope(repo, pr):
             con = sqlite3.connect(self.db)
             try:
                 con.execute(
-                    "UPDATE documents SET body="
-                    "'# SPRINT: T\nstatus: CLOSED\n' WHERE document_id=101")
+                    "UPDATE documents SET title='Retro notes' "
+                    "WHERE document_id=101")
                 con.commit()
             finally:
                 con.close()
-            return ({"state": "OPEN", "sha": "closed-during-baseline",
+            return ({"state": "OPEN", "sha": "retitled-during-baseline",
                      "checks": "PENDING", "reviews": 0,
                      "review_state": None}, None)
 
-        pr_poller.baseline_read = close_scope
+        pr_poller.baseline_read = unmake_scope
         try:
             with self.assertRaises(SystemExit) as denied:
                 watch.main(
@@ -878,10 +889,52 @@ class ApiTest(unittest.TestCase):
             pr_poller.baseline_read = real
 
         self.assertIn("HTTP 409", str(denied.exception))
-        self.assertIn("not an ACTIVE, unfrozen SPRINT doc",
-                      str(denied.exception))
+        self.assertIn("not a SPRINT doc", str(denied.exception))
         self.assertEqual(
             self.q("SELECT 1 FROM watched_prs WHERE pr_number=22"), [])
+
+    def test_registration_on_a_frozen_sprint_is_accepted_but_dormant(self):
+        """H-2's deliberate loosening, stated as behaviour rather than left
+        implicit. Registration is an identity check, so a frozen sprint takes
+        the row; the poller then never sees it, because arming reads liveness.
+        Registering during the declaration window rides the same rule."""
+        con = sqlite3.connect(self.db)
+        seed_sprint_doc(con, 113)
+        con.execute("UPDATE documents SET frozen=1 WHERE document_id=113")
+        seed_sprint_doc(con, 114, units=0)          # board not declared yet
+        con.commit()
+        con.close()
+        real = pr_poller.baseline_read
+        pr_poller.baseline_read = lambda repo, pr: (
+            {"state": "OPEN", "sha": "s", "checks": None, "reviews": 0,
+             "review_state": None}, None)
+        # PR numbers unused by any other test in this class: the DB is
+        # per-CLASS, and re-registering a PR under a SECOND sprint takes a new
+        # row rather than rebinding, so a shared number reads back as two rows.
+        try:
+            watch.main(["pr", "own/repo", "41", "--sprint", "113"])
+            watch.main(["pr", "own/repo", "42", "--sprint", "114"])
+        finally:
+            pr_poller.baseline_read = real
+
+        self.assertEqual(
+            [(r["pr_number"], r["sprint_doc_id"]) for r in self.q(
+                "SELECT pr_number, sprint_doc_id FROM watched_prs "
+                "WHERE pr_number IN (41, 42) ORDER BY pr_number")],
+            [(41, 113), (42, 114)], "both registrations were accepted")
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            armed = {w["sprint_doc_id"] for w in pr_poller.armed_watches(con)}
+        finally:
+            con.close()
+        # POSITIVE CONTROL FIRST: both claims below are absences, and an empty
+        # armed set satisfies them for free. Doc 100 is the class fixture's
+        # live sprint and carries watches, so its presence proves the probe
+        # sees armed watches at all.
+        self.assertIn(100, armed, "the probe sees a live sprint's watches")
+        self.assertNotIn(113, armed, "a frozen sprint is never polled")
+        self.assertNotIn(114, armed, "an undeclared board is never polled")
 
     def test_scoped_registration_rebinds_legacy_and_resolves_alert(self):
         con = sqlite3.connect(self.db)
@@ -910,7 +963,7 @@ class ApiTest(unittest.TestCase):
             watch_id)[0]
         self.assertIsNotNone(alert["resolved_at"])
 
-    def test_legacy_rebind_refuses_scope_closed_during_baseline(self):
+    def test_legacy_rebind_refuses_scope_unmade_during_baseline(self):
         con = sqlite3.connect(self.db)
         seed_sprint_doc(con, 102)
         watch_id = con.execute(
@@ -926,19 +979,20 @@ class ApiTest(unittest.TestCase):
         con.close()
         real = pr_poller.baseline_read
 
-        def freeze_scope(repo, pr):
+        def unmake_scope(repo, pr):
             con = sqlite3.connect(self.db)
             try:
                 con.execute(
-                    "UPDATE documents SET frozen=1 WHERE document_id=102")
+                    "UPDATE documents SET title='Retro notes' "
+                    "WHERE document_id=102")
                 con.commit()
             finally:
                 con.close()
-            return ({"state": "OPEN", "sha": "frozen-during-baseline",
+            return ({"state": "OPEN", "sha": "retitled-during-baseline",
                      "checks": "SUCCESS", "reviews": 1,
                      "review_state": "APPROVED"}, None)
 
-        pr_poller.baseline_read = freeze_scope
+        pr_poller.baseline_read = unmake_scope
         try:
             with self.assertRaises(SystemExit) as denied:
                 watch.main(
@@ -983,6 +1037,104 @@ class ApiTest(unittest.TestCase):
     def test_cli_refuses_pr_event_kind(self):
         with self.assertRaises(SystemExit):   # argparse: not in choices
             mem.main(["message", "send", "dev1", "forged", "--kind", "pr_event"])
+
+    def test_api_refuses_pr_event_from_a_shell_token(self):
+        """H-3 — kind parity. The CLI's argparse `choices` was the ONLY fence:
+        any holder of any shell key could POST kind='pr_event' straight past it
+        and mint a PR transition GitHub never reported, waking a planner on
+        forged ground truth. The refusal belongs at shell-token ingress, which
+        is what this route is."""
+        before = self.q("SELECT COUNT(*) c FROM shell_messages "
+                        "WHERE kind='pr_event'")[0]["c"]
+        with self.assertRaises(SystemExit) as denied:
+            mem._api("POST", "/_sc/mem/messages",
+                     {"to": "plan1", "body": "own/repo#9 merged (forged)",
+                      "kind": "pr_event", "sprint_doc_id": 100})
+        self.assertIn("HTTP 403", str(denied.exception))
+        self.assertEqual(
+            self.q("SELECT COUNT(*) c FROM shell_messages "
+                   "WHERE kind='pr_event'")[0]["c"], before,
+            "the refused send must leave no row")
+
+    def test_the_poller_still_emits_pr_event_through_its_own_path(self):
+        """The other half of H-3, and the reason it is a 403 and not a schema
+        change: the poller writes `pr_event` by direct DB insert, so the API
+        refusal cannot reach it. If this ever goes red, the poller has been
+        moved onto the API and needs a system credential — not a carve-out in
+        the ingress check.
+
+        Its own DB, not the class fixture: poll_cycle sweeps EVERY armed watch,
+        so the sibling tests' registrations would share the batched read.
+        """
+        con = build_db()
+        try:
+            seed_shells(con)
+            seed_sprint_doc(con)
+            con.execute(
+                "INSERT INTO watched_prs (repo, pr_number, shell_id, "
+                "sprint_doc_id, last_seen) VALUES ('own/repo', 77, 1, 100, ?)",
+                (json.dumps({"state": "OPEN", "sha": "aaa", "checks": "PENDING",
+                             "reviews": 0, "review_state": None}),))
+            con.commit()
+            pr_poller.poll_cycle(con, fetch=lambda q: pr_poller.GhResult(
+                data={"r0": {"pullRequest": {
+                    "state": "MERGED", "headRefOid": "bbb",
+                    "reviews": {"totalCount": 0, "nodes": []},
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup":
+                                                      {"state": "SUCCESS"}}}]},
+                }}}))
+            emitted = con.execute(
+                "SELECT body FROM shell_messages WHERE kind='pr_event'"
+            ).fetchall()
+        finally:
+            con.close()
+        self.assertTrue(emitted, "the poller's own path is unaffected")
+
+    def test_message_scope_must_name_a_sprint_doc(self):
+        """H-2 — validate sprint scope at the write boundary. This route took
+        ANY integer, so a typo'd --sprint produced a message scoped to nothing:
+        never woke, never filtered with the sprint's traffic, reported success.
+        """
+        spec_id = 100 - 1
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO documents (document_id, kind, title, body) "
+            "VALUES (?, 'spec', 'Sprint flow hardening', 'x')", (spec_id,))
+        con.commit()
+        con.close()
+        for scope in (spec_id, 99999):
+            with self.subTest(scope=scope):
+                with self.assertRaises(SystemExit) as denied:
+                    mem._api("POST", "/_sc/mem/messages",
+                             {"to": "dev1", "body": "scoped wrong",
+                              "kind": "task", "sprint_doc_id": scope})
+                self.assertIn("HTTP 422", str(denied.exception))
+        self.assertEqual(
+            self.q("SELECT COUNT(*) c FROM shell_messages "
+                   "WHERE body='scoped wrong'")[0]["c"], 0)
+
+    def test_message_scope_accepts_a_sprint_doc_at_any_liveness(self):
+        """The deliberately distinct half of H-2: tagging validates IDENTITY,
+        never liveness. A coordination message in the declaration window (board
+        declared, units not yet) and a result row sent after close are both
+        legal traffic — gating them on liveness would make the sprint's own
+        open and close unreportable."""
+        con = sqlite3.connect(self.db)
+        seed_sprint_doc(con, 121, units=0)            # declaration window
+        seed_sprint_doc(con, 122)
+        con.execute("UPDATE documents SET frozen=1 WHERE document_id=122")
+        con.commit()
+        con.close()
+        for scope in (121, 122):
+            with self.subTest(scope=scope):
+                out = mem._api("POST", "/_sc/mem/messages",
+                               {"to": "dev1", "body": f"legal {scope}",
+                                "kind": "result", "sprint_doc_id": scope})
+                self.assertIn("message_id", out)
+                self.assertEqual(
+                    self.q("SELECT sprint_doc_id s FROM shell_messages "
+                           "WHERE message_id=?", out["message_id"])[0]["s"],
+                    scope)
 
     def test_messages_read_returns_kind(self):
         mem.main(["message", "send", "plan1", "report done", "--kind", "result"])
