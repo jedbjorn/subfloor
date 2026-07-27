@@ -304,7 +304,11 @@ SPRINTS = {
                     "dev_shortname": "DEV4",
                     "reviewer_shell_id": 7,
                     "reviewer_shortname": "REV2",
-                    "depends_on": "U2",
+                    # U2 is merged (Done column) and U5 is working: one
+                    # suppressed prerequisite and one live one on a single
+                    # card, so the visual gate sees both halves of the
+                    # done-edge suppression rule.
+                    "depends_on": "U2, U5",
                     "overlap": None,
                     "branch": None,
                     "pr_number": None,
@@ -656,7 +660,28 @@ def test_sprints_multi_board_read_only_visual_gate(
             'nav button[data-tab="sprints"]'
         ).inner_text() == "SPRINTS 2"
         assert boards.nth(0).locator(".sprint-wire").count() == 0
-        assert boards.nth(1).locator(".sprint-wire").count() == 3
+        # Board 2 declares four resolvable edges. Three are sourced in the
+        # Done column (U2 -> U5, U4 -> U5, U2 -> U2f) and one is live at both
+        # ends (U5 -> U2f), so the drawn set pins drawing and suppression
+        # against each other: a broken wire path fails the first assertion,
+        # a lost suppression fails the second.
+        wires = boards.nth(1).locator(".sprint-wire")
+        drawn = {
+            (
+                wires.nth(index).get_attribute("data-from"),
+                wires.nth(index).get_attribute("data-to"),
+            )
+            for index in range(wires.count())
+        }
+        assert ("U5", "U2f") in drawn, (
+            "the live dependency U5 -> U2f must still draw a wire; "
+            f"drawn: {sorted(drawn)}"
+        )
+        assert drawn == {("U5", "U2f")}, (
+            "done-edge suppression: a prerequisite in the Done column draws "
+            "no wire, so U2 -> U5, U4 -> U5 and U2 -> U2f must be absent; "
+            f"drawn: {sorted(drawn)}"
+        )
         unavailable = boards.nth(1).get_by_role(
             "img", name="dependency unavailable: U99", exact=True
         )
