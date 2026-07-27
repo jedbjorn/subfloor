@@ -38,15 +38,15 @@ Every transition and ruling request goes to the planner as a durable scoped
 result:
 
 ```sh
-./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <doc-id>
 ./sc mem message sent
 ```
 
 Compose message and task bodies via a file, never inline in a quoted shell
-string: backticks and `$()` execute before `sc` receives the body. Send the
-file''s content as one argument through task-specific `SC_MESSAGE_BODY_FILE`,
-then use `message sent` to read the stored row back and confirm its body.
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
 
 File findings, flags, PRs, and reports within your assigned authority. A question
 printed only in final output reaches no sprint actor.
@@ -142,7 +142,7 @@ When dependencies are on `main` and the planner has released the unit:
 ```sh
 ./sc watch pr <owner/repo> <pr-number> \
   --shell <planner> --sprint <doc-id>
-./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <doc-id>
 ./sc mem message sent
 ```
@@ -222,7 +222,7 @@ follow-ups: <Low findings and deferred work, or none>
 Send it:
 
 ```sh
-./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <doc-id>
 ./sc mem message sent
 ```
@@ -886,15 +886,15 @@ SPRINT doc=<id> reviewing=<unit or conformance>
 Every review transition uses a durable scoped result:
 
 ```sh
-./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <doc-id>
 ./sc mem message sent
 ```
 
 Compose message and task bodies via a file, never inline in a quoted shell
-string: backticks and `$()` execute before `sc` receives the body. Send the
-file''s content as one argument through task-specific `SC_MESSAGE_BODY_FILE`,
-then use `message sent` to read the stored row back and confirm its body.
+string: backticks and `$()` execute before `sc` receives the body. Write the
+body to `./sprint-result.md`, send its content as one argument, then use
+`message sent` to read the stored row back and confirm its body.
 
 File findings and verdicts within the assignment. Send ruling requests to the
 planner with alternatives and evidence.
@@ -972,8 +972,10 @@ detectors: an early failure masks every later one.
 - Low: non-blocking clarity, cleanup, or improvement.
 
 Send the verdict to the planner immediately. The planner is the gate; delivering
-a completed verdict needs no additional permission. Include location,
-consequence, required behavior, and severity. The planner routes fix work or
+a completed verdict needs no additional permission. This displaces the base
+`review` skill''s FnB approval gate for sprint-scoped verdicts; the FnB gate
+resumes when the sprint document freezes. Include location, consequence,
+required behavior, and severity. The planner routes fix work or
 merge authority to the developer.
 
 On a clean pass, explicitly send the planner:
@@ -1029,7 +1031,7 @@ Create a document titled `CONFORMANCE: <sprint title>`, kind `doc`, containing:
 Persist it with `./sc mem doc add`, then send one pointer:
 
 ```sh
-./sc mem message send <planner> "$(<"$SC_MESSAGE_BODY_FILE")" \
+./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <sprint-doc-id>
 ./sc mem message sent
 ```
