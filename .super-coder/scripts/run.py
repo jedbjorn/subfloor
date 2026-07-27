@@ -69,6 +69,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
 
 ADAPTERS = ENGINE / "adapters"
+PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
@@ -1647,9 +1648,94 @@ def main() -> None:
     # supported env var alongside SC_PROTECTED_BRANCHES and SC_SHELL_WORKTREE.
     if not headless:
         set_terminal_tab_title(full["display_name"])
+    # H-25: claim the pid we are ABOUT to become for this shell.
+    record_launch(full["shell_id"], work_dir, harness, headless=headless)
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
     os.execvpe(cmd[0], cmd, env)
+
+
+def _self_start_ticks() -> "int | None":
+    """This process's start time — /proc/<pid>/stat field 22.
+
+    The discriminator that makes a recorded pid safe to trust later: a pid on
+    its own is a reusable integer, so a record naming a dead worker would
+    resurrect as a false "working" the moment the kernel handed that number to
+    something unrelated. execvpe does not reset the value — it belongs to the
+    PROCESS, not to the program image — so reading it here, before the exec,
+    describes the harness that is about to replace us.
+
+    comm (field 2) may contain spaces and parens, so the split starts after the
+    final ')': rest[0] is state (field 3), rest[19] is starttime (field 22) —
+    the same indexing shell_liveness._stat_fields and activity_readers._stat
+    already use.
+    """
+    try:
+        data = (PROC_SELF_STAT).read_text()
+    except OSError:
+        return None
+    rest = data[data.rfind(")") + 2:].split()
+    try:
+        return int(rest[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def record_launch(shell_id: int, work_dir: Path, harness: "str | None",
+                  *, headless: bool) -> None:
+    """Record the harness pid this launch is about to become (spec #76 H-25).
+
+    HEADLESS ONLY, deliberately — hence the parameter rather than a caller-side
+    `if`: the rule is the requirement, so it is stated and tested here. A sprint
+    worker runs detached — no controlling TTY, launcher gone, ppid==1 — so the
+    lineage scan can only ever call it 'detached' and project 'unreconciled';
+    between relaunches nothing holds the worktree at all and the same shell
+    projects 'available'. The record is what replaces that inference. An
+    INTERACTIVE boot has a live parent, which the lineage scan reads correctly
+    today, and recording one would suppress a TRUE orphan verdict — a closed
+    terminal's survivor would arrive pre-claimed and the operator would never be
+    told to clear it. So the claim covers exactly the launches whose lineage is
+    unreadable, and no others.
+
+    One row per shell, upserted: the newest launch is the only claim, which is
+    what "re-stamped on each relaunch" means. Accepted cost, stated in the spec's
+    own terms: run.py execs and never returns, so nothing clears the row at exit
+    — a worker that has finished for good keeps reading expected-but-absent
+    until its next launch. That is the honest reading ("the record claimed a
+    worker here; it is gone") and it is the evidence row feature #27's compare
+    consumes; deciding whether an absence is a FAULT stays with #27.
+
+    Best-effort: a failed stamp must never block a boot. The only consequence is
+    that this session falls back to the lineage scan — where it was before.
+    """
+    if not headless:
+        return
+    ticks = _self_start_ticks()
+    if ticks is None:
+        return                       # non-Linux / unreadable — no claim to make
+    try:
+        con = open_db()
+    except SystemExit:
+        return
+    try:
+        con.execute(
+            "INSERT INTO shell_launch_records "
+            "(shell_id, pid, start_ticks, worktree, harness, launched_at) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(shell_id) DO UPDATE SET "
+            " pid=excluded.pid, start_ticks=excluded.start_ticks,"
+            " worktree=excluded.worktree, harness=excluded.harness,"
+            " launched_at=excluded.launched_at",
+            (shell_id, os.getpid(), ticks, str(work_dir), harness,
+             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        con.commit()
+    except (db_driver.OperationalError, db_driver.IntegrityError):
+        # An un-migrated fork (no such table) or a busy writer. Neither is worth
+        # a boot failure; the lineage fallback still answers.
+        con.rollback()
+    finally:
+        con.close()
 
 
 def set_terminal_tab_title(name: str) -> None:

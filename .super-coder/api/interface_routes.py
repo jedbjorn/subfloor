@@ -599,7 +599,8 @@ def _availability(con, shell_id: int, snap) -> dict:
                 "composer": composer[0] if composer else None,
                 "alerts": _alert_count(con, session_id),
                 **_NO_SPRINT, **client}
-    state = shell_liveness.session_state(_shortname(con, shell_id), snap)
+    shortname = _shortname(con, shell_id)
+    state = shell_liveness.session_state(shortname, snap)
     if state is not None:
         # Only a WORKING shell names a sprint. A remnant must not borrow its
         # dead session's label and read as live work.
@@ -610,6 +611,19 @@ def _availability(con, shell_id: int, snap) -> dict:
                 "model_route": None, "title": None, "launch_effort": None,
                 "alerts": 0,
                 **(_sprint_context(con, shell_id) if working else _NO_SPRINT)}
+    # No process holds the worktree — but absence of a process is not evidence
+    # of availability when a launch RECORD claims this shell (H-25). Both arms
+    # name the sprint, and neither is borrowing a label: the claim is the
+    # shell's own current launch, so `working` says which sprint holds it and
+    # `expected_absent` says which sprint is missing its worker. That second row
+    # is what feature #27's compare consumes; judging whether the absence is a
+    # fault stays with #27, never with this projection.
+    claimed = shell_liveness.record_state(shortname, snap)
+    if claimed is not None:
+        return {"availability": claimed, "session_id": None,
+                "lifecycle": None, "harness": None, "composer": None,
+                "model_route": None, "title": None, "launch_effort": None,
+                "alerts": 0, **_sprint_context(con, shell_id)}
     return {"availability": "available", "session_id": None,
             "lifecycle": None, "harness": None, "model_route": None,
             "title": None, "launch_effort": None,

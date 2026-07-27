@@ -50,6 +50,18 @@ a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
 operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
 processes doing work, then `kill <pid>`.
 
+Launch claims (spec #76 H-25): lineage cannot answer for a headless sprint
+worker. It is detached from birth — no controlling TTY, launcher gone — so
+'detached' describes how it was STARTED, not whether it is working, and between
+relaunches no process holds the worktree at all. `run.record_launch` therefore
+records the pid each headless boot is about to become (`shell_launch_records`),
+and this scan tests THAT pid — identity by pid + start ticks, plus its worktree
+hold — never its parentage. A claimed pid is never an orphan; `orphan` now means
+a pid holding a worktree that no launch record claims, i.e. a true remnant. A
+claim whose process is gone is `expected_absent`, which is not `available`:
+the difference between "nobody launched anything here" and "a launch claimed
+this shell and its worker is missing".
+
 Non-Linux: /proc is absent; compute() returns supported=False. Fall back to
 `lsof -a +D <worktree>` / `ps`. The substrate host is Linux.
 
@@ -156,6 +168,17 @@ def _tty_nr(pid: int) -> int | None:
     rest = _stat_fields(pid)
     try:
         return int(rest[4])              # rest[4]=tty_nr; 0 = no controlling TTY
+    except (IndexError, ValueError):
+        return None
+
+
+def _start_ticks(pid: int) -> int | None:
+    """Field 22 of /proc/<pid>/stat — when this process started. Pairs with the
+    pid to form an identity a recycled pid number cannot inherit. None for a
+    pid that is gone, which is the answer a stale claim needs."""
+    rest = _stat_fields(pid)
+    try:
+        return int(rest[19])             # rest[0]=state (field 3) → rest[19]=field 22
     except (IndexError, ValueError):
         return None
 
@@ -284,6 +307,66 @@ def _shell_labels() -> dict[str, dict]:
     return {r["shortname"].lower(): dict(r) for r in rows}
 
 
+def _launch_claims() -> dict[str, dict]:
+    """shortname.lower() → this shell's current launch claim (spec #76 H-25).
+
+    `run.record_launch` writes one row per shell at every HEADLESS boot, naming
+    the pid it is about to become. Best-effort like _shell_labels: no DB, a
+    locked DB, or an un-migrated fork with no such table all mean "no claims",
+    and the scan falls back to lineage exactly as it did before the record
+    existed."""
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT s.shortname, r.pid, r.start_ticks, r.worktree, r.launched_at "
+            "FROM shell_launch_records r JOIN shells s ON s.shell_id=r.shell_id "
+            "WHERE s.shortname IS NOT NULL "
+            "AND COALESCE(s.is_deleted,0)=0").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return {}
+    return {r["shortname"].lower(): dict(r) for r in rows}
+
+
+def claim_live(claim: dict) -> bool:
+    """Is the process a launch claim names still the one that was launched, and
+    does it still hold that shell's worktree?
+
+    PARENTAGE IS NEVER ASKED — that is the whole of H-25. A headless sprint
+    worker is reparented to init the moment its launcher exits, so every
+    lineage-shaped question ('detached', 'a NORMAL headless session still has a
+    live parent') answers about the launch style rather than about the work.
+
+    Identity is pid + start ticks, so a recycled pid number cannot inherit a
+    dead worker's claim, and a zombie — which keeps both — is excluded before
+    the question is asked, exactly as the main scan does.
+
+    The worktree hold only REFUTES on a positive mismatch. An unreadable cwd is
+    missing data (foreign user, or the process exiting mid-scan), and turning
+    missing data into "the worker is gone" is the failure direction this
+    requirement exists to remove."""
+    pid = claim.get("pid")
+    if not pid or _is_zombie(pid):
+        return False
+    if _start_ticks(pid) != claim.get("start_ticks"):
+        return False
+    worktree = claim.get("worktree")
+    if not worktree:
+        return True
+    try:
+        cwd = Path(os.readlink(PROC / str(pid) / "cwd")).resolve()
+    except OSError:
+        return True                      # unreadable → no refutation
+    try:
+        cwd.relative_to(Path(worktree).resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def compute() -> dict:
     """Live shell-liveness snapshot. Pure read — never mutates."""
     if not PROC.is_dir():
@@ -297,6 +380,8 @@ def compute() -> dict:
     bins = harness_binaries()
     root = REPO_ROOT.resolve()
     labels = _shell_labels()
+    claims = _launch_claims()
+    live_claims = {name: c for name, c in claims.items() if claim_live(c)}
 
     # First pass: every harness process and its raw pid/comm (cwd resolved next).
     harness_pids: set[int] = set()
@@ -348,13 +433,18 @@ def compute() -> dict:
             "shortname": shortname,
             "display_name": (labels.get(shortname or "", {}).get("display_name")),
             "is_self": pid == self_pid,
+            # H-25: a pid a live launch record claims is not a remnant, whatever
+            # its lineage says. `orphaned` keeps reporting the raw lineage read;
+            # `claimed` is what every verdict below consults alongside it.
+            "claimed": live_claims.get(shortname or "", {}).get("pid") == pid,
             "orphaned": (None if pid == self_pid
                          else _orphan_verdict(pid)),
         })
 
     active_other = sorted(worktree_sessions)
     indeterminate = len(indeterminate_pids)
-    orphaned_pids = [p["pid"] for p in processes if p["orphaned"]]
+    orphaned_pids = [p["pid"] for p in processes
+                     if p["orphaned"] and not p["claimed"]]
     admin_present = self_pid is not None and self_pid in admin_root_pids
     admin_presence = "present" if admin_present else "indeterminate"
     return {
@@ -370,6 +460,11 @@ def compute() -> dict:
         "indeterminate": indeterminate,
         "indeterminate_pids": indeterminate_pids,
         "orphaned_pids": orphaned_pids,
+        # The launch record's two answers (H-25), for consumers that must
+        # distinguish "nobody launched anything here" from "a launch claimed
+        # this shell and its process is gone".
+        "claimed_pids": {name: c["pid"] for name, c in live_claims.items()},
+        "claimed_absent": sorted(set(claims) - set(live_claims)),
         # The gate: Admin is positively present, no other shell is live, and
         # every harness cwd was readable.
         "safe_to_clean_all": admin_present and not active_other and indeterminate == 0,
@@ -385,11 +480,16 @@ def is_active(shortname: str, snap: dict | None = None) -> bool:
 def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
     """(all pids, orphaned pids) for one shell's worktree sessions — the shape
     the `sc run` guard needs: every-session-orphaned means the slot is held by
-    survivors of closed terminals / dead parents, not by a working session."""
+    survivors of closed terminals / dead parents, not by a working session.
+
+    A CLAIMED pid is never in the orphan half (H-25). The consumer of this list
+    is advice to kill, and a detached sprint worker is the one process that
+    reads as a remnant by lineage while being the healthiest thing on the box."""
     procs = [p for p in snap.get("processes", [])
              if (p.get("shortname") or "").lower() == shortname.lower()]
     return ([p["pid"] for p in procs],
-            [p["pid"] for p in procs if p.get("orphaned")])
+            [p["pid"] for p in procs
+             if p.get("orphaned") and not p.get("claimed")])
 
 
 def session_state(shortname: str, snap: dict) -> "str | None":
@@ -404,6 +504,29 @@ def session_state(shortname: str, snap: dict) -> "str | None":
     if not pids:
         return None
     return "orphan" if len(orphans) == len(pids) else "busy"
+
+
+def record_state(shortname: str, snap: dict) -> "str | None":
+    """The launch RECORD's verdict for one shell (spec #76 H-25) — asked only
+    after session_state() found no process holding the worktree.
+
+    'working'         — the claimed pid is live and still holds the worktree.
+                        Reachable even when the process scan saw nothing: the
+                        claim is comm-blind, so a harness that renames itself
+                        out of the expected set stays visible.
+    'expected_absent' — a launch claimed this shell and that process is gone.
+                        The distinction the rail could not previously draw:
+                        between relaunches a sprint worker's shell held no
+                        process at all and read as a bare 'available'.
+    None              — no claim was ever made, or liveness is unsupported."""
+    if not snap.get("supported"):
+        return None
+    name = shortname.lower()
+    if name in snap.get("claimed_pids", {}):
+        return "working"
+    if name in snap.get("claimed_absent", []):
+        return "expected_absent"
+    return None
 
 
 def _print_text(d: dict) -> None:
@@ -422,7 +545,9 @@ def _print_text(d: dict) -> None:
         tags = []
         if p["is_self"]:
             tags.append("SELF")
-        if p["orphaned"]:
+        if p.get("claimed"):
+            tags.append("CLAIMED")
+        if p["orphaned"] and not p.get("claimed"):
             tags.append(f"ORPHAN:{p['orphaned']}")
         tag = f"  [{', '.join(tags)}]" if tags else ""
         print(f"  pid {p['pid']:<7} {p['comm']:<9} {p['region']:<9} {who}{tag}")
@@ -438,6 +563,12 @@ def _print_text(d: dict) -> None:
               f"(`ps -o etime=,stat= -p <pid>`; no busy children), then "
               f"`kill <pid>`. An orphan can still be mid-work — never kill "
               f"unverified.")
+    if d.get("claimed_absent"):
+        print(f"\n⚠ {len(d['claimed_absent'])} shell(s) EXPECTED BUT ABSENT: "
+              f"{', '.join(d['claimed_absent'])} — a headless launch claimed "
+              f"each one and that process is gone. Not a remnant to kill; the "
+              f"opposite. Whether an absence is a FAULT is the sprint "
+              f"reconciler's call, never this scan's.")
     print("\nVERDICT")
     if d["active_other_shells"]:
         print(f"  Live OTHER shells: {', '.join(d['active_other_shells'])}"

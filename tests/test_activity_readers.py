@@ -440,15 +440,75 @@ class DatabaseContractTest(ReaderCase):
             evidence.last_result_row_at,
         )
 
-    def test_doc_unit_and_rowless_shell_never_claim_code_work(self):
+    def test_undeclared_branch_still_reads_code_work_from_head(self):
+        """Spec #76 H-15: the board's `branch` column is filled at PR-open, so
+        gating code evidence on it blinded the reader to a dev who had branched
+        and was heads-down building — and a blind reader falls to the
+        no-progress floor. An undeclared branch reads the worktree's own HEAD;
+        branch PRESENCE is the only thing there is nothing to say about."""
+        worked = datetime(2020, 1, 3, tzinfo=UTC)
+        source = self.worktree / "source.py"
+        source.write_text("heads-down\n")
+        stamp(source, worked)
+
         doc = dict(self.unit, branch=None)
         evidence = self.reader.read(self.shell, doc, datetime(2020, 1, 10, tzinfo=UTC))
+
+        self.assertTrue(evidence.edits_code)
+        self.assertIsNone(evidence.branch_declared)
+        self.assertIsNone(evidence.branch_present)
+        self.assertTrue(evidence.dirty)
+        self.assertEqual(0, evidence.commits_since_epoch)
+        self.assertEqual(worked, evidence.last_work_at)
+
+    def test_reviewer_role_reads_no_branch_or_git_evidence(self):
+        """Spec #76 H-16: a reviewer inherited the DEV's branch off the unit row
+        and was then graded on whether that branch existed — so it read
+        `not_started` until the dev pushed. The reviewer's own worktree has
+        nothing to do with the dev's branch; every code-shaped field stays
+        unread, while the review-shaped ones (result rows, durable writes) are
+        still observed."""
+        source = self.worktree / "source.py"
+        source.write_text("the reviewer's own tree\n")
+        stamp(source, datetime(2020, 1, 3, tzinfo=UTC))
+
+        evidence = self.reader.read(
+            self.shell, self.unit, datetime(2020, 1, 10, tzinfo=UTC),
+            role="reviewer",
+        )
+
         self.assertFalse(evidence.edits_code)
         self.assertIsNone(evidence.branch_present)
         self.assertIsNone(evidence.dirty)
         self.assertIsNone(evidence.commits_since_epoch)
         self.assertIsNone(evidence.last_work_at)
+        # The board fact is still reported honestly; it just decides nothing.
+        self.assertEqual("feat/test", evidence.branch_declared)
+        self.assertEqual(
+            datetime(2020, 1, 2, tzinfo=UTC), evidence.last_result_row_at
+        )
+        self.assertEqual(
+            datetime(2020, 1, 6, tzinfo=UTC), evidence.last_durable_write_at
+        )
 
+    def test_dev_role_reads_code_work_the_reviewer_does_not(self):
+        """The paired positive control: one unit, one shell, two roles. Without
+        it, `reviewer reads nothing` would also pass on a reader that reads
+        nothing for anyone."""
+        source = self.worktree / "source.py"
+        source.write_text("dev work\n")
+        stamp(source, datetime(2020, 1, 3, tzinfo=UTC))
+        when = datetime(2020, 1, 10, tzinfo=UTC)
+
+        dev = self.reader.read(self.shell, self.unit, when, role="dev")
+        reviewer = self.reader.read(self.shell, self.unit, when, role="reviewer")
+
+        self.assertTrue(dev.edits_code)
+        self.assertEqual(datetime(2020, 1, 3, tzinfo=UTC), dev.last_work_at)
+        self.assertFalse(reviewer.edits_code)
+        self.assertIsNone(reviewer.last_work_at)
+
+    def test_rowless_shell_never_claims_code_work(self):
         con = sqlite3.connect(self.db)
         con.execute(
             "INSERT INTO interface_sessions VALUES "

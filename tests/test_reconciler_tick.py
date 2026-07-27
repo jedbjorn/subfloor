@@ -219,6 +219,93 @@ class ClassificationPrecedenceTest(unittest.TestCase):
             ),
         )
 
+    def test_live_durable_write_is_working_for_a_role_with_no_code(self):
+        """Flag #364 defect (b) / spec #76 H-16. A planner emits `task` rows,
+        never `result`, and has no branch — so Rules 2, 3 and 5 all miss it and
+        Rule 6's floor pinned it at `checkup` for the rest of the sprint, where
+        no healthy signal could ever resolve the alert. Its durable writes were
+        read the whole time and consulted only behind `session_over`; counting
+        them as evidence in the floor is what lets the signal come back."""
+        planner = evidence(
+            edits_code=False,
+            branch_declared=None,
+            branch_present=None,
+            last_result_row_at=None,
+            last_durable_write_at=NOW - timedelta(minutes=3),
+        )
+        self.assertEqual("working", pr_poller.classify(planner, NOW))
+
+    def test_a_durable_write_older_than_the_window_is_still_checkup(self):
+        """The paired negative: the rule reads a CURRENT write, not the mere
+        existence of one. Without this, `working` would become unfalsifiable
+        for every role that has ever written a row."""
+        planner = evidence(
+            edits_code=False,
+            branch_declared=None,
+            branch_present=None,
+            last_durable_write_at=NOW - timedelta(minutes=21),
+        )
+        self.assertEqual("checkup", pr_poller.classify(planner, NOW))
+
+    def test_durable_write_never_outranks_a_closed_session_report(self):
+        """The durable write is evidence in Rule 6's floor and NOWHERE above
+        it. Once the session is over, a durable write is a completion report,
+        not a sign of life, and Rule 4 must keep winning."""
+        item = evidence(
+            edits_code=False,
+            branch_declared=None,
+            branch_present=None,
+            process_present=False,
+            last_durable_write_at=NOW - timedelta(minutes=1),
+        )
+        self.assertEqual("work_complete_unreported", pr_poller.classify(item, NOW))
+
+    def test_a_stale_durable_write_still_resets_the_no_progress_floor(self):
+        """Rule 6 counts the durable write for the same reason it already counts
+        a work event: with a tighter-than-default window the write is too old to
+        prove `working` on its own, but it is still the newest thing that
+        happened, and the floor measures SILENCE from the newest event. Without
+        it the floor would be measured from a boot clock the worker has long
+        since spoken past."""
+        item = evidence(
+            edits_code=False,
+            branch_declared=None,
+            branch_present=None,
+            last_durable_write_at=NOW - timedelta(minutes=10),
+        )
+        self.assertEqual(
+            "working",
+            pr_poller.classify(item, NOW, window=timedelta(minutes=5)),
+        )
+
+    def test_reviewer_without_branch_presence_is_never_not_started(self):
+        """Spec #76 H-16: a reviewer inherited the dev's branch and read
+        `not_started` until the dev pushed. With no code surface it is judged on
+        review-shaped evidence — here, none yet, which is `checkup`, not an
+        accusation that it never began."""
+        reviewer = evidence(
+            edits_code=False,
+            branch_declared="feat/test",
+            branch_present=False,
+        )
+        self.assertEqual("checkup", pr_poller.classify(reviewer, NOW))
+        # Positive control: the same missing branch on a DEV still accuses.
+        self.assertEqual(
+            "not_started",
+            pr_poller.classify(evidence(branch_present=False), NOW),
+        )
+
+    def test_building_dev_with_no_declared_branch_is_working(self):
+        """Spec #76 H-15, the classifier half: with the reader no longer gated
+        on the board's `branch` column, a heads-down dev arrives carrying a work
+        event and must not fall to the 20-minute floor."""
+        dev = evidence(
+            branch_declared=None,
+            branch_present=None,
+            last_work_at=NOW - timedelta(minutes=2),
+        )
+        self.assertEqual("working", pr_poller.classify(dev, NOW))
+
     def test_declared_missing_branch_uses_the_boot_grace(self):
         self.assertEqual(
             "not_started",
@@ -518,7 +605,7 @@ class ExplanationTierTest(unittest.TestCase):
             readable = pr_poller.reconcile_tick(
                 self.con,
                 now=NOW,
-                reader=lambda shell, unit, now: evidence(
+                reader=lambda shell, unit, now, role=None: evidence(
                     marker_at=NOW,
                     cpu_delta=7.0,
                     launch_shape="headless",
@@ -528,7 +615,7 @@ class ExplanationTierTest(unittest.TestCase):
             unreadable = pr_poller.reconcile_tick(
                 self.con,
                 now=NOW,
-                reader=lambda shell, unit, now: evidence(
+                reader=lambda shell, unit, now, role=None: evidence(
                     unreadable=["marker", "process_binding"],
                 ),
                 refresh=lambda worktree: True,
@@ -597,7 +684,7 @@ class TickTest(unittest.TestCase):
             readings = pr_poller.reconcile_tick(
                 self.con,
                 now=NOW,
-                reader=lambda shell, unit, now: evidence(
+                reader=lambda shell, unit, now, role=None: evidence(
                     branch_declared=unit["branch"]
                 ),
                 refresh=lambda worktree: True,
@@ -742,7 +829,12 @@ class TickTest(unittest.TestCase):
             ],
         )
 
-    def test_one_refresh_per_tick_and_one_read_for_two_roles(self):
+    def test_one_refresh_per_tick_but_a_read_per_role(self):
+        """Refresh stays once per tick — the shared integration ref is fetched
+        for the whole run. The READ is now per role (spec #76 H-15/H-16): dev
+        and reviewer are observed differently, so one shell holding both roles
+        on one unit must not have the dev's answer cached and served to the
+        reviewer. Caching on (shell, unit) alone is what did exactly that."""
         add_unit(self.con, dev=1, reviewer=1)
         refreshes = []
         reads = []
@@ -750,23 +842,48 @@ class TickTest(unittest.TestCase):
         result = pr_poller.reconcile_tick(
             self.con,
             now=NOW,
-            reader=lambda shell, unit, now: (
-                reads.append((shell["shell_id"], unit["unit_id"]))
+            reader=lambda shell, unit, now, role=None: (
+                reads.append((shell["shell_id"], unit["unit_id"], role))
                 or evidence()
             ),
             refresh=lambda worktree: refreshes.append(worktree) or True,
         )
 
         self.assertEqual(1, len(refreshes))
-        self.assertEqual([(1, 1)], reads)
+        self.assertEqual([(1, 1, "dev"), (1, 1, "reviewer")], reads)
         self.assertEqual(2, len(result))
+
+    def test_repeated_expectations_for_one_role_still_read_once(self):
+        """The cache is not defeated, only re-keyed: the same (shell, unit,
+        role) triple is read once however many times it is reached."""
+        add_unit(self.con, dev=1, reviewer=None)
+        reads = []
+
+        pr_poller.reconcile_tick(
+            self.con,
+            now=NOW,
+            reader=lambda shell, unit, now, role=None: (
+                reads.append(role) or evidence()
+            ),
+            refresh=lambda worktree: True,
+        )
+        pr_poller.reconcile_tick(
+            self.con,
+            now=NOW,
+            reader=lambda shell, unit, now, role=None: (
+                reads.append(role) or evidence()
+            ),
+            refresh=lambda worktree: True,
+        )
+
+        self.assertEqual(["dev", "dev"], reads)   # one per tick, not two
 
     def test_failed_refresh_is_joined_to_each_affected_reading(self):
         add_unit(self.con)
         readings = pr_poller.reconcile_tick(
             self.con,
             now=NOW,
-            reader=lambda shell, unit, now: evidence(),
+            reader=lambda shell, unit, now, role=None: evidence(),
             refresh=lambda worktree: False,
         )
         for reading in readings:
@@ -779,7 +896,7 @@ class TickTest(unittest.TestCase):
     def test_two_consecutive_ticks_confirm_and_recovery_resets(self):
         add_unit(self.con, reviewer=None)
         state = pr_poller.ReconcilerState()
-        stale = lambda shell, unit, now: evidence()
+        stale = lambda shell, unit, now, role=None: evidence()
 
         first = pr_poller.reconcile_tick(
             self.con,
@@ -798,7 +915,7 @@ class TickTest(unittest.TestCase):
         recovered = pr_poller.reconcile_tick(
             self.con,
             now=NOW + timedelta(minutes=11),
-            reader=lambda shell, unit, now: evidence(last_work_at=now),
+            reader=lambda shell, unit, now, role=None: evidence(last_work_at=now),
             refresh=lambda worktree: True,
             state=state,
         )
@@ -825,7 +942,7 @@ class TickTest(unittest.TestCase):
         readings = pr_poller.reconcile_tick(
             self.con,
             now=NOW,
-            reader=lambda shell, unit, now: evidence(
+            reader=lambda shell, unit, now, role=None: evidence(
                 last_result_row_at=(
                     NOW if unit["sprint_doc_id"] == 60 else None
                 )

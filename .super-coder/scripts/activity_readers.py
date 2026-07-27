@@ -14,6 +14,13 @@ unattributed surfaces are excluded rather than guessed.
 freshness is the caller's responsibility because one reconciler tick reads
 many worktrees but must fetch the shared integration ref only once.
 
+``read()`` takes the expectation's ``role`` because WHICH surfaces are worth
+asking about depends on it (spec #76 H-15/H-16, flag #364).  A reviewer has no
+code surface, so its evidence never includes branch presence; a dev has one
+whether or not the board's ``branch`` column has been filled yet.  Judging every
+role by the dev-shaped git read is what produced alerts a role could not
+possibly clear.
+
 "Which unit is this row about" is answered STRUCTURALLY where a row carries a
 link (``watched_prs.unit_id``, reached through the poller's ``pr-event|``
 dedupe key) and by regex over prose where it does not — see
@@ -480,8 +487,6 @@ class ActivityReader:
             return
         epoch = evidence.epoch
         branch = evidence.branch_declared
-        if branch is None:
-            return
         try:
             status = self._git(
                 worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all"
@@ -519,7 +524,16 @@ class ActivityReader:
             elif "R" in code:
                 self._mark(evidence, UNTIMED_DELETE_RENAME)
 
-        revision = "HEAD" if on_declared_head else f"refs/remotes/origin/{branch}"
+        # H-15: an UNDECLARED branch is not "no code evidence" — a dev who has
+        # branched and is heads-down building has a worktree HEAD that carries
+        # exactly the work, and the board's `branch` column is filled only at
+        # PR-open. Reading HEAD is what stops the 20-minute checkup floor from
+        # firing on a working dev. A DECLARED branch the worktree is not on
+        # still resolves through the remote, unchanged.
+        revision = (
+            "HEAD" if on_declared_head or branch is None
+            else f"refs/remotes/origin/{branch}"
+        )
         try:
             contribution = f"refs/remotes/origin/main..{revision}"
             log = self._git(worktree, "log", contribution, "--format=%aI")
@@ -813,13 +827,26 @@ class ActivityReader:
         if marker is None:
             self._mark(evidence, "marker")
 
-    def read(self, shell: Any, unit: Any, now: Any) -> Evidence:
-        """Return all readable observations; never classify and never raise."""
+    def read(
+        self, shell: Any, unit: Any, now: Any, role: str | None = None
+    ) -> Evidence:
+        """Return all readable observations; never classify and never raise.
+
+        `role` is the expectation's role on the board ("dev" / "reviewer" /
+        "planner"), and it decides which surfaces are even ASKED about — the
+        second half of flag #364's finding, that each role was judged on
+        dev-shaped evidence it cannot produce. It defaults to None, which reads
+        as the historical dev-shaped unit expectation.
+        """
         evidence = Evidence()
         evidence.branch_declared = _value(unit, "branch")
-        evidence.edits_code = (
-            unit is not None and evidence.branch_declared is not None
-        )
+        # H-15/H-16: what makes an expectation a CODE expectation is its role,
+        # not the board's `branch` column. Gating on the column meant a dev
+        # heads-down before PR-open produced no git evidence at all (and fell to
+        # the no-progress floor), while a reviewer inherited the dev's branch and
+        # read `not_started` until the dev pushed. Reviewers are judged on
+        # review-shaped evidence — result rows and durable writes — only.
+        evidence.edits_code = unit is not None and role != "reviewer"
         if unit is not None:
             evidence.state_changed_at = _timestamp(
                 _value(unit, "state_changed_at")
@@ -838,7 +865,7 @@ class ActivityReader:
                 self._mark(evidence, "state_changed_at")
 
         on_declared_head = False
-        if evidence.branch_declared is not None:
+        if evidence.edits_code and evidence.branch_declared is not None:
             try:
                 present, on_declared_head = self._branch_present(
                     evidence, worktree, evidence.branch_declared
@@ -870,6 +897,6 @@ class ActivityReader:
 _DEFAULT_READER = ActivityReader()
 
 
-def read(shell: Any, unit: Any, now: Any) -> Evidence:
-    """Module contract: ``read(shell, unit, now) -> Evidence``."""
-    return _DEFAULT_READER.read(shell, unit, now)
+def read(shell: Any, unit: Any, now: Any, role: str | None = None) -> Evidence:
+    """Module contract: ``read(shell, unit, now, role=None) -> Evidence``."""
+    return _DEFAULT_READER.read(shell, unit, now, role)
