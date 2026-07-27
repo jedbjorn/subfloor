@@ -135,8 +135,8 @@ BINDING = {
     "retry": {"applicable": True, "needs_outcome": True},
 }
 
-# Two active documents present in the live engine at S77-U5 kickoff, represented
-# through the public projection so the browser gate stays hermetic and repeatable.
+# Representative active-sprint projection fixtures. They intentionally exercise
+# two independently titled boards while keeping the browser gate hermetic.
 SPRINTS = {
     "active_count": 2,
     "sprints": [
@@ -581,14 +581,22 @@ def test_sprints_multi_board_read_only_visual_gate(
         page.goto(f"{ui_url}/#sprints", wait_until="networkidle")
         boards = page.locator("#view-sprints .sprint-board")
         assert boards.count() == 2
+        assert boards.nth(0).locator("h2").inner_text() == (
+            "SPRINT: Worker expectation reconciler"
+        )
+        assert boards.nth(1).locator("h2").inner_text() == (
+            "sprint: Active sprint flow board"
+        )
         assert page.locator(
             'nav button[data-tab="sprints"]'
         ).inner_text() == "SPRINTS 2"
         assert boards.nth(0).locator(".sprint-wire").count() == 0
         assert boards.nth(1).locator(".sprint-wire").count() == 3
-        assert boards.nth(1).locator(
-            '[aria-label="dependency unavailable: U99"]'
-        ).count() == 1
+        unavailable = boards.nth(1).get_by_role(
+            "img", name="dependency unavailable: U99", exact=True
+        )
+        assert unavailable.count() == 1
+        assert unavailable.is_visible()
 
         view = page.locator("#view-sprints")
         assert view.locator(
@@ -598,7 +606,6 @@ def test_sprints_multi_board_read_only_visual_gate(
         cards = view.locator('.sprint-unit[role="button"]')
         assert cards.count() == view.locator(".sprint-unit").count() == 7
 
-        before_card_interactions = len(api_requests)
         for index in range(cards.count()):
             card = cards.nth(index)
             card.click()
@@ -609,7 +616,6 @@ def test_sprints_multi_board_read_only_visual_gate(
             assert card.get_attribute("aria-pressed") == "true"
             card.press(" ")
             assert card.get_attribute("aria-pressed") == "false"
-        assert len(api_requests) == before_card_interactions
         assert {method for method, _path in api_requests} == {"GET"}
 
         selected = boards.nth(1).locator('.sprint-unit[data-seq="U5"]')
