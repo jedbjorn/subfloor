@@ -30,10 +30,17 @@ Verified against the installed CLIs (2026-07-23):
   and AskUserQuestion has none — per spec a harness lacking distinct
   approval/user-input hooks stays `busy` during the wait (safe), so those
   events are deliberately not mapped.
-- codex 0.145.0: hooks feature stable+on; SessionStart (during session
-  init — pre-prompt), UserPromptSubmit, Stop, SessionEnd (present in the
-  binary, undocumented on the hooks page). No approval-result, user-input,
-  interrupt, or failure events.
+- codex 0.145.0: hooks feature stable+on; SessionStart, UserPromptSubmit,
+  Stop, SessionEnd (present in the binary, undocumented on the hooks page).
+  No approval-result, user-input, interrupt, or failure events.
+  CORRECTED 2026-07-27 (flag #303, measured on a live 0.145.0 TUI seat):
+  codex does NOT fire SessionStart during session init. It DEFERS it to the
+  first user prompt submission — a turn-less seat emits nothing at all, and
+  the first turn then fires SessionStart, UserPromptSubmit and Stop together,
+  in that order. Config discovery and trust are NOT implicated: the project
+  `.codex/hooks.json` is discovered, parsed, validated (codex clamps our
+  SessionEnd timeout) and persisted into `[hooks.state]` regardless. Its
+  readiness class is therefore `first_turn_gated` — see the readiness notes.
 - kimi 0.27.0: full 16-event HookEngine; SessionStart is awaited as the
   FINAL step of session creation (the strongest readiness signal of the
   three), UserPromptSubmit, Stop, Interrupt, StopFailure, SessionEnd,
@@ -51,7 +58,7 @@ from pathlib import Path
 # ── Contract vocabulary ─────────────────────────────────────────────────────
 
 EVENTS = (
-    "session_start",      # mandatory — provider readiness (see CAPABILITIES)
+    "session_start",      # mandatory — readiness (see CAPABILITIES readiness)
     "prompt_submit",      # mandatory
     "turn_stop",          # mandatory
     "session_end",        # mandatory
@@ -65,9 +72,13 @@ MANDATORY = ("session_start", "prompt_submit", "turn_stop", "session_end")
 
 # Sources the hook-callback route accepts. `entrypoint` = the pane
 # entrypoint's pre-exec identity claim (interface_exec); it proves PID
-# identity and promotes the reservation but is NOT provider readiness.
-# `provider` = a native harness hook delivered through the emitter; its
-# session_start is the real readiness signal that moves starting→idle.
+# identity, promotes the reservation, and proves the PROCESS is up — it is
+# never proof the provider handshaked. `provider` = a native harness hook
+# delivered through the emitter; its session_start is the real provider
+# readiness signal, and for every harness EXCEPT a 'first_turn_gated' one it
+# is also the only thing that moves starting→idle. On a first_turn_gated
+# harness that hook cannot arrive unbidden, so the entrypoint's weaker proof
+# makes the move instead and is stamped separately (see readiness notes).
 SOURCES = ("entrypoint", "provider")
 
 EMITTER = "interface_hook.py"
@@ -90,12 +101,38 @@ def _emitter_command(event: str) -> str:
 # min_version: oldest CLI release this mapping was verified against —
 # anything older is treated as incapable (fail closed for arming, the
 # ordinary chat is unaffected).
-# readiness: how strong the harness's session_start is as a start-READY
-# proof — 'session_created' = fires after session construction completes
-# (kimi: awaited final step of createMain); 'startup_hook' = fires during
-# startup, before the interactive prompt is proven painted (claude/codex).
-# Neither CLI offers a later native prompt-ready signal; the wake gate's
-# quiet debounce + submit-hook fence absorb the residual window.
+# readiness: WHEN the harness's own session_start arrives, and therefore how
+# strong it is as a start-READY proof. Three classes, strongest first:
+#
+#   'session_created'  — fires after session construction completes (kimi:
+#                        the awaited final step of createMain).
+#   'startup_hook'     — fires during startup, before the interactive prompt
+#                        is proven painted (claude). Weaker: the process is
+#                        up and the provider handshaked, but the TUI may not
+#                        have painted yet.
+#   'first_turn_gated' — does not arrive at all until a human submits the
+#                        first turn (codex 0.145.0, flag #303, measured).
+#
+# No CLI offers a later native prompt-ready signal, so for the first two the
+# wake gate's quiet debounce + submit-hook fence absorb the residual window.
+#
+# 'first_turn_gated' cannot be handled that way, because there is no signal to
+# debounce FROM: a codex seat that exists to be woken would wait forever on a
+# hook only a human turn can trigger, so wake never arms and the deadlock is
+# silent (flag #303). Such a harness is instead promoted starting -> idle on
+# the ENTRYPOINT's pre-exec claim, which proves the PROCESS is up and nothing
+# more. That weaker proof is recorded in its OWN column (process_ready_at,
+# migration 0113) and never aliased into provider_ready_at, so no reader that
+# trusts provider_ready_at as "the provider handshaked" becomes wrong.
+#
+# Read that as "proceed on weak proof, upgrade to strong proof when it
+# arrives", NOT as lowering the bar: the first real turn still fires
+# session_start and still stamps true provider readiness. And if the provider
+# really is down, the submit goes out and FAILS loudly (the persistent
+# gate-failure alert carries the reason verbatim) instead of the status quo,
+# which is never arming at all, silently, forever — the direction decision #76
+# requires. Sprint 84 U7, decisions #98/#99.
+FIRST_TURN_GATED = "first_turn_gated"
 
 CAPABILITIES = {
     "claude": {
@@ -111,10 +148,11 @@ CAPABILITIES = {
         "min_version": (0, 145, 0),
         "events": ("session_start", "prompt_submit", "turn_stop",
                    "session_end"),
-        "readiness": "startup_hook",
+        "readiness": FIRST_TURN_GATED,
         "degraded": ("no approval, user-input, interrupt, or failure hook "
                      "events — approval waits stay busy (safe); SessionEnd "
-                     "is undocumented but present in 0.145.0"),
+                     "is undocumented but present in 0.145.0; SessionStart is "
+                     "NOT delivered until the first user turn (flag #303)"),
     },
     "kimi": {
         "min_version": (0, 14, 0),
@@ -312,9 +350,27 @@ def install(harness: "str | None", work_dir: Path, *, run_dir: Path,
     Returns {"installed": bool, "argv": [...], "capability": capability()}.
     `argv` carries launch-flag additions (claude's --settings overlay).
     Installed=False means the harness is unversioned/unknown or the config
-    write failed: the chat still launches, the provider session_start
-    simply never arrives — lifecycle stays `starting`, sprint wake can
-    never arm on it (fail closed, ordinary chat unaffected).
+    write failed: the chat still launches, but the session can deliver NO
+    lifecycle hook to the engine at all.
+
+    The caller must REPORT that value on the entrypoint's session_start
+    claim (`hooks_installed`), because the two ways a seat is kept out of
+    the wake path differ by readiness class and only one of them is
+    self-enforcing:
+
+      claude / kimi  — the provider session_start is what moves
+                       starting → idle, and an uninstalled hook cannot send
+                       it. Fail-closed with no further help.
+      first_turn_gated (codex) — the seat is promoted on the ENTRYPOINT's
+                       claim instead (flag #303), and `capability()` is a
+                       static version lookup that still reads
+                       mandatory_ok=True for an install that wrote nothing.
+                       Without the report the promotion arms a seat with no
+                       prompt_submit fence and no turn_stop.
+
+    With the report, both classes end the same way: lifecycle stays
+    `starting` and sprint wake can never arm on the session (fail closed,
+    ordinary chat unaffected).
     """
     cap = capability(harness, cli_version)
     result = {"installed": False, "argv": [], "capability": cap}

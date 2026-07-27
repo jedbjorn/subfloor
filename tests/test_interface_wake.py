@@ -10,6 +10,10 @@ Covers, without tmux or a live harness:
 - Flag #49 (decisions #28/#31): the quiet baseline keys off REAL provider
   readiness (provider session_start stamp), never the pre-exec
   occupied_at — a >3s boot can no longer submit into an unpainted TUI.
+  Flag #303 adds the one exception and it is not a loophole: on a
+  'first_turn_gated' harness the provider stamp cannot arrive unbidden, so
+  the baseline is the weaker process_ready_at stamp — a separately aged
+  column, still owed in full, and only for a seat whose hooks installed.
 - Gate hardening: mandatory-hook capability, unmanaged-writable probe
   (decision #15 disarm), PreSendError (definite pre-send failure → queued,
   never parked) vs ambiguous failure (parked, never auto-retried).
@@ -44,6 +48,7 @@ MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import interface_broker  # noqa: E402
 import interface_hook  # noqa: E402
+import interface_hooks  # noqa: E402
 import interface_wake  # noqa: E402
 
 QUIET = 0.2  # tight debounce for fast hermetic drains
@@ -77,7 +82,17 @@ def _age(con, table, col, row_id, seconds, pk):
 
 class WakeFixture(unittest.TestCase):
     """An armed sprint: occupied+idle+clean planner session (kimi, full
-    hooks), an ACTIVE sprint doc, an unreleased binding."""
+    hooks), an ACTIVE sprint doc, an unreleased binding.
+
+    The seat is built from the four class attributes below rather than
+    mutated afterwards: the lifecycle trigger legitimately refuses an
+    idle -> starting rewind, so a test that needs a pre-readiness seat must
+    INSERT one in that state."""
+
+    HARNESS = "kimi"
+    CLI_VERSION = "kimi-code 0.27.0"
+    LIFECYCLE = "idle"
+    COMPOSER = "clean"
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -89,11 +104,12 @@ class WakeFixture(unittest.TestCase):
             "VALUES (1,1)")
         self.sid = self.con.execute(
             "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
-            " lifecycle, harness, cli_version) VALUES (1,1,'occupied','idle',"
-            "'kimi','kimi-code 0.27.0')").lastrowid
+            " lifecycle, harness, cli_version) VALUES (1,1,'occupied',?,?,?)",
+            (self.LIFECYCLE, self.HARNESS, self.CLI_VERSION)).lastrowid
         self.con.execute(
             "INSERT INTO interface_input_state (session_id, shell_id,"
-            " generation, composer) VALUES (?,1,1,'clean')", (self.sid,))
+            " generation, composer) VALUES (?,1,1,?)",
+            (self.sid, self.COMPOSER))
         self.binding = self.con.execute(
             "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation) "
@@ -297,6 +313,207 @@ class WakeReadinessTest(WakeFixture):
         out = self.submit(batch_id, lambda n: None, quiet_s=3.0)
         self.assertFalse(out["submitted"])
         self.assertIn("quiet", out["reason"])
+
+
+# ── Flag #303: a first-turn-gated harness (codex) arms on the weaker proof ───
+
+class CodexFirstTurnGatedTest(WakeFixture):
+    """Codex 0.145.0 does not fire SessionStart until a human submits the
+    first turn (measured on a live TUI seat). Waiting for it deadlocks the
+    seat that exists to BE woken: no readiness -> lifecycle stays 'starting'
+    -> the gate never sees occupied+idle -> the submit that would have
+    triggered the hook never goes out. Decisions #98/#99."""
+
+    # The state interface_exec's pre-exec claim arrives in: promoted to
+    # occupied, but lifecycle still 'starting' and the composer not yet
+    # proven — and running codex, not kimi.
+    HARNESS = "codex"
+    CLI_VERSION = "codex-cli 0.145.0"
+    LIFECYCLE = "starting"
+    COMPOSER = "unknown"
+
+    def seat(self):
+        return self.con.execute(
+            "SELECT lifecycle, provider_ready_at, process_ready_at "
+            "FROM interface_sessions WHERE session_id=?",
+            (self.sid,)).fetchone()
+
+    def composer(self):
+        return self.con.execute(
+            "SELECT composer FROM interface_input_state WHERE session_id=?",
+            (self.sid,)).fetchone()[0]
+
+    def entrypoint_claim(self, seq=1, hooks_installed=True):
+        interface_broker.record_hook(self.con, 1, 1, seq, "session_start",
+                                     source="entrypoint",
+                                     hooks_installed=hooks_installed)
+        self.con.commit()
+
+    def test_entrypoint_claim_promotes_a_first_turn_gated_seat(self):
+        self.entrypoint_claim()
+        lifecycle, provider, process = self.seat()
+        with self.subTest("lifecycle"):
+            self.assertEqual(lifecycle, "idle")
+        with self.subTest("composer"):
+            self.assertEqual(self.composer(), "clean")
+        with self.subTest("weak proof recorded"):
+            self.assertIsNotNone(process)
+        with self.subTest("strong proof not claimed"):
+            self.assertIsNone(
+                provider,
+                "the pre-exec claim proves the PROCESS is up, never that "
+                "the provider handshaked — aliasing it into "
+                "provider_ready_at makes that column mean two different "
+                "things by harness and silently breaks every reader")
+
+    def test_turnless_codex_seat_can_be_woken(self):
+        """The flag #303 deadlock, end to end: nobody ever types, so no
+        provider session_start arrives — the wake must still submit."""
+        self.entrypoint_claim()
+        _age(self.con, "interface_sessions", "process_ready_at", self.sid,
+             60, "session_id")
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch_id = self.form()
+        writes = []
+        out = self.submit(batch_id, writes.append)
+        self.assertTrue(out["submitted"], out)
+        self.assertEqual(writes, [len(interface_broker.WAKE_PROMPT) + 1])
+
+    def test_debounce_is_owed_from_the_process_stamp(self):
+        """Proceeding on weak proof does NOT skip the fence. occupied_at and
+        created_at are 60s old, but the process claim landed just now — the
+        gate must still owe the full debounce, or flag #49's defect returns
+        through the new column."""
+        self.entrypoint_claim()
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch_id = self.form()
+        out = self.submit(batch_id, lambda n: None, quiet_s=3.0)
+        self.assertFalse(out["submitted"])
+        self.assertIn("quiet", out["reason"])
+        self.assertEqual(self.batch_state(batch_id), "queued")
+
+    def test_a_failed_hook_install_neither_promotes_nor_arms(self):
+        """Flag #366 (SC-354): promotion on the entrypoint's claim is only
+        sound while the seat really holds the hooks its capability
+        advertises. `capability()` is a STATIC version lookup — a codex seat
+        whose `.codex/hooks.json` is unparseable installs nothing and still
+        reads mandatory_ok=True — so without the install report the claim
+        would arm a seat with ZERO lifecycle hooks: no prompt_submit fence,
+        no turn_stop. That configuration was fail-CLOSED before this unit and
+        must stay that way.
+
+        The install result is CHAINED from the real installer rather than
+        written in as a literal False: a change that made the corrupt file
+        install cleanly has to turn this red too."""
+        work = self.tmp / "corrupt-seat"
+        (work / ".codex").mkdir(parents=True)
+        (work / ".codex" / "hooks.json").write_text("{ not json")
+        out = interface_hooks.install("codex", work, run_dir=self.tmp / "run",
+                                      session_id=self.sid,
+                                      cli_version=self.CLI_VERSION)
+        with self.subTest("install refuses the corrupt file"):
+            self.assertFalse(out["installed"])
+        with self.subTest("capability alone would have promoted"):
+            self.assertTrue(
+                out["capability"]["mandatory_ok"],
+                "the static table is exactly why the install report is "
+                "needed — if it ever fails closed on its own, this test is "
+                "no longer measuring the gap it was written for")
+
+        self.entrypoint_claim(hooks_installed=out["installed"])
+        lifecycle, provider, process = self.seat()
+        with self.subTest("not promoted"):
+            self.assertEqual(lifecycle, "starting")
+        with self.subTest("composer not certified"):
+            self.assertEqual(self.composer(), "unknown")
+        with self.subTest("provider stamp"):
+            self.assertIsNone(provider)
+        with self.subTest("process stamp is still recorded"):
+            self.assertIsNotNone(
+                process, "the process IS up — the weak proof is true and "
+                         "stays recorded; it is the PROMOTION that is "
+                         "withheld")
+
+        # ...and the wake gate refuses. The item and batch still form: the
+        # ingress check reads the same static capability, so the ONLY thing
+        # standing between this seat and a submit is the withheld promotion.
+        _age(self.con, "interface_sessions", "process_ready_at", self.sid,
+             60, "session_id")
+        mid = self.add_message("task")
+        self.assertIsNotNone(
+            interface_wake.maybe_create_wake_item(self.con, mid))
+        self.con.commit()
+        writes = []
+        out = self.submit(self.form(), writes.append)
+        with self.subTest("no submit"):
+            self.assertFalse(out["submitted"], out)
+        with self.subTest("refused on the unpromoted lifecycle"):
+            self.assertIn("starting", out["reason"])
+        with self.subTest("nothing was written to the pane"):
+            self.assertEqual(writes, [])
+
+    def test_first_real_turn_upgrades_to_provider_readiness(self):
+        """'Proceed on weak proof, upgrade to strong proof when it arrives.'
+        The deferred provider hook still stamps the real column, and BOTH
+        stamps survive — that is what lets a reader tell 'process ready,
+        provider unproven' from 'provider handshaked'."""
+        self.entrypoint_claim()
+        _, provider, process = self.seat()
+        self.assertIsNone(provider)
+        interface_broker.record_hook(self.con, 1, 1, 2, "session_start",
+                                     source="provider")
+        self.con.commit()
+        lifecycle, provider, process_after = self.seat()
+        with self.subTest("provider stamp arrives"):
+            self.assertIsNotNone(provider)
+        with self.subTest("process stamp survives"):
+            self.assertEqual(process_after, process)
+        with self.subTest("still idle"):
+            self.assertEqual(lifecycle, "idle")
+
+
+class NativeReadinessSeatTest(WakeFixture):
+    """The counterpart scope proof: a harness whose readiness signal DOES
+    arrive unbidden must not be armed by the weaker claim."""
+
+    LIFECYCLE = "starting"
+    COMPOSER = "unknown"
+
+    def test_entrypoint_claim_does_not_promote_a_native_readiness_harness(self):
+        """kimi awaits SessionStart as the final step of session creation,
+        so it has a real signal coming and nothing is deadlocked. The
+        process stamp is still recorded (it is true of every harness); only
+        the PROMOTION is scoped to first_turn_gated.
+
+        The claim reports hooks_installed=True so that what is proved here is
+        the readiness-class scoping and nothing else — with the operand false
+        this seat would stay 'starting' for the other reason and the test
+        would pass while measuring nothing."""
+        interface_broker.record_hook(self.con, 1, 1, 1, "session_start",
+                                     source="entrypoint",
+                                     hooks_installed=True)
+        self.con.commit()
+        lifecycle, provider, process = self.con.execute(
+            "SELECT lifecycle, provider_ready_at, process_ready_at "
+            "FROM interface_sessions WHERE session_id=?",
+            (self.sid,)).fetchone()
+        with self.subTest("lifecycle"):
+            self.assertEqual(lifecycle, "starting",
+                             "kimi still owes its native readiness hook")
+        with self.subTest("composer"):
+            self.assertEqual(
+                self.con.execute(
+                    "SELECT composer FROM interface_input_state "
+                    "WHERE session_id=?", (self.sid,)).fetchone()[0],
+                "unknown")
+        with self.subTest("provider stamp"):
+            self.assertIsNone(provider)
+        with self.subTest("process stamp"):
+            self.assertIsNotNone(process)
 
 
 # ── Gate hardening: hooks capability, unmanaged probe, PreSendError ───────────

@@ -190,8 +190,15 @@ def main(argv: "list[str] | None" = None) -> int:
     # hook config WITHOUT replacing fork/user hooks, and hand the emitter
     # its per-generation credentials through the launch env — the token
     # never touches a config file, argv, or stderr. A harness whose hooks
-    # can't install still launches (ordinary chat unaffected); without the
-    # provider session_start the session simply never becomes wake-armable.
+    # can't install still launches (ordinary chat unaffected) and never
+    # becomes wake-armable — for most harnesses because the provider
+    # session_start that would move it out of 'starting' can no longer be
+    # delivered, and for a 'first_turn_gated' one because the claim below
+    # reports the failure as `hooks_installed: false` and the broker
+    # withholds the promotion on it. Reporting it is REQUIRED, not
+    # informational: the mandatory-hook gate reads the static capability
+    # table, which says what this harness version CAN deliver and cannot
+    # know that this launch installed nothing (flag #303).
     hook_install = interface_hooks.install(
         plan.harness, Path(plan.cwd), run_dir=RUN_DIR,
         session_id=int(token["session_id"]), cli_version=plan.cli_version)
@@ -210,6 +217,7 @@ def main(argv: "list[str] | None" = None) -> int:
         "archive_id": plan.archive_id,
         "pid": os.getpid(),
         "start_ticks": _start_ticks(),
+        "hooks_installed": bool(hook_install["installed"]),
     }
     if plan.cli_version:
         body["cli_version"] = plan.cli_version
