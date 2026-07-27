@@ -2516,8 +2516,12 @@ window.addEventListener("pagehide", ifDetach);
 // `working` is amber, not red (flag #94): a live non-orphan harness holds the
 // worktree — someone is genuinely working outside the Interface. Only the
 // orphan verdict (`unreconciled`) is a stranded remnant worth recovering.
+// `expected_absent` (spec #76 H-25) is warn, not bad: a headless launch claimed
+// this shell and its process is gone. That is evidence, not a remnant to
+// recover — whether the absence is a FAULT is the sprint reconciler's call.
 const IF_BADGE = { available: "ok", starting: "warn", occupied: "accent",
-  working: "warn", lost: "bad", error: "bad", unreconciled: "bad" };
+  working: "warn", lost: "bad", error: "bad", unreconciled: "bad",
+  expected_absent: "warn" };
 const IF_ATTACHABLE_LIFECYCLES = new Set(
   ["starting", "idle", "busy", "approval", "user_input"]);
 
@@ -2631,7 +2635,11 @@ async function renderInterface(root) {
     if (shells.length) pane.append(el("div", { className: "card muted" }, "Select a shell on the left."));
     return;
   }
-  if (sel.availability === "available") return ifAvailablePane(pane, sel, root);
+  // `expected_absent` takes the available pane: no process holds the worktree,
+  // so New chat is legal here. The rail badge is what carries the distinction
+  // the record makes; the pane has nothing different to offer.
+  if (sel.availability === "available" || sel.availability === "expected_absent")
+    return ifAvailablePane(pane, sel, root);
   if (sel.availability === "working") {
     ifDetach();
     return ifWorkingPane(pane, sel, root);

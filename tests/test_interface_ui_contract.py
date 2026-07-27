@@ -1183,6 +1183,21 @@ def test_rail_routes_working_away_from_recovery_and_paints_it_amber():
     assert '"working"' not in recovery_route.split("ifRecoveryPane")[0]
 
 
+def test_rail_paints_expected_absent_warn_and_never_on_the_recovery_route():
+    """Spec #76 H-25: a record-claimed shell whose worker is gone is EVIDENCE,
+    not a stranded remnant — warn, not bad. And New chat stays legal there, so
+    the value must take the available arm rather than falling through the
+    dispatch into a session fetch for a null session_id."""
+    assert 'expected_absent: "warn"' in RENDER_INTERFACE
+    available_route = RENDER_INTERFACE[
+        RENDER_INTERFACE.index('sel.availability === "available"'):
+        RENDER_INTERFACE.index('sel.availability === "lost"')]
+    assert '"expected_absent"' in available_route
+    recovery_route = RENDER_INTERFACE[
+        RENDER_INTERFACE.index('sel.availability === "lost"'):]
+    assert '"expected_absent"' not in recovery_route.split("ifRecoveryPane")[0]
+
+
 RAIL_POLL_SETUP = r"""
 const shellRow = (shortname, availability, extra = {}) => ({
   shell_id: shortname === "S3" ? 3 : 4, shortname,
@@ -1260,6 +1275,39 @@ invariant(rendered === 0,
   "a still-occupied session was re-rendered — the live terminal would drop");
 invariant(badges(root).some((b) => b.includes("2")),
   `the new alert count never reached the rail: ${badges(root)}`);
+ifStopRailPoll();
+""")
+
+
+def test_expected_absent_renders_as_a_warn_badge_over_the_available_pane():
+    """The behavioural half of the H-25 rail consequence: the badge carries the
+    new word (an unknown value would paint an empty tone class), and selecting
+    the shell lands on the available pane — never the recovery pane, which
+    would tell the operator to recover a worker that already finished."""
+    run_recovery_js(RAIL_POLL_SETUP + r"""
+ifSelected = "S3";
+serveShells([shellRow("S3", "expected_absent", { sprint_ref: "84" })]);
+const root = new FakeElement("div");
+await renderInterface(root);
+
+const badge = all(railOf(root), (n) =>
+  String(n.className || "").includes("if-badge"))[0];
+invariant(badge.textContent === "expected_absent",
+  `rail did not paint the record verdict: ${badge.textContent}`);
+// Token compare, not substring: "if-badge" contains "bad".
+const tone = String(badge.className).split(" ");
+invariant(tone.includes("warn"),
+  `expected_absent painted as "${badge.className}" — an unrecognised `
+  + `availability falls through to an empty tone class`);
+invariant(!tone.includes("bad"),
+  "a finished worker was painted as a stranded remnant");
+
+// The dispatch arm: without it the value falls past every branch into
+// ifSessionPane, which fetches /sessions/null. That path is stubbed inert
+// here, so the tell is a pane with no New-chat affordance at all.
+const pane = all(root, (n) => n.className === "if-pane")[0];
+invariant(Boolean(button(pane, "New chat")),
+  `expected_absent did not reach the available pane: ${pane.textContent}`);
 ifStopRailPoll();
 """)
 
