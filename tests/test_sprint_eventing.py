@@ -908,23 +908,31 @@ class ApiTest(unittest.TestCase):
         pr_poller.baseline_read = lambda repo, pr: (
             {"state": "OPEN", "sha": "s", "checks": None, "reviews": 0,
              "review_state": None}, None)
+        # PR numbers unused by any other test in this class: the DB is
+        # per-CLASS, and re-registering a PR under a SECOND sprint takes a new
+        # row rather than rebinding, so a shared number reads back as two rows.
         try:
-            watch.main(["pr", "own/repo", "31", "--sprint", "113"])
-            watch.main(["pr", "own/repo", "32", "--sprint", "114"])
+            watch.main(["pr", "own/repo", "41", "--sprint", "113"])
+            watch.main(["pr", "own/repo", "42", "--sprint", "114"])
         finally:
             pr_poller.baseline_read = real
 
         self.assertEqual(
             [(r["pr_number"], r["sprint_doc_id"]) for r in self.q(
                 "SELECT pr_number, sprint_doc_id FROM watched_prs "
-                "WHERE pr_number IN (31, 32) ORDER BY pr_number")],
-            [(31, 113), (32, 114)], "both registrations were accepted")
+                "WHERE pr_number IN (41, 42) ORDER BY pr_number")],
+            [(41, 113), (42, 114)], "both registrations were accepted")
         con = sqlite3.connect(self.db)
         con.row_factory = sqlite3.Row
         try:
             armed = {w["sprint_doc_id"] for w in pr_poller.armed_watches(con)}
         finally:
             con.close()
+        # POSITIVE CONTROL FIRST: both claims below are absences, and an empty
+        # armed set satisfies them for free. Doc 100 is the class fixture's
+        # live sprint and carries watches, so its presence proves the probe
+        # sees armed watches at all.
+        self.assertIn(100, armed, "the probe sees a live sprint's watches")
         self.assertNotIn(113, armed, "a frozen sprint is never polled")
         self.assertNotIn(114, armed, "an undeclared board is never polled")
 

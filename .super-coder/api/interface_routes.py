@@ -2688,10 +2688,14 @@ def _add_sprint_unit(actor, headers, body):
             # clause that can drift from it.
             #
             # `is_writable_sprint_board`, not `is_live_sprint`: a frozen board
-            # is not mutable (H-1 answers the question this site used to park),
-            # but the unit-count clause cannot appear here, because this is the
-            # route that CREATES the first unit. Declare the board, then arm
-            # the binding.
+            # takes no NEW units (H-1 answers the question this site used to
+            # park), but the unit-count clause cannot appear here, because this
+            # is the route that CREATES the first unit. Declare the board, then
+            # arm the binding.
+            #
+            # "No new units" is narrower than "immutable", deliberately: PATCH
+            # is NOT gated on the freeze, so a planner can still correct a
+            # closed sprint's board. You may correct history, not extend it.
             #
             # The typo this catches is adjacent-integer, not exotic: a sprint
             # doc and its spec are consecutive ids (59 and 58 for this very

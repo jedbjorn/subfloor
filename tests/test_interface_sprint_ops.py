@@ -843,31 +843,56 @@ class SprintCloseTest(unittest.TestCase):
         finally:
             con.close()
 
-    def arm_sprint(self, doc_id, status_line="ACTIVE"):
+    def arm_sprint(self, doc_id, status_line="ACTIVE", unit_state="cancelled"):
+        """A live sprint with one armed binding and one queued wake item.
+
+        Two composed rules shape this helper, and getting either wrong makes
+        the whole class order-dependent — the DB is per-CLASS, not per-test.
+
+        H-1: a declared board is what makes the sprint live and the wake item
+        eligible; the `status:` line is display prose. So a unit row is
+        mandatory here.
+
+        U3's freeze machine: freeze refuses while any unit is non-terminal, and
+        the default state is 'pending'. A board whose only unit is 'pending' is
+        live AND unfreezable, so the callers that close the sprint would get
+        409 before reaching the close path they exist to test. 'cancelled' is
+        the terminal state that needs no invented review_head SHA — the freeze
+        refusal itself is pinned by its own tests below, not by this helper.
+
+        The prior active binding is released because the partial unique index
+        allows one per planner shell: a caller that does NOT close its sprint
+        (the prose-close test) leaves its binding armed for whoever runs next.
+        """
         con = sqlite3.connect(self.db)
-        con.execute(
-            "INSERT INTO documents (document_id, kind, title, body) "
-            "VALUES (?,'doc','SPRINT: close',?)",
-            (doc_id, f"# SPRINT: close\nstatus: {status_line}"))
-        # A declared board is what makes the sprint live and the wake item
-        # eligible (H-1). The `status:` line above is display prose.
-        con.execute(
-            "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
-            "VALUES (?,'U1','the unit')", (doc_id,))
-        binding = con.execute(
-            "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
-            " planner_shell_id, session_id, shell_id, generation) "
-            "VALUES (?,1,?,1,1)", (doc_id, self.sid)).lastrowid
-        mid = con.execute(
-            "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
-            " kind, sprint_doc_id) VALUES (2,1,'x','task',?)",
-            (doc_id,)).lastrowid
-        interface_wake.maybe_create_wake_item(con, mid)
-        interface_broker._alert(con, severity="critical",
-                                reason="wake_presend_retries_exhausted",
-                                binding_id=binding)
-        con.commit()
-        con.close()
+        try:
+            con.execute(
+                "UPDATE sprint_planner_bindings SET "
+                "released_at=datetime('now'), "
+                "release_reason='superseded test case' "
+                "WHERE released_at IS NULL")
+            con.execute(
+                "INSERT INTO documents (document_id, kind, title, body) "
+                "VALUES (?,'doc','SPRINT: close',?)",
+                (doc_id, f"# SPRINT: close\nstatus: {status_line}"))
+            con.execute(
+                "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title, "
+                "state) VALUES (?,'U1','the unit',?)", (doc_id, unit_state))
+            binding = con.execute(
+                "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
+                " planner_shell_id, session_id, shell_id, generation) "
+                "VALUES (?,1,?,1,1)", (doc_id, self.sid)).lastrowid
+            mid = con.execute(
+                "INSERT INTO shell_messages (from_shell_id, to_shell_id, body,"
+                " kind, sprint_doc_id) VALUES (2,1,'x','task',?)",
+                (doc_id,)).lastrowid
+            interface_wake.maybe_create_wake_item(con, mid)
+            interface_broker._alert(con, severity="critical",
+                                    reason="wake_presend_retries_exhausted",
+                                    binding_id=binding)
+            con.commit()
+        finally:
+            con.close()
         return binding, mid
 
     def test_status_closed_line_alone_closes_nothing(self):
