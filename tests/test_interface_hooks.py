@@ -65,6 +65,22 @@ class CapabilityTest(unittest.TestCase):
         self.assertFalse(codex["events"]["interrupt"])
         self.assertFalse(codex["events"]["failure"])
 
+    def test_readiness_classes_are_per_harness(self):
+        """Flag #303: codex is neither 'startup_hook' nor 'session_created'.
+        Its SessionStart does not arrive until a human submits the first
+        turn, so the table must name that class rather than overstate the
+        signal — the arming path reads this value to decide whether the
+        entrypoint's weaker proof may promote the seat."""
+        for harness, version, expected in (
+                ("claude", "2.1.217 (Claude Code)", "startup_hook"),
+                ("codex", "codex-cli 0.145.0",
+                 interface_hooks.FIRST_TURN_GATED),
+                ("kimi", "0.27.0", "session_created")):
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    interface_hooks.capability(harness, version)["readiness"],
+                    expected)
+
     def test_below_minimum_version_fails_closed(self):
         cap = interface_hooks.capability("claude", "2.0.0 (Claude Code)")
         self.assertFalse(cap["mandatory_ok"])

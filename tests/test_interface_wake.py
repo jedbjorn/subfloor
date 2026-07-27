@@ -77,7 +77,17 @@ def _age(con, table, col, row_id, seconds, pk):
 
 class WakeFixture(unittest.TestCase):
     """An armed sprint: occupied+idle+clean planner session (kimi, full
-    hooks), an ACTIVE sprint doc, an unreleased binding."""
+    hooks), an ACTIVE sprint doc, an unreleased binding.
+
+    The seat is built from the four class attributes below rather than
+    mutated afterwards: the lifecycle trigger legitimately refuses an
+    idle -> starting rewind, so a test that needs a pre-readiness seat must
+    INSERT one in that state."""
+
+    HARNESS = "kimi"
+    CLI_VERSION = "kimi-code 0.27.0"
+    LIFECYCLE = "idle"
+    COMPOSER = "clean"
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -89,11 +99,12 @@ class WakeFixture(unittest.TestCase):
             "VALUES (1,1)")
         self.sid = self.con.execute(
             "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
-            " lifecycle, harness, cli_version) VALUES (1,1,'occupied','idle',"
-            "'kimi','kimi-code 0.27.0')").lastrowid
+            " lifecycle, harness, cli_version) VALUES (1,1,'occupied',?,?,?)",
+            (self.LIFECYCLE, self.HARNESS, self.CLI_VERSION)).lastrowid
         self.con.execute(
             "INSERT INTO interface_input_state (session_id, shell_id,"
-            " generation, composer) VALUES (?,1,1,'clean')", (self.sid,))
+            " generation, composer) VALUES (?,1,1,?)",
+            (self.sid, self.COMPOSER))
         self.binding = self.con.execute(
             "INSERT INTO sprint_planner_bindings (sprint_doc_id,"
             " planner_shell_id, session_id, shell_id, generation) "
@@ -297,6 +308,140 @@ class WakeReadinessTest(WakeFixture):
         out = self.submit(batch_id, lambda n: None, quiet_s=3.0)
         self.assertFalse(out["submitted"])
         self.assertIn("quiet", out["reason"])
+
+
+# ── Flag #303: a first-turn-gated harness (codex) arms on the weaker proof ───
+
+class CodexFirstTurnGatedTest(WakeFixture):
+    """Codex 0.145.0 does not fire SessionStart until a human submits the
+    first turn (measured on a live TUI seat). Waiting for it deadlocks the
+    seat that exists to BE woken: no readiness -> lifecycle stays 'starting'
+    -> the gate never sees occupied+idle -> the submit that would have
+    triggered the hook never goes out. Decisions #98/#99."""
+
+    # The state interface_exec's pre-exec claim arrives in: promoted to
+    # occupied, but lifecycle still 'starting' and the composer not yet
+    # proven — and running codex, not kimi.
+    HARNESS = "codex"
+    CLI_VERSION = "codex-cli 0.145.0"
+    LIFECYCLE = "starting"
+    COMPOSER = "unknown"
+
+    def seat(self):
+        return self.con.execute(
+            "SELECT lifecycle, provider_ready_at, process_ready_at "
+            "FROM interface_sessions WHERE session_id=?",
+            (self.sid,)).fetchone()
+
+    def composer(self):
+        return self.con.execute(
+            "SELECT composer FROM interface_input_state WHERE session_id=?",
+            (self.sid,)).fetchone()[0]
+
+    def entrypoint_claim(self, seq=1):
+        interface_broker.record_hook(self.con, 1, 1, seq, "session_start",
+                                     source="entrypoint")
+        self.con.commit()
+
+    def test_entrypoint_claim_promotes_a_first_turn_gated_seat(self):
+        self.entrypoint_claim()
+        lifecycle, provider, process = self.seat()
+        with self.subTest("lifecycle"):
+            self.assertEqual(lifecycle, "idle")
+        with self.subTest("composer"):
+            self.assertEqual(self.composer(), "clean")
+        with self.subTest("weak proof recorded"):
+            self.assertIsNotNone(process)
+        with self.subTest("strong proof not claimed"):
+            self.assertIsNone(
+                provider,
+                "the pre-exec claim proves the PROCESS is up, never that "
+                "the provider handshaked — aliasing it into "
+                "provider_ready_at makes that column mean two different "
+                "things by harness and silently breaks every reader")
+
+    def test_turnless_codex_seat_can_be_woken(self):
+        """The flag #303 deadlock, end to end: nobody ever types, so no
+        provider session_start arrives — the wake must still submit."""
+        self.entrypoint_claim()
+        _age(self.con, "interface_sessions", "process_ready_at", self.sid,
+             60, "session_id")
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch_id = self.form()
+        writes = []
+        out = self.submit(batch_id, writes.append)
+        self.assertTrue(out["submitted"], out)
+        self.assertEqual(writes, [len(interface_broker.WAKE_PROMPT) + 1])
+
+    def test_debounce_is_owed_from_the_process_stamp(self):
+        """Proceeding on weak proof does NOT skip the fence. occupied_at and
+        created_at are 60s old, but the process claim landed just now — the
+        gate must still owe the full debounce, or flag #49's defect returns
+        through the new column."""
+        self.entrypoint_claim()
+        mid = self.add_message("task")
+        interface_wake.maybe_create_wake_item(self.con, mid)
+        self.con.commit()
+        batch_id = self.form()
+        out = self.submit(batch_id, lambda n: None, quiet_s=3.0)
+        self.assertFalse(out["submitted"])
+        self.assertIn("quiet", out["reason"])
+        self.assertEqual(self.batch_state(batch_id), "queued")
+
+    def test_first_real_turn_upgrades_to_provider_readiness(self):
+        """'Proceed on weak proof, upgrade to strong proof when it arrives.'
+        The deferred provider hook still stamps the real column, and BOTH
+        stamps survive — that is what lets a reader tell 'process ready,
+        provider unproven' from 'provider handshaked'."""
+        self.entrypoint_claim()
+        _, provider, process = self.seat()
+        self.assertIsNone(provider)
+        interface_broker.record_hook(self.con, 1, 1, 2, "session_start",
+                                     source="provider")
+        self.con.commit()
+        lifecycle, provider, process_after = self.seat()
+        with self.subTest("provider stamp arrives"):
+            self.assertIsNotNone(provider)
+        with self.subTest("process stamp survives"):
+            self.assertEqual(process_after, process)
+        with self.subTest("still idle"):
+            self.assertEqual(lifecycle, "idle")
+
+
+class NativeReadinessSeatTest(WakeFixture):
+    """The counterpart scope proof: a harness whose readiness signal DOES
+    arrive unbidden must not be armed by the weaker claim."""
+
+    LIFECYCLE = "starting"
+    COMPOSER = "unknown"
+
+    def test_entrypoint_claim_does_not_promote_a_native_readiness_harness(self):
+        """kimi awaits SessionStart as the final step of session creation,
+        so it has a real signal coming and nothing is deadlocked. The
+        process stamp is still recorded (it is true of every harness); only
+        the PROMOTION is scoped to first_turn_gated."""
+        interface_broker.record_hook(self.con, 1, 1, 1, "session_start",
+                                     source="entrypoint")
+        self.con.commit()
+        lifecycle, provider, process = self.con.execute(
+            "SELECT lifecycle, provider_ready_at, process_ready_at "
+            "FROM interface_sessions WHERE session_id=?",
+            (self.sid,)).fetchone()
+        with self.subTest("lifecycle"):
+            self.assertEqual(lifecycle, "starting",
+                             "kimi still owes its native readiness hook")
+        with self.subTest("composer"):
+            self.assertEqual(
+                self.con.execute(
+                    "SELECT composer FROM interface_input_state "
+                    "WHERE session_id=?", (self.sid,)).fetchone()[0],
+                "unknown")
+        with self.subTest("provider stamp"):
+            self.assertIsNone(provider)
+        with self.subTest("process stamp"):
+            self.assertIsNotNone(process)
 
 
 # ── Gate hardening: hooks capability, unmanaged probe, PreSendError ───────────

@@ -2878,7 +2878,11 @@ def _hook_callback(headers, body):
     Wrong tokens, stale generations, replayed sequences, unknown events,
     illegal transitions, and PID mismatches are rejected and audited.
     `source` distinguishes the entrypoint's pre-exec identity claim from a
-    provider-native hook; only the provider's session_start is readiness."""
+    provider-native hook; only the provider's session_start is PROVIDER
+    readiness. The entrypoint's claim proves the process is up (stamped
+    separately, never into provider_ready_at), and on a 'first_turn_gated'
+    harness — whose provider hook never arrives unbidden — that weaker proof
+    is what moves the session to idle (flag #303)."""
     authz = headers.get("Authorization") or ""
     token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
     shell_id, generation = body.get("shell_id"), body.get("generation")

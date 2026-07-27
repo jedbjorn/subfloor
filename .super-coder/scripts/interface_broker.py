@@ -501,10 +501,13 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
     trusts only these durable stamps — never the broker's memory of what
     it sent.
 
-    `source` distinguishes the entrypoint's pre-exec identity claim
-    (reserved → occupied promotion; NOT readiness) from a provider-native
-    hook delivered by the emitter — only the provider's session_start is
-    real start-readiness (sprint 25 seq 7).
+    `source` distinguishes the entrypoint's pre-exec identity claim from a
+    provider-native hook delivered by the emitter. Only the provider's
+    session_start is real PROVIDER readiness (sprint 25 seq 7) — the
+    entrypoint's claim proves the process is up and nothing more, and it is
+    stamped into its own column. On a 'first_turn_gated' harness that weaker
+    proof is nonetheless what moves starting → idle, because the provider hook
+    never arrives unbidden (flag #303, decisions #98/#99).
     """
     if event not in interface_hooks.EVENTS:
         raise BrokerError(f"unknown hook event {event!r} — rejected")
@@ -534,7 +537,8 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
         (hook_seq, shell_id, generation))
 
     sess = con.execute(
-        "SELECT session_id, lifecycle FROM interface_sessions "
+        "SELECT session_id, lifecycle, harness, cli_version "
+        "FROM interface_sessions "
         "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
         (shell_id, generation),
     ).fetchone()
@@ -566,8 +570,39 @@ def record_hook(con, shell_id: int, generation: int, hook_seq: int,
             if istate is not None and istate[1] is None and istate[2] == 0:
                 interface_state.transition(con, "composer", sess[0], "clean")
             _hook_capability_alerts(con, sess[0])
-        # source='entrypoint': identity/promotion only (the route owns the
-        # reserved → occupied move); readiness waits for the provider hook.
+        else:
+            # source='entrypoint': the pre-exec identity claim (the route owns
+            # the reserved → occupied move). It proves the PANE IS LIVE and
+            # interface_exec is about to exec the harness with its hooks
+            # installed — the PROCESS is up. It is NOT provider readiness, so
+            # it is stamped into its own column and never into
+            # provider_ready_at, which keeps meaning "the provider
+            # handshaked" for every reader (flag #303 condition 1).
+            con.execute(
+                "UPDATE interface_sessions SET process_ready_at=datetime('now') "
+                "WHERE session_id=?", (sess[0],))
+            cap = interface_hooks.capability(sess[2], sess[3])
+            if cap["readiness"] == interface_hooks.FIRST_TURN_GATED:
+                # This harness's own session_start cannot arrive until a human
+                # submits the first turn (codex 0.145.0 — measured), so waiting
+                # for it deadlocks the very seat that exists to BE woken: no
+                # readiness → lifecycle stays 'starting' → the wake gate never
+                # sees occupied+idle → the submit that would have triggered the
+                # hook never goes out. Promote on the weak proof instead; the
+                # first real turn still fires session_start and still upgrades
+                # the record to true provider readiness above.
+                if sess[1] == "starting":
+                    interface_state.transition(
+                        con, "lifecycle", sess[0], "idle")
+                istate = con.execute(
+                    "SELECT composer, pending_seq, forwarded_seq "
+                    "FROM interface_input_state WHERE session_id=?",
+                    (sess[0],)).fetchone()
+                if istate is not None and istate[1] is None \
+                        and istate[2] == 0:
+                    interface_state.transition(
+                        con, "composer", sess[0], "clean")
+                _hook_capability_alerts(con, sess[0])
     elif event == "prompt_submit":
         # Fenced submit callback. A prompt_submit hook clears dirty -> clean
         # and promotes a submitting wake batch ONLY when it provably answers
@@ -941,9 +976,11 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
     never crash on it), idle lifecycle, clean harness/tmux composer, clean
     metadata-only browser composer, quiet >= quiet_s since the last accepted
     human input AND since
-    REAL provider readiness (flag #49: the provider session_start stamp, NOT
-    the pre-exec occupied_at — a >3s claude/codex boot must not submit into
-    an unpainted TUI) AND since the last service restart (a fresh full
+    readiness (flag #49: the provider session_start stamp, NOT the pre-exec
+    occupied_at — a >3s claude boot must not submit into an unpainted TUI; on
+    a first_turn_gated harness the provider stamp cannot arrive unbidden, so
+    the weaker process_ready_at stamp is the baseline instead, flag #303) AND
+    since the last service restart (a fresh full
     debounce is owed after every restart), no pending human frame, mandatory
     lifecycle hooks actually supported by the session's harness, and NO
     unmanaged writable tmux client (decision #15: one is an immediate
@@ -1020,7 +1057,8 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
 
         sess = con.execute(
             "SELECT session_id, occupancy, lifecycle, occupied_at, "
-            "created_at, provider_ready_at, harness, cli_version "
+            "created_at, provider_ready_at, harness, cli_version, "
+            "process_ready_at "
             "FROM interface_sessions "
             "WHERE shell_id=? AND generation=? AND occupancy <> 'ended'",
             (shell_id, generation)).fetchone()
@@ -1082,10 +1120,14 @@ def submit_wake_batch(con, batch_id: int, writer, now_iso: str,
                               "clean certification"}
         # Quiet baseline (#49): the most recent of — last accepted human
         # input, REAL provider readiness (the provider session_start stamp,
-        # never the pre-exec occupied_at), session start, and the last
-        # service restart (startup_reconcile revokes every lease with reason
+        # never the pre-exec occupied_at), the weaker process-readiness stamp
+        # (flag #303: on a first_turn_gated harness that is the stamp we armed
+        # on, so the debounce must be owed from it and not from an invariant
+        # that it equals occupied_at), session start, and the last service
+        # restart (startup_reconcile revokes every lease with reason
         # 'service_restart'; that stamp is the restart time).
-        baseline = max(t for t in (istate[4], sess[3], sess[4], sess[5])
+        baseline = max(t for t in (istate[4], sess[3], sess[4], sess[5],
+                                   sess[8])
                        if t is not None)
         restart_at = con.execute(
             "SELECT MAX(revoked_at) FROM interface_writer_leases "

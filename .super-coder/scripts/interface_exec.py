@@ -190,8 +190,11 @@ def main(argv: "list[str] | None" = None) -> int:
     # hook config WITHOUT replacing fork/user hooks, and hand the emitter
     # its per-generation credentials through the launch env — the token
     # never touches a config file, argv, or stderr. A harness whose hooks
-    # can't install still launches (ordinary chat unaffected); without the
-    # provider session_start the session simply never becomes wake-armable.
+    # can't install still launches (ordinary chat unaffected); it simply
+    # never becomes wake-armable — for most harnesses because the provider
+    # session_start never arrives, and for a 'first_turn_gated' one because
+    # the claim below promotes it but the mandatory-hook gate still refuses
+    # (flag #303).
     hook_install = interface_hooks.install(
         plan.harness, Path(plan.cwd), run_dir=RUN_DIR,
         session_id=int(token["session_id"]), cli_version=plan.cli_version)
