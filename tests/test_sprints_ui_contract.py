@@ -355,6 +355,24 @@ out({
     assert "must not leak" not in result["unknown"]
 
 
+def test_roles_resolve_independently_to_their_own_shortnames():
+    result = run_js(
+        """
+const flow = sprintsBuildFlow(DATA.sprints[0]);
+const roles = byClass(flow, "sprint-role").map(
+  (role) => ({ text: role.textContent, className: role.className }));
+out(roles);
+""",
+        prelude="const DATA = " + json.dumps(payload(units=[
+            unit("U1", "pending", dev_id=None, dev=None)
+        ])) + ";\n",
+    )
+    assert result == [
+        {"text": "Dev: Unassigned", "className": "sprint-role warn"},
+        {"text": "Reviewer: REV2", "className": "sprint-role"},
+    ]
+
+
 def test_unrecognized_column_is_omitted_when_empty():
     result = run_js(
         """
