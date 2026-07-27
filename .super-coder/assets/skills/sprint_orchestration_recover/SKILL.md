@@ -107,6 +107,8 @@ Record assignment changes before boot:
 ./sc mem message sent
 ```
 
+Before sending, write the complete continuation body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
+
 Use `blocked` while the unit has no active path:
 
 ```sh

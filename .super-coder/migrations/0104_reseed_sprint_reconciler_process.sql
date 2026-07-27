@@ -610,6 +610,8 @@ Assign an independent reviewer to compare the governing spec with integrated
 ./sc run <reviewer> --harness <review-harness> -m <review-model> --effort high
 ```
 
+Before sending, write the complete task body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
+
 State the sections and units included. For decision-driven units without a spec,
 name the alternate evidence: unit report, exact-head review, and mutation check.
 
@@ -823,6 +825,8 @@ Record assignment changes before boot:
 ./sc mem message sent
 ```
 
+Before sending, write the complete continuation body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
+
 Use `blocked` while the unit has no active path:
 
 ```sh
@@ -978,7 +982,7 @@ detectors: an early failure masks every later one.
 - Low: non-blocking clarity, cleanup, or improvement.
 
 Under an ACTIVE sprint document the planner holds the FnB''s delegated approval
-for sprint-scoped verdicts. Sending your verdict to the planner SATISFIES the
+for your sprint-scoped sends to the planner. Sending them SATISFIES the
 outbound-handoff approval gate — whether that gate reaches you from the base
 `review` skill or from your own system prompt — rather than bypassing it. The
 gate reverts to the FnB when the sprint document freezes. Include location,
@@ -1001,6 +1005,8 @@ review head, with every blocking finding named.
 ## Run close-time conformance
 
 Use this procedure when the task says `Conformance`.
+
+The sprint-scoped send approval rule in **Classify and hand off** applies here.
 
 Read the governing spec and integrated code on `main` at the supplied SHA.
 Treat ratified deviations from the task as the complete intentional-deviation

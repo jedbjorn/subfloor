@@ -50,6 +50,8 @@ Assign an independent reviewer to compare the governing spec with integrated
 ./sc run <reviewer> --harness <review-harness> -m <review-model> --effort high
 ```
 
+Before sending, write the complete task body to `./sprint-result.md`; after sending, read the stored row with `message sent` and confirm its body.
+
 State the sections and units included. For decision-driven units without a spec,
 name the alternate evidence: unit report, exact-head review, and mutation check.
 
