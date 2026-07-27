@@ -1,11 +1,16 @@
----
-name: sprint_orchestration
-description: Run the steady-state planner loop for a multi-shell sprint. Declare the sprint and structured unit board, assign developers and reviewers, arm event-driven wake, dispatch scoped tasks, advance units from durable events, and route merge order. Load sprint_orchestration_recover only when an expected transition stalls or an alert opens. Load sprint_orchestration_close only when every unit is terminal and main is green.
-category: craft
-common: false
----
+-- 0106 — reseed sprint_orchestration with structured sprint feature linkage.
+-- Generated from assets/skills/sprint_orchestration/SKILL.md; the full-body
+-- UPSERT keeps existing installations aligned with the source asset.
 
-# sprint_orchestration
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_orchestration',
+  'Run the steady-state planner loop for a multi-shell sprint. Declare the sprint and structured unit board, assign developers and reviewers, arm event-driven wake, dispatch scoped tasks, advance units from durable events, and route merge order. Load sprint_orchestration_recover only when an expected transition stalls or an alert opens. Load sprint_orchestration_close only when every unit is terminal and main is green.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_orchestration
 
 Coordinate the sprint from durable records. Keep code context in worker shells
 and coordination context here.
@@ -62,7 +67,7 @@ routes, and no silently shared hard resource.
 Define units that one developer can own through merge. Add dependency edges
 only for real code dependencies.
 
-Predict each unit's file surface and compare intersections:
+Predict each unit''s file surface and compare intersections:
 
 - empty intersection: parallel;
 - shared files: sequence the units or record an explicit overlap protocol;
@@ -72,7 +77,7 @@ Assign one developer and one reviewer to every unit. Balance reviewer load
 against the dependency graph.
 
 Reserve the close-time conformance reviewer now, while reviewer independence is
-still available. Record that shell's conflict set: units authored, unit reviews
+still available. Record that shell''s conflict set: units authored, unit reviews
 performed, rulings supplied, and any other reason it would grade its own work.
 Pass only with a named reviewer whose recorded set is disjoint from conformance
 scope, or an explicit FnB disposition for every unavoidable conflict.
@@ -220,7 +225,7 @@ Boot only the actor that owns the next transition:
 
 Run `./sc run` from a durable interactive planner process. It executes the
 harness over its own process, so a timeout, bounded background task, or exiting
-wrapper becomes the worker's lifetime. If a wrapper already owns a live harness,
+wrapper becomes the worker''s lifetime. If a wrapper already owns a live harness,
 load `sprint_orchestration_recover` and unwrap it there.
 
 Dispatch passes when the harness PID is non-zombie at the assigned worktree and
@@ -253,7 +258,7 @@ message is only the push layer and is emitted only when `board_writer` resolves
 a recipient. Open alerts dedupe, resolve when evidence returns, and re-arm after
 resolution.
 
-Read `sc watch list` for the reconciler's own heartbeat. A stale `reconcile`
+Read `sc watch list` for the reconciler''s own heartbeat. A stale `reconcile`
 line means the watchdog may be wedged; no alerts from a stale watchdog do not
 prove a quiet sprint.
 
@@ -285,13 +290,13 @@ Register each PR with the planner at PR open:
 Monitor before interrupting a worker. Send a new task when behavior must change,
 not to request generic progress.
 
-Never use a draft PR as a planner hold. A state the worker's own procedure
+Never use a draft PR as a planner hold. A state the worker''s own procedure
 teaches it to clear cannot carry a stop; record the hold in board state plus a
 scoped task. No reliable interrupt exists today, and flag #321 owns that gap.
 A stop signal indistinguishable from an obstacle is an instruction to proceed;
 this rule does not close flag #321.
 
-When a review ruling changes a unit's file surface, update the overlap record
+When a review ruling changes a unit''s file surface, update the overlap record
 and re-send the surface notice to every affected concurrent planner before the
 next durable action. The ruling that widens the surface triggers the notice.
 
@@ -321,4 +326,12 @@ This procedure is complete when either:
 - the next expected unit transition is dispatched and the binding is healthy;
 - a diagnosed stall triggers `sprint_orchestration_recover`; or
 - every unit is terminal with green `main`, triggering
-  `sprint_orchestration_close`.
+  `sprint_orchestration_close`.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

@@ -129,6 +129,19 @@ class SchemaTest(unittest.TestCase):
         body = self.con.execute(
             "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
         self.assertEqual(body, asset)
+        declaration = body.split("## 3. Declare the sprint", 1)[1].split(
+            "## 4. Arm event-driven wake", 1)[0]
+        self.assertEqual([
+            line.strip() for line in declaration.splitlines()
+            if "./sc mem doc add" in line
+        ], [
+            './sc mem doc add "SPRINT: <title>" --kind doc '
+            '--feature <feature-id> \\'
+        ])
+        self.assertIn(
+            "./sc mem get documents --doc <doc-id>",
+            declaration,
+        )
 
     def test_sprint_watch_scope_reseed_matches_asset_and_is_idempotent(self):
         con = sqlite3.connect(":memory:")
