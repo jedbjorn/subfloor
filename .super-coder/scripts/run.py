@@ -1771,4 +1771,6 @@ def set_terminal_tab_title(name: str) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from cli_entry import run_cli
+
+    run_cli(main)

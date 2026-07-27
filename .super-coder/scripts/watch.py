@@ -56,7 +56,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import sys
 import time
 import urllib.error
@@ -330,11 +329,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: "list[str]") -> int:
-    if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # Early-closed stdout is handled at the entrypoint (cli_entry.run_cli, #384).
     args = build_parser().parse_args(argv)
     return args.fn(args)
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    sys.exit(run_cli(main, sys.argv[1:]))
