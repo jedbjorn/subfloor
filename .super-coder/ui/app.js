@@ -2187,12 +2187,11 @@ const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kim
 // stops at "how much is left" — the FnB's ruling that retired account identity
 // rests on the provider's own page being one click away, so the link is part of
 // the design and not a convenience. Each URL is taken from the harness CLI's own
-// binary rather than guessed; Kimi's ships no usage page, so its product page is
-// the closest honest destination.
+// binary rather than guessed; Kimi links to its Code usage console.
 const AN_PROVIDER_USAGE_URL = {
   anthropic: "https://claude.ai/settings/usage",
   openai: "https://chatgpt.com/codex/settings/usage",
-  moonshot: "https://www.kimi.com/code",
+  moonshot: "https://www.kimi.com/code/console",
 };
 // Display order for a card's windows. Unrecognized kinds sort last rather than
 // being dropped — the probe stores a window it could not map under its raw
