@@ -814,7 +814,7 @@ out({ flowReused: byClass(root, "sprint-flow")[0] === flow });
                 self.assertFalse(result["flowReused"])
 
 
-def test_freezing_one_of_two_boards_removes_only_that_board():
+def test_freezing_boards_updates_two_to_one_and_one_to_zero():
     initial = payload()
     initial["sprints"].append({
         "document_id": 78,
@@ -828,9 +828,10 @@ def test_freezing_one_of_two_boards_removes_only_that_board():
     updated = json.loads(json.dumps(initial))
     updated["active_count"] = 1
     updated["sprints"] = updated["sprints"][:1]
+    empty = payload(count=0)
     result = run_js(
         """
-apiQueue = [INITIAL, UPDATED];
+apiQueue = [INITIAL, UPDATED, EMPTY];
 await sprintsRefresh({ render: false });
 const root = makeRoot();
 await renderSprints(root);
@@ -838,32 +839,53 @@ const survivor = byClass(root, "sprint-unit")[0];
 survivor.onclick({ stopPropagation: () => {} });
 await sprintsRefresh();
 const boards = byClass(root, "sprint-board");
-out({
+const afterOne = {
   nav: navButton.textContent,
   warn: navButton.classList.contains("warn"),
   boardCount: boards.length,
-  boardText: boards.map((board) => board.textContent),
+  survivorPresent: boards.some(
+    (board) => board.textContent.includes("SPRINT: Active sprint flow board")),
+  frozenPresent: boards.some(
+    (board) => board.textContent.includes("SPRINT: Frozen after this payload")),
   selected: byClass(root, "sprint-unit")
     .filter((card) => card.classList.contains("selected"))
     .map((card) => card.dataset.seq),
+};
+await sprintsRefresh();
+out({
+  afterOne,
+  afterZero: {
+    nav: navButton.textContent,
+    warn: navButton.classList.contains("warn"),
+    title: navButton.title,
+    boardCount: byClass(root, "sprint-board").length,
+    text: root.textContent,
+  },
 });
 """,
         prelude=(
             "const INITIAL = " + json.dumps(initial) + ";\n"
             "const UPDATED = " + json.dumps(updated) + ";\n"
+            "const EMPTY = " + json.dumps(empty) + ";\n"
         ),
     )
-    assert {
-        key: result[key]
-        for key in ("nav", "warn", "boardCount", "selected")
-    } == {
-        "nav": "Sprints 1",
-        "warn": True,
-        "boardCount": 1,
-        "selected": ["U3"],
+    assert result == {
+        "afterOne": {
+            "nav": "Sprints 1",
+            "warn": True,
+            "boardCount": 1,
+            "survivorPresent": True,
+            "frozenPresent": False,
+            "selected": ["U3"],
+        },
+        "afterZero": {
+            "nav": "Sprints",
+            "warn": False,
+            "title": "",
+            "boardCount": 0,
+            "text": "No active sprints.",
+        },
     }
-    assert "SPRINT: Active sprint flow board" in result["boardText"][0]
-    assert "SPRINT: Frozen after this payload" not in result["boardText"][0]
 
 
 def test_changed_refresh_replaces_dom_preserves_selection_and_cleans_listener():
