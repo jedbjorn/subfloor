@@ -194,6 +194,26 @@ class SprintOpsRoutesTest(unittest.TestCase):
         con.close()
         return batch
 
+    # -- arming ------------------------------------------------------------------
+
+    def test_arm_refuses_a_bool_id_rather_than_arming_against_document_1(self):
+        """`isinstance(True, int)` is True, so a plain int check let a JSON
+        `true` through to `is_live_sprint`, where SQLite binds it as 1 — the
+        route would have armed a binding against document 1's board (which is
+        live here, so nothing downstream would have refused it). Both ids go
+        through `_is_int` for that reason.
+        """
+        for field in ("sprint_doc_id", "planner_shell_id"):
+            with self.subTest(field=field):
+                body = {"sprint_doc_id": 1, "planner_shell_id": 1, field: True}
+                status, resp = self.call(
+                    "POST", "/api/interface/sprint-bindings",
+                    (OP, f"Idempotency-Key: k-bool-{field}"), body)
+                self.assertEqual(status, 422, resp)
+                self.assertEqual("validation", resp["error"]["code"])
+        self.assertIsNone(self.q("SELECT binding_id FROM "
+                                 "sprint_planner_bindings LIMIT 1"))
+
     # -- wake status -------------------------------------------------------------
 
     def test_status_armed_projection(self):

@@ -1671,7 +1671,7 @@ def _arm_binding(actor, headers, body):
     """
     doc_id = body.get("sprint_doc_id")
     planner = body.get("planner_shell_id")
-    if not isinstance(doc_id, int) or not isinstance(planner, int):
+    if not _is_int(doc_id) or not _is_int(planner):
         return _err(422, "validation",
                     "sprint_doc_id, planner_shell_id (int) required")
     if actor.kind == "shell" and actor.shell_id != planner:

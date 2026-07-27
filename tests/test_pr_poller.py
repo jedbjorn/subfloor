@@ -142,6 +142,25 @@ class SprintScopingTest(unittest.TestCase):
         self.con.commit()
         self.assertTrue(sprint_state.is_live_sprint(self.con, 100))
 
+    def test_a_bool_doc_id_never_addresses_document_1s_board(self):
+        """`True` is an `int` in Python and SQLite binds it as 1, so every
+        predicate here would answer for document 1 if the guard were dropped —
+        a caller that fumbles a JSON `true` into a doc id would read some other
+        sprint's liveness as its own. Document 1 is seeded live on purpose:
+        that is the known positive the guard has to refuse anyway, so a False
+        below cannot come from an empty table.
+        """
+        seed_sprint_doc(self.con, 1)
+        probes = (sprint_state.is_sprint_doc,
+                  sprint_state.is_writable_sprint_board,
+                  sprint_state.is_live_sprint,
+                  sprint_state.has_units)
+        for probe in probes:
+            with self.subTest(probe=probe.__name__):
+                self.assertIs(probe(self.con, 1), True)    # known positive
+                self.assertIs(probe(self.con, True), False)
+                self.assertIs(probe(self.con, False), False)
+
     def test_armed_watches_excludes_unscoped_and_inactive(self):
         seed_shells(self.con)
         seed_sprint_doc(self.con, 100)
