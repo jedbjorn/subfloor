@@ -205,7 +205,7 @@ Fork ships no database of its own -> skip.
 
 After a curation pass your writes are already live in the shared map db —
 done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc
+persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 sc
 snapshot`. Don't chase it. (Sections are snapshotted; descriptions ride the
 live DB + survive remap — refill from the worklist if a rebuild drops them.)
 

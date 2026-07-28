@@ -1,6 +1,6 @@
 ---
 name: rev_sprint
-description: Execute one ephemeral Conductor reviewer slot. Review an assigned unit at an exact head and emit `findings` or `review-clean`, or run the folded-in close-time conformance pass when launched without `--unit`. Load only from `./sc run <reviewer> --slot rev --sprint <id> [--unit U]`.
+description: Execute one ephemeral Conductor reviewer slot. Review an assigned unit at an exact head and emit `findings` or `review-clean`, or run the folded-in close-time conformance pass when launched without `--unit`. Load only from `sc run <reviewer> --slot rev --sprint <id> [--unit U]`.
 category: craft
 common: false
 ---
@@ -16,9 +16,9 @@ board, boot another shell, poll, or wait.
 Read the slot context, relayed prompt, board, and governing document:
 
 ```sh
-./sc sprint board --sprint <doc-id>
-./sc directives list --status pending --sprint <doc-id>
-./sc mem get documents --doc <doc-id>
+sc sprint board --sprint <doc-id>
+sc directives list --status pending --sprint <doc-id>
+sc mem get documents --doc <doc-id>
 ```
 
 - Focused numeric unit in the slot -> unit review.
@@ -37,7 +37,7 @@ For a missing/superseded head, unclear scope, missing ratified deviations, or
 overlap requiring a rebase, emit:
 
 ```sh
-./sc directives emit ask-planner \
+sc directives emit ask-planner \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -58,7 +58,7 @@ relevant test fails, restore it, and prove the test passes.
 Emit blocking and nonblocking findings together:
 
 ```sh
-./sc directives emit findings \
+sc directives emit findings \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -68,7 +68,7 @@ Emit blocking and nonblocking findings together:
 When no finding remains, emit:
 
 ```sh
-./sc directives emit review-clean \
+sc directives emit review-clean \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -100,7 +100,7 @@ silent deviation or unimplemented requirement.
 Emit gaps:
 
 ```sh
-./sc directives emit findings \
+sc directives emit findings \
   --target conductor \
   --sprint <doc-id> \
   --payload '{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"<id>","verdict":"unimplemented","severity":"Major","evidence":"path:line"}]}'
@@ -109,7 +109,7 @@ Emit gaps:
 Emit clean conformance:
 
 ```sh
-./sc directives emit review-clean \
+sc directives emit review-clean \
   --target conductor \
   --sprint <doc-id> \
   --payload '{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"<id>","verdict":"as-specced"}],"findings":[]}'
@@ -120,7 +120,7 @@ the integrated SHA.
 
 ## Exit gate
 
-Read the emitted ID with `./sc directives inspect <id>`.
+Read the emitted ID with `sc directives inspect <id>`.
 
 **Reviewer completion:** one valid reviewer directive addressed to `conductor`
 contains the exact target, evidence, and verdict; the worktree contains no

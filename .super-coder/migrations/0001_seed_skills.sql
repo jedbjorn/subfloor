@@ -68,7 +68,7 @@ procedure solo; at most spawn one adversarial skeptic against your own diff
    reaching for isolation — it has real costs. Reviewer/checker agents are
    read-only; no isolation needed.
 4. **Agent claims are inputs, not results.** Re-run the real check yourself
-   — `./sc test`, lint, the spec''s done-condition — before marking anything
+   — `sc test`, lint, the spec''s done-condition — before marking anything
    done. "Agent says tests pass" is not verification. Diffs: pull them
    yourself (`git -C <worktree> diff`); NEVER adjudicate pasted diffs or
    pasted test output — pastes are lossy and unverifiable.
@@ -764,7 +764,7 @@ Fork ships no database of its own -> skip.
 
 After a curation pass your writes are already live in the shared map db —
 done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 ./sc
+persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 sc
 snapshot`. Don''t chase it. (Sections are snapshotted; descriptions ride the
 live DB + survive remap — refill from the worklist if a rebuild drops them.)
 
@@ -1186,7 +1186,7 @@ are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
 | `feature_blockers` | roadmap dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite lands first). Directed, kept acyclic (GUI Flow view wires them; the card''s "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `sc mem roadmap depends` |
 | `documents` | content store — spec/doc bodies; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; NEVER edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
-| `skills` / `flavor_skills` / `shell_skills` | skill catalogue + shared packs for standard flavors + per-shell packs for Bespoke shells; `resolved_shell_skills` is the effective read view | managed by engine; name any standard shell to change its flavor pack, or a Bespoke shell to change only itself, via `./sc skill grant/revoke` |
+| `skills` / `flavor_skills` / `shell_skills` | skill catalogue + shared packs for standard flavors + per-shell packs for Bespoke shells; `resolved_shell_skills` is the effective read view | managed by engine; name any standard shell to change its flavor pack, or a Bespoke shell to change only itself, via `sc skill grant/revoke` |
 | `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a work-stream that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
 `<self>` = your `shell_id` (in the boot doc''s ACTIVE SESSION block).
@@ -1252,7 +1252,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'dev_sprint',
-  'Execute one ephemeral Conductor developer slot. Build the launcher-assigned sprint unit, resolve ambiguity through `ask-planner`, send `ready-for-review`, merge only at an approved green head, and emit the structured unit report. Load only from `./sc run <dev> --slot dev --sprint <id> [--unit U]`.',
+  'Execute one ephemeral Conductor developer slot. Build the launcher-assigned sprint unit, resolve ambiguity through `ask-planner`, send `ready-for-review`, merge only at an approved green head, and emit the structured unit report. Load only from `sc run <dev> --slot dev --sprint <id> [--unit U]`.',
   'craft',
   NULL,
   0,
@@ -1267,9 +1267,9 @@ required `unit-report`.
 Read the slot context, relayed prompt, sprint board, and governing document:
 
 ```sh
-./sc sprint board --sprint <doc-id>
-./sc directives list --status pending --sprint <doc-id>
-./sc mem get documents --doc <doc-id>
+sc sprint board --sprint <doc-id>
+sc directives list --status pending --sprint <doc-id>
+sc mem get documents --doc <doc-id>
 ```
 
 Use the boot section''s numeric unit ID for `--unit`; `U1` is display sequence.
@@ -1286,7 +1286,7 @@ a credential/human action is required, or the work crosses the recorded scope.
 Emit:
 
 ```sh
-./sc directives emit ask-planner \
+sc directives emit ask-planner \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -1302,7 +1302,7 @@ and the returned directive ID inspects as pending.
 
 Sync the recorded base, create or resume the recorded unit branch, and implement
 the smallest complete change. Preserve unrelated work. Run focused checks, then
-the unit''s full gate. Use `./sc job` for work that must outlive the harness
+the unit''s full gate. Use `sc job` for work that must outlive the harness
 turn.
 
 Do not write the sprint board or schedule polling. The Conductor applies
@@ -1311,7 +1311,7 @@ mechanical transitions from directives; the sentinel observes liveness.
 When implementation and required checks are green, push/open the PR and emit:
 
 ```sh
-./sc directives emit ready-for-review \
+sc directives emit ready-for-review \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -1342,7 +1342,7 @@ Merge only when all conditions hold:
 After the merge, emit the transition:
 
 ```sh
-./sc directives emit merged \
+sc directives emit merged \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -1352,14 +1352,14 @@ After the merge, emit the transition:
 Then emit the report:
 
 ```sh
-./sc directives emit unit-report \
+sc directives emit unit-report \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
   --payload ''{"shipped":"<observable behavior>","judgements":[],"issues":[],"deviations":[],"follow_ups":[]}''
 ```
 
-Read both IDs back with `./sc directives inspect <id>`, then clean the local
+Read both IDs back with `sc directives inspect <id>`, then clean the local
 branch according to `git`.
 
 **Developer completion:** the approved green head is merged, `merged` and
@@ -2407,13 +2407,13 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'issue_reporting',
-  'Report engine defects upstream — the moment a ./sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
+  'Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
   'substrate',
   NULL,
   1,
   '# issue_reporting — the backwards flow
 
-An engine defect fixed upstream reaches every fork via `./sc update`; worked
+An engine defect fixed upstream reaches every fork via `sc update`; worked
 around silently, every fork re-derives the workaround. File the issue while
 the failure is on screen — NEVER batch to session end.
 
@@ -2424,7 +2424,7 @@ or hand-patching state to proceed -> you hold the exact repro; file it now.
 
 | Where | What |
 |---|---|
-| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `./sc update` + migrations, the `_sc` API + `sc mem` |
+| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `sc update` + migrations, the `_sc` API + `sc mem` |
 | **Fork — don''t** | the repo''s app code, fork-local skills (see `local_skill_management`), operator-owned host config |
 
 Unsure -> "would the same problem hit any other fork?" yes = upstream.
@@ -2436,28 +2436,28 @@ Match the left column -> file.
 
 | You hit | Real case |
 |---|---|
-| A `./sc` command fails out of the box | `./sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
-| A command exits green without doing the work | `./sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
-| The documented remedy is a closed loop | `./sc lint` said "run `./sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
+| A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
+| A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
+| The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
 | A skill instructs tools/paths your seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400''d standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404''d advancing its status (#224) |
 | Every write suddenly 401s | rebuild didn''t re-mint api_keys — all live shells locked out until an API bounce (#214) |
-| `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
-| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `./sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
+| `sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
+| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
 | The sandbox can reach something it shouldn''t | `do_push` src/dest weren''t contained — sandbox→host escape (#228) |
 
 Stale guidance (skill says X, engine does Y) files the same as a crash.
 
 ## Capture — while the failure is on screen
 
-- **engine ref** = `cat .sc-state/engine.ref` — first line of every report
+- **engine ref** = `sc engine-ref` — first line of every report
 - **staleness** = compare that ref to upstream head:
   `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
   `current` or `behind head <sha7>`. Behind + the symptom is a missing
   command or a skill/engine mismatch -> the fix may already be shipped:
-  ask your FnB for `./sc update` first, and file only if the defect
+  ask your FnB for `sc update` first, and file only if the defect
   survives the update (or updating isn''t an option — then the staleness
   note carries that caveat). Triage reads this line to tell a live
   engine defect from a stale fork build.
@@ -3015,7 +3015,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'plan_sprint',
-  'Decide and direct one ephemeral Conductor planner slot. Decompose a declared sprint, assign models and units, rule on questions or sentinel evidence, re-scope or re-task work, launch close-time conformance, and close only after the integrated result passes. Load only from `./sc run <planner> --slot plan --sprint <id>`.',
+  'Decide and direct one ephemeral Conductor planner slot. Decompose a declared sprint, assign models and units, rule on questions or sentinel evidence, re-scope or re-task work, launch close-time conformance, and close only after the integrated result passes. Load only from `sc run <planner> --slot plan --sprint <id>`.',
   'craft',
   NULL,
   0,
@@ -3031,9 +3031,9 @@ Read the mandatory slot section and the relayed prompt. Confirm the sprint,
 unit IDs, dependencies, assignments, and current states:
 
 ```sh
-./sc sprint board --sprint <doc-id>
-./sc directives list --status pending --sprint <doc-id>
-./sc mem get documents --doc <doc-id>
+sc sprint board --sprint <doc-id>
+sc directives list --status pending --sprint <doc-id>
+sc mem get documents --doc <doc-id>
 ```
 
 Treat the boot section''s numeric unit ID as the `--unit` value. Treat `U1` as
@@ -3067,7 +3067,7 @@ units whose dependencies are satisfied.
 Emit each released assignment to the Conductor:
 
 ```sh
-./sc directives emit kickoff \
+sc directives emit kickoff \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3085,7 +3085,7 @@ guess.
 Answer a worker:
 
 ```sh
-./sc directives emit answer \
+sc directives emit answer \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3095,7 +3095,7 @@ Answer a worker:
 Hold unsafe progress:
 
 ```sh
-./sc directives emit hold \
+sc directives emit hold \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3105,13 +3105,13 @@ Hold unsafe progress:
 Re-task the same outcome or re-scope the outcome itself:
 
 ```sh
-./sc directives emit re-task \
+sc directives emit re-task \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
   --payload ''{"to":"DEV1","instruction":"<replacement execution path>","reason":"<evidence>"}''
 
-./sc directives emit re-scope \
+sc directives emit re-scope \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3128,7 +3128,7 @@ integrated SHA, full requirement scope, and complete ratified-deviation list.
 Conformance uses `rev_sprint` without a unit focus.
 
 ```sh
-./sc directives emit kickoff \
+sc directives emit kickoff \
   --target conductor \
   --sprint <doc-id> \
   --payload ''{"to":"REV1","mode":"conformance","main_sha":"<sha>","scope":"all requirements","ratified_deviations":[],"model":"<approved route>"}''
@@ -3137,7 +3137,7 @@ Conformance uses `rev_sprint` without a unit focus.
 After a clean conformance directive, emit:
 
 ```sh
-./sc directives emit close \
+sc directives emit close \
   --target conductor \
   --sprint <doc-id> \
   --payload ''{"main_sha":"<sha>","conformance_directive_id":84,"summary":"<shipped outcome>"}''
@@ -3148,7 +3148,7 @@ required checks, or missing conformance.
 
 ## Exit gate
 
-Read back the emitted directive ID with `./sc directives inspect <id>`.
+Read back the emitted directive ID with `sc directives inspect <id>`.
 
 **Planner completion:** every requested decision is represented by a valid
 planner directive addressed to `conductor`; no shell was booted, no board row
@@ -3423,7 +3423,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'rev_sprint',
-  'Execute one ephemeral Conductor reviewer slot. Review an assigned unit at an exact head and emit `findings` or `review-clean`, or run the folded-in close-time conformance pass when launched without `--unit`. Load only from `./sc run <reviewer> --slot rev --sprint <id> [--unit U]`.',
+  'Execute one ephemeral Conductor reviewer slot. Review an assigned unit at an exact head and emit `findings` or `review-clean`, or run the folded-in close-time conformance pass when launched without `--unit`. Load only from `sc run <reviewer> --slot rev --sprint <id> [--unit U]`.',
   'craft',
   NULL,
   0,
@@ -3438,9 +3438,9 @@ board, boot another shell, poll, or wait.
 Read the slot context, relayed prompt, board, and governing document:
 
 ```sh
-./sc sprint board --sprint <doc-id>
-./sc directives list --status pending --sprint <doc-id>
-./sc mem get documents --doc <doc-id>
+sc sprint board --sprint <doc-id>
+sc directives list --status pending --sprint <doc-id>
+sc mem get documents --doc <doc-id>
 ```
 
 - Focused numeric unit in the slot -> unit review.
@@ -3459,7 +3459,7 @@ For a missing/superseded head, unclear scope, missing ratified deviations, or
 overlap requiring a rebase, emit:
 
 ```sh
-./sc directives emit ask-planner \
+sc directives emit ask-planner \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3480,7 +3480,7 @@ relevant test fails, restore it, and prove the test passes.
 Emit blocking and nonblocking findings together:
 
 ```sh
-./sc directives emit findings \
+sc directives emit findings \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3490,7 +3490,7 @@ Emit blocking and nonblocking findings together:
 When no finding remains, emit:
 
 ```sh
-./sc directives emit review-clean \
+sc directives emit review-clean \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -3522,7 +3522,7 @@ silent deviation or unimplemented requirement.
 Emit gaps:
 
 ```sh
-./sc directives emit findings \
+sc directives emit findings \
   --target conductor \
   --sprint <doc-id> \
   --payload ''{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"<id>","verdict":"unimplemented","severity":"Major","evidence":"path:line"}]}''
@@ -3531,7 +3531,7 @@ Emit gaps:
 Emit clean conformance:
 
 ```sh
-./sc directives emit review-clean \
+sc directives emit review-clean \
   --target conductor \
   --sprint <doc-id> \
   --payload ''{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"<id>","verdict":"as-specced"}],"findings":[]}''
@@ -3542,7 +3542,7 @@ the integrated SHA.
 
 ## Exit gate
 
-Read the emitted ID with `./sc directives inspect <id>`.
+Read the emitted ID with `sc directives inspect <id>`.
 
 **Reviewer completion:** one valid reviewer directive addressed to `conductor`
 contains the exact target, evidence, and verdict; the worktree contains no

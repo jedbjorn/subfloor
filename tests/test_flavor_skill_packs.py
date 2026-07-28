@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
+ROOT_ONLY_MARKER = "<!-- sc-root-only:"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import shell_factory  # noqa: E402
@@ -65,6 +66,20 @@ def resolved_names(con: sqlite3.Connection, shell_id: int) -> set[str]:
     }
 
 
+def unexplained_relative_sc(body: str) -> list[tuple[int, str]]:
+    """Return worktree-relative launcher references without a root-only note."""
+    findings = []
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if "./sc" not in line:
+            continue
+        previous = lines[index - 1] if index else ""
+        if ROOT_ONLY_MARKER in line or ROOT_ONLY_MARKER in previous:
+            continue
+        findings.append((index + 1, line.strip()))
+    return findings
+
+
 class HardCutoverMigrationTest(unittest.TestCase):
     def test_seeded_packs_match_common_plus_shipped_template_opt_ins(self) -> None:
         con = build_db()
@@ -93,6 +108,40 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 inherited | set(template.get("skills", [])),
                 template["flavor"],
             )
+
+    def test_non_admin_skill_packs_use_the_canonical_sc_command(self) -> None:
+        con = build_db()
+        skills = {
+            row[0]: row[1]
+            for row in con.execute(
+                "SELECT DISTINCT s.name,s.content FROM flavor_skills fs "
+                "JOIN skills s ON s.skill_id=fs.skill_id "
+                "WHERE fs.flavor <> 'admin' AND s.is_deleted=0"
+            )
+        }
+        findings = {}
+        for name, body in sorted(skills.items()):
+            found = unexplained_relative_sc(body)
+            if found:
+                findings[name] = found
+        self.assertEqual(
+            findings,
+            {},
+            "non-admin shells boot in worktrees where ./sc may be absent; "
+            "use bare sc, or explain an intentional root-only instruction on "
+            "the preceding line with '<!-- sc-root-only: reason -->'",
+        )
+
+    def test_root_only_marker_applies_to_the_adjacent_instruction_only(self) -> None:
+        body = (
+            "<!-- sc-root-only: operator runs this from the main checkout -->\n"
+            "./sc update\n"
+            "./sc sprint board --sprint 1\n"
+        )
+        self.assertEqual(
+            unexplained_relative_sc(body),
+            [(3, "./sc sprint board --sprint 1")],
+        )
 
     def test_flavored_rows_are_discarded_bespoke_rows_survive(self) -> None:
         con = build_db(through_0105=False)
