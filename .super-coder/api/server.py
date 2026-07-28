@@ -3075,7 +3075,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
-            summary = pr_poller.poll_cycle(con, source="reconcile")
+            summary = pr_poller.poll_cycle(
+                con,
+                source="reconcile",
+                system_signals=pr_poller.sentinel.load_config().enabled,
+            )
             return self._send(200, summary)
         except Exception as e:
             return self._fail(e)
@@ -3743,12 +3747,10 @@ def main(argv):
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
-    # Watched-PR poller (spec #20 task #85, decision #19): this service is the
-    # fork's SOLE GitHub poller — the legacy host `sc watch daemon` (direct-DB
-    # writer) is retired by the same commit that enables this scheduler, which
-    # is the cutover gate: no second writer can be started by any supervised
-    # path. Bounded interval only while ACTIVE sprint watches exist, plus the
-    # startup pass inside the thread; self-disables when gh is absent.
+    # Sole scheduler: watched-PR polling (spec #20 task #85, decision #19) plus
+    # the config-gated Conductor sentinel. The retired host `sc watch daemon`
+    # cannot form a second DB writer. GitHub reads stay watch-gated; sentinel
+    # reads stay live-sprint-gated and never boot a shell before Step 8.
     pr_poller.Poller(DB_PATH).start()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
