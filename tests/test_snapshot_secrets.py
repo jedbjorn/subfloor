@@ -89,6 +89,21 @@ class SnapshotSecretsTest(unittest.TestCase):
             missing = cols - live
             self.assertFalse(missing, f"{table}: SENSITIVE_COLUMNS names not in schema: {missing}")
 
+    def test_retired_interface_and_wake_audit_is_not_snapshotted(self):
+        retired = {
+            "interface_generations",
+            "interface_sessions",
+            "interface_input_state",
+            "interface_idempotency_keys",
+            "interface_writer_leases",
+            "sprint_planner_bindings",
+            "planner_wake_batches",
+            "planner_wake_items",
+            "planner_action_receipts",
+        }
+        self.assertTrue(retired.isdisjoint(snapshot.PER_INSTANCE_TABLES))
+        self.assertTrue(retired.isdisjoint(snapshot.SNAPSHOT_ROW_FILTERS))
+
 
 if __name__ == "__main__":
     unittest.main()

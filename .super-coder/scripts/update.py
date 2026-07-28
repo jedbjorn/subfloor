@@ -45,7 +45,6 @@ materialize to a specific upstream version instead of the branch head.
 
 Usage:
     ./sc update [--no-fetch] [--branch <name>] [--ref <tag|sha>] [--force]
-                [--discard-live-state]
     python3 .super-coder/scripts/update.py [same flags]
 """
 from __future__ import annotations
@@ -72,17 +71,10 @@ import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
-# STEP2(conductor): the Interface stack is retired; the live-state refusal
-# guard's replacement rule (an ACTIVE sprint blocks update, read from
-# sprint_state) lands in Step 2. Until then the guard no-ops when the module
-# is absent.
-try:
-    import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
-except ImportError:
-    interface_reconcile = None
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
+import sprint_state  # noqa: E402
 
 EJECTED_MARKER = STATE_DIR / "ejected"
 
@@ -625,69 +617,31 @@ def fetch_and_materialize(branch: str, ref: str | None = None,
     materialize_fetched_engine(sha, force=force)
 
 
-def preflight_live_state(*, allow_discard: bool = False,
-                         discard_requested: bool = False) -> None:
-    """Guard from the current engine before any installed-floor mutation.
-
-    Normal callers fail closed.  ``update.main`` additionally offers an
-    interactive continue-or-roll-back choice, or accepts the explicit
-    ``--discard-live-state`` flag for a headless invocation.  The destructive
-    path is deliberately local-DB only so it still works while the API is down.
-    """
-    if interface_reconcile is None:  # STEP2(conductor): Interface retired
-        return
-    if not allow_discard:
-        reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
-        if not reasons:
-            return
-        details = "\n  - " + "\n  - ".join(reasons)
-        sys.exit(
-            "update: refusing — live Interface state exists; drain/reconcile "
-            "it first:" + details)
-
-    manifest = interface_reconcile.live_loss_manifest(DB_PATH)
-    if manifest.empty():
-        return
-    details = "\n  - " + "\n  - ".join(manifest.loss_lines())
-    print(
-        "WARNING: update detected durable live Interface state.\n"
-        "Continuing will permanently terminalize exactly this loss manifest:"
-        + details,
-        file=sys.stderr,
-    )
-    if not discard_requested:
-        if not sys.stdin.isatty():
-            sys.exit(
-                "update: refusing — no interactive consent is available. "
-                "Drain/reconcile after starting the API, or explicitly accept "
-                "the loss with `./sc update --discard-live-state`.")
-        answer = input(
-            "Choose 'continue' to discard it, or 'rollback' to leave the "
-            "installed floor unchanged [rollback]: "
-        ).strip().lower()
-        if answer != "continue":
-            sys.exit(
-                "update: rolled back — installed engine, pins, and database "
-                "state are unchanged.")
-    else:
-        print(
-            "  --discard-live-state: explicit consent received; discarding.",
-            file=sys.stderr,
-        )
-
+def active_sprint_ids(db_path: Path | None = None) -> set[int]:
+    """Read the centralized ACTIVE-sprint predicate from the live engine DB."""
+    db_path = db_path or DB_PATH
+    if not db_path.exists():
+        return set()
+    con = db_driver.connect(db_path)
     try:
-        counts = interface_reconcile.discard_live_state(DB_PATH, manifest)
-    except interface_reconcile.LiveStateChanged:
-        sys.exit(
-            "update: refusing — live Interface state changed while consent "
-            "was pending; no rows were mutated. Re-run update to review and "
-            "consent to the fresh exact loss manifest.")
-    changed = ", ".join(
-        f"{name.replace('_', ' ')}={value}"
-        for name, value in counts.items()
-        if value
-    ) or "no rows changed"
-    print(f"→ discarded durable Interface state ({changed})")
+        return sprint_state.live_sprint_doc_ids(con)
+    except db_driver.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return set()
+        raise
+    finally:
+        con.close()
+
+
+def preflight_live_state() -> None:
+    """Refuse before mutation while any structurally ACTIVE sprint exists."""
+    active = active_sprint_ids()
+    if not active:
+        return
+    ids = ", ".join(str(doc_id) for doc_id in sorted(active))
+    sys.exit(
+        "update: refusing — ACTIVE sprint(s) exist: "
+        f"{ids}. Close or freeze every sprint before updating.")
 
 
 def migrate_engine_untrack() -> None:
@@ -812,7 +766,6 @@ def expire_sandbox_harnesses() -> str | None:
 def main(argv: list[str]) -> int:
     no_fetch = "--no-fetch" in argv
     force = "--force" in argv
-    discard_live_state = "--discard-live-state" in argv
     branch = "main"
     if "--branch" in argv:
         i = argv.index("--branch")
@@ -842,8 +795,7 @@ def main(argv: list[str]) -> int:
     target_sha = None
     if not source and not no_fetch:
         target_sha = fetch_update_ref(branch, ref=ref)
-    preflight_live_state(
-        allow_discard=True, discard_requested=discard_live_state)
+    preflight_live_state()
 
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
