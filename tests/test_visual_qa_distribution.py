@@ -137,7 +137,7 @@ class VisualQaSeedTest(unittest.TestCase):
                 "WHERE sh.flavor IS NULL;"
             )
 
-        next_shell_id = iter(range(1, 7))
+        next_shell_id = iter(range(1, 11))
 
         def create_shell(con, *, flavor, **_kwargs):
             shell_id = next(next_shell_id)
@@ -165,7 +165,25 @@ class VisualQaSeedTest(unittest.TestCase):
         seed.assert_called_once_with()
         with sqlite3.connect(database) as con:
             self.assertEqual(con.execute("SELECT username FROM users").fetchall(), [("Jed",)])
-            self.assertEqual(con.execute("SELECT COUNT(*) FROM shells").fetchone()[0], 6)
+            flavors = con.execute(
+                "SELECT flavor FROM shells ORDER BY shell_id"
+            ).fetchall()
+            self.assertEqual(
+                flavors,
+                [
+                    ("planner",),
+                    ("admin",),
+                    ("planner",),
+                    ("dev",),
+                    ("dev",),
+                    ("dev",),
+                    ("dev",),
+                    ("reviewer",),
+                    ("reviewer",),
+                    ("cartographer",),
+                ],
+            )
+            self.assertNotIn(("devops",), flavors)
 
 
 class VisualQaUpdateTest(unittest.TestCase):

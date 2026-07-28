@@ -6,9 +6,9 @@ catalogue, the render chain) but **no per-instance content** — a fork inherits
 the system, never super-coder's memory or roadmap. So a just-installed fork has
 no users and no shells, and `./sc launch` has nothing to authenticate or boot.
 This provisions the local user, then seeds the starting team via the shared
-shell factory: your primary shell (default `planner`) plus an `admin`, two
-`dev`, a `reviewer`, and the singleton `cartographer` — the full roster out of
-the box.
+shell factory: two `planner`, four `dev`, two `reviewer` shells, an `admin`, and the
+singleton `cartographer` — a ten-shell roster out of the box. One planner is
+your primary by default.
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
 exists. After it runs: `SC_ADMIN=1 ./sc snapshot`, then `./sc launch`. More shells (or
@@ -39,8 +39,18 @@ import install as install_mod  # noqa: E402
 
 # The starting team seeded at install, besides the singleton cartographer (added
 # separately below). Your interviewed primary shell — default planner — fills one
-# of these slots; the rest are auto-named team members (ADM1, DEV1, DEV2, REV1).
-TEAM_ROSTER = ["admin", "planner", "dev", "dev", "reviewer"]
+# of these slots; the rest are auto-named team members.
+TEAM_ROSTER = [
+    "admin",
+    "planner",
+    "planner",
+    "dev",
+    "dev",
+    "dev",
+    "dev",
+    "reviewer",
+    "reviewer",
+]
 
 from shell_factory import create_shell, flavors  # noqa: E402
 
@@ -123,7 +133,7 @@ def main(argv: list[str]) -> int:
             partner=a.partner or username, repo=repo,
             role=a.role, mandate=a.mandate)
         # The rest of the starting team — the full roster minus the slot your
-        # primary already fills — auto-named by the factory (ADM1/DEV1/DEV2/REV1).
+        # primary already fills — auto-named by the factory.
         rest = list(TEAM_ROSTER)
         if flavor in rest:
             rest.remove(flavor)
