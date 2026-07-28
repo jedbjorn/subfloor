@@ -47,11 +47,14 @@ A reconciler finding requests a checkup. For a headless shell:
 2. Find the harness process whose `/proc/<pid>/cwd` is that worktree.
 3. Read `/proc/<pid>/stat` and reject state `Z`; a zombie directory and stat
    file are not liveness.
-4. Sample `/proc/<pid>/stat` twice over a bounded interval and compare
-   `utime + stime`.
+4. Sample `/proc/<pid>/stat` twice **5 seconds apart** and compare
+   `utime + stime`. Five seconds is the interval for every sample in this
+   procedure; take it inside the turn and never sleep longer to "be sure."
 5. Treat a positive CPU delta as active work.
 6. Treat process presence with no delta as indeterminate until the task,
-   artifacts, and another bounded sample establish progress or fault.
+   artifacts, and another 5-second sample establish progress or fault. A worker
+   blocked on a provider response burns no CPU, so one flat sample is not stop
+   evidence and no number of flat samples becomes one.
 7. Treat no matching non-zombie process, combined with no live job or producing
    external operation, as positive stop evidence.
 
@@ -74,10 +77,13 @@ its producer is inactive or unable to deliver it.
 |---|---|
 | Worker stopped with a clean worktree and no artifact | Re-send the exact scoped task and boot the assigned shell. |
 | Worker stopped with a branch, commit, PR, report, or dirty worktree | Preserve the owner and artifact. Send an idempotent continuation task naming the durable state, then boot that shell. |
-| Worker is active | Leave it running. Record the observed process and wait for its bounded completion event. |
+| Worker is active | Leave it running. Record the observed process, send the scoped recovery result, and END THE TURN. The worker's own completion event is the next wake; a headless planner that stays resident to watch for it holds its session occupied and blocks the delivery it is waiting for. |
+| Binding released while the sprint is still live | Re-arm it: `./sc sprint arm --sprint <doc-id>`, then `./sc sprint status`. Arming re-parents the released generation's queued wake items to the new binding and resolves the `binding_released_live_sprint` alert. Until it is armed the planner is deaf and nothing else will say so. |
+| Unit must be abandoned | The planner cancels it — no one else may. Close the unit's PR on GitHub first (a close-without-merge retires its watch on the next poll; an unopened PR has no watch), state the branch and PR disposition in the cancellation result, then `./sc sprint unit state --sprint <doc-id> --seq <unit> cancelled`. `cancelled` is TERMINAL: it has no exit edge and the board refuses to move it back. Redo the work as a NEW unit at a new seq; the cancelled row stands as the record of what was declared. Close exempts cancelled units from the review-head requirement, so a cancellation never has to be dressed up as a review. |
 | Session input parked with delivery unknown | Decide whether input landed, then run `./sc sprint retry --binding <id> --outcome delivered\|not_delivered`. |
 | Wake batch parked before delivery | Run `./sc sprint retry --binding <id>`; the coordinator creates a new gated batch. |
-| Item quarantined | Read and act on that message manually, then send a fresh scoped task for any remaining action. |
+| Item quarantined | Three completed wake turns left its message unread. Read and act on that message, mark it read, then clear the item: `./sc sprint retry --binding <id> --stuck quarantined --stuck-outcome requeue\|cancel`. Cancel when you have already acted; requeue only when the message still needs a wake turn. |
+| Item parked in `reconcile` | An action receipt is still `intent` or `unknown`, so the coordinator will not requeue a side effect that may already have happened. Establish what actually landed, settle the receipt with `./sc sprint action reconcile <receipt-id> --detail "<what you established>"`, then clear the item with `./sc sprint retry --binding <id> --stuck reconcile --stuck-outcome requeue\|cancel`. Never clear the item first — the receipt is the evidence. |
 | Reviewer unavailable | Reassign the board to an idle reviewer, send the exact-head request, and boot the new reviewer. |
 | Developer unavailable before work starts | Reassign the board and task the replacement. |
 | Developer unavailable after durable work exists | Hand the branch and exact head to a replacement; preserve authorship and report the handoff. |
@@ -123,15 +129,27 @@ durable.
 
 ## Engine-source recovery
 
-When the sprint changes the engine that is running it, load `engine_surgery`.
-Distinguish:
+When the sprint changes the engine that is running it, three trees answer
+differently and you must name which one a claim is about:
 
-- feature worktree source;
-- `origin/main`, which proves merged engine code;
-- the main checkout and live DB, which define the running floor.
+- a feature worktree, which proves only what one shell has written;
+- `origin/main`, which proves merged engine code — `git show origin/main:<path>`
+  is the only reading that settles "did this land";
+- the main checkout and its live DB, which define the running floor every
+  `./sc` command actually executes.
 
-Defer pull, reconcile, migration of the live DB, and restart to a declared sprint
-boundary. A feature worktree being current does not update the running floor.
+A worktree being current does not update the running floor, so a stall
+diagnosed against the wrong tree gets a confident wrong answer. Verify engine
+claims against `origin/main`, and treat any behavior the floor contradicts as
+evidence the floor is stale rather than as a defect in the merged code.
+
+Defer pull, reconcile, migration of the live DB, and restart to a declared
+sprint boundary — a restart kills live worker sessions, and the operator owns
+that call. Surface the need to the FnB; never perform it as a recovery step.
+
+Engine-source work itself belongs to the shell that owns the repo, under its
+own procedure. Do not load that procedure here: the planner pack does not carry
+it, and this section needs only the tree distinction above.
 
 ## Return to orchestration
 

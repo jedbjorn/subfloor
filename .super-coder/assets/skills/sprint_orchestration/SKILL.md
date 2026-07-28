@@ -147,17 +147,19 @@ sequencing plan without reading prose.
 A confirmation that is not about the thing it appears to confirm is not a
 confirmation. Verify the durable artifact that governs the next action.
 
-Arm the planner binding from the Interface Sprint wake panel or
-`POST /api/interface/sprint-bindings` with:
+Declare the board before you arm. A sprint doc with no `sprint_units` rows is
+not yet live, so a binding armed ahead of section 3 arms against a sprint the
+wake path does not recognize.
 
-```http
-Idempotency-Key: sprint-bind-<doc>-<planner>-<attempt>
+Arm the binding with the verb; it owns its own idempotency key, so a transport
+retry and a later re-arm both need nothing from you:
 
-{"sprint_doc_id": <doc-id>, "planner_shell_id": <planner-shell-id>}
+```sh
+./sc sprint arm --sprint <doc-id>
 ```
 
-Generate one caller-stable attempt value and reuse it for transport retries of
-that attempt. Generate a fresh value for a later re-arm.
+A shell arms only itself. `--planner <shell-id>` is the operator's argument;
+never pass it to arm a different shell.
 
 Verify:
 
@@ -172,12 +174,20 @@ boot.
 PR events and scoped task/result rows drive the loop. Avoid scheduled trackers
 and session-bound inbox waiters.
 
-When the sprint pauses, release its binding from the Interface Sprint wake panel
-or `DELETE /api/interface/sprint-bindings/<id>` with a caller-stable
-`Idempotency-Key` and `reason: pause`. Read `./sc sprint status --all` back and
-stop only when the binding reports released or disarmed. Plain status hides
-released bindings and cannot prove release. A paused sprint may remain ACTIVE
-and unfrozen; it must not remain armed.
+When the sprint pauses, disarm it:
+
+```sh
+./sc sprint disarm --sprint <doc-id> --reason pause
+./sc sprint status --all
+```
+
+Disarm cancels the binding's queued wake items and leaves their messages
+UNREAD — the rows survive, the wake turns do not. Drain the inbox before
+disarming, or accept that those items are delivered only by the next re-arm.
+Read `./sc sprint status --all` back and stop only when the binding reports
+released or disarmed; plain status hides released bindings and cannot prove
+release. A paused sprint may remain ACTIVE and unfrozen; it must not remain
+armed.
 
 ## 5. Dispatch ready work
 
@@ -240,10 +250,43 @@ naming the same unit record.
 On each wake:
 
 1. Drain inbox rows.
-2. Read `./sc sprint board --sprint <doc-id>`.
-3. Read `./sc sprint status` and `./sc sprint alerts`.
-4. Apply the smallest state transition supported by the event.
-5. Dispatch newly ready work.
+2. Mark each row read as you fold it in.
+3. Read `./sc sprint board --sprint <doc-id>`.
+4. Read `./sc sprint status` and `./sc sprint alerts`.
+5. Apply the smallest state transition supported by the event.
+6. Dispatch newly ready work.
+
+```sh
+./sc mem message check
+./sc mem message mark-read <message-id>
+```
+
+Step 2 is the loop's completion contract, not bookkeeping. Infrastructure never
+marks a message read; the wake coordinator reconciles each delivered item from
+`read_at` alone. A row you acted on but left unread is requeued for another
+wake turn, and the THIRD completed wake still finding it unread quarantines the
+item and opens an alert — so a fully handled message that was never marked
+costs three planner turns and then reports itself as a fault. Mark it read in
+the same turn you act on it; never mark a row you have not acted on.
+
+Record a receipt around any action that is destructive, externally visible, or
+long enough to outlive the turn — a merge, a freeze, a boot, a release:
+
+```sh
+./sc sprint action begin --message <id> --operation <verb> --target <thing>
+./sc sprint action complete <receipt-id> --detail "<what landed>"
+```
+
+Begin BEFORE the side effect, complete AFTER observing its result. `begin`
+returning `SUPPRESSED` means a completed receipt already covers this action —
+do not perform it again. When the result is genuinely unobserved, record
+`./sc sprint action unknown <receipt-id>` rather than guessing: an open
+`intent` or `unknown` receipt is what makes the coordinator park that item in
+`reconcile` with a `wake_item_reconcile` alert instead of blindly requeuing a
+side effect that may already have happened. Settle such a receipt with
+`./sc sprint action reconcile <receipt-id> --detail "<what you established>"`
+once you know what actually landed; the parked wake item itself is a separate
+exit, and `sprint_orchestration_recover` owns it.
 
 The reconciler runs independently of PR watches and returns a report-only
 reading for every live sprint expectation. Each reading carries `expectation`,
@@ -269,20 +312,32 @@ Use this routing table:
 | Event | Planner action |
 |---|---|
 | Developer starts | Confirm `working`. |
-| PR opens | Record branch and PR; confirm its sprint watch exists. |
+| Developer declares its branch | Record it: `./sc sprint unit set --sprint <doc-id> --seq <unit> --branch <name>`. |
+| PR opens | Record the PR; confirm the developer's sprint watch exists. |
+| Developer requests a ruling | Rule on mechanics, sequencing, or scope inside the boundary; escalate product meaning, contracts, or human-only inputs to the FnB. Move the unit to `blocked` only while it has no path; return the ruling as a scoped task naming the unit. |
 | Developer reports green review-ready head | Move unit to `in_review`; send the assigned reviewer an exact-head task and boot it. |
 | Reviewer reports Major/Medium | Send a scoped fix task to the developer; keep `in_review`. |
-| Reviewer reports clean + checks green | Send the developer a scoped merge instruction for the reviewed head. |
+| Reviewer reports clean + checks green | Record `--review-head <sha>`, then send the developer a scoped merge instruction for that head. |
 | PR merged + unit report | Move unit to `merged`; dispatch newly unblocked units. |
 | Declared blocker | Move unit to `blocked`; rule on mechanics or escalate judgment. |
-| Reconciler checkup or critical wake alert | Treat it as a request to verify, then load `sprint_orchestration_recover`. |
+| Reconciler checkup | Report-only. Verify against the board and the worker's own evidence; route to recovery only if that verification finds a real stall. |
+| Critical wake alert | Treat it as a request to verify, then load `sprint_orchestration_recover`. |
 | All units terminal and `main` green | Load `sprint_orchestration_close`. |
 
-Register each PR with the planner at PR open:
+The developer registers its own PR watch at PR open — they hold the PR context.
+Confirm the registration rather than repeating it:
 
 ```sh
-./sc watch pr <owner/repo> <number> --shell <planner> --sprint <doc-id>
+./sc watch list
 ```
+
+A missing or unscoped watch is the developer's to fix; re-register it yourself
+only when that shell is gone.
+
+The board's `branch` column is what makes a heads-down developer classify as
+`working` rather than as a stalled one, so record a declared branch on the wake
+turn that carries it — the developer cannot write the board and the column
+stays empty until you fill it.
 
 Monitor before interrupting a worker. Send a new task when behavior must change,
 not to request generic progress.

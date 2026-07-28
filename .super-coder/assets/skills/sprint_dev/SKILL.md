@@ -105,6 +105,13 @@ Branch from current `main` when the unit is independently buildable. Stack on an
 upstream branch only for a real code dependency and accept the later retarget
 and rebase duty.
 
+Declare the branch name to the planner in a scoped result immediately after you
+create it, before the first commit — not at PR-open. You cannot write the board
+yourself; the board rejects a worker's write by design, so the planner records
+the name. Until the board's `branch` column is filled, a developer who is
+heads-down building has no code evidence the reconciler can attribute to this
+unit, and a long build reads as a stalled one.
+
 Implement the smallest complete change. Verify in proportion to risk. Keep scope
 changes as planner rulings or follow-up flags.
 
@@ -136,13 +143,19 @@ When dependencies are on `main` and the planner has released the unit:
 
 ```sh
 ./sc watch pr <owner/repo> <pr-number> \
-  --shell <planner> --sprint <doc-id>
+  --shell <planner> --sprint <doc-id> --unit <seq>
 ./sc mem message send <planner> "$(<./sprint-result.md)" \
   --kind result --sprint <doc-id>
 ./sc mem message sent
 ```
 
-Update the board's branch and PR through the planner. An unregistered PR has no
+You are the sole registrant — you hold the PR context, and the planner only
+confirms the watch exists. Pass `--unit <seq>` exactly as the board writes it:
+it rides onto every emitted `pr_event`, so readers resolve which unit the event
+is about structurally instead of by matching prose. Omitting it does not fail
+the registration; it silently drops those events back onto the regex fallback.
+
+Update the board's PR number through the planner. An unregistered PR has no
 event path back to orchestration.
 
 If a PR is unexpectedly in draft, ask the planner before marking it ready. This
