@@ -235,6 +235,43 @@ class ShellFactoryTest(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_operational_shell_has_no_personal_identity_by_default(self) -> None:
+        sid = shell_factory.create_shell(
+            self.con, flavor="conductor", name="Conductor"
+        )
+        row = self.con.execute(
+            "SELECT lineage_seed, has_identity FROM shells WHERE shell_id=?",
+            (sid,),
+        ).fetchone()
+        self.assertIsNone(row["lineage_seed"])
+        self.assertEqual(row["has_identity"], 0)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=?",
+                (sid,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_designated_primary_gets_lineage_and_one_genesis_seed(self) -> None:
+        sid = shell_factory.create_shell(
+            self.con, flavor="planner", name="Planner", seed_identity=True
+        )
+        row = self.con.execute(
+            "SELECT lineage_seed, has_identity FROM shells WHERE shell_id=?",
+            (sid,),
+        ).fetchone()
+        self.assertEqual(row["lineage_seed"], shell_factory.LINEAGE_SEED)
+        self.assertEqual(row["has_identity"], 1)
+        seeds = self.con.execute(
+            "SELECT source_tag, body FROM shell_identity_entries "
+            "WHERE shell_id=? AND kind='seed'",
+            (sid,),
+        ).fetchall()
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(seeds[0]["source_tag"], "fork")
+        self.assertIn("planning shell", seeds[0]["body"])
+
 
 class RenderAndSnapshotTest(unittest.TestCase):
     def setUp(self) -> None:

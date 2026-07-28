@@ -112,8 +112,10 @@ def main(argv: list[str]) -> int:
 
         username = need(a.username, "Your username")
         # Your primary shell — default planner (every fork needs a planner to
-        # scope the work + carry the lineage seed). --flavor picks which roster
-        # slot is *yours*; the rest of the team seeds alongside it.
+        # scope the work). This is the one personal shell that carries lineage
+        # + genesis identity; every roster/operational shell is role-only.
+        # --flavor picks which roster slot is *yours*; the rest of the team
+        # seeds alongside it.
         flavor = a.flavor or "planner"
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
@@ -131,7 +133,7 @@ def main(argv: list[str]) -> int:
         shell_id = create_shell(
             con, flavor=flavor, name=name, shortname=shortname,
             partner=a.partner or username, repo=repo,
-            role=a.role, mandate=a.mandate)
+            role=a.role, mandate=a.mandate, seed_identity=True)
         # The rest of the starting team — the full roster minus the slot your
         # primary already fills — auto-named by the factory.
         rest = list(TEAM_ROSTER)

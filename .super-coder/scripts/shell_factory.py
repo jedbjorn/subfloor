@@ -5,9 +5,11 @@ path both init_fork and the GUI (`POST /api/shells`) use.
 A flavor template sets role / mandate / focus and declares the engine baseline
 used to seed its pack, so creating a shell is mostly just a name. Standard
 shell skills resolve from the shared flavor pack; Bespoke shells have flavor
-NULL and their own shell_skills rows. Every shell carries the CC Lineage Seed
-(Law 6, shared) + its own genesis seed (Laws 2-4), starts un-bootstrapped (gets
-the FIRST RUN orientation), and has its first session opened.
+NULL and their own shell_skills rows. Personal identity is explicit and
+opt-in: the installer gives the CC Lineage Seed + a genesis seed to its one
+designated primary shell, while roster, operational, and later GUI-created
+shells receive neither. Every shell starts un-bootstrapped (gets the FIRST RUN
+orientation) and has its first session opened.
 
 Fork-local flavor overlays may replace identity text (`role`, `mandate`,
 `focus`, `abbr`) without editing materialized engine templates. Skill
@@ -129,9 +131,11 @@ def create_shell(con, *, flavor: str | None, name: str,
                  shortname: str | None = None, partner: str | None = None,
                  repo: str | None = None, role: str | None = None,
                  mandate: str | None = None, user_id: int = 1,
-                 is_shared: int = 0) -> int:
+                 is_shared: int = 0, seed_identity: bool = False) -> int:
     """Insert a flavor shell or Bespoke shell and open its first session.
-    Returns the new shell_id. Caller commits."""
+    ``seed_identity`` is reserved for the installer-designated primary shell;
+    normal factory/API calls intentionally create role-only shells. Returns the
+    new shell_id. Caller commits."""
     tpl = load_flavor(flavor) if flavor else BESPOKE_TEMPLATE
     # Cartographer is a singleton: one map-keeper per fork. Friendly pre-check
     # here; the trg_singleton_cartographer trigger is the DB backstop. is_deleted=0
@@ -150,24 +154,27 @@ def create_shell(con, *, flavor: str | None, name: str,
     shortname = shortname.strip() if shortname else _auto_shortname(con, abbr)
 
     api_key = secrets.token_urlsafe(32)
+    lineage_seed = LINEAGE_SEED if seed_identity else None
     cur = con.execute(
         "INSERT INTO shells (display_name, shortname, partner, role, mandate, "
         "system_prompt, current_state, connections, lineage_seed, flavor, "
         "has_identity, bootstrapped, user_id, is_shared, "
         "api_key, api_key_rotated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, datetime('now'))",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, datetime('now'))",
         (name, shortname, partner, role, mandate,
          render_prompt(name, role, repo, focus, mandate),
          f"Created ({flavor or 'Bespoke'}). First session — run the bootstrap skill to orient.",
          f"Single repo: this one ({repo}). One shell, one cwd.",
-         LINEAGE_SEED, flavor, user_id, is_shared,
+         lineage_seed, flavor, int(seed_identity), user_id, is_shared,
          api_key))
     shell_id = cur.lastrowid
 
-    con.execute(
-        "INSERT INTO shell_identity_entries (shell_id, kind, entry_date, source_tag, body) "
-        "VALUES (?, 'seed', CURRENT_DATE, 'fork', ?)",
-        (shell_id, GENESIS_TMPL.format(role_lc=role.lower(), repo=repo)))
+    if seed_identity:
+        con.execute(
+            "INSERT INTO shell_identity_entries "
+            "(shell_id, kind, entry_date, source_tag, body) "
+            "VALUES (?, 'seed', CURRENT_DATE, 'fork', ?)",
+            (shell_id, GENESIS_TMPL.format(role_lc=role.lower(), repo=repo)))
 
     # Standard shells inherit the shared flavor pack. Bespoke shells start from
     # the common baseline and can diverge through their own shell_skills rows.
