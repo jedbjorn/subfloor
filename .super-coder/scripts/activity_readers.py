@@ -268,6 +268,8 @@ class ActivityReader:
                 self._mark(evidence, "result_row")
                 self._mark(evidence, "state_changed_at")
 
+        # STEP2(conductor): replace the retired Interface-session epoch and
+        # end-state reads with launch/archive truth.
         try:
             if unit is None:
                 row = con.execute(

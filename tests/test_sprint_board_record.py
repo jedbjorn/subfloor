@@ -314,6 +314,33 @@ class _BoardCase(unittest.TestCase):
 
 class BoardRecordTest(_BoardCase):
 
+    # -- localhost operator boundary -----------------------------------------
+
+    def test_cross_site_browser_cannot_mutate_as_the_operator(self):
+        """Host=localhost is not provenance: a hostile page can target a
+        loopback URL while the browser still supplies the destination Host.
+        Origin / Fetch Metadata keep that request outside operator authority."""
+        for browser_headers in (
+                ("Origin: https://hostile.example",
+                 "Sec-Fetch-Site: cross-site"),
+                ("Sec-Fetch-Site: cross-site",)):
+            with self.subTest(browser_headers=browser_headers):
+                status, error = self.add(
+                    who=browser_headers,
+                    seq=f"U{self._keys + 1}",
+                )
+                self.assertEqual(status, 403, error)
+                self.assertEqual(error["error"]["code"], "not_same_origin")
+        self.assertEqual(
+            self.sql_one("SELECT COUNT(*) FROM sprint_units"), 0)
+
+    def test_same_origin_browser_keeps_operator_authority(self):
+        status, unit = self.add(
+            who=("Origin: http://127.0.0.1:8800",
+                 "Sec-Fetch-Site: same-origin"),
+        )
+        self.assertEqual(status, 201, unit)
+
     # -- the reviewer column: the whole point of the unit ---------------------
 
     def test_both_roles_are_records_and_resolve_to_shells(self):

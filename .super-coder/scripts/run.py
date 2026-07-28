@@ -16,12 +16,14 @@ Usage:
     python3 .super-coder/scripts/run.py [shortname] [--first]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
 
-Interface gate (spec #20): the INTERACTIVE path of main() is no longer a public
-entry — interactive chats start through the Interface API (`./sc enter`), which
-holds the reservation capability, so a direct interactive launch refuses before
-creating an archive (SC_RAW_BOOT=1 is the tooling escape hatch). Headless and
-RENDER_ONLY are unaffected. The token-carrying engine path (interface_exec)
-calls prepare_launch below, never main().
+STEP2(conductor): retire this Interface gate and reopen direct interactive
+boot. Interface gate (spec #20): the INTERACTIVE path of main() is no longer
+a public entry — interactive chats start through the Interface API
+(`./sc enter`), which holds the reservation capability, so a direct
+interactive launch refuses before creating an archive (SC_RAW_BOOT=1 is the
+tooling escape hatch). Headless and RENDER_ONLY are unaffected. The
+token-carrying engine path (interface_exec) calls prepare_launch below, never
+main().
 
 Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
 [--effort <level>]`):
@@ -1258,6 +1260,7 @@ def main() -> None:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
                  '[-m <model>] [--effort <level>]')
 
+    # STEP2(conductor): remove this gate when `sc enter` targets direct boot.
     # Interface gate (spec #20 Tmux Runtime): a public INTERACTIVE launch holds
     # no reservation capability. Interactive chats start through the Interface
     # API (`./sc enter` / `sc interface start`), which reserves the generation
