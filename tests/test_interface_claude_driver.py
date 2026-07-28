@@ -200,6 +200,33 @@ class ClaudeFixtureContractTest(unittest.TestCase):
         )
         self.assertIsNone(good.error)
 
+    def test_retry_posture_operand_matrix(self):
+        cases = [
+            ("proved absent after exact anchor", True, True, False, True, True),
+            ("prompt present", True, True, True, True, False),
+            ("anchor missing", False, True, False, True, False),
+            ("anchor rewritten or ambiguous", True, False, False, True, False),
+            ("process and output did not fail", True, True, False, False, False),
+        ]
+        for (
+            label,
+            anchor_present,
+            anchor_unambiguous,
+            prompt_present,
+            turn_failed,
+            expected,
+        ) in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    claude_driver.retry_allowed(
+                        anchor_present=anchor_present,
+                        anchor_unambiguous=anchor_unambiguous,
+                        prompt_present=prompt_present,
+                        turn_failed=turn_failed,
+                    ),
+                    expected,
+                )
+
 
 class ClaudeDriverTest(unittest.TestCase):
     def setUp(self):

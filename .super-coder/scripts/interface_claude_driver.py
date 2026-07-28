@@ -365,6 +365,22 @@ def _contains_text(value: Any, needle: str) -> bool:
     return False
 
 
+def retry_allowed(
+    *,
+    anchor_present: bool,
+    anchor_unambiguous: bool,
+    prompt_present: bool,
+    turn_failed: bool,
+) -> bool:
+    """The four independently pinned operands of the no-replay rule."""
+    return (
+        turn_failed
+        and anchor_present
+        and anchor_unambiguous
+        and not prompt_present
+    )
+
+
 def _human_prompt_row(row: dict[str, Any]) -> bool:
     if row.get("type") != "user":
         return False
@@ -513,10 +529,13 @@ class ClaudeTranscriptResolver:
         prompt: str,
     ) -> tuple[dict[str, Any], bool]:
         resolution, rows = self.suffix(anchor)
-        if resolution["status"] == "gap":
-            return resolution, False
         prompt_present = any(_contains_text(row, prompt) for row in rows)
-        return resolution, not prompt_present
+        return resolution, retry_allowed(
+            anchor_present=anchor.get("status") == "ready",
+            anchor_unambiguous=resolution["status"] in {"exact", "relocated"},
+            prompt_present=prompt_present,
+            turn_failed=True,
+        )
 
     def backfill(
         self,
