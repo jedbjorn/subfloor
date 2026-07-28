@@ -799,18 +799,9 @@ def beat(con, interval: int, *, name: str = "watch") -> None:
 
 # ── The poll cycle ────────────────────────────────────────────────────────────
 
-def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
-    """Raise an alert, deduplicated while open (partial unique index). Local
-    helper — interface_broker._alert predates watch-scoped alerts.
-
-    The sprint and unit are read off the watch rather than left NULL (H-13):
-    0102 gave planner_alerts structured identity columns, and a watch is the
-    one alert source that KNOWS both. Leaving them NULL forced every reader
-    back to parsing `dedupe_key` or grepping prose for "U3" — the guess this
-    linkage exists to delete. `dedupe_key` is unchanged, so an already-open
-    alert stays the same open alert and no re-alert storm follows.
-    """
-    dedupe = f"-|-|{watch_id or '-'}|-|{reason}"
+def _sentinel_observation(con, *, severity: str, reason: str,
+                          watch_id=None) -> None:
+    """Record poller evidence in the Step 4 append-only observation log."""
     sprint_doc_id = unit_id = None
     if watch_id is not None:
         row = con.execute(
@@ -819,20 +810,26 @@ def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
         if row is not None:
             sprint_doc_id, unit_id = row["sprint_doc_id"], row["unit_id"]
     con.execute(
-        "INSERT OR IGNORE INTO planner_alerts "
-        "(watch_id, sprint_doc_id, unit_id, severity, reason, dedupe_key) "
-        "VALUES (?,?,?,?,?,?)",
-        (watch_id, sprint_doc_id, unit_id, severity, reason, dedupe))
+        "INSERT INTO sentinel_events "
+        "(event_kind, sprint_doc_id, unit_id, evidence) VALUES (?,?,?,?)",
+        (reason, sprint_doc_id, unit_id,
+         json.dumps({"severity": severity, "watch_id": watch_id},
+                    sort_keys=True)))
 
 
 def surface_unscoped_watches(con) -> int:
-    """Turn dormant legacy state into an operator-visible, deduped alert.
-    Returns the number of affected watches, whether newly alerted or already
-    carrying the same open alert."""
+    """Turn dormant legacy state into a deduped sentinel observation."""
     watch_ids = live_unscoped_watch_ids(con)
     for watch_id in watch_ids:
-        _alert(con, severity="critical", reason="pr_watch_unscoped",
-               watch_id=watch_id)
+        already = con.execute(
+            "SELECT 1 FROM sentinel_events "
+            "WHERE event_kind='pr_watch_unscoped' "
+            "AND json_extract(evidence,'$.watch_id')=? LIMIT 1",
+            (watch_id,)).fetchone()
+        if already is None:
+            _sentinel_observation(
+                con, severity="critical", reason="pr_watch_unscoped",
+                watch_id=watch_id)
     if watch_ids:
         con.commit()
     return len(watch_ids)
@@ -924,14 +921,16 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                 "UPDATE pr_poll_runs SET finished_at=datetime('now'), status=?, "
                 "error=? WHERE run_id=?",
                 ("rate_limited" if r.rate_limited else "error", r.error, run_id))
-            _alert(con, severity="warning", reason="pr_poll_failure",
-                   watch_id=repo_watches[0]["watch_id"])
+            _sentinel_observation(
+                con, severity="warning", reason="pr_poll_failure",
+                watch_id=repo_watches[0]["watch_id"])
             con.commit()
             summary["errors"] += 1
             if failures >= 3:
-                _alert(con, severity="critical",
-                       reason="pr_poll_backoff_escalated",
-                       watch_id=repo_watches[0]["watch_id"])
+                _sentinel_observation(
+                    con, severity="critical",
+                    reason="pr_poll_backoff_escalated",
+                    watch_id=repo_watches[0]["watch_id"])
                 con.commit()
             continue
 

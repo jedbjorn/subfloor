@@ -370,13 +370,8 @@ def snap(state="OPEN", sha="abc1234def", checks=None, reviews=0, review_state=No
             "reviews": reviews, "review_state": review_state}
 
 
-class WatchAlertIdentityTest(unittest.TestCase):
-    """H-13's other half: an alert about a watch says WHICH UNIT structurally.
-
-    0102 gave planner_alerts `sprint_doc_id`/`unit_id` and the watch path left
-    both NULL, so every reader was pushed back to parsing `dedupe_key` or
-    grepping prose. The watch is the one alert source that knows the answer.
-    """
+class WatchSentinelIdentityTest(unittest.TestCase):
+    """A poller observation about a watch says which sprint/unit structurally."""
 
     def setUp(self):
         self.con = build_db()
@@ -398,17 +393,19 @@ class WatchAlertIdentityTest(unittest.TestCase):
         self.con.commit()
         return wid
 
-    def _alert_row(self, wid):
+    def _event_row(self, wid):
         return self.con.execute(
-            "SELECT sprint_doc_id, unit_id, dedupe_key FROM planner_alerts "
-            "WHERE watch_id=?", (wid,)).fetchone()
+            "SELECT sprint_doc_id, unit_id, evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=? "
+            "ORDER BY event_id DESC LIMIT 1", (wid,)).fetchone()
 
-    def test_an_alert_on_a_linked_watch_names_the_unit(self):
+    def test_an_observation_on_a_linked_watch_names_the_unit(self):
         wid = self._watch(41, self.unit)
-        pr_poller._alert(self.con, severity="critical",
-                         reason="pr_poll_failure", watch_id=wid)
+        pr_poller._sentinel_observation(
+            self.con, severity="critical",
+            reason="pr_poll_failure", watch_id=wid)
         self.con.commit()
-        row = self._alert_row(wid)
+        row = self._event_row(wid)
         self.assertEqual(row["sprint_doc_id"], 100)
         self.assertEqual(row["unit_id"], self.unit)
 
@@ -416,27 +413,29 @@ class WatchAlertIdentityTest(unittest.TestCase):
         """Partial structure beats none: the sprint is known even when the
         unit is not, and claiming a unit here would be a guess."""
         wid = self._watch(42, None)
-        pr_poller._alert(self.con, severity="critical",
-                         reason="pr_poll_failure", watch_id=wid)
+        pr_poller._sentinel_observation(
+            self.con, severity="critical",
+            reason="pr_poll_failure", watch_id=wid)
         self.con.commit()
-        row = self._alert_row(wid)
+        row = self._event_row(wid)
         self.assertEqual(row["sprint_doc_id"], 100)
         self.assertIsNone(row["unit_id"])
 
-    def test_the_dedupe_identity_did_not_move(self):
-        """The structured columns are ADDITIVE. If dedupe_key changed shape,
-        every alert already open would re-raise as a new row the moment this
-        shipped — a fleet-wide alert storm on upgrade."""
+    def test_repeated_failures_remain_distinct_observations(self):
         wid = self._watch(43, self.unit)
         for _ in range(3):
-            pr_poller._alert(self.con, severity="critical",
-                             reason="pr_poll_failure", watch_id=wid)
+            pr_poller._sentinel_observation(
+                self.con, severity="critical",
+                reason="pr_poll_failure", watch_id=wid)
         self.con.commit()
         rows = self.con.execute(
-            "SELECT dedupe_key FROM planner_alerts WHERE watch_id=?",
+            "SELECT evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=?",
             (wid,)).fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["dedupe_key"], f"-|-|{wid}|-|pr_poll_failure")
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(
+            json.loads(row["evidence"])["severity"] == "critical"
+            for row in rows))
 
 
 class DiffEventsTest(unittest.TestCase):
@@ -936,16 +935,15 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn(113, armed, "a frozen sprint is never polled")
         self.assertNotIn(114, armed, "an undeclared board is never polled")
 
-    def test_scoped_registration_rebinds_legacy_and_resolves_alert(self):
+    def test_scoped_registration_rebinds_legacy_and_preserves_observation(self):
         con = sqlite3.connect(self.db)
         watch_id = con.execute(
             "INSERT INTO watched_prs (repo, pr_number, shell_id) "
             "VALUES ('own/repo', 21, 1)").lastrowid
         con.execute(
-            "INSERT INTO planner_alerts "
-            "(watch_id, severity, reason, dedupe_key) VALUES "
-            "(?, 'critical', 'pr_watch_unscoped', ?)",
-            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+            "INSERT INTO sentinel_events (event_kind, evidence) VALUES "
+            "('pr_watch_unscoped', ?)",
+            (json.dumps({"severity": "critical", "watch_id": watch_id}),))
         con.commit()
         con.close()
 
@@ -958,10 +956,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(rows[0]["watch_id"], watch_id)
         self.assertEqual(rows[0]["sprint_doc_id"], 100)
         self.assertIn('"checks": "PENDING"', rows[0]["last_seen"])
-        alert = self.q(
-            "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
+        event = self.q(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=?",
             watch_id)[0]
-        self.assertIsNotNone(alert["resolved_at"])
+        self.assertEqual(json.loads(event["evidence"])["severity"], "critical")
 
     def test_legacy_rebind_refuses_scope_unmade_during_baseline(self):
         con = sqlite3.connect(self.db)
@@ -971,10 +970,9 @@ class ApiTest(unittest.TestCase):
             "(repo, pr_number, shell_id, last_seen) "
             "VALUES ('own/repo', 23, 1, '{\"state\":\"OPEN\"}')").lastrowid
         con.execute(
-            "INSERT INTO planner_alerts "
-            "(watch_id, severity, reason, dedupe_key) VALUES "
-            "(?, 'critical', 'pr_watch_unscoped', ?)",
-            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+            "INSERT INTO sentinel_events (event_kind, evidence) VALUES "
+            "('pr_watch_unscoped', ?)",
+            (json.dumps({"severity": "critical", "watch_id": watch_id}),))
         con.commit()
         con.close()
         real = pr_poller.baseline_read
@@ -1006,10 +1004,11 @@ class ApiTest(unittest.TestCase):
             "WHERE watch_id=?", watch_id)[0]
         self.assertIsNone(row["sprint_doc_id"])
         self.assertEqual(row["last_seen"], '{"state":"OPEN"}')
-        alert = self.q(
-            "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
+        event = self.q(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=?",
             watch_id)[0]
-        self.assertIsNone(alert["resolved_at"])
+        self.assertEqual(json.loads(event["evidence"])["severity"], "critical")
 
     def test_list_shows_live_watches(self):
         watch.main(["pr", "own/repo", "17", "--sprint", "100"])

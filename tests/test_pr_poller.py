@@ -280,13 +280,13 @@ class PollCycleTest(unittest.TestCase):
             self.con,
             fetch_ok(gh_node(checks="PENDING"), gh_node(checks="PENDING")))
 
-        alerts = self.con.execute(
-            "SELECT watch_id, severity, reason, resolved_at "
-            "FROM planner_alerts WHERE reason='pr_watch_unscoped'").fetchall()
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["watch_id"], 4)
-        self.assertEqual(alerts[0]["severity"], "critical")
-        self.assertIsNone(alerts[0]["resolved_at"])
+        events = self.con.execute(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE event_kind='pr_watch_unscoped'").fetchall()
+        self.assertEqual(len(events), 1)
+        evidence = json.loads(events[0]["evidence"])
+        self.assertEqual(evidence["watch_id"], 4)
+        self.assertEqual(evidence["severity"], "critical")
 
     def test_transition_fans_out_scoped_and_idempotent(self):
         pr_poller.poll_cycle(self.con, fetch_ok(
@@ -414,10 +414,10 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(run["status"], "error")
         self.assertEqual(run["error"], "connect timeout")
         self.assertIsNotNone(run["finished_at"])
-        # Alert raised, deduplicated while open.
+        # Failure is durable sentinel evidence.
         self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) FROM planner_alerts WHERE reason='pr_poll_failure' "
-            "AND resolved_at IS NULL").fetchone()[0], 1)
+            "SELECT COUNT(*) FROM sentinel_events "
+            "WHERE event_kind='pr_poll_failure'").fetchone()[0], 1)
         # In backoff: the next cycle skips the repo without fetching.
         n = pr_poller.poll_cycle(self.con, state=state, now=t + 5,
                                  fetch=lambda q: self.fail("fetched during backoff"))
@@ -778,10 +778,10 @@ class CutoverTest(unittest.TestCase):
         con = sqlite3.connect(tmp)
         try:
             row = con.execute(
-                "SELECT severity, reason, resolved_at FROM planner_alerts "
-                "WHERE watch_id=1").fetchone()
-            self.assertEqual(row[:2], ("critical", "pr_watch_unscoped"))
-            self.assertIsNone(row[2])
+                "SELECT event_kind, evidence FROM sentinel_events "
+                "WHERE json_extract(evidence,'$.watch_id')=1").fetchone()
+            self.assertEqual(row[0], "pr_watch_unscoped")
+            self.assertEqual(json.loads(row[1])["severity"], "critical")
         finally:
             con.close()
 

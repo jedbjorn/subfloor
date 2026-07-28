@@ -1191,6 +1191,8 @@ case "$cmd" in
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
+  directives)   exec "$PY" "$S/conductor_contracts.py" directives "$@" ;;
+  events)       exec "$PY" "$S/conductor_contracts.py" events "$@" ;;
   # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
   # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
   watch)             exec "$PY" "$S/watch.py" "$@" ;;
@@ -1596,6 +1598,9 @@ super-coder — forkable shell substrate
                              never written back into the document body; the doc keeps its prose
                              During Conductor decoupling, boot workers explicitly with plain headless
                              `./sc run <shortname>`; automated sprint coordination arrives with Conductor.
+  ./sc directives <cmd>    Conductor directives: list/inspect read the durable queue; emit validates the
+                             authenticated shell's flavor against the data whitelist before inserting
+  ./sc events <cmd>        sentinel observation log: list/inspect append-only evidence rows
   ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner;
                              --sprint <doc-id> arms it to an ACTIVE sprint); an immediate GitHub baseline
                              is taken at registration, then the engine service poller turns transitions
