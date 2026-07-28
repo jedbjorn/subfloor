@@ -191,6 +191,7 @@ class ClaudeFixtureContractTest(unittest.TestCase):
                     require_terminal=False,
                 )
                 self.assertEqual(outcome.error, expected)
+                self.assertFalse(outcome.boundary_valid)
         good = claude_driver.ClaudeStreamParser().parse(
             json.dumps(valid),
             expected_provider_session_id="provider-1",
@@ -199,6 +200,7 @@ class ClaudeFixtureContractTest(unittest.TestCase):
             require_terminal=False,
         )
         self.assertIsNone(good.error)
+        self.assertTrue(good.boundary_valid)
 
     def test_retry_posture_operand_matrix(self):
         cases = [
@@ -537,6 +539,21 @@ class ClaudeDriverTest(unittest.TestCase):
                 (result.turn_id,),
             ).fetchone()[0]
         self.assertEqual(status, "relocated")
+
+    def test_retry_proof_fails_closed_when_post_anchor_suffix_exceeds_bound(self):
+        _, resolver, transcript = self.context("retry-bounded")
+        anchor = resolver.capture(
+            cwd=self.cwd, provider_session_id=PROVIDER_SESSION
+        )
+        with transcript.open("a") as stream:
+            stream.write(json.dumps({"padding": "x" * 256}) + "\n")
+        with mock.patch.object(
+            claude_driver, "TRANSCRIPT_SUFFIX_LIMIT_BYTES", 32
+        ):
+            resolution, retry_safe = resolver.retry_proof(anchor, "absent")
+        self.assertEqual(resolution["status"], "gap")
+        self.assertIn("bounded suffix", resolution["reason"])
+        self.assertFalse(retry_safe)
 
     def test_process_exit_and_provider_terminal_are_both_required(self):
         cases = [

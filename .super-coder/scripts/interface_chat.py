@@ -12,6 +12,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -95,11 +96,21 @@ def _migration_files(directory: Path) -> list[Path]:
 
 
 def connect_chat(path: str | Path) -> sqlite3.Connection:
-    con = sqlite3.connect(str(path), timeout=5)
+    db_path = Path(path)
+    db_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(db_path.parent, 0o700)
+    con = sqlite3.connect(str(db_path), timeout=5)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")
+    for candidate in (
+        db_path,
+        Path(str(db_path) + "-wal"),
+        Path(str(db_path) + "-shm"),
+    ):
+        if candidate.exists():
+            os.chmod(candidate, 0o600)
     return con
 
 
@@ -111,7 +122,6 @@ def run_chat_migrations(
     path = Path(db_path)
     directory = Path(migrations_dir)
     files = _migration_files(directory)
-    path.parent.mkdir(parents=True, exist_ok=True)
     con = connect_chat(path)
     applied_now: list[str] = []
     try:
@@ -174,17 +184,26 @@ def run_chat_migrations(
 
 def _json_text(value: Any, *, label: str) -> str:
     try:
-        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
-        json.loads(text)
+        text = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        json.loads(text, parse_constant=_reject_json_constant)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ChatStoreError(f"{label} is not valid JSON") from exc
     return text
 
 
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _raw_json_text(value: str, *, label: str) -> str:
     try:
-        json.loads(value)
-    except json.JSONDecodeError as exc:
+        json.loads(value, parse_constant=_reject_json_constant)
+    except (ValueError, json.JSONDecodeError) as exc:
         raise ChatStoreError(f"{label} is not valid JSON") from exc
     return value
 
@@ -305,6 +324,8 @@ class ChatStore:
                 raise ChatStoreError(f"{action} requires a non-empty prompt")
             if not isinstance(anchor, dict):
                 raise ChatStoreError(f"{action} requires a pre-turn anchor")
+            if anchor.get("status") not in {"ready", "missing"}:
+                raise ChatStoreError("pre-turn anchor status must be ready|missing")
             anchor_json = _json_text(anchor, label="pre-turn anchor")
         else:
             anchor_json = ""

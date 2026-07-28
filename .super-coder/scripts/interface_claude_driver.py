@@ -20,6 +20,7 @@ from typing import Any
 import interface_chat
 
 STDERR_LIMIT_BYTES = 4096
+TRANSCRIPT_SUFFIX_LIMIT_BYTES = 8 * 1024 * 1024
 CLAUDE_MODEL = "fable"
 CLAUDE_EFFORT = "low"
 
@@ -37,6 +38,7 @@ class ParseOutcome:
     previews: list[str] = dataclasses.field(default_factory=list)
     health_keys: list[str] = dataclasses.field(default_factory=list)
     provider_session_id: str | None = None
+    boundary_valid: bool = False
     terminal: str | None = None
     error: str | None = None
     aborted: bool = False
@@ -187,11 +189,14 @@ class ClaudeStreamParser:
                         and outcome.provider_session_id != provider_id
                     ):
                         outcome.error = outcome.error or "provider_session_mismatch"
+                        outcome.boundary_valid = False
                         continue
                     outcome.provider_session_id = provider_id
                     saw_boundary = True
+                    boundary_valid = True
                     if expected_cwd is not None and row.get("cwd") != expected_cwd:
                         outcome.error = outcome.error or "provider_cwd_mismatch"
+                        boundary_valid = False
                     actual_model = row.get("model")
                     if expected_model is not None and not (
                         actual_model == expected_model
@@ -201,8 +206,11 @@ class ClaudeStreamParser:
                         )
                     ):
                         outcome.error = outcome.error or "provider_model_mismatch"
+                        boundary_valid = False
                     if row.get("apiKeySource") not in (None, "none"):
                         outcome.error = outcome.error or "api_key_billing_disallowed"
+                        boundary_valid = False
+                    outcome.boundary_valid = boundary_valid
                 elif subtype in {"status", "thinking_tokens"}:
                     continue
                 else:
@@ -514,7 +522,12 @@ class ClaudeTranscriptResolver:
         path = Path(resolution["path"])
         with path.open("rb") as stream:
             stream.seek(resolution["next_offset"])
-            data = stream.read()
+            data = stream.read(TRANSCRIPT_SUFFIX_LIMIT_BYTES + 1)
+        if len(data) > TRANSCRIPT_SUFFIX_LIMIT_BYTES:
+            return {
+                "status": "gap",
+                "reason": "post-anchor transcript exceeds bounded suffix",
+            }, []
         rows, malformed = _json_rows(data)
         if malformed:
             return {
@@ -658,7 +671,7 @@ class ClaudeDriver:
         provider_id = parsed.provider_session_id or session["provider_session_id"]
         if (
             parsed.provider_session_id
-            and parsed.error != "provider_session_mismatch"
+            and parsed.boundary_valid
         ):
             try:
                 self.store.bind_provider_session(

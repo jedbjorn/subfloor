@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,8 @@ class ChatStoreTest(unittest.TestCase):
         self.assertIn("chat_transcript_cursors", tables)
         self.assertNotIn("schema_migrations", tables)
         self.assertNotIn("shells", tables)
+        self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.db.parent.stat().st_mode), 0o700)
 
     def test_chat_driver_is_constructed_only_after_migration_success(self):
         runtime = interface_chat.ChatRuntime(self.tmp / "runtime-chat.db")
@@ -381,6 +384,17 @@ class ChatStoreTest(unittest.TestCase):
                 kind="message_completed",
                 role="assistant",
                 payload_json='{"broken":',
+            )
+        with self.assertRaisesRegex(interface_chat.ChatStoreError, "not valid JSON"):
+            self.store.append_events(
+                active.turn_id,
+                [
+                    {
+                        "kind": "usage",
+                        "role": None,
+                        "payload": {"not_json": float("nan")},
+                    }
+                ],
             )
         with self.store.connect() as con:
             after = con.execute(
