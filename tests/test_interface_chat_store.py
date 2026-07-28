@@ -76,6 +76,15 @@ class ChatStoreTest(unittest.TestCase):
         self.assertNotIn("schema_migrations", tables)
         self.assertNotIn("shells", tables)
 
+    def test_chat_driver_is_constructed_only_after_migration_success(self):
+        runtime = interface_chat.ChatRuntime(self.tmp / "runtime-chat.db")
+        self.assertFalse(runtime.available)
+        self.assertIsNone(runtime.claude)
+        runtime.start()
+        self.assertTrue(runtime.available)
+        self.assertIsNotNone(runtime.claude)
+        self.assertIs(runtime.claude.store, runtime.store)
+
     def test_failed_followup_migration_rolls_back_its_partial_schema(self):
         migrations = self.tmp / "migrations"
         migrations.mkdir()

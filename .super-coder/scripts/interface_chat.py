@@ -841,11 +841,18 @@ class ChatRuntime:
         self.store = ChatStore(db_path, migrations_dir)
         self.available = False
         self.unavailable_reason = "start() not called"
+        self.claude: Any | None = None
 
     def start(self) -> None:
         try:
             self.store.migrate()
+            # Import only after this module is fully initialized: the adapter
+            # depends on ChatStore.  No driver exists until its schema is ready.
+            from interface_claude_driver import ClaudeDriver
+
+            self.claude = ClaudeDriver(self.store)
         except Exception as exc:  # noqa: BLE001 - every migration failure gates chat
+            self.claude = None
             self.available = False
             self.unavailable_reason = f"chat migration failed: {exc}"[:512]
             return
