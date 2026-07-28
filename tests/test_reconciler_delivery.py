@@ -14,7 +14,6 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
-import interface_broker  # noqa: E402
 import pr_poller  # noqa: E402
 
 NOW = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -171,7 +170,7 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             explanation=explanation,
         )
 
-    def test_confirmed_actionable_reading_writes_exact_alert_message_and_wake(self):
+    def test_confirmed_actionable_reading_writes_exact_alert_and_message(self):
         before_board = tuple(self.con.execute(
             "SELECT * FROM sprint_units ORDER BY unit_id"
         ).fetchall())
@@ -213,14 +212,13 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             f"observed_at={NOW.isoformat()}",
             message["body"],
         )
+        # Wake machine retired (conductor Step 1): the alert + message rows
+        # are the durable record; no wake item may form any more.
         self.assertEqual(
-            [(self.binding_id, emitted[0])],
-            [
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT binding_id, message_id FROM planner_wake_items"
-                )
-            ],
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM planner_wake_items"
+            ).fetchone()[0],
         )
         self.assertEqual(
             before_board,
@@ -362,8 +360,10 @@ class ReconcilerDeliveryTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM shell_messages"
             ).fetchone()[0],
         )
+        # Wake machine retired (conductor Step 1): no wake items ride the
+        # re-armed alert either.
         self.assertEqual(
-            2,
+            0,
             self.con.execute(
                 "SELECT COUNT(*) FROM planner_wake_items"
             ).fetchone()[0],
@@ -708,38 +708,9 @@ class ReconcilerDeliveryTest(unittest.TestCase):
                     ).fetchall()),
                 )
 
-    def test_legacy_interface_alert_opens_dedupes_resolves_with_null_new_columns(self):
-        interface_broker._alert(
-            self.con,
-            severity="critical",
-            reason="turn_failure",
-            session_id=self.session_id,
-        )
-        interface_broker._alert(
-            self.con,
-            severity="critical",
-            reason="turn_failure",
-            session_id=self.session_id,
-        )
-        self.con.commit()
-        row = self.con.execute(
-            "SELECT sprint_doc_id, unit_id, role, signal, shell_id, resolved_at "
-            "FROM planner_alerts WHERE reason='turn_failure'"
-        ).fetchone()
-        self.assertEqual((None, None, None, None, None, None), tuple(row))
-
-        interface_broker.close_session(
-            self.con,
-            self.session_id,
-            "test_complete",
-        )
-        self.con.commit()
-        rows = self.con.execute(
-            "SELECT resolved_at FROM planner_alerts "
-            "WHERE reason='turn_failure'"
-        ).fetchall()
-        self.assertEqual(1, len(rows))
-        self.assertIsNotNone(rows[0][0])
+    # test_legacy_interface_alert_opens_dedupes_resolves_with_null_new_columns
+    # was deleted here: it exercised interface_broker._alert / close_session,
+    # which retired with the Interface wake machine (conductor Step 1).
 
     def test_migration_expands_a_dirty_legacy_alert_table_without_rewriting_rows(self):
         migration_name = "0102_reconciler_alert_keys.sql"
@@ -773,37 +744,10 @@ class ReconcilerDeliveryTest(unittest.TestCase):
             tuple(before) + (None, None, None, None, None),
             tuple(after),
         )
-        interface_broker._alert(
-            legacy,
-            severity="warning",
-            reason="legacy_open",
-        )
-        self.assertEqual(
-            1,
-            legacy.execute(
-                "SELECT COUNT(*) FROM planner_alerts "
-                "WHERE reason='legacy_open'"
-            ).fetchone()[0],
-        )
-        legacy.execute(
-            "UPDATE planner_alerts SET resolved_at=datetime('now') "
-            "WHERE reason='legacy_open'"
-        )
-        interface_broker._alert(
-            legacy,
-            severity="warning",
-            reason="legacy_open",
-        )
-        rows = legacy.execute(
-            "SELECT resolved_at, sprint_doc_id, unit_id, role, signal, shell_id "
-            "FROM planner_alerts WHERE reason='legacy_open' ORDER BY alert_id"
-        ).fetchall()
-        self.assertEqual(2, len(rows))
-        self.assertIsNotNone(rows[0]["resolved_at"])
-        self.assertEqual(
-            (None, None, None, None, None, None),
-            tuple(rows[1]),
-        )
+        # The second half of this test drove interface_broker._alert against
+        # the expanded table (dedupe-while-open, reopen-after-resolve). That
+        # writer retired with the Interface wake machine (conductor Step 1);
+        # the expand-without-rewrite property above is the durable claim.
 
 
 if __name__ == "__main__":

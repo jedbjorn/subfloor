@@ -38,7 +38,6 @@ FIXTURES = ROOT / "tests" / "fixtures" / "live_model"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
-import interface_broker  # noqa: E402  (the writer of `last_human_input_at`)
 import live_model  # noqa: E402
 from live_model import claude as p_claude  # noqa: E402
 from live_model import kimi as p_kimi  # noqa: E402
@@ -48,7 +47,9 @@ from live_model import opencode as p_opencode  # noqa: E402
 # mutually orderable as strings — `'T'` (0x54) sorts above `' '` (0x20) — so a
 # same-day engine timestamp compares as EARLIER than any observation of that
 # day. That is SC-165, and it is why nothing here compares raw strings.
-BROKER_TS = "%Y-%m-%d %H:%M:%S"    # interface_broker._now() = SELECT datetime('now')
+# (The Interface broker that wrote `last_human_input_at` retired with the
+# wake machine; SELECT datetime('now') remains the engine's DB clock form.)
+BROKER_TS = "%Y-%m-%d %H:%M:%S"    # SELECT datetime('now') — engine DB form
 HARNESS_TS = "%Y-%m-%dT%H:%M:%SZ"  # norm_iso's canonical form = every observed_at
 
 # The cwds the capture runs actually ran in — the fixtures record these paths
@@ -303,11 +304,13 @@ class Freshness(ProbeCase):
     """`stale` — and the format `active_since` actually arrives in (SC-165).
 
     Every value the probe compares against comes from the ENGINE, not from a
-    harness: the Interface writes `last_human_input_at` through
-    `interface_broker._now()`. So the timestamps here are built by SHIFTING a
-    real observation and rendering it in the writer's own form — not by naming
-    a far-future instant, which no run of this feature can produce and which
-    passes on nothing but the year digits.
+    harness: engine activity clocks are written as SQLite `datetime('now')`
+    strings (the retired Interface broker wrote `last_human_input_at` that
+    way, and any engine-side caller inherits the same DB clock form). So the
+    timestamps here are built by SHIFTING a real observation and rendering it
+    in the writer's own form — not by naming a far-future instant, which no
+    run of this feature can produce and which passes on nothing but the year
+    digits.
 
     Shifting rather than reading the clock is also what keeps these tests
     honest tomorrow: an `active_since` of "now" is on a later calendar DATE
@@ -322,13 +325,16 @@ class Freshness(ProbeCase):
         self.assertIsNotNone(r["live_model_at"])
         return r["live_model_at"]
 
-    def test_the_engine_writes_last_human_input_at_in_sqlite_datetime_form(self):
+    def test_the_engine_db_clock_is_sqlite_datetime_form(self):
         """The premise every test in this class is built on, asserted against
-        the writer itself: if the broker ever moves to ISO-Z, this goes red and
-        says so, instead of the stale tests quietly testing nothing."""
+        the engine's DB clock itself (the retired Interface broker wrote
+        activity timestamps as `SELECT datetime('now')`; that remains the
+        engine-side form any caller of `probe(active_since=…)` hands over):
+        if that form ever moves to ISO-Z, this goes red and says so, instead
+        of the stale tests quietly testing nothing."""
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
-        written = interface_broker._now(con)
+        written = con.execute("SELECT datetime('now')").fetchone()[0]
         datetime.strptime(written, BROKER_TS)  # exact parse: space, no Z
         self.assertNotIn("T", written)
         self.assertNotIn("Z", written)
@@ -854,51 +860,10 @@ class Caching(ProbeCase):
             "stale")
 
 
-class RouteProjection(ProbeCase):
-    """interface_routes._live_model — the mapping the API actually serves."""
-
-    def setUp(self):
-        super().setUp()
-        import interface_routes
-        self.routes = interface_routes
-        self.con = sqlite3.connect(":memory:")
-        self.addCleanup(self.con.close)
-        self.con.execute("CREATE TABLE interface_input_state "
-                         "(session_id INTEGER, last_human_input_at TEXT)")
-
-    def test_probe_result_is_renamed_onto_the_api_fields(self):
-        got = self.routes._live_model(self.con, "claude", None,
-                                      worktree=CLAUDE_BACK)
-        self.assertEqual(
-            got, {"live_model": "claude-haiku-4-5-20251001",
-                  "live_model_at": got["live_model_at"],
-                  "live_model_verdict": "ok"})
-        self.assertIsNotNone(got["live_model_at"])
-
-    def test_last_human_input_drives_the_stale_verdict(self):
-        """End to end on the REAL column contents: `last_human_input_at` holds
-        what `interface_broker._now()` writes (`Freshness` pins that form), one
-        minute after this observation — the everyday case a rail poll sees, not
-        a year no session can be in."""
-        observed = self.routes._live_model(
-            self.con, "claude", None, worktree=CLAUDE_BACK)["live_model_at"]
-        self.con.execute("INSERT INTO interface_input_state VALUES (7, ?)",
-                         (_shift(observed, 60, BROKER_TS),))
-        got = self.routes._live_model(self.con, "claude", 7,
-                                      worktree=CLAUDE_BACK)
-        self.assertEqual(got["live_model_verdict"], "stale")
-        self.assertEqual(got["live_model"], "claude-haiku-4-5-20251001")
-
-    def test_no_harness_means_no_claim(self):
-        got = self.routes._live_model(self.con, None, None,
-                                      worktree=CLAUDE_BACK)
-        self.assertEqual(got, {"live_model": None, "live_model_at": None,
-                               "live_model_verdict": "none"})
-
-    def test_a_failure_resolving_the_worktree_does_not_raise(self):
-        got = self.routes._live_model(self.con, "claude", None,
-                                      shortname=None, flavor=None)
-        self.assertEqual(got["live_model_verdict"], "none")
+# The RouteProjection class was deleted here: it exercised
+# interface_routes._live_model, the Interface-session API projection of the
+# probe, which retired with the Interface stack (conductor Step 1). The probe
+# itself — the surviving surface — is covered by every class above.
 
 
 # ----------------------------------------------------------------- helpers

@@ -736,7 +736,6 @@ def deliver_reconciliation_readings(
         # NULL` alone and could queue an item no gate would ever pass — it
         # went straight into a stall, invisibly. The alert still records the
         # binding it belongs to whether or not a wake can ride it.
-        import interface_wake
         binding = con.execute(
             "SELECT binding_id FROM sprint_planner_bindings "
             "WHERE sprint_doc_id=? AND planner_shell_id=? "
@@ -749,14 +748,8 @@ def deliver_reconciliation_readings(
             "WHERE alert_id=?",
             (message_id, binding_id, alert_id),
         )
-        wakeable = interface_wake.eligible_binding(
-            con, sprint_doc_id, planner_shell_id)
-        if wakeable is not None:
-            con.execute(
-                "INSERT OR IGNORE INTO planner_wake_items "
-                "(binding_id, message_id) VALUES (?,?)",
-                (wakeable, message_id),
-            )
+        # STEP2(conductor): Interface wake retired — the alert row is the
+        # record; wake-item emission moves to the sentinel→Conductor path.
         emitted.append(message_id)
     return emitted
 
@@ -1087,16 +1080,8 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     except sqlite3.IntegrityError:
         return None  # the dedupe index — already emitted
     message_id = cur.lastrowid
-    # H-8: the same eligibility ladder the message ingress uses — an item the
-    # gate can never pass is not created, it is refused, and the condition
-    # behind the refusal is H-5/H-6's to report.
-    import interface_wake
-    binding_id = interface_wake.eligible_binding(
-        con, watch["sprint_doc_id"], watch["shell_id"])
-    if binding_id is not None:
-        con.execute(
-            "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
-            "VALUES (?, ?)", (binding_id, message_id))
+    # STEP2(conductor): Interface wake retired — the pr_event message row is
+    # the record; waking its consumer moves to the sentinel→Conductor path.
     return message_id
 
 
@@ -1211,11 +1196,8 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
             if terminal:
                 summary["retired"] += 1
         con.commit()
-    # Events are durable — signal the wake coordinator (thread-safe; a no-op
-    # when the Interface stack is down, durable work drains at next startup).
-    import interface_wake
-    for mid in emitted_ids:
-        interface_wake.notify_message(mid)
+    # STEP2(conductor): Interface wake coordinator retired — emitted rows are
+    # durable; their consumer's wake-up moves to the sentinel→Conductor path.
     return summary
 
 
@@ -1318,10 +1300,8 @@ class Poller(threading.Thread):
                             # them while leaving the absent beat honest.
                             con.commit()
                             print(f"pr-poller: heartbeat error ({e})", flush=True)
-                        if emitted:
-                            import interface_wake
-                            for message_id in emitted:
-                                interface_wake.notify_message(message_id)
+                        # STEP2(conductor): wake notify retired with the
+                        # Interface; emitted rows are durable records.
                         self._reconcile_due = (
                             monotonic_now + self._reconcile_interval
                         )

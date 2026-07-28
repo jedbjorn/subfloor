@@ -72,7 +72,14 @@ import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
-import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
+# STEP2(conductor): the Interface stack is retired; the live-state refusal
+# guard's replacement rule (an ACTIVE sprint blocks update, read from
+# sprint_state) lands in Step 2. Until then the guard no-ops when the module
+# is absent.
+try:
+    import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
+except ImportError:
+    interface_reconcile = None
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
@@ -627,6 +634,8 @@ def preflight_live_state(*, allow_discard: bool = False,
     ``--discard-live-state`` flag for a headless invocation.  The destructive
     path is deliberately local-DB only so it still works while the API is down.
     """
+    if interface_reconcile is None:  # STEP2(conductor): Interface retired
+        return
     if not allow_discard:
         reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
         if not reasons:

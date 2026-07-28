@@ -30,7 +30,13 @@ import db_driver    # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import map_repo     # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
-import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
+# STEP2(conductor): the Interface stack is retired; the live-state refusal
+# guard's replacement rule lands in Step 2. Until then the guard no-ops when
+# the module is absent.
+try:
+    import interface_reconcile  # noqa: E402  (live-Interface refusal guard)
+except ImportError:
+    interface_reconcile = None
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
 
 # Compatibility/readability constant: the historical preferred location.
@@ -230,12 +236,13 @@ def main(argv: list[str]) -> int:
     # Interface state would be lost — non-ended session, unreleased binding,
     # nonterminal wake batch, or input ambiguity. Same fail-closed shape as
     # read_existing_keys (#279): abort while the outgoing DB still exists.
-    reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
-    if reasons:
-        sys.exit(
-            "rebuild: refusing — live Interface state exists; the clean "
-            "operator drain path is required first:\n  - "
-            + "\n  - ".join(reasons))
+    if interface_reconcile is not None:  # STEP2(conductor): Interface retired
+        reasons = interface_reconcile.live_refusal_reasons(DB_PATH)
+        if reasons:
+            sys.exit(
+                "rebuild: refusing — live Interface state exists; the clean "
+                "operator drain path is required first:\n  - "
+                + "\n  - ".join(reasons))
     if not no_backup:
         backup_existing()
 
@@ -269,11 +276,12 @@ def main(argv: list[str]) -> int:
         # legacy open alerts for fully ended sessions. Reconcile the completed
         # candidate, not merely the pre-snapshot schema, so rebuild cannot
         # reattach actionable state to terminal audit.
-        con = db_driver.connect(candidate)
-        try:
-            interface_reconcile.startup_reconcile(con)
-        finally:
-            con.close()
+        if interface_reconcile is not None:  # STEP2(conductor)
+            con = db_driver.connect(candidate)
+            try:
+                interface_reconcile.startup_reconcile(con)
+            finally:
+                con.close()
 
         # The migrations above seeded every engine skill live (is_deleted=0) —
         # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
