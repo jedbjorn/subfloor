@@ -19,6 +19,8 @@ STEP4 = MIGRATIONS / "0119_conductor_contracts.sql"
 sys.path.insert(0, str(ENGINE / "api"))
 import conductor_routes  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402
+sys.path.insert(0, str(ENGINE / "scripts"))
+import conductor_contracts as conductor_cli  # noqa: E402
 
 
 def build_file_db(path: Path, *, include_step4: bool = True) -> sqlite3.Connection:
@@ -36,6 +38,23 @@ def build_file_db(path: Path, *, include_step4: bool = True) -> sqlite3.Connecti
 def response(result):
     status, _headers, body = result
     return status, json.loads(body)
+
+
+class ConductorClientApiBaseTests(unittest.TestCase):
+    def test_uses_the_installed_instance_port_when_launch_did_not_inject_one(self):
+        with mock.patch.object(conductor_cli, "SC_API_BASE", ""), \
+                mock.patch.object(
+                    conductor_cli.ports_mod, "resolve",
+                    return_value={"port": 8842},
+                ):
+            self.assertEqual(
+                conductor_cli._api_base(), "http://127.0.0.1:8842")
+
+    def test_launch_injected_api_base_wins(self):
+        with mock.patch.object(
+                conductor_cli, "SC_API_BASE", "http://127.0.0.1:8899/"):
+            self.assertEqual(
+                conductor_cli._api_base(), "http://127.0.0.1:8899")
 
 
 class ConductorContractTests(unittest.TestCase):

@@ -85,6 +85,23 @@ class SharedStateVocabularyTest(unittest.TestCase):
         )
 
 
+class SprintClientApiBaseTests(unittest.TestCase):
+    def test_uses_the_installed_instance_port_when_launch_did_not_inject_one(self):
+        with mock.patch.object(sprint_cli, "SC_API_BASE", ""), \
+                mock.patch.object(
+                    sprint_cli.ports_mod, "resolve",
+                    return_value={"port": 8842},
+                ):
+            self.assertEqual(
+                sprint_cli._api_base(), "http://127.0.0.1:8842")
+
+    def test_launch_injected_api_base_wins(self):
+        with mock.patch.object(
+                sprint_cli, "SC_API_BASE", "http://127.0.0.1:8899/"):
+            self.assertEqual(
+                sprint_cli._api_base(), "http://127.0.0.1:8899")
+
+
 def build_engine_db(path: Path) -> None:
     con = sqlite3.connect(path)
     con.executescript(SCHEMA.read_text())

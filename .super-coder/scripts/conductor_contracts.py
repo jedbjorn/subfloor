@@ -10,13 +10,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SC_API_BASE = os.environ.get("SC_API_BASE", "http://127.0.0.1:8800")
+import ports as ports_mod
+
+SC_API_BASE = os.environ.get("SC_API_BASE", "")
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
 _TIMEOUT = 10
 
 
 def _die(msg: str) -> "SystemExit":
     return SystemExit(f"sc conductor: {msg}")
+
+
+def _api_base() -> str:
+    if SC_API_BASE:
+        return SC_API_BASE.rstrip("/")
+    try:
+        port = ports_mod.resolve()["port"]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise _die(f"could not resolve this install's API URL: {exc}") from exc
+    return f"http://127.0.0.1:{port}"
 
 
 def _api(method: str, path: str, payload=None):
@@ -28,7 +40,7 @@ def _api(method: str, path: str, payload=None):
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
-        SC_API_BASE.rstrip("/") + path,
+        _api_base() + path,
         data=data,
         method=method,
         headers=headers,
