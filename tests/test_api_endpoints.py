@@ -35,7 +35,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (server.py adds scripts/ to the path on import)
-import interface_routes  # noqa: E402
+import sprint_routes  # noqa: E402
 import sprint_units  # noqa: E402
 
 
@@ -339,11 +339,11 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
         self.assertEqual(sprint["document_id"], doc_id)
         self.assertEqual(sprint["title"], "sprint: lowercase declaration")
 
-    def test_sprint_unit_columns_match_interface_projection(self) -> None:
+    def test_sprint_unit_columns_match_board_route_projection(self) -> None:
         self.assertIs(server._SPRINT_UNIT_COLUMNS, sprint_units.UNIT_COLUMNS)
         self.assertEqual(
             sprint_units.UNIT_COLUMNS,
-            interface_routes._UNIT_COLS)
+            sprint_routes._UNIT_COLS)
 
     def test_orders_sprints_and_units_and_projects_full_unit_shape(self) -> None:
         later = self._doc(

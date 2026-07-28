@@ -41,8 +41,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import interface_routes as routes  # noqa: E402
-import interface_wake  # noqa: E402
+import sprint_routes as routes  # noqa: E402
 from test_sprint_board_record import DEV, PLANNER, _BoardCase  # noqa: E402
 
 REV1, REV2, DEV5, DEV6, PLN1, PLN2 = 7, 8, 11, 12, 9, 10
@@ -316,15 +315,16 @@ class AssignmentNoticeTest(_BoardCase):
                          {PLN1})
 
     def test_the_notice_can_never_boot_a_shell(self):
-        """`kind` is the whole safety argument: task / result / pr_event are
-        exactly the wake-eligible kinds, so any of them would let a planner's
-        board edit turn into a BOOT of whichever party is a bound planner.
+        """`kind` is the whole safety argument: task / result / pr_event were
+        the Interface's wake-eligible kinds, and any consumer that grows out
+        of the conductor path will inherit that vocabulary — `shell` is inert
+        by construction. The wake machine itself is retired (conductor Step
+        1), so the set is pinned here rather than read off interface_wake.
         This is a notice, not work."""
         self.patch(seq="U1", reviewer=REV2)
         kinds = {m["kind"] for m in self.notices()}
         self.assertEqual(kinds, {"shell"})
-        for kind in kinds:
-            self.assertNotIn(kind, interface_wake.ELIGIBLE_KINDS)
+        self.assertTrue(kinds.isdisjoint({"task", "result", "pr_event"}))
 
     def test_the_notice_is_scoped_to_its_sprint(self):
         self.patch(seq="U1", reviewer=REV2)

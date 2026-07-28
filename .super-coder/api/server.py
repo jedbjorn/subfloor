@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """super-coder review layer — a localhost server.
 
-One process serves the JSON API, the static review UI, and (sprint 25 seq 5+)
-the Interface WebSocket streams on a single per-fork port (see
-scripts/ports.py + api/transport.py). The review layer stays zero-dependency
-stdlib; the Interface transport pins `websockets` (spec #20: a maintained
-stream stack, never hand-rolled framing). When websockets/tmux are absent the
-review UI still serves and Interface reports unavailable (spec #20 req 13).
-Single-user, localhost — network controls are the operator's, exactly like
-superCC's API surface.
+One process serves the JSON API and the static review UI on a single per-fork
+port (see scripts/ports.py + api/transport.py). The review layer stays
+zero-dependency stdlib; the transport pins `websockets` for its one-port
+multiplex (WS upgrades answer unavailable — the Interface stream stack was
+retired on the conductor branch, Step 1). Single-user, localhost — network
+controls are the operator's, exactly like superCC's API surface.
 
 It is a REVIEW layer over the live `shell_db.db`. The law-curated fields (seed,
 L&S) are returned for reading but have **no write endpoint at all** — not a

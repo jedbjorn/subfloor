@@ -175,10 +175,11 @@ class EntrypointsTest(unittest.TestCase):
     def test_finder_sees_a_known_entrypoint(self):
         """Positive control: an empty scan would pass every test below."""
         self.assertIn("sprint.py", self.blocks)
-        self.assertGreaterEqual(len(self.blocks), 40,
-                                "scripts/ holds ~42 CLI entrypoints; a short "
-                                "scan means the finder broke, not that the "
-                                "tree shrank")
+        self.assertGreaterEqual(len(self.blocks), 35,
+                                "scripts/ holds ~39 CLI entrypoints (the "
+                                "interface_* CLIs retired, conductor Step 1); "
+                                "a short scan means the finder broke, not "
+                                "that the tree shrank")
 
     def test_every_entrypoint_routes_through_run_cli(self):
         for name, body in self.blocks.items():

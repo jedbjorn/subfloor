@@ -389,10 +389,12 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(merge["kind"], "pr_event")
         self.assertEqual(merge["sprint_doc_id"], 100)
         self.assertIn("watch retired", merge["body"])
+        # Wake-item emission retired (conductor Step 1): the pr_event row is
+        # the durable record; its consumer's wake-up is the sentinel's job.
         item = self.con.execute(
             "SELECT binding_id, state FROM planner_wake_items "
             "WHERE message_id=?", (merge["message_id"],)).fetchone()
-        self.assertEqual((item["binding_id"], item["state"]), (1, "queued"))
+        self.assertIsNone(item)
         row = self.con.execute(
             "SELECT closed_at FROM watched_prs "
             "WHERE repo='o/r' AND pr_number=2 AND shell_id=1").fetchone()
@@ -469,9 +471,10 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(run["watch_count"], 3)      # the dormant one excluded
         self.assertEqual(run["status"], "ok")
 
-    def test_wake_item_created_when_binding_is_armed(self):
-        # A live (sprint, planner) binding turns the pr_event into scoped wake
-        # work in the same transaction — unique (binding_id, message_id).
+    def test_no_wake_item_forms_even_with_an_armed_binding(self):
+        # Wake-item emission retired (conductor Step 1): even a live
+        # (sprint, planner) binding creates no wake work — the pr_event row
+        # is the durable record; waking its consumer is the sentinel's job.
         self.con.executescript(
             "INSERT INTO interface_generations (shell_id, generation) VALUES (1, 1);"
             "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
@@ -486,14 +489,13 @@ class PollCycleTest(unittest.TestCase):
         pr_poller.poll_cycle(self.con, fetch_ok(gh_node(checks="SUCCESS"),
                                                 gh_node(checks="PENDING")))
         items = self.con.execute(
-            "SELECT i.binding_id, i.state, m.kind, m.sprint_doc_id "
-            "FROM planner_wake_items i JOIN shell_messages m "
-            "ON m.message_id = i.message_id").fetchall()
-        self.assertEqual(len(items), 1)              # planner's watch only — not dev1's
-        self.assertEqual(items[0]["binding_id"], 1)
-        self.assertEqual(items[0]["state"], "queued")
-        self.assertEqual(items[0]["kind"], "pr_event")
-        self.assertEqual(items[0]["sprint_doc_id"], 100)
+            "SELECT i.binding_id FROM planner_wake_items i").fetchall()
+        self.assertEqual(len(items), 0)
+        events = self.con.execute(
+            "SELECT kind, sprint_doc_id FROM shell_messages "
+            "WHERE kind='pr_event'").fetchall()
+        self.assertEqual(len(events), 2)     # both watches' rows — the record
+        self.assertEqual({e["sprint_doc_id"] for e in events}, {100})
 
     def test_startup_sweeps_runs_stranded_by_a_crash(self):
         """H-9. A run row is committed before the fetch and closed after it,
