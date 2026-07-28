@@ -45,6 +45,7 @@ from pathlib import Path
 
 import db_driver
 import interface_broker
+import interface_chat
 import interface_hooks
 import interface_wake
 
@@ -527,7 +528,9 @@ class InterfaceRuntime:
     """
 
     def __init__(self, db_path: str, run_dir: str | None = None,
-                 shadow_script: str | None = None):
+                 shadow_script: str | None = None,
+                 chat_db_path: str | None = None,
+                 chat_migrations_dir: str | None = None):
         self.db_path = str(db_path)
         self.loop: asyncio.AbstractEventLoop | None = None
         self.run_dir = run_dir or str(Path(self.db_path).parent / "run"
@@ -537,6 +540,10 @@ class InterfaceRuntime:
         self.sock = os.path.join(self.run_dir, "tmux.sock")
         self.shadow = ShadowSidecar(
             shadow_script or str(SHADOW_DIR / "sidecar.js"))
+        self.chat = interface_chat.ChatRuntime(
+            chat_db_path or interface_chat.default_chat_db_path(self.db_path),
+            chat_migrations_dir or interface_chat.CHAT_MIGRATIONS,
+        )
         self.generations: dict[int, Generation] = {}
         self.available = False
         self.unavailable_reason = "start() not called"
@@ -577,6 +584,13 @@ class InterfaceRuntime:
 
     async def start(self) -> None:
         self.loop = asyncio.get_running_loop()
+        # Chat has its own database and availability bit.  A failed chat
+        # migration disables only headless hosting; the existing tmux runtime
+        # continues through its independent startup below.
+        await asyncio.to_thread(self.chat.start)
+        if not self.chat.available:
+            _log("boot", f"CHAT UNAVAILABLE: {self.chat.unavailable_reason} — "
+                         "terminal hosting remains available")
         reason = self._check_available()
         if reason is not None:
             self.available = False

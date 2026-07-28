@@ -67,6 +67,17 @@ CODE_LANGS = {"Python", "JavaScript", "TypeScript", "Svelte", "Vue", "Go", "Rust
 CONFIG_EXTS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf"}
 
 
+def path_is_skipped(
+    rel_parts: tuple[str, ...],
+    skip_dirs: set[str],
+    skip_files: set[str],
+) -> bool:
+    """One testable exclusion predicate for the derived repo catalogue."""
+    return any(part in skip_dirs for part in rel_parts) or (
+        bool(rel_parts) and rel_parts[-1] in skip_files
+    )
+
+
 def infer_role(path: str, ext: str, lang: str | None) -> str:
     p = path.lower()
     name = path.rsplit("/", 1)[-1].lower()
@@ -305,9 +316,7 @@ def main() -> int:
         truncated = False
         for p in sorted(REPO_ROOT.rglob("*")):
             rel_parts = p.relative_to(REPO_ROOT).parts
-            if any(part in skip for part in rel_parts):
-                continue
-            if not p.is_file() or p.name in skip_files:
+            if path_is_skipped(rel_parts, skip, skip_files) or not p.is_file():
                 continue
             if files >= MAX_FILES:
                 truncated = True

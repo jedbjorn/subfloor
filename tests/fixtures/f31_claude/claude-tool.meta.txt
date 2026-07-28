@@ -1,0 +1,3 @@
+argv=IS_SANDBOX=1 claude -p <controlled-prompt> --resume d1f38597-ee45-4b5b-97fd-8d39cda6b8ec --model fable --effort low --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions
+rc=0
+elapsed_ms=7913
