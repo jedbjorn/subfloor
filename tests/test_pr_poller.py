@@ -312,6 +312,52 @@ class PollCycleTest(unittest.TestCase):
             self.assertEqual(o["blind_window"], 0)
             self.assertIsNotNone(o["run_id"])
 
+    def test_enabled_sentinel_retargets_pr_transition_once_to_conductor(self):
+        unit_id = self.con.execute(
+            "SELECT unit_id FROM sprint_units "
+            "WHERE sprint_doc_id=100 ORDER BY unit_id LIMIT 1"
+        ).fetchone()[0]
+        self.con.execute(
+            "UPDATE watched_prs SET unit_id=? WHERE pr_number=1",
+            (unit_id,),
+        )
+        self.con.commit()
+        pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="PENDING"), gh_node(checks="PENDING")),
+            system_signals=True,
+        )
+        result = pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="SUCCESS"), gh_node(checks="PENDING")),
+            system_signals=True,
+        )
+
+        self.assertEqual(result["events"], 1)
+        self.assertEqual(self.messages(), [])
+        directives = self.con.execute(
+            "SELECT issuer_flavor,kind,target,sprint_doc_id,unit_id,payload "
+            "FROM directives"
+        ).fetchall()
+        self.assertEqual(len(directives), 1)
+        self.assertEqual(
+            tuple(directives[0])[:5],
+            ("system", "pr-green", "conductor", 100, unit_id),
+        )
+        self.assertEqual(
+            json.loads(directives[0]["payload"])["head_sha"],
+            "abc1234def",
+        )
+        event = self.con.execute(
+            "SELECT event_kind,directive_id,evidence FROM sentinel_events "
+            "WHERE event_kind='pr-green'"
+        ).fetchone()
+        self.assertEqual(event["directive_id"], 1)
+        self.assertEqual(
+            json.loads(event["evidence"])["transition"],
+            "checks:SUCCESS",
+        )
+
     def test_semantic_dedupe_survives_a_replayed_transition(self):
         pr_poller.poll_cycle(self.con, fetch_ok(gh_node(checks="PENDING"),
                                                 gh_node(checks="PENDING")))

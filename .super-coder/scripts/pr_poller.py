@@ -18,20 +18,20 @@ What lives here:
   sprint_doc_id names a LIVE sprint per `sprint_state`; unscoped legacy
   watches stay dormant until rebound). Per cycle: a `pr_poll_runs` audit row
   per repo, durable `pr_poll_observations` for transitions and blind windows,
-  idempotent `pr_event` messages (dedupe_key), fingerprint persistence, and
-  terminal retirement. Per-repo failures back off capped without blocking
-  other repos; a repo recovering from failure marks its next observations as
-  blind windows (GitHub may have moved unobserved — convergence, not history).
+  fingerprint persistence, and terminal retirement. With the per-fork sentinel
+  enabled, semantic transitions become deduplicated system directives plus
+  sentinel events; the disabled rollback path keeps the legacy `pr_event`
+  message behavior. Per-repo failures back off capped without blocking other
+  repos; a repo recovering from failure marks its next observations as blind
+  windows (GitHub may have moved unobserved — convergence, not history).
 - `Poller` — the service's scheduler thread. GitHub polling keeps its 30s
-  watch-gated cadence; worker-expectation reconciliation runs every 10 minutes
-  from structured live units even before a PR or watch exists. Explicit PR
-  reconcile still rides `poll_cycle(source='reconcile')` through the API.
-  PR polling beats the status-visible watch heartbeat. Worker reconciliation
-  records tick completion in a separate row rendered alongside it by `sc watch list`.
+  watch-gated cadence. An enabled sentinel evaluates structured live units on
+  its configured cadence even before a PR or watch exists; when disabled, the
+  previous report-only reconciliation remains the rollback behavior. Explicit
+  PR reconcile still rides `poll_cycle(source='reconcile')` through the API.
 
 It never injects terminal input, never marks a message read, never acts on a
-PR, and never mutates the sprint board. PR polling may create an event; the
-worker reconciler returns report-only readings for the alert unit to consume.
+PR, never mutates the sprint board, and never boots a shell.
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
+import sentinel
 import sprint_state
 from quota_probes import dispatch as quota_dispatch
 from sprint_units import TERMINAL_UNIT_STATES
@@ -879,7 +880,8 @@ def sweep_stranded_runs(con) -> int:
 
 def poll_cycle(con, fetch=None, source: str = "scheduler",
                state: "PollerState | None" = None,
-               interval: int = DEFAULT_INTERVAL, now: "float | None" = None) -> dict:
+               interval: int = DEFAULT_INTERVAL, now: float | None = None,
+               system_signals: bool = False) -> dict:
     """One bounded pass over armed watches. Per repo: one batched read, one
     pr_poll_runs audit row, transition/blind-window observations, idempotent
     events, fingerprint persistence, terminal retirement. A failed repo backs
@@ -892,7 +894,6 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                "unscoped_alerts": surface_unscoped_watches(con),
                "stranded_runs": (sweep_stranded_runs(con)
                                  if source == "startup" else 0)}
-    emitted_ids: list[int] = []
     watches = armed_watches(con)
     summary["watches"] = len(watches)
     if not watches:
@@ -957,10 +958,15 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                     (w["watch_id"], run_id, cur.get("sha"), json.dumps(cur),
                      ",".join(e["key"] for e in events) or None, blind))
             for e in events:
-                mid = _emit_event(con, w, e, cur.get("sha") or "")
-                if mid is not None:
+                emitted = (
+                    sentinel.emit_pr_transition(
+                        con, w, e, cur.get("sha") or ""
+                    )
+                    if system_signals
+                    else _emit_event(con, w, e, cur.get("sha") or "")
+                )
+                if emitted is not None:
                     summary["events"] += 1
-                    emitted_ids.append(mid)
             con.execute(
                 "UPDATE watched_prs SET last_seen=?" +
                 (", closed_at=datetime('now')" if terminal else "") +
@@ -977,14 +983,18 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
 class Poller(threading.Thread):
     """The service's bounded scheduler.
 
-    GitHub reads remain watch-gated.  Reconciliation has its own cadence and
-    structured-unit trigger, so it still runs before a sprint has any PR.
+    GitHub reads remain watch-gated.  The enabled sentinel has its own cadence
+    and structured-unit trigger, so it runs before a sprint has any PR.  The
+    disabled path preserves the preceding report-only reconciler for rollback.
     """
 
     def __init__(self, db_path, interval: int = DEFAULT_INTERVAL, fetch=None,
                  connect=None,
                  reconcile_interval: int = DEFAULT_RECONCILE_INTERVAL,
-                 activity_reader=None, refresh=None):
+                 activity_reader=None, refresh=None,
+                 sentinel_config: sentinel.SentinelConfig | None = None,
+                 sentinel_cycle=None, sentinel_liveness=None,
+                 sentinel_git_probe=None):
         super().__init__(name="pr-poller", daemon=True)
         self._db_path = str(db_path)
         self._interval = interval
@@ -996,11 +1006,17 @@ class Poller(threading.Thread):
         )
         self._refresh = refresh
         self._reconcile_due = 0.0
+        self._sentinel_config = sentinel_config or sentinel.load_config()
+        self._sentinel_cycle = sentinel_cycle or sentinel.cycle
+        self._sentinel_liveness = sentinel_liveness
+        self._sentinel_git_probe = sentinel_git_probe
+        self._sentinel_due = 0.0
         self._github_enabled = fetch is not None or shutil.which("gh") is not None
         self._stop_event = threading.Event()
         self.state = PollerState()
         self.reconciler_state = ReconcilerState()
         self.last_reconciliation: list[ReconciliationReading] = []
+        self.last_sentinel: dict | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1014,7 +1030,7 @@ class Poller(threading.Thread):
     def run(self) -> None:  # pragma: no cover — thread loop; scheduler tests drive it
         if not self._github_enabled:
             print("pr-poller: gh CLI not found — PR polling disabled "
-                  "(worker reconciliation remains enabled)", flush=True)
+                  "(sentinel/reconciliation remains enabled)", flush=True)
         source = "startup"
         while not self._stop_event.is_set():
             try:
@@ -1040,12 +1056,41 @@ class Poller(threading.Thread):
                                 source=source,
                                 state=self.state,
                                 interval=self._interval,
+                                system_signals=self._sentinel_config.enabled,
                             )
                             if n["events"] or n["errors"]:
                                 print(f"pr-poller: {n}", flush=True)
 
                     monotonic_now = time.monotonic()
-                    if monotonic_now >= self._reconcile_due:
+                    if (
+                        self._sentinel_config.enabled
+                        and monotonic_now >= self._sentinel_due
+                    ):
+                        kwargs = {
+                            "config": self._sentinel_config,
+                            "activity_reader": self._activity_reader,
+                        }
+                        if self._sentinel_liveness is not None:
+                            kwargs["liveness"] = self._sentinel_liveness
+                        if self._sentinel_git_probe is not None:
+                            kwargs["git_probe"] = self._sentinel_git_probe
+                        self.last_sentinel = self._sentinel_cycle(
+                            con, **kwargs
+                        )
+                        if self.last_sentinel["active_units"]:
+                            beat(
+                                con,
+                                self._sentinel_config.interval_seconds,
+                                name="sentinel",
+                            )
+                        self._sentinel_due = (
+                            monotonic_now
+                            + self._sentinel_config.interval_seconds
+                        )
+                    elif (
+                        not self._sentinel_config.enabled
+                        and monotonic_now >= self._reconcile_due
+                    ):
                         self.last_reconciliation = reconcile_tick(
                             con,
                             reader=self._activity_reader,
@@ -1080,5 +1125,14 @@ class Poller(threading.Thread):
                 # fork to the polling world. Log and keep the loop.
                 print(f"pr-poller: cycle error ({e})", flush=True)
             source = "scheduler"
-            self._stop_event.wait(self._interval +
-                            random.uniform(0, self._interval * JITTER_FRACTION))
+            cadence = min(
+                self._interval,
+                (
+                    self._sentinel_config.interval_seconds
+                    if self._sentinel_config.enabled
+                    else self._reconcile_interval
+                ),
+            )
+            self._stop_event.wait(
+                cadence + random.uniform(0, cadence * JITTER_FRACTION)
+            )
