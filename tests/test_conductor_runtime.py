@@ -190,8 +190,18 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
         config = runtime.ConductorConfig(True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL)
         with (
             mock.patch.object(runtime, "_launch_is_live", return_value=False),
-            mock.patch.object(runtime.shutil, "which", return_value="/bin/opencode"),
-            mock.patch.object(runtime.subprocess, "run", self.model_probe()),
+            mock.patch.object(
+                runtime,
+                "doctor",
+                return_value={
+                    "enabled": True,
+                    "ok": True,
+                    "shell_id": 1,
+                    "shell": "CON1",
+                    "harness": "opencode",
+                    "model": runtime.DEFAULT_CONDUCTOR_MODEL,
+                },
+            ),
         ):
             first = runtime.maybe_wake(
                 self.con, config=config, launcher=self.launcher, now=lambda: 100.0
