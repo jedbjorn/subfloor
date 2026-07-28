@@ -89,10 +89,10 @@ keeps running if you close the terminal.
   is the landing view — each shell's role, mandate, current state, and
   identity. The other tabs, the roadmap views, and the token analytics:
   [*Review GUI*](README.md#review-gui).
-- **Meet the team.** The installer seeded a planner (your primary), two devs,
-  a reviewer, the admin that owns `main`, and the cartographer that owns the
-  repo map. Each boots into its own worktree; how they share one repo without
-  collisions: [*Shells & worktrees*](README.md#shells--worktrees).
+- **Meet the team.** The installer seeded two planners (one is your primary),
+  four devs, two reviewers, the admin that owns `main`, and the cartographer
+  that owns the repo map. Each boots into its own worktree; how they share one
+  repo without collisions: [*Shells & worktrees*](README.md#shells--worktrees).
 - **First acts.** Let the cartographer map the repo on its first boot, then
   tell the planner what you're building — it authors the roadmap and the
   first spec.

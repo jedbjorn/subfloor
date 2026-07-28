@@ -83,7 +83,7 @@ that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 ### Quick start
 
 > [!class2]
-> **UI** Shells (your landing tab) · **Shells** your starting team — planner · 2×dev · reviewer · admin · cartographer
+> **UI** Shells (your landing tab) · **Shells** your starting team — 2×planner · 4×dev · 2×reviewer · admin · cartographer
 
 **Preparation**
 
@@ -136,7 +136,7 @@ arc from a fresh repo through ship-and-loop, see [*The loop*](#the-loop).
 ### Installer internals
 
 > [!class2]
-> **UI** Shells · Scripts · **Shells** seeds the starting team — planner · 2×dev · reviewer · admin · cartographer
+> **UI** Shells · Scripts · **Shells** seeds the starting team — 2×planner · 4×dev · 2×reviewer · admin · cartographer
 
 subfloor installs **alongside** your code — it renders to `_sc` dirs, so it
 never collides with your repo's own `/docs`, `/specs`, or skills. A fork
@@ -185,9 +185,9 @@ files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
 subfloor's own per-instance content** (a fork inherits the *system* — schema +
 skill catalogue + render chain — never the memory or roadmap), builds the system
 DB, seeds your fork's **starting team** (your user + a planner-flavor *primary*
-carrying the CC Lineage Seed and its own genesis seed, plus two `dev`, a
-`reviewer`, the `admin` that owns `main`, and the singleton **Cartographer**
-repo-map owner), and renders. So after install
+carrying the CC Lineage Seed and its own genesis seed, plus a second `planner`,
+four `dev`, two `reviewer` shells, the `admin` that owns `main`, and the singleton
+**Cartographer** repo-map owner), and renders. So after install
 your git surfaces show only your project — the engine no longer appears in
 `git status`. It refuses to run in the subfloor source repo or on an
 already-installed fork (guarding against content loss).
@@ -286,9 +286,10 @@ it owns:
 | **reviewer** | `test_authoring` · `database-migrations` · `redline_review` · `api-design` · `flags` | review |
 | **admin** | `git_cleanup` · `self_update` · `migration_management` · `local_skill_management` | engine · verify-clean |
 
-1. **Install** — `./sc install` seeds your **starting team**: a `planner` (your
-   primary), two `dev`, a `reviewer`, the `admin` that owns `main` + the engine,
-   and the singleton `cartographer`. *(admin · `self_update`, `migration_management` · UI: Shells)*
+1. **Install** — `./sc install` seeds your **starting team**: two `planner`
+   (one is your primary), four `dev`, two `reviewer` shells, the `admin` that owns
+   `main` + the engine, and the singleton `cartographer`.
+   *(admin · `self_update`, `migration_management` · UI: Shells)*
 2. **Map the repo** — the cartographer configures the index once with
    `./sc map-setup`, then `./sc map` builds it; git hooks re-map on every pull.
    It's infrastructure working shells *read* via `surface_catalogue`.
