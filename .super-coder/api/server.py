@@ -575,9 +575,9 @@ def get_docs(con) -> dict:
 def get_active_sprints(con) -> dict:
     """Build the active-sprint board from one consistent read snapshot.
 
-    One SELECT reads open sprint documents, latest planner bindings, feature
-    and role labels, and units. The document body is deliberately absent from
-    both the projection and predicate.
+    One SELECT reads open sprint documents, feature and role labels, and units.
+    The document body and retired Interface bindings are deliberately absent
+    from both the projection and predicate.
 
     The predicate comes from `sprint_state` rather than being inlined here, so
     it cannot drift from the one the wake path enforces. It is
@@ -588,10 +588,6 @@ def get_active_sprints(con) -> dict:
     engine ACTS on; this view shows the operator what exists.
     """
     result = rows(con.execute(
-        "WITH latest_bindings AS ("
-        "  SELECT sprint_doc_id, MAX(binding_id) AS binding_id "
-        "  FROM sprint_planner_bindings GROUP BY sprint_doc_id"
-        ") "
         "SELECT "
         "d.document_id, d.title AS sprint_title, "
         # SQLite also parses relative clocks and bare Julian days. The shape
@@ -600,7 +596,6 @@ def get_active_sprints(con) -> dict:
         "  THEN strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) "
         "  ELSE NULL END AS started_at, "
         "d.feature_id, feature.title AS feature_title, "
-        "binding.planner_shell_id, planner.shortname AS planner_shortname, "
         "unit.unit_id AS unit_unit_id, "
         "unit.sprint_doc_id AS unit_sprint_doc_id, "
         "unit.seq AS unit_seq, unit.unit_title AS unit_unit_title, "
@@ -618,12 +613,6 @@ def get_active_sprints(con) -> dict:
         "reviewer.shortname AS reviewer_shortname "
         "FROM documents d "
         "LEFT JOIN roadmap feature ON feature.feature_id=d.feature_id "
-        "LEFT JOIN latest_bindings latest "
-        "  ON latest.sprint_doc_id=d.document_id "
-        "LEFT JOIN sprint_planner_bindings binding "
-        "  ON binding.binding_id=latest.binding_id "
-        "LEFT JOIN shells planner "
-        "  ON planner.shell_id=binding.planner_shell_id "
         "LEFT JOIN sprint_units unit "
         "  ON unit.sprint_doc_id=d.document_id "
         "LEFT JOIN shells dev ON dev.shell_id=unit.dev_shell_id "
@@ -642,7 +631,6 @@ def get_active_sprints(con) -> dict:
         document_id = row["document_id"]
         sprint = by_document.get(document_id)
         if sprint is None:
-            planner_id = row["planner_shell_id"]
             feature_id = row["feature_id"]
             title = row["sprint_title"]
             # The active-title predicate guarantees a non-NULL matching title;
@@ -653,10 +641,9 @@ def get_active_sprints(con) -> dict:
                 "document_id": document_id,
                 "title": title,
                 "started_at": row["started_at"],
-                "planner": None if planner_id is None else {
-                    "shell_id": planner_id,
-                    "shortname": row["planner_shortname"],
-                },
+                # Planner context becomes explicit launch state in Step 7.
+                # Until then no retired binding is presented as live truth.
+                "planner": None,
                 "feature": None if feature_id is None else {
                     "feature_id": feature_id,
                     "title": row["feature_title"],

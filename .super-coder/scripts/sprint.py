@@ -2,20 +2,11 @@
 """sc sprint — planner-side sprint workflow client (spec #20 Event Ingress,
 sprint 25 seq 8 task #84; wake ops seq 10 task #86).
 
-    ./sc sprint action begin     --message <id> --operation <op> --target <t>
-    ./sc sprint action complete  <receipt_id> [--detail "…"]
-    ./sc sprint action unknown   <receipt_id> [--detail "…"]
-    ./sc sprint action reconcile <receipt_id> [--detail "…"]
     ./sc sprint unit add   --sprint <doc-id> --seq U1 --title "…" [roles/fields]
     ./sc sprint unit set   --sprint <doc-id> --seq U1 [roles/fields]
     ./sc sprint unit state --sprint <doc-id> --seq U1 <state>
     ./sc sprint unit list  [--sprint <doc-id>]
     ./sc sprint board      --sprint <doc-id>
-    ./sc sprint arm     --sprint <doc-id> [--planner <shell-id>]
-    ./sc sprint disarm  (--sprint <doc-id> | --binding <id>) [--reason "…"]
-    ./sc sprint status  [--sprint <doc-id>] [--all]
-    ./sc sprint alerts  [--all]
-    ./sc sprint retry   --binding <id> [--outcome delivered|not_delivered]
 
 The BOARD is a record, not a markdown table a planner edits by hand (spec
 doc 58). The planner is its only writer — devs and reviewers work and
@@ -47,30 +38,10 @@ the planner's job. Cancelled units never had a clean review and are exempt.
 write it back into the document: the document keeps its prose, the record is
 the source, and a stored copy would state the board twice.
 
-Before a planner performs an engine-owned or external side effect for a
-message it records action INTENT (begin) under a key derived from
-message + operation + target; a completed existing receipt suppresses the
-duplicate. After the side effect it records the observed result
-(complete), parks it (unknown — the wake item reconciles instead of
-requeuing blind), and an operator later resolves the park (reconcile).
-Only then is the message marked read. Informational messages need no
-receipt.
-
-arm / disarm are the binding's own verbs (H-7). Arming was a raw authenticated
-POST written out in skill prose, and re-arming after a generation change had no
-written procedure at all — a recovery step that exists only as prose is a step
-that gets improvised. A shell arms only itself and resolves its own id from its
-token; the operator may name a planner.
-
-status / alerts are the read-only wake ops surfaces: binding armed/released,
-sprint doc live/frozen, batch state, park/quarantine reason, last wake
-outcome, and the open wake alerts (session-loss, retry-exhausted,
-quarantine, unmanaged-writer). retry is the operator recovery path for a
-PARKED/stalled batch: the parked batch is NEVER resubmitted — it resolves
-as audit, its items requeue, and the coordinator forms a NEW batch that
-re-gates everything before a byte moves. A parked input needs the
-operator's explicit --outcome verdict. The CLI is a pure API client (shell
-token); it never touches the DB directly.
+The retired Interface wake verbs are not part of this parser. During the
+Conductor branch's decoupling window, workers boot explicitly through plain
+headless `./sc run`; automated coordination arrives with the Conductor. The
+CLI remains a pure API client (shell token); it never touches the DB directly.
 """
 from __future__ import annotations
 
@@ -124,24 +95,21 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                    "the duplicate.")
 
 
-def _retired(verb: str) -> int:
-    """The Interface wake machine (bindings, wake batches, action receipts,
-    alerts) is retired — conductor Step 1. Its replacement is the directive
-    contract (Step 4) executed by the Conductor shell (Step 8); until those
-    land, these verbs refuse loudly rather than half-work."""
-    print(f"sc sprint {verb}: retired — the Interface wake machine is gone "
-          "(conductor branch, Step 1). Sprint coordination moves to the "
-          "directive contract + Conductor; the board verbs (unit/board) "
-          "remain live.", file=sys.stderr)
-    return 2
+_CONDUCTOR_COMMANDS = frozenset(
+    {"action", "arm", "disarm", "status", "alerts", "retry"}
+)
 
 
-def cmd_begin(args) -> int:
-    return _retired("action begin")
-
-
-def _cmd_update(args, state: str) -> int:
-    return _retired(f"action {state}")
+def _conductor_gap(argv: "list[str] | None") -> None:
+    """Keep removed wake verbs loud without advertising them as live syntax."""
+    words = list(argv) if argv is not None else sys.argv[1:]
+    if words and words[0] in _CONDUCTOR_COMMANDS:
+        raise _die(
+            f"{words[0]} retired with the Interface wake machine — automated "
+            "sprint coordination arrives with Conductor (Step 8); boot a "
+            "worker explicitly with plain headless `./sc run <shortname>` "
+            "during the decoupling window"
+        )
 
 
 # ── the board as a record (spec doc 58 U1): unit add/set/state/list, board ──
@@ -300,45 +268,11 @@ def cmd_board(args) -> int:
     return 0
 
 
-# ── wake ops (seq 10): retired — see _retired ───────────────────────────────
-
-def cmd_status(args) -> int:
-    return _retired("status")
-
-
-def cmd_alerts(args) -> int:
-    return _retired("alerts")
-
-
-def cmd_retry(args) -> int:
-    return _retired("retry")
-
-
-def cmd_arm(args) -> int:
-    return _retired("arm")
-
-
-def cmd_disarm(args) -> int:
-    return _retired("disarm")
-
-
 def main(argv: "list[str] | None" = None) -> int:
+    _conductor_gap(argv)
     p = argparse.ArgumentParser(prog="sc sprint",
                                 description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    act = sub.add_parser("action", help="idempotent planner action receipts")
-    asub = act.add_subparsers(dest="action_cmd", required=True)
-    b = asub.add_parser("begin", help="record action intent before a side effect")
-    b.add_argument("--message", type=int, default=None,
-                   help="the sprint message this action answers")
-    b.add_argument("--operation", required=True)
-    b.add_argument("--target", required=True)
-    for name, state in (("complete", "complete"), ("unknown", "unknown"),
-                        ("reconcile", "reconciled")):
-        sp = asub.add_parser(name, help=f"record the action as {state}")
-        sp.add_argument("receipt_id", type=int)
-        sp.add_argument("--detail", default=None)
-        sp.set_defaults(_state=state)
     un = sub.add_parser("unit", help="the sprint board record — declare, "
                                      "reassign, and move units (planner "
                                      "writes; anyone reads)")
@@ -395,66 +329,14 @@ def main(argv: "list[str] | None" = None) -> int:
                                       "document)")
     bd.add_argument("--sprint", type=int, required=True)
 
-    st = sub.add_parser("status", help="wake status: binding, batch, park, "
-                                       "last outcome (read-only)")
-    st.add_argument("--sprint", type=int, default=None,
-                    help="filter to one sprint doc id")
-    st.add_argument("--all", action="store_true",
-                    help="include released bindings")
-    al = sub.add_parser("alerts", help="open wake alerts (read-only)")
-    al.add_argument("--all", action="store_true",
-                    help="include resolved alerts (audit history)")
-    rt = sub.add_parser("retry", help="operator recovery for a parked/stalled "
-                                      "batch — NEVER resubmits the park; "
-                                      "requeues as a NEW gated batch")
-    rt.add_argument("--binding", type=int, required=True)
-    rt.add_argument("--outcome", choices=("delivered", "not_delivered"),
-                    default=None,
-                    help="required when the session's input is parked: did "
-                         "the parked frame reach the planner?")
-    rt.add_argument("--stuck", choices=("reconcile", "quarantined", "both"),
-                    default=None,
-                    help="also move items stuck in these states (H-9): they "
-                         "have legal exits no code performs")
-    rt.add_argument("--stuck-outcome", dest="stuck_outcome",
-                    choices=("requeue", "cancel"), default=None,
-                    help="required with --stuck: requeue for another wake, or "
-                         "cancel outright")
-    ar = sub.add_parser("arm", help="arm this sprint's planner wake binding "
-                                    "(the board must be declared first)")
-    ar.add_argument("--sprint", type=int, required=True)
-    ar.add_argument("--planner", type=int, default=None,
-                    help="operator only — a shell may arm only itself, and "
-                         "resolves its own id from its token")
-    dis = sub.add_parser("disarm", help="release the binding and cancel its "
-                                        "queued wake work (messages stay "
-                                        "UNREAD)")
-    dis.add_argument("--sprint", type=int, default=None,
-                     help="resolve the armed binding from the sprint doc")
-    dis.add_argument("--binding", type=int, default=None,
-                     help="release one binding by id")
-    dis.add_argument("--reason", default=None,
-                     help="audit reason recorded on the release")
     args = p.parse_args(argv)
-    if args.cmd == "action":
-        if args.action_cmd == "begin":
-            return cmd_begin(args)
-        return _cmd_update(args, args._state)
     if args.cmd == "unit":
         return {"add": cmd_unit_add, "set": cmd_unit_set,
                 "state": cmd_unit_state, "list": cmd_unit_list}[
                     args.unit_cmd](args)
     if args.cmd == "board":
         return cmd_board(args)
-    if args.cmd == "status":
-        return cmd_status(args)
-    if args.cmd == "alerts":
-        return cmd_alerts(args)
-    if args.cmd == "arm":
-        return cmd_arm(args)
-    if args.cmd == "disarm":
-        return cmd_disarm(args)
-    return cmd_retry(args)
+    raise AssertionError(f"unhandled sprint command: {args.cmd}")
 
 
 if __name__ == "__main__":

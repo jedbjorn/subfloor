@@ -410,83 +410,17 @@ class BoardRecordTest(_BoardCase):
             self.assertEqual(len(out["units"]), 1)
             self.assertEqual(out["units"][0]["reviewer_shortname"], "REV2")
 
-    def test_bound_planner_writes_and_another_planner_does_not(self):
-        """The binding names ONE planner. A second planner shell — running its
-        own sprint next door — is not an authority on this board."""
-        self.arm_binding(planner_shell_id=9)
-        status, _ = self.add((PLANNER,), dev="DEV5")
-        self.assertEqual(status, 201)
-        status, err = self.patch((PLANNER2,), state="working")
-        self.assertEqual(status, 403)
-        self.assertEqual(err["error"]["code"], "not_the_planner")
-        self.assertEqual(self.row()["state"], "pending")
-
-    def test_a_released_binding_still_names_the_board_writer(self):
-        """flag 222. `released_at IS NULL` made the fence read "before a
-        binding is armed" — but a binding is ALSO released with no operator
-        action when the planner's session ends (shell_recovery), on
-        update_discard, and when the sprint is closed or frozen. In that
-        window every planner-flavored shell inherited every board.
-
-        The state moved to is the sharp one: `merged` is terminal, and
-        terminal is exactly what makes the reconciler stop watching a unit —
-        so a foreign planner could silently end the sprint's watch on a unit
-        it has nothing to do with. Asserted with the row UNMOVED, because a
-        403 that still wrote would satisfy a status-code-only test."""
+    def test_planner_flavor_writes_without_interface_binding_truth(self):
+        """Step 3 retires bindings as an authority source. Until the explicit
+        Conductor contract lands, planner flavor is the complete write fence;
+        both planner shells may write and workers still may not."""
         binding_id = self.arm_binding(planner_shell_id=9)
+        self.release(binding_id)
         status, _ = self.add((PLANNER,), dev="DEV5")
         self.assertEqual(status, 201)
-        self.release(binding_id)
-        status, err = self.patch((PLANNER2,), state="merged")
-        self.assertEqual(status, 403,
-                         "a foreign planner wrote the board after release")
-        self.assertEqual(err["error"]["code"], "not_the_planner")
-        self.assertEqual(self.row()["state"], "pending")
-        # and the planner the sprint actually belongs to still writes it —
-        # the fix narrows the fallback to one shell, it does not close it
-        status, _ = self.patch((PLANNER,), state="working")
+        status, _ = self.patch((PLANNER2,), state="working")
         self.assertEqual(status, 200)
         self.assertEqual(self.row()["state"], "working")
-
-    def test_a_handover_leaves_the_board_with_the_planner_that_took_it(self):
-        """"The most recent planner ever bound" is the fallback's whole shape,
-        and a released binding is now part of the answer — so WHICH released
-        binding answers is load-bearing rather than incidental. A sprint handed
-        from one planner to the next (`idx_spb_live_sprint` allows one live
-        binding, so a handover is release-then-arm) and then released again
-        must answer with the planner that TOOK the sprint, not the one that
-        started it. Reading the bindings in the other order gives a
-        confidently wrong writer instead of no writer."""
-        first = self.arm_binding(planner_shell_id=9)
-        self.release(first, "shell_recovery")
-        second = self.arm_binding(planner_shell_id=10)
-        self.release(second, "sprint closed")
-        status, _ = self.add((PLANNER2,), dev="DEV5")
-        self.assertEqual(status, 201, "the planner that took the sprint over "
-                                      "cannot write its board")
-        status, err = self.patch((PLANNER,), state="merged")
-        self.assertEqual(status, 403, "the superseded planner still writes")
-        self.assertEqual(err["error"]["code"], "not_the_planner")
-        self.assertEqual(self.row()["state"], "pending")
-
-    def test_a_released_binding_does_not_open_a_sprint_next_door(self):
-        """The cross-sprint leg of flag 222: a planner running its own sprint
-        reached a board on a doc it never bound, once that doc's binding had
-        been released. Its own sprint stays writable throughout — the fence is
-        per-sprint, not a global lock."""
-        self.sql("INSERT INTO documents (document_id, kind, title, body) "
-                 "VALUES (2,'doc','SPRINT: next door','x')")
-        theirs = self.arm_binding(planner_shell_id=9, sprint_doc_id=2)
-        self.arm_binding(planner_shell_id=10, sprint_doc_id=1)
-        self.release(theirs, "sprint closed")
-        status, err = self.call("POST", "/api/sprint-units", (PLANNER2,),
-                                {"sprint_doc_id": 2, "seq": "U1",
-                                 "unit_title": "not its sprint"})
-        self.assertEqual(status, 403, "declared a unit on a foreign board")
-        self.assertEqual(err["error"]["code"], "not_the_planner")
-        self.assertIsNone(self.row("U1"))
-        self.assertEqual(self.add((PLANNER2,), dev="DEV5")[0], 201)
-        self.assertEqual(self.row()["sprint_doc_id"], 1)
 
     def test_unbound_sprint_falls_back_to_planner_flavor_not_to_anyone(self):
         """The spec's fallback is 'the sprint doc's author', which `documents`
@@ -494,7 +428,7 @@ class BoardRecordTest(_BoardCase):
         workers, or the fence is decorative before a binding is armed."""
         status, _ = self.add((PLANNER2,), dev="DEV5")
         self.assertEqual(status, 201)
-        status, err = self.patch((DEV,), branch="feat/x")
+        status, _err = self.patch((DEV,), branch="feat/x")
         self.assertEqual(status, 403)
         self.assertIsNone(self.row()["branch"])
 
@@ -1329,12 +1263,19 @@ class LiveUpgradeTest(_BoardCase):
             con.close()
 
 
-# ArmDisarmVerbsTest and ScopeSilentEmptyCopyTest were deleted here: the
-# `sc sprint arm|disarm|status` verbs and the binding wake machinery they
-# drove retired with the Interface wake machine (conductor Step 1) — the
-# CLI verbs are now loud `_retired` stubs. The board_writer authority the
-# bindings still confer is pinned above (released-binding / handover /
-# next-door tests in BoardRecordTest).
+class RemovedWakeVerbsTest(unittest.TestCase):
+    def test_removed_verbs_are_absent_from_help_and_fail_with_conductor_bridge(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            sprint_cli.main(["--help"])
+        help_text = out.getvalue()
+        for verb in ("action", "arm", "disarm", "status", "alerts", "retry"):
+            self.assertNotIn(f"{{{verb}", help_text)
+            with self.subTest(verb=verb):
+                with self.assertRaises(SystemExit) as raised:
+                    sprint_cli.main([verb])
+                self.assertIn("arrives with Conductor", str(raised.exception))
+                self.assertIn("./sc run <shortname>", str(raised.exception))
 
 
 if __name__ == "__main__":

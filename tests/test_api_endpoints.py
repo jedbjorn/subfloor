@@ -365,8 +365,10 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
             [s["document_id"] for s in out["sprints"]], [earlier, later])
         sprint = out["sprints"][0]
         self.assertEqual(sprint["started_at"], "2026-07-26T11:00:00Z")
-        self.assertEqual(sprint["planner"], {
-            "shell_id": self.planner_new, "shortname": "PLN-NEW"})
+        self.assertIsNone(
+            sprint["planner"],
+            "retired bindings must not project as live planner truth",
+        )
         self.assertEqual(sprint["feature"], {
             "feature_id": self.feature, "title": "Flow Board"})
         self.assertEqual(

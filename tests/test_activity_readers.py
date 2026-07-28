@@ -510,17 +510,12 @@ class DatabaseContractTest(ReaderCase):
         self.assertFalse(rowless.edits_code)
         self.assertEqual(datetime(2020, 1, 5, tzinfo=UTC), rowless.epoch)
         self.assertIsNone(rowless.branch_declared)
-        self.assertEqual(
-            datetime(2020, 1, 6, tzinfo=UTC),
-            rowless.last_durable_write_at,
-        )
-        self.assertEqual(
-            datetime(2020, 1, 2, tzinfo=UTC),
-            rowless.last_result_row_at,
-        )
-        self.assertEqual(
-            datetime(2020, 1, 4, tzinfo=UTC),
-            rowless.state_changed_at,
+        self.assertIsNone(rowless.last_durable_write_at)
+        self.assertIsNone(rowless.last_result_row_at)
+        self.assertIsNone(rowless.state_changed_at)
+        self.assertTrue(
+            {"durable_write", "result_row", "state_changed_at"}
+            <= set(rowless.unreadable)
         )
 
     def test_rowless_shell_rejects_a_binding_superseded_for_that_sprint(self):
@@ -607,7 +602,7 @@ class DatabaseContractTest(ReaderCase):
             {"durable_write", "result_row", "state_changed_at"}
             <= set(evidence.unreadable)
         )
-        self.assertIn(ar.AMBIGUOUS_PLANNER_BINDING, evidence.unreadable)
+        self.assertNotIn(ar.AMBIGUOUS_PLANNER_BINDING, evidence.unreadable)
 
     def test_each_unreadable_input_is_nullable_and_read_never_raises(self):
         broken = ar.ActivityReader(

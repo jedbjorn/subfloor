@@ -229,42 +229,12 @@ class ActivityReader:
 
         harness = None
         if unit is None:
-            try:
-                rows = con.execute(
-                    "SELECT b.sprint_doc_id, b.armed_at "
-                    "FROM sprint_planner_bindings b "
-                    "JOIN documents d ON d.document_id=b.sprint_doc_id "
-                    "WHERE b.binding_id=("
-                    " SELECT MAX(b2.binding_id) FROM sprint_planner_bindings b2"
-                    " WHERE b2.sprint_doc_id=b.sprint_doc_id"
-                    ") AND b.planner_shell_id=? AND d.frozen=0 "
-                    "AND EXISTS (SELECT 1 FROM sprint_units u "
-                    "            WHERE u.sprint_doc_id=b.sprint_doc_id) "
-                    "ORDER BY b.sprint_doc_id",
-                    (shell_id,),
-                ).fetchall()
-                # U9 can render several live planner roles, but Evidence carries
-                # one sprint scope.  Never collapse several bindings to a
-                # confident answer for whichever row happens to sort newest.
-                if len(rows) == 1:
-                    sprint_doc_id = rows[0]["sprint_doc_id"]
-                    evidence.state_changed_at = _timestamp(rows[0]["armed_at"])
-                    if evidence.state_changed_at is None:
-                        self._mark(evidence, "state_changed_at")
-                else:
-                    sprint_doc_id = None
-                    if len(rows) > 1:
-                        self._mark(evidence, AMBIGUOUS_PLANNER_BINDING)
-                    for name in (
-                        "durable_write",
-                        "result_row",
-                        "state_changed_at",
-                    ):
-                        self._mark(evidence, name)
-            except sqlite3.Error:
-                self._mark(evidence, "durable_write")
-                self._mark(evidence, "result_row")
-                self._mark(evidence, "state_changed_at")
+            # Planner scope used to be guessed from Interface bindings. There
+            # is no planner expectation during the Step 3 decoupling window;
+            # Step 5 supplies explicit sentinel expectations instead.
+            sprint_doc_id = None
+            for name in ("durable_write", "result_row", "state_changed_at"):
+                self._mark(evidence, name)
 
         try:
             row = con.execute(

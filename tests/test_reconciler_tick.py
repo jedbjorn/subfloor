@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -738,7 +737,7 @@ class TickTest(unittest.TestCase):
         )
         self.assertEqual([], pr_poller.live_expectations(self.con))
 
-    def test_latest_planner_binding_emits_the_rowless_planner_expectation(self):
+    def test_planner_bindings_never_emit_runtime_expectations(self):
         add_unit(self.con)
         add_binding(
             self.con,
@@ -747,19 +746,14 @@ class TickTest(unittest.TestCase):
         )
         add_binding(self.con, planner=4)
 
-        planners = [
-            expectation
+        roles = [
+            expectation.role
             for expectation in pr_poller.live_expectations(self.con)
-            if expectation.role == "planner"
         ]
+        self.assertNotIn("planner", roles)
+        self.assertEqual(["dev", "reviewer"], roles)
 
-        self.assertEqual(1, len(planners))
-        self.assertEqual(4, planners[0].shell_id)
-        self.assertEqual("PLN2", planners[0].shell["shortname"])
-        self.assertIsNone(planners[0].unit_id)
-        self.assertIsNone(planners[0].unit)
-
-    def test_all_terminal_live_sprint_still_has_its_planner_expectation(self):
+    def test_all_terminal_sprint_has_no_worker_expectation(self):
         add_unit(
             self.con,
             state=sprint_units.TERMINAL_UNIT_STATES[0],
@@ -768,21 +762,9 @@ class TickTest(unittest.TestCase):
 
         expectations = pr_poller.live_expectations(self.con)
 
-        self.assertEqual(
-            [(59, None, None, "planner", 3)],
-            [
-                (
-                    item.sprint_doc_id,
-                    item.unit_id,
-                    item.seq,
-                    item.role,
-                    item.shell_id,
-                )
-                for item in expectations
-            ],
-        )
+        self.assertEqual([], expectations)
 
-    def test_all_terminal_planner_expectation_never_reads_the_doc_title(self):
+    def test_document_title_never_creates_a_planner_expectation(self):
         add_unit(
             self.con,
             state=sprint_units.TERMINAL_UNIT_STATES[0],
@@ -794,19 +776,7 @@ class TickTest(unittest.TestCase):
         self.con.commit()
         add_binding(self.con, planner=3)
 
-        self.assertEqual(
-            [(59, None, None, "planner", 3)],
-            [
-                (
-                    item.sprint_doc_id,
-                    item.unit_id,
-                    item.seq,
-                    item.role,
-                    item.shell_id,
-                )
-                for item in pr_poller.live_expectations(self.con)
-            ],
-        )
+        self.assertEqual([], pr_poller.live_expectations(self.con))
 
     def test_every_nonterminal_schema_state_remains_a_live_expectation(self):
         for offset, state in enumerate(

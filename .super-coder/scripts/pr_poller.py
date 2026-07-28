@@ -50,7 +50,7 @@ from pathlib import Path
 import activity_readers
 import sprint_state
 from quota_probes import dispatch as quota_dispatch
-from sprint_units import TERMINAL_UNIT_STATES, board_writer
+from sprint_units import TERMINAL_UNIT_STATES
 
 CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
 
@@ -263,7 +263,7 @@ def classify(
     """Apply spec 58's precedence ladder without side effects.
 
     The clocks are intentionally explicit:
-    - result evidence compares with the unit/binding state clock;
+    - result evidence compares with the unit state clock;
     - recent work compares with ``now``;
     - durable completion and branch grace use the boot epoch;
     - the no-progress window starts at the newest boot, state, work, or
@@ -563,195 +563,22 @@ class ReconcilerState:
         }
 
 
-RECONCILER_SEVERITY = {
-    "checkup": "warning",
-    "not_started": "warning",
-    "work_complete_unreported": "info",
-    # Mapping only: reconcile_tick cannot confirm this signal because it is
-    # deliberately absent from ReconcilerState.ACTIONABLE. No producer exists.
-    "recovery_blocked": "critical",
-}
-HEALTHY_RECONCILER_SIGNALS = {"reported", "working"}
-
-
-def _open_reconciliation_alert(
-    con,
-    reading: ReconciliationReading,
-    severity: str,
-) -> "int | None":
-    expectation = reading.expectation
-    unit_key = (
-        expectation.unit_id
-        if expectation.unit_id is not None
-        else "-"
-    )
-    dedupe_key = (
-        f"reconciler|{expectation.sprint_doc_id}|{unit_key}|"
-        f"{expectation.role}|{reading.signal}"
-    )
-    opened_at = reading.observed_at.isoformat()
-    cursor = con.execute(
-        "INSERT INTO planner_alerts "
-        "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
-        " dedupe_key, opened_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
-        (
-            expectation.sprint_doc_id,
-            expectation.unit_id,
-            expectation.role,
-            reading.signal,
-            expectation.shell_id,
-            severity,
-            f"worker_{reading.signal}",
-            dedupe_key,
-            opened_at,
-        ),
-    )
-    if cursor.rowcount == 1:
-        return cursor.lastrowid
-    con.execute(
-        "UPDATE planner_alerts SET shell_id=? "
-        "WHERE dedupe_key=? AND resolved_at IS NULL AND shell_id IS NOT ?",
-        (expectation.shell_id, dedupe_key, expectation.shell_id),
-    )
-    return None
-
-
-def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
-    con.execute(
-        "INSERT INTO planner_alerts "
-        "(sprint_doc_id, severity, reason, dedupe_key) "
-        "VALUES (?, 'warning', 'reconciler_missing_binding', ?) "
-        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
-        (
-            sprint_doc_id,
-            f"reconciler|{sprint_doc_id}|-|-|missing_binding",
-        ),
-    )
-
-
-def _resolve_reconciliation_alerts(
-    con,
-    reading: ReconciliationReading,
-) -> None:
-    if reading.signal not in HEALTHY_RECONCILER_SIGNALS:
-        return
-    expectation = reading.expectation
-    con.execute(
-        "UPDATE planner_alerts SET resolved_at=? "
-        "WHERE sprint_doc_id=? AND unit_id IS ? AND role=? "
-        "AND signal IN ('checkup','not_started',"
-        "'work_complete_unreported') "
-        "AND resolved_at IS NULL",
-        (
-            reading.observed_at.isoformat(),
-            expectation.sprint_doc_id,
-            expectation.unit_id,
-            expectation.role,
-        ),
-    )
-
-
-def _reconciliation_body(reading: ReconciliationReading) -> str:
-    expectation = reading.expectation
-    shell = _row(expectation.shell, "shortname", expectation.shell_id)
-    measurement = json.dumps(
-        reading.measurement,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    body = (
-        f"reconciler unit={expectation.seq or '-'} role={expectation.role} "
-        f"shell={shell} signal={reading.signal} measurement={measurement} "
-        f"observed_at={reading.observed_at.isoformat()}"
-    )
-    if reading.explanation is not None:
-        body += " explanation=" + json.dumps(
-            reading.explanation,
-            ensure_ascii=False,
-        )
-    return body
-
-
 def deliver_reconciliation_readings(
     con,
     readings: "list[ReconciliationReading]",
 ) -> list[int]:
-    """Record confirmed findings and push each newly-opened one to its planner.
+    """Transitional sink while the old planner wake path is retired.
 
-    The structured alert is the unconditional record. A message is only the
-    push layer and therefore exists only when the sprint has a historical
-    binding whose planner can be addressed. This function consumes U4's
-    rendered fields and never inspects Evidence or classifies a reading.
-
-    The caller owns the transaction. Returning message ids lets it notify the
-    wake coordinator only after the tick and its heartbeat commit together.
+    Evidence collection stays available for Step 5's sentinel, but Step 3
+    deliberately emits no binding-addressed alert or message. The directive
+    contract (Step 4) gives the sentinel its durable event target.
     """
-    emitted: list[int] = []
-    writers: dict[int, "int | None"] = {}
-    for reading in readings:
-        sprint_doc_id = reading.expectation.sprint_doc_id
-        if sprint_doc_id not in writers:
-            writers[sprint_doc_id] = board_writer(con, sprint_doc_id)
-        planner_shell_id = writers[sprint_doc_id]
-        if planner_shell_id is not None:
-            con.execute(
-                "UPDATE planner_alerts SET resolved_at=? "
-                "WHERE sprint_doc_id=? "
-                "AND reason='reconciler_missing_binding' "
-                "AND resolved_at IS NULL",
-                (reading.observed_at.isoformat(), sprint_doc_id),
-            )
-
-        _resolve_reconciliation_alerts(con, reading)
-        if not reading.confirmed:
-            continue
-        # ReconcilerState only confirms ACTIONABLE signals, and every one is
-        # required to have an explicit severity. Fail loudly if that contract
-        # ever drifts instead of preserving an unreachable fallback.
-        severity = RECONCILER_SEVERITY[reading.signal]
-        if planner_shell_id is None:
-            _open_missing_binding_alert(con, sprint_doc_id)
-
-        alert_id = _open_reconciliation_alert(con, reading, severity)
-        if alert_id is None or planner_shell_id is None:
-            continue
-
-        message_id = con.execute(
-            "INSERT INTO shell_messages "
-            "(from_shell_id, to_shell_id, body, kind, sprint_doc_id, "
-            " dedupe_key) VALUES (?,?,?,'pr_event',?,?)",
-            (
-                planner_shell_id,
-                planner_shell_id,
-                _reconciliation_body(reading),
-                sprint_doc_id,
-                f"reconciler-alert|{alert_id}",
-            ),
-        ).lastrowid
-        con.execute(
-            "UPDATE planner_alerts SET message_id=? WHERE alert_id=?",
-            (message_id, alert_id),
-        )
-        emitted.append(message_id)
-    return emitted
+    return []
 
 
 def live_expectations(con) -> list[Expectation]:
-    """Enumerate the structured board, independent of PR watches and prose."""
+    """Enumerate live worker assignments from the structured board."""
     placeholders = ",".join("?" for _ in TERMINAL_UNIT_STATES)
-    planner_doc_ids = [
-        _row(row, "document_id")
-        for row in con.execute(
-            "SELECT d.document_id FROM documents d "
-            "WHERE d.frozen=0 "
-            "AND EXISTS (SELECT 1 FROM sprint_units u "
-            "WHERE u.sprint_doc_id=d.document_id) "
-            "ORDER BY d.document_id"
-        ).fetchall()
-    ]
     units = con.execute(
         "SELECT u.* FROM sprint_units u "
         "JOIN documents d ON d.document_id=u.sprint_doc_id "
@@ -759,13 +586,6 @@ def live_expectations(con) -> list[Expectation]:
         "ORDER BY u.sprint_doc_id, u.unit_id",
         TERMINAL_UNIT_STATES,
     ).fetchall()
-    doc_ids = sorted(
-        set(planner_doc_ids)
-        | {_row(unit, "sprint_doc_id") for unit in units}
-    )
-    if not doc_ids:
-        return []
-
     shell_ids = {
         shell_id
         for unit in units
@@ -775,19 +595,6 @@ def live_expectations(con) -> list[Expectation]:
         )
         if shell_id is not None
     }
-    marks = ",".join("?" for _ in doc_ids)
-    bindings = con.execute(
-        "SELECT b.sprint_doc_id, b.planner_shell_id "
-        "FROM sprint_planner_bindings b "
-        "WHERE b.binding_id=("
-        " SELECT MAX(b2.binding_id) FROM sprint_planner_bindings b2 "
-        " WHERE b2.sprint_doc_id=b.sprint_doc_id"
-        f") AND b.sprint_doc_id IN ({marks}) "
-        "ORDER BY b.sprint_doc_id",
-        doc_ids,
-    ).fetchall()
-    shell_ids.update(_row(row, "planner_shell_id") for row in bindings)
-
     if not shell_ids:
         return []
     shell_marks = ",".join("?" for _ in shell_ids)
@@ -801,22 +608,6 @@ def live_expectations(con) -> list[Expectation]:
     }
 
     expectations: list[Expectation] = []
-    for binding in bindings:
-        shell_id = _row(binding, "planner_shell_id")
-        shell = shells.get(shell_id)
-        if shell is None:
-            continue
-        expectations.append(
-            Expectation(
-                sprint_doc_id=_row(binding, "sprint_doc_id"),
-                unit_id=None,
-                seq=None,
-                role="planner",
-                shell_id=shell_id,
-                shell=shell,
-                unit=None,
-            )
-        )
     for unit in units:
         for role, column in (
             ("dev", "dev_shell_id"),
@@ -1267,9 +1058,8 @@ class Poller(threading.Thread):
                             self.last_reconciliation,
                         )
                         try:
-                            # Commit the reconciliation writes and its liveness
-                            # proof together. A failure before this point leaves
-                            # no fresh beat claiming the tick completed.
+                            # The transitional sink writes nothing; the beat is
+                            # still the proof that evidence collection ran.
                             beat(
                                 con,
                                 self._reconcile_interval,

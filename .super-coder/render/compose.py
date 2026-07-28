@@ -104,8 +104,8 @@ MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 #
 # So the remedy is not a better sentence. The boot doc is the one artifact the
 # harness is guaranteed to read, and this section is a function of `sprint_units`
-# and the planner binding: a task row cannot grant it, and a missing task row
-# cannot withhold it. The planner is removed from the path.
+# alone: a task row cannot grant it, and a missing task row cannot withhold it.
+# The planner and the retired Interface binding are removed from the path.
 # Stated inline rather than referenced, because the failure mode is precisely a
 # skill body that never loads. This renders as prose in a document every harness
 # reads, so it survives a harness with no skill mechanism at all.
@@ -126,26 +126,15 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     """Every sprint role `shell_id` holds right now, read fresh from the record
     — never cached, so a role changed since the last boot resolves correctly.
 
-    Returns a list of `{doc_id, doc_title, role, units}` — planner entries
-    first, then the dev/reviewer ones in `unit_id` order (so whichever role's
-    lowest unit_id comes first, NOT dev-before-reviewer); `units` within an
-    entry are in `unit_id` order too, which is the order the planner wrote the
-    board. Empty means no section renders. A shell with roles in two sprints
-    gets an entry per (sprint, role) — every one is named, because silently
-    choosing one is the failure this unit removes.
+    Returns a list of `{doc_id, doc_title, role, units}` for dev/reviewer
+    assignments in `unit_id` order. Empty means no section renders. A shell
+    with roles in two sprints gets an entry per (sprint, role) — every one is
+    named, because silently choosing one is the failure this unit removes.
 
-    THE PLANNER IS RESOLVED FROM THE LATEST BINDING, ARMED OR RELEASED. The
-    spec said "the armed binding", and that predicate is anti-correlated with
-    the need: `_arm_binding` refuses unless the planner already has an
-    `occupied` Interface session, so the session being booted cannot have a
-    binding yet, and the previous one is generation-bound and released when
-    that generation ends (`interface_recovery`). Under the armed reading the
-    directive renders only when recovery lags — a race, not a record. The
-    latest binding names who the sprint's planner IS; the LIVE predicate below
-    is what retires it. Same definition as `interface_routes._board_writer`
-    minus the armed filter, so the two cannot disagree about whose sprint it
-    is. (Reported to the planner as an ambiguity call before build; adopted in
-    PLN1 messages #2257 / #2263.)
+    Planner identity is deliberately absent during Conductor decoupling. It
+    used to come from `sprint_planner_bindings`, an Interface wake table that
+    is no longer runtime truth. Step 7's explicit `--slot plan --sprint …`
+    launch makes planner context deterministic without resurrecting a binding.
 
     LIVENESS IS STRUCTURED, NEVER THE BODY'S PROSE — `documents.frozen` plus
     `sprint_units` rows, never the `status: ACTIVE` line. Regex-matching
@@ -154,26 +143,9 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     reintroducing it here would have the boot render and the reconciler
     disagreeing the moment someone reformats a line.
 
-    BUT THE TWO ROLES DO NOT SHARE ONE PREDICATE, and collapsing them was
-    flag_id 231 (my first cut did, on the planner's own instruction; the
-    planner withdrew it):
-
-    - dev / reviewer: `frozen = 0` AND a NON-TERMINAL row of their own. Same
-      pair as the reconciler's trigger, which likewise should not watch a
-      sprint with no live units.
-    - planner: `frozen = 0` AND ANY unit row at all. Every step of close-out —
-      the pre-freeze conformance pass, `status: CLOSED`, the freeze, the
-      participant messages, the watch-retirement sweep, the sprint report, the
-      flag and roadmap bookkeeping — happens AFTER the last unit reaches
-      `merged` and BEFORE the doc is frozen. A non-terminal gate would delete
-      the planner's directive at the exact moment its longest and most
-      procedure-heavy phase begins. So the planner retires on the freeze alone,
-      which is the participant skills' revocation predicate — the two surfaces
-      cannot disagree about when a sprint ends.
-
-    Consequence, decided rather than discovered: at a sprint's very first boot
-    no unit rows exist yet, so the planner gets no directive — correct, since
-    the planner is the shell CREATING those rows.
+    A dev/reviewer role is `frozen = 0` plus a non-terminal row of its own.
+    The same pair drives the worker reconciler, so boot and monitoring cannot
+    disagree about whether an assignment is live.
 
     Returns `[]` when `sprint_units` DOES NOT EXIST — a floor that has not
     applied migration 0098 has no such table, which was the state of this
@@ -190,26 +162,7 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='sprint_units'").fetchone():
         return []
-    # `sprint_planner_bindings` needs no check of its own: it arrived in
-    # migration 0078 and `sprint_units` in 0098, so units-present implies
-    # bindings-present on any floor that can reach this line.
     placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
-    planner_docs = con.execute(
-        "SELECT b.sprint_doc_id, d.title FROM sprint_planner_bindings b "
-        "JOIN documents d ON d.document_id = b.sprint_doc_id "
-        "WHERE b.binding_id = (SELECT MAX(b2.binding_id) "
-        "                      FROM sprint_planner_bindings b2 "
-        "                      WHERE b2.sprint_doc_id = b.sprint_doc_id) "
-        "  AND b.planner_shell_id = ? AND d.frozen = 0 "
-        # ANY row, not a non-terminal one — see the predicate split above.
-        "  AND EXISTS (SELECT 1 FROM sprint_units u "
-        "              WHERE u.sprint_doc_id = b.sprint_doc_id) "
-        "ORDER BY b.sprint_doc_id",
-        (shell_id,)).fetchall()
-    for doc_id, title in planner_docs:
-        entries.append({"doc_id": doc_id, "doc_title": title,
-                        "role": "planner", "units": []})
-
     rows = con.execute(
         "SELECT u.sprint_doc_id, d.title, u.seq, u.unit_title, "
         "       u.dev_shell_id, u.reviewer_shell_id "
@@ -245,18 +198,14 @@ def render_sprint_directive(con, shell_id: int) -> str:
         return ""
     lines = [
         "You hold sprint work. This section is resolved from the RECORD at "
-        "every boot — the board's `sprint_units` rows and the planner binding "
-        "define the standing role independently of message wording.",
+        "every boot — the board's `sprint_units` rows define the standing "
+        "worker role independently of message wording.",
         "",
     ]
     for e in entries:
         sprint = f"**Sprint doc {e['doc_id']}**"
         if e["doc_title"]:
             sprint += f" — {e['doc_title']}"
-        if e["role"] == "planner":
-            lines.append(f"- {sprint}: you are the **PLANNER**. Invoke the "
-                         "`sprint_orchestration` skill.")
-            continue
         units = ", ".join(f"`{seq}` ({title})" for seq, title in e["units"])
         slot = "dev" if e["role"] == "dev" else "reviewer"
         skill = "sprint_dev" if e["role"] == "dev" else "sprint_review"

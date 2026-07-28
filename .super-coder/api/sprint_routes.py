@@ -40,7 +40,6 @@ from sprint_units import SPRINT_UNIT_EDGES  # noqa: E402
 from sprint_units import SprintTransitionError  # noqa: E402
 from sprint_units import TERMINAL_UNIT_STATES as _TERMINAL_UNIT_STATES  # noqa: E402,E501
 from sprint_units import UNIT_STATES as _UNIT_STATES  # noqa: E402
-from sprint_units import board_writer as _board_writer  # noqa: E402
 from sprint_units import check_transition as _check_transition  # noqa: E402
 
 IDEM_TTL_S = 24 * 3600
@@ -337,23 +336,15 @@ def _may_write_board(con, actor, sprint_doc_id: int):
     value is the disagreement. Returns an error tuple, or None to allow."""
     if actor.kind != "shell":
         return None                       # the operator owns everything
-    bound = _board_writer(con, sprint_doc_id)
-    if bound is not None:
-        if actor.shell_id == bound:
-            return None
-        return _err(403, "not_the_planner",
-                    f"sprint {sprint_doc_id} is bound to planner shell "
-                    f"{bound} — only it writes this board; workers work and "
-                    "message, and the planner moves the board")
     flavor = con.execute(
         "SELECT flavor FROM shells WHERE shell_id=?",
         (actor.shell_id,)).fetchone()
     if flavor is not None and flavor[0] == "planner":
         return None
     return _err(403, "not_the_planner",
-                f"sprint {sprint_doc_id} has no armed binding and shell "
-                f"{actor.shell_id} is not a planner — only a planner writes "
-                "the board")
+                f"shell {actor.shell_id} is not a planner — only a planner "
+                f"writes sprint {sprint_doc_id}'s board; workers work and "
+                "message, and a planner moves the board")
 
 
 def _resolve_shell(con, value):
@@ -502,12 +493,11 @@ def _emit_assignment_notice(con, actor, doc_id: int, seq: str,
         return 0
     body = (f"sprint {doc_id} unit {seq} assignment change: "
             + _role_phrase(con, before, after))
-    # from_shell_id is NOT NULL and the operator carries no shell, so the
-    # sender falls back to the sprint's planner (the shell whose belief this
-    # is) and finally to the recipient itself — the same self-addressing
-    # pr_poller.py uses for daemon-emitted rows. No synthetic shell is minted.
+    # from_shell_id is NOT NULL and the operator carries no shell, so an
+    # operator-authored notice self-addresses at each recipient. A shell write
+    # names its actual actor; no retired binding is consulted and no synthetic
+    # planner is minted.
     sender = actor.shell_id if actor.kind == "shell" else None
-    sender = sender if sender is not None else _board_writer(con, doc_id)
     for shell_id in live:
         con.execute(
             "INSERT INTO shell_messages "
