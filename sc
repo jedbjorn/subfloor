@@ -1313,6 +1313,8 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
+  # STEP2(conductor): delete the retired interface dispatches after enter is
+  # repointed at direct boot.
   # Interface pane entrypoint (internal; spec #20) — consumes the single-use
   # launch token the API wrote, then becomes the shell's harness TUI.
   interface-exec)  exec "$PY" "$S/interface_exec.py" "$@" ;;
@@ -1467,6 +1469,7 @@ case "$cmd" in
     # no host watch-daemon is started here anymore.
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
+  # STEP2(conductor): repoint enter/enter-* at direct `sc boot`.
   # Interactive entry goes through the Interface API (spec #20): the in-container
   # target resolves occupancy, starts a New chat (picker + reservation) for an
   # available shell, or reattaches the occupied generation. Never a raw boot.

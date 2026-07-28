@@ -28,6 +28,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
@@ -86,6 +87,36 @@ def _host_ok(headers) -> bool:
     else:
         host = host.rsplit(":", 1)[0] if ":" in host else host
     return host in _ALLOWED_HOST_SET
+
+
+def _same_origin_as_host(origin: str, host: str) -> bool:
+    """A browser Origin must name this request's exact HTTP(S) authority."""
+    parsed = urlparse(origin)
+    return (
+        parsed.scheme in ("http", "https")
+        and not (
+            parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        )
+        and parsed.netloc == host
+    )
+
+
+def _mutation_site_ok(headers) -> bool:
+    """Keep hostile web origins outside the no-token operator boundary.
+
+    Host fencing stops DNS rebinding, but it does not stop a foreign page
+    from sending a request directly to 127.0.0.1. Origin and Fetch Metadata
+    are browser-controlled, so shell curl/API calls may omit them while a
+    browser mutation must prove it is same-origin.
+    """
+    origin = headers.get("Origin")
+    if origin and not _same_origin_as_host(
+            origin, headers.get("Host") or ""):
+        return False
+    return headers.get("Sec-Fetch-Site") in (None, "same-origin", "none")
 
 
 # ------------------------------------------------------------------ authority
@@ -759,7 +790,6 @@ def _patch_sprint_unit(actor, headers, body):
 # ------------------------------------------------------------------ dispatch
 
 def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
-    from urllib.parse import parse_qs, urlparse
     headers = _parse_headers(headers_raw)
     if not _host_ok(headers):
         return _err(403, "host_not_allowed",
@@ -777,6 +807,10 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
     if actor is None:
         return _err(401, "unauthorized",
                     "the presented Bearer token matches no shell")
+    if method in ("POST", "DELETE", "PATCH", "PUT") \
+            and not _mutation_site_ok(headers):
+        return _err(403, "not_same_origin",
+                    "cross-site board mutation rejected")
     if p == "/api/sprint-units" and method == "GET":
         return _sprint_units(actor, query)
     if p == "/api/sprint-units" and method == "POST":

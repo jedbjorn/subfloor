@@ -78,6 +78,8 @@ PER_INSTANCE_TABLES = [
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
+    # STEP2(conductor): drop the five retired interface_* audit tables from
+    # this serialization surface; Step 4 owns wake-table drain/retirement.
     # ── Interface (spec #20, 0078) — durable audit only. Live rows are
     # row-filtered OUT (SNAPSHOT_ROW_FILTERS below): snapshot may run while a
     # chat is live, and rebuild/update refuse while any live state exists, so

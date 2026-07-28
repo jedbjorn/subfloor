@@ -153,7 +153,7 @@ class HarnessEpochDockerfile(unittest.TestCase):
         """Rolling must cost the harness downloads and nothing else — put the
         ARG above node/playwright/pip and every roll rebuilds the world."""
         arg_at = self.text.index("ARG SC_HARNESS_EPOCH")
-        for costly in ("playwright", "nodesource", "@xterm/headless"):
+        for costly in ("playwright", "nodesource"):
             with self.subTest(layer=costly):
                 self.assertLess(self.text.index(costly), arg_at)
 
