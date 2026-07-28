@@ -50,6 +50,7 @@ IGNORE = shutil.ignore_patterns(
 # holds becomes a file only that checkout's render-check can produce.
 SENTINEL_MIGRATION = "9999_worktree_sentinel.sql"
 SENTINEL_SKILL = "wt-sentinel-skill"
+ENGINE_PIN = "1234567890abcdef1234567890abcdef12345678"
 SENTINEL_SQL = (
     "INSERT INTO skills (name, description, content, common, is_deleted) "
     f"VALUES ('{SENTINEL_SKILL}', 'present only in the linked worktree', "
@@ -64,6 +65,18 @@ def run_sc(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     env.pop("SC_PYTHON", None)
     return subprocess.run(
         [str(cwd / "sc"), *args],
+        cwd=str(cwd), capture_output=True, text=True, timeout=600,
+        check=False, env=env)
+
+
+def run_bare_sc(cwd: Path, live_root: Path,
+                *args: str) -> subprocess.CompletedProcess:
+    """Drive the canonical launcher contract run.py gives every shell."""
+    env = dict(os.environ)
+    env.pop("SC_PYTHON", None)
+    env["PATH"] = f"{live_root}:{env['PATH']}"
+    return subprocess.run(
+        ["sc", *args],
         cwd=str(cwd), capture_output=True, text=True, timeout=600,
         check=False, env=env)
 
@@ -123,6 +136,9 @@ class WorktreeFixture(unittest.TestCase):
         # whole spec is about.
         cls.live_db = cls.main / ".super-coder" / "shell_db.db"
         make_live_db(cls.live_db, cls.main / ".super-coder")
+        state = cls.main / ".sc-state"
+        state.mkdir()
+        (state / "engine.ref").write_text(ENGINE_PIN + "\n")
         backups = cls.main / ".super-coder" / "backups"
         backups.mkdir(exist_ok=True)
         (backups / "shell_db.prerebuild.20260101_000000.db").write_bytes(b"old-backup")
@@ -358,6 +374,41 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         done = run_sc(self.wt, "map-sql", "SELECT who FROM map_marker;")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("LIVE-MAP-DB", done.stdout)
+
+    def test_engine_ref_from_the_worktree_reads_the_full_live_pin(self):
+        done = run_sc(self.wt, "engine-ref")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, ENGINE_PIN + "\n")
+        self.assertEqual(done.stderr, "")
+
+    def test_bare_sc_works_when_the_worktree_launcher_is_absent(self):
+        launcher = self.wt / "sc"
+        absent = self.wt / "sc.absent"
+        launcher.rename(absent)
+        try:
+            self.assertFalse(launcher.exists())
+            sprint = run_bare_sc(self.wt, self.main, "sprint", "--help")
+            pin = run_bare_sc(self.wt, self.main, "engine-ref")
+        finally:
+            absent.rename(launcher)
+        self.assertEqual(sprint.returncode, 0, sprint.stderr)
+        self.assertIn("usage:", sprint.stdout)
+        self.assertEqual(pin.returncode, 0, pin.stderr)
+        self.assertEqual(pin.stdout, ENGINE_PIN + "\n")
+
+    def test_engine_ref_refuses_a_missing_or_malformed_live_pin(self):
+        path = self.main / ".sc-state" / "engine.ref"
+        for bad in (None, "short-pin\n", "g" * 40 + "\n"):
+            with self.subTest(bad=bad):
+                if bad is None:
+                    path.unlink()
+                else:
+                    path.write_text(bad)
+                done = run_sc(self.wt, "engine-ref")
+                self.assertEqual(done.returncode, 1)
+                self.assertEqual(done.stdout, "")
+                self.assertIn(str(path), done.stderr)
+                path.write_text(ENGINE_PIN + "\n")
 
 
 class StandaloneRootTest(unittest.TestCase):

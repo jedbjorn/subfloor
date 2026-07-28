@@ -1,13 +1,13 @@
 ---
 name: issue_reporting
-description: Report engine defects upstream — the moment a ./sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo's app bugs stay in the fork.
+description: Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo's app bugs stay in the fork.
 category: substrate
 common: true
 ---
 
 # issue_reporting — the backwards flow
 
-An engine defect fixed upstream reaches every fork via `./sc update`; worked
+An engine defect fixed upstream reaches every fork via `sc update`; worked
 around silently, every fork re-derives the workaround. File the issue while
 the failure is on screen — NEVER batch to session end.
 
@@ -18,7 +18,7 @@ or hand-patching state to proceed -> you hold the exact repro; file it now.
 
 | Where | What |
 |---|---|
-| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `./sc update` + migrations, the `_sc` API + `sc mem` |
+| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `sc update` + migrations, the `_sc` API + `sc mem` |
 | **Fork — don't** | the repo's app code, fork-local skills (see `local_skill_management`), operator-owned host config |
 
 Unsure -> "would the same problem hit any other fork?" yes = upstream.
@@ -30,28 +30,28 @@ Match the left column -> file.
 
 | You hit | Real case |
 |---|---|
-| A `./sc` command fails out of the box | `./sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
-| A command exits green without doing the work | `./sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
-| The documented remedy is a closed loop | `./sc lint` said "run `./sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
+| A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
+| A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
+| The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
 | A skill instructs tools/paths your seat doesn't have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400'd standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404'd advancing its status (#224) |
 | Every write suddenly 401s | rebuild didn't re-mint api_keys — all live shells locked out until an API bounce (#214) |
-| `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
-| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `./sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
+| `sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
+| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
 | The sandbox can reach something it shouldn't | `do_push` src/dest weren't contained — sandbox→host escape (#228) |
 
 Stale guidance (skill says X, engine does Y) files the same as a crash.
 
 ## Capture — while the failure is on screen
 
-- **engine ref** = `cat .sc-state/engine.ref` — first line of every report
+- **engine ref** = `sc engine-ref` — first line of every report
 - **staleness** = compare that ref to upstream head:
   `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
   `current` or `behind head <sha7>`. Behind + the symptom is a missing
   command or a skill/engine mismatch -> the fix may already be shipped:
-  ask your FnB for `./sc update` first, and file only if the defect
+  ask your FnB for `sc update` first, and file only if the defect
   survives the update (or updating isn't an option — then the staleness
   note carries that caveat). Triage reads this line to tell a live
   engine defect from a stale fork build.

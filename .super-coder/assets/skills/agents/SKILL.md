@@ -60,7 +60,7 @@ procedure solo; at most spawn one adversarial skeptic against your own diff
    reaching for isolation — it has real costs. Reviewer/checker agents are
    read-only; no isolation needed.
 4. **Agent claims are inputs, not results.** Re-run the real check yourself
-   — `./sc test`, lint, the spec's done-condition — before marking anything
+   — `sc test`, lint, the spec's done-condition — before marking anything
    done. "Agent says tests pass" is not verification. Diffs: pull them
    yourself (`git -C <worktree> diff`); NEVER adjudicate pasted diffs or
    pasted test output — pastes are lossy and unverifiable.

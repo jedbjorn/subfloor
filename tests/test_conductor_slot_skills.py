@@ -137,14 +137,14 @@ class FreshCatalogueTest(unittest.TestCase):
         for skill_name, (flavor, expected) in SLOT_KINDS.items():
             body = (SKILLS / skill_name / "SKILL.md").read_text()
             emitted = set(re.findall(
-                r"\./sc directives emit ([a-z-]+)", body))
+                r"\bsc directives emit ([a-z-]+)", body))
             self.assertEqual(emitted, expected, skill_name)
             self.assertTrue(
                 {(flavor, kind) for kind in emitted} <= allowed,
                 skill_name,
             )
             command_count = len(re.findall(
-                r"\./sc directives emit [a-z-]+", body))
+                r"\bsc directives emit [a-z-]+", body))
             self.assertEqual(
                 body.count("--target conductor"),
                 command_count,

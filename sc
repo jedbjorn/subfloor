@@ -1190,6 +1190,22 @@ case "$cmd" in
                 exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
+  engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
+                if [ ! -r "$sc_engine_ref_path" ]; then
+                  echo "✗ sc engine-ref: no readable engine pin at $sc_engine_ref_path" >&2
+                  exit 1
+                fi
+                IFS= read -r sc_engine_ref < "$sc_engine_ref_path" || true
+                case "$sc_engine_ref" in
+                  ""|*[!0-9a-f]*)
+                    echo "✗ sc engine-ref: invalid engine pin at $sc_engine_ref_path" >&2
+                    exit 1 ;;
+                esac
+                if [ "${#sc_engine_ref}" -ne 40 ]; then
+                  echo "✗ sc engine-ref: invalid engine pin at $sc_engine_ref_path" >&2
+                  exit 1
+                fi
+                printf '%s\n' "$sc_engine_ref" ;;
   sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
   directives)   exec "$PY" "$S/conductor_contracts.py" directives "$@" ;;
   events)       exec "$PY" "$S/conductor_contracts.py" events "$@" ;;
@@ -1587,6 +1603,8 @@ super-coder — forkable shell substrate
                              rotates; a missing/unreadable/insecure artifact refuses on stderr with the service
                              action (`./sc restart` / `make dos-r`). A recovery path — the browser attaches its
                              own credential, so pasting a token by hand is no longer the everyday sign-in
+  sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
+                             worktree; stdout is the 40-character SHA only
   ./sc sprint unit <cmd>   the sprint board, as a record: add declares a unit (--sprint/--seq/--title, plus
                              --dev/--reviewer/--depends-on/--overlap/--branch/--pr; an existing seq is a 409,
                              never an upsert); set edits those fields but NOT state; state <s> moves one unit alone

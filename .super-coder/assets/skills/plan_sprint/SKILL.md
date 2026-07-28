@@ -1,6 +1,6 @@
 ---
 name: plan_sprint
-description: Decide and direct one ephemeral Conductor planner slot. Decompose a declared sprint, assign models and units, rule on questions or sentinel evidence, re-scope or re-task work, launch close-time conformance, and close only after the integrated result passes. Load only from `./sc run <planner> --slot plan --sprint <id>`.
+description: Decide and direct one ephemeral Conductor planner slot. Decompose a declared sprint, assign models and units, rule on questions or sentinel evidence, re-scope or re-task work, launch close-time conformance, and close only after the integrated result passes. Load only from `sc run <planner> --slot plan --sprint <id>`.
 category: craft
 common: false
 ---
@@ -17,9 +17,9 @@ Read the mandatory slot section and the relayed prompt. Confirm the sprint,
 unit IDs, dependencies, assignments, and current states:
 
 ```sh
-./sc sprint board --sprint <doc-id>
-./sc directives list --status pending --sprint <doc-id>
-./sc mem get documents --doc <doc-id>
+sc sprint board --sprint <doc-id>
+sc directives list --status pending --sprint <doc-id>
+sc mem get documents --doc <doc-id>
 ```
 
 Treat the boot section's numeric unit ID as the `--unit` value. Treat `U1` as
@@ -53,7 +53,7 @@ units whose dependencies are satisfied.
 Emit each released assignment to the Conductor:
 
 ```sh
-./sc directives emit kickoff \
+sc directives emit kickoff \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -71,7 +71,7 @@ guess.
 Answer a worker:
 
 ```sh
-./sc directives emit answer \
+sc directives emit answer \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -81,7 +81,7 @@ Answer a worker:
 Hold unsafe progress:
 
 ```sh
-./sc directives emit hold \
+sc directives emit hold \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -91,13 +91,13 @@ Hold unsafe progress:
 Re-task the same outcome or re-scope the outcome itself:
 
 ```sh
-./sc directives emit re-task \
+sc directives emit re-task \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
   --payload '{"to":"DEV1","instruction":"<replacement execution path>","reason":"<evidence>"}'
 
-./sc directives emit re-scope \
+sc directives emit re-scope \
   --target conductor \
   --sprint <doc-id> \
   --unit <numeric-unit-id> \
@@ -114,7 +114,7 @@ integrated SHA, full requirement scope, and complete ratified-deviation list.
 Conformance uses `rev_sprint` without a unit focus.
 
 ```sh
-./sc directives emit kickoff \
+sc directives emit kickoff \
   --target conductor \
   --sprint <doc-id> \
   --payload '{"to":"REV1","mode":"conformance","main_sha":"<sha>","scope":"all requirements","ratified_deviations":[],"model":"<approved route>"}'
@@ -123,7 +123,7 @@ Conformance uses `rev_sprint` without a unit focus.
 After a clean conformance directive, emit:
 
 ```sh
-./sc directives emit close \
+sc directives emit close \
   --target conductor \
   --sprint <doc-id> \
   --payload '{"main_sha":"<sha>","conformance_directive_id":84,"summary":"<shipped outcome>"}'
@@ -134,7 +134,7 @@ required checks, or missing conformance.
 
 ## Exit gate
 
-Read back the emitted directive ID with `./sc directives inspect <id>`.
+Read back the emitted directive ID with `sc directives inspect <id>`.
 
 **Planner completion:** every requested decision is represented by a valid
 planner directive addressed to `conductor`; no shell was booted, no board row
