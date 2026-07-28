@@ -208,13 +208,53 @@ def render_sprint_directive(con, shell_id: int) -> str:
             sprint += f" — {e['doc_title']}"
         units = ", ".join(f"`{seq}` ({title})" for seq, title in e["units"])
         slot = "dev" if e["role"] == "dev" else "reviewer"
-        skill = "sprint_dev" if e["role"] == "dev" else "sprint_review"
+        skill = "dev_sprint" if e["role"] == "dev" else "rev_sprint"
         lines.append(f"- {sprint}: you are the **{slot.upper()}** for {units}. "
                      f"Invoke the `{skill}` skill.")
     if len(entries) > 1:
         lines.append("")
         lines.append("**Act on every role listed above.**")
     return "\n".join(lines + ["", PARTICIPANT_RULES])
+
+
+def render_slot_directive(context: "dict | None") -> str:
+    """Render one launcher-validated slot plus its complete role skill."""
+    if context is None:
+        return ""
+    title = context.get("sprint_title") or "(untitled sprint)"
+    lines = [
+        "This ephemeral session has one launcher-validated role. Execute only "
+        "this slot and finish by emitting the directive required by its loaded "
+        "skill.",
+        "",
+        f"- **Slot:** `{context['slot']}`",
+        f"- **Sprint:** document `{context['sprint_doc_id']}` — {title}",
+        f"- **Loaded skill:** `{context['skill_name']}`",
+        "",
+        "### Kickoff context",
+        "",
+    ]
+    for unit in context["units"]:
+        detail = (
+            f"`{unit['seq']}` (unit id `{unit['unit_id']}`) — "
+            f"{unit['unit_title']} · state `{unit['state']}`"
+        )
+        if unit.get("depends_on"):
+            detail += f" · depends on {unit['depends_on']}"
+        if unit.get("branch"):
+            detail += f" · branch `{unit['branch']}`"
+        if unit.get("pr_number"):
+            detail += f" · PR #{unit['pr_number']}"
+        lines.append(f"- {detail}")
+        if unit.get("overlap"):
+            lines.append(f"  - overlap: {unit['overlap']}")
+    lines.extend([
+        "",
+        f"### Loaded skill — {context['skill_name']}",
+        "",
+        context["skill_body"].strip(),
+    ])
+    return "\n".join(lines)
 
 
 def open_map_ro() -> "sqlite3.Connection | None":
@@ -442,7 +482,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  floor_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
-                 source_mode: bool = False) -> str:
+                 source_mode: bool = False,
+                 slot_context: "dict | None" = None) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -556,9 +597,16 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     # appends: it is this session's standing orders, and the whole unit exists
     # because a worker missed the context it was operating in. Empty for a
     # shell with no sprint role — the section is mandatory, never unconditional.
-    sprint_directive = render_sprint_directive(con, shell_id)
-    sprint_block = (["## SPRINT DIRECTIVE — MANDATORY", "", sprint_directive,
-                     "", "---", ""] if sprint_directive else [])
+    slot_directive = render_slot_directive(slot_context)
+    sprint_directive = (
+        "" if slot_directive else render_sprint_directive(con, shell_id)
+    )
+    sprint_block = (
+        ["## SLOT DIRECTIVE — MANDATORY", "", slot_directive, "", "---", ""]
+        if slot_directive
+        else (["## SPRINT DIRECTIVE — MANDATORY", "", sprint_directive,
+               "", "---", ""] if sprint_directive else [])
+    )
 
     parts = [
         template,

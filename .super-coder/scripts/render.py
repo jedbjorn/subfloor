@@ -59,9 +59,10 @@ def _heal_fresh(con) -> None:
 
 def _report(label: str, summary: dict) -> None:
     w, s = len(summary["written"]), len(summary["skipped"])
-    print(f"render {label}: {w} written, {s} unchanged")
+    print(f"render {label}: {w} changed, {s} unchanged")
     for p in summary["written"]:
-        print(f"  + {p.relative_to(flat.REPO_ROOT)}")
+        marker = "+" if p.exists() else "-"
+        print(f"  {marker} {p.relative_to(flat.REPO_ROOT)}")
 
 
 def main(argv: list[str]) -> int:

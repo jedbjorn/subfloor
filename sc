@@ -1596,8 +1596,9 @@ super-coder — forkable shell substrate
                              'none' clears a role or field (--pr -1)
   ./sc sprint board        render the unit table from the record and print it (--sprint <doc-id>) — a VIEW,
                              never written back into the document body; the doc keeps its prose
-                             During Conductor decoupling, boot workers explicitly with plain headless
-                             `./sc run <shortname>`; automated sprint coordination arrives with Conductor.
+                             Conductor slots boot explicitly with
+                             `./sc run <shortname> --slot <plan|dev|rev> --sprint <id> [--unit U]`;
+                             launch validates flavor and assignment, then embeds the exact sprint context.
   ./sc directives <cmd>    Conductor directives: list/inspect read the durable queue; emit validates the
                              authenticated shell's flavor against the data whitelist before inserting
   ./sc events <cmd>        sentinel observation log: list/inspect append-only evidence rows
@@ -1648,9 +1649,9 @@ super-coder — forkable shell substrate
   make dos-help            supported operator aliases for lifecycle, models,
                              sprint/watch/job, maintenance, browser token, and generic ./sc forwarding
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
-                             opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
-                             default prompt · --harness <h> · -m <model> (else flavor_defaults);
-                             --effort defaults to high; refuses a shell that already has a live session
+                             opencode · kimi); -p "<prompt>" · --harness <h> · -m <model> · --effort;
+                             Conductor workers add --slot <plan|dev|rev> --sprint <id> [--unit U];
+                             refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services
                              --yes skips the prompt · --no-build preflights/reuses the existing image
