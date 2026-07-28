@@ -1,0 +1,4 @@
+{
+  "mandate": "Maintain a complete source map of super-coder, including `.super-coder/`, `sc`, tests, docs, and tracked state. Detect source-mode drift first; no other shell maps.",
+  "skills_add": ["source-maintenance"]
+}

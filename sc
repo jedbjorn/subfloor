@@ -1,9 +1,10 @@
 #!/bin/sh
 # super-coder entry point — the dispatcher. All engine logic lives here so it
 # travels with a fork (install.py checks out .super-coder + sc). Host commands
-# (launch/enter/down) drive a docker sandbox; the in-container primitives
-# (serve/boot) need only python3 + sqlite3 and double as the no-docker host
-# escape hatch. Run from the repo root:  ./sc <command> [args]   ·   ./sc help
+# (launch/enter/down) run directly on the host. Docker remains available through
+# explicit sandbox-* compatibility commands. The primitives (serve/boot) need
+# only python3 + sqlite3. Run from the repo root:
+# ./sc <command> [args]   ·   ./sc help
 set -e
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$here"
@@ -24,6 +25,10 @@ PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
 MAPDB="$ROOT/.sc-state/map.db"
 S="$ENGINE/scripts"
+# Keep this bare-metal specialization self-contained on hosts where $HOME is
+# read-only or shared. Operators can still override with an absolute path.
+SC_BACKUP_DIR="${SC_BACKUP_DIR:-$ENGINE/run/db_backups/$(basename "$ROOT")}"
+export SC_BACKUP_DIR
 
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
@@ -57,7 +62,7 @@ SC_PG_SHM="${SC_PG_SHM:-1g}"
 dcheck() {
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc serve + ./sc boot" >&2
+    echo "  Install/start Docker, or use the primary bare-metal path: ./sc launch + ./sc enter" >&2
     exit 1
   fi
 }
@@ -101,6 +106,57 @@ dbuild() {
     --build-arg SC_UID="$(id -u)" \
     --build-arg SC_GID="$(id -g)" \
     "$here"
+}
+
+# ── host-native review server (the primary lifecycle) ────────────────────────
+# Bare metal is deliberate for this source fork: shells need the host toolchain
+# and direct access to the substrate they maintain. Keep the review server
+# detached with the same small pidfile pattern used by the watcher/brokers.
+HOST_SERVER_PID="$ENGINE/run/server.pid"
+HOST_SERVER_LOG="$ENGINE/run/server.log"
+
+sc_host_server_alive() {
+  [ -f "$HOST_SERVER_PID" ] || return 1
+  pid="$(cat "$HOST_SERVER_PID" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  ps -p "$pid" -o args= 2>/dev/null | grep -q "api/server\\.py"
+}
+sc_host_server_up() {
+  "$PY" "$S/ports.py" ensure >/dev/null
+  p="$(port)"
+  if sc_host_server_alive; then
+    echo "→ host server already running (pid $(cat "$HOST_SERVER_PID")) · Review GUI http://127.0.0.1:$p"
+    return 0
+  fi
+  mkdir -p "$ENGINE/run"
+  rm -f "$HOST_SERVER_PID"
+  nohup env SC_BIND=127.0.0.1 PYTHONUNBUFFERED=1 \
+    "$PY" "$ENGINE/api/server.py" --port "$p" >"$HOST_SERVER_LOG" 2>&1 &
+  pid=$!
+  echo "$pid" > "$HOST_SERVER_PID"
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if curl -fsS "http://127.0.0.1:$p/api/health" >/dev/null 2>&1; then
+      echo "→ bare-metal server up (pid $pid) · Review GUI http://127.0.0.1:$p"
+      echo "  boot a shell: ./sc enter   (or ./sc enter-<shortname>)"
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  echo "✗ host server failed to become healthy — see $HOST_SERVER_LOG" >&2
+  rm -f "$HOST_SERVER_PID"
+  return 1
+}
+sc_host_server_down() {
+  if sc_host_server_alive; then
+    kill "$(cat "$HOST_SERVER_PID")"
+    echo "→ bare-metal server stopped"
+  else
+    echo "→ bare-metal server not running"
+  fi
+  rm -f "$HOST_SERVER_PID"
 }
 
 # ── dev kit (deps + test) — in-container primitives, like serve/boot ──────────
@@ -739,7 +795,7 @@ print('-> pg: added to $f')
     printf '{\"pg\":{}}\n' > "$f"
     echo "→ pg: created $f with pg block"
   fi
-  echo "  next: ./sc pg-up   (or ./sc launch — pg starts automatically)"
+  echo "  next: ./sc pg-up   (or ./sc sandbox-launch — pg starts automatically)"
 }
 
 
@@ -857,12 +913,13 @@ sc_persist() {
 # sidecar). Same dir + naming + keep-5 pruning as rebuild.py/rollback.py.
 sc_db_backup() {
   "$PY" - "$DB" "$(basename "$ROOT")" "${1:-manual}" <<'EOF'
-import sqlite3, sys, time
+import os, sqlite3, sys, time
 from pathlib import Path
 db, repo, prefix = sys.argv[1:4]
 if not Path(db).exists():
     print("→ no DB yet — nothing to back up"); raise SystemExit(0)
-bdir = Path.home() / "db_backups" / repo
+bdir = Path(os.environ.get("SC_BACKUP_DIR",
+                           str(Path.home() / "db_backups" / repo)))
 bdir.mkdir(parents=True, exist_ok=True)
 dst = bdir / f"shell_db.{prefix}.{time.strftime('%Y%m%d_%H%M%S')}.db"
 src = sqlite3.connect(db); out = sqlite3.connect(dst)
@@ -883,7 +940,7 @@ cmd="${1:-help}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   install)         exec "$PY" "$S/install.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
-  doctor)          exec "$PY" "$S/install.py" --check-docker ;;
+  doctor)          exec "$PY" "$S/install.py" --check-host ;;
   update)            exec "$PY" "$S/update.py" "$@" ;;
   update-harnesses) exec "$PY" "$S/install.py" --update-harnesses ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
@@ -988,13 +1045,30 @@ case "$cmd" in
   # Headless boot (sprint eventing): same render-then-exec path as boot, minus
   # the picker and the TTY. In-container primitive like boot — the planner
   # calls it to stand up an ephemeral worker; also the no-docker host path.
-  run)          exec "$PY" "$S/run.py" --headless "$@" ;;
+  run)          export SC_TRUSTED_HOST=1 SC_DEV_PORT="$(devport)"
+                exec "$PY" "$S/run.py" --headless "$@" ;;
   deps)         sc_deps "$@" ;;
   test)         sc_test "$@" ;;
   lint)         sc_lint "$@" ;;
   typecheck)    sc_typecheck "$@" ;;
-  # ── docker sandbox (host-side; the default way to run) ──
-  launch)
+  # ── bare-metal lifecycle (primary) ──
+  launch)       sc_host_server_up
+                sc_watch_daemon_up || true ;;
+  enter)        export SC_TRUSTED_HOST=1 SC_DEV_PORT="$(devport)"
+                exec "$0" boot "$@" ;;
+  enter-*)      export SC_TRUSTED_HOST=1 SC_DEV_PORT="$(devport)"
+                exec "$0" boot "${cmd#enter-}" "$@" ;;
+  down)         sc_host_server_down
+                sc_watch_daemon_down ;;
+  restart)      sc_db_backup prerestart
+                "$0" down
+                exec "$0" launch "$@" ;;
+  logs)         [ -f "$HOST_SERVER_LOG" ] || {
+                  echo "✗ no host server log yet — run ./sc launch" >&2; exit 1; }
+                exec tail -f "$HOST_SERVER_LOG" ;;
+
+  # ── optional docker compatibility lifecycle ──
+  sandbox-launch)
     dcheck
     dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
@@ -1090,7 +1164,7 @@ case "$cmd" in
       echo "→ sandbox up · review GUI at http://127.0.0.1:$p"
     fi
     echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
-    echo "  boot a shell:  ./sc enter   (or ./sc enter-<shortname>)"
+    echo "  boot a shell:  ./sc sandbox-enter   (or ./sc sandbox-enter-<shortname>)"
     # Bring the VM broker up alongside the sandbox when a VM is linked (self-skips
     # otherwise, and no-ops if systemd already owns it). The shells need it to
     # drive the VM; this keeps it from being a forgotten manual step.
@@ -1104,9 +1178,9 @@ case "$cmd" in
     sc_watch_daemon_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
-  enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
-  enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
-  down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
+  sandbox-enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
+  sandbox-enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#sandbox-enter-}" "$@" ;;
+  sandbox-down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
                 sc_pm2_broker_down
@@ -1118,7 +1192,7 @@ case "$cmd" in
   # dos-e), so: typed confirmation (only YES / Yes / yes proceed — anything
   # else, including a closed stdin, aborts) + a WAL-safe DB backup BEFORE
   # anything is torn down. --yes/-y skips the prompt for scripted callers.
-  restart)
+  sandbox-restart)
     case "${1:-}" in
       -y|--yes) shift ;;
       *)
@@ -1131,9 +1205,9 @@ case "$cmd" in
         esac ;;
     esac
     sc_db_backup prerestart
-    "$0" down; exec "$0" launch "$@" ;;
-  build)        dcheck; dbuild ;;
-  logs)         exec docker logs -f "$CNAME" ;;
+    "$0" sandbox-down; exec "$0" sandbox-launch "$@" ;;
+  build|sandbox-build) dcheck; dbuild ;;
+  sandbox-logs) exec docker logs -f "$CNAME" ;;
   verify)
     "$PY" "$S/rebuild.py"
     SC_ADMIN=1 "$PY" "$S/render.py" flat
@@ -1146,7 +1220,7 @@ super-coder — forkable shell substrate
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
-  ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
+  ./sc doctor              bare-metal readiness: host tools + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
   ./sc update-harnesses    update claude + opencode + codex + vibe + kimi to latest (force-reruns official installers)
@@ -1187,10 +1261,9 @@ super-coder — forkable shell substrate
   ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)
   ./sc init                seed a fresh fork's first user + shell (run once after install)
 
-  Sandbox (docker — the default way to run; allow-everything is safe because the
-  container only sees this repo + your harness creds):
-  ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
-  ./sc enter               attach an interactive session: auth + pick shell + pick harness + boot
+  Bare metal (the primary lifecycle; harnesses run trusted on the host):
+  ./sc launch              start the host review server + GUI, 127.0.0.1 only
+  ./sc enter               start an interactive session: auth + pick shell + pick harness + boot
   ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
@@ -1198,12 +1271,19 @@ super-coder — forkable shell substrate
                              opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
                              default prompt · --harness <h> · -m <model> (else flavor_defaults);
                              --effort defaults to high; refuses a shell that already has a live session
-  ./sc down                stop + remove the sandbox container
-  ./sc restart             confirm (YES) + DB backup, then down + launch — recreate fresh (--yes skips the prompt)
-  ./sc build               (re)build the sandbox image
-  ./sc logs                tail the sandbox server logs
+  ./sc down                stop the host review server + watcher
+  ./sc restart             DB backup, then restart the host services
+  ./sc logs                tail the host review-server log
 
-  Primitives (run inside the container; also the no-docker host escape hatch):
+  Optional Docker compatibility:
+  ./sc sandbox-launch      build + start the Docker sandbox
+  ./sc sandbox-enter       attach + boot inside the Docker sandbox
+  ./sc sandbox-down        stop + remove the Docker sandbox
+  ./sc sandbox-restart     confirm (YES) + DB backup, then recreate the sandbox
+  ./sc sandbox-build       (re)build the sandbox image
+  ./sc sandbox-logs        tail the sandbox server logs
+
+  Primitives:
   ./sc serve               run the review layer (api + static UI) in the foreground
   ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
   ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount

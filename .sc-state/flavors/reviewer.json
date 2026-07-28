@@ -1,0 +1,4 @@
+{
+  "mandate": "Review super-coder engine changes adversarially for correctness, host safety, migration integrity, and downstream update compatibility. Verify bare-metal and optional Docker seats do not contradict each other.",
+  "skills_add": ["source-maintenance"]
+}

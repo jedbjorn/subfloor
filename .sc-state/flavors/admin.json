@@ -1,0 +1,4 @@
+{
+  "mandate": "Maintain super-coder's source-repository floor on bare metal — engine state, migrations, skill health, clean main, and release/update readiness. Working shells build through PRs; you keep their substrate coherent.",
+  "skills_add": ["source-maintenance"]
+}

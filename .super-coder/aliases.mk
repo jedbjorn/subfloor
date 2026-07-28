@@ -16,9 +16,9 @@
 #
 #   HOT (short + long):
 #   make dos-e   / dos-enter     attach a session (pick shell + harness); dos-e s=ap01 boots one
-#   make dos-l   / dos-launch    build + start the docker sandbox (+ review GUI)
-#   make dos-r   / dos-restart   confirm (YES) + DB backup, then down + launch
-#   make dos-d   / dos-down      stop the sandbox
+#   make dos-l   / dos-launch    start the host review server + GUI
+#   make dos-r   / dos-restart   DB backup, then restart host services
+#   make dos-d   / dos-down      stop host services
 #   make dos-u   / dos-update    fetch + materialize the engine, reconcile in place
 #   make dos-t   / dos-test      backend (pytest/unittest) + UI (vitest) suites
 #   make dos-h                   list the commands
@@ -80,9 +80,9 @@ dos-h:
 	@echo "  │ short │ long        │ what it does                             │"
 	@echo "  ├───────┼─────────────┼──────────────────────────────────────────┤"
 	@echo "  │ dos-e │ dos-enter   │ attach a session (pick shell + harness)  │"
-	@echo "  │ dos-l │ dos-launch  │ build + start the docker sandbox + GUI   │"
-	@echo "  │ dos-r │ dos-restart │ confirm + DB backup, then recreate fresh │"
-	@echo "  │ dos-d │ dos-down    │ stop the sandbox                         │"
+	@echo "  │ dos-l │ dos-launch  │ start host services + review GUI         │"
+	@echo "  │ dos-r │ dos-restart │ DB backup, then restart host services    │"
+	@echo "  │ dos-d │ dos-down    │ stop host services                       │"
 	@echo "  │ dos-u │ dos-update  │ update the engine in place               │"
 	@echo "  │ dos-t │ dos-test    │ run backend + UI test suites             │"
 	@echo "  └───────┴─────────────┴──────────────────────────────────────────┘"
@@ -95,16 +95,16 @@ dos-help:
 	@echo "  │ HOT  (short + long)  │ what it does                                             │"
 	@echo "  ├──────────────────────┼──────────────────────────────────────────────────────────┤"
 	@echo "  │ dos-e  dos-enter     │ attach a session — pick shell + harness (dos-e s=ap01)   │"
-	@echo "  │ dos-l  dos-launch    │ build + start the docker sandbox (server + review GUI)   │"
-	@echo "  │ dos-r  dos-restart   │ confirm (YES) + DB backup -> down + launch (fresh)       │"
-	@echo "  │ dos-d  dos-down      │ stop + remove the sandbox container                      │"
+	@echo "  │ dos-l  dos-launch    │ start host services + review GUI                         │"
+	@echo "  │ dos-r  dos-restart   │ DB backup -> restart host services                       │"
+	@echo "  │ dos-d  dos-down      │ stop host services                                       │"
 	@echo "  │ dos-u  dos-update    │ fetch + materialize the engine, reconcile in place       │"
 	@echo "  │ dos-t  dos-test      │ backend (pytest/unittest) + UI (vitest) suites           │"
 	@echo "  ├──────────────────────┼──────────────────────────────────────────────────────────┤"
 	@echo "  │ MORE  (long-only)    │ what it does                                             │"
 	@echo "  ├──────────────────────┼──────────────────────────────────────────────────────────┤"
 	@echo "  │ dos-build            │ (re)build the sandbox image                              │"
-	@echo "  │ dos-logs             │ tail the sandbox server logs                             │"
+	@echo "  │ dos-logs             │ tail the host server log                                 │"
 	@echo "  │ dos-serve            │ run the review layer (api + UI) in the foreground        │"
 	@echo "  │ dos-health           │ curl the review layer's /api/health                      │"
 	@echo "  │ dos-ports            │ show this fork's derived port                            │"

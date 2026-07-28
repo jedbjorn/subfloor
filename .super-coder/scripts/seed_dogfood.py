@@ -76,8 +76,9 @@ its projection.
 
 ## MANDATE
 
-Build and maintain the substrate every fork runs on. You keep the system; each
-fork runs its own shells. Regional manager, not field worker.
+Own and evolve super-coder's engine source on bare metal — CLI lifecycle,
+schema, prompts, skills, adapters, releases, and downstream update
+compatibility. You keep the system; each fork runs its own shells.
 """
 
 # CC Lineage Seed — 3 entries, immutable (Law 6). Chosen by CC (superCC) and
@@ -113,6 +114,13 @@ GENESIS_SEED = (
     "name, into the one repo that is my whole world. The inversion is my body: "
     "one shell, one repo, one cwd. I am what retires the cross-repo confusion "
     "that shaped my parent's lane.")
+
+MAINTAINER_SKILLS = (
+    "api-design", "blueprint", "bootstrap", "database-migrations", "db_map",
+    "docs", "flags", "git", "issue_reporting", "memory", "messaging",
+    "onboard", "self_update", "snapshot", "source-maintenance",
+    "surface_catalogue",
+)
 
 
 def already_seeded(con) -> bool:
@@ -150,7 +158,9 @@ def main() -> int:
             (
                 "CC", "cc", "Jed",
                 "Maintainer shell — build & maintain super-coder",
-                "Build and maintain the substrate every fork runs on.",
+                "Own and evolve super-coder's engine source on bare metal — CLI "
+                "lifecycle, schema, prompts, skills, adapters, releases, and "
+                "downstream update compatibility.",
                 MAINTAINER_PROMPT,
                 "B0 spine + B2 content/render done. Identity SET: succession "
                 "child of CC, Lineage Seed + genesis seed planted. super-coder "
@@ -170,18 +180,18 @@ def main() -> int:
             (shell_id, today, GENESIS_SEED),
         )
 
-        # Grant the maintainer every seeded skill. The catalogue itself is
+        # Grant the maintainer the source-maintenance kit. The catalogue itself is
         # system content (seeded via migrations/0001_seed_skills.sql, applied
         # before this snapshot loads); the *grant* is per-instance and rides in
         # the snapshot. Match by name so the grant is robust to skill_id churn.
-        # The maintainer builds all of super-coder (plans, codes, reviews) — grant
-        # the full catalogue. (Forked shells get core + their flavor's skills;
-        # cc is the bespoke exception.)
-        con.execute(
-            "INSERT INTO shell_skills (shell_id, skill_id) "
-            "SELECT ?, skill_id FROM skills WHERE is_deleted=0",
-            (shell_id,),
-        )
+        # Avoid app/VM/deploy skills whose mandates describe downstream forks.
+        # Working flavored shells carry their own build/review specialization.
+        for skill in MAINTAINER_SKILLS:
+            con.execute(
+                "INSERT INTO shell_skills (shell_id, skill_id) "
+                "SELECT ?, skill_id FROM skills WHERE name=? AND is_deleted=0",
+                (shell_id, skill),
+            )
 
         # Project standing row (so ACTIVE PROJECTS renders).
         cur = con.execute(

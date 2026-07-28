@@ -231,15 +231,27 @@ def apply_merge_json(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
 
 def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     """Sandbox-only: elevate harness permissions to allow-all when booting
-    INSIDE the docker sandbox (SC_SANDBOX, set by `sc launch`'s docker run). The
+    INSIDE the Docker sandbox (SC_SANDBOX, set by `sc sandbox-launch`). The
     container is the safety boundary, so permission prompts inside it are pure
-    friction; the no-docker host escape hatch (`./sc boot` with SC_SANDBOX
-    unset) keeps normal prompts. Each adapter declares sandbox.merge_json:
+    friction; direct `./sc boot` with SC_SANDBOX unset keeps normal prompts.
+    Each adapter declares sandbox.merge_json:
     {repo-relative-path: patch}; we deep-merge the patch into that
     project-scoped file (preserving any keys the fork set)."""
     if not os.environ.get("SC_SANDBOX"):
         return []
     return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {}, root)
+
+
+def apply_trusted_host(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
+    """Apply allow-all config for the explicit bare-metal lifecycle.
+
+    Direct `sc boot` remains conservative unless SC_TRUSTED_HOST is deliberately
+    set by `sc enter` or `sc run`.
+    """
+    if not os.environ.get("SC_TRUSTED_HOST"):
+        return []
+    return _merge_json_spec(
+        (adapter.get("trusted_host") or {}).get("merge_json") or {}, root)
 
 
 def ensure_worktree(work_dir: Path, shortname: str) -> None:
@@ -1045,6 +1057,7 @@ def main() -> None:
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
                                source_mode=install.is_source_repo(),
+                               sandbox_mode=bool(os.environ.get("SC_SANDBOX")),
                                api_key=full["api_key"],
                                api_port=api_port)
 
@@ -1122,10 +1135,13 @@ def main() -> None:
     sandboxed = apply_sandbox(adapter, work_dir)
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
+    trusted = apply_trusted_host(adapter, work_dir)
+    if trusted:
+        print(f"→ bare metal: trusted permissions → {', '.join(trusted)}")
 
-    # Sandbox-only launch flags — e.g. codex's approval/sandbox bypass, safe
-    # because the container is the safety boundary. The no-docker host path keeps
-    # the harness's normal prompts (SC_SANDBOX unset). The two flag sets are
+    # Execution-mode launch flags. Bare-metal entry is trusted by explicit
+    # operator choice; direct `sc boot` keeps the harness's normal prompts. The
+    # two flag sets are
     # disjoint by launch mode: `launch_flags` for interactive, `headless_flags`
     # for headless — a non-interactive run can't answer a permission prompt (it
     # auto-denies and the worker silently stalls), so e.g. claude gets its bypass
@@ -1133,20 +1149,27 @@ def main() -> None:
     # together because a harness's interactive flag can be invalid headless —
     # `kimi -p` hard-errors on `--yolo`/`--auto` (prompt mode is always
     # auto-permission, no flag needed).
-    sandbox_flags: list[str] = []
-    sandbox_env: dict[str, str] = {}
+    mode_flags: list[str] = []
+    mode_env: dict[str, str] = {}
+    mode_name = ""
+    mode_cfg: dict = {}
     if os.environ.get("SC_SANDBOX"):
-        scfg = adapter.get("sandbox") or {}
+        mode_name = "sandbox"
+        mode_cfg = adapter.get("sandbox") or {}
+    elif os.environ.get("SC_TRUSTED_HOST"):
+        mode_name = "bare metal"
+        mode_cfg = adapter.get("trusted_host") or {}
+    if mode_cfg:
         key = "headless_flags" if headless else "launch_flags"
-        sandbox_flags = list(scfg.get(key) or [])
-        if sandbox_flags:
-            print(f"→ sandbox: launch flags → {' '.join(sandbox_flags)}")
+        mode_flags = list(mode_cfg.get(key) or [])
+        if mode_flags:
+            print(f"→ {mode_name}: launch flags → {' '.join(mode_flags)}")
         # Sandbox-only launch env — e.g. claude's IS_SANDBOX=1, required because
         # the rootless container runs the harness as uid 0 and claude refuses
         # bypass-permissions mode as root unless the env marks it as sandboxed.
-        sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
-        if sandbox_env:
-            print(f"→ sandbox: launch env → {' '.join(sandbox_env)}")
+        mode_env = {k: str(v) for k, v in (mode_cfg.get("env") or {}).items()}
+        if mode_env:
+            print(f"→ {mode_name}: launch env → {' '.join(mode_env)}")
 
     # Headless: resolve the non-interactive argv now (before RENDER_ONLY) so a
     # render-only run still validates the adapter + prints what would exec.
@@ -1154,7 +1177,7 @@ def main() -> None:
     if headless:
         hmodel = session_model  # resolved up front (persisted on the archive row)
         headless_cmd = headless_command(
-            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags,
+            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, mode_flags,
             session_effort)
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
@@ -1185,10 +1208,10 @@ def main() -> None:
         name_args = [ncfg["flag"], full["display_name"]]
 
     cmd = (headless_cmd if headless else
-           (adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags)
+           (adapter.get("launch") or [harness]) + name_args + model_args + mode_flags)
     effort_env = headless_effort_env(adapter, session_effort) if headless else {}
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
-           **sandbox_env, **effort_env}
+           **mode_env, **effort_env}
     # The booted shell's flavor, inherited by everything the harness spawns.
     # branch-guard.sh reads it to exempt the admin shell (which works on main
     # by mandate); like SC_PROTECTED_BRANCHES it's a guardrail, not a boundary.

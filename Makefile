@@ -8,11 +8,11 @@
 # shared with forks (install wires a fork to include the same file). Edit the
 # aliases there, not here.
 #
-#   make dos-l / dos-launch  build + start the docker sandbox
-#   make dos-e / dos-enter   attach an interactive session (pick shell + harness)
+#   make dos-l / dos-launch  start host services + review GUI
+#   make dos-e / dos-enter   boot a bare-metal session (pick shell + harness)
 #   make dos-e s=cc          attach + boot the 'cc' shell directly
-#   make dos-r / dos-restart confirm (YES) + DB backup, then down + launch
-#   make dos-d / dos-down    stop the sandbox
+#   make dos-r / dos-restart DB backup, then restart host services
+#   make dos-d / dos-down    stop host services
 #   make dos-h / dos-help    list / describe all commands
 include .super-coder/aliases.mk
 

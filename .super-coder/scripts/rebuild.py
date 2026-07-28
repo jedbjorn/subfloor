@@ -13,6 +13,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 from datetime import datetime
@@ -30,7 +31,8 @@ SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
 # sweep could roll one fork back onto ANOTHER FORK'S DB. In the source repo the
 # name IS super-coder, so its path is unchanged. Old pooled dumps stay where
 # they are: they cannot be attributed to a fork after the fact.
-BACKUP_DIR = Path.home() / "db_backups" / REPO_ROOT.name
+BACKUP_DIR = Path(os.environ.get(
+    "SC_BACKUP_DIR", str(Path.home() / "db_backups" / REPO_ROOT.name)))
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver    # noqa: E402

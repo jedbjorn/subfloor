@@ -47,10 +47,8 @@ What that buys you in practice:
 ## Install
 
 > [!class4]
-> **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.**
-> `./sc doctor` reports what it finds and the exact next command. The
-> prerequisites table (Arch / macOS), docker modes, and the no-docker escape
-> hatch: [*Install*](README.md#install).
+> **The bar: Python 3, git, curl, and one signed-in harness CLI on PATH.**
+> `./sc doctor` checks the bare-metal runtime and harness login.
 
 Five steps, from an existing git repo to a booted shell:
 
@@ -64,10 +62,9 @@ Five steps, from an existing git repo to a booted shell:
    [*Install → Installer internals*](README.md#install).
 3. **Sign in once, on the host.** Each harness authenticates with your own
    account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
-   or `kimi login` — and the sandbox mounts the credentials in. Host, never
-   inside the sandbox: [*Install → Harness sign-in*](README.md#install).
-4. **Launch.** `./sc launch` builds and starts the sandbox container — the
-   engine server plus the Review GUI, published to `127.0.0.1` only.
+   or `kimi login`. [*Install → Harness sign-in*](README.md#install).
+4. **Launch.** `./sc launch` starts the host-native engine server plus the
+   Review GUI, bound to `127.0.0.1`.
 5. **Commit the install.** Only `sc`, `.sc-state/`, and config track; the
    engine itself stays a gitignored dependency.
 

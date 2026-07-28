@@ -61,6 +61,30 @@ PROJECT_VS_ENGINE_SOURCE = (
     "`.super-coder/`\" or \"report/file it upstream\", that guidance is for forks —\n"
     "here you author the fix directly instead."
 )
+RUNTIME_GUIDANCE_HOST = (
+    "You run **directly on the host**. There is no container boundary: the host "
+    "toolchain, network, credentials, services, and files available to your user "
+    "are in reach. Treat that authority deliberately.\n"
+    "\n"
+    "- Run project dev servers on `$SC_DEV_PORT`, bound to `127.0.0.1` unless "
+    "the task explicitly needs another interface.\n"
+    "- Respect process supervisors already owning a service (`pm2`, `systemd`, "
+    "`make`): operate through the supervisor instead of starting a competing "
+    "hand-run process.\n"
+    "- Broker-only instructions in portable skills describe the optional Docker "
+    "seat. On this host seat, use the underlying host tool directly when it is "
+    "available and the task authorizes it."
+)
+RUNTIME_GUIDANCE_SANDBOX = (
+    "You run **inside the optional Docker sandbox**; this repo is bind-mounted "
+    "at its host path.\n"
+    "\n"
+    "- Run project dev servers bound to `0.0.0.0:$SC_DEV_PORT`; the sandbox "
+    "publishes that port to host loopback.\n"
+    "- Host services and credentials remain outside the container. Use the "
+    "declared broker skills for those resources.\n"
+    "- Do not start a competing host-stack process from the container."
+)
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 
@@ -243,7 +267,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  sync_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
-                 source_mode: bool = False) -> str:
+                 source_mode: bool = False,
+                 sandbox_mode: bool = False) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -259,6 +284,9 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     template = template.replace(
         "{{project_vs_engine}}",
         PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK)
+    template = template.replace(
+        "{{runtime_guidance}}",
+        RUNTIME_GUIDANCE_SANDBOX if sandbox_mode else RUNTIME_GUIDANCE_HOST)
     shell_id = shell["shell_id"]
     counts = fetch_counts(con, shell_id)
 

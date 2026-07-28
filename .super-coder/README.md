@@ -82,8 +82,8 @@ is harness-blind. Each holds an `adapter.json`:
   (we dual-write both). Edit the tracked `opencode.json` template to change a
   fork's config.
 - **`codex/`** — reads `AGENTS.md` natively; emits **`.codex/hooks.json`**.
-  Launches `codex --dangerously-bypass-hook-trust` (and, inside the sandbox,
-  `--dangerously-bypass-approvals-and-sandbox`); model is selected via `--model`.
+  Trusted host and sandbox seats add
+  `--dangerously-bypass-approvals-and-sandbox`; model is selected via `--model`.
 - **`vibe/`** — reads `AGENTS.md` natively; nothing to emit. Launches `vibe
   --trust` (sandbox adds `--agent auto-approve`).
 - **`kimi/`** — reads `AGENTS.md` natively; nothing to emit. Launches `kimi`
@@ -116,8 +116,7 @@ and the static `ui/` (one page, vanilla JS) on a single per-fork port.
 
 `scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
 100`), bumping past anything occupied, and persists it to the gitignored
-`instance.json`. The server runs inside the docker sandbox (`Dockerfile` +
-`./sc launch`/`down`); the container is named `sc-<repo>` so forks never clash,
-and the port publishes to `127.0.0.1` only. `./sc serve` runs it on the host
-without docker (the escape hatch). `ecosystem.config.cjs` (pm2) is legacy from
-the pre-docker host model and no longer on the default path.
+`instance.json`. `./sc launch` supervises the server directly on the host and
+binds it to `127.0.0.1`; `./sc down` stops it. The optional Docker lifecycle is
+available under `sandbox-*`. `ecosystem.config.cjs` remains an alternative pm2
+supervision definition.

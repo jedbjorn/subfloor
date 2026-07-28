@@ -6,7 +6,8 @@ fork-flavored B7 engine untrack (`git rm -r --cached .super-coder`) plus the
 fork gitignore block. The day origin was renamed to subfloor, the
 basename == "super-coder" check silently flipped to False and the untrack
 fired on the dogfood repo. Three modules carry the check (install, update,
-map_repo); all must key off install.SOURCE_REPO_NAMES and accept BOTH names.
+map_repo); all must key off install.SOURCE_REPO_NAMES and accept every canonical
+source name, including the public CLI repository basename.
 
 Run:
     python3 tests/test_source_repo_guard.py
@@ -29,22 +30,25 @@ class SourceRepoGuardTest(unittest.TestCase):
     def test_canonical_names(self):
         self.assertIn("super-coder", install.SOURCE_REPO_NAMES)
         self.assertIn("subfloor", install.SOURCE_REPO_NAMES)
+        self.assertIn("subfloor-cli", install.SOURCE_REPO_NAMES)
 
-    def test_install_accepts_both_names(self):
+    def test_install_accepts_source_names(self):
         orig = install.origin_basename
         try:
             for base, want in [("super-coder", True), ("subfloor", True),
+                               ("subfloor-cli", True),
                                ("my-fork", False), (None, False)]:
                 install.origin_basename = lambda b=base: b
                 self.assertEqual(install.is_source_repo(), want, base)
         finally:
             install.origin_basename = orig
 
-    def test_update_accepts_both_names(self):
+    def test_update_accepts_source_names(self):
         orig = update.git
         try:
             for url, want in [("https://github.com/jedbjorn/subfloor.git", True),
                               ("https://github.com/jedbjorn/super-coder.git", True),
+                              ("https://github.com/jedbjorn/subfloor-cli.git", True),
                               ("git@github.com:me/my-fork.git", False)]:
                 update.git = lambda *a, u=url, **k: SimpleNamespace(stdout=u + "\n",
                                                                     returncode=0)
@@ -52,11 +56,12 @@ class SourceRepoGuardTest(unittest.TestCase):
         finally:
             update.git = orig
 
-    def test_map_repo_accepts_both_names(self):
+    def test_map_repo_accepts_source_names(self):
         orig = map_repo.git
         try:
             for url, want in [("https://github.com/jedbjorn/subfloor", True),
                               ("https://github.com/jedbjorn/super-coder", True),
+                              ("https://github.com/jedbjorn/subfloor-cli", True),
                               ("https://github.com/me/other", False)]:
                 map_repo.git = lambda *a, u=url: u
                 self.assertEqual(map_repo.is_source_repo(), want, url)

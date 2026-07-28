@@ -118,7 +118,7 @@ def sh(*args: str) -> subprocess.CompletedProcess:
 # appear in a checkout's origin. Getting this wrong is not cosmetic — a source
 # repo misread as a fork gets its tracked engine `git rm --cached`-ed by the
 # B7 untrack migration (this fired on the dogfood repo the day of the rename).
-SOURCE_REPO_NAMES = ("super-coder", "subfloor")
+SOURCE_REPO_NAMES = ("super-coder", "subfloor", "subfloor-cli")
 
 VISUAL_QA_TEMPLATE_TARGETS = {
     "subfloor-visual-qa.yml": Path(".github/workflows/subfloor-visual-qa.yml"),
@@ -325,11 +325,10 @@ def ensure_harnesses() -> dict[str, str]:
     return status
 
 
-# ── Docker preflight (the default run mode is a sandbox container) ────────────
+# ── Runtime preflight ─────────────────────────────────────────────────────────
 # Advisory only: real docker setup needs root + a re-login, so install GUIDES with
 # the right commands for the state it finds, never mutates. Mirrors the git/curl
-# warnings — a missing/under-configured docker is not fatal, because the no-docker
-# escape hatch (`./sc serve` + `./sc boot`) still runs the shell on the host.
+# warnings — Docker is optional because the primary lifecycle runs on the host.
 
 def docker_status() -> dict:
     """Docker availability + mode. 'absent' (no CLI) · 'no-daemon' (CLI but no
@@ -367,7 +366,7 @@ def report_docker() -> dict:
         if st.get("detail"):
             print(f"            ({st['detail']})")
     else:  # absent
-        print("  docker    ⚠ not found — the default run mode is a sandbox container.")
+        print("  docker    ⚠ not found — optional sandbox-* commands are unavailable.")
         if IS_MAC:
             print("            Install it (e.g. colima: brew install colima docker && colima start),")
             print("            then `./sc doctor`.")
@@ -375,6 +374,23 @@ def report_docker() -> dict:
             print("            Install it (e.g. Arch: sudo pacman -S docker), then `./sc doctor`.")
         print("            Or run without docker via the escape hatch: ./sc serve + ./sc boot")
     return st
+
+
+def report_host() -> dict:
+    """Print the bare-metal prerequisites used by launch/enter."""
+    status = {
+        "python3": bool(shutil.which(PY)),
+        "git": bool(shutil.which("git")),
+        "curl": bool(shutil.which("curl")),
+        "harness": bool(detect_harness()),
+    }
+    for name in ("python3", "git", "curl"):
+        print(f"  {name:9} {'✓ present' if status[name] else '✗ missing'}")
+    if status["harness"]:
+        print(f"  harness   ✓ {detect_harness()} available on PATH")
+    else:
+        print("  harness   ✗ none available — run `./sc ensure-harness`")
+    return status
 
 
 # ── Harness login preflight ──────────────────────────────────────────────────
@@ -550,7 +566,8 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness", "--update-harnesses", "--check-docker"}
+    own = {"--force", "--skip-harness-install", "--ensure-harness",
+           "--update-harnesses", "--check-docker", "--check-host"}
     fork_args = [a for a in argv if a not in own]
 
     # Standalone: force-update all harness CLIs to latest and exit.
@@ -566,8 +583,15 @@ def main(argv: list[str]) -> int:
         ensure_harnesses()
         return 0
 
-    # Standalone preflight (re-run after configuring docker / logging in) —
-    # `./sc doctor`: is the sandbox ready to launch + boot a harness?
+    # Standalone preflight for the bare-metal primary lifecycle.
+    if "--check-host" in argv:
+        step("Bare-metal runtime")
+        report_host()
+        step("Harness login")
+        report_logins()
+        return 0
+
+    # Optional Docker compatibility preflight.
     if "--check-docker" in argv:
         step("Sandbox runtime (docker)")
         report_docker()
@@ -598,9 +622,7 @@ def main(argv: list[str]) -> int:
         print(f"  ⚠ git not on PATH — needed for the commit→PR flow later.{brew}")
     if not shutil.which("curl"):
         print(f"  ⚠ curl not on PATH — needed to auto-install a missing harness.{brew}")
-    # Docker is the default run path (the sandbox); guide if it's missing or
-    # under-configured. Never fatal — `./sc serve`+`boot` run without it.
-    report_docker()
+    report_host()
 
     # 3. Ensure harness CLIs --------------------------------------------------
     # Install claude + opencode + codex + vibe + kimi if missing, via their official NATIVE
@@ -618,9 +640,8 @@ def main(argv: list[str]) -> int:
     harness = detect_harness() or "claude"  # claude preferred; both should be present
     print(f"  → default harness for instance.json: {harness}")
 
-    # 3.1 Harness login — the sandbox mounts host creds in, so a one-time host
-    # login is what populates them. Detect + guide; the oauth flow isn't scriptable.
-    step("Harness login (one-time, on the host — the sandbox mounts these creds in)")
+    # 3.1 Harness login is host-native in the primary lifecycle.
+    step("Harness login (one-time, on the host)")
     report_logins()
 
     # 3.5 Wire the host repo's .gitignore -------------------------------------
@@ -727,8 +748,8 @@ def main(argv: list[str]) -> int:
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")
     print("\nNext:")
     print("  git add -A && git commit -m 'install super-coder'")
-    print("  ./sc launch        # or: make launch — starts the sandbox + GUI")
-    print("  ./sc enter         # or: make enter  — attach + boot your shell")
+    print("  ./sc launch        # or: make launch — starts host services + GUI")
+    print("  ./sc enter         # or: make enter  — boot your shell on bare metal")
     return 0
 
 

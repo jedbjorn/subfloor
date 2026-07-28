@@ -12,5 +12,12 @@
         "permission": { "bash": "allow" }
       }
     }
+  },
+  "trusted_host": {
+    "merge_json": {
+      "opencode.json": {
+        "permission": { "bash": "allow" }
+      }
+    }
   }
 }

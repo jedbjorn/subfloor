@@ -13,5 +13,9 @@
   "sandbox": {
     "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"],
     "headless_flags": ["--dangerously-bypass-approvals-and-sandbox"]
+  },
+  "trusted_host": {
+    "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"],
+    "headless_flags": ["--dangerously-bypass-approvals-and-sandbox"]
   }
 }

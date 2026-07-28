@@ -1197,7 +1197,10 @@ re-decide a settled choice.
 Write through `sc mem doc add` (routes through the engine API): `--body-file`
 reads the markdown from a file (no shell-escaping a long body); `--seq`
 auto-increments within `(feature, kind)`; it renders + snapshots for you
-(pipeline = the `snapshot` skill):
+(pipeline = the `snapshot` skill). The render+snapshot is serialized by one
+in-process API lock — sufficient because these artifacts only ever come from
+manual admin-shell or GUI actions (single writer by design; cross-process
+concurrency is out of scope for v1, decision #20 / roadmap #21).
 ```
 # a doc against a feature (kind=''doc''); DB owns the body:
 sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-path docs_sc/….md
@@ -1949,6 +1952,14 @@ Stale guidance (skill says X, engine does Y) files the same as a crash.
 ## Capture — while the failure is on screen
 
 - **engine ref** = `cat .sc-state/engine.ref` — first line of every report
+- **staleness** = compare that ref to upstream head:
+  `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
+  `current` or `behind head <sha7>`. Behind + the symptom is a missing
+  command or a skill/engine mismatch -> the fix may already be shipped:
+  ask your FnB for `./sc update` first, and file only if the defect
+  survives the update (or updating isn''t an option — then the staleness
+  note carries that caveat). Triage reads this line to tell a live
+  engine defect from a stale fork build.
 - **fork + seat**: repo name, shell flavor, sandbox/host
 - **ran / followed**: the exact command, or skill name + step
 - **expected vs actual**: exact output, trimmed to the failing lines
@@ -1966,7 +1977,7 @@ gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
 gh issue create --repo jedbjorn/subfloor \
   --title "[<fork>] <area>: <symptom>" \
   --body "$(cat <<''EOF''
-- engine ref: <sha from .sc-state/engine.ref>
+- engine ref: <sha from .sc-state/engine.ref> · <current | behind head <sha7>>
 - fork/seat: <repo> · <shell flavor> · <sandbox|host>
 
 **Ran / followed:** <command or skill+step>
@@ -3052,6 +3063,78 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'source-maintenance',
+  'Maintain the super-coder/subfloor engine source itself on bare metal. Use for changes to sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or the source repository''s tracked dogfood state.',
+  'substrate',
+  NULL,
+  0,
+  '# Source maintenance
+
+Treat this repository as upstream: `.super-coder/` and `sc` are the product,
+not an installed dependency. Fix engine defects here; do not run the fork
+report-upstream or never-edit-engine procedures.
+
+## Orient
+
+1. Confirm source mode:
+   `python3 -c "import sys; sys.path.insert(0,''.super-coder/scripts''); import install; print(install.is_source_repo())"`
+   must print `True`. If not, fix `SOURCE_REPO_NAMES` before other work.
+2. Query the repo map, but verify it includes `.super-coder/`. A source map that
+   hides the engine is invalid.
+3. Read active decisions before choosing an architecture.
+4. Work from a branch/worktree. Preserve tracked `.sc-state/content.sql`; it is
+   this source repo''s dogfood memory, not a disposable fork seed.
+
+## Change the right source
+
+| Concern | Authoritative source |
+|---|---|
+| Runtime and CLI lifecycle | `sc` plus `.super-coder/scripts/` |
+| Harness behavior | `.super-coder/adapters/<harness>/adapter.json` |
+| Boot-wide instructions | `.super-coder/templates/boot.md` and `render/compose.py` |
+| Shell flavor defaults | `.super-coder/templates/shells/*.json` |
+| Engine skill | `.super-coder/assets/skills/<name>/SKILL.md`, then `./sc seed-skills` |
+| Schema/system content | a new ordered migration; never rewrite an applied migration except the generated skill seed |
+| This team''s mandate, grants, memory, roadmap | live DB, then `SC_ADMIN=1 ./sc snapshot` |
+
+Flat `_sc` markdown and `AGENTS.md`/`CLAUDE.md` are renders. Never author a
+behavioral change in them.
+
+## Bare-metal contract
+
+- `./sc launch`, `enter`, `run`, `down`, `restart`, and `logs` are the primary
+  host-native lifecycle.
+- `enter` and `run` intentionally set trusted harness mode. Do not silently
+  restore a harness sandbox or approval loop.
+- Docker compatibility is explicit under `sandbox-*`; do not let its
+  assumptions leak into host prompts or primary help.
+- Bind the engine API and ordinary dev servers to loopback by default.
+- Direct host authority is not task authority: keep actions scoped to the
+  operator''s request and preserve unrelated host state.
+
+## Finish
+
+Run focused tests, then:
+
+```bash
+./sc map
+./sc render-check
+./sc verify
+git diff --check
+```
+
+If skill assets changed, run `./sc seed-skills` first. If dogfood DB content or
+grants changed, snapshot it. A source change reaches downstream forks only
+after it is merged and they update; never expect the currently running shell to
+inherit a changed prompt or skill until its next boot.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'spec',
   'Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step. Load when starting, implementing, or building any feature, spec, or roadmap item — before writing code.',
   'craft',
@@ -3687,9 +3770,30 @@ Flavor-uniform by design: shells of a flavor are interchangeable workers,
 and one answer per flavor keeps the board readable and the review lineage
 coherent — reviewers stay a different lineage from the code they gate,
 chosen per sprint instead of per boot. No answer -> `flavor_defaults`,
-unchanged (omit the `models:` line). The answers parameterize every
-`./sc run` you issue for this sprint. Per-unit model mixing is out of
-scope — the interview covers the real need, provider choice per role.
+unchanged (omit the `models:` line). Every sprint worker still runs at high
+effort. Per-unit model mixing is out of scope — the interview covers the real
+need, provider choice per role.
+
+**Resolve each answered route before declaring it.** Lazy-load only the two
+choices the FnB made — never trust a display name or translate a provider id by
+hand:
+
+```
+sc models resolve <devs-harness> <devs-model>
+sc models resolve <reviewers-harness> <reviewers-model>
+```
+
+Each must return `route:` plus an exact `call:` ending in `--effort high`.
+Failure means the selector is not locally callable, the harness lacks a
+headless/high-effort seam, or Refresh models has not seen it. Run
+`sc models list <harness>` for the local choices; the FnB''s **Refresh models**
+button in `/#shells` repopulates the same runtime table. Resolve again after a
+refresh. Never silently fall back across a provider or lineage.
+
+Common exact selectors: Claude aliases (`fable`, `opus`) and Codex ids
+(`gpt-5.6-sol`, `gpt-5.6-terra`) pass directly. Kimi takes the configured alias
+shown by `sc models list kimi` (for example `kimi-code/k3`), never the bare
+provider model `k3`.
 
 Write the board as a `documents` row:
 
@@ -3754,8 +3858,8 @@ sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. D
 # reviewers — assigned units, the severity bar:
 sc mem message send <reviewer> "SPRINT <doc-id>: you review units <seq,seq> — Major/Medium block, Low goes to the report. Load the sprint skill (reviewer slot). Review requests come to you directly as units go green." --kind task
 
-# boot each first-in-chain dev headless, with the sprint''s models:
-./sc run <dev> --harness <devs-harness> -m <devs-model>
+# boot each first-in-chain dev with the RESOLVED selector; high is invariant:
+./sc run <dev> --harness <devs-harness> -m <devs-model> --effort high
 ```
 
 `./sc run` renders the shell''s boot doc and drains its inbox
@@ -3837,13 +3941,14 @@ Stalls and the moves:
   fix unit at the front of the chain, resume when green.
 - **Review stall** (unit sitting `in-review` while its reviewer is idle):
   boot the reviewer — `./sc run <reviewer> --harness <reviewers-harness>
-  -m <reviewers-model>`; its inbox holds the review request. Still stuck
+  -m <reviewers-model> --effort high`; its inbox holds the review request. Still stuck
   -> reassign the unit to another reviewer. Severity dispute (dev says
   Low, reviewer says Medium) -> rule by message immediately — a chain
   waiting on a classification argument is pure loss. Dispute about what
   the unit *should do* -> FnB.
-- **Link gone quiet** (no `result` row, no `pr_event` movement): boot it —
-  `./sc run <shortname>` drains its inbox and acts; that IS the nudge in
+- **Link gone quiet** (no `result` row, no `pr_event` movement): boot it with
+  its declared sprint route — `./sc run <shortname> --harness <role-harness>
+  -m <role-model> --effort high` drains its inbox and acts; that IS the nudge in
   an event-driven sprint. The liveness guard refusing (session already
   live) + still silent -> escalate to the FnB with the worktree state.
   The bottleneck question in Step 3 is what surfaces a dead link.
@@ -3882,7 +3987,7 @@ When every unit is `merged` and `main` is green:
 
    ```
    sc mem message send <reviewer> "SPRINT <doc-id>: conformance pass — spec doc <spec-id>, main @ <merge-sha><, sections <scope> if sharded>. Ratified judgement calls: <list — the only narrative input>. Load the sprint skill (conformance slot)." --kind task
-   ./sc run <reviewer> --harness <reviewers-harness> -m <reviewers-model>
+   ./sc run <reviewer> --harness <reviewers-harness> -m <reviewers-model> --effort high
    ```
 
    The shell judges the spec against the code on `main` — never the

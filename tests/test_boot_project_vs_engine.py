@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "render"))
 import compose  # noqa: E402
 
 SLOT = "{{project_vs_engine}}"
+RUNTIME_SLOT = "{{runtime_guidance}}"
 
 
 class ProjectVsEngineTest(unittest.TestCase):
@@ -60,6 +61,17 @@ class ProjectVsEngineTest(unittest.TestCase):
             self.assertNotIn(SLOT, render)
         self.assertIn("gitignored dependency", fork_render)
         self.assertIn("you are upstream", source_render)
+
+    def test_runtime_guidance_resolves_per_seat(self):
+        self.assertEqual(self.template.count(RUNTIME_SLOT), 1)
+        host = self.template.replace(RUNTIME_SLOT, compose.RUNTIME_GUIDANCE_HOST)
+        sandbox = self.template.replace(
+            RUNTIME_SLOT, compose.RUNTIME_GUIDANCE_SANDBOX)
+        self.assertIn("directly on the host", host)
+        self.assertIn("no container boundary", host.lower())
+        self.assertIn("optional Docker sandbox", sandbox)
+        self.assertNotIn(RUNTIME_SLOT, host)
+        self.assertNotIn(RUNTIME_SLOT, sandbox)
 
 
 if __name__ == "__main__":

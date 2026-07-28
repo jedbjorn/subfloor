@@ -157,18 +157,6 @@ cleanup, what not to commit: the `git` skill; flag detail: the `flags` skill.
 
 ## RUNNING THE APP
 
-You run **inside the sandbox container**; this repo is bind-mounted in at its host
-path. The app the FnB watches in their browser is a **separate instance** — the
-host-supervised stack, outside your container. So there are two runtimes with two
-homes — keep them apart:
-
-- **Project dev servers** (vite, `npm run dev`, etc.) belong in the **sandbox**,
-  bound to `0.0.0.0:$SC_DEV_PORT` — the per-fork port `./sc launch` publishes to
-  the host for exactly this. Reach it at `http://127.0.0.1:$SC_DEV_PORT`.
-- **A process-supervised host stack** (pm2 / `make`) is owned by its supervisor.
-  Start/stop/restart only through it (`make up`, `make restart`) — never a bare
-  `vite dev` / `npm run dev` on the host. A hand-run dev server races the
-  supervised process for its port, fails to bind, and orphans — taking the app
-  down.
+{{runtime_guidance}}
 
 ---

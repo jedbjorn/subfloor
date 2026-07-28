@@ -87,20 +87,19 @@ that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
 
 **Preparation**
 
-One-time host setup — get this right and the rest is `./sc install`. subfloor
-runs the harness in a **docker sandbox**; the installer bootstraps everything
-else. The host needs a container engine, a few base tools, and one signed-in
-coding harness.
+One-time host setup — get this right and the rest is `./sc install`. This
+specialization runs the harness **directly on the host**. The host needs a few
+base tools and one signed-in coding harness; Docker is optional.
 
 | Need | Arch Linux | macOS |
 |---|---|---|
-| **Container engine** | `sudo pacman -S docker`, then start a daemon — rootless default: `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker` | `brew install colima docker && colima start` (or Docker Desktop) |
 | **Base tools** | `sudo pacman -S git curl python sqlite` (usually already present) | `xcode-select --install` (git/curl); python3 + sqlite3 ship with macOS |
 | **Harness CLI** | installed for you by `./sc install` (`claude` · `opencode` · `codex` · `vibe` · `kimi`, native installers). Repair by hand: `curl -fsSL https://claude.ai/install.sh \| bash` | same — **and put `~/.local/bin` on your PATH** (a fresh macOS shell omits it) |
 | **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe · Kimi Code; sign in once on the host (step 3) | same |
 
 > [!class4]
-> **The bar: a reachable docker daemon + a harness CLI on PATH.** `./sc doctor` reports the docker mode it finds (rootless / rootful) and the exact next command; `python3` + `sqlite3` are the only *hard* requirements (the engine runtime). **macOS PATH gotcha:** if `claude` reports *"missing or broken — run claude install to repair"*, the CLI installed fine but `~/.local/bin` isn't on your PATH. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc`), open a new shell, then `claude install`. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the host.
+> **The bar: Python 3, git, curl, and a harness CLI on PATH.** `./sc doctor`
+> checks the bare-metal seat. On macOS, ensure `~/.local/bin` is on `PATH`.
 
 **Install & launch**
 
@@ -118,10 +117,10 @@ git checkout super-coder/main -- .super-coder sc
 # 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your starting team:
 ./sc install
 
-# 3. Sign in to your harness once, on the HOST (not inside the sandbox):
+# 3. Sign in to your harness once on the host:
 claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
 
-# 4. Launch the sandbox (server + GUI) and attach a session:
+# 4. Launch the host server + GUI and boot a bare-metal session:
 ./sc launch
 ./sc enter                      # auth + pick a shell + pick a harness + boot
 
@@ -130,7 +129,7 @@ git add -A && git commit -m "chore: install subfloor"
 ```
 
 That's the happy path. Each step is covered in depth below — installer internals,
-harness sign-in, the docker modes, and the localhost review GUI. For the full
+harness sign-in, the optional Docker mode, and the localhost review GUI. For the full
 arc from a fresh repo through ship-and-loop, see [*The loop*](#the-loop).
 
 ### Installer internals
@@ -144,22 +143,23 @@ inherits the **system** (schema + the skill catalogue + the render chain), never
 subfloor's own memory or roadmap.
 
 > [!class4]
-> **Requirements: `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the four harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with only `python3` + `sqlite3` (and a harness on `PATH`).
+> **Primary runtime: bare metal.** `./sc launch` starts the review server on the
+> host and `./sc enter` launches the chosen harness with trusted permissions.
+> Use `sandbox-launch` / `sandbox-enter` only when a Docker seat is wanted.
 
-**Docker mode — rootless is the default.** `./sc doctor` checks your docker.
-Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen
-default: zero setup, same function.** Under rootless the sandbox runs the
+**Optional Docker mode.** Run `./sc sandbox-launch` when isolation is useful.
+Both Docker modes work (the launcher's `duser()` adapts). Under rootless the sandbox runs the
 container as root, which maps to *you*, so repo writes come out owned by you —
 no phantom-uid problem (verified). Its only wart: `claude` runs as root inside,
 so its `--dangerously-skip-permissions` flag is blocked — the sandbox replaces
 the need for it. **Rootful is optional**, purely to drop that wart (1:1
 bind-mounts, harness runs as a normal user); it costs a one-time sudo + re-login.
 
-**Setup is one-time per machine (and rootless needs none).** `./sc launch` only
-checks the daemon is reachable and points you here if not — it never does setup.
+**Setup is one-time per machine.** `./sc sandbox-launch` checks that the daemon
+is reachable; it never performs privileged setup.
 
-- **Rootless (default) — nothing to do.** If rootless docker runs as your user,
-  `./sc launch` works as-is.
+- **Rootless — nothing to do.** If rootless Docker runs as your user,
+  `./sc sandbox-launch` works as-is.
 - **Rootful (optional upgrade).** Needs sudo + a re-login (a new `docker` group
   only applies to a fresh session — which is exactly why it can't fold into
   `launch`):
@@ -170,7 +170,7 @@ checks the daemon is reachable and points you here if not — it never does setu
   # 3. LOG OUT and back in (the group only applies to a new session)
   docker context use default                # 4. point the CLI at the system daemon
   systemctl --user disable --now docker.service  # 5. optional: stop rootless
-  ./sc doctor                               # verify → "docker ✓ rootful"
+  ./sc sandbox-launch
   ```
 
 The commands are the five steps in the Quick start above — pull the engine in
@@ -783,9 +783,9 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 > **UI** Scripts · Map (via `./sc preview`) · **Shells** all
 
 ```bash
-./sc launch              # build + start the sandbox container (server + GUI), 127.0.0.1 only
-./sc enter               # attach a session: auth + pick a shell + pick a harness + boot
-./sc enter-<shortname>   # attach + boot one shell directly, skip the shell picker
+./sc launch              # start host services + Review GUI, 127.0.0.1 only
+./sc enter               # boot a trusted bare-metal session
+./sc enter-<shortname>   # boot one shell directly, skip the shell picker
 ./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
 ./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
 ./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
@@ -794,10 +794,10 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·
                          #   flag · roadmap · doc · narrative) — identity is the shell's token
 sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` for the repo-map dr_*
-./sc down                # stop + remove the sandbox container
-./sc restart             # confirm-gated (YES) + DB backup, then down + launch — recreate fresh
+./sc down                # stop host services
+./sc restart             # DB backup, then restart host services
 ./sc persist             # reboot-proof the host daemons: install every applicable systemd --user unit
-./sc logs                # tail the sandbox server logs
+./sc logs                # tail the host server log
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
 ./sc render              # regenerate the tracked flat _sc files from the DB
 ./sc render-check        # fail if the committed _sc files drift from the DB render (CI guard)

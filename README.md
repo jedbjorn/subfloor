@@ -64,12 +64,12 @@ Subfloor is a **forkable shell substrate for a single code repository.** You ins
 a project repo; it brings the shell system — DB-backed identity, memory, seed/L&S,
 decisions, flags, a roadmap, and spec/doc content — and runs that repo through
 whatever coding harness you point at it — **Claude Code, OpenCode, Codex,
-Mistral Vibe, and Kimi Code**, all sandbox-integrated (or run on the no-docker
-host path).
+Mistral Vibe, and Kimi Code**. This specialization runs them directly on the
+host; Docker remains available through explicit `sandbox-*` commands.
 Free to use, open source, MIT License.
 
 > [!class2]
-> **Repo:** [github.com/jedbjorn/subfloor](https://github.com/jedbjorn/subfloor) — source, issues, and releases.
+> **Repo:** [github.com/jedbjorn/subfloor-cli](https://github.com/jedbjorn/subfloor-cli) — source, issues, and releases.
 
 ![subfloor's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cover.png)
 
@@ -119,7 +119,8 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 ## Install quickstart
 
 > [!class4]
-> **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.** `./sc doctor` reports what it finds and the exact next command. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
+> **The bar: Python 3, git, curl, and one signed-in harness CLI on PATH.**
+> `./sc doctor` checks the bare-metal seat. Docker is optional.
 
 Drop subfloor into an existing git repo and boot a shell:
 
@@ -134,10 +135,10 @@ git checkout super-coder/main -- .super-coder sc
 # 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your starting team:
 ./sc install
 
-# 3. Sign in to your harness once, on the HOST (not inside the sandbox):
+# 3. Sign in to your harness once on the host:
 claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
 
-# 4. Launch the sandbox (server + GUI) and attach a session:
+# 4. Launch the host server + GUI and boot a trusted bare-metal session:
 ./sc launch
 ./sc enter                      # auth + pick a shell + pick a harness + boot
 

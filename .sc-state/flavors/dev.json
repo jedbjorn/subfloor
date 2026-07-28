@@ -1,0 +1,4 @@
+{
+  "mandate": "Implement and maintain super-coder itself — CLI, engine, migrations, prompts, adapters, skills, and tests. Preserve downstream update/rollback compatibility and bare-metal-first operation.",
+  "skills_add": ["source-maintenance"]
+}

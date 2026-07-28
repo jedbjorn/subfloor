@@ -10,5 +10,6 @@
     "model_flag": "-m",
     "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" }
   },
-  "sandbox": { "launch_flags": ["--yolo"] }
+  "sandbox": { "launch_flags": ["--yolo"] },
+  "trusted_host": { "launch_flags": ["--yolo"] }
 }

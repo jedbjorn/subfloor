@@ -22,6 +22,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -582,6 +583,21 @@ class HeadlessTest(unittest.TestCase):
         self.assertEqual(cmd, ["codex", "exec", "-m", "gpt-5.4",
                                "-c", 'model_reasoning_effort="high"',
                                "--dangerously-bypass-approvals-and-sandbox", "do it"])
+
+    def test_trusted_host_codex_bypasses_approvals_and_sandbox(self):
+        cfg = self.adapter("codex")["trusted_host"]
+        flag = "--dangerously-bypass-approvals-and-sandbox"
+        self.assertIn(flag, cfg["launch_flags"])
+        self.assertIn(flag, cfg["headless_flags"])
+
+    def test_trusted_host_merges_allow_all_config(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                run.os.environ, {"SC_TRUSTED_HOST": "1"}, clear=True):
+            touched = run.apply_trusted_host(
+                self.adapter("opencode"), Path(td))
+            self.assertEqual(touched, ["opencode.json"])
+            cfg = json.loads((Path(td) / "opencode.json").read_text())
+            self.assertEqual(cfg["permission"]["bash"], "allow")
 
     def test_opencode_headless_argv(self):
         cmd = run.headless_command(self.adapter("opencode"), "p", "zai/glm")

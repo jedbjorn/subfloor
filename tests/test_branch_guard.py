@@ -6,8 +6,9 @@ handoff dir pattern) can never land on a branch — blocking it forced shells to
 side-step the hook via Bash `cp` to complete a documented workflow. These tests
 drive the real script against a scratch repo.
 
-The scratch repo deliberately lives under $HOME, NOT /tmp — the guard's scratch
-exemption allows /tmp/* outright, which would short-circuit every case here.
+The scratch repo deliberately lives beside this checkout, NOT /tmp — the
+guard's scratch exemption allows /tmp/* outright, which would short-circuit
+every case here. This also works when a managed host exposes a read-only HOME.
 
 Run:
     python3 tests/test_branch_guard.py
@@ -32,7 +33,8 @@ GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
 class BranchGuardTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.repo = Path(tempfile.mkdtemp(prefix="sc-bg-test-", dir=Path.home()))
+        cls.repo = Path(tempfile.mkdtemp(
+            prefix="sc-bg-test-", dir=ROOT.parent))
         run = lambda *a: subprocess.run(a, cwd=cls.repo, check=True,  # noqa: E731
                                         capture_output=True,
                                         env={**os.environ, **GIT_ENV})

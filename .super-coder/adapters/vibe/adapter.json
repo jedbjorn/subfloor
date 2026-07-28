@@ -4,5 +4,6 @@
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},
-  "sandbox": { "launch_flags": ["--agent", "auto-approve"] }
+  "sandbox": { "launch_flags": ["--agent", "auto-approve"] },
+  "trusted_host": { "launch_flags": ["--agent", "auto-approve"] }
 }

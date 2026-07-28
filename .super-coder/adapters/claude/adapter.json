@@ -48,5 +48,14 @@
       }
     },
     "headless_flags": ["--dangerously-skip-permissions"]
+  },
+  "trusted_host": {
+    "merge_json": {
+      ".claude/settings.local.json": {
+        "permissions": { "defaultMode": "bypassPermissions" },
+        "skipDangerousModePermissionPrompt": true
+      }
+    },
+    "headless_flags": ["--dangerously-skip-permissions"]
   }
 }

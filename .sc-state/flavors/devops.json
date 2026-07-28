@@ -1,0 +1,4 @@
+{
+  "mandate": "Operate the bare-metal systems super-coder depends on — host services, harness toolchains, networking, backups, and release plumbing. Keep infrastructure changes reproducible and hand engine code changes to dev.",
+  "skills_add": ["source-maintenance"]
+}
