@@ -138,8 +138,10 @@ class VisualQaSeedTest(unittest.TestCase):
             )
 
         next_shell_id = iter(range(1, 11))
+        identity_flags = []
 
-        def create_shell(con, *, flavor, **_kwargs):
+        def create_shell(con, *, flavor, **kwargs):
+            identity_flags.append(kwargs.get("seed_identity", False))
             shell_id = next(next_shell_id)
             con.execute(
                 "INSERT INTO shells(shell_id, shortname, flavor, is_deleted) "
@@ -184,6 +186,7 @@ class VisualQaSeedTest(unittest.TestCase):
                 ],
             )
             self.assertNotIn(("devops",), flavors)
+        self.assertEqual(identity_flags, [True] + [False] * 9)
 
 
 class VisualQaUpdateTest(unittest.TestCase):

@@ -16,9 +16,10 @@ from "engine present" to "a team you can launch":
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
     6. Seed    — the fork's first user + starting TEAM (delegates to init_fork:
                  two planners, four dev, two reviewers, an admin, and the singleton
-                 cartographer — each with the CC lineage + a genesis seed + skill
-                 grants). Shells ship pre-named, so install asks only for a username;
-                 no shell-naming interview.
+                 cartographer). The designated primary alone receives CC lineage +
+                 a genesis seed; roster/operational shells are role-only. Shells
+                 ship pre-named, so install asks only for a username; no shell-naming
+                 interview.
     7. Persist — `./sc snapshot` (serialize the team) + `./sc render` (flat _sc).
     8. Done    — print how to launch.
 
