@@ -19,15 +19,14 @@ defect this module exists to close:
   route it guards CREATES the first unit: gating that on liveness would make
   every board undeclarable.
 - `is_live_sprint` / `live_sprint_doc_ids` / `live_sprint_clause` — the full
-  predicate. It gates the wake path, binding arm, the assignment notice, poller
-  scoping and the sprint-activity projection, and nothing else.
+  predicate. It gates assignment notices, poller scoping and the
+  sprint-activity projection, and nothing else.
 
 Ordering consequence, decided rather than discovered: a sprint doc with zero
-`sprint_units` rows is not live, so the board is declared BEFORE the binding is
-armed.
+`sprint_units` rows is not live.
 
-Closing a sprint IS freezing its doc — atomic with binding release and queue
-cancellation through the freeze route's `_close_sprint_wake`.
+Closing a sprint IS freezing its doc. The freeze route retires its PR watches
+in the same transaction.
 
 The boot renderer's directive predicate (`render/compose.py`) is NOT one of
 these and must not be folded in: it is role-scoped (a dev retires on its last

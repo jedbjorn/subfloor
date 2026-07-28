@@ -195,77 +195,38 @@ class ShellStatusTest(unittest.TestCase):
 
 
 class SprintRefTest(unittest.TestCase):
-    """shell_memory_archives.sprint_ref (migration 0071) is what lets the
-    Interface rail name WHICH sprint a working shell is on (flag #94). The
-    recording path always worked; nothing ever set the value. Source priority
-    per the planner's ruling: explicit SC_SPRINT_REF, then the armed
-    sprint_planner_bindings row, then NULL. current_state's `SPRINT doc=`
-    marker is deliberately NOT a source — it is prose."""
+    """Archive sprint scope comes only from explicit launch context."""
 
-    def _bindings(self, *armed, released=()):
+    def _db(self):
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
-        con.executescript("""
-            CREATE TABLE sprint_planner_bindings (
-                binding_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sprint_doc_id INTEGER NOT NULL,
-                planner_shell_id INTEGER NOT NULL,
-                released_at TEXT);
-        """)
-        for doc in armed:
-            con.execute("INSERT INTO sprint_planner_bindings "
-                        "(sprint_doc_id, planner_shell_id) VALUES (?, 9)",
-                        (doc,))
-        for doc in released:
-            con.execute("INSERT INTO sprint_planner_bindings "
-                        "(sprint_doc_id, planner_shell_id, released_at) "
-                        "VALUES (?, 9, '2026-07-24T00:00:00Z')", (doc,))
-        con.commit()
         return con
 
-    def test_explicit_env_wins_over_the_armed_binding(self) -> None:
-        con = self._bindings(38)
+    def test_explicit_env_is_the_scope(self) -> None:
+        con = self._db()
         with mock.patch.dict(run.os.environ, {"SC_SPRINT_REF": "40"},
                              clear=True):
             self.assertEqual("40", run.resolve_sprint_ref(con))
 
     def test_explicitly_empty_env_declares_a_non_sprint_boot(self) -> None:
-        """Set-but-empty is meaningful: it opts a known non-sprint boot out of
-        the armed-binding fallback rather than falling through to it."""
-        con = self._bindings(38)
+        con = self._db()
         for blank in ("", "   "):
-            with self.subTest(blank=blank):
-                with mock.patch.dict(run.os.environ,
-                                     {"SC_SPRINT_REF": blank}, clear=True):
-                    self.assertIsNone(run.resolve_sprint_ref(con))
+            with self.subTest(blank=blank), mock.patch.dict(
+                run.os.environ,
+                {"SC_SPRINT_REF": blank},
+                clear=True,
+            ):
+                self.assertIsNone(run.resolve_sprint_ref(con))
 
-    def test_armed_binding_is_the_fallback(self) -> None:
-        con = self._bindings(38)
-        with mock.patch.dict(run.os.environ, {}, clear=True):
-            self.assertEqual("38", run.resolve_sprint_ref(con))
-
-    def test_released_binding_stamps_nothing(self) -> None:
-        """Released transactionally at sprint close — a closed sprint must
-        stop labelling later boots."""
-        con = self._bindings(released=(38,))
-        with mock.patch.dict(run.os.environ, {}, clear=True):
-            self.assertIsNone(run.resolve_sprint_ref(con))
-
-    def test_two_armed_sprints_refuse_to_guess(self) -> None:
-        con = self._bindings(31, 38)
-        with mock.patch.dict(run.os.environ, {}, clear=True):
-            self.assertIsNone(run.resolve_sprint_ref(con))
-
-    def test_one_sprint_bound_twice_still_resolves(self) -> None:
-        """Re-arming the same sprint is not ambiguity — DISTINCT collapses it."""
-        con = self._bindings(38, 38)
-        with mock.patch.dict(run.os.environ, {}, clear=True):
-            self.assertEqual("38", run.resolve_sprint_ref(con))
-
-    def test_missing_table_never_blocks_a_boot(self) -> None:
-        """A fork mid-migration degrades to no label, not a failed launch."""
-        con = sqlite3.connect(":memory:")
-        self.addCleanup(con.close)
+    def test_absent_env_never_guesses_from_the_database(self) -> None:
+        con = self._db()
+        con.executescript("""
+            CREATE TABLE sprint_planner_bindings (
+                binding_id INTEGER PRIMARY KEY,
+                sprint_doc_id INTEGER,
+                released_at TEXT);
+            INSERT INTO sprint_planner_bindings VALUES (1, 38, NULL);
+        """)
         with mock.patch.dict(run.os.environ, {}, clear=True):
             self.assertIsNone(run.resolve_sprint_ref(con))
 
@@ -273,7 +234,7 @@ class SprintRefTest(unittest.TestCase):
         """The ruling's whole point: a shell whose current_state names an
         ACTIVE sprint doc still stamps nothing without a binding or the env.
         Deriving hard state from prose is the defect class this unit fixes."""
-        con = self._bindings()
+        con = self._db()
         con.executescript("""
             CREATE TABLE shells (
                 shell_id INTEGER PRIMARY KEY, display_name TEXT,
@@ -292,9 +253,8 @@ class SprintRefTest(unittest.TestCase):
             self.assertIsNone(run.resolve_sprint_ref(con))
 
     def test_headless_boot_writes_the_resolved_ref_onto_the_archive(self) -> None:
-        """End to end through open_session: the column the rail reads is
-        populated by a `./sc run` boot, not left NULL."""
-        con = self._bindings(38)
+        """End to end through open_session: explicit launch scope is stored."""
+        con = self._db()
         con.executescript("""
             CREATE TABLE shells (
                 shell_id INTEGER PRIMARY KEY, active_archive_id INTEGER);
@@ -307,7 +267,8 @@ class SprintRefTest(unittest.TestCase):
             CREATE TABLE session_token_usage (archive_id INTEGER);
             INSERT INTO shells VALUES (1, NULL);
         """)
-        with mock.patch.dict(run.os.environ, {}, clear=True):
+        with mock.patch.dict(run.os.environ, {"SC_SPRINT_REF": "38"},
+                             clear=True):
             run.open_session(con, 1, lifecycle={
                 "harness": "claude", "provider": "anthropic", "model": "opus",
                 "sprint_ref": run.resolve_sprint_ref(con)})
