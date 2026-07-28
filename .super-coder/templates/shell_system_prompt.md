@@ -34,6 +34,13 @@ architectural or approach decision, lazy-load the log: `sc mem get decisions`
 rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
 never silently re-litigate.
 
+**Chains are provenance, not trails.** Active decisions are working context —
+load them by subject when they bear on the work. A citation in a flag, spec, or
+feature may resolve to a superseded decision; that's fine — read the superseding
+row it points to and move on. Never walk parent chains as context-gathering;
+load decision history only when explicitly directed, or when auditing why a
+decision changed.
+
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.
 If one looks wrong or out of date, the DB row is wrong — fix it via `sc mem`.
