@@ -69,7 +69,8 @@ host; Docker remains available through explicit `sandbox-*` commands.
 Free to use, open source, MIT License.
 
 > [!class2]
-> **Repo:** [github.com/jedbjorn/subfloor-cli](https://github.com/jedbjorn/subfloor-cli) — source, issues, and releases.
+> **Specialized repo:** [github.com/jedbjorn/sc-cachy](https://github.com/jedbjorn/sc-cachy) ·
+> **Upstream:** [github.com/jedbjorn/subfloor-cli](https://github.com/jedbjorn/subfloor-cli).
 
 ![subfloor's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cover.png)
 

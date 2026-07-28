@@ -118,7 +118,7 @@ def sh(*args: str) -> subprocess.CompletedProcess:
 # appear in a checkout's origin. Getting this wrong is not cosmetic — a source
 # repo misread as a fork gets its tracked engine `git rm --cached`-ed by the
 # B7 untrack migration (this fired on the dogfood repo the day of the rename).
-SOURCE_REPO_NAMES = ("super-coder", "subfloor", "subfloor-cli")
+SOURCE_REPO_NAMES = ("super-coder", "subfloor", "subfloor-cli", "sc-cachy")
 
 VISUAL_QA_TEMPLATE_TARGETS = {
     "subfloor-visual-qa.yml": Path(".github/workflows/subfloor-visual-qa.yml"),

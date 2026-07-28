@@ -31,12 +31,14 @@ class SourceRepoGuardTest(unittest.TestCase):
         self.assertIn("super-coder", install.SOURCE_REPO_NAMES)
         self.assertIn("subfloor", install.SOURCE_REPO_NAMES)
         self.assertIn("subfloor-cli", install.SOURCE_REPO_NAMES)
+        self.assertIn("sc-cachy", install.SOURCE_REPO_NAMES)
 
     def test_install_accepts_source_names(self):
         orig = install.origin_basename
         try:
             for base, want in [("super-coder", True), ("subfloor", True),
                                ("subfloor-cli", True),
+                               ("sc-cachy", True),
                                ("my-fork", False), (None, False)]:
                 install.origin_basename = lambda b=base: b
                 self.assertEqual(install.is_source_repo(), want, base)
@@ -49,6 +51,7 @@ class SourceRepoGuardTest(unittest.TestCase):
             for url, want in [("https://github.com/jedbjorn/subfloor.git", True),
                               ("https://github.com/jedbjorn/super-coder.git", True),
                               ("https://github.com/jedbjorn/subfloor-cli.git", True),
+                              ("https://github.com/jedbjorn/sc-cachy.git", True),
                               ("git@github.com:me/my-fork.git", False)]:
                 update.git = lambda *a, u=url, **k: SimpleNamespace(stdout=u + "\n",
                                                                     returncode=0)
@@ -62,6 +65,7 @@ class SourceRepoGuardTest(unittest.TestCase):
             for url, want in [("https://github.com/jedbjorn/subfloor", True),
                               ("https://github.com/jedbjorn/super-coder", True),
                               ("https://github.com/jedbjorn/subfloor-cli", True),
+                              ("https://github.com/jedbjorn/sc-cachy", True),
                               ("https://github.com/me/other", False)]:
                 map_repo.git = lambda *a, u=url: u
                 self.assertEqual(map_repo.is_source_repo(), want, url)
