@@ -101,8 +101,8 @@ class EnginePathsCoverageTest(unittest.TestCase):
         # The dir whose omission broke the Interface on every fresh fork (#59).
         self.assertIn(".super-coder/shadow", update.ENGINE_PATHS)
 
-    def test_chat_migrations_specifically_present(self):
-        self.assertIn(".super-coder/chat_migrations", update.ENGINE_PATHS)
+    def test_retired_interface_chat_migrations_are_not_materialized(self):
+        self.assertNotIn(".super-coder/chat_migrations", update.ENGINE_PATHS)
 
     def test_every_tracked_engine_file_is_materialized(self):
         """The recurrence guard for the class: any git-tracked file under
@@ -181,36 +181,6 @@ class EnginePathsAtRefTest(unittest.TestCase):
             f"{new_sha[:12]}: .super-coder/new-path",
             output.getvalue(),
         )
-
-    def test_real_chat_migration_materializes_into_updating_fork(self):
-        installed = ["sc", ".super-coder/scripts"]
-        (self.root / "sc").write_text("old dispatcher\n")
-        self.write_manifest(installed)
-        (self.scripts / "update.py").write_text(
-            "from engine_manifest import ENGINE_PATHS\n"
-        )
-        old_sha = self.commit("fork installed before chat migrations")
-
-        target = [*installed, ".super-coder/chat_migrations"]
-        self.write_manifest(target)
-        source = ROOT / ".super-coder" / "chat_migrations" / "0001_initial.sql"
-        migration = (
-            self.root / ".super-coder" / "chat_migrations" / "0001_initial.sql"
-        )
-        migration.parent.mkdir()
-        migration.write_bytes(source.read_bytes())
-        target_sha = self.commit("engine adds chat migration 0001")
-        _git(self.root, "checkout", old_sha)
-        self.assertFalse(migration.exists())
-
-        with mock.patch.multiple(
-            update,
-            REPO_ROOT=self.root,
-            ENGINE_PATHS=installed,
-        ):
-            update.materialize_engine(target_sha)
-
-        self.assertEqual(migration.read_bytes(), source.read_bytes())
 
     def test_retired_path_is_not_materialized_and_is_reported(self):
         base = ["sc", ".super-coder/scripts"]

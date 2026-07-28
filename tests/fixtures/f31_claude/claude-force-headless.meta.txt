@@ -1,5 +1,0 @@
-rc=0
-started=1
-pre_interrupt_bytes=3065
-post_interrupt_bytes=4163
-session_exited=1

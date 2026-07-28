@@ -44,11 +44,7 @@ def make_db(path: Path) -> None:
         """
         CREATE TABLE shell_memory_archives (
           archive_id INTEGER PRIMARY KEY, shell_id INTEGER, started_at TEXT,
-          harness TEXT
-        );
-        CREATE TABLE interface_sessions (
-          session_id INTEGER PRIMARY KEY, shell_id INTEGER, archive_id INTEGER,
-          created_at TEXT, ended_at TEXT, end_reason TEXT, harness TEXT
+          ended_at TEXT, harness TEXT
         );
         CREATE TABLE shell_messages (
           message_id INTEGER PRIMARY KEY, from_shell_id INTEGER,
@@ -80,15 +76,8 @@ def make_db(path: Path) -> None:
         """
     )
     con.execute(
-        "INSERT INTO shell_memory_archives VALUES (10,1,?,'codex')",
+        "INSERT INTO shell_memory_archives VALUES (10,1,?,NULL,'codex')",
         ("2020-01-01T00:00:00Z",),
-    )
-    # A stale ended Interface session must not describe the current headless
-    # archive.  The current archive has no Interface row at all.
-    con.execute(
-        "INSERT INTO interface_sessions VALUES "
-        "(8,1,9,'2019-12-01T00:00:00Z','2019-12-01T00:01:00Z',"
-        "'operator_end','codex')"
     )
     con.execute(
         "INSERT INTO shell_messages (message_id, from_shell_id, sprint_doc_id, created_at, kind, body) VALUES "
@@ -286,9 +275,8 @@ class DatabaseContractTest(ReaderCase):
     def test_current_archive_session_end_fields_are_observed(self):
         con = sqlite3.connect(self.db)
         con.execute(
-            "INSERT INTO interface_sessions VALUES "
-            "(10,1,10,'2020-01-01T00:00:00Z','2020-01-05T00:00:00Z',"
-            "'stop_hook','codex')"
+            "UPDATE shell_memory_archives SET ended_at=? WHERE archive_id=10",
+            ("2020-01-05T00:00:00Z",),
         )
         con.commit()
         con.close()
@@ -298,7 +286,7 @@ class DatabaseContractTest(ReaderCase):
         self.assertEqual(
             datetime(2020, 1, 5, tzinfo=UTC), evidence.session_ended_at
         )
-        self.assertEqual("stop_hook", evidence.session_end_reason)
+        self.assertIsNone(evidence.session_end_reason)
 
     def test_result_row_is_unit_scoped_when_shell_holds_multiple_units(self):
         con = sqlite3.connect(self.db)
@@ -511,8 +499,8 @@ class DatabaseContractTest(ReaderCase):
     def test_rowless_shell_never_claims_code_work(self):
         con = sqlite3.connect(self.db)
         con.execute(
-            "INSERT INTO interface_sessions VALUES "
-            "(9,1,NULL,'2020-01-05T00:00:00Z',NULL,NULL,'codex')"
+            "INSERT INTO shell_memory_archives VALUES "
+            "(11,1,'2020-01-05T00:00:00Z',NULL,'codex')"
         )
         con.commit()
         con.close()
@@ -522,17 +510,12 @@ class DatabaseContractTest(ReaderCase):
         self.assertFalse(rowless.edits_code)
         self.assertEqual(datetime(2020, 1, 5, tzinfo=UTC), rowless.epoch)
         self.assertIsNone(rowless.branch_declared)
-        self.assertEqual(
-            datetime(2020, 1, 6, tzinfo=UTC),
-            rowless.last_durable_write_at,
-        )
-        self.assertEqual(
-            datetime(2020, 1, 2, tzinfo=UTC),
-            rowless.last_result_row_at,
-        )
-        self.assertEqual(
-            datetime(2020, 1, 4, tzinfo=UTC),
-            rowless.state_changed_at,
+        self.assertIsNone(rowless.last_durable_write_at)
+        self.assertIsNone(rowless.last_result_row_at)
+        self.assertIsNone(rowless.state_changed_at)
+        self.assertTrue(
+            {"durable_write", "result_row", "state_changed_at"}
+            <= set(rowless.unreadable)
         )
 
     def test_rowless_shell_rejects_a_binding_superseded_for_that_sprint(self):
@@ -619,7 +602,7 @@ class DatabaseContractTest(ReaderCase):
             {"durable_write", "result_row", "state_changed_at"}
             <= set(evidence.unreadable)
         )
-        self.assertIn(ar.AMBIGUOUS_PLANNER_BINDING, evidence.unreadable)
+        self.assertNotIn(ar.AMBIGUOUS_PLANNER_BINDING, evidence.unreadable)
 
     def test_each_unreadable_input_is_nullable_and_read_never_raises(self):
         broken = ar.ActivityReader(

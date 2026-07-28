@@ -204,8 +204,8 @@ def _tty_exists(pid: int, tty_fd: "str | None") -> "bool | None":
     OWN mount namespace, via /proc/<pid>/root<tty_fd>.
 
     Testing the bare path instead asks the SCANNER's namespace, which is a
-    different question whenever the two disagree. A post-TMUX session holds a pty
-    from the container's devpts; scanned from the host, `/dev/pts/3` names the
+    different question whenever the two disagree. A containerized session holds
+    a pty from the container's devpts; scanned from the host, `/dev/pts/3` names the
     HOST's pts 3 — a device that is absent, or worse, belongs to some unrelated
     terminal. The live session then read as `tty-gone`, the rail projected
     `unreconciled` with a recovery affordance instead of `working`, and the

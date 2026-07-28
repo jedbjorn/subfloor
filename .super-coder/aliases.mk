@@ -71,7 +71,7 @@ dos-t: dos-test
 dos-url:              ; $(SC) url
 
 # Interface operator workflow. These are the accepted public API-backed verbs;
-# server-only primitives and direct DB/tmux operations intentionally stay out.
+# server-only primitives and direct DB operations intentionally stay out.
 dos-status:           ; $(SC) interface status $(shell-arg) $(ARGS)
 dos-start:            ; $(call require-shell)$(SC) interface start $(s) $(ARGS)
 dos-view:             ; $(call require-shell)$(SC) interface view $(s)

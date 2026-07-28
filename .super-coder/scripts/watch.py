@@ -29,8 +29,8 @@ notice and exits clean so legacy nohup/systemd supervision stops instead of
 racing the service. Registration performs an immediate GitHub read and stores
 the normalized baseline before arming; the service then polls armed watches
 (live, scoped to a LIVE sprint) on a bounded interval, and every semantic
-transition becomes an idempotent `pr_event` row (+ wake item when a binding is
-armed) addressed to the watch's shell. Events: checks concluded (green or
+transition becomes an idempotent `pr_event` row addressed to the watch's shell
+(Step 5 retargets it as a system directive). Events: checks concluded (green or
 red), review submitted, merged, closed. On close — and on merge with no
 checks still running — the final event is emitted and `closed_at` set: the
 watch retires itself. A merge with checks still PENDING retains the watch

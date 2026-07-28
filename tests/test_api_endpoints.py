@@ -35,7 +35,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (server.py adds scripts/ to the path on import)
-import interface_routes  # noqa: E402
+import sprint_routes  # noqa: E402
 import sprint_units  # noqa: E402
 
 
@@ -339,11 +339,11 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
         self.assertEqual(sprint["document_id"], doc_id)
         self.assertEqual(sprint["title"], "sprint: lowercase declaration")
 
-    def test_sprint_unit_columns_match_interface_projection(self) -> None:
+    def test_sprint_unit_columns_match_board_route_projection(self) -> None:
         self.assertIs(server._SPRINT_UNIT_COLUMNS, sprint_units.UNIT_COLUMNS)
         self.assertEqual(
             sprint_units.UNIT_COLUMNS,
-            interface_routes._UNIT_COLS)
+            sprint_routes._UNIT_COLS)
 
     def test_orders_sprints_and_units_and_projects_full_unit_shape(self) -> None:
         later = self._doc(
@@ -365,8 +365,10 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
             [s["document_id"] for s in out["sprints"]], [earlier, later])
         sprint = out["sprints"][0]
         self.assertEqual(sprint["started_at"], "2026-07-26T11:00:00Z")
-        self.assertEqual(sprint["planner"], {
-            "shell_id": self.planner_new, "shortname": "PLN-NEW"})
+        self.assertIsNone(
+            sprint["planner"],
+            "retired bindings must not project as live planner truth",
+        )
         self.assertEqual(sprint["feature"], {
             "feature_id": self.feature, "title": "Flow Board"})
         self.assertEqual(

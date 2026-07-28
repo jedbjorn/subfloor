@@ -280,13 +280,13 @@ class PollCycleTest(unittest.TestCase):
             self.con,
             fetch_ok(gh_node(checks="PENDING"), gh_node(checks="PENDING")))
 
-        alerts = self.con.execute(
-            "SELECT watch_id, severity, reason, resolved_at "
-            "FROM planner_alerts WHERE reason='pr_watch_unscoped'").fetchall()
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["watch_id"], 4)
-        self.assertEqual(alerts[0]["severity"], "critical")
-        self.assertIsNone(alerts[0]["resolved_at"])
+        events = self.con.execute(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE event_kind='pr_watch_unscoped'").fetchall()
+        self.assertEqual(len(events), 1)
+        evidence = json.loads(events[0]["evidence"])
+        self.assertEqual(evidence["watch_id"], 4)
+        self.assertEqual(evidence["severity"], "critical")
 
     def test_transition_fans_out_scoped_and_idempotent(self):
         pr_poller.poll_cycle(self.con, fetch_ok(
@@ -311,6 +311,52 @@ class PollCycleTest(unittest.TestCase):
             self.assertEqual(o["head_sha"], "abc1234def")
             self.assertEqual(o["blind_window"], 0)
             self.assertIsNotNone(o["run_id"])
+
+    def test_enabled_sentinel_retargets_pr_transition_once_to_conductor(self):
+        unit_id = self.con.execute(
+            "SELECT unit_id FROM sprint_units "
+            "WHERE sprint_doc_id=100 ORDER BY unit_id LIMIT 1"
+        ).fetchone()[0]
+        self.con.execute(
+            "UPDATE watched_prs SET unit_id=? WHERE pr_number=1",
+            (unit_id,),
+        )
+        self.con.commit()
+        pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="PENDING"), gh_node(checks="PENDING")),
+            system_signals=True,
+        )
+        result = pr_poller.poll_cycle(
+            self.con,
+            fetch_ok(gh_node(checks="SUCCESS"), gh_node(checks="PENDING")),
+            system_signals=True,
+        )
+
+        self.assertEqual(result["events"], 1)
+        self.assertEqual(self.messages(), [])
+        directives = self.con.execute(
+            "SELECT issuer_flavor,kind,target,sprint_doc_id,unit_id,payload "
+            "FROM directives"
+        ).fetchall()
+        self.assertEqual(len(directives), 1)
+        self.assertEqual(
+            tuple(directives[0])[:5],
+            ("system", "pr-green", "conductor", 100, unit_id),
+        )
+        self.assertEqual(
+            json.loads(directives[0]["payload"])["head_sha"],
+            "abc1234def",
+        )
+        event = self.con.execute(
+            "SELECT event_kind,directive_id,evidence FROM sentinel_events "
+            "WHERE event_kind='pr-green'"
+        ).fetchone()
+        self.assertEqual(event["directive_id"], 1)
+        self.assertEqual(
+            json.loads(event["evidence"])["transition"],
+            "checks:SUCCESS",
+        )
 
     def test_semantic_dedupe_survives_a_replayed_transition(self):
         pr_poller.poll_cycle(self.con, fetch_ok(gh_node(checks="PENDING"),
@@ -389,10 +435,12 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(merge["kind"], "pr_event")
         self.assertEqual(merge["sprint_doc_id"], 100)
         self.assertIn("watch retired", merge["body"])
+        # Wake-item emission retired (conductor Step 1): the pr_event row is
+        # the durable record; its consumer's wake-up is the sentinel's job.
         item = self.con.execute(
             "SELECT binding_id, state FROM planner_wake_items "
             "WHERE message_id=?", (merge["message_id"],)).fetchone()
-        self.assertEqual((item["binding_id"], item["state"]), (1, "queued"))
+        self.assertIsNone(item)
         row = self.con.execute(
             "SELECT closed_at FROM watched_prs "
             "WHERE repo='o/r' AND pr_number=2 AND shell_id=1").fetchone()
@@ -412,10 +460,10 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(run["status"], "error")
         self.assertEqual(run["error"], "connect timeout")
         self.assertIsNotNone(run["finished_at"])
-        # Alert raised, deduplicated while open.
+        # Failure is durable sentinel evidence.
         self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) FROM planner_alerts WHERE reason='pr_poll_failure' "
-            "AND resolved_at IS NULL").fetchone()[0], 1)
+            "SELECT COUNT(*) FROM sentinel_events "
+            "WHERE event_kind='pr_poll_failure'").fetchone()[0], 1)
         # In backoff: the next cycle skips the repo without fetching.
         n = pr_poller.poll_cycle(self.con, state=state, now=t + 5,
                                  fetch=lambda q: self.fail("fetched during backoff"))
@@ -469,9 +517,10 @@ class PollCycleTest(unittest.TestCase):
         self.assertEqual(run["watch_count"], 3)      # the dormant one excluded
         self.assertEqual(run["status"], "ok")
 
-    def test_wake_item_created_when_binding_is_armed(self):
-        # A live (sprint, planner) binding turns the pr_event into scoped wake
-        # work in the same transaction — unique (binding_id, message_id).
+    def test_no_wake_item_forms_even_with_an_armed_binding(self):
+        # Wake-item emission retired (conductor Step 1): even a live
+        # (sprint, planner) binding creates no wake work — the pr_event row
+        # is the durable record; waking its consumer is the sentinel's job.
         self.con.executescript(
             "INSERT INTO interface_generations (shell_id, generation) VALUES (1, 1);"
             "INSERT INTO interface_sessions (shell_id, generation, occupancy,"
@@ -486,14 +535,13 @@ class PollCycleTest(unittest.TestCase):
         pr_poller.poll_cycle(self.con, fetch_ok(gh_node(checks="SUCCESS"),
                                                 gh_node(checks="PENDING")))
         items = self.con.execute(
-            "SELECT i.binding_id, i.state, m.kind, m.sprint_doc_id "
-            "FROM planner_wake_items i JOIN shell_messages m "
-            "ON m.message_id = i.message_id").fetchall()
-        self.assertEqual(len(items), 1)              # planner's watch only — not dev1's
-        self.assertEqual(items[0]["binding_id"], 1)
-        self.assertEqual(items[0]["state"], "queued")
-        self.assertEqual(items[0]["kind"], "pr_event")
-        self.assertEqual(items[0]["sprint_doc_id"], 100)
+            "SELECT i.binding_id FROM planner_wake_items i").fetchall()
+        self.assertEqual(len(items), 0)
+        events = self.con.execute(
+            "SELECT kind, sprint_doc_id FROM shell_messages "
+            "WHERE kind='pr_event'").fetchall()
+        self.assertEqual(len(events), 2)     # both watches' rows — the record
+        self.assertEqual({e["sprint_doc_id"] for e in events}, {100})
 
     def test_startup_sweeps_runs_stranded_by_a_crash(self):
         """H-9. A run row is committed before the fetch and closed after it,
@@ -776,10 +824,10 @@ class CutoverTest(unittest.TestCase):
         con = sqlite3.connect(tmp)
         try:
             row = con.execute(
-                "SELECT severity, reason, resolved_at FROM planner_alerts "
-                "WHERE watch_id=1").fetchone()
-            self.assertEqual(row[:2], ("critical", "pr_watch_unscoped"))
-            self.assertIsNone(row[2])
+                "SELECT event_kind, evidence FROM sentinel_events "
+                "WHERE json_extract(evidence,'$.watch_id')=1").fetchone()
+            self.assertEqual(row[0], "pr_watch_unscoped")
+            self.assertEqual(json.loads(row[1])["severity"], "critical")
         finally:
             con.close()
 

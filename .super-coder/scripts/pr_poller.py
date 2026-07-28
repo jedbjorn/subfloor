@@ -18,21 +18,20 @@ What lives here:
   sprint_doc_id names a LIVE sprint per `sprint_state`; unscoped legacy
   watches stay dormant until rebound). Per cycle: a `pr_poll_runs` audit row
   per repo, durable `pr_poll_observations` for transitions and blind windows,
-  idempotent `pr_event` messages (dedupe_key) plus same-transaction wake items
-  when a live binding owns the (sprint, planner) pair, fingerprint persistence,
-  and terminal retirement. Per-repo failures back off capped without blocking
-  other repos; a repo recovering from failure marks its next observations as
-  blind windows (GitHub may have moved unobserved — convergence, not history).
+  fingerprint persistence, and terminal retirement. With the per-fork sentinel
+  enabled, semantic transitions become deduplicated system directives plus
+  sentinel events; the disabled rollback path keeps the legacy `pr_event`
+  message behavior. Per-repo failures back off capped without blocking other
+  repos; a repo recovering from failure marks its next observations as blind
+  windows (GitHub may have moved unobserved — convergence, not history).
 - `Poller` — the service's scheduler thread. GitHub polling keeps its 30s
-  watch-gated cadence; worker-expectation reconciliation runs every 10 minutes
-  from structured live units even before a PR or watch exists. Explicit PR
-  reconcile still rides `poll_cycle(source='reconcile')` through the API.
-  PR polling beats the status-visible watch heartbeat. Worker reconciliation
-  records tick completion in a separate row rendered alongside it by `sc watch list`.
+  watch-gated cadence. An enabled sentinel evaluates structured live units on
+  its configured cadence even before a PR or watch exists; when disabled, the
+  previous report-only reconciliation remains the rollback behavior. Explicit
+  PR reconcile still rides `poll_cycle(source='reconcile')` through the API.
 
 It never injects terminal input, never marks a message read, never acts on a
-PR, and never mutates the sprint board. PR polling may create an event; the
-worker reconciler returns report-only readings for the alert unit to consume.
+PR, never mutates the sprint board, and never boots a shell.
 """
 from __future__ import annotations
 
@@ -49,9 +48,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
+import conductor_runtime
+import sentinel
 import sprint_state
 from quota_probes import dispatch as quota_dispatch
-from sprint_units import TERMINAL_UNIT_STATES, board_writer
+from sprint_units import TERMINAL_UNIT_STATES
 
 CONCLUDED = {"SUCCESS", "FAILURE", "ERROR"}   # statusCheckRollup terminal states
 
@@ -264,7 +265,7 @@ def classify(
     """Apply spec 58's precedence ladder without side effects.
 
     The clocks are intentionally explicit:
-    - result evidence compares with the unit/binding state clock;
+    - result evidence compares with the unit state clock;
     - recent work compares with ``now``;
     - durable completion and branch grace use the boot epoch;
     - the no-progress window starts at the newest boot, state, work, or
@@ -314,8 +315,8 @@ def classify(
     ):
         return "working"
 
-    # Rule 4 — BOOT clock.  Either authoritative Interface end state or an
-    # absent headless process closes the session.
+    # Rule 4 — BOOT clock. Either the archive lifecycle or an absent headless
+    # process closes the session.
     session_over = (
         _utc(evidence.session_ended_at) is not None
         or evidence.process_present is False
@@ -564,216 +565,22 @@ class ReconcilerState:
         }
 
 
-RECONCILER_SEVERITY = {
-    "checkup": "warning",
-    "not_started": "warning",
-    "work_complete_unreported": "info",
-    # Mapping only: reconcile_tick cannot confirm this signal because it is
-    # deliberately absent from ReconcilerState.ACTIONABLE. No producer exists.
-    "recovery_blocked": "critical",
-}
-HEALTHY_RECONCILER_SIGNALS = {"reported", "working"}
-
-
-def _open_reconciliation_alert(
-    con,
-    reading: ReconciliationReading,
-    severity: str,
-) -> "int | None":
-    expectation = reading.expectation
-    unit_key = (
-        expectation.unit_id
-        if expectation.unit_id is not None
-        else "-"
-    )
-    dedupe_key = (
-        f"reconciler|{expectation.sprint_doc_id}|{unit_key}|"
-        f"{expectation.role}|{reading.signal}"
-    )
-    opened_at = reading.observed_at.isoformat()
-    cursor = con.execute(
-        "INSERT INTO planner_alerts "
-        "(sprint_doc_id, unit_id, role, signal, shell_id, severity, reason, "
-        " dedupe_key, opened_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
-        (
-            expectation.sprint_doc_id,
-            expectation.unit_id,
-            expectation.role,
-            reading.signal,
-            expectation.shell_id,
-            severity,
-            f"worker_{reading.signal}",
-            dedupe_key,
-            opened_at,
-        ),
-    )
-    if cursor.rowcount == 1:
-        return cursor.lastrowid
-    con.execute(
-        "UPDATE planner_alerts SET shell_id=? "
-        "WHERE dedupe_key=? AND resolved_at IS NULL AND shell_id IS NOT ?",
-        (expectation.shell_id, dedupe_key, expectation.shell_id),
-    )
-    return None
-
-
-def _open_missing_binding_alert(con, sprint_doc_id: int) -> None:
-    con.execute(
-        "INSERT INTO planner_alerts "
-        "(sprint_doc_id, severity, reason, dedupe_key) "
-        "VALUES (?, 'warning', 'reconciler_missing_binding', ?) "
-        "ON CONFLICT(dedupe_key) WHERE resolved_at IS NULL DO NOTHING",
-        (
-            sprint_doc_id,
-            f"reconciler|{sprint_doc_id}|-|-|missing_binding",
-        ),
-    )
-
-
-def _resolve_reconciliation_alerts(
-    con,
-    reading: ReconciliationReading,
-) -> None:
-    if reading.signal not in HEALTHY_RECONCILER_SIGNALS:
-        return
-    expectation = reading.expectation
-    con.execute(
-        "UPDATE planner_alerts SET resolved_at=? "
-        "WHERE sprint_doc_id=? AND unit_id IS ? AND role=? "
-        "AND signal IN ('checkup','not_started',"
-        "'work_complete_unreported') "
-        "AND resolved_at IS NULL",
-        (
-            reading.observed_at.isoformat(),
-            expectation.sprint_doc_id,
-            expectation.unit_id,
-            expectation.role,
-        ),
-    )
-
-
-def _reconciliation_body(reading: ReconciliationReading) -> str:
-    expectation = reading.expectation
-    shell = _row(expectation.shell, "shortname", expectation.shell_id)
-    measurement = json.dumps(
-        reading.measurement,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    body = (
-        f"reconciler unit={expectation.seq or '-'} role={expectation.role} "
-        f"shell={shell} signal={reading.signal} measurement={measurement} "
-        f"observed_at={reading.observed_at.isoformat()}"
-    )
-    if reading.explanation is not None:
-        body += " explanation=" + json.dumps(
-            reading.explanation,
-            ensure_ascii=False,
-        )
-    return body
-
-
 def deliver_reconciliation_readings(
     con,
     readings: "list[ReconciliationReading]",
 ) -> list[int]:
-    """Record confirmed findings and push each newly-opened one to its planner.
+    """Transitional sink while the old planner wake path is retired.
 
-    The structured alert is the unconditional record. A message is only the
-    push layer and therefore exists only when the sprint has a historical
-    binding whose planner can be addressed. This function consumes U4's
-    rendered fields and never inspects Evidence or classifies a reading.
-
-    The caller owns the transaction. Returning message ids lets it notify the
-    wake coordinator only after the tick and its heartbeat commit together.
+    Evidence collection stays available for Step 5's sentinel, but Step 3
+    deliberately emits no binding-addressed alert or message. The directive
+    contract (Step 4) gives the sentinel its durable event target.
     """
-    emitted: list[int] = []
-    writers: dict[int, "int | None"] = {}
-    for reading in readings:
-        sprint_doc_id = reading.expectation.sprint_doc_id
-        if sprint_doc_id not in writers:
-            writers[sprint_doc_id] = board_writer(con, sprint_doc_id)
-        planner_shell_id = writers[sprint_doc_id]
-        if planner_shell_id is not None:
-            con.execute(
-                "UPDATE planner_alerts SET resolved_at=? "
-                "WHERE sprint_doc_id=? "
-                "AND reason='reconciler_missing_binding' "
-                "AND resolved_at IS NULL",
-                (reading.observed_at.isoformat(), sprint_doc_id),
-            )
-
-        _resolve_reconciliation_alerts(con, reading)
-        if not reading.confirmed:
-            continue
-        # ReconcilerState only confirms ACTIONABLE signals, and every one is
-        # required to have an explicit severity. Fail loudly if that contract
-        # ever drifts instead of preserving an unreachable fallback.
-        severity = RECONCILER_SEVERITY[reading.signal]
-        if planner_shell_id is None:
-            _open_missing_binding_alert(con, sprint_doc_id)
-
-        alert_id = _open_reconciliation_alert(con, reading, severity)
-        if alert_id is None or planner_shell_id is None:
-            continue
-
-        message_id = con.execute(
-            "INSERT INTO shell_messages "
-            "(from_shell_id, to_shell_id, body, kind, sprint_doc_id, "
-            " dedupe_key) VALUES (?,?,?,'pr_event',?,?)",
-            (
-                planner_shell_id,
-                planner_shell_id,
-                _reconciliation_body(reading),
-                sprint_doc_id,
-                f"reconciler-alert|{alert_id}",
-            ),
-        ).lastrowid
-        # H-8: ONE eligibility ladder. This used to check `released_at IS
-        # NULL` alone and could queue an item no gate would ever pass — it
-        # went straight into a stall, invisibly. The alert still records the
-        # binding it belongs to whether or not a wake can ride it.
-        import interface_wake
-        binding = con.execute(
-            "SELECT binding_id FROM sprint_planner_bindings "
-            "WHERE sprint_doc_id=? AND planner_shell_id=? "
-            "AND released_at IS NULL ORDER BY binding_id DESC LIMIT 1",
-            (sprint_doc_id, planner_shell_id),
-        ).fetchone()
-        binding_id = binding[0] if binding is not None else None
-        con.execute(
-            "UPDATE planner_alerts SET message_id=?, binding_id=? "
-            "WHERE alert_id=?",
-            (message_id, binding_id, alert_id),
-        )
-        wakeable = interface_wake.eligible_binding(
-            con, sprint_doc_id, planner_shell_id)
-        if wakeable is not None:
-            con.execute(
-                "INSERT OR IGNORE INTO planner_wake_items "
-                "(binding_id, message_id) VALUES (?,?)",
-                (wakeable, message_id),
-            )
-        emitted.append(message_id)
-    return emitted
+    return []
 
 
 def live_expectations(con) -> list[Expectation]:
-    """Enumerate the structured board, independent of PR watches and prose."""
+    """Enumerate live worker assignments from the structured board."""
     placeholders = ",".join("?" for _ in TERMINAL_UNIT_STATES)
-    planner_doc_ids = [
-        _row(row, "document_id")
-        for row in con.execute(
-            "SELECT d.document_id FROM documents d "
-            "WHERE d.frozen=0 "
-            "AND EXISTS (SELECT 1 FROM sprint_units u "
-            "WHERE u.sprint_doc_id=d.document_id) "
-            "ORDER BY d.document_id"
-        ).fetchall()
-    ]
     units = con.execute(
         "SELECT u.* FROM sprint_units u "
         "JOIN documents d ON d.document_id=u.sprint_doc_id "
@@ -781,13 +588,6 @@ def live_expectations(con) -> list[Expectation]:
         "ORDER BY u.sprint_doc_id, u.unit_id",
         TERMINAL_UNIT_STATES,
     ).fetchall()
-    doc_ids = sorted(
-        set(planner_doc_ids)
-        | {_row(unit, "sprint_doc_id") for unit in units}
-    )
-    if not doc_ids:
-        return []
-
     shell_ids = {
         shell_id
         for unit in units
@@ -797,19 +597,6 @@ def live_expectations(con) -> list[Expectation]:
         )
         if shell_id is not None
     }
-    marks = ",".join("?" for _ in doc_ids)
-    bindings = con.execute(
-        "SELECT b.sprint_doc_id, b.planner_shell_id "
-        "FROM sprint_planner_bindings b "
-        "WHERE b.binding_id=("
-        " SELECT MAX(b2.binding_id) FROM sprint_planner_bindings b2 "
-        " WHERE b2.sprint_doc_id=b.sprint_doc_id"
-        f") AND b.sprint_doc_id IN ({marks}) "
-        "ORDER BY b.sprint_doc_id",
-        doc_ids,
-    ).fetchall()
-    shell_ids.update(_row(row, "planner_shell_id") for row in bindings)
-
     if not shell_ids:
         return []
     shell_marks = ",".join("?" for _ in shell_ids)
@@ -823,22 +610,6 @@ def live_expectations(con) -> list[Expectation]:
     }
 
     expectations: list[Expectation] = []
-    for binding in bindings:
-        shell_id = _row(binding, "planner_shell_id")
-        shell = shells.get(shell_id)
-        if shell is None:
-            continue
-        expectations.append(
-            Expectation(
-                sprint_doc_id=_row(binding, "sprint_doc_id"),
-                unit_id=None,
-                seq=None,
-                role="planner",
-                shell_id=shell_id,
-                shell=shell,
-                unit=None,
-            )
-        )
     for unit in units:
         for role, column in (
             ("dev", "dev_shell_id"),
@@ -1030,18 +801,9 @@ def beat(con, interval: int, *, name: str = "watch") -> None:
 
 # ── The poll cycle ────────────────────────────────────────────────────────────
 
-def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
-    """Raise an alert, deduplicated while open (partial unique index). Local
-    helper — interface_broker._alert predates watch-scoped alerts.
-
-    The sprint and unit are read off the watch rather than left NULL (H-13):
-    0102 gave planner_alerts structured identity columns, and a watch is the
-    one alert source that KNOWS both. Leaving them NULL forced every reader
-    back to parsing `dedupe_key` or grepping prose for "U3" — the guess this
-    linkage exists to delete. `dedupe_key` is unchanged, so an already-open
-    alert stays the same open alert and no re-alert storm follows.
-    """
-    dedupe = f"-|-|{watch_id or '-'}|-|{reason}"
+def _sentinel_observation(con, *, severity: str, reason: str,
+                          watch_id=None) -> None:
+    """Record poller evidence in the Step 4 append-only observation log."""
     sprint_doc_id = unit_id = None
     if watch_id is not None:
         row = con.execute(
@@ -1050,32 +812,38 @@ def _alert(con, *, severity: str, reason: str, watch_id=None) -> None:
         if row is not None:
             sprint_doc_id, unit_id = row["sprint_doc_id"], row["unit_id"]
     con.execute(
-        "INSERT OR IGNORE INTO planner_alerts "
-        "(watch_id, sprint_doc_id, unit_id, severity, reason, dedupe_key) "
-        "VALUES (?,?,?,?,?,?)",
-        (watch_id, sprint_doc_id, unit_id, severity, reason, dedupe))
+        "INSERT INTO sentinel_events "
+        "(event_kind, sprint_doc_id, unit_id, evidence) VALUES (?,?,?,?)",
+        (reason, sprint_doc_id, unit_id,
+         json.dumps({"severity": severity, "watch_id": watch_id},
+                    sort_keys=True)))
 
 
 def surface_unscoped_watches(con) -> int:
-    """Turn dormant legacy state into an operator-visible, deduped alert.
-    Returns the number of affected watches, whether newly alerted or already
-    carrying the same open alert."""
+    """Turn dormant legacy state into a deduped sentinel observation."""
     watch_ids = live_unscoped_watch_ids(con)
     for watch_id in watch_ids:
-        _alert(con, severity="critical", reason="pr_watch_unscoped",
-               watch_id=watch_id)
+        already = con.execute(
+            "SELECT 1 FROM sentinel_events "
+            "WHERE event_kind='pr_watch_unscoped' "
+            "AND json_extract(evidence,'$.watch_id')=? LIMIT 1",
+            (watch_id,)).fetchone()
+        if already is None:
+            _sentinel_observation(
+                con, severity="critical", reason="pr_watch_unscoped",
+                watch_id=watch_id)
     if watch_ids:
         con.commit()
     return len(watch_ids)
 
 
 def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
-    """One semantic transition → idempotent pr_event + same-transaction wake
-    item. Dedupe keyed (watch, transition, head SHA, state) via the message's
+    """One semantic transition → an idempotent pr_event message.
+
+    Dedupe keyed (watch, transition, head SHA, state) via the message's
     dedupe_key partial unique index: a repeated key is a no-op, so a replayed
-    poll or a baseline race can never double-wake the planner. Returns the
-    new message_id when the event was emitted (None on dedupe) so the caller
-    can signal the wake coordinator after commit."""
+    poll or a baseline race can never duplicate the event. Returns the new
+    message_id when emitted, or None on dedupe."""
     dedupe_key = f"pr-event|{watch['watch_id']}|{event['key']}|{head_sha}"
     try:
         cur = con.execute(
@@ -1087,16 +855,6 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     except sqlite3.IntegrityError:
         return None  # the dedupe index — already emitted
     message_id = cur.lastrowid
-    # H-8: the same eligibility ladder the message ingress uses — an item the
-    # gate can never pass is not created, it is refused, and the condition
-    # behind the refusal is H-5/H-6's to report.
-    import interface_wake
-    binding_id = interface_wake.eligible_binding(
-        con, watch["sprint_doc_id"], watch["shell_id"])
-    if binding_id is not None:
-        con.execute(
-            "INSERT OR IGNORE INTO planner_wake_items (binding_id, message_id) "
-            "VALUES (?, ?)", (binding_id, message_id))
     return message_id
 
 
@@ -1123,7 +881,8 @@ def sweep_stranded_runs(con) -> int:
 
 def poll_cycle(con, fetch=None, source: str = "scheduler",
                state: "PollerState | None" = None,
-               interval: int = DEFAULT_INTERVAL, now: "float | None" = None) -> dict:
+               interval: int = DEFAULT_INTERVAL, now: float | None = None,
+               system_signals: bool = False) -> dict:
     """One bounded pass over armed watches. Per repo: one batched read, one
     pr_poll_runs audit row, transition/blind-window observations, idempotent
     events, fingerprint persistence, terminal retirement. A failed repo backs
@@ -1136,7 +895,6 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                "unscoped_alerts": surface_unscoped_watches(con),
                "stranded_runs": (sweep_stranded_runs(con)
                                  if source == "startup" else 0)}
-    emitted_ids: list[int] = []
     watches = armed_watches(con)
     summary["watches"] = len(watches)
     if not watches:
@@ -1165,14 +923,16 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                 "UPDATE pr_poll_runs SET finished_at=datetime('now'), status=?, "
                 "error=? WHERE run_id=?",
                 ("rate_limited" if r.rate_limited else "error", r.error, run_id))
-            _alert(con, severity="warning", reason="pr_poll_failure",
-                   watch_id=repo_watches[0]["watch_id"])
+            _sentinel_observation(
+                con, severity="warning", reason="pr_poll_failure",
+                watch_id=repo_watches[0]["watch_id"])
             con.commit()
             summary["errors"] += 1
             if failures >= 3:
-                _alert(con, severity="critical",
-                       reason="pr_poll_backoff_escalated",
-                       watch_id=repo_watches[0]["watch_id"])
+                _sentinel_observation(
+                    con, severity="critical",
+                    reason="pr_poll_backoff_escalated",
+                    watch_id=repo_watches[0]["watch_id"])
                 con.commit()
             continue
 
@@ -1199,10 +959,15 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
                     (w["watch_id"], run_id, cur.get("sha"), json.dumps(cur),
                      ",".join(e["key"] for e in events) or None, blind))
             for e in events:
-                mid = _emit_event(con, w, e, cur.get("sha") or "")
-                if mid is not None:
+                emitted = (
+                    sentinel.emit_pr_transition(
+                        con, w, e, cur.get("sha") or ""
+                    )
+                    if system_signals
+                    else _emit_event(con, w, e, cur.get("sha") or "")
+                )
+                if emitted is not None:
                     summary["events"] += 1
-                    emitted_ids.append(mid)
             con.execute(
                 "UPDATE watched_prs SET last_seen=?" +
                 (", closed_at=datetime('now')" if terminal else "") +
@@ -1211,11 +976,6 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
             if terminal:
                 summary["retired"] += 1
         con.commit()
-    # Events are durable — signal the wake coordinator (thread-safe; a no-op
-    # when the Interface stack is down, durable work drains at next startup).
-    import interface_wake
-    for mid in emitted_ids:
-        interface_wake.notify_message(mid)
     return summary
 
 
@@ -1224,14 +984,20 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
 class Poller(threading.Thread):
     """The service's bounded scheduler.
 
-    GitHub reads remain watch-gated.  Reconciliation has its own cadence and
-    structured-unit trigger, so it still runs before a sprint has any PR.
+    GitHub reads remain watch-gated.  The enabled sentinel has its own cadence
+    and structured-unit trigger, so it runs before a sprint has any PR.  The
+    disabled path preserves the preceding report-only reconciler for rollback.
     """
 
     def __init__(self, db_path, interval: int = DEFAULT_INTERVAL, fetch=None,
                  connect=None,
                  reconcile_interval: int = DEFAULT_RECONCILE_INTERVAL,
-                 activity_reader=None, refresh=None):
+                 activity_reader=None, refresh=None,
+                 sentinel_config: sentinel.SentinelConfig | None = None,
+                 sentinel_cycle=None, sentinel_liveness=None,
+                 sentinel_git_probe=None,
+                 conductor_config: conductor_runtime.ConductorConfig | None = None,
+                 conductor_wake=None):
         super().__init__(name="pr-poller", daemon=True)
         self._db_path = str(db_path)
         self._interval = interval
@@ -1243,11 +1009,33 @@ class Poller(threading.Thread):
         )
         self._refresh = refresh
         self._reconcile_due = 0.0
+        # API startup owns ambient instance config and injects it. Direct
+        # construction (tests and bounded tools) is inert unless opted in.
+        self._sentinel_config = (
+            sentinel_config
+            if sentinel_config is not None
+            else sentinel.SentinelConfig()
+        )
+        self._sentinel_cycle = sentinel_cycle or sentinel.cycle
+        self._sentinel_liveness = sentinel_liveness
+        self._sentinel_git_probe = sentinel_git_probe
+        self._sentinel_due = 0.0
+        # The API startup also owns Conductor config loading and doctor
+        # validation. A directly-constructed Poller stays disabled instead of
+        # inheriting ambient repository config.
+        self._conductor_config = (
+            conductor_config
+            if conductor_config is not None
+            else conductor_runtime.ConductorConfig()
+        )
+        self._conductor_wake = conductor_wake or conductor_runtime.maybe_wake
         self._github_enabled = fetch is not None or shutil.which("gh") is not None
         self._stop_event = threading.Event()
         self.state = PollerState()
         self.reconciler_state = ReconcilerState()
         self.last_reconciliation: list[ReconciliationReading] = []
+        self.last_sentinel: dict | None = None
+        self.last_conductor: dict | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1261,7 +1049,7 @@ class Poller(threading.Thread):
     def run(self) -> None:  # pragma: no cover — thread loop; scheduler tests drive it
         if not self._github_enabled:
             print("pr-poller: gh CLI not found — PR polling disabled "
-                  "(worker reconciliation remains enabled)", flush=True)
+                  "(sentinel/reconciliation remains enabled)", flush=True)
         source = "startup"
         while not self._stop_event.is_set():
             try:
@@ -1287,26 +1075,54 @@ class Poller(threading.Thread):
                                 source=source,
                                 state=self.state,
                                 interval=self._interval,
+                                system_signals=self._sentinel_config.enabled,
                             )
                             if n["events"] or n["errors"]:
                                 print(f"pr-poller: {n}", flush=True)
 
                     monotonic_now = time.monotonic()
-                    if monotonic_now >= self._reconcile_due:
+                    if (
+                        self._sentinel_config.enabled
+                        and monotonic_now >= self._sentinel_due
+                    ):
+                        kwargs = {
+                            "config": self._sentinel_config,
+                            "activity_reader": self._activity_reader,
+                        }
+                        if self._sentinel_liveness is not None:
+                            kwargs["liveness"] = self._sentinel_liveness
+                        if self._sentinel_git_probe is not None:
+                            kwargs["git_probe"] = self._sentinel_git_probe
+                        self.last_sentinel = self._sentinel_cycle(
+                            con, **kwargs
+                        )
+                        if self.last_sentinel["active_units"]:
+                            beat(
+                                con,
+                                self._sentinel_config.interval_seconds,
+                                name="sentinel",
+                            )
+                        self._sentinel_due = (
+                            monotonic_now
+                            + self._sentinel_config.interval_seconds
+                        )
+                    elif (
+                        not self._sentinel_config.enabled
+                        and monotonic_now >= self._reconcile_due
+                    ):
                         self.last_reconciliation = reconcile_tick(
                             con,
                             reader=self._activity_reader,
                             refresh=self._refresh,
                             state=self.reconciler_state,
                         )
-                        emitted = deliver_reconciliation_readings(
+                        deliver_reconciliation_readings(
                             con,
                             self.last_reconciliation,
                         )
                         try:
-                            # Commit the reconciliation writes and its liveness
-                            # proof together. A failure before this point leaves
-                            # no fresh beat claiming the tick completed.
+                            # The transitional sink writes nothing; the beat is
+                            # still the proof that evidence collection ran.
                             beat(
                                 con,
                                 self._reconcile_interval,
@@ -1318,13 +1134,22 @@ class Poller(threading.Thread):
                             # them while leaving the absent beat honest.
                             con.commit()
                             print(f"pr-poller: heartbeat error ({e})", flush=True)
-                        if emitted:
-                            import interface_wake
-                            for message_id in emitted:
-                                interface_wake.notify_message(message_id)
                         self._reconcile_due = (
                             monotonic_now + self._reconcile_interval
                         )
+                    if self._conductor_config.enabled:
+                        try:
+                            self.last_conductor = self._conductor_wake(
+                                con, config=self._conductor_config)
+                        except Exception as e:
+                            # Wake is a notification edge, never the scheduler
+                            # mission. Startup doctor catches static config;
+                            # transient launch failures remain visible without
+                            # suppressing poll/sentinel/reconciliation work.
+                            print(
+                                f"pr-poller: conductor wake error ({e})",
+                                flush=True,
+                            )
                 finally:
                     con.close()
             except Exception as e:
@@ -1332,5 +1157,14 @@ class Poller(threading.Thread):
                 # fork to the polling world. Log and keep the loop.
                 print(f"pr-poller: cycle error ({e})", flush=True)
             source = "scheduler"
-            self._stop_event.wait(self._interval +
-                            random.uniform(0, self._interval * JITTER_FRACTION))
+            cadence = min(
+                self._interval,
+                (
+                    self._sentinel_config.interval_seconds
+                    if self._sentinel_config.enabled
+                    else self._reconcile_interval
+                ),
+            )
+            self._stop_event.wait(
+                cadence + random.uniform(0, cadence * JITTER_FRACTION)
+            )

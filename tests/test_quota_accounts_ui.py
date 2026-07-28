@@ -56,7 +56,7 @@ EL = APP[APP.index("const el ="):APP.index("const esc =")]
 HELPERS = APP[APP.index("const fmt = (n)"):APP.index("// On/off switch")]
 SHELL_STATE = APP[APP.index("let selectedShell ="):
                   APP.index("// Rough token estimator")]
-QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Interface tab")]
+QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Active sprints")]
 _ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[_ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach', _ROUTER_AT)]

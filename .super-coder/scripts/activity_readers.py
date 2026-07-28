@@ -228,93 +228,31 @@ class ActivityReader:
             return None
 
         harness = None
-        archive_id = None
-        planner_session = None
         if unit is None:
-            try:
-                rows = con.execute(
-                    "SELECT b.sprint_doc_id, b.armed_at "
-                    "FROM sprint_planner_bindings b "
-                    "JOIN documents d ON d.document_id=b.sprint_doc_id "
-                    "WHERE b.binding_id=("
-                    " SELECT MAX(b2.binding_id) FROM sprint_planner_bindings b2"
-                    " WHERE b2.sprint_doc_id=b.sprint_doc_id"
-                    ") AND b.planner_shell_id=? AND d.frozen=0 "
-                    "AND EXISTS (SELECT 1 FROM sprint_units u "
-                    "            WHERE u.sprint_doc_id=b.sprint_doc_id) "
-                    "ORDER BY b.sprint_doc_id",
-                    (shell_id,),
-                ).fetchall()
-                # U9 can render several live planner roles, but Evidence carries
-                # one sprint scope.  Never collapse several bindings to a
-                # confident answer for whichever row happens to sort newest.
-                if len(rows) == 1:
-                    sprint_doc_id = rows[0]["sprint_doc_id"]
-                    evidence.state_changed_at = _timestamp(rows[0]["armed_at"])
-                    if evidence.state_changed_at is None:
-                        self._mark(evidence, "state_changed_at")
-                else:
-                    sprint_doc_id = None
-                    if len(rows) > 1:
-                        self._mark(evidence, AMBIGUOUS_PLANNER_BINDING)
-                    for name in (
-                        "durable_write",
-                        "result_row",
-                        "state_changed_at",
-                    ):
-                        self._mark(evidence, name)
-            except sqlite3.Error:
-                self._mark(evidence, "durable_write")
-                self._mark(evidence, "result_row")
-                self._mark(evidence, "state_changed_at")
+            # Planner scope used to be guessed from Interface bindings. There
+            # is no planner expectation during the Step 3 decoupling window;
+            # Step 5 supplies explicit sentinel expectations instead.
+            sprint_doc_id = None
+            for name in ("durable_write", "result_row", "state_changed_at"):
+                self._mark(evidence, name)
 
         try:
-            if unit is None:
-                row = con.execute(
-                    "SELECT session_id, created_at, harness FROM interface_sessions "
-                    "WHERE shell_id=? ORDER BY session_id DESC LIMIT 1",
-                    (shell_id,),
-                ).fetchone()
-                evidence.epoch = _timestamp(row["created_at"]) if row else None
-                harness = row["harness"] if row else None
-                planner_session = row["session_id"] if row else None
-            else:
-                row = con.execute(
-                    "SELECT archive_id, started_at, harness "
-                    "FROM shell_memory_archives "
-                    "WHERE shell_id=? AND started_at IS NOT NULL "
-                    "ORDER BY started_at DESC, archive_id DESC LIMIT 1",
-                    (shell_id,),
-                ).fetchone()
-                evidence.epoch = _timestamp(row["started_at"]) if row else None
-                harness = row["harness"] if row else None
-                archive_id = row["archive_id"] if row else None
+            row = con.execute(
+                "SELECT archive_id, started_at, ended_at, harness "
+                "FROM shell_memory_archives "
+                "WHERE shell_id=? AND started_at IS NOT NULL "
+                "ORDER BY started_at DESC, archive_id DESC LIMIT 1",
+                (shell_id,),
+            ).fetchone()
+            evidence.epoch = _timestamp(row["started_at"]) if row else None
+            evidence.session_ended_at = (
+                _timestamp(row["ended_at"]) if row else None
+            )
+            harness = row["harness"] if row else None
             if evidence.epoch is None:
                 self._mark(evidence, "epoch")
         except sqlite3.Error:
             self._mark(evidence, "epoch")
-
-        try:
-            if unit is None and planner_session is not None:
-                row = con.execute(
-                    "SELECT ended_at, end_reason, harness "
-                    "FROM interface_sessions WHERE session_id=?",
-                    (planner_session,),
-                ).fetchone()
-            elif archive_id is not None:
-                row = con.execute(
-                    "SELECT ended_at, end_reason, harness "
-                    "FROM interface_sessions WHERE shell_id=? AND archive_id=? "
-                    "ORDER BY session_id DESC LIMIT 1",
-                    (shell_id, archive_id),
-                ).fetchone()
-            else:
-                row = None
-            if row:
-                evidence.session_ended_at = _timestamp(row["ended_at"])
-                evidence.session_end_reason = row["end_reason"]
-                harness = harness or row["harness"]
-        except sqlite3.Error:
             self._mark(evidence, "session")
 
         if sprint_doc_id is not None:

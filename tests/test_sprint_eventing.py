@@ -15,7 +15,6 @@ Run:
 from __future__ import annotations
 
 import json
-import shlex
 import sqlite3
 import sys
 import tempfile
@@ -130,237 +129,64 @@ class SchemaTest(unittest.TestCase):
         self.assertTrue({"harness", "selector", "availability",
                          "high_effort_supported", "stale"}.issubset(cols))
 
-    def test_sprint_orchestration_seed_matches_source_asset(self):
-        asset = (ENGINE / "assets" / "skills" / "sprint_orchestration" /
-                 "SKILL.md").read_text().split("---", 2)[2].strip()
-        body = self.con.execute(
-            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-        self.assertEqual(body, asset)
+    def test_slot_skill_seed_matches_each_source_asset(self):
+        for name in ("plan_sprint", "dev_sprint", "rev_sprint"):
+            with self.subTest(name=name):
+                asset = (
+                    ENGINE / "assets" / "skills" / name / "SKILL.md"
+                ).read_text().split("---", 2)[2].strip()
+                row = self.con.execute(
+                    "SELECT content,is_deleted FROM skills WHERE name=?",
+                    (name,),
+                ).fetchone()
+                self.assertEqual(row["is_deleted"], 0)
+                self.assertEqual(row["content"], asset)
 
-    def _sprint_orchestration_declaration(self) -> str:
-        body = self.con.execute(
-            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-        start = "## 3. Declare the sprint"
-        end = "## 4. Arm event-driven wake"
-        self.assertEqual(body.count(start), 1)
-        self.assertEqual(body.count(end), 1)
-        return body.split(start, 1)[1].split(end, 1)[0]
-
-    def test_sprint_declaration_normatively_requires_feature_link(self):
-        declaration = " ".join(self._sprint_orchestration_declaration().split())
-        self.assertIn(
-            "linked to its governing roadmap feature with "
-            "`--feature <feature-id>`",
-            declaration,
+    def test_legacy_sprint_role_skills_are_retired(self):
+        names = (
+            "sprint_dev",
+            "sprint_review",
+            "sprint_orchestration",
+            "sprint_orchestration_recover",
+            "sprint_orchestration_close",
         )
+        rows = self.con.execute(
+            f"SELECT name,is_deleted FROM skills WHERE name IN "
+            f"({','.join('?' for _ in names)})",
+            names,
+        ).fetchall()
+        self.assertEqual({row["name"] for row in rows}, set(names))
+        self.assertTrue(all(row["is_deleted"] for row in rows))
 
-    def test_sprint_declaration_doc_add_carries_feature_link(self):
-        declaration = self._sprint_orchestration_declaration()
-        lines = declaration.splitlines()
-        invocations = []
-        for index, line in enumerate(lines):
-            if not line.strip().startswith("./sc mem doc add"):
-                continue
-            invocation = line.strip()
-            while invocation.endswith("\\"):
-                index += 1
-                invocation = f"{invocation[:-1]} {lines[index].strip()}"
-            invocations.append(shlex.split(invocation))
-
-        self.assertEqual(len(invocations), 1)
-        tokens = invocations[0]
-        self.assertEqual(
-            tokens[:5],
-            ["./sc", "mem", "doc", "add", "SPRINT: <title>"],
-        )
-        for option, value in (
-            ("--kind", "doc"),
-            ("--feature", "<feature-id>"),
-            ("--body-file", "<draft.md>"),
-        ):
-            with self.subTest(option=option):
-                self.assertEqual(tokens.count(option), 1)
-                self.assertEqual(tokens[tokens.index(option) + 1], value)
-
-    def test_sprint_declaration_readback_resolves_feature_link(self):
-        declaration = self._sprint_orchestration_declaration()
-        invocations = [
-            shlex.split(line.strip())
-            for line in declaration.splitlines()
-            if line.strip().startswith("./sc mem get documents")
-        ]
-        self.assertEqual(invocations, [[
-            "./sc", "mem", "get", "documents", "--feature", "<feature-id>",
-        ]])
-
-    def test_sprint_declaration_pass_condition_requires_resolved_link(self):
-        declaration = " ".join(self._sprint_orchestration_declaration().split())
-        self.assertIn(
-            "**Pass condition:** the `<feature-id>` document read-back names "
-            "the sprint document, and",
-            declaration,
-        )
-
-    def test_sprint_watch_scope_reseed_matches_asset_and_is_idempotent(self):
-        con = sqlite3.connect(":memory:")
-        self.addCleanup(con.close)
-        con.executescript(SCHEMA.read_text())
-        for migration in sorted(MIGRATIONS.glob("*.sql")):
-            if migration.name == "0086_reseed_sprint_watch_scope.sql":
-                break
-            con.executescript(migration.read_text())
-
-        old = con.execute(
-            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
-        self.assertNotIn("--sprint <doc-id>", old.split("**5. Babysit", 1)[0])
-
-        reseed = (MIGRATIONS / "0086_reseed_sprint_watch_scope.sql").read_text()
-        con.executescript(reseed)
-        once = con.execute(
-            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
-        con.executescript(reseed)
-        twice = con.execute(
-            "SELECT content FROM skills WHERE name='sprint'").fetchone()[0]
-
-        # 0086 is idempotent on its own: applying it twice is applying it once.
-        self.assertEqual(twice, once)
-        # Its scope fix survives every LATER reseed. Asserting `once == asset`
-        # would pin 0086 as the last word on this skill and silently forbid any
-        # subsequent reseed, so replay the rest of the chain and require the
-        # chain — not one migration — to converge on the asset.
-        for migration in sorted(MIGRATIONS.glob("*.sql")):
-            if migration.name > "0086_reseed_sprint_watch_scope.sql":
-                con.executescript(migration.read_text())
-        retired = con.execute(
-            "SELECT is_deleted FROM skills WHERE name='sprint'").fetchone()[0]
-        final = con.execute(
-            "SELECT content FROM skills WHERE name='sprint_dev'").fetchone()[0]
-        asset = (ENGINE / "assets" / "skills" / "sprint_dev" /
-                 "SKILL.md").read_text().split("---", 2)[2].strip()
-        self.assertEqual(retired, 1)
-        self.assertEqual(final, asset)
-        self.assertIn("--sprint <doc-id>", final)
-
-    def test_sprint_orchestration_has_no_billing_gate(self):
-        body = self.con.execute(
-            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-        self.assertIn("Which harness and model should every developer use?", body)
-        self.assertIn("Which harness and model should every reviewer use?", body)
-        self.assertIn("operator-managed inputs", body)
-        for retired_gate in (
-                "Billing approval required",
-                "billing-exception:",
-                "CODEX_API_KEY",
-                "ANTHROPIC_API_KEY",
-                "Extra Usage",
-                "flexible-credit balance"):
-            self.assertNotIn(retired_gate, body)
-
-    def test_sprint_chain_migration_grants_roles_and_retires_combined_skill(self):
-        con = sqlite3.connect(":memory:")
-        self.addCleanup(con.close)
-        con.executescript(SCHEMA.read_text())
-        for migration in sorted(MIGRATIONS.glob("*.sql")):
-            if migration.name == "0103_sprint_skill_chain.sql":
-                break
-            con.executescript(migration.read_text())
-        con.executescript(
-            "INSERT INTO users (user_id, username, is_active) "
-            "VALUES (1, 'T', 1);"
-            "INSERT INTO shells (shell_id, display_name, shortname, flavor, "
-            "system_prompt, user_id) VALUES "
-            "(1, 'Planner', 'plan1', 'planner', 'x', 1),"
-            "(2, 'Dev', 'dev1', 'dev', 'x', 1),"
-            "(3, 'Reviewer', 'rev1', 'reviewer', 'x', 1);")
-
-        reseed = (MIGRATIONS / "0103_sprint_skill_chain.sql").read_text()
-        con.executescript(reseed)
-        con.executescript(reseed)
-
-        grants = {}
-        for shortname, skill in con.execute(
-                "SELECT sh.shortname, sk.name FROM shell_skills ss "
-                "JOIN shells sh ON sh.shell_id=ss.shell_id "
-                "JOIN skills sk ON sk.skill_id=ss.skill_id "
-                "WHERE sk.is_deleted=0"):
-            grants.setdefault(shortname, set()).add(skill)
-
-        self.assertTrue(
-            {"sprint_orchestration", "sprint_orchestration_recover",
-             "sprint_orchestration_close"}.issubset(grants["plan1"]))
-        self.assertIn("sprint_dev", grants["dev1"])
-        self.assertIn("sprint_review", grants["rev1"])
-        self.assertEqual(
-            con.execute("SELECT is_deleted FROM skills WHERE name='sprint'")
-            .fetchone()[0], 1)
-
-    def test_shell_templates_grant_only_the_role_specific_sprint_skills(self):
+    def test_shell_templates_grant_only_the_slot_skill_for_each_role(self):
         templates = ENGINE / "templates" / "shells"
         planner = json.loads((templates / "planner.json").read_text())["skills"]
         dev = json.loads((templates / "dev.json").read_text())["skills"]
         reviewer = json.loads((templates / "reviewer.json").read_text())["skills"]
 
-        self.assertTrue(
-            {"sprint_orchestration", "sprint_orchestration_recover",
-             "sprint_orchestration_close"}.issubset(planner))
-        self.assertIn("sprint_dev", dev)
-        self.assertIn("sprint_review", reviewer)
-        self.assertNotIn("sprint", dev + reviewer)
+        self.assertIn("plan_sprint", planner)
+        self.assertIn("dev_sprint", dev)
+        self.assertIn("rev_sprint", reviewer)
+        legacy = {
+            "sprint_dev",
+            "sprint_review",
+            "sprint_orchestration",
+            "sprint_orchestration_recover",
+            "sprint_orchestration_close",
+        }
+        self.assertTrue(legacy.isdisjoint(planner + dev + reviewer))
 
-    def test_role_skills_keep_the_planner_as_the_event_router(self):
+    def test_role_skills_route_only_through_the_conductor(self):
         def body(name):
             return (ENGINE / "assets" / "skills" / name / "SKILL.md"
                     ).read_text().split("---", 2)[2]
 
-        orchestration = body("sprint_orchestration")
-        dev = body("sprint_dev")
-        review = body("sprint_review")
-
-        self.assertIn("developer reports\na green exact head", orchestration)
-        self.assertIn("The planner sends and boots the reviewer", dev)
-        self.assertIn(
-            "The planner routes fix work or\nmerge authority to the developer",
-            review)
-        self.assertNotIn(
-            "Send Major and Medium findings directly to the developer", review)
-
-    def test_recovery_requires_process_and_subject_evidence_before_reboot(self):
-        recovery = (
-            ENGINE / "assets" / "skills" / "sprint_orchestration_recover" /
-            "SKILL.md").read_text().split("---", 2)[2]
-
-        self.assertIn("/proc/<pid>/stat", recovery)
-        self.assertIn("positive CPU delta as active work", recovery)
-        self.assertIn(
-            "the board and scoped task prove which sprint and unit", recovery)
-        self.assertIn("A reconciler finding requests a checkup", recovery)
-
-    def test_billing_approval_reseed_replaces_scrub_and_is_idempotent(self):
-        con = sqlite3.connect(":memory:")
-        self.addCleanup(con.close)
-        con.executescript(SCHEMA.read_text())
-        for migration in sorted(MIGRATIONS.glob("*.sql")):
-            con.executescript(migration.read_text())
-            if migration.name == "0078_reseed_sprint_plan_billing.sql":
-                break
-
-        before = con.execute(
-            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-        self.assertIn("env -u CODEX_API_KEY", before)
-        self.assertIn("env -u ANTHROPIC_API_KEY", before)
-
-        reseed = (MIGRATIONS / "0079_reseed_sprint_billing_approval.sql").read_text()
-        con.executescript(reseed)
-        once = con.execute(
-            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-        con.executescript(reseed)
-        twice = con.execute(
-            "SELECT content FROM skills WHERE name='sprint_orchestration'").fetchone()[0]
-
-        self.assertIn("observe, never mutate auth", once)
-        self.assertIn("Default scope = one launch", once)
-        self.assertNotIn("env -u", once)
-        self.assertEqual(twice, once)
+        for name in ("plan_sprint", "dev_sprint", "rev_sprint"):
+            with self.subTest(name=name):
+                text = body(name)
+                self.assertIn("--target conductor", text)
+                self.assertNotIn("mem message send", text)
+                self.assertNotIn("watch inbox", text)
 
 
 # ── daemon core: diff_events (pure) ──────────────────────────────────────────
@@ -370,13 +196,8 @@ def snap(state="OPEN", sha="abc1234def", checks=None, reviews=0, review_state=No
             "reviews": reviews, "review_state": review_state}
 
 
-class WatchAlertIdentityTest(unittest.TestCase):
-    """H-13's other half: an alert about a watch says WHICH UNIT structurally.
-
-    0102 gave planner_alerts `sprint_doc_id`/`unit_id` and the watch path left
-    both NULL, so every reader was pushed back to parsing `dedupe_key` or
-    grepping prose. The watch is the one alert source that knows the answer.
-    """
+class WatchSentinelIdentityTest(unittest.TestCase):
+    """A poller observation about a watch says which sprint/unit structurally."""
 
     def setUp(self):
         self.con = build_db()
@@ -398,17 +219,19 @@ class WatchAlertIdentityTest(unittest.TestCase):
         self.con.commit()
         return wid
 
-    def _alert_row(self, wid):
+    def _event_row(self, wid):
         return self.con.execute(
-            "SELECT sprint_doc_id, unit_id, dedupe_key FROM planner_alerts "
-            "WHERE watch_id=?", (wid,)).fetchone()
+            "SELECT sprint_doc_id, unit_id, evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=? "
+            "ORDER BY event_id DESC LIMIT 1", (wid,)).fetchone()
 
-    def test_an_alert_on_a_linked_watch_names_the_unit(self):
+    def test_an_observation_on_a_linked_watch_names_the_unit(self):
         wid = self._watch(41, self.unit)
-        pr_poller._alert(self.con, severity="critical",
-                         reason="pr_poll_failure", watch_id=wid)
+        pr_poller._sentinel_observation(
+            self.con, severity="critical",
+            reason="pr_poll_failure", watch_id=wid)
         self.con.commit()
-        row = self._alert_row(wid)
+        row = self._event_row(wid)
         self.assertEqual(row["sprint_doc_id"], 100)
         self.assertEqual(row["unit_id"], self.unit)
 
@@ -416,27 +239,29 @@ class WatchAlertIdentityTest(unittest.TestCase):
         """Partial structure beats none: the sprint is known even when the
         unit is not, and claiming a unit here would be a guess."""
         wid = self._watch(42, None)
-        pr_poller._alert(self.con, severity="critical",
-                         reason="pr_poll_failure", watch_id=wid)
+        pr_poller._sentinel_observation(
+            self.con, severity="critical",
+            reason="pr_poll_failure", watch_id=wid)
         self.con.commit()
-        row = self._alert_row(wid)
+        row = self._event_row(wid)
         self.assertEqual(row["sprint_doc_id"], 100)
         self.assertIsNone(row["unit_id"])
 
-    def test_the_dedupe_identity_did_not_move(self):
-        """The structured columns are ADDITIVE. If dedupe_key changed shape,
-        every alert already open would re-raise as a new row the moment this
-        shipped — a fleet-wide alert storm on upgrade."""
+    def test_repeated_failures_remain_distinct_observations(self):
         wid = self._watch(43, self.unit)
         for _ in range(3):
-            pr_poller._alert(self.con, severity="critical",
-                             reason="pr_poll_failure", watch_id=wid)
+            pr_poller._sentinel_observation(
+                self.con, severity="critical",
+                reason="pr_poll_failure", watch_id=wid)
         self.con.commit()
         rows = self.con.execute(
-            "SELECT dedupe_key FROM planner_alerts WHERE watch_id=?",
+            "SELECT evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=?",
             (wid,)).fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["dedupe_key"], f"-|-|{wid}|-|pr_poll_failure")
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(
+            json.loads(row["evidence"])["severity"] == "critical"
+            for row in rows))
 
 
 class DiffEventsTest(unittest.TestCase):
@@ -936,16 +761,15 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn(113, armed, "a frozen sprint is never polled")
         self.assertNotIn(114, armed, "an undeclared board is never polled")
 
-    def test_scoped_registration_rebinds_legacy_and_resolves_alert(self):
+    def test_scoped_registration_rebinds_legacy_and_preserves_observation(self):
         con = sqlite3.connect(self.db)
         watch_id = con.execute(
             "INSERT INTO watched_prs (repo, pr_number, shell_id) "
             "VALUES ('own/repo', 21, 1)").lastrowid
         con.execute(
-            "INSERT INTO planner_alerts "
-            "(watch_id, severity, reason, dedupe_key) VALUES "
-            "(?, 'critical', 'pr_watch_unscoped', ?)",
-            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+            "INSERT INTO sentinel_events (event_kind, evidence) VALUES "
+            "('pr_watch_unscoped', ?)",
+            (json.dumps({"severity": "critical", "watch_id": watch_id}),))
         con.commit()
         con.close()
 
@@ -958,10 +782,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(rows[0]["watch_id"], watch_id)
         self.assertEqual(rows[0]["sprint_doc_id"], 100)
         self.assertIn('"checks": "PENDING"', rows[0]["last_seen"])
-        alert = self.q(
-            "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
+        event = self.q(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=?",
             watch_id)[0]
-        self.assertIsNotNone(alert["resolved_at"])
+        self.assertEqual(json.loads(event["evidence"])["severity"], "critical")
 
     def test_legacy_rebind_refuses_scope_unmade_during_baseline(self):
         con = sqlite3.connect(self.db)
@@ -971,10 +796,9 @@ class ApiTest(unittest.TestCase):
             "(repo, pr_number, shell_id, last_seen) "
             "VALUES ('own/repo', 23, 1, '{\"state\":\"OPEN\"}')").lastrowid
         con.execute(
-            "INSERT INTO planner_alerts "
-            "(watch_id, severity, reason, dedupe_key) VALUES "
-            "(?, 'critical', 'pr_watch_unscoped', ?)",
-            (watch_id, f"-|-|{watch_id}|-|pr_watch_unscoped"))
+            "INSERT INTO sentinel_events (event_kind, evidence) VALUES "
+            "('pr_watch_unscoped', ?)",
+            (json.dumps({"severity": "critical", "watch_id": watch_id}),))
         con.commit()
         con.close()
         real = pr_poller.baseline_read
@@ -1006,10 +830,11 @@ class ApiTest(unittest.TestCase):
             "WHERE watch_id=?", watch_id)[0]
         self.assertIsNone(row["sprint_doc_id"])
         self.assertEqual(row["last_seen"], '{"state":"OPEN"}')
-        alert = self.q(
-            "SELECT resolved_at FROM planner_alerts WHERE watch_id=?",
+        event = self.q(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE json_extract(evidence,'$.watch_id')=?",
             watch_id)[0]
-        self.assertIsNone(alert["resolved_at"])
+        self.assertEqual(json.loads(event["evidence"])["severity"], "critical")
 
     def test_list_shows_live_watches(self):
         watch.main(["pr", "own/repo", "17", "--sprint", "100"])

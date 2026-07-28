@@ -81,28 +81,14 @@ sc_refuse_linked() {
   exit 1
 }
 
-# Python for the Interface verbs: PREFER an interpreter with `websockets`
-# (baked into the sandbox image's own python and pinned in requirements.txt
-# for the ./sc deps .venv) because attach/view/take-control stream over it.
-# Never a hard gate here (spec #30 req 12, #518): HTTP-only verbs
-# (status/start/stop/reconcile) are stdlib-only and run on any python3 —
-# the stream dependency is checked lazily, inside the verbs that stream,
-# where interface_cli refuses with the exact dependency action.
-ifpy() {
-  if "$PY" -c 'import websockets' >/dev/null 2>&1; then printf '%s\n' "$PY"; return 0; fi
-  if [ -x "$here/.venv/bin/python" ] && "$here/.venv/bin/python" -c 'import websockets' >/dev/null 2>&1; then printf '%s\n' "$here/.venv/bin/python"; return 0; fi
-  printf '%s\n' "$PY"
-}
-
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
 
 # The two localhost URLs an operator needs, derived from this fork's ports —
 # never a fixed 8800, because every fork lands on its own offset (ports.py).
-# One printer, three callers (`url`, `enter`, `enter-<shortname>`): the boot
-# summary now paints INSIDE the tmux pane where the harness TUI overdraws it,
-# so `enter` restates the links host-side before attaching and `./sc url` /
-# `make dos-url` is the recall path once they have scrolled away (decision #50).
+# One printer, three callers (`url`, `enter`, `enter-<shortname>`): entry
+# restates the links before handing the terminal to the harness, and `./sc url`
+# / `make dos-url` is the recall path once they have scrolled away.
 sc_urls() {
   # Under `set -e` a failed derivation would abort the caller, so it is a
   # return here and `enter` ignores it: an operator who cannot be told the
@@ -149,7 +135,7 @@ SC_PG_SHM="${SC_PG_SHM:-1g}"
 dcheck() {
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc serve + ./sc interface enter" >&2
+    echo "  Setup (one-time):  ./sc doctor      No docker:  ./sc boot" >&2
     exit 1
   fi
 }
@@ -1205,6 +1191,8 @@ case "$cmd" in
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
+  directives)   exec "$PY" "$S/conductor_contracts.py" directives "$@" ;;
+  events)       exec "$PY" "$S/conductor_contracts.py" events "$@" ;;
   # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
   # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
   watch)             exec "$PY" "$S/watch.py" "$@" ;;
@@ -1313,14 +1301,6 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
-  # Interface pane entrypoint (internal; spec #20) — consumes the single-use
-  # launch token the API wrote, then becomes the shell's harness TUI.
-  interface-exec)  exec "$PY" "$S/interface_exec.py" "$@" ;;
-  # Interface CLI parity (spec #20 seq 6) — status/start/view/attach/
-  # take-control/stop/reconcile, and the in-container half of `sc enter`.
-  # API-backed only. ifpy prefers a websockets-capable interpreter for the
-  # stream verbs but never blocks the stdlib-only HTTP verbs (spec #30).
-  interface)    exec "$(ifpy)" "$S/interface_cli.py" "$@" ;;
   # Headless boot (sprint eventing): same render-then-exec path as boot, minus
   # the picker and the TTY. In-container primitive like boot — the planner
   # calls it to stand up an ephemeral worker; also the no-docker host path.
@@ -1467,11 +1447,8 @@ case "$cmd" in
     # no host watch-daemon is started here anymore.
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
-  # Interactive entry goes through the Interface API (spec #20): the in-container
-  # target resolves occupancy, starts a New chat (picker + reservation) for an
-  # available shell, or reattaches the occupied generation. Never a raw boot.
-  enter)        sc_urls || true; exec docker exec -it "$CNAME" ./sc interface enter "$@" ;;
-  enter-*)      sc_urls || true; exec docker exec -it "$CNAME" ./sc interface enter "${cmd#enter-}" "$@" ;;
+  enter)        sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "$@" ;;
+  enter-*)      sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
@@ -1580,7 +1557,7 @@ super-coder — forkable shell substrate
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
-                             live Interface state asks continue-or-rollback; headless discard requires --discard-live-state
+                             refuses while any sprint is ACTIVE
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
                              source repo: no materialize — the floor is reconciled FROM the checkout, so it is fast-forwarded first.
                              Advisory, never blocking: a tree it cannot fast-forward (uncommitted work, or diverged) WARNS that the
@@ -1610,25 +1587,22 @@ super-coder — forkable shell substrate
                              rotates; a missing/unreadable/insecure artifact refuses on stderr with the service
                              action (`./sc restart` / `make dos-r`). A recovery path — the browser attaches its
                              own credential, so pasting a token by hand is no longer the everyday sign-in
-  ./sc sprint action <cmd>  planner action receipts over the API: begin (--message/--operation/--target) records
-                             intent before a side effect; complete|unknown|reconcile <receipt_id> records the result
   ./sc sprint unit <cmd>   the sprint board, as a record: add declares a unit (--sprint/--seq/--title, plus
                              --dev/--reviewer/--depends-on/--overlap/--branch/--pr; an existing seq is a 409,
                              never an upsert); set edits those fields but NOT state; state <s> moves one unit alone
                              (pending|working|in_review|blocked|merged|cancelled) and restamps
                              state_changed_at only when the state actually changes; list reads it.
-                             WRITES are the planner's: the shell bound to that sprint, or — when no binding
-                             is armed — any shell of planner flavor; every other shell is refused 403 and
-                             reads freely. 'none' clears a role or field (--pr -1)
+                             WRITES are planner-flavor only; every worker is refused 403 and reads freely.
+                             'none' clears a role or field (--pr -1)
   ./sc sprint board        render the unit table from the record and print it (--sprint <doc-id>) — a VIEW,
                              never written back into the document body; the doc keeps its prose
-  ./sc sprint status       wake status per binding: armed/released, sprint ACTIVE/frozen, batch state,
-                             last outcome, park/quarantine reason (--sprint <doc-id>, --all incl. released)
-  ./sc sprint alerts       open wake alerts — session-loss, retries-exhausted, quarantine, unmanaged-writer
-                             (--all includes resolved); the only window into wake failures
-  ./sc sprint retry        operator recovery for a parked/stalled batch: --binding <id> [--outcome
-                             delivered|not_delivered] — the park is NEVER resubmitted; items requeue as a
-                             NEW batch that re-gates before a byte moves
+                             Conductor slots boot explicitly with
+                             `./sc run <shortname> --slot <plan|dev|rev> --sprint <id> [--unit U]`;
+                             launch validates flavor and assignment, then embeds the exact sprint context.
+  ./sc directives <cmd>    Conductor directives: list/inspect read the durable queue; emit validates the
+                             authenticated shell's flavor against the data whitelist before inserting;
+                             act executes/refuses one pending row through the mechanical transition table
+  ./sc events <cmd>        sentinel observation log: list/inspect append-only evidence rows
   ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner;
                              --sprint <doc-id> arms it to an ACTIVE sprint); an immediate GitHub baseline
                              is taken at registration, then the engine service poller turns transitions
@@ -1669,24 +1643,16 @@ super-coder — forkable shell substrate
   container only sees this repo + your harness creds):
   ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
                              --no-build reuses the existing image and refuses before runtime changes when absent
-  ./sc enter               enter a shell through the Interface API: pick a shell, then
-                             New chat (harness picker) if available, else reattach the live session
+  ./sc enter               boot an interactive shell directly (picker when omitted)
   ./sc enter-<shortname>   enter that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
-  ./sc interface <verb>    Interface CLI parity (spec #20), API-backed (never direct DB/tmux):
-                             status [shell] [--json] · start <shell> [--harness H] [--model M] [--effort E]
-                             view <shell> (read-only) · attach <shell> (writer) · take-control <shell>
-                             stop <shell> [--force] · reconcile <shell> [--close]
-                             recover <shell> [--force] [--discard-worktree] [--yes] — mutations take --json
-                             (the browser opens the Interface with no sign-in step: what that trusts and
-                             what it still defends against is .super-coder/docs/interface-trust-boundary.md)
-  make dos-help            supported operator aliases for lifecycle, Interface, models,
+  make dos-help            supported operator aliases for lifecycle, models,
                              sprint/watch/job, maintenance, browser token, and generic ./sc forwarding
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
-                             opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
-                             default prompt · --harness <h> · -m <model> (else flavor_defaults);
-                             --effort defaults to high; refuses a shell that already has a live session
+                             opencode · kimi); -p "<prompt>" · --harness <h> · -m <model> · --effort;
+                             Conductor workers add --slot <plan|dev|rev> --sprint <id> [--unit U];
+                             refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services
                              --yes skips the prompt · --no-build preflights/reuses the existing image
@@ -1695,8 +1661,7 @@ super-coder — forkable shell substrate
 
   Primitives (run inside the container; also the no-docker host escape hatch):
   ./sc serve               run the review layer (api + static UI) in the foreground
-  ./sc boot [shortname]    raw interactive launch — REFUSES without the Interface reservation
-                             capability (spec #20); use ./sc enter / ./sc interface instead
+  ./sc boot [shortname]    direct interactive launch (host/no-docker primitive)
   ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
                              (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette)
   ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure

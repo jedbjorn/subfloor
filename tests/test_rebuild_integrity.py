@@ -102,11 +102,10 @@ class RebuildIntegrityTest(unittest.TestCase):
             ).fetchone())
             con.close()
 
-    def test_rebuild_reconciles_open_ended_alert_loaded_after_migrations(self):
+    def test_active_sprint_refuses_before_rebuild_mutation(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             outgoing = tmp / "shell_db.db"
-            snapshot = tmp / "content.sql"
             apply_engine_schema(outgoing)
             con = sqlite3.connect(outgoing)
             con.execute(
@@ -116,60 +115,27 @@ class RebuildIntegrityTest(unittest.TestCase):
                 "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
                 "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
                 "VALUES (1,'Before','s1','test','sp',1,0,1,1)")
+            con.execute(
+                "INSERT INTO documents "
+                "(document_id, kind, title, frozen) "
+                "VALUES (59,'doc','SPRINT: rebuild guard',0)")
+            con.execute(
+                "INSERT INTO sprint_units "
+                "(sprint_doc_id, seq, unit_title, state) "
+                "VALUES (59,'U1','guard proof','working')")
             con.commit()
             con.close()
-
-            snapshot.write_text(
-                "PRAGMA foreign_keys=OFF;\n"
-                "BEGIN;\n"
-                "DELETE FROM users;\n"
-                "INSERT INTO users (user_id, username, is_active) "
-                "VALUES (1,'after',1);\n"
-                "DELETE FROM shells;\n"
-                "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
-                "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
-                "VALUES (1,'After','s1','test','sp',1,0,1,1);\n"
-                "INSERT INTO interface_generations "
-                "(shell_id, generation, ended_at) "
-                "VALUES (1,1,'2026-07-20 00:00:00');\n"
-                "INSERT INTO interface_sessions "
-                "(session_id, shell_id, generation, occupancy, lifecycle, "
-                "ended_at) VALUES "
-                "(1,1,1,'ended','ended','2026-07-20 00:00:00');\n"
-                "INSERT INTO interface_input_state "
-                "(session_id, shell_id, generation, composer, delivery, "
-                "pending_seq) VALUES "
-                "(1,1,1,'unknown','delivery_unknown',7);\n"
-                "INSERT INTO planner_alerts "
-                "(alert_id, session_id, severity, reason, dedupe_key) "
-                "VALUES (42,1,'critical','crash_window_delivery_unknown',"
-                "'1|-|-|crash_window_delivery_unknown');\n"
-                "COMMIT;\n"
-                "PRAGMA foreign_keys=ON;\n"
-            )
+            before = digest(outgoing)
 
             with mock.patch.multiple(
-                rebuild,
-                ENGINE=tmp / ".super-coder",
-                DB_PATH=outgoing,
-                REPO_ROOT=tmp,
-                SNAPSHOT=snapshot,
-                SNAPSHOT_LEGACY=tmp / "missing-content.sql",
-            ), mock.patch.object(rebuild.map_repo, "main"):
-                self.assertEqual(rebuild.main(["--no-backup"]), 0)
-                self.assertEqual(rebuild.main(["--no-backup"]), 0)
+                rebuild, DB_PATH=outgoing, REPO_ROOT=tmp
+            ), self.assertRaises(SystemExit) as ctx:
+                rebuild.main(["--no-backup"])
 
-            con = sqlite3.connect(outgoing)
-            try:
-                alerts = con.execute(
-                    "SELECT alert_id, reason, resolved_at "
-                    "FROM planner_alerts WHERE session_id=1").fetchall()
-            finally:
-                con.close()
-            self.assertEqual(alerts, [
-                (42, "crash_window_delivery_unknown",
-                 "2026-07-20 00:00:00")
-            ])
+            self.assertIn("ACTIVE sprint", str(ctx.exception))
+            self.assertIn("59", str(ctx.exception))
+            self.assertEqual(before, digest(outgoing))
+            self.assertFalse(Path(str(outgoing) + ".rebuild").exists())
 
     def test_valid_candidate_atomically_replaces_outgoing_db(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
