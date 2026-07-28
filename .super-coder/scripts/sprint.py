@@ -53,13 +53,25 @@ import urllib.error
 import urllib.request
 import uuid
 
-SC_API_BASE = os.environ.get("SC_API_BASE", "http://127.0.0.1:8800")
+import ports as ports_mod
+
+SC_API_BASE = os.environ.get("SC_API_BASE", "")
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
 _TIMEOUT = 10
 
 
 def _die(msg: str) -> "SystemExit":
     return SystemExit(f"sc sprint: {msg}")
+
+
+def _api_base() -> str:
+    if SC_API_BASE:
+        return SC_API_BASE.rstrip("/")
+    try:
+        port = ports_mod.resolve()["port"]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise _die(f"could not resolve this install's API URL: {exc}") from exc
+    return f"http://127.0.0.1:{port}"
 
 
 def _api(method: str, path: str, payload: "dict | None" = None,
@@ -74,7 +86,7 @@ def _api(method: str, path: str, payload: "dict | None" = None,
     if idem_key:
         headers["Idempotency-Key"] = idem_key
     req = urllib.request.Request(
-        SC_API_BASE.rstrip("/") + path, data=data, method=method,
+        _api_base() + path, data=data, method=method,
         headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
