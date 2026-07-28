@@ -97,6 +97,12 @@ def _directive_emit(args) -> int:
     return 0
 
 
+def _directive_act(args) -> int:
+    result = _api("POST", f"/api/directives/{args.directive_id}/act", {})
+    _dump(result)
+    return 0 if result["status"] in ("executed", "refused") else 2
+
+
 def _event_list(args) -> int:
     result = _api("GET", _query("/api/sentinel-events", {
         "event_kind": args.kind,
@@ -140,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     de.add_argument("--payload", default="{}")
     de.add_argument("--sprint", type=int)
     de.add_argument("--unit", type=int)
+    da = dsub.add_parser(
+        "act", help="execute/refuse one pending row as the Conductor")
+    da.add_argument("directive_id", type=int)
 
     events = surfaces.add_parser(
         "events", help="read append-only sentinel observations")
@@ -160,6 +169,7 @@ def main(argv=None) -> int:
         ("directives", "list"): _directive_list,
         ("directives", "inspect"): _directive_inspect,
         ("directives", "emit"): _directive_emit,
+        ("directives", "act"): _directive_act,
         ("events", "list"): _event_list,
         ("events", "inspect"): _event_inspect,
     }

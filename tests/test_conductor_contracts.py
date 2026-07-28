@@ -139,6 +139,59 @@ class ConductorContractTests(unittest.TestCase):
         })
         self.assertEqual((status, obj["error"]["code"]), (422, "validation"))
 
+    def test_valid_creation_requests_config_gated_conductor_wake(self):
+        with mock.patch.object(
+                conductor_routes.conductor_runtime,
+                "maybe_wake",
+                return_value={"launched": True},
+        ) as wake:
+            status, _item = self.post({
+                "kind": "ready-for-review",
+                "target": "conductor",
+                "payload": {"head": "abc"},
+            })
+        self.assertEqual(status, 201)
+        wake.assert_called_once()
+
+    def test_act_requires_conductor_token_and_calls_mechanical_runtime(self):
+        conductor_id = self.con.execute(
+            "INSERT INTO shells "
+            "(display_name,shortname,flavor,system_prompt,api_key) "
+            "VALUES ('Conductor','con1','conductor','x','con-token')"
+        ).lastrowid
+        self.con.commit()
+        status, item = self.post({
+            "kind": "ready-for-review",
+            "target": "conductor",
+            "payload": {"head": "abc"},
+        })
+        self.assertEqual(status, 201)
+        directive_id = item["directive_id"]
+
+        status, obj = response(conductor_routes.handle(
+            "POST", f"/api/directives/{directive_id}/act",
+            self.headers("dev-token"), b"{}"))
+        self.assertEqual((status, obj["error"]["code"]),
+                         (403, "conductor_required"))
+
+        expected = {
+            "directive_id": directive_id,
+            "status": "executed",
+            "launches": [],
+            "pids": [],
+        }
+        with mock.patch.object(
+                conductor_routes.conductor_runtime,
+                "act",
+                return_value=expected,
+        ) as act:
+            status, obj = response(conductor_routes.handle(
+                "POST", f"/api/directives/{directive_id}/act",
+                self.headers("con-token"), b"{}"))
+        self.assertEqual((status, obj), (200, expected))
+        act.assert_called_once()
+        self.assertEqual(act.call_args.args[2], conductor_id)
+
     def test_sentinel_events_are_readable_and_append_only(self):
         event_id = conductor_routes.append_sentinel_event(
             self.con, event_kind="activity-beat",

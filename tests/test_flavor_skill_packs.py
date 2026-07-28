@@ -85,9 +85,12 @@ class HardCutoverMigrationTest(unittest.TestCase):
                     (template["flavor"],),
                 )
             }
+            inherited = (
+                common if template.get("inherit_common_skills", True) else set()
+            )
             self.assertEqual(
                 actual,
-                common | set(template.get("skills", [])),
+                inherited | set(template.get("skills", [])),
                 template["flavor"],
             )
 

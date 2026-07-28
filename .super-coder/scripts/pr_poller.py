@@ -48,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import activity_readers
+import conductor_runtime
 import sentinel
 import sprint_state
 from quota_probes import dispatch as quota_dispatch
@@ -994,7 +995,9 @@ class Poller(threading.Thread):
                  activity_reader=None, refresh=None,
                  sentinel_config: sentinel.SentinelConfig | None = None,
                  sentinel_cycle=None, sentinel_liveness=None,
-                 sentinel_git_probe=None):
+                 sentinel_git_probe=None,
+                 conductor_config: conductor_runtime.ConductorConfig | None = None,
+                 conductor_wake=None):
         super().__init__(name="pr-poller", daemon=True)
         self._db_path = str(db_path)
         self._interval = interval
@@ -1006,17 +1009,33 @@ class Poller(threading.Thread):
         )
         self._refresh = refresh
         self._reconcile_due = 0.0
-        self._sentinel_config = sentinel_config or sentinel.load_config()
+        # API startup owns ambient instance config and injects it. Direct
+        # construction (tests and bounded tools) is inert unless opted in.
+        self._sentinel_config = (
+            sentinel_config
+            if sentinel_config is not None
+            else sentinel.SentinelConfig()
+        )
         self._sentinel_cycle = sentinel_cycle or sentinel.cycle
         self._sentinel_liveness = sentinel_liveness
         self._sentinel_git_probe = sentinel_git_probe
         self._sentinel_due = 0.0
+        # The API startup also owns Conductor config loading and doctor
+        # validation. A directly-constructed Poller stays disabled instead of
+        # inheriting ambient repository config.
+        self._conductor_config = (
+            conductor_config
+            if conductor_config is not None
+            else conductor_runtime.ConductorConfig()
+        )
+        self._conductor_wake = conductor_wake or conductor_runtime.maybe_wake
         self._github_enabled = fetch is not None or shutil.which("gh") is not None
         self._stop_event = threading.Event()
         self.state = PollerState()
         self.reconciler_state = ReconcilerState()
         self.last_reconciliation: list[ReconciliationReading] = []
         self.last_sentinel: dict | None = None
+        self.last_conductor: dict | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1118,6 +1137,19 @@ class Poller(threading.Thread):
                         self._reconcile_due = (
                             monotonic_now + self._reconcile_interval
                         )
+                    if self._conductor_config.enabled:
+                        try:
+                            self.last_conductor = self._conductor_wake(
+                                con, config=self._conductor_config)
+                        except Exception as e:
+                            # Wake is a notification edge, never the scheduler
+                            # mission. Startup doctor catches static config;
+                            # transient launch failures remain visible without
+                            # suppressing poll/sentinel/reconciliation work.
+                            print(
+                                f"pr-poller: conductor wake error ({e})",
+                                flush=True,
+                            )
                 finally:
                     con.close()
             except Exception as e:
