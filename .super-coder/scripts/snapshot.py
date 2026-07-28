@@ -78,29 +78,10 @@ PER_INSTANCE_TABLES = [
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
-    # STEP2(conductor): drop the five retired interface_* audit tables from
-    # this serialization surface; Step 4 owns wake-table drain/retirement.
-    # ── Interface (spec #20, 0078) — durable audit only. Live rows are
-    # row-filtered OUT (SNAPSHOT_ROW_FILTERS below): snapshot may run while a
-    # chat is live, and rebuild/update refuse while any live state exists, so
-    # content.sql only ever carries closed/terminal rows. Volatile columns
-    # (tmux socket, PIDs/start ticks, hook token hash) ride SENSITIVE_COLUMNS.
-    # Fully volatile tables (interface_writer_leases, pr_poll_runs) are NOT in
-    # this list — a rebuild rederives them empty. interface_input_state keeps
-    # only terminal delivery-unknown metadata (never terminal bytes).
-    "interface_generations",
-    "interface_sessions",
-    "interface_input_state",
-    # Ordinary mutation idempotency survives rebuild, but credential-producing
-    # responses do not: acquire_lease carries the raw writer bearer and
-    # mint_ticket carries a single-use stream credential. Their backing
-    # runtime state is deliberately not serialized, so replaying either after
-    # rebuild would return a dead credential as well as leak it to git.
-    "interface_idempotency_keys",
-    "sprint_planner_bindings",
-    "planner_wake_batches",
-    "planner_wake_items",
-    "planner_action_receipts",
+    # Retired Interface state and its dependent wake-machine audit remain in
+    # live installed DBs until Step 4 drains them, but are no longer part of a
+    # rebuilt instance. Serializing the dependents without their Interface FK
+    # parents would create an invalid candidate.
     "pr_poll_observations",
     # sprint_units (0098) is the planner's AUTHORED board — the declared belief
     # about who should be doing what — not a derived cache: nothing re-derives
@@ -119,113 +100,15 @@ PER_INSTANCE_TABLES = [
     # .sc-state/map_content.sql by snapshot_map() below, not here.
 ]
 
-# Row-level projection for tables whose LIVE rows must not reach content.sql
-# (spec #20: snapshot preserves closed session/binding audit, terminal/
-# quarantined wake audit, and transition/blind-window observations — and may
-# run while a chat is live). The dump still DELETEs the whole table on load;
-# rows outside the filter simply never existed as far as the rebuild knows.
-def _serialized_session(session_ref: str) -> str:
-    return (
-        "EXISTS (SELECT 1 FROM interface_sessions s "
-        "JOIN interface_generations g "
-        "ON g.shell_id=s.shell_id AND g.generation=s.generation "
-        f"WHERE s.session_id={session_ref} "
-        "AND s.occupancy='ended' AND s.lifecycle='ended' "
-        "AND s.ended_at IS NOT NULL AND g.ended_at IS NOT NULL)"
-    )
-
-
-def _serialized_binding(binding_ref: str) -> str:
-    return (
-        "EXISTS (SELECT 1 FROM sprint_planner_bindings b "
-        "JOIN interface_sessions s ON s.session_id=b.session_id "
-        "JOIN interface_generations sg "
-        "ON sg.shell_id=s.shell_id AND sg.generation=s.generation "
-        "JOIN interface_generations bg "
-        "ON bg.shell_id=b.shell_id AND bg.generation=b.generation "
-        f"WHERE b.binding_id={binding_ref} "
-        "AND (b.released_at IS NOT NULL "
-        "OR EXISTS (SELECT 1 FROM interface_input_state i "
-        "WHERE i.session_id=b.session_id "
-        "AND i.delivery='delivery_unknown') "
-        "OR EXISTS (SELECT 1 FROM planner_wake_batches p "
-        "WHERE p.binding_id=b.binding_id "
-        "AND p.state='delivery_unknown')) "
-        "AND s.occupancy='ended' AND s.lifecycle='ended' "
-        "AND s.ended_at IS NOT NULL "
-        "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL)"
-    )
-
-
-def _serialized_batch(
-        batch_ref: str,
-        states: tuple[str, ...] = ("complete", "delivery_unknown")) -> str:
-    state_list = ",".join(f"'{state}'" for state in states)
-    return (
-        "EXISTS (SELECT 1 FROM planner_wake_batches wb "
-        "JOIN sprint_planner_bindings b ON b.binding_id=wb.binding_id "
-        "JOIN interface_sessions s ON s.session_id=b.session_id "
-        "JOIN interface_generations sg "
-        "ON sg.shell_id=s.shell_id AND sg.generation=s.generation "
-        "JOIN interface_generations bg "
-        "ON bg.shell_id=b.shell_id AND bg.generation=b.generation "
-        "JOIN interface_generations wg "
-        "ON wg.shell_id=wb.shell_id AND wg.generation=wb.generation "
-        f"WHERE wb.batch_id={batch_ref} "
-        f"AND wb.state IN ({state_list}) "
-        "AND s.occupancy='ended' AND s.lifecycle='ended' "
-        "AND s.ended_at IS NOT NULL "
-        "AND sg.ended_at IS NOT NULL AND bg.ended_at IS NOT NULL "
-        "AND wg.ended_at IS NOT NULL)"
-    )
-
-
 SNAPSHOT_ROW_FILTERS = {
-    "interface_generations": "WHERE ended_at IS NOT NULL",
-    "interface_sessions":
-        "WHERE occupancy='ended' AND lifecycle='ended' AND ended_at IS NOT NULL "
-        "AND EXISTS (SELECT 1 FROM interface_generations g "
-        "WHERE g.shell_id=interface_sessions.shell_id "
-        "AND g.generation=interface_sessions.generation "
-        "AND g.ended_at IS NOT NULL)",
-    "interface_input_state":
-        "WHERE delivery='delivery_unknown' "
-        "AND " + _serialized_session("interface_input_state.session_id"),
-    "interface_idempotency_keys":
-        "WHERE expires_at > datetime('now') "
-        "AND operation NOT IN ('acquire_lease','mint_ticket')",
-    "sprint_planner_bindings":
-        "WHERE " + _serialized_binding(
-            "sprint_planner_bindings.binding_id"),
-    "planner_wake_batches":
-        "WHERE " + _serialized_batch("planner_wake_batches.batch_id"),
-    # In-flight items are normally volatile. The exception is an item owned
-    # by a serialized delivery_unknown batch: resolve_batch() needs that row
-    # after rebuild to requeue the still-unread message on explicit retry.
-    "planner_wake_items":
-        "WHERE (state IN ('done','reconcile','quarantined','cancelled') "
-        "OR (state IN ('batched','submitting','running') "
-        "AND batch_id IS NOT NULL AND "
-        + _serialized_batch(
-            "planner_wake_items.batch_id", ("delivery_unknown",)) + ")) "
-        "AND " + _serialized_binding("planner_wake_items.binding_id") + " "
-        "AND EXISTS (SELECT 1 FROM shell_messages m "
-        "WHERE m.message_id=planner_wake_items.message_id) "
-        "AND (batch_id IS NULL OR "
-        + _serialized_batch("planner_wake_items.batch_id") + ")",
     "pr_poll_observations":
         "WHERE (transition IS NOT NULL OR blind_window <> 0) "
         "AND EXISTS (SELECT 1 FROM watched_prs w "
         "WHERE w.watch_id=pr_poll_observations.watch_id)",
-    # Alerts are durable only when every referenced parent is in this same
-    # projection. This drops session-scoped alerts for excluded live sessions
-    # and all legacy orphans, preventing integer-ID reuse from reattaching old
-    # generation state (#533).
+    # New poller alerts are plain rows. Legacy rows tied to the retired
+    # Interface/wake machine stay only in the live DB for Step 4's drain.
     "planner_alerts":
-        "WHERE (session_id IS NULL OR "
-        + _serialized_session("planner_alerts.session_id") + ") "
-        "AND (binding_id IS NULL OR "
-        + _serialized_binding("planner_alerts.binding_id") + ") "
+        "WHERE session_id IS NULL AND binding_id IS NULL "
         "AND (message_id IS NULL OR EXISTS ("
         "SELECT 1 FROM shell_messages m "
         "WHERE m.message_id=planner_alerts.message_id)) "
@@ -355,11 +238,6 @@ def dump_local_skills(con) -> list[str]:
 SENSITIVE_COLUMNS = {
     "shells": {"api_key", "api_key_rotated_at"},
     "users": {"password_hash", "password_salt"},
-    # Interface (0078): exact-identity fencing + credential hashes are
-    # volatile runtime state — never serialized even on ended audit rows.
-    "interface_generations": {"hook_token_hash"},
-    "interface_sessions": {"tmux_socket", "pane_pid", "pane_start_ticks",
-                           "harness_pid", "harness_start_ticks"},
 }
 
 
@@ -375,18 +253,9 @@ def dump_table(con, table: str) -> list[str]:
     if not cols:
         return []
     collist = ", ".join(cols)
-    select_cols = list(cols)
-    if table == "planner_alerts" and "resolved_at" in cols:
-        index = cols.index("resolved_at")
-        select_cols[index] = (
-            "CASE WHEN session_id IS NOT NULL THEN COALESCE("
-            "resolved_at, (SELECT s.ended_at FROM interface_sessions s "
-            "WHERE s.session_id=planner_alerts.session_id)) "
-            "ELSE resolved_at END"
-        )
     where = SNAPSHOT_ROW_FILTERS.get(table, "")
     rows = con.execute(
-        f"SELECT {', '.join(select_cols)} FROM {table} "
+        f"SELECT {collist} FROM {table} "
         f"{where} ORDER BY rowid").fetchall()
     lines = [f"DELETE FROM {table};"]
     for row in rows:

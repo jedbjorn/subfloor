@@ -18,9 +18,8 @@ What lives here:
   sprint_doc_id names a LIVE sprint per `sprint_state`; unscoped legacy
   watches stay dormant until rebound). Per cycle: a `pr_poll_runs` audit row
   per repo, durable `pr_poll_observations` for transitions and blind windows,
-  idempotent `pr_event` messages (dedupe_key) plus same-transaction wake items
-  when a live binding owns the (sprint, planner) pair, fingerprint persistence,
-  and terminal retirement. Per-repo failures back off capped without blocking
+  idempotent `pr_event` messages (dedupe_key), fingerprint persistence, and
+  terminal retirement. Per-repo failures back off capped without blocking
   other repos; a repo recovering from failure marks its next observations as
   blind windows (GitHub may have moved unobserved — convergence, not history).
 - `Poller` — the service's scheduler thread. GitHub polling keeps its 30s
@@ -314,8 +313,8 @@ def classify(
     ):
         return "working"
 
-    # Rule 4 — BOOT clock.  Either authoritative Interface end state or an
-    # absent headless process closes the session.
+    # Rule 4 — BOOT clock. Either the archive lifecycle or an absent headless
+    # process closes the session.
     session_over = (
         _utc(evidence.session_ended_at) is not None
         or evidence.process_present is False
@@ -732,24 +731,10 @@ def deliver_reconciliation_readings(
                 f"reconciler-alert|{alert_id}",
             ),
         ).lastrowid
-        # H-8: ONE eligibility ladder. This used to check `released_at IS
-        # NULL` alone and could queue an item no gate would ever pass — it
-        # went straight into a stall, invisibly. The alert still records the
-        # binding it belongs to whether or not a wake can ride it.
-        binding = con.execute(
-            "SELECT binding_id FROM sprint_planner_bindings "
-            "WHERE sprint_doc_id=? AND planner_shell_id=? "
-            "AND released_at IS NULL ORDER BY binding_id DESC LIMIT 1",
-            (sprint_doc_id, planner_shell_id),
-        ).fetchone()
-        binding_id = binding[0] if binding is not None else None
         con.execute(
-            "UPDATE planner_alerts SET message_id=?, binding_id=? "
-            "WHERE alert_id=?",
-            (message_id, binding_id, alert_id),
+            "UPDATE planner_alerts SET message_id=? WHERE alert_id=?",
+            (message_id, alert_id),
         )
-        # STEP2(conductor): Interface wake retired — the alert row is the
-        # record; wake-item emission moves to the sentinel→Conductor path.
         emitted.append(message_id)
     return emitted
 
@@ -1063,12 +1048,12 @@ def surface_unscoped_watches(con) -> int:
 
 
 def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
-    """One semantic transition → idempotent pr_event + same-transaction wake
-    item. Dedupe keyed (watch, transition, head SHA, state) via the message's
+    """One semantic transition → an idempotent pr_event message.
+
+    Dedupe keyed (watch, transition, head SHA, state) via the message's
     dedupe_key partial unique index: a repeated key is a no-op, so a replayed
-    poll or a baseline race can never double-wake the planner. Returns the
-    new message_id when the event was emitted (None on dedupe) so the caller
-    can signal the wake coordinator after commit."""
+    poll or a baseline race can never duplicate the event. Returns the new
+    message_id when emitted, or None on dedupe."""
     dedupe_key = f"pr-event|{watch['watch_id']}|{event['key']}|{head_sha}"
     try:
         cur = con.execute(
@@ -1080,8 +1065,6 @@ def _emit_event(con, watch, event: dict, head_sha: str) -> "int | None":
     except sqlite3.IntegrityError:
         return None  # the dedupe index — already emitted
     message_id = cur.lastrowid
-    # STEP2(conductor): Interface wake retired — the pr_event message row is
-    # the record; waking its consumer moves to the sentinel→Conductor path.
     return message_id
 
 
@@ -1196,8 +1179,6 @@ def poll_cycle(con, fetch=None, source: str = "scheduler",
             if terminal:
                 summary["retired"] += 1
         con.commit()
-    # STEP2(conductor): Interface wake coordinator retired — emitted rows are
-    # durable; their consumer's wake-up moves to the sentinel→Conductor path.
     return summary
 
 
@@ -1281,7 +1262,7 @@ class Poller(threading.Thread):
                             refresh=self._refresh,
                             state=self.reconciler_state,
                         )
-                        emitted = deliver_reconciliation_readings(
+                        deliver_reconciliation_readings(
                             con,
                             self.last_reconciliation,
                         )
@@ -1300,8 +1281,6 @@ class Poller(threading.Thread):
                             # them while leaving the absent beat honest.
                             con.commit()
                             print(f"pr-poller: heartbeat error ({e})", flush=True)
-                        # STEP2(conductor): wake notify retired with the
-                        # Interface; emitted rows are durable records.
                         self._reconcile_due = (
                             monotonic_now + self._reconcile_interval
                         )

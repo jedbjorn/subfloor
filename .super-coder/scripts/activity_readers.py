@@ -228,8 +228,6 @@ class ActivityReader:
             return None
 
         harness = None
-        archive_id = None
-        planner_session = None
         if unit is None:
             try:
                 rows = con.execute(
@@ -268,55 +266,23 @@ class ActivityReader:
                 self._mark(evidence, "result_row")
                 self._mark(evidence, "state_changed_at")
 
-        # STEP2(conductor): replace the retired Interface-session epoch and
-        # end-state reads with launch/archive truth.
         try:
-            if unit is None:
-                row = con.execute(
-                    "SELECT session_id, created_at, harness FROM interface_sessions "
-                    "WHERE shell_id=? ORDER BY session_id DESC LIMIT 1",
-                    (shell_id,),
-                ).fetchone()
-                evidence.epoch = _timestamp(row["created_at"]) if row else None
-                harness = row["harness"] if row else None
-                planner_session = row["session_id"] if row else None
-            else:
-                row = con.execute(
-                    "SELECT archive_id, started_at, harness "
-                    "FROM shell_memory_archives "
-                    "WHERE shell_id=? AND started_at IS NOT NULL "
-                    "ORDER BY started_at DESC, archive_id DESC LIMIT 1",
-                    (shell_id,),
-                ).fetchone()
-                evidence.epoch = _timestamp(row["started_at"]) if row else None
-                harness = row["harness"] if row else None
-                archive_id = row["archive_id"] if row else None
+            row = con.execute(
+                "SELECT archive_id, started_at, ended_at, harness "
+                "FROM shell_memory_archives "
+                "WHERE shell_id=? AND started_at IS NOT NULL "
+                "ORDER BY started_at DESC, archive_id DESC LIMIT 1",
+                (shell_id,),
+            ).fetchone()
+            evidence.epoch = _timestamp(row["started_at"]) if row else None
+            evidence.session_ended_at = (
+                _timestamp(row["ended_at"]) if row else None
+            )
+            harness = row["harness"] if row else None
             if evidence.epoch is None:
                 self._mark(evidence, "epoch")
         except sqlite3.Error:
             self._mark(evidence, "epoch")
-
-        try:
-            if unit is None and planner_session is not None:
-                row = con.execute(
-                    "SELECT ended_at, end_reason, harness "
-                    "FROM interface_sessions WHERE session_id=?",
-                    (planner_session,),
-                ).fetchone()
-            elif archive_id is not None:
-                row = con.execute(
-                    "SELECT ended_at, end_reason, harness "
-                    "FROM interface_sessions WHERE shell_id=? AND archive_id=? "
-                    "ORDER BY session_id DESC LIMIT 1",
-                    (shell_id, archive_id),
-                ).fetchone()
-            else:
-                row = None
-            if row:
-                evidence.session_ended_at = _timestamp(row["ended_at"])
-                evidence.session_end_reason = row["end_reason"]
-                harness = harness or row["harness"]
-        except sqlite3.Error:
             self._mark(evidence, "session")
 
         if sprint_doc_id is not None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import io
 import sqlite3
 import subprocess
 import sys
@@ -55,12 +54,12 @@ def build_live_db(path: Path) -> None:
             "user_id, is_shared, has_identity, bootstrapped) "
             "VALUES (1,'Admin','AMI','test','test',1,0,1,1)")
         con.execute(
-            "INSERT INTO interface_generations (shell_id, generation) "
-            "VALUES (1,1)")
+            "INSERT INTO documents (document_id, kind, title, frozen) "
+            "VALUES (59,'doc','SPRINT: update guard',0)")
         con.execute(
-            "INSERT INTO interface_sessions "
-            "(shell_id, generation, occupancy, lifecycle) "
-            "VALUES (1,1,'occupied','idle')")
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id, seq, unit_title, state) "
+            "VALUES (59,'U1','guard proof','working')")
         con.commit()
     finally:
         con.close()
@@ -112,10 +111,7 @@ class UpdatePreflightSentinelTest(unittest.TestCase):
             ), mock.patch.object(
                 update, "fetch_update_ref", return_value="a" * 40
             ) as fetch, mock.patch.object(
-                update.interface_reconcile,
-                "live_loss_manifest",
-                return_value=update.interface_reconcile.LiveLossManifest(
-                    sessions=(7,)),
+                update, "active_sprint_ids", return_value={59}
             ), mock.patch.object(
                 update, "migrate_engine_untrack"
             ) as untrack, mock.patch.object(
@@ -221,7 +217,7 @@ class UpdatePreflightSentinelTest(unittest.TestCase):
                 update.main([])
 
             self.assertIn("refusing", str(ctx.exception))
-            self.assertIn("--discard-live-state", str(ctx.exception))
+            self.assertIn("ACTIVE sprint", str(ctx.exception))
             self.assertEqual(fingerprint(watched), before_files)
             with contextlib.closing(sqlite3.connect(db_path)) as con:
                 self.assertEqual(con.execute(
@@ -233,134 +229,18 @@ class UpdatePreflightSentinelTest(unittest.TestCase):
                     before_schema)
 
 
-class UpdateConsentTest(unittest.TestCase):
-    def _preflight(self, *, interactive: bool, answer: str | None = None,
-                   explicit: bool = False):
-        stderr = io.StringIO()
-        patches = [
-            mock.patch.object(
-                update.interface_reconcile,
-                "live_loss_manifest",
-                return_value=update.interface_reconcile.LiveLossManifest(
-                    generations=((1, 1),), sessions=(7,)),
-            ),
-            mock.patch.object(
-                update.interface_reconcile,
-                "discard_live_state",
-                return_value={"sessions_ended": 1, "batches_completed": 1},
-            ),
-            mock.patch.object(sys.stdin, "isatty", return_value=interactive),
-            contextlib.redirect_stderr(stderr),
-        ]
-        if answer is not None:
-            patches.append(mock.patch("builtins.input", return_value=answer))
-        with contextlib.ExitStack() as stack:
-            entered = [stack.enter_context(patch) for patch in patches]
-            update.preflight_live_state(
-                allow_discard=True, discard_requested=explicit)
-        prompt = entered[-1].call_args.args[0] if answer is not None else None
-        return entered[1], stderr.getvalue(), prompt
-
-    def test_down_api_interactive_continue_warns_then_discards(self):
-        discard, warning, prompt = self._preflight(
-            interactive=True, answer="continue")
-        discard.assert_called_once_with(
-            update.DB_PATH,
-            update.interface_reconcile.LiveLossManifest(
-                generations=((1, 1),), sessions=(7,)),
-        )
-        self.assertIn("Interface generation(s): 1/1", warning)
-        self.assertIn("Interface session ID(s): 7", warning)
-        self.assertIn("'continue'", prompt)
-        self.assertIn("'rollback'", prompt)
-
-    def test_interactive_rollback_mutates_nothing(self):
+class UpdateActiveSprintGuardTest(unittest.TestCase):
+    def test_active_sprint_refuses_without_consent_path(self):
         with mock.patch.object(
-            update.interface_reconcile,
-            "live_loss_manifest",
-            return_value=update.interface_reconcile.LiveLossManifest(
-                sessions=(7,)),
-        ), mock.patch.object(
-            update.interface_reconcile, "discard_live_state"
-        ) as discard, mock.patch.object(
-            sys.stdin, "isatty", return_value=True
-        ), mock.patch(
-            "builtins.input", return_value="rollback"
+            update, "active_sprint_ids", return_value={59, 60}
         ), self.assertRaises(SystemExit) as ctx:
-            update.preflight_live_state(allow_discard=True)
-        self.assertIn("unchanged", str(ctx.exception))
-        discard.assert_not_called()
+            update.preflight_live_state()
+        self.assertIn("59, 60", str(ctx.exception))
+        self.assertIn("Close or freeze", str(ctx.exception))
 
-    def test_headless_without_explicit_flag_fails_closed(self):
-        with mock.patch.object(
-            update.interface_reconcile,
-            "live_loss_manifest",
-            return_value=update.interface_reconcile.LiveLossManifest(
-                sessions=(7,)),
-        ), mock.patch.object(
-            update.interface_reconcile, "discard_live_state"
-        ) as discard, mock.patch.object(
-            sys.stdin, "isatty", return_value=False
-        ), self.assertRaises(SystemExit) as ctx:
-            update.preflight_live_state(allow_discard=True)
-        self.assertIn("--discard-live-state", str(ctx.exception))
-        discard.assert_not_called()
-
-    def test_headless_explicit_flag_discards_and_proceeds(self):
-        discard, warning, prompt = self._preflight(
-            interactive=False, explicit=True)
-        discard.assert_called_once_with(
-            update.DB_PATH,
-            update.interface_reconcile.LiveLossManifest(
-                generations=((1, 1),), sessions=(7,)),
-        )
-        self.assertIn("explicit consent received", warning)
-        self.assertIsNone(prompt)
-
-    def test_post_prompt_insertion_refuses_without_mutating_any_row(self):
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            db_path = Path(raw_tmp) / "shell_db.db"
-            build_live_db(db_path)
-            after_insert = {}
-
-            def insert_new_live_state(_prompt):
-                con = sqlite3.connect(db_path)
-                try:
-                    con.execute(
-                        "INSERT INTO shells "
-                        "(shell_id, display_name, shortname, mandate, "
-                        "system_prompt, user_id, is_shared, has_identity, "
-                        "bootstrapped) "
-                        "VALUES (2,'Worker','WORK','test','test',1,0,1,1)")
-                    con.execute(
-                        "INSERT INTO interface_generations "
-                        "(shell_id, generation) VALUES (2,1)")
-                    con.execute(
-                        "INSERT INTO interface_sessions "
-                        "(shell_id, generation, occupancy, lifecycle) "
-                        "VALUES (2,1,'occupied','idle')")
-                    con.commit()
-                    after_insert["dump"] = list(con.iterdump())
-                finally:
-                    con.close()
-                return "continue"
-
-            with mock.patch.object(
-                update, "DB_PATH", db_path
-            ), mock.patch.object(
-                sys.stdin, "isatty", return_value=True
-            ), mock.patch(
-                "builtins.input", side_effect=insert_new_live_state
-            ), self.assertRaises(SystemExit) as refused:
-                update.preflight_live_state(allow_discard=True)
-
-            self.assertIn("changed while consent was pending",
-                          str(refused.exception))
-            con = sqlite3.connect(db_path)
-            try:
-                self.assertEqual(list(con.iterdump()), after_insert["dump"])
-            finally:
-                con.close()
+    def test_no_active_sprint_proceeds(self):
+        with mock.patch.object(update, "active_sprint_ids", return_value=set()):
+            self.assertIsNone(update.preflight_live_state())
 
 
 if __name__ == "__main__":

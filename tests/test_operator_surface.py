@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """The launcher's host-side operator surface — URLs and the command chart.
 
-The review GUI link went missing from `make dos-e` when `enter` started
-routing through `./sc interface enter`: the boot summary moved INSIDE the
-tmux pane, where the harness TUI overdraws it. Nothing was deleted; the
-output moved somewhere the operator cannot read (decisions #50, #52).
-
   - `./sc url` prints this fork's DERIVED ports — a fork whose offset is not
     0 must not be told 8800 (ports.py owns the derivation, nobody restates it)
   - `enter` / `enter-<shortname>` restate the links BEFORE handing the
@@ -13,9 +8,6 @@ output moved somewhere the operator cannot read (decisions #50, #52).
   - every dispatchable verb is charted in `./sc help` — enumerated from the
     dispatcher itself, so a verb added without a help line fails here rather
     than becoming invisible to its operator
-
-The in-session half — the attach line the stream client renders — lives in
-tests/test_interface_cli.py, where the client's own harness is.
 
 Run:
     python3 tests/test_operator_surface.py
@@ -37,9 +29,6 @@ ROOT = Path(__file__).resolve().parents[1]
 # Dispatchable but deliberately absent from the operator chart. Anything else
 # missing is drift, not a decision.
 UNCHARTED_BY_DESIGN = {
-    # The in-pane exec target the runtime spawns — a server-only primitive,
-    # never an operator verb (same line aliases.mk draws for the Make surface).
-    "interface-exec",
     # `./sc help` listing itself is noise.
     "help",
 }
@@ -107,7 +96,12 @@ class EnterPreAttachPrintTest(unittest.TestCase):
     def setUp(self):
         self.bin = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.bin)
-        self._stub("docker", "#!/bin/sh\nexit 0\n")
+        self._stub(
+            "docker",
+            "#!/bin/sh\n"
+            "[ -n \"$SC_DOCKER_LOG\" ] && printf '%s\\n' \"$*\" > \"$SC_DOCKER_LOG\"\n"
+            "exit 0\n",
+        )
         # A python that runs everything except ports.py — the one seam whose
         # failure must not decide whether the operator gets a shell.
         self._stub("no-ports-python",
@@ -131,6 +125,16 @@ class EnterPreAttachPrintTest(unittest.TestCase):
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertIn(f"http://127.0.0.1:{cfg['port']}", out.stdout)
                 self.assertIn(f"http://127.0.0.1:{cfg['dev_port']}", out.stdout)
+
+    def test_enter_dispatches_direct_boot(self):
+        log = self.bin / "docker.log"
+        cases = ((("enter",), "./sc boot"), (("enter-DEV1",), "./sc boot DEV1"))
+        for argv, target in cases:
+            with self.subTest(verb=argv[0]):
+                out = sc(*argv, env=self._env(SC_DOCKER_LOG=str(log)))
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn(target, log.read_text())
+                self.assertNotIn("interface", log.read_text().lower())
 
     def test_an_underivable_url_never_costs_the_operator_their_shell(self):
         """`sc` runs under `set -e`, so an unguarded print is a new way for
