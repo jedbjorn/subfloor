@@ -192,11 +192,23 @@ def _skill_slug(name: str) -> str:
 def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
     """skills_sc/ — the substrate's skill catalogue for browsers: one file per
     skill plus a README index. This is the *catalogue* (every non-deleted
-    skill), distinct from `.claude/skills/` which renders one shell's grants."""
+    skill), distinct from `.claude/skills/` which renders one shell's grants.
+    Retired skill mirrors are pruned so the directory remains an exact render,
+    not an accumulating archive."""
     rows = con.execute(
         "SELECT name, description, category, command, content FROM skills "
         "WHERE is_deleted=0 ORDER BY name"
     ).fetchall()
+    skills_root = root / "skills_sc"
+    current = {
+        "README.md",
+        *(f"{_skill_slug(row['name'])}.md" for row in rows),
+    }
+    if skills_root.exists():
+        for path in skills_root.glob("*.md"):
+            if path.name not in current:
+                path.unlink()
+                written.append(path)
     index = ["# Skills", "",
              "> The substrate's skill catalogue, rendered from the DB. "
              "Per-shell grants live in `.claude/skills/` (rebuilt at boot).", ""]
@@ -216,9 +228,9 @@ def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
             parts += ["  ·  ".join(meta), ""]
         if r["content"]:
             parts += ["---", "", r["content"].strip()]
-        _write_if_changed(root / "skills_sc" / f"{slug}.md",
+        _write_if_changed(skills_root / f"{slug}.md",
                           with_banner("\n".join(parts).rstrip()), written, skipped)
-    _write_if_changed(root / "skills_sc" / "README.md",
+    _write_if_changed(skills_root / "README.md",
                       with_banner("\n".join(index).rstrip()), written, skipped)
 
 

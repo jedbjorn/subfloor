@@ -20,15 +20,17 @@ Interactive and headless launches share this direct boot path. `./sc enter`
 dispatches here for a human session; `./sc run` supplies `--headless`.
 
 Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
-[--effort <level>]`):
+[--effort <level>] [--slot <plan|dev|rev> --sprint <id> [--unit U]]`):
 the same render-then-exec path minus the picker and the TTY. The harness runs
 non-interactively via its adapter's `headless` block (claude -p · codex exec ·
 opencode run), streams a final message, and exits — the ephemeral-worker
-primitive of sprint eventing (specs_sc/sprint-eventing.md). Default prompt
-drains the inbox; a liveness guard refuses a shell whose worktree already
-hosts a live session (one shell, one session). Harness + model resolve:
-explicit flags → the shell's flavor_defaults (a sprint's `models:` line rides
-in AS flags — the planner passes it on every `sc run` it issues).
+primitive of sprint eventing (`specs_sc/sprint-eventing.md`). A slot launch
+validates the shell flavor, live sprint, and assigned unit before opening a
+session, then embeds the exact board context plus the full slot skill in the
+boot artifact. Plain headless launches keep the inbox-drain default. A liveness
+guard refuses a shell whose worktree already hosts a live session (one shell,
+one session). Harness + model resolve: explicit flags → the shell's
+flavor_defaults.
 """
 from __future__ import annotations
 
@@ -60,6 +62,8 @@ import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
+import sprint_state  # noqa: E402  — canonical structural sprint liveness
+from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
@@ -68,6 +72,11 @@ ADAPTERS = ENGINE / "adapters"
 PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
+SLOT_SKILLS = {
+    "plan": ("planner", "plan_sprint"),
+    "dev": ("dev", "dev_sprint"),
+    "rev": ("reviewer", "rev_sprint"),
+}
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
 
 
@@ -677,11 +686,105 @@ def resolve_sprint_ref(con) -> "str | None":
 
     Only the explicit launch context is truth. The old armed-binding fallback
     guessed that every boot during a live sprint belonged to that sprint and
-    depended on the retired Interface wake table. Step 7 promotes this hook to
-    the `--slot … --sprint …` contract; until then callers may set
-    ``SC_SPRINT_REF`` directly. Set-but-empty explicitly means non-sprint.
+    depended on the retired Interface wake table. Slot launches pass the
+    validated `--sprint` value directly; compatibility callers may still set
+    ``SC_SPRINT_REF``. Set-but-empty explicitly means non-sprint.
     """
     return os.environ.get("SC_SPRINT_REF", "").strip() or None
+
+
+class SlotRequestError(ValueError):
+    """A slot launch that cannot resolve one unambiguous sprint assignment."""
+
+
+def resolve_slot_context(con, shell, slot: str, sprint_ref: int,
+                         unit_ref: "str | None" = None) -> dict:
+    """Validate and load the deterministic context for one ephemeral slot.
+
+    This runs before session/worktree creation. A slot therefore cannot start
+    with the wrong flavor, a closed sprint, an unassigned unit, or a missing
+    role skill.
+    """
+    route = SLOT_SKILLS.get(slot)
+    if route is None:
+        raise SlotRequestError(
+            f"--slot must be one of {', '.join(SLOT_SKILLS)}")
+    required_flavor, skill_name = route
+    if shell["flavor"] != required_flavor:
+        raise SlotRequestError(
+            f"--slot {slot} requires a {required_flavor} shell; "
+            f"'{shell['shortname']}' is {shell['flavor'] or 'bespoke'}")
+
+    doc = con.execute(
+        "SELECT document_id,title,frozen FROM documents WHERE document_id=?",
+        (sprint_ref,),
+    ).fetchone()
+    if doc is None:
+        raise SlotRequestError(f"sprint document {sprint_ref} does not exist")
+    if not sprint_state.is_live_sprint(con, sprint_ref):
+        state = "frozen" if doc["frozen"] else "not live"
+        raise SlotRequestError(
+            f"sprint document {sprint_ref} is {state}")
+
+    skill = con.execute(
+        "SELECT name,content FROM skills "
+        "WHERE name=? AND COALESCE(is_deleted,0)=0",
+        (skill_name,),
+    ).fetchone()
+    if skill is None:
+        raise SlotRequestError(
+            f"slot skill '{skill_name}' is unavailable; run ./sc seed-skills")
+
+    params: list = [sprint_ref]
+    where = ["sprint_doc_id=?"]
+    live_assignment = slot == "dev" or (slot == "rev" and unit_ref is not None)
+    if live_assignment:
+        placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
+        where.append(f"state NOT IN ({placeholders})")
+        params.extend(TERMINAL_UNIT_STATES)
+    if unit_ref is not None:
+        where.append("seq=?")
+        params.append(unit_ref)
+    if slot == "dev":
+        where.append("dev_shell_id=?")
+        params.append(shell["shell_id"])
+    elif slot == "rev" and unit_ref is not None:
+        where.append("reviewer_shell_id=?")
+        params.append(shell["shell_id"])
+
+    units = con.execute(
+        "SELECT unit_id,seq,unit_title,state,depends_on,overlap,branch,"
+        "pr_number,dev_shell_id,reviewer_shell_id FROM sprint_units WHERE "
+        + " AND ".join(where)
+        + " ORDER BY unit_id",
+        tuple(params),
+    ).fetchall()
+    if not units:
+        focus = f" unit {unit_ref}" if unit_ref is not None else ""
+        if slot == "plan" or (slot == "rev" and unit_ref is None):
+            raise SlotRequestError(
+                f"sprint document {sprint_ref}{focus} has no unit")
+        raise SlotRequestError(
+            f"shell '{shell['shortname']}' has no live {slot} assignment in "
+            f"sprint document {sprint_ref}{focus}")
+
+    return {
+        "slot": slot,
+        "skill_name": skill["name"],
+        "skill_body": skill["content"],
+        "sprint_doc_id": doc["document_id"],
+        "sprint_title": doc["title"],
+        "units": [dict(row) for row in units],
+    }
+
+
+def slot_default_prompt(context: dict) -> str:
+    """The prompt used when the Conductor supplies no narrower relay payload."""
+    units = ", ".join(row["seq"] for row in context["units"])
+    return (
+        f"Execute the loaded {context['skill_name']} slot for sprint "
+        f"{context['sprint_doc_id']} ({units}); emit the required directive."
+    )
 
 
 def _shell_status(shell, snap: "dict | None") -> str:
@@ -1187,6 +1290,9 @@ def main() -> None:
     flag_model = None
     flag_effort = None
     prompt = None
+    slot = None
+    slot_sprint = None
+    slot_unit = None
     positional = []
     i = 0
     while i < len(args):
@@ -1207,6 +1313,18 @@ def main() -> None:
             prompt = args[i + 1] if i + 1 < len(args) else None
             i += 2
             continue
+        if a == "--slot":
+            slot = args[i + 1] if i + 1 < len(args) else ""
+            i += 2
+            continue
+        if a == "--sprint":
+            slot_sprint = args[i + 1] if i + 1 < len(args) else ""
+            i += 2
+            continue
+        if a == "--unit":
+            slot_unit = args[i + 1] if i + 1 < len(args) else ""
+            i += 2
+            continue
         if a.startswith("--harness="):
             flag_harness = a.split("=", 1)[1]
         elif a.startswith("--model="):
@@ -1215,13 +1333,34 @@ def main() -> None:
             flag_effort = a.split("=", 1)[1]
         elif a.startswith("--prompt="):
             prompt = a.split("=", 1)[1]
+        elif a.startswith("--slot="):
+            slot = a.split("=", 1)[1]
+        elif a.startswith("--sprint="):
+            slot_sprint = a.split("=", 1)[1]
+        elif a.startswith("--unit="):
+            slot_unit = a.split("=", 1)[1]
         elif not a.startswith("-"):
             positional.append(a)
         i += 1
     requested = positional[0] if positional else None
     if headless and not requested:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
-                 '[-m <model>] [--effort <level>]')
+                 '[-m <model>] [--effort <level>] '
+                 '[--slot <plan|dev|rev> --sprint <id> [--unit U]]')
+    slot_flags = (slot is not None, slot_sprint is not None, slot_unit is not None)
+    if any(slot_flags) and not headless:
+        sys.exit("session launch: --slot/--sprint/--unit require ./sc run")
+    if any(slot_flags) and (not slot or not slot_sprint):
+        sys.exit("sc run: --slot and --sprint are required together")
+    if slot_unit == "":
+        sys.exit("sc run: --unit requires a value")
+    if slot_sprint is not None:
+        try:
+            slot_sprint = int(slot_sprint)
+        except (TypeError, ValueError):
+            sys.exit("sc run: --sprint must be a positive integer")
+        if slot_sprint <= 0:
+            sys.exit("sc run: --sprint must be a positive integer")
 
     # Wordmark banner — interactive boots only; headless/verify logs stay clean.
     if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():
@@ -1258,6 +1397,14 @@ def main() -> None:
             if not headless and sys.stdin.isatty() else None)
     chosen = pick_shell(list_shells(con, user["user_id"]), requested, first,
                         fdefaults, snap)
+    slot_context = None
+    if slot is not None:
+        try:
+            slot_context = resolve_slot_context(
+                con, chosen, slot, slot_sprint, slot_unit)
+        except SlotRequestError as exc:
+            con.close()
+            sys.exit(f"sc run: {exc}")
     # Direct interactive boots (`./sc enter dev3`) skip the picker and its
     # confirm — run the same guard here. Picker path already confirmed.
     if requested and not headless and not confirm_live(chosen, snap):
@@ -1353,11 +1500,16 @@ def main() -> None:
         # flavor default; interactive routes the flavor default). None = the harness
         # picks its own — recorded as NULL, honest about what we know at boot.
         try:
+            launch_sprint_ref = (
+                str(slot_context["sprint_doc_id"])
+                if slot_context is not None
+                else resolve_sprint_ref(con)
+            )
             session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
                 "harness": harness,
                 "provider": session_provider(harness, session_model),
                 "model": session_model,
-                "sprint_ref": resolve_sprint_ref(con),
+                "sprint_ref": launch_sprint_ref,
             })
         except SessionOpenError as exc:
             con.close()
@@ -1414,7 +1566,8 @@ def main() -> None:
                                floor_note=floor_note,
                                source_mode=install.is_source_repo(),
                                api_key=full["api_key"],
-                               api_port=api_port)
+                               api_port=api_port,
+                               slot_context=slot_context)
 
         # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
         # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
@@ -1521,8 +1674,13 @@ def main() -> None:
     headless_cmd = None
     if headless:
         hmodel = session_model  # resolved up front (persisted on the archive row)
+        effective_prompt = (
+            prompt
+            or (slot_default_prompt(slot_context)
+                if slot_context is not None else DEFAULT_HEADLESS_PROMPT)
+        )
         headless_cmd = headless_command(
-            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, sandbox_flags,
+            adapter, effective_prompt, hmodel, sandbox_flags,
             session_effort)
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
@@ -1531,7 +1689,13 @@ def main() -> None:
             src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
             print(f"→ model: {hmodel} ({src})")
         print(f"→ effort: {session_effort}")
-        print(f"→ headless prompt: {(prompt or DEFAULT_HEADLESS_PROMPT)[:120]}")
+        if slot_context is not None:
+            print(
+                f"→ slot: {slot_context['slot']} · "
+                f"sprint {slot_context['sprint_doc_id']} · "
+                f"skill {slot_context['skill_name']}"
+            )
+        print(f"→ headless prompt: {effective_prompt[:120]}")
 
     # Close the boot summary with the review GUI — the link lives in a different
     # place per fork, so every interactive boot restates it where it can't be
@@ -1563,6 +1727,11 @@ def main() -> None:
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
+    if slot_context is not None:
+        env["SC_SPRINT_REF"] = str(slot_context["sprint_doc_id"])
+        env["SC_SPRINT_SLOT"] = slot_context["slot"]
+        env["SC_SPRINT_UNITS"] = ",".join(
+            row["seq"] for row in slot_context["units"])
     # Optional fast-path for the branch-guard hooks: the absolute engine path, so
     # they skip the `git rev-parse --git-common-dir` walk. NOT load-bearing — the
     # hooks resolve the engine env-independently (a fork gitignores .super-coder/,

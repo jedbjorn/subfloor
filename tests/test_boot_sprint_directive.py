@@ -138,7 +138,7 @@ class SprintDirectiveTest(unittest.TestCase):
                  title="boot-stamped directive")
         out = self.render(DEV_SHELL)
         self.assertIn("DEV", out)
-        self.assertIn("`sprint_dev` skill", out)
+        self.assertIn("`dev_sprint` skill", out)
         self.assertIn("`U9`", out)
         self.assertIn("boot-stamped directive", out)
         self.assertIn("doc 59", out)
@@ -153,7 +153,7 @@ class SprintDirectiveTest(unittest.TestCase):
         add_unit(self.con, 59, "U3", dev=DEV_SHELL, reviewer=REVIEWER_SHELL)
         out = self.render(REVIEWER_SHELL)
         self.assertIn("REVIEWER", out)
-        self.assertIn("`sprint_review` skill", out)
+        self.assertIn("`rev_sprint` skill", out)
         self.assertIn("`U3`", out)
 
     def test_planner_context_does_not_resolve_from_retired_bindings(self):
@@ -172,7 +172,7 @@ class SprintDirectiveTest(unittest.TestCase):
         out = self.render(REVIEWER_SHELL)
         self.assertIn("`U3`", out)
         self.assertIn("`U4`", out)
-        self.assertEqual(out.count("`sprint_review` skill"), 1)
+        self.assertEqual(out.count("`rev_sprint` skill"), 1)
 
     # ── two roles / two sprints — every one named, never a silent pick ──────
 
@@ -181,8 +181,8 @@ class SprintDirectiveTest(unittest.TestCase):
         add_unit(self.con, 59, "U9", dev=DEV_SHELL)
         add_unit(self.con, 59, "U3", reviewer=DEV_SHELL)
         out = self.render(DEV_SHELL)
-        self.assertIn("`sprint_dev` skill", out)
-        self.assertIn("`sprint_review` skill", out)
+        self.assertIn("`dev_sprint` skill", out)
+        self.assertIn("`rev_sprint` skill", out)
         self.assertIn("Act on every role listed above", out)
 
     def test_a_shell_in_two_sprints_sees_both(self):
