@@ -61,6 +61,7 @@ _LOG_LOCK = threading.Lock()
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
+import conductor_runtime  # noqa: E402  (Step 8 wake/config/doctor)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
@@ -3747,11 +3748,24 @@ def main(argv):
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
+    conductor_config = conductor_runtime.load_config()
+    if conductor_config.enabled:
+        con = db_driver.connect(str(DB_PATH))
+        try:
+            conductor_runtime.doctor(con, conductor_config)
+        except conductor_runtime.ConductorConfigError as exc:
+            sys.exit(f"server: conductor config invalid — {exc}")
+        finally:
+            con.close()
     # Sole scheduler: watched-PR polling (spec #20 task #85, decision #19) plus
     # the config-gated Conductor sentinel. The retired host `sc watch daemon`
     # cannot form a second DB writer. GitHub reads stay watch-gated; sentinel
     # reads stay live-sprint-gated and never boot a shell before Step 8.
-    pr_poller.Poller(DB_PATH).start()
+    pr_poller.Poller(
+        DB_PATH,
+        sentinel_config=pr_poller.sentinel.load_config(),
+        conductor_config=conductor_config,
+    ).start()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which

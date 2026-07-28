@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
 sys.path.insert(0, str(ENGINE / "scripts"))
+import conductor_runtime  # noqa: E402
 import db_driver  # noqa: E402
 
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
@@ -271,7 +272,31 @@ def _create_directive(con, headers, body):
     except db_driver.IntegrityError as exc:
         con.rollback()
         return _err(422, "directive_invalid", str(exc))
-    return _json(201, _directive(con, cur.lastrowid))
+    item = _directive(con, cur.lastrowid)
+    conductor_runtime.maybe_wake(con)
+    return _json(201, item)
+
+
+def _act_directive(con, headers, directive_id: int):
+    shell = _shell_for_token(con, headers)
+    if shell is None:
+        return _err(
+            401, "conductor_required",
+            "directive execution requires a valid conductor bearer token",
+        )
+    shell_id, flavor = shell
+    if flavor != "conductor":
+        return _err(
+            403, "conductor_required",
+            f"shell {shell_id} is {flavor or 'bespoke'}, not conductor",
+        )
+    try:
+        result = conductor_runtime.act(con, directive_id, shell_id)
+    except KeyError:
+        return _err(404, "not_found", "no such directive")
+    except PermissionError as exc:
+        return _err(403, "conductor_required", str(exc))
+    return _json(200, result)
 
 
 def handle(method: str, path: str, headers_raw: str, body: bytes):
@@ -309,6 +334,12 @@ def handle(method: str, path: str, headers_raw: str, body: bytes):
                     return _err(422, "validation", str(exc))
                 return _json(200, item) if item else _err(
                     404, "not_found", "no such directive")
+            if len(parts) == 4 and parts[3] == "act" and method == "POST":
+                try:
+                    directive_id = _int(parts[2], "directive_id")
+                except ValueError as exc:
+                    return _err(422, "validation", str(exc))
+                return _act_directive(con, headers, directive_id)
         if parts[:2] == ["api", "sentinel-events"]:
             if len(parts) == 2 and method == "GET":
                 try:

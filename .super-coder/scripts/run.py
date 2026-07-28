@@ -109,6 +109,11 @@ def headless_effort_env(adapter: dict, effort: "str | None") -> dict[str, str]:
     return {ecfg["env"]: effort} if effort and ecfg.get("env") else {}
 
 
+def default_headless_effort(adapter: dict) -> "str | None":
+    """Use high only when the adapter has an effort transport."""
+    return "high" if ((adapter.get("headless") or {}).get("effort")) else None
+
+
 def validate_headless_request(adapter: dict, model: "str | None",
                               effort: "str | None") -> None:
     hcfg = adapter.get("headless") or {}
@@ -1120,12 +1125,14 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
 
     # Model route: an explicit model wins; else the (flavor, harness) cell,
     # exactly main()'s flavor_defaults routing. Effort mirrors main(): a
-    # headless plan defaults to high; the interactive TUI path has no effort
-    # seam in the adapters (main() ignores --effort there too), so it is
-    # recorded on the plan but not applied.
+    # headless plan defaults to high only when the adapter can transport it;
+    # OpenCode's no-effort seam stays unset instead of failing before launch.
     flavor_model = fdef["models"].get(harness) if fdef else None
     session_model = model or flavor_model
-    session_effort = effort or ("high" if headless else None)
+    session_effort = (
+        effort if effort is not None
+        else (default_headless_effort(adapter) if headless else None)
+    )
     if headless:
         try:
             validate_headless_request(adapter, session_model, session_effort)
@@ -1456,13 +1463,17 @@ def main() -> None:
                or default_harness)
 
     # Resolve + validate the complete headless route before opening a session.
-    # `sc run` is the sprint-worker primitive, so high effort is its default;
-    # the orchestration skill passes it explicitly as well for auditability.
+    # `sc run` is the sprint-worker primitive, so high effort is the default
+    # where the harness exposes an effort seam. OpenCode exposes none and keeps
+    # the model's own default.
     flavor_model = fdef["models"].get(harness) if fdef else None
+    adapter = load_adapter(harness)
     session_model = (resolve_headless_model(flag_model, fdef, harness)
                      if headless else flavor_model)
-    session_effort = flag_effort or ("high" if headless else None)
-    adapter = load_adapter(harness)
+    session_effort = (
+        flag_effort if flag_effort is not None
+        else (default_headless_effort(adapter) if headless else None)
+    )
     if headless:
         try:
             validate_headless_request(adapter, session_model, session_effort)

@@ -1600,7 +1600,8 @@ super-coder — forkable shell substrate
                              `./sc run <shortname> --slot <plan|dev|rev> --sprint <id> [--unit U]`;
                              launch validates flavor and assignment, then embeds the exact sprint context.
   ./sc directives <cmd>    Conductor directives: list/inspect read the durable queue; emit validates the
-                             authenticated shell's flavor against the data whitelist before inserting
+                             authenticated shell's flavor against the data whitelist before inserting;
+                             act executes/refuses one pending row through the mechanical transition table
   ./sc events <cmd>        sentinel observation log: list/inspect append-only evidence rows
   ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner;
                              --sprint <doc-id> arms it to an ACTIVE sprint); an immediate GitHub baseline
