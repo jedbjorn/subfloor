@@ -65,6 +65,7 @@ import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 sys.path.insert(0, str(ENGINE / "api"))
+import conductor_routes  # noqa: E402  (Step 4 directive/event contracts)
 import sprint_routes  # noqa: E402  (sprint board API — /api/sprint-units)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
@@ -1239,16 +1240,6 @@ def patch_document(con, doc_id, body, commit=True):
                          {"body", "title", "render_path"}, commit=commit)
 
 
-# The alert reasons a WATCH carries, as opposed to a binding. Until H-12 these
-# were resolved on exactly one path — a watch being rebound to a sprint — so a
-# sprint that closed with a failing or unscoped watch left them open forever,
-# and `sc sprint alerts` grew a permanent floor of alerts about sprints nobody
-# was running. Enumerated rather than "every alert with a watch_id" so a future
-# reason has to be classified deliberately.
-_WATCH_ALERT_REASONS = ("pr_watch_unscoped", "pr_poll_failure",
-                        "pr_poll_backoff_escalated")
-
-
 def _link_watch_unit(con, watch_id: int, unit_id) -> bool:
     """Point a live watch at a board unit (H-13). True when the row changed.
 
@@ -1321,10 +1312,9 @@ def _freeze_board_refusal(con, doc_id) -> "dict | None":
 def _close_sprint_wake(con, doc_id) -> dict:
     """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10;
     spec #76 H-12; H-1): closing a sprint IS freezing its doc, and the freeze
-    retires the sprint's live footprint in the SAME transaction — its live PR
-    watches and the watch-scoped alerts those watches opened. No watch still
-    polling GitHub for a sprint that ended, and no permanently-open alert
-    about one. Messages stay unread.
+    retires the sprint's live PR watches in the SAME transaction. Sentinel
+    observations are append-only evidence and are never "resolved" on close.
+    Messages stay unread.
 
     The Interface wake machine's close hooks (binding release, held wake-item
     cancellation) died with the Interface stack (conductor Step 1); the legacy
@@ -1338,15 +1328,8 @@ def _close_sprint_wake(con, doc_id) -> dict:
     retired = con.execute(
         "UPDATE watched_prs SET closed_at=datetime('now') "
         "WHERE sprint_doc_id=? AND closed_at IS NULL", (doc_id,)).rowcount
-    marks = ",".join("?" for _ in _WATCH_ALERT_REASONS)
-    resolved = con.execute(
-        "UPDATE planner_alerts SET resolved_at=datetime('now') "
-        f"WHERE resolved_at IS NULL AND reason IN ({marks}) "
-        "AND watch_id IN (SELECT watch_id FROM watched_prs "
-        "                 WHERE sprint_doc_id=?)",
-        (*_WATCH_ALERT_REASONS, doc_id)).rowcount
     return {"released_bindings": 0, "retired_watches": retired,
-            "resolved_watch_alerts": resolved,
+            "resolved_watch_alerts": 0,
             "cancelled_held_items": 0}
 
 
@@ -3069,11 +3052,6 @@ class Handler(BaseHTTPRequestHandler):
                     "unit_id=COALESCE(?, unit_id) WHERE watch_id=?",
                     (sprint_doc_id, json.dumps(fp), unit_id,
                      unscoped["watch_id"]))
-                con.execute(
-                    "UPDATE planner_alerts SET resolved_at=datetime('now') "
-                    "WHERE watch_id=? AND reason='pr_watch_unscoped' "
-                    "AND resolved_at IS NULL",
-                    (unscoped["watch_id"],))
                 con.commit()
                 return self._send(200, {"watch_id": unscoped["watch_id"],
                                         "rebound": True, "daemon": daemon})
@@ -3611,9 +3589,13 @@ class _ShimHandler(Handler):
 def dispatch_http(method: str, path: str, headers_raw: str,
                   body: bytes) -> tuple:
     """The transport's HTTP entry: route one request, return
-    (status, [(header, value)], body bytes). Sprint board paths go to the
-    sprint_routes module; everything else runs through the shimmed Handler."""
+    (status, [(header, value)], body bytes). Contract and sprint-board paths
+    go to their focused route modules; everything else runs through the
+    shimmed Handler."""
     parsed = urlparse(path)
+    if parsed.path.startswith(("/api/directives",
+                               "/api/sentinel-events")):
+        return conductor_routes.handle(method, path, headers_raw, body)
     if parsed.path.startswith("/api/sprint-units"):
         return sprint_routes.handle(method, path, headers_raw, body)
     handler = _ShimHandler(method, path, headers_raw, body)

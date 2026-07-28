@@ -91,10 +91,12 @@ PER_INSTANCE_TABLES = [
     # rebuilds. Loads after `shells` and `documents`, both its FK targets. No
     # row filter: every unit row is durable planner content, terminal or not.
     "sprint_units",
-    # Reconciler alerts may reference sprint_units.unit_id (0102), so alerts
-    # load after the board record just as they already load after their
-    # session, binding, message, and watch parents.
-    "planner_alerts",
+    # Conductor contract rows are durable orchestration truth. Whitelist and
+    # expectation defaults are migration-owned system data; the live queue,
+    # evidence trail, and one-time legacy-drain audit are instance state.
+    "directives",
+    "sentinel_events",
+    "wake_machine_retirements",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/map_content.sql by snapshot_map() below, not here.
@@ -105,16 +107,6 @@ SNAPSHOT_ROW_FILTERS = {
         "WHERE (transition IS NOT NULL OR blind_window <> 0) "
         "AND EXISTS (SELECT 1 FROM watched_prs w "
         "WHERE w.watch_id=pr_poll_observations.watch_id)",
-    # New poller alerts are plain rows. Legacy rows tied to the retired
-    # Interface/wake machine stay only in the live DB for Step 4's drain.
-    "planner_alerts":
-        "WHERE session_id IS NULL AND binding_id IS NULL "
-        "AND (message_id IS NULL OR EXISTS ("
-        "SELECT 1 FROM shell_messages m "
-        "WHERE m.message_id=planner_alerts.message_id)) "
-        "AND (watch_id IS NULL OR EXISTS ("
-        "SELECT 1 FROM watched_prs w "
-        "WHERE w.watch_id=planner_alerts.watch_id))",
 }
 
 
