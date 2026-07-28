@@ -374,15 +374,16 @@ class ChatStore:
                 raise ChatStoreError("accepted chat action requires a turn id")
             source = action
             if attempt_of is not None:
-                original = con.execute(
-                    "SELECT session_id, retry_safe FROM chat_turns WHERE turn_id=?",
-                    (attempt_of,),
-                ).fetchone()
-                if (
-                    original is None
-                    or original["session_id"] != session_id
-                    or original["retry_safe"] != 1
-                ):
+                consumed = con.execute(
+                    "UPDATE chat_turns SET retry_safe=0 "
+                    "WHERE turn_id=? AND session_id=? AND retry_safe=1 "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM chat_turns AS attempt "
+                    "WHERE attempt.attempt_of=chat_turns.turn_id"
+                    ")",
+                    (attempt_of, session_id),
+                )
+                if consumed.rowcount != 1:
                     raise ChatStoreError("attempt_of is not a retry-safe turn")
                 source = "retry"
             now = utc_now()
@@ -593,13 +594,35 @@ class ChatStore:
         diagnostic: str,
         retry_safe: bool,
         aborted: bool = False,
+        anchor_resolution: dict[str, Any] | None = None,
     ) -> int:
+        if anchor_resolution is not None and anchor_resolution.get("status") not in {
+            "exact",
+            "relocated",
+            "gap",
+        }:
+            raise ChatStoreError("invalid transcript anchor resolution")
         prepared = self._prepare_events(events, None)
         con = self.connect()
         try:
             con.execute("BEGIN IMMEDIATE")
             turn = self._running_turn(con, turn_id)
             now = utc_now()
+            if anchor_resolution is not None:
+                cursor = con.execute(
+                    "UPDATE chat_transcript_cursors SET resolution_status=?, "
+                    "resolved_offset=?, resolved_at=? WHERE turn_id=?",
+                    (
+                        anchor_resolution["status"],
+                        anchor_resolution.get("next_offset"),
+                        now,
+                        turn_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ChatStoreError(
+                        f"turn {turn_id} has no transcript cursor"
+                    )
             inserted = self._insert_prepared(
                 con, turn["session_id"], turn_id, prepared, created_at=now
             )
@@ -813,6 +836,22 @@ class ChatStore:
         finally:
             con.close()
 
+    def running_turn_ids(self, harness: str) -> list[str]:
+        con = self.connect()
+        try:
+            return [
+                row["turn_id"]
+                for row in con.execute(
+                    "SELECT t.turn_id FROM chat_turns AS t "
+                    "JOIN chat_sessions AS s ON s.session_id=t.session_id "
+                    "WHERE t.state='running' AND s.harness=? "
+                    "ORDER BY t.started_at, t.turn_id",
+                    (harness,),
+                )
+            ]
+        finally:
+            con.close()
+
     def consume_boundary_request(self, session_id: str) -> str | None:
         """Consume at most one coalesced request; toggle wins the boundary."""
         con = self.connect()
@@ -867,15 +906,22 @@ class ChatRuntime:
     def start(self) -> None:
         try:
             self.store.migrate()
+        except Exception as exc:  # noqa: BLE001 - every migration failure gates chat
+            self.claude = None
+            self.available = False
+            self.unavailable_reason = f"chat migration failed: {exc}"[:512]
+            return
+        try:
             # Import only after this module is fully initialized: the adapter
             # depends on ChatStore.  No driver exists until its schema is ready.
             from interface_claude_driver import ClaudeDriver
 
             self.claude = ClaudeDriver(self.store)
-        except Exception as exc:  # noqa: BLE001 - every migration failure gates chat
+            self.claude.recover_orphaned_turns()
+        except Exception as exc:  # noqa: BLE001 - incomplete recovery gates chat
             self.claude = None
             self.available = False
-            self.unavailable_reason = f"chat migration failed: {exc}"[:512]
+            self.unavailable_reason = f"chat startup recovery failed: {exc}"[:512]
             return
         self.available = True
         self.unavailable_reason = ""

@@ -48,6 +48,10 @@ CREATE TABLE chat_turns (
 CREATE INDEX chat_turns_session_started
 ON chat_turns(session_id, started_at, turn_id);
 
+CREATE UNIQUE INDEX chat_turns_one_attempt
+ON chat_turns(attempt_of)
+WHERE attempt_of IS NOT NULL;
+
 CREATE TABLE chat_events (
     event_key TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES chat_sessions(session_id),

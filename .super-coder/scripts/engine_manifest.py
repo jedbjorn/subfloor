@@ -63,6 +63,7 @@ ENGINE_PATHS = [
     ".super-coder/README.md",
     ".super-coder/docs",
     ".super-coder/migrations",
+    ".super-coder/chat_migrations",
     ".super-coder/scripts",
     ".super-coder/render",
     ".super-coder/templates",

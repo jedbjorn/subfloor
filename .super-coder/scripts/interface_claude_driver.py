@@ -62,7 +62,7 @@ def build_argv(
     effort: str = CLAUDE_EFFORT,
 ) -> list[str]:
     """Return the exact Claude 2.1.220 production composition proved by S1b."""
-    argv = ["claude", "-p", prompt]
+    argv = ["claude", "-p"]
     if provider_session_id:
         argv.extend(["--resume", provider_session_id])
     argv.extend(
@@ -78,6 +78,9 @@ def build_argv(
             "--dangerously-skip-permissions",
         ]
     )
+    # Claude parses the prompt as a positional argument.  Without the option
+    # terminator a prompt such as ``--continue`` is consumed as a CLI flag.
+    argv.extend(["--", prompt])
     return argv
 
 
@@ -711,7 +714,6 @@ class ClaudeDriver:
             )
 
         resolution, retry_safe = self.resolver.retry_proof(anchor, prompt)
-        self.store.update_anchor_resolution(turn_id, resolution)
         if process_lost:
             failure_code = "process_lost"
         elif parsed.error is not None:
@@ -728,6 +730,7 @@ class ClaudeDriver:
             diagnostic=bounded_diagnostic(process.stderr, cwd=session["cwd"]),
             retry_safe=retry_safe,
             aborted=parsed.aborted,
+            anchor_resolution=resolution,
         )
         return TurnRunResult(
             "failed",
@@ -747,6 +750,32 @@ class ClaudeDriver:
             source="composer",
             attempt_of=turn_id,
         )
+
+    def recover_orphaned_turns(self) -> None:
+        """Fail process-less Claude turns and re-prove retry safety on startup."""
+        for turn_id in self.store.running_turn_ids("claude"):
+            context = self.store.turn_context(turn_id)
+            anchor = json.loads(context["pre_turn_anchor_json"])
+            try:
+                resolution, retry_safe = self.resolver.retry_proof(
+                    anchor,
+                    context["submitted_prompt"],
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                resolution = {
+                    "status": "gap",
+                    "reason": f"restart retry proof failed: {type(exc).__name__}",
+                }
+                retry_safe = False
+            self.store.fail_turn(
+                turn_id,
+                [],
+                exit_code=None,
+                failure_code="engine_restart",
+                diagnostic="headless process absent after engine restart",
+                retry_safe=retry_safe,
+                anchor_resolution=resolution,
+            )
 
     def backfill_turn(self, turn_id: str) -> tuple[str, int]:
         context = self.store.turn_context(turn_id)

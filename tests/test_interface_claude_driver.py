@@ -324,7 +324,6 @@ class ClaudeDriverTest(unittest.TestCase):
         expected_argv = [
             "claude",
             "-p",
-            "hello",
             "--resume",
             PROVIDER_SESSION,
             "--model",
@@ -336,6 +335,8 @@ class ClaudeDriverTest(unittest.TestCase):
             "--verbose",
             "--include-partial-messages",
             "--dangerously-skip-permissions",
+            "--",
+            "hello",
         ]
         self.assertEqual(result.status, "completed")
         self.assertEqual(runner.calls[0][0], expected_argv)
@@ -365,6 +366,16 @@ class ClaudeDriverTest(unittest.TestCase):
             ],
         )
         self.assertNotIn("message_preview", kinds)
+
+    def test_leading_dash_prompt_is_positional_after_option_terminator(self):
+        argv = claude_driver.build_argv(
+            "--continue",
+            provider_session_id=PROVIDER_SESSION,
+        )
+        self.assertEqual(argv[-2:], ["--", "--continue"])
+        resume_index = argv.index("--resume")
+        self.assertEqual(argv[resume_index + 1], PROVIDER_SESSION)
+        self.assertLess(resume_index, argv.index("--"))
 
     def test_new_session_binds_stream_id_and_next_turn_resumes_it(self):
         store, resolver, _ = self.context(
@@ -453,6 +464,146 @@ class ClaudeDriverTest(unittest.TestCase):
         result = driver.run_turn("local-session", "ABSENT_PROMPT")
         self.assertEqual((result.status, result.retry_safe), ("failed", True))
         self.assertEqual(store.retry_prompt(result.turn_id), "ABSENT_PROMPT")
+
+    def test_retry_is_consumed_by_first_attempt_and_cannot_send_twice(self):
+        store, resolver, _ = self.context("retry-consumed")
+        runner = SequenceRunner(
+            [
+                self.failure_result(),
+                self.result("claude-headless1.stdout.jsonl"),
+                self.result("claude-headless1.stdout.jsonl"),
+            ]
+        )
+        driver = claude_driver.ClaudeDriver(
+            store,
+            runner=runner,
+            resolver=resolver,
+        )
+        original = driver.run_turn("local-session", "ONE_RETRY_ONLY")
+        first_retry = driver.retry(original.turn_id)
+
+        self.assertEqual((original.status, original.retry_safe), ("failed", True))
+        self.assertEqual(first_retry.status, "completed")
+        with self.assertRaisesRegex(interface_chat.ChatStoreError, "not eligible"):
+            driver.retry(original.turn_id)
+        self.assertEqual(len(runner.calls), 2)
+        with store.connect() as con:
+            original_retry_safe = con.execute(
+                "SELECT retry_safe FROM chat_turns WHERE turn_id=?",
+                (original.turn_id,),
+            ).fetchone()[0]
+            attempts = con.execute(
+                "SELECT turn_id, state FROM chat_turns WHERE attempt_of=?",
+                (original.turn_id,),
+            ).fetchall()
+        self.assertEqual(original_retry_safe, 0)
+        self.assertEqual(
+            [(row["turn_id"], row["state"]) for row in attempts],
+            [(first_retry.turn_id, "completed")],
+        )
+
+    def test_restart_recovers_orphan_and_reproves_retry_before_composer(self):
+        store, resolver, _ = self.context("restart-safe")
+        anchor = resolver.capture(
+            cwd=self.cwd,
+            provider_session_id=PROVIDER_SESSION,
+        )
+        orphan = store.request_action(
+            "local-session",
+            "composer",
+            prompt="NOT_DELIVERED_BEFORE_RESTART",
+            anchor=anchor,
+            turn_id="restart-orphan",
+        )
+        self.assertEqual(orphan.status, "accepted")
+
+        restarted = interface_chat.ChatRuntime(store.db_path)
+        restarted.start()
+
+        self.assertTrue(restarted.available)
+        with restarted.store.connect() as con:
+            turn = con.execute(
+                "SELECT state, failure_code, retry_safe, pre_turn_anchor_json "
+                "FROM chat_turns WHERE turn_id=?",
+                (orphan.turn_id,),
+            ).fetchone()
+            cursor = con.execute(
+                "SELECT transcript_path, source_offset, next_offset, "
+                "line_sha256, resolution_status FROM chat_transcript_cursors "
+                "WHERE turn_id=?",
+                (orphan.turn_id,),
+            ).fetchone()
+        self.assertEqual(
+            (turn["state"], turn["failure_code"], turn["retry_safe"]),
+            ("failed", "engine_restart", 1),
+        )
+        saved_anchor = json.loads(turn["pre_turn_anchor_json"])
+        self.assertEqual(cursor["transcript_path"], saved_anchor["path"])
+        self.assertEqual(cursor["source_offset"], saved_anchor["offset"])
+        self.assertEqual(cursor["next_offset"], saved_anchor["next_offset"])
+        self.assertEqual(cursor["line_sha256"], saved_anchor["line_sha256"])
+        self.assertEqual(cursor["resolution_status"], "exact")
+
+        next_turn = restarted.store.request_action(
+            "local-session",
+            "composer",
+            prompt="AFTER_RESTART",
+            anchor=resolver.capture(
+                cwd=self.cwd,
+                provider_session_id=PROVIDER_SESSION,
+            ),
+            turn_id="after-restart",
+        )
+        self.assertEqual(next_turn.status, "accepted")
+        self.assertNotEqual(next_turn.status, "turn_busy")
+
+    def test_restart_recovery_disables_retry_when_prompt_reached_transcript(self):
+        store, resolver, transcript = self.context("restart-uncertain")
+        prompt = "DELIVERED_BEFORE_RESTART"
+        anchor = resolver.capture(
+            cwd=self.cwd,
+            provider_session_id=PROVIDER_SESSION,
+        )
+        orphan = store.request_action(
+            "local-session",
+            "composer",
+            prompt=prompt,
+            anchor=anchor,
+            turn_id="restart-uncertain-orphan",
+        )
+        with transcript.open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": PROVIDER_SESSION,
+                        "message": {"role": "user", "content": prompt},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+        restarted = interface_chat.ChatRuntime(store.db_path)
+        restarted.start()
+
+        with restarted.store.connect() as con:
+            turn = con.execute(
+                "SELECT state, failure_code, retry_safe FROM chat_turns "
+                "WHERE turn_id=?",
+                (orphan.turn_id,),
+            ).fetchone()
+            host_mode = con.execute(
+                "SELECT host_mode FROM chat_sessions WHERE session_id=?",
+                ("local-session",),
+            ).fetchone()[0]
+        self.assertEqual(
+            (turn["state"], turn["failure_code"], turn["retry_safe"]),
+            ("failed", "engine_restart", 0),
+        )
+        self.assertEqual(host_mode, "idle_chat")
+        with self.assertRaisesRegex(interface_chat.ChatStoreError, "not eligible"):
+            restarted.store.retry_prompt(orphan.turn_id)
 
     def test_retry_guard_rejects_prompt_present_after_anchor(self):
         store, resolver, transcript = self.context("retry-present")
