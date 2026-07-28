@@ -81,6 +81,12 @@ class FakeRuntime:
         self.abandoned = []
         self.absence_proved = True
         self.terminate_result = {"terminated": True}
+        # spec #62 D2: the hook route satisfies an armed submit watch through
+        # this call. Part of the facade contract, so it belongs here.
+        self.submit_notifications = []
+
+    def notify_submit(self, session_id):
+        self.submit_notifications.append(session_id)
 
     def call(self, coro):
         return asyncio.run(coro)
@@ -1127,6 +1133,61 @@ class InterfaceApiTest(unittest.TestCase):
                           "WHERE session_id=1").fetchone()[0]
         con.close()
         self.assertEqual(occ, "reserved")
+
+    def test_prompt_submit_hook_notifies_the_runtime_submit_watch(self):
+        """spec #62 D2: the ROUTE half of submit confirmation.
+
+        The runtime's own tests prove that notify_submit resolves an armed
+        watch; nothing there proves anyone CALLS it. That is the whole join —
+        the hook arrives over HTTP and the watch lives in the WS runtime, and
+        they only meet because this route reaches through bind_runtime. With
+        this untested, a watch could arm correctly, retry correctly, and still
+        report every healthy submit as pending forever.
+        """
+        sid = self.occupy()
+        # Measure THIS call's effect. `bind_runtime` writes a module global, so
+        # what the list holds on entry is a property of the whole process, not
+        # of the hook under test; the claim being pinned is "this callback
+        # produced exactly one notify, for this session".
+        self.runtime.submit_notifications.clear()
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(sid),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 3,
+             "event": "prompt_submit", "pid": 4321})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.runtime.submit_notifications, [sid])
+
+    def test_non_submit_hooks_do_not_notify_the_submit_watch(self):
+        # The watch is satisfied by PROOF OF SUBMIT specifically. Notifying on
+        # any lifecycle event would confirm a frame that never submitted —
+        # turn_stop in particular fires on every completed turn, so keying on
+        # "a hook arrived" would make the watch unfalsifiable.
+        sid = self.occupy()
+        self.runtime.submit_notifications.clear()   # this call's effect only
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(sid),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 3,
+             "event": "turn_stop", "pid": 4321})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.runtime.submit_notifications, [],
+                         "only prompt_submit proves a submit")
+
+    def test_rejected_prompt_submit_hook_does_not_notify(self):
+        # A replayed/stale hook_seq is refused by record_hook and never
+        # commits. Notifying anyway would let a replay confirm a live frame
+        # that has not submitted — the notify must sit after the commit, on
+        # the success path only.
+        sid = self.occupy()
+        self.runtime.submit_notifications.clear()   # this call's effect only
+        status, _, _ = self.call(
+            "POST", "/api/interface/hook-callbacks",
+            ("Authorization: Bearer " + self.hook_token(sid),),
+            {"shell_id": 1, "generation": 1, "hook_seq": 1,   # already used
+             "event": "prompt_submit", "pid": 4321})
+        self.assertEqual(status, 409)
+        self.assertEqual(self.runtime.submit_notifications, [])
 
     def test_hook_session_start_promotes(self):
         self.create_session()

@@ -45,6 +45,7 @@ from pathlib import Path
 
 import db_driver
 import interface_broker
+import interface_hooks
 import interface_wake
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -64,6 +65,43 @@ TMUX_SYNC_TIMEOUT_S = 10.0   # a wedged-but-alive tmux must never hang the
                              # broker worker thread (SC-013)
 
 TMUX_SESSION = "sc-interface"
+
+# ── Deterministic submit (spec #62 D1/D2) ───────────────────────────────────
+#
+# A TUI decides whether a `\r` SUBMITS or inserts a newline by whether it
+# classified the surrounding input as a paste, and paste-classified input
+# bypasses keybinding resolution entirely (claude-code #15553, #74238). Sent as
+# one rapid burst, `body + \r` is therefore a coin-flip. These three constants
+# are the whole accommodation:
+#
+# SUBMIT_SETTLE_MS — how long the body is left alone before the submit CR goes
+# out as its own send-keys call, so the TUI's re-arming paste timer (50ms base,
+# 500ms in paste mode) has expired and the CR resolves as a keybinding.
+#
+# SUBMIT_CONFIRM_S / SUBMIT_RETRIES — the submit watch: how long to wait for the
+# `prompt_submit` hook that PROVES a submit, and how many bare-CR retries to
+# spend before reporting the frame delivered-but-not-submitted. A bare CR at an
+# already-submitted (empty) prompt is a no-op on all three verified TUIs, which
+# is what makes a retry safe against a late hook.
+#
+# Env-tunable because they are accommodations of someone else's heuristic, not
+# protocol constants — U5's live-TUI matrix is expected to revise the settle.
+# Read as module globals at CALL time, never bound into a default argument: a
+# default would freeze the value at import and leave these attributes decoys
+# that read correctly and change nothing.
+#
+# ORDERING IS LOAD-BEARING (decision #107). SUBMIT_RETRIES x SUBMIT_CONFIRM_S
+# must stay strictly under interface_broker.HOOKS_SUBMIT_SILENT_S: the watch is
+# the REPAIR and H-27's batch-silence alert is the BACKSTOP, so the repair has
+# to have finished trying before the backstop reports. Pinned by
+# test_deterministic_submit.py::ConstantOrderingTest.
+SUBMIT_SETTLE_MS = float(os.environ.get("SC_SUBMIT_SETTLE_MS", "250"))
+SUBMIT_CONFIRM_S = float(os.environ.get("SC_SUBMIT_CONFIRM_S", "3"))
+SUBMIT_RETRIES = int(os.environ.get("SC_SUBMIT_RETRIES", "2"))
+
+CR = b"\r"
+PASTE_START = b"\x1b[200~"
+PASTE_END = b"\x1b[201~"
 
 
 def _log(tag: str, msg: str) -> None:
@@ -146,6 +184,22 @@ class HumanInput:
 class Resize:
     def __init__(self, rows: int, cols: int):
         self.rows, self.cols = rows, cols
+
+
+class SubmitWatch:
+    """One delivered frame's wait for PROOF that it actually submitted.
+
+    `input_ack` has only ever meant "bytes committed to tmux". This is the
+    other half: the `prompt_submit` hook is the only thing in the system that
+    proves the TUI accepted the Enter, and it arrives over HTTP rather than
+    through the pane, so the wait is an Event the hook route sets — never a
+    scrape of terminal output."""
+
+    def __init__(self, seq: "int | None"):
+        self.seq = seq
+        self.attempts = 0
+        self.confirmed = asyncio.Event()
+        self.task: "asyncio.Task | None" = None
 
 
 # ---------------------------------------------------------------- shadow sidecar
@@ -237,6 +291,25 @@ class ShadowSidecar:
             raise RuntimeError(f"shadow snapshot failed: {msg.get('error')}")
         return base64.b64decode(msg["redraw"])
 
+    async def bracketed_paste(self, gen: str) -> str:
+        """The pane's DECSET 2004 state: 'on', 'off', or 'unknown'.
+
+        UNLIKE every other request here, this one never raises. Its caller is
+        the writer deciding whether to wrap a body in paste markers, and the
+        wrap is an optimization of INTERPRETATION, not correctness of delivery
+        — a sidecar that is dead, restarting, or behind must degrade that
+        caller to no-wrap, not fail the send. Every failure mode (exited
+        sidecar, request timeout, unknown generation, a reply from an older
+        sidecar with no such field) therefore reads 'unknown'."""
+        try:
+            msg = await self._request({"op": "modes", "gen": gen})
+        except Exception:  # noqa: BLE001 — see docstring: no failure may raise
+            return "unknown"
+        if not msg.get("ok"):
+            return "unknown"
+        value = msg.get("bracketed_paste")
+        return value if value in ("on", "off") else "unknown"
+
     async def stop(self) -> None:
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
@@ -264,6 +337,11 @@ class Generation:
         self.clients: set = set()
         self.queue: asyncio.Queue = asyncio.Queue()
         self.continuity_broken = False
+
+        # Submit determinism (spec #62 D2). `submit_confirmable` caches the
+        # capability answer for this generation's seat: None = not yet asked.
+        self.submit_watch: "SubmitWatch | None" = None
+        self.submit_confirmable: "bool | None" = None
 
         self._bridge: collections.deque[bytes] = collections.deque()
         self._bridge_bytes = 0
@@ -406,6 +484,14 @@ class Generation:
         _log(self.sid, "tearing down generation")
         for task in self._tasks:
             task.cancel()
+        # The submit watch is per-frame, so it is deliberately NOT in _tasks
+        # (a long session would accumulate one dead entry per message there).
+        # It still has to die with the generation: a pane that is going away
+        # cannot submit, and a retry into a killed window is a tmux error
+        # nobody asked for.
+        if self.submit_watch is not None and self.submit_watch.task is not None:
+            self.submit_watch.task.cancel()
+            self.submit_watch = None
         if kill_window:
             for client in list(self.clients):
                 client.send_control({"type": "error", "code": "terminated"})
@@ -569,7 +655,9 @@ class InterfaceRuntime:
                 raise interface_broker.PreSendError(
                     f"wake preflight failed for {gen.pane_id}: "
                     f"{exc!r}") from exc
-            self._send_keys_sync(gen.pane_id, payload)
+            # No seq: a wake frame is not any client's frame, so its
+            # confirmation carries no sequence to match against a draft.
+            self._deliver_frame_sync(gen, payload)
 
         return writer
 
@@ -670,13 +758,53 @@ class InterfaceRuntime:
                 f"{err.decode(errors='replace').strip()}")
         return out
 
+    async def _pin_server_options(self) -> None:
+        """Pin the private tmux server's key encoding, at server creation.
+
+        `extended-keys on` makes tmux re-encode keys in CSI-u form, which
+        rewrites 0x0D inside paste content (claude-code #43169) — and this
+        writer's entire determinism argument (spec #62 D4) is that the 0x0D it
+        sends as a separate submit reaches the pane AS 0x0D. `off` is tmux
+        3.5a's default, so this pins a default rather than changing behaviour;
+        it exists because a default is not a guarantee and nothing else in the
+        runtime states the requirement.
+
+        ASSERTED, NOT ASSUMED: tmux accepts `set` and can still report a
+        different effective value (a version whose default differs, a
+        `-f`-loaded config we do not own). Both the set and the readback are
+        advisory — a refusal is LOGGED and the spawn continues, because a
+        server option we could not pin is not a reason to deny the operator a
+        chat session. Server-scoped (`-s`), so it belongs on the two paths
+        that CREATE the server and nowhere else."""
+        try:
+            await self.tmux("set", "-s", "extended-keys", "off")
+        except RuntimeError as exc:
+            _log("boot", f"tmux extended-keys off REFUSED: {exc!r} — a CR sent "
+                         "as a separate submit may be CSI-u re-encoded")
+            return
+        try:
+            out = await self.tmux("show", "-sv", "extended-keys")
+        except RuntimeError as exc:
+            _log("boot", f"tmux extended-keys readback failed: {exc!r} — "
+                         "the pin is unverified")
+            return
+        effective = out.decode(errors="replace").strip()
+        if effective != "off":
+            _log("boot", f"tmux extended-keys is {effective!r} after setting "
+                         "it off — CSI-u re-encoding is still possible")
+
     def _send_keys_sync(self, pane_id: str, payload: bytes) -> None:
         """The injected broker writer: chunked send-keys -H, ≤512 bytes per
         invocation, called exactly once per accepted frame (as many tmux
         calls as chunks). Runs in the broker worker thread. Every call is
         timeout-bounded: a wedged server raises (TimeoutExpired — ambiguous,
         the caller parks delivery_unknown) instead of hanging the thread
-        (SC-013)."""
+        (SC-013).
+
+        Bytes only — no splitting, no wrapping, no settle. The two-phase
+        delivery protocol lives in `_deliver_frame_sync`, which calls this
+        primitive once per phase; keep this the single audited `-H` byte path
+        the broker contract measures."""
         for off in range(0, len(payload), SENDKEYS_CHUNK):
             chunk = payload[off:off + SENDKEYS_CHUNK]
             subprocess.run(
@@ -684,6 +812,230 @@ class InterfaceRuntime:
                  *[f"{b:02x}" for b in chunk]],
                 capture_output=True, check=True,
                 timeout=TMUX_SYNC_TIMEOUT_S)
+
+    def _bracketed_paste_sync(self, gen: "Generation") -> str:
+        """The pane's DECSET 2004 state — 'on', 'off', or 'unknown'.
+
+        Runs in the writer's worker thread, so the sidecar request rides the
+        runtime loop. Safe from both writer call sites because each is already
+        inside an `asyncio.to_thread` the loop is awaiting — the loop is free
+        to service this. NEVER call it from the loop thread: that self-deadlocks.
+
+        `bracketed_paste` already answers 'unknown' rather than raising for
+        every sidecar-side failure; the outer guard here is for the loop
+        itself being gone or wedged, which its own timeout cannot cover."""
+        try:
+            return asyncio.run_coroutine_threadsafe(
+                self.shadow.bracketed_paste(gen.sid), self.loop
+            ).result(timeout=SHADOW_REQUEST_TIMEOUT_S + 1)
+        except Exception:  # noqa: BLE001 — a mode read may never fail a send
+            return "unknown"
+
+    def _deliver_frame_sync(self, gen: "Generation", payload: bytes, *,
+                            seq: "int | None" = None) -> None:
+        """Deliver ONE accepted frame as mode-aware two-phase bytes (D1).
+
+        This is the injected broker writer both call sites pass down, so it
+        runs once per accepted frame in a worker thread. It may make several
+        tmux calls — the chunker always has, and the broker's "writer called
+        exactly once per frame" contract counts frames, not tmux invocations.
+        What it must never do is put a frame's body and its submit CR in one
+        rapid burst, because the TUI then classifies the CR as pasted content
+        and inserts a newline instead of submitting.
+
+        Three shapes; only the third is split:
+
+        * **no trailing CR** — a raw terminal keystroke forwarded verbatim.
+          Not ours to interpret, and splitting it would change what the
+          operator typed.
+        * **exactly CR** — the operator tapping Enter to answer a TUI dialog.
+          There is no body to settle after and nothing to wrap, and there is
+          no submit of ours to confirm, so no watch is armed.
+        * **body + trailing CR** — a composer or wake frame. Wrap the body
+          when 2004 is active, settle, then send the CR as its own call.
+
+        Delivery failure is left to the caller exactly as before: an exception
+        from any phase propagates, and a frame whose body reached tmux before
+        the failure is genuinely ambiguous — which is the delivery_unknown park
+        the broker already performs. Nothing here catches it into a lie."""
+        if not payload.endswith(CR) or payload == CR:
+            self._send_keys_sync(gen.pane_id, payload)
+            return
+
+        body = payload[:-1]
+        if self._bracketed_paste_sync(gen) == "on":
+            # Protocol-correct: we stand exactly where a terminal emulator
+            # stands, and this is what one does with a paste. It makes every
+            # byte of the body DATA — embedded newlines included, which is
+            # what also fixes multiline composer messages — so nothing inside
+            # the body can submit early. When 2004 is off or unknown the raw
+            # body is delivered instead: the separate-CR phase alone is
+            # already strictly better than today's single burst, never worse.
+            body = PASTE_START + body + PASTE_END
+        self._send_keys_sync(gen.pane_id, body)
+        time.sleep(SUBMIT_SETTLE_MS / 1000.0)
+        self._send_keys_sync(gen.pane_id, CR)
+        self._arm_submit_watch(gen, seq)
+
+    # -- submit watch (D2) ---------------------------------------------------
+
+    def _read_submit_capability(self, session_id: int) -> bool:
+        con = db_driver.connect(self.db_path)
+        try:
+            row = con.execute(
+                "SELECT harness, cli_version FROM interface_sessions "
+                "WHERE session_id=?", (session_id,)).fetchone()
+        finally:
+            con.close()
+        if row is None:
+            return False
+        cap = interface_hooks.capability(row[0], row[1])
+        return cap["events"].get("prompt_submit", False)
+
+    def _submit_confirmable(self, gen: "Generation") -> bool:
+        """Can a `prompt_submit` hook EVER arrive for this seat? (D2 gating)
+
+        vibe and opencode have no hook adapter at all, so no contract event is
+        ever delivered for them. Arming a watch there would press Enter twice
+        into a perfectly healthy pane and then report every correct send as
+        delivered-not-submitted — a monitor that lies on the happy path, which
+        decision #76 forbids. Those seats keep today's delivery-only semantics.
+
+        Note this keys on the EVENT, not on `mandatory_ok`: a seat whose
+        cli_version is unparseable is a metadata-capture miss, not a harness
+        that cannot deliver the hook, and its watch should still arm.
+
+        Resolved once per generation. `harness` and `cli_version` are stamped
+        when the entrypoint promotes the reservation — before any frame can be
+        accepted — and neither changes under a live generation, so re-reading
+        them per frame would only put a DB round trip inside the writer."""
+        if gen.submit_confirmable is None:
+            gen.submit_confirmable = self._read_submit_capability(
+                gen.session_id)
+        return gen.submit_confirmable
+
+    def _arm_submit_watch(self, gen: "Generation", seq: "int | None") -> None:
+        """Arm the delivered frame's submit watch, from the writer thread.
+
+        A hop, not the watch: the watch is loop state (a task and an Event the
+        hook route sets), and this runs in the broker's worker thread.
+
+        NOTHING HERE MAY RAISE. By the time this is called the frame's bytes —
+        body, settle, and submit CR — have all reached tmux successfully. An
+        exception escaping into the writer would propagate out of the broker's
+        two-phase commit, which reads any writer exception as an AMBIGUOUS
+        WRITE and parks the session `delivery_unknown`. That would take a frame
+        that demonstrably delivered and record it as maybe-delivered, over a
+        capability lookup. Confirmation is an observability layer on top of
+        delivery; it is never allowed to damage the delivery beneath it."""
+        try:
+            if not self._submit_confirmable(gen):
+                return
+            loop = getattr(self, "loop", None)
+            if loop is None:
+                return
+            loop.call_soon_threadsafe(self._start_submit_watch, gen, seq)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            # Degrades to today's delivery-only semantics for this frame: no
+            # confirmation, no retries, and no client message claiming either.
+            _log(gen.sid, f"submit watch NOT armed ({exc!r}) — frame "
+                          "delivered, confirmation unavailable")
+
+    def _start_submit_watch(self, gen: "Generation",
+                            seq: "int | None") -> None:
+        previous = gen.submit_watch
+        if previous is not None and previous.task is not None:
+            # A live previous watch means its frame was superseded before it
+            # resolved (the ack that frees the next frame fires at DELIVERY,
+            # so a second frame can legitimately arrive mid-watch). Drop it:
+            # reporting submit_pending for a frame the operator has already
+            # followed with another is noise, not news.
+            previous.task.cancel()
+        watch = SubmitWatch(seq)
+        gen.submit_watch = watch
+        watch.task = asyncio.create_task(self._submit_watch_loop(gen, watch))
+
+    async def _submit_watch_loop(self, gen: "Generation",
+                                 watch: SubmitWatch) -> None:
+        """Wait for the submit hook; press Enter again a bounded number of
+        times; then report honestly (D2).
+
+        Never parks the session and never revokes the writer. The bytes ARE on
+        the screen — that is the whole difference between this and a delivery
+        failure, and it is why the operator gets a message telling them to look
+        rather than a lock telling them they cannot."""
+        try:
+            while True:
+                confirmed = True
+                try:
+                    await asyncio.wait_for(watch.confirmed.wait(),
+                                           SUBMIT_CONFIRM_S)
+                except asyncio.TimeoutError:
+                    confirmed = False
+                if confirmed:
+                    gen.broadcast_control({"type": "submit_confirmed",
+                                           "seq": watch.seq})
+                    return
+                if watch.attempts >= SUBMIT_RETRIES:
+                    break
+                watch.attempts += 1
+                _log(gen.sid,
+                     f"submit unconfirmed after {SUBMIT_CONFIRM_S}s — bare-CR "
+                     f"retry {watch.attempts}/{SUBMIT_RETRIES}")
+                try:
+                    await asyncio.to_thread(self._send_keys_sync,
+                                            gen.pane_id, CR)
+                except Exception as exc:  # noqa: BLE001 — see below
+                    # A failed retry is a failed ATTEMPT, not a new fault: the
+                    # frame's own bytes already landed, so the honest end state
+                    # is still delivered-not-submitted. Log it and let the
+                    # budget run out into the one report below, rather than
+                    # inventing a second failure surface for it.
+                    _log(gen.sid, f"submit retry {watch.attempts} write "
+                                  f"failed: {exc!r}")
+
+            gen.broadcast_control({"type": "submit_pending", "seq": watch.seq})
+            disposition = await asyncio.to_thread(
+                self._record_submit_unconfirmed, gen.session_id,
+                watch.attempts)
+            _log(gen.sid,
+                 f"submit UNCONFIRMED after {watch.attempts} retries — "
+                 f"delivered but not submitted ({disposition})")
+        finally:
+            if gen.submit_watch is watch:
+                gen.submit_watch = None
+
+    def _record_submit_unconfirmed(self, session_id: int,
+                                   attempts: int) -> str:
+        con = db_driver.connect(self.db_path)
+        try:
+            return interface_broker.record_submit_unconfirmed(
+                con, session_id, attempts)
+        finally:
+            con.close()
+
+    def notify_submit(self, session_id: int) -> None:
+        """The `prompt_submit` hook landed for this session — satisfy an armed
+        submit watch (D2 confirmation).
+
+        Called from the hook route's request thread, in this same process,
+        AFTER its commit: the same in-process pattern (and the same
+        `bind_runtime` reference) as `interface_wake.notify_session`, for the
+        same reason — the hook is the only proof of submit the system has, and
+        it arrives over HTTP, not through the pane."""
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._confirm_submit, session_id)
+        except RuntimeError:
+            pass   # loop closed: the service is going down
+
+    def _confirm_submit(self, session_id: int) -> None:
+        gen = self.generations.get(session_id)
+        if gen is None or gen.submit_watch is None:
+            return
+        gen.submit_watch.confirmed.set()
 
     async def send_keys(self, pane_id: str, payload: bytes) -> None:
         for off in range(0, len(payload), SENDKEYS_CHUNK):
@@ -826,6 +1178,7 @@ class InterfaceRuntime:
                                 "-n", window, "-x", str(cols), "-y", str(rows),
                                 shell_line)
                 self._tmux_session_started = True
+                await self._pin_server_options()
             else:
                 try:
                     await self.tmux("new-window", "-d", "-t", f"{TMUX_SESSION}:",
@@ -839,6 +1192,9 @@ class InterfaceRuntime:
                                     "-n", window, "-x", str(cols), "-y",
                                     str(rows), shell_line)
                     self._tmux_session_started = True
+                    # A re-created server is a NEW server: its options are
+                    # back at defaults, so the pin has to happen here too.
+                    await self._pin_server_options()
                 else:
                     await self.tmux("resize-window", "-t",
                                     f"{TMUX_SESSION}:{window}",
@@ -1147,7 +1503,7 @@ class InterfaceRuntime:
 
             def writer(n):
                 assert n == len(payload)
-                self._send_keys_sync(gen.pane_id, payload)
+                self._deliver_frame_sync(gen, payload, seq=seq)
 
             result = interface_broker.accept_human_input(
                 con, gen.session_id, seq, len(payload), writer)

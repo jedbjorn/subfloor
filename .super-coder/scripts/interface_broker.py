@@ -55,6 +55,14 @@ WAKE_BATCH_STALL_S = 300.0
 # keystroke. A minute is two orders of magnitude past the hook's own round
 # trip.
 #
+# It is also the OUTER of two thresholds on one condition (decision #107):
+# interface_runtime's submit watch retries Enter within ~6s of the original,
+# and its budget (SUBMIT_RETRIES x SUBMIT_CONFIRM_S) must stay strictly under
+# this value so the repair finishes before the backstop reports. Changing this
+# number downward without changing those reverses that order and makes the two
+# report the same fault twice — the ordering is pinned by
+# test_deterministic_submit.py::ConstantOrderingTest.
+#
 # Both bound INVISIBILITY, not delivery — nothing here hurries a hook, and
 # neither threshold is evaluated for a seat that has already been observed.
 HOOKS_READY_SILENT_S = 180.0
@@ -983,6 +991,84 @@ def _silence_detail(harness, cli_version, unobserved: str,
             f"declares {unobserved!r} — {measured}")
 
 
+def _submit_silent_alert(con, *, session_id, harness, cli_version, batch_id,
+                         sprint_doc_id, measured: str) -> None:
+    """THE row for "the engine pressed Enter and no prompt_submit answered".
+
+    That is ONE condition, and this sprint gave it TWO measurements at two
+    timescales (decision #107):
+
+      * the submit watch (spec #62 D2, `interface_runtime`) — per delivered
+        frame, ~6s, and it is the REPAIR: it presses Enter again;
+      * H-27's batch silence (below) — per submitting wake batch, 60s, and it
+        is the BACKSTOP: it reports that nothing worked.
+
+    Both raise through here so they produce the SAME reason with the SAME
+    refs, hence the same dedupe key: whichever observes first opens the row
+    and the other REFRESHES its detail. Never inline this `_alert` call at
+    either site — two literal call shapes are two dedupe keys the moment one
+    of them is edited, and the operator then sees one fault reported twice
+    (the double-alerting class decision #106 forbids)."""
+    _alert(con, severity="warning", reason="hooks_declared_but_silent",
+           session_id=session_id, batch_id=batch_id,
+           sprint_doc_id=sprint_doc_id,
+           detail=_silence_detail(harness, cli_version, "prompt_submit",
+                                  measured))
+
+
+def record_submit_unconfirmed(con, session_id: int, attempts: int) -> str:
+    """The submit watch spent every bare-CR retry and the frame never
+    submitted (spec #62 D2 exhaustion). Records the observation; returns the
+    disposition taken, for the caller's log.
+
+    Two dispositions, because the condition has two scopes:
+
+    * **A wake batch is in flight** — this IS H-27's condition, observed
+      early. It feeds H-27's own row (`_submit_silent_alert`) carrying the
+      retry evidence, so the operator gets one row that says the repair was
+      attempted and failed, not one alert now and a second at 60s.
+    * **No batch** — a human composer frame. H-27 scopes to an armed
+      binding's submitting batch and never measures human input, so there is
+      no row of its to feed. It gets its own reason, which also keeps it from
+      colliding with the batch-less READINESS row that `record_hook` resolves
+      on session_start — that row means a different thing and is cleared by a
+      different event.
+
+    Never parks the session and never revokes the writer: the bytes are on
+    screen and the operator can act on them, which is the whole difference
+    between this and a delivery failure.
+    """
+    sess = con.execute(
+        "SELECT harness, cli_version FROM interface_sessions "
+        "WHERE session_id=?", (session_id,)).fetchone()
+    if sess is None:
+        return "no_session"
+    harness, cli_version = sess[0], sess[1]
+    measured = (f"the submit CR was delivered and {attempts} bare-CR "
+                f"{'retry' if attempts == 1 else 'retries'} did not produce "
+                f"a submit hook")
+
+    batch = con.execute(
+        "SELECT b.batch_id, k.sprint_doc_id "
+        "FROM planner_wake_batches b "
+        "JOIN sprint_planner_bindings k ON k.binding_id = b.binding_id "
+        "WHERE b.state='submitting' AND k.session_id=? "
+        "AND k.released_at IS NULL", (session_id,)).fetchone()
+    if batch is not None:
+        _submit_silent_alert(con, session_id=session_id, harness=harness,
+                             cli_version=cli_version, batch_id=batch[0],
+                             sprint_doc_id=batch[1], measured=measured)
+        con.commit()
+        return "fed_h27_batch_row"
+
+    _alert(con, severity="info", reason="submit_unconfirmed",
+           session_id=session_id,
+           detail=_silence_detail(harness, cli_version, "prompt_submit",
+                                  measured))
+    con.commit()
+    return "own_row"
+
+
 def hooks_silence_alert(con, binding_id: int, ready_s=None,
                         submit_s=None) -> "float | None":
     """Check a declared hook chain against what has ACTUALLY arrived, for the
@@ -1018,6 +1104,19 @@ def hooks_silence_alert(con, binding_id: int, ready_s=None,
        a dead chain no longer parks in `starting` where the arming gate could
        see it — it parks HERE, where `_drain_sync` returns early and nothing
        in flight ever looks again.
+
+       POST-D2 THIS CLAUSE IS STRICTLY STRONGER, and it now means something
+       different from what it meant when it shipped (decision #107). Spec #62
+       D2 put a submit watch on every delivered frame: within ~6s of the
+       original Enter it has pressed Enter up to SUBMIT_RETRIES more times.
+       Those retries are ordered to complete well inside HOOKS_SUBMIT_SILENT_S
+       (pinned by test_deterministic_submit.py::ConstantOrderingTest), so by
+       the time this threshold falls due, the cheap repair has ALREADY BEEN
+       TRIED AND FAILED. Reaching here no longer reads "the submit hook is
+       late"; it reads "Enter was pressed several times and this chain
+       answered none of them" — which is why waiting still does not clear it.
+       This is the BACKSTOP; the watch is the repair. Both report through
+       `_submit_silent_alert` so one condition keeps one row.
 
     NOT MEASURED: H-27's literal "a completed human turn produced no
     turn_stop". In band, the only evidence that a turn completed IS
@@ -1075,13 +1174,13 @@ def hooks_silence_alert(con, binding_id: int, ready_s=None,
     # batch submitted zero seconds ago: unmeasured, never reported as silent.
     if batch is not None and batch[1] is not None:
         if batch[1] >= submit_s:
-            _alert(con, severity="warning",
-                   reason="hooks_declared_but_silent", session_id=session_id,
-                   batch_id=batch[0], sprint_doc_id=doc_id,
-                   detail=_silence_detail(
-                       harness, cli_version, "prompt_submit",
-                       f"batch {batch[0]} submitted {batch[1]:.0f}s ago and "
-                       f"the submit hook has not answered"))
+            _submit_silent_alert(
+                con, session_id=session_id, harness=harness,
+                cli_version=cli_version, batch_id=batch[0],
+                sprint_doc_id=doc_id,
+                measured=(f"batch {batch[0]} submitted {batch[1]:.0f}s ago "
+                          f"and the submit hook has not answered, after the "
+                          f"submit watch's bare-CR retries"))
         else:
             pending.append(submit_s - batch[1])
 

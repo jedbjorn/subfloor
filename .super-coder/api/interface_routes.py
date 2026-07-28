@@ -2127,6 +2127,15 @@ _ALERT_COPY = {
         "Waiting does not clear it — the declaration is what is wrong.",
         "capability",
     ),
+    "submit_unconfirmed": (
+        "A composer message was delivered to the pane and the harness never "
+        "reported submitting it, including after the engine pressed Enter "
+        "again; `detail` names the harness and how many retries were spent.",
+        "Open the terminal for that session and look: the text is on screen "
+        "unsent, so pressing Enter there completes it. If this repeats on one "
+        "seat, its hook config is the thing to check.",
+        "warning",
+    ),
     "binding_released_live_sprint": (
         "The planner binding was released while this sprint still has "
         "non-terminal units, so nothing is listening for its wake events.",
@@ -3237,6 +3246,13 @@ def _hook_callback(headers, body):
             # (turn_stop → idle, provider session_start → ready+quiet
             # baseline). Signal after commit; a no-op when nothing is queued.
             interface_wake.notify_session(session_id)
+            # spec #62 D2: this hook is the ONLY proof a submit happened, so
+            # it is also what satisfies the runtime's submit watch and stops
+            # its bare-CR retries. Same post-commit, in-process shape as the
+            # wake notify above — the runtime is the one bound here by
+            # bind_runtime, which is the same process that armed the watch.
+            if event == "prompt_submit" and _runtime is not None:
+                _runtime.notify_submit(session_id)
             return _json(200, result)
         except interface_broker.BrokerError as exc:
             # Flag #51 (decision #31): EVERY rejection is audited — a silent

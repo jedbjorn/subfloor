@@ -7,6 +7,7 @@
 //   feed     {gen, data: base64}        (synchronous-ordered per gen)
 //   resize   {gen, rows, cols}
 //   snapshot {gen}  -> {id, ok, gen, redraw: base64}
+//   modes    {gen}  -> {id, ok, gen, bracketed_paste: 'on'|'off'}
 //   dispose  {gen}
 // Ops without id are fire-and-forget (no reply).
 
@@ -68,6 +69,23 @@ rl.on('line', (line) => {
         return Buffer.from(buildRedraw(g.term, g.st), 'utf8').toString('base64');
       }).then(
         (redraw) => reply({ id, ok: true, gen, redraw }),
+        (e) => reply({ id, ok: false, gen, error: String(e) }),
+      );
+      break;
+    case 'modes':
+      // Bracketed-paste (DECSET 2004) as the pane's harness has left it. The
+      // injected writer asks before delivering a body so it can wrap in real
+      // paste markers; a throw here (no such generation) answers ok:false and
+      // the runtime reads that as 'unknown', which degrades to no-wrap.
+      // Rides the same per-gen chain as feed, so the answer reflects every
+      // byte fed before the ask — never a mode read that raced the redraw
+      // that changed it.
+      run(gen, async () => {
+        const g = gens.get(gen);
+        if (!g) throw new Error('no such generation');
+        return g.term.modes.bracketedPasteMode ? 'on' : 'off';
+      }).then(
+        (bp) => reply({ id, ok: true, gen, bracketed_paste: bp }),
         (e) => reply({ id, ok: false, gen, error: String(e) }),
       );
       break;

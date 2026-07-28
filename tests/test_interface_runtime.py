@@ -411,6 +411,180 @@ class ShadowSidecarTest(unittest.TestCase):
         asyncio.run(flow())
 
 
+@unittest.skipUnless(HAS_SHADOW_STACK,
+                     "needs node + @xterm/headless (shadow sidecar)")
+class ShadowBracketedPasteTest(unittest.TestCase):
+    """The `modes` op (spec #62 D1 step 4): the writer's ONLY route to the
+    pane's DECSET 2004 state, and the one input to whether a body is wrapped
+    in real paste markers.
+
+    Driven against the REAL sidecar, not a stub: the whole point of the op is
+    that @xterm/headless tracks a mode our own code does not model, so a stub
+    that returns what we expect would prove only that we can spell the field
+    name. Every case here feeds actual escape bytes and reads back what the
+    terminal made of them."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.sidecar = interface_runtime.ShadowSidecar(
+            str(interface_runtime.SHADOW_DIR / "sidecar.js"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, coro_fn):
+        async def flow():
+            await self.sidecar.start()
+            try:
+                return await coro_fn()
+            finally:
+                await self.sidecar.stop()
+        return asyncio.run(flow())
+
+    def test_tracks_mode_set_and_reset(self):
+        # One generation, both transitions, in the order a real harness makes
+        # them: a TUI enables 2004 when it takes the prompt and disables it on
+        # the way out. Asserting 'on' alone would pass against a stub wired to
+        # a constant.
+        async def flow():
+            self.sidecar.create("g1", 24, 80)
+            self.assertEqual(await self.sidecar.bracketed_paste("g1"), "off",
+                             "a fresh terminal has 2004 inactive")
+            self.sidecar.feed("g1", b"\x1b[?2004h")
+            self.assertEqual(await self.sidecar.bracketed_paste("g1"), "on")
+            self.sidecar.feed("g1", b"\x1b[?2004l")
+            self.assertEqual(await self.sidecar.bracketed_paste("g1"), "off")
+        self._run(flow)
+
+    def test_answer_reflects_bytes_fed_before_the_ask(self):
+        # feed is fire-and-forget; the ask must ride the same per-generation
+        # chain. If it did not, this read could answer from the state BEFORE
+        # the mode-setting bytes were parsed — a wrap decision racing the
+        # redraw that justifies it. The mode bytes are deliberately trailed by
+        # a payload large enough that parsing cannot plausibly be instant.
+        async def flow():
+            self.sidecar.create("g2", 24, 80)
+            self.sidecar.feed("g2", b"\x1b[?2004h" + b"x" * 200_000)
+            self.assertEqual(await self.sidecar.bracketed_paste("g2"), "on")
+        self._run(flow)
+
+    def test_isolated_per_generation(self):
+        # The sidecar multiplexes every session in one process; a mode read is
+        # meaningless if it can answer from a neighbour's terminal.
+        async def flow():
+            self.sidecar.create("a", 24, 80)
+            self.sidecar.create("b", 24, 80)
+            self.sidecar.feed("a", b"\x1b[?2004h")
+            self.assertEqual(await self.sidecar.bracketed_paste("a"), "on")
+            self.assertEqual(await self.sidecar.bracketed_paste("b"), "off")
+        self._run(flow)
+
+    def test_unknown_generation_reads_unknown_without_raising(self):
+        # The caller is a writer mid-frame: 'unknown' degrades it to no-wrap,
+        # an exception would fail a send whose bytes are fine.
+        async def flow():
+            self.assertEqual(await self.sidecar.bracketed_paste("nope"),
+                             "unknown")
+        self._run(flow)
+
+    def test_dead_sidecar_reads_unknown_without_raising(self):
+        # Same contract at the harshest failure: the process is gone, so the
+        # request cannot be answered at all. snapshot() RAISES here by design
+        # (attach has a capture-pane fallback to fall into); this one must not.
+        script = self.tmp / "dead.js"
+        script.write_text("process.exit(1)\n")
+        dead = interface_runtime.ShadowSidecar(str(script))
+
+        async def flow():
+            with self.assertRaises(RuntimeError):
+                await dead.start()          # boot probe sees the death
+            self.assertEqual(await dead.bracketed_paste("g1"), "unknown")
+            await dead.stop()
+        asyncio.run(flow())
+
+    def test_silent_sidecar_reads_unknown_without_raising(self):
+        # A wedged-but-alive sidecar: the request times out rather than
+        # failing on EOF. Same degradation, different path — and this is the
+        # one that would otherwise stall a writer thread on a future nothing
+        # resolves.
+        script = self.tmp / "silent.js"
+        script.write_text("require('readline').createInterface"
+                          "({input: process.stdin}).on('line', () => {});\n")
+        silent = interface_runtime.ShadowSidecar(str(script))
+
+        async def flow():
+            with mock.patch.object(
+                    interface_runtime, "SHADOW_REQUEST_TIMEOUT_S", 0.3):
+                with self.assertRaises(RuntimeError):
+                    await silent.start()
+                self.assertEqual(await silent.bracketed_paste("g1"), "unknown")
+            await silent.stop()
+        asyncio.run(flow())
+
+
+class ServerOptionPinTest(unittest.TestCase):
+    """_pin_server_options is ADVISORY at every step (spec #62 D4).
+
+    A server option the runtime could not pin is not a reason to deny the
+    operator a chat session, so each of the three things that can go wrong —
+    the set is refused, the readback fails, the effective value disagrees —
+    must be logged and swallowed. They are three separate code paths, and an
+    `except` that covers the first says nothing about the other two, so each
+    gets its own case."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.rt = interface_runtime.InterfaceRuntime(
+            str(self.tmp / "shell_db.db"), run_dir=str(self.tmp / "run"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pin_with(self, fake_tmux):
+        calls: list[tuple] = []
+
+        async def tmux(*args):
+            calls.append(args)
+            return fake_tmux(*args)
+
+        with mock.patch.object(self.rt, "tmux", new=tmux):
+            asyncio.run(self.rt._pin_server_options())
+        return calls
+
+    def test_set_refused_does_not_raise(self):
+        def fake(*args):
+            raise RuntimeError("invalid option: extended-keys")
+        calls = self._pin_with(fake)
+        self.assertEqual([c[0] for c in calls], ["set"],
+                         "a refused set must not be followed by a readback")
+
+    def test_readback_failure_does_not_raise(self):
+        def fake(*args):
+            if args[0] == "show":
+                raise RuntimeError("no server running")
+            return b""
+        calls = self._pin_with(fake)
+        self.assertEqual([c[0] for c in calls], ["set", "show"])
+
+    def test_disagreeing_effective_value_does_not_raise(self):
+        # tmux accepted the set and still reports something else. The pin
+        # cannot fix that; it must report it and let the spawn proceed.
+        def fake(*args):
+            return b"on\n" if args[0] == "show" else b""
+        calls = self._pin_with(fake)
+        self.assertEqual([c[0] for c in calls], ["set", "show"])
+
+    def test_pins_the_server_scope_off(self):
+        # The exact argv matters: `-s` is server scope (one server, set at
+        # creation). A session- or window-scoped set would silently not apply
+        # to panes created later, which is every pane we care about.
+        def fake(*args):
+            return b"off\n" if args[0] == "show" else b""
+        calls = self._pin_with(fake)
+        self.assertEqual(calls[0], ("set", "-s", "extended-keys", "off"))
+        self.assertEqual(calls[1], ("show", "-sv", "extended-keys"))
+
+
 class TicketTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -783,6 +957,48 @@ class TmuxIntegrationTest(unittest.TestCase):
         await wait_for(lambda: gen.dbg_fanout_bytes >= 5,
                        what="pane raw-mode READY marker")
         return info
+
+    def test_extended_keys_pinned_at_server_creation(self):
+        """The runtime PINS extended-keys off; it does not inherit the default.
+
+        tmux 3.5a already defaults this off, so asserting `off` after a plain
+        spawn is a test that cannot come back red — it passes with
+        _pin_server_options deleted. So the private server is pre-seeded with
+        `extended-keys on` (exactly what a tmux config we do not own could do)
+        and the spawn has to have flipped it. The seed uses a DIFFERENT session
+        name so the runtime's own `new-session -d -s sc-interface` still
+        succeeds against the now-existing server.
+
+        Why it matters: `on` makes tmux re-encode keys in CSI-u form, which
+        rewrites the 0x0D this writer sends as its separate submit phase
+        (claude-code #43169) — the byte the whole two-phase protocol exists to
+        deliver intact.
+        """
+        async def flow():
+            sock = self.rt.sock
+            subprocess.run(["tmux", "-S", sock, "new-session", "-d",
+                            "-s", "seed-not-ours", "sleep 60"],
+                           check=True, capture_output=True)
+            subprocess.run(["tmux", "-S", sock, "set", "-s",
+                            "extended-keys", "on"],
+                           check=True, capture_output=True)
+            seeded = subprocess.run(
+                ["tmux", "-S", sock, "show", "-sv", "extended-keys"],
+                check=True, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(seeded, "on",
+                             "seeding failed, so the assertion below could "
+                             "not have failed either — test is vacuous")
+
+            await self._spawn_stub()
+            try:
+                out = await self.rt.tmux("show", "-sv", "extended-keys")
+                self.assertEqual(
+                    out.decode().strip(), "off",
+                    "the runtime did not pin extended-keys at server creation "
+                    "— CSI-u re-encoding can still corrupt the submit CR")
+            finally:
+                await self.rt.stop()   # the sidecar is a child process
+        asyncio.run(flow())
 
     def test_input_echo_redraw_terminate(self):
         asyncio.run(self._flow_input_echo_redraw_terminate())

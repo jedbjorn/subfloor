@@ -14,6 +14,13 @@ Wire protocol (subprotocol sc-term.v1):
   text JSON control both ways: input_ack, input_reject, writer, lifecycle,
   resync, heartbeat, error. There is NO client "wake" frame — production
   wake submissions are the coordinator's (seq 8).
+  Server->client only (spec #62 D2): submit_confirmed{seq} and
+  submit_pending{seq}. input_ack means "bytes committed to tmux" and never
+  meant more; these two carry what it cannot — whether the harness actually
+  SUBMITTED the frame. `seq` is null for a wake submission, which is nobody's
+  frame. A confirmation may never arrive on a seat whose harness delivers no
+  prompt_submit hook (vibe, opencode): there the watch is not armed at all,
+  and delivery-only semantics are the honest contract.
 
 Upgrade contract: GET /api/interface/session-streams/<session_id>?ticket=T
 with subprotocol sc-term.v1; the ticket is single-use, minted via
