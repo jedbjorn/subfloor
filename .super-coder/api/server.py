@@ -65,19 +65,9 @@ import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
-import interface_reconcile  # noqa: E402  (Interface startup reconciliation)
-import interface_wake  # noqa: E402  (transactional wake ingress + coordinator)
-import interface_broker  # noqa: E402  (sprint close → binding release, seq 10)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 sys.path.insert(0, str(ENGINE / "api"))
-try:
-    import interface_routes  # noqa: E402  (Interface HTTP API, spec #20)
-    import interface_ws  # noqa: E402  (sc-term.v1 stream protocol)
-    _INTERFACE_IMPORT_ERROR = None
-except ImportError as _exc:  # websockets/tmux stack absent → review UI still serves
-    interface_routes = None
-    interface_ws = None
-    _INTERFACE_IMPORT_ERROR = _exc
+import sprint_routes  # noqa: E402  (sprint board API — /api/sprint-units)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
 import sprint_state  # noqa: E402  (the one structural sprint-liveness predicate)
@@ -164,10 +154,9 @@ def _resolve_vendor(rel: str) -> tuple:
         return None, "unresolvable path"
     return candidate, ctype
 
-# The Interface's own authorities, for the socket sources in the CSP below —
-# the same three `interface_routes._ALLOWED_HOSTS` fences the API to. Spelled
-# out again here rather than imported: the Interface stack is an optional
-# import on this server, and the app shell must carry a policy either way.
+# The localhost authorities, for the socket sources in the CSP below — the
+# same set the sprint board API fences to. The app shell carries the policy
+# itself either way.
 _CSP_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 
@@ -1347,17 +1336,19 @@ def _freeze_board_refusal(con, doc_id) -> "dict | None":
 def _close_sprint_wake(con, doc_id) -> dict:
     """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10;
     spec #76 H-12; H-1): closing a sprint IS freezing its doc, and the freeze
-    retires the sprint's WHOLE live footprint in the SAME transaction — its wake
-    bindings and their queued wake work, its live PR watches, and the
-    watch-scoped alerts those watches opened. No orphan armed binding, no
-    stranded queued batch, no watch still polling GitHub for a sprint that
-    ended, and no permanently-open alert about either (the frozen-CANCEL in
-    the submit gate is the in-flight backstop, not the cleanup). Messages stay
-    unread; the Interface chat is untouched.
+    retires the sprint's live footprint in the SAME transaction — its live PR
+    watches and the watch-scoped alerts those watches opened. No watch still
+    polling GitHub for a sprint that ended, and no permanently-open alert
+    about one. Messages stay unread.
 
-    Returns the three counts, because a cleanup nobody can see is
-    indistinguishable from one that did not run — the close response reports
-    what it retired.
+    The Interface wake machine's close hooks (binding release, held wake-item
+    cancellation) died with the Interface stack (conductor Step 1); the legacy
+    binding/wake tables themselves are drained and dropped by the Step 4
+    migration. The response keeps their keys at zero until then so close
+    callers keep parsing.
+
+    Returns the counts, because a cleanup nobody can see is indistinguishable
+    from one that did not run — the close response reports what it retired.
     """
     retired = con.execute(
         "UPDATE watched_prs SET closed_at=datetime('now') "
@@ -1369,22 +1360,9 @@ def _close_sprint_wake(con, doc_id) -> dict:
         "AND watch_id IN (SELECT watch_id FROM watched_prs "
         "                 WHERE sprint_doc_id=?)",
         (*_WATCH_ALERT_REASONS, doc_id)).rowcount
-    released = 0
-    if con.execute(
-            "SELECT 1 FROM sprint_planner_bindings "
-            "WHERE sprint_doc_id=? AND released_at IS NULL LIMIT 1",
-            (doc_id,)).fetchone() is not None:
-        released = len(interface_broker.release_bindings_for_sprint(
-            con, doc_id, "sprint closed"))
-    # H-6: items held behind ALREADY-released bindings, plus the deaf-sprint
-    # alert. Deliberately outside the guard above — the sprint that most
-    # needs this is the one whose planner was lost and never re-armed, which
-    # has no unreleased binding for that guard to find.
-    cancelled = interface_broker.close_sprint_wake_work(
-        con, doc_id, "sprint closed")
-    return {"released_bindings": released, "retired_watches": retired,
+    return {"released_bindings": 0, "retired_watches": retired,
             "resolved_watch_alerts": resolved,
-            "cancelled_held_items": cancelled}
+            "cancelled_held_items": 0}
 
 
 def create_flag(con, body):
@@ -2614,9 +2592,8 @@ class Handler(BaseHTTPRequestHandler):
                     # SPRINT-DOC IDENTITY ONLY, deliberately — not liveness.
                     # Declaration-window coordination (board declared, units
                     # not yet) and post-close result rows are both legal
-                    # traffic; liveness gates the WAKE path, one layer down in
-                    # `interface_wake.maybe_create_wake_item`, and must never
-                    # gate acceptance of the message itself.
+                    # traffic; liveness never gates acceptance of the message
+                    # itself.
                     if isinstance(sprint_doc_id, bool) or not isinstance(sprint_doc_id, int):
                         return self._send(400, {"error":
                             "sprint_doc_id must be an int (a sprint document id)"})
@@ -2670,13 +2647,6 @@ class Handler(BaseHTTPRequestHandler):
                         "VALUES (?, ?, ?, ?, ?, ?)",
                         (sid, int(to_sid), msg, kind, sprint_doc_id, dk))
                     message_id = cur.lastrowid
-                    # Transactional wake ingress (spec #20 Event Ingress, seq
-                    # 8): the wake item rides the SAME transaction as the
-                    # message — unique (binding_id, message_id) dedupes; a
-                    # rollback drops both, so no accepted event is ever lost
-                    # or double-woken. Ineligible traffic (shell kind,
-                    # unscoped, no ACTIVE binding) creates nothing.
-                    interface_wake.maybe_create_wake_item(con, message_id)
                     con.commit()
                 except db_driver.IntegrityError:
                     r = con.execute(
@@ -2685,10 +2655,6 @@ class Handler(BaseHTTPRequestHandler):
                     if r is None:
                         raise
                     return self._send(200, {"message_id": r[0], "duplicate": True})
-                # The event is durable — signal the wake coordinator (a no-op
-                # when the Interface stack or coordinator is down; the next
-                # startup pass drains durable queued work regardless).
-                interface_wake.notify_message(message_id)
                 return self._send(201, {"message_id": message_id})
 
             if path == "/_sc/mem/projects":
@@ -3660,21 +3626,11 @@ class _ShimHandler(Handler):
 def dispatch_http(method: str, path: str, headers_raw: str,
                   body: bytes) -> tuple:
     """The transport's HTTP entry: route one request, return
-    (status, [(header, value)], body bytes). Interface API paths go to the
-    interface module; everything else runs through the shimmed Handler."""
+    (status, [(header, value)], body bytes). Sprint board paths go to the
+    sprint_routes module; everything else runs through the shimmed Handler."""
     parsed = urlparse(path)
-    if parsed.path.startswith("/api/interface/") or \
-            parsed.path.startswith("/_sc/interface/") or \
-            parsed.path.startswith("/api/planner-action-receipts") or \
-            parsed.path.startswith("/api/sprint-units"):
-        if interface_routes is None:
-            return (503, [("Content-Type", "application/json")],
-                    json.dumps({"error": {
-                        "code": "interface_unavailable",
-                        "message": "Interface stack not importable on this "
-                                   f"server ({_INTERFACE_IMPORT_ERROR})",
-                        "details": {}}}).encode())
-        return interface_routes.handle(method, path, headers_raw, body)
+    if parsed.path.startswith("/api/sprint-units"):
+        return sprint_routes.handle(method, path, headers_raw, body)
     handler = _ShimHandler(method, path, headers_raw, body)
     try:
         route = getattr(handler, f"do_{method}", None)
@@ -3820,18 +3776,6 @@ def main(argv):
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
-    # Interface startup reconciliation (spec #20): idempotent, once per boot —
-    # parks any crash-window pending input as delivery_unknown (never
-    # replays), recovers wake batches from durable hook-sequence evidence,
-    # repairs expired reservations, revokes stale writer leases. No-ops on a
-    # pre-0078 DB.
-    con = db_driver.connect(DB_PATH)
-    try:
-        recon = interface_reconcile.startup_reconcile(con)
-    finally:
-        con.close()
-    if recon.get("parks") or recon.get("batches_delivery_unknown"):
-        print(f"server: interface reconcile {recon}")
     # Watched-PR poller (spec #20 task #85, decision #19): this service is the
     # fork's SOLE GitHub poller — the legacy host `sc watch daemon` (direct-DB
     # writer) is retired by the same commit that enables this scheduler, which
@@ -3848,24 +3792,7 @@ def main(argv):
     import transport  # noqa: E402  (api/ — asyncio one-port multiplex)
 
     async def _serve():
-        ws_handler = _ws_unavailable
-        runtime = None
-        if interface_ws is not None:
-            runtime = interface_ws.build_runtime(db_path=str(DB_PATH))
-            # Bind BEFORE start(): start() reattaches survivors and walks lost
-            # sessions through the routes callback, so it must be set first.
-            interface_routes.bind_runtime(runtime)
-            interface_routes.ensure_operator_capability()
-            await runtime.start()
-            ws_handler = runtime.handle_ws
-        else:
-            print(f"server: Interface unavailable ({_INTERFACE_IMPORT_ERROR}) "
-                  "— review UI only", file=sys.stderr)
-        try:
-            await transport.serve(bind, port, dispatch_http, ws_handler)
-        finally:
-            if runtime is not None:
-                await runtime.stop()
+        await transport.serve(bind, port, dispatch_http, _ws_unavailable)
 
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:
