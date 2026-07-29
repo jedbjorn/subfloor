@@ -480,6 +480,7 @@ def _slot_command(
         slot,
         "--sprint",
         str(sprint_id),
+        "--await-sprint-active",
         "--harness",
         harness,
         "--model",
