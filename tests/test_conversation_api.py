@@ -149,6 +149,41 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
+    def test_opencode_requires_an_exact_resolved_model(self) -> None:
+        with mock.patch.object(
+            conversation_routes.run_mod,
+            "flavor_defaults",
+            return_value={
+                "dev": {
+                    "default_harness": "opencode",
+                    "models": {},
+                }
+            },
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "opencode"},
+                key="opencode-no-model",
+            )
+        self.assertEqual(status, 422)
+        self.assertEqual(error["error"]["code"], "HARNESS_MODEL_REQUIRED")
+        self.assertIn("provider connected in OpenCode",
+                      error["error"]["message"])
+
+        status, _, created = self.request(
+            "POST",
+            "/api/conversations",
+            body={
+                "shell_id": 1,
+                "harness": "opencode",
+                "model": "openai/gpt-connected",
+            },
+            key="opencode-exact-model",
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["route"]["model"], "openai/gpt-connected")
+
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
         first = self.create(title="API")
         second = self.create(title="API")

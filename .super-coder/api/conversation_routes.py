@@ -451,6 +451,14 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     if model is None and defaults:
         model = defaults["models"].get(harness)
     model = _nonblank(model, "model", maximum=255, optional=True)
+    if harness == "opencode" and model is None:
+        con.rollback()
+        raise ApiError(
+            422,
+            "HARNESS_MODEL_REQUIRED",
+            "OpenCode browser conversations require an exact model from a "
+            "provider connected in OpenCode",
+        )
     effort = _nonblank(body.get("effort"), "effort", maximum=64, optional=True)
     adapter = run_mod.load_adapter(harness)
     if effort is None:

@@ -2,11 +2,20 @@
 """OpenCode server-backed conversation adapter."""
 from __future__ import annotations
 
+import atexit
+import os
+import secrets
+import shutil
+import subprocess
+import threading
+import time
 import uuid
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any
 
 from .base import (
+    TERMINAL_EVENTS,
     AdapterError,
     ConversationAdapter,
     ConversationContext,
@@ -17,13 +26,197 @@ from .base import (
     ProbeResult,
     ReconcileResult,
     SessionInspection,
-    TERMINAL_EVENTS,
     UrlHttpTransport,
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
     terminal_outcome,
 )
+
+ENGINE = Path(__file__).resolve().parents[2]
+SERVER_ENDPOINT = "http://127.0.0.1:4096"
+SERVER_LOG = ENGINE / "logs" / "opencode-server.log"
+_SERVER_LOCK = threading.RLock()
+_SERVER_PROCESS: subprocess.Popen | None = None
+_SERVER_PASSWORD: str | None = None
+_SERVER_LOG_HANDLE = None
+
+
+def _server_healthy(password: str | None) -> bool:
+    try:
+        health = UrlHttpTransport(
+            SERVER_ENDPOINT,
+            password=password,
+            timeout=1.0,
+        ).request("GET", "/global/health")
+    except AdapterError:
+        return False
+    return bool(
+        isinstance(health, dict)
+        and health.get("healthy")
+        and isinstance(health.get("version"), str)
+    )
+
+
+def ensure_server(*, timeout: float = 10.0) -> str | None:
+    """Return the credential for a healthy loopback ``opencode serve``.
+
+    Browser conversations are server-backed, so the engine owns the local
+    sidecar lifecycle instead of requiring an operator to start it by hand.
+    An already-running compatible server is reused. A server started here is
+    loopback-only and protected with an in-memory Basic Auth password.
+    """
+    global _SERVER_PROCESS, _SERVER_PASSWORD, _SERVER_LOG_HANDLE
+    with _SERVER_LOCK:
+        configured_password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+        candidate_passwords = []
+        for password in (_SERVER_PASSWORD, configured_password, None):
+            if password not in candidate_passwords:
+                candidate_passwords.append(password)
+        for password in candidate_passwords:
+            if _server_healthy(password):
+                _SERVER_PASSWORD = password
+                return password
+
+        if _SERVER_PROCESS is not None and _SERVER_PROCESS.poll() is None:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "managed OpenCode server is running but failed its health check",
+                retryable=True,
+            )
+
+        binary = shutil.which("opencode")
+        if not binary:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "opencode executable is not installed",
+                retryable=True,
+            )
+
+        password = configured_password or secrets.token_urlsafe(32)
+        env = dict(os.environ)
+        env["OPENCODE_SERVER_PASSWORD"] = password
+        env.setdefault("OPENCODE_SERVER_USERNAME", "opencode")
+        env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
+        SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _SERVER_LOG_HANDLE = SERVER_LOG.open("a")
+        try:
+            _SERVER_PROCESS = subprocess.Popen(
+                [
+                    binary,
+                    "serve",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    "4096",
+                    "--log-level",
+                    "WARN",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=_SERVER_LOG_HANDLE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            _SERVER_LOG_HANDLE.close()
+            _SERVER_LOG_HANDLE = None
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                f"could not start opencode serve: {exc}",
+                retryable=True,
+            ) from exc
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _SERVER_PROCESS.poll() is not None:
+                break
+            if _server_healthy(password):
+                _SERVER_PASSWORD = password
+                return password
+            time.sleep(0.05)
+
+        exit_code = _SERVER_PROCESS.poll()
+        stop_server()
+        detail = (
+            f"exited with code {exit_code}"
+            if exit_code is not None
+            else f"did not become healthy within {timeout:g}s"
+        )
+        raise AdapterError(
+            "HARNESS_UNAVAILABLE",
+            f"opencode serve {detail}; see {SERVER_LOG}",
+            retryable=True,
+        )
+
+
+def stop_server() -> None:
+    """Stop only the OpenCode server process this module started."""
+    global _SERVER_PROCESS, _SERVER_PASSWORD, _SERVER_LOG_HANDLE
+    with _SERVER_LOCK:
+        process = _SERVER_PROCESS
+        _SERVER_PROCESS = None
+        _SERVER_PASSWORD = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        if _SERVER_LOG_HANDLE is not None:
+            _SERVER_LOG_HANDLE.close()
+            _SERVER_LOG_HANDLE = None
+
+
+def provider_state() -> dict[str, Any]:
+    """Return OpenCode's authoritative provider/model connection projection."""
+    password = ensure_server()
+    result = UrlHttpTransport(
+        SERVER_ENDPOINT,
+        password=password,
+        timeout=10.0,
+    ).request("GET", "/provider")
+    if not isinstance(result, dict):
+        raise AdapterError(
+            "HARNESS_PROTOCOL_ERROR",
+            "OpenCode provider response was not an object",
+        )
+    return result
+
+
+def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Flatten models belonging to providers OpenCode reports as connected."""
+    state = state or provider_state()
+    connected = {
+        item for item in (state.get("connected") or []) if isinstance(item, str)
+    }
+    models: list[dict[str, Any]] = []
+    for provider in state.get("all") or []:
+        if not isinstance(provider, dict) or provider.get("id") not in connected:
+            continue
+        provider_id = provider["id"]
+        for model_id, model in (provider.get("models") or {}).items():
+            if not isinstance(model_id, str) or not isinstance(model, dict):
+                continue
+            status = model.get("status")
+            if status not in (None, "active"):
+                continue
+            models.append(
+                {
+                    "id": f"{provider_id}/{model_id}",
+                    "provider": provider_id,
+                    "provider_model": model_id,
+                    "name": model.get("name") or model_id,
+                    "family": model.get("family"),
+                    "release_date": model.get("release_date") or "",
+                    "status": status or "active",
+                }
+            )
+    return sorted(models, key=lambda item: (item["provider"], item["id"]))
+
+
+atexit.register(stop_server)
 
 
 class OpenCodeAdapter(ConversationAdapter):
@@ -32,16 +225,19 @@ class OpenCodeAdapter(ConversationAdapter):
     def __init__(
         self,
         *,
-        endpoint: str = "http://127.0.0.1:4096",
+        endpoint: str = SERVER_ENDPOINT,
         password: str | None = None,
         transport: HttpTransport | None = None,
         manifest: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
-        self.transport = transport or UrlHttpTransport(
-            endpoint,
-            password=password,
-        )
+        if transport is not None:
+            self.transport = transport
+        else:
+            self.transport = UrlHttpTransport(
+                endpoint,
+                password=password if password is not None else ensure_server(),
+            )
 
     def probe(self) -> ProbeResult:
         health = self.transport.request("GET", "/global/health")
@@ -64,7 +260,14 @@ class OpenCodeAdapter(ConversationAdapter):
         if not context.model:
             return None
         if context.provider:
-            return context.provider, context.model
+            prefix = f"{context.provider}/"
+            model = (
+                context.model.removeprefix(prefix)
+                if context.model.startswith(prefix)
+                else context.model
+            )
+            if model:
+                return context.provider, model
         if "/" in context.model:
             provider, model = context.model.split("/", 1)
             if provider and model:
