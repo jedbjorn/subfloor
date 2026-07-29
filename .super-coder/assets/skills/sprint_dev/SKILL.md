@@ -48,6 +48,21 @@ requires a new review. Merge only when the board still assigns this unit, all
 required checks are green, dependencies are satisfied, and `review-clean`
 names the exact head.
 
+When the bounded investigation proves the requested state is already true and
+the originating Planner explicitly rules that no change should be fabricated,
+send the current integrated main head through the same independent review:
+
+```sh
+sc directives emit ready-for-review \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload '{"report_only":true,"pr_number":null,"head":"<main-sha>","branch":null,"checks":"report-only","verification":["<re-executed gate>"]}'
+```
+
+This is not a shortcut around implementation or review. Use it only for a
+Planner-ratified no-diff outcome with concrete verification. Conductor moves a
+clean report-only unit terminal after exact-head review. When that
+`review-clean` returns, do not emit `merged`; emit only the `unit-report` below.
+
 After merge emit both records:
 
 ```sh

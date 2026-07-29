@@ -74,6 +74,7 @@ import install as install_mod  # noqa: E402  (ensure_harnesses)
 import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
+import shell_factory  # noqa: E402
 import sprint_state  # noqa: E402
 
 EJECTED_MARKER = STATE_DIR / "ejected"
@@ -761,11 +762,14 @@ def regrant() -> int:
         }
         added = 0
         for flavor in sorted(template_flavors | live_flavors):
-            cur = con.execute(
-                "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
-                "SELECT ?, skill_id FROM skills "
-                "WHERE is_deleted=0 AND common=1", (flavor,))
-            added += cur.rowcount
+            if flavor in template_flavors:
+                added += shell_factory.reconcile_flavor_pack(con, flavor)
+            else:
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+                    "SELECT ?, skill_id FROM skills "
+                    "WHERE is_deleted=0 AND common=1", (flavor,))
+                added += cur.rowcount
         cur = con.execute(
             "INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
             "SELECT s.shell_id, k.skill_id FROM shells s, skills k "
@@ -774,6 +778,24 @@ def regrant() -> int:
         added += cur.rowcount
         con.commit()
         return added
+    finally:
+        con.close()
+
+
+def reconcile_conductor() -> bool:
+    """Provision/update the singleton operational Conductor in the live DB."""
+    con = db_driver.connect(DB_PATH)
+    try:
+        user = con.execute(
+            "SELECT username FROM users WHERE user_id=1"
+        ).fetchone()
+        _, created = shell_factory.reconcile_conductor(
+            con,
+            partner=user[0] if user is not None else None,
+            repo=REPO_ROOT.name,
+        )
+        con.commit()
+        return created
     finally:
         con.close()
 
@@ -894,7 +916,9 @@ def main(argv: list[str]) -> int:
     print("→ sync skills catalogue (id-stable)")
     sync_skills()
     print("→ re-grant catalogue skills to all shells")
-    print(f"  {regrant()} new grant(s)")
+    print(f"  {regrant()} grant change(s)")
+    print("→ reconcile singleton Conductor")
+    print("  created CON1" if reconcile_conductor() else "  CON1 current")
     print("→ wire map automation + map the repo")
     run_script("map_setup.py")
     print("→ snapshot the live state")

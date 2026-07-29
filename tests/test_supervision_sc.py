@@ -412,12 +412,21 @@ class RestrictedLaunchTests(unittest.TestCase):
 
 
 class MakeDispatchTests(unittest.TestCase):
+    @staticmethod
+    def make_env():
+        # The suite itself may be launched through `make dos-test`. Inheriting
+        # MAKELEVEL makes this direct probe look recursive and adds GNU Make's
+        # Entering/Leaving directory wrappers to otherwise exact output.
+        return {key: value for key, value in os.environ.items()
+                if key != "MAKELEVEL"}
+
     def test_dos_launch_forwards_no_build(self):
         result = subprocess.run(
             ["make", "-n", "dos-l", "ARGS=--no-build"],
             cwd=ROOT,
             text=True,
             capture_output=True,
+            env=self.make_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "./sc launch --no-build")
@@ -428,6 +437,7 @@ class MakeDispatchTests(unittest.TestCase):
             cwd=ROOT,
             text=True,
             capture_output=True,
+            env=self.make_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "./sc restart --yes --no-build")
