@@ -36,7 +36,7 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
                     APP.index("// ── Tabs + boot")]
     assert 'const CHAT_HARNESSES = ["opencode", "claude", "codex"]' in interface
     assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
-    assert 'textContent: "＋ New chat"' in interface
+    assert 'textContent: "＋ Chat"' in interface
     assert 'textContent: "Configure"' in interface
     assert "const conversation = await chatCreateConversation(shell);" in interface
     assert "{ shell_id: shell.shell_id, ...fields }" in interface
@@ -153,6 +153,41 @@ def test_conversation_identity_uses_shell_context_and_neutral_user_label():
     assert '(active ? " active-chat" : "")' in interface
 
 
+def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
+    assert "body.interface-view { height: 100dvh; overflow: hidden; }" in STYLE
+    assert "height: calc(100dvh - 52px);" in STYLE
+    assert ".chat-layout {" in STYLE
+    assert "height: 100%; min-height: 0; background: var(--panel2);" in STYLE
+    assert ".chat-rail { padding: .8rem .6rem; overflow-y: auto; }" in STYLE
+    assert "min-height: 0; overflow: hidden; background: var(--panel);" in STYLE
+    assert (
+        ".chat-history-list { flex: 1 1 auto; min-height: 0; "
+        "overflow-y: auto; padding: .5rem; }"
+    ) in STYLE
+    assert "height: 100%; overflow-y: auto;" in STYLE
+
+
+def test_shell_rail_is_flat_but_retains_flavor_order():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    assert "const orderedShells = orderedFlavors.flatMap" in interface
+    assert "for (const item of orderedShells)" in interface
+    assert 'className: "chat-shell-group"' not in interface
+    assert ".chat-shell-group" not in STYLE
+
+
+def test_history_header_places_configure_under_identity_and_centers_chat_action():
+    interface = APP[APP.index('side.append(el("div", { className: "chat-history-head" }'):
+                    APP.index('const history = el("div"', APP.index(
+                        'side.append(el("div", { className: "chat-history-head" }'))]
+    assert 'className: "chat-history-shell"' in interface
+    assert "configure)," in interface
+    assert "newChat));" in interface
+    assert 'className: "chat-history-actions"' not in interface
+    assert ".chat-history-head > .act" in STYLE
+    assert "display: block; background: transparent;" in STYLE
+
+
 def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
     for selector in (
         ".chat-layout",
@@ -169,8 +204,8 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-shell.active-chat::before",
     ):
         assert selector in STYLE
-    assert "grid-template-columns: 198px 260px minmax(0, 1fr)" in STYLE
-    assert "grid-template-columns: 145px 210px minmax(0, 1fr)" in STYLE
+    assert "grid-template-columns: 260px 260px minmax(0, 1fr)" in STYLE
+    assert "grid-template-columns: 210px 210px minmax(0, 1fr)" in STYLE
     assert "grid-template-columns: 101px minmax(0, 1fr)" in STYLE
     assert ".chat-working-dots" in STYLE
     assert "@keyframes chat-working-dot" in STYLE
