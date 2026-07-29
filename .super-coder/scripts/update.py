@@ -17,8 +17,9 @@ kept as `.sc-state/engine.ref.prev` — the engine half of the restore point tha
 makes `./sc rollback` sound (DB + engine restored together).
 
 Flow:
-    1. fetch upstream objects, then run the installed engine's read-only live
-       state guard. A refusal changes no installed file or pin.
+    1. attempt to fast-forward the current checkout with `git pull --ff-only`,
+       then fetch upstream engine objects. Checkout sync failures and active
+       sprints warn but never prevent an engine update.
     2. capture the restore point: the current `engine.ref` → `engine.ref.prev`.
     3. materialize the engine paths at the new ref into the
        gitignored `.super-coder/` dir; write the new `engine.ref`. Per-instance
@@ -484,17 +485,17 @@ def check_local_edits(force: bool) -> None:
         "  - ./sc eject            one-way: stop tracking upstream and own the engine")
 
 
-def sync_source_checkout() -> None:
-    """Fast-forward the SOURCE repo's checkout before reconciling from it.
+def sync_repo_checkout() -> None:
+    """Fast-forward the current repo checkout before reconciling the engine.
 
-    Here the engine is tracked, so the update skips fetch/materialize and lays
-    the floor FROM THE WORKING TREE. A checkout behind its upstream therefore
-    reconciles stale code and reports success — the operator's only defence was
-    remembering to pull first, with no signal on the runs they didn't.
+    Source installs lay the floor FROM THE WORKING TREE, while installed forks
+    may need app changes that accompany a newer engine. In either case, updating
+    from a checkout behind its own upstream can reconcile an incoherent floor
+    and report success.
 
-    Fast-forward ONLY. This never merges, rebases, resets, or changes branch,
-    and it never touches a tree with uncommitted work — the main checkout is the
-    running server's tree and may hold work in flight.
+    Fast-forward ONLY. This never merges, rebases, resets, or changes branch.
+    Git itself protects overlapping uncommitted work; non-overlapping local work
+    is not a reason to skip the fast-forward.
 
     ADVISORY, NEVER BLOCKING (FnB ruling 2026-07-27). Anything that cannot be
     fast-forwarded warns loudly, names the remedy, and lets the update proceed
@@ -512,41 +513,28 @@ def sync_source_checkout() -> None:
     if upstream.returncode != 0 or not tracking:
         print(f"→ engine sync: '{branch}' tracks no upstream — skipped")
         return
-    if git("fetch", "--quiet", check=False).returncode != 0:
-        print(f"! engine sync: fetch failed (offline?) — reconciling against the "
-              f"current tree, which may be behind {tracking}")
-        return
-    behind = git("rev-list", "--count", f"HEAD..{tracking}",
-                 check=False).stdout.strip()
-    if behind in ("", "0"):
-        print(f"→ engine sync: {branch} already current with {tracking}")
-        return
-    if git("status", "--porcelain", check=False).stdout.strip():
-        print(f"! engine sync: {branch} is {behind} commit(s) behind {tracking}, but "
-              f"the checkout has uncommitted changes — not fast-forwarding a tree "
-              f"with work in flight.")
-        print(f"  Updating anyway from the CURRENT tree, so the floor will be "
-              f"{behind} commit(s) stale.")
-        print(f"  To take the newer floor: commit or stash in {REPO_ROOT}, re-run.")
-        return
-    before = git("rev-parse", "--short", "HEAD", check=False).stdout.strip()
+    before = git("rev-parse", "HEAD", check=False).stdout.strip()
     pull = git("pull", "--ff-only", check=False)
     if pull.returncode != 0:
-        print(f"! engine sync: cannot fast-forward {branch} to {tracking} "
-              f"({behind} commit(s) behind) — the branch has diverged.")
+        print(f"! engine sync: `git pull --ff-only` failed for "
+              f"{branch} → {tracking}.")
         print(f"  {pull.stderr.strip().splitlines()[-1] if pull.stderr.strip() else ''}")
         print(f"  Updating anyway from the CURRENT tree — update never merges, "
               f"rebases or resets. Reconcile {REPO_ROOT} by hand for the newer floor.")
         return
-    after = git("rev-parse", "--short", "HEAD", check=False).stdout.strip()
-    print(f"→ engine sync: fast-forwarded {branch} {before} → {after} "
-          f"({behind} commit(s) from {tracking})")
+    after = git("rev-parse", "HEAD", check=False).stdout.strip()
+    if after == before:
+        print(f"→ engine sync: {branch} already current with {tracking}")
+        return
+    advanced = git("rev-list", "--count", f"{before}..{after}",
+                   check=False).stdout.strip()
+    print(f"→ engine sync: fast-forwarded {branch} {before[:7]} → {after[:7]} "
+          f"({advanced or '?'} commit(s) from {tracking})")
 
 
 def fetch_update_ref(branch: str, ref: str | None = None) -> str:
     """Refresh remote objects and resolve the engine ref without touching the
-    installed floor. Git object refresh is the sole mutation allowed before
-    the live-state refusal preflight."""
+    installed engine floor."""
     remote = super_coder_remote()
     if ref:
         # Pin to an explicit upstream version. `git fetch <remote> <ref>` serves
@@ -634,15 +622,15 @@ def active_sprint_ids(db_path: Path | None = None) -> set[int]:
         con.close()
 
 
-def preflight_live_state() -> None:
-    """Refuse before mutation while any structurally ACTIVE sprint exists."""
+def warn_live_state() -> None:
+    """Surface active sprints without withholding the update recovery path."""
     active = active_sprint_ids()
     if not active:
         return
     ids = ", ".join(str(doc_id) for doc_id in sorted(active))
-    sys.exit(
-        "update: refusing — ACTIVE sprint(s) exist: "
-        f"{ids}. Close or freeze every sprint before updating.")
+    print(
+        "! update: ACTIVE sprint(s) exist: "
+        f"{ids} — continuing; sprint rows and board state will be preserved.")
 
 
 def migrate_engine_untrack() -> None:
@@ -703,16 +691,15 @@ def migrate_generated_artifacts_local() -> None:
     )
 
 
-def migrate_or_rebuild(*, live_preflight_done: bool = False) -> None:
+def migrate_or_rebuild(*, live_warning_done: bool = False) -> None:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
-    # Direct callers still get the live guard. update.main passes the explicit
-    # preflight receipt so no second, post-materialization refusal can strand a
-    # half-applied installed floor.
-    if not live_preflight_done:
-        preflight_live_state()
+    # Direct callers still surface the warning. update.main passes the explicit
+    # receipt so the same active sprint is not announced twice.
+    if not live_warning_done:
+        warn_live_state()
     rebuild_mod.backup_existing()  # restore point before any structural change
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
@@ -849,25 +836,25 @@ def main(argv: list[str]) -> int:
                  "like any other code. (To re-adopt upstream, that's a manual "
                  "re-fork — see README → 'Customize a fork vs diverge from it'.)")
 
-    # Fetch may refresh remote Git objects, but nothing installed is touched
-    # until the CURRENT engine's guard has approved the live floor. In
-    # particular this precedes untracking/ignore edits, engine materialization,
-    # workflow seeding, and both pin files (#528).
+    # Keep the app/source checkout current before reconciling its engine. This
+    # is deliberately advisory: dirty, detached, offline, or diverged checkouts
+    # warn and continue from their current tree. The one allowed mutation is an
+    # explicit fast-forward; update never creates a merge, rebase, or reset.
+    if not no_fetch:
+        sync_repo_checkout()
+
     target_sha = None
     if not source and not no_fetch:
         target_sha = fetch_update_ref(branch, ref=ref)
-    preflight_live_state()
+    warn_live_state()
 
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
         print("→ super-coder SOURCE repo — engine is tracked here; "
               "skipping fetch/materialize/untrack (reconcile in place only)")
-        # Reconciling in place makes the WORKING TREE the floor's source, so it
-        # has to be current first. --no-fetch keeps its meaning (touch no
-        # network) and is the escape hatch for reconciling a tree deliberately.
-        if not no_fetch:
-            sync_source_checkout()
+        # --no-fetch keeps its meaning (touch no network) and is the escape
+        # hatch for reconciling a tree deliberately.
         no_fetch = True
     else:
         migrate_engine_untrack()  # one-time B7: untrack the engine (idempotent)
@@ -911,7 +898,7 @@ def main(argv: list[str]) -> int:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
         print("  they reinstall on the next image build — `./sc restart` / `make dos-r`")
 
-    migrate_or_rebuild(live_preflight_done=True)
+    migrate_or_rebuild(live_warning_done=True)
 
     print("→ sync skills catalogue (id-stable)")
     sync_skills()
