@@ -20,6 +20,18 @@ def test_interface_is_a_first_class_reload_safe_view():
     assert "chatRouteConversation = decodeURIComponent(conversation)" in APP
 
 
+def test_open_chat_restore_matches_the_flat_shell_projection():
+    assert (
+        "shells.find((item) => item.shell_id === openConversation.shell.shell_id)"
+        in APP
+    )
+    assert (
+        "shells.find((item) => item.shell.shell_id "
+        "=== openConversation.shell.shell_id)"
+        not in APP
+    )
+
+
 def test_start_chat_exposes_shell_harness_and_model_without_terminal_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
