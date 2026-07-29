@@ -3026,15 +3026,22 @@ const CHAT_FLAVOR_ORDER = [
   "cartographer", "admin", "conductor", "planner", "dev", "reviewer", "devops",
 ];
 const CHAT_CONFIGURE_ROUTE = "configure";
+const CHAT_HISTORY_POLL_MS = 2000;
 let chatRouteShell = "";
 let chatRouteConversation = "";
 let chatSource = null;
+let chatHistoryPollTimer = null;
 let chatRenderGeneration = 0;
 let chatPendingSend = null;
 
 function chatStopStream() {
   if (chatSource) chatSource.close();
   chatSource = null;
+}
+
+function chatStopHistoryPoll() {
+  if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer);
+  chatHistoryPollTimer = null;
 }
 
 function chatHash(shortname, conversationId = "") {
@@ -3619,6 +3626,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
 
 async function renderInterface(root) {
   chatStopStream();
+  chatStopHistoryPoll();
   const generation = ++chatRenderGeneration;
   root.replaceChildren(el("div", { className: "chat-loading" }, "Loading conversations…"));
   const [{ shells }, defaults, catalog, allConversations] = await Promise.all([
@@ -3727,6 +3735,7 @@ async function renderInterface(root) {
       configure),
     newChat));
   const history = el("div", { className: "chat-history-list" });
+  const historyItems = new Map();
   for (const conversation of conversations) {
     const button = el("button", {
       className: "chat-history-item"
@@ -3738,6 +3747,7 @@ async function renderInterface(root) {
       el("span", { className: "chat-history-name" },
       chatConversationName(conversation)),
       chatStatePill(conversation.state));
+    historyItems.set(conversation.conversation_id, button);
     button.onclick = async () => {
       if (conversation.conversation_id === selectedId) return;
       if (await chatCloseForSwitch(selectedConversation))
@@ -3748,6 +3758,25 @@ async function renderInterface(root) {
   if (!conversations.length)
     history.append(el("div", { className: "chat-history-empty" }, "No chats yet."));
   side.append(history);
+  let historyPollInFlight = false;
+  const pollHistory = async () => {
+    if (document.hidden || historyPollInFlight) return;
+    historyPollInFlight = true;
+    try {
+      const page = await chatApi("/conversations?limit=100");
+      if (generation !== chatRenderGeneration || !chatHistoryPollTimer) return;
+      for (const conversation of page.items) {
+        if (conversation.shell.shell_id !== shell.shell_id) continue;
+        const button = historyItems.get(conversation.conversation_id);
+        const pill = button?.querySelector(".chat-state");
+        const nextState = conversation.state || "idle";
+        if (!pill || pill.classList.contains(`state-${nextState}`)) continue;
+        pill.replaceWith(chatStatePill(nextState));
+      }
+    } catch { /* The next poll retries without disrupting the open chat. */ }
+    finally { historyPollInFlight = false; }
+  };
+  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);
 
   const pane = el("section", { className: "chat-pane" });
   layout.append(rail, side, pane);
@@ -3805,7 +3834,10 @@ function show(tab) {
   document.body.classList.toggle("sprints-view", tab === "sprints");
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "sprints") sprintsStopRender();
-  if (tab !== "interface") chatStopStream();
+  if (tab !== "interface") {
+    chatStopStream();
+    chatStopHistoryPoll();
+  }
   setDocumentTitle(tab);
   load(tab);
 }

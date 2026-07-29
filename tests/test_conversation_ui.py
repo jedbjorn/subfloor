@@ -198,6 +198,32 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     assert ".chat-shell-divider" in STYLE
 
 
+def test_history_badges_poll_without_repainting_the_interface():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert "const CHAT_HISTORY_POLL_MS = 2000" in interface
+    assert "if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer)" in interface
+    assert "const historyItems = new Map()" in interface
+    assert "historyItems.set(conversation.conversation_id, button)" in interface
+    assert 'await chatApi("/conversations?limit=100")' in interface
+    assert "generation !== chatRenderGeneration || !chatHistoryPollTimer" in interface
+    assert "historyItems.get(conversation.conversation_id)" in interface
+    assert "pill.replaceWith(chatStatePill(nextState))" in interface
+    assert "if (document.hidden || historyPollInFlight) return" in interface
+    assert "finally { historyPollInFlight = false; }" in interface
+    assert "setInterval(pollHistory, CHAT_HISTORY_POLL_MS)" in interface
+    poll = interface[interface.index("const pollHistory = async"):
+                     interface.index("chatHistoryPollTimer = setInterval")]
+    assert "renderInterface(" not in poll
+
+
+def test_redline_chat_text_is_one_pixel_larger():
+    assert "font-size: 15px;" in STYLE[STYLE.index(".chat-shell {"):
+                                      STYLE.index(".chat-shell:hover")]
+    assert "background: var(--panel); font-size: 15px;" in STYLE
+    assert "font-size: calc(.62rem + 1px)" in STYLE
+
+
 def test_history_header_places_configure_under_identity_and_centers_chat_action():
     interface = APP[APP.index('side.append(el("div", { className: "chat-history-head" }'):
                     APP.index('const history = el("div"', APP.index(

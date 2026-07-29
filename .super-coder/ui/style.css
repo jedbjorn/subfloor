@@ -102,6 +102,7 @@ body.interface-view main {
   position: relative; width: 100%; display: flex; align-items: center; gap: .45rem;
   background: transparent; border: 1px solid transparent; color: var(--dim);
   border-radius: 8px; padding: .48rem .55rem; cursor: pointer; text-align: left;
+  font-size: 15px;
 }
 .chat-shell:hover { color: var(--ink); background: var(--panel); }
 .chat-shell.selected { color: var(--ink); border-color: var(--line); background: var(--panel); }
@@ -219,7 +220,7 @@ body.interface-view main {
 .chat-bubble {
   width: fit-content; max-width: min(720px, 82%);
   border: 1px solid var(--line); border-radius: 12px; padding: .65rem .8rem;
-  background: var(--panel);
+  background: var(--panel); font-size: 15px;
 }
 .chat-bubble.chat-user { align-self: flex-end; background: #202936; border-color: #2c3b50; }
 .chat-bubble.chat-assistant { align-self: flex-start; }
@@ -228,7 +229,7 @@ body.interface-view main {
   color: var(--dim); font-size: .78rem; padding: .4rem .65rem;
 }
 .chat-who {
-  color: var(--dim); font-size: .62rem; text-transform: uppercase;
+  color: var(--dim); font-size: calc(.62rem + 1px); text-transform: uppercase;
   letter-spacing: .12em; margin-bottom: .22rem;
 }
 .chat-bubble .md > :first-child { margin-top: 0; }
