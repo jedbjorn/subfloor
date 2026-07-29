@@ -110,8 +110,8 @@ boot a shell:
 ```bash
 cd your-repo                                                  # an existing git repo
 
-# 1. Pull in the engine + entry script (files only, no history merge):
-git remote add super-coder https://github.com/jedbjorn/subfloor.git
+# 1. Pull in the engine + entry script (files only, main branch only, no history merge):
+git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 
@@ -873,7 +873,7 @@ new floor.
   engine branch. `--ref <tag|sha>` pins the materialize to a specific upstream
   version instead of the branch head — hold a fork at a known-good engine and
   move deliberately.
-- Missing remote? `git remote add super-coder https://github.com/jedbjorn/subfloor.git`
+- Missing remote? `git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git`
 
 > [!class4]
 > **Local engine edits block the update — never silently overwritten.** The
