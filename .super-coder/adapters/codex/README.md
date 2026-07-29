@@ -57,3 +57,20 @@ claude/opencode get).
 mounted from the host — so `codex` must be installed + logged in on the host once:
 `curl -fsSL https://chatgpt.com/codex/install.sh | sh` then `codex` and sign in
 with ChatGPT. That writes `~/.codex/auth.json`, which `./sc launch` mounts in.
+
+## Conversation capability
+
+Feature #24 selected `codex app-server`, not transcript mutation and not
+`exec resume --last`. The broker records `thread/start`'s `thread.id`, later
+opens it with `thread/resume`, starts one turn at a time, consumes JSONL-RPC
+notifications, interrupts with `turn/interrupt`, and inspects persisted state
+with `thread/read`.
+
+The contract was live-probed on 0.145.0. Exact `codex exec resume <thread-id>`
+kept two same-cwd conversations isolated. The app-server probe ran with
+`approvalPolicy=never` and `sandbox=danger-full-access`, interrupted a live
+harmless command, observed terminal status `interrupted`, stopped the server,
+started a new server, resumed the exact thread, and recovered the original
+nonce. Permission policy is the requirement; `--sandbox` is not part of the
+shared contract. This CLI version expects kebab-case `danger-full-access` in
+the app-server payload.

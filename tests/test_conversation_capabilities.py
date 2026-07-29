@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Contract tests for Feature #24's live-probed harness capabilities."""
+from __future__ import annotations
+
+import json
+import re
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ADAPTERS = ROOT / ".super-coder" / "adapters"
+PROBES = ROOT / "tests" / "fixtures" / "conversations" / "capability_probes.json"
+REQUIRED = ("opencode", "claude", "codex")
+CAPABILITIES = {
+    "exact_session_resume",
+    "structured_streaming",
+    "interruption",
+    "interactive_permission_response",
+    "server_backed",
+    "session_inspection",
+}
+VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+class ConversationCapabilityContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probes = json.loads(PROBES.read_text())
+
+    def adapter(self, harness: str) -> dict:
+        return json.loads(
+            (ADAPTERS / harness / "adapter.json").read_text()
+        )
+
+    def test_required_harnesses_have_verified_conversation_contracts(self) -> None:
+        self.assertEqual(
+            set(self.probes["required_harnesses"]),
+            set(REQUIRED),
+        )
+        for harness in REQUIRED:
+            with self.subTest(harness=harness):
+                conversation = self.adapter(harness)["conversation"]
+                probe = self.probes["required_harnesses"][harness]
+                self.assertRegex(conversation["minimum_cli_version"], VERSION)
+                self.assertEqual(
+                    conversation["verified_cli_version"],
+                    probe["verified_cli_version"],
+                )
+                self.assertEqual(
+                    conversation["minimum_cli_version"],
+                    conversation["verified_cli_version"],
+                    "the spike uses the conservative live-probed version as its floor",
+                )
+                self.assertEqual(conversation["driver"], probe["driver"])
+                self.assertEqual(
+                    set(conversation["capabilities"]),
+                    CAPABILITIES,
+                )
+                for proof in (
+                    "two_turn_exact_resume",
+                    "same_worktree_isolation",
+                    "structured_streaming",
+                    "interruption",
+                    "resume_after_compute_exit",
+                    "session_inspection",
+                ):
+                    self.assertIs(
+                        probe["proof"][proof],
+                        True,
+                        f"{harness} lacks live proof for {proof}",
+                    )
+
+    def test_opencode_uses_exact_server_resources(self) -> None:
+        conversation = self.adapter("opencode")["conversation"]
+        self.assertEqual(conversation["session_ref"], {
+            "source": "session.create",
+            "field": "id",
+        })
+        self.assertEqual(conversation["stream"]["path"], "/event")
+        self.assertIn("{session_ref}", conversation["interrupt"]["path"])
+        self.assertIn("{session_ref}", conversation["inspect"]["path"])
+
+    def test_claude_streaming_and_resume_flags_are_explicit(self) -> None:
+        conversation = self.adapter("claude")["conversation"]
+        flags = conversation["start"]["stream_flags"]
+        self.assertIn("--verbose", flags)
+        self.assertIn("stream-json", flags)
+        self.assertEqual(conversation["start"]["session_flag"], "--session-id")
+        self.assertEqual(conversation["resume"]["session_flag"], "--resume")
+        self.assertEqual(conversation["interrupt"]["signal"], "SIGINT")
+        self.assertFalse(
+            conversation["capabilities"]["interactive_permission_response"]
+        )
+
+    def test_codex_uses_app_server_and_permission_policy_not_resume_sandbox_flag(
+            self) -> None:
+        conversation = self.adapter("codex")["conversation"]
+        self.assertEqual(conversation["start"]["method"], "thread/start")
+        self.assertEqual(conversation["resume"], {
+            "method": "thread/resume",
+            "session_field": "threadId",
+        })
+        self.assertEqual(conversation["interrupt"]["method"], "turn/interrupt")
+        self.assertEqual(
+            conversation["permission_values"]["unrestricted"],
+            "danger-full-access",
+        )
+        self.assertTrue(
+            self.probes["required_harnesses"]["codex"]["proof"]
+            ["resume_after_server_restart"]
+        )
+
+    def test_kimi_reference_does_not_widen_the_release_gate(self) -> None:
+        kimi = self.probes["reference_only"]["kimi"]
+        self.assertEqual(kimi["exact_worktree_field"], "workDir")
+        self.assertIn("turn.cancel", kimi["observed_events"])
+        self.assertFalse(kimi["release_gate_member"])
+
+
+if __name__ == "__main__":
+    unittest.main()

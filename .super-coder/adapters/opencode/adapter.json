@@ -7,6 +7,24 @@
   "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" },
   "model": { "file": "opencode.json", "key": "model" },
   "headless": { "launch": ["opencode", "run"], "model_flag": "-m" },
+  "conversation": {
+    "minimum_cli_version": "1.18.9",
+    "verified_cli_version": "1.18.9",
+    "driver": "opencode-server",
+    "session_ref": { "source": "session.create", "field": "id" },
+    "stream": { "transport": "sse", "path": "/event" },
+    "interrupt": { "method": "POST", "path": "/session/{session_ref}/abort" },
+    "inspect": { "method": "GET", "path": "/session/{session_ref}" },
+    "permission_policy": "opencode-config-and-permission-events",
+    "capabilities": {
+      "exact_session_resume": true,
+      "structured_streaming": true,
+      "interruption": true,
+      "interactive_permission_response": true,
+      "server_backed": true,
+      "session_inspection": true
+    }
+  },
   "sandbox": {
     "merge_json": {
       "opencode.json": {

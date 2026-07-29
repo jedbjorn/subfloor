@@ -12,6 +12,29 @@
     "model_flag": "--model",
     "effort": { "flag": "--effort" }
   },
+  "conversation": {
+    "minimum_cli_version": "2.1.220",
+    "verified_cli_version": "2.1.220",
+    "driver": "claude-print",
+    "session_ref": { "source": "system.init", "field": "session_id" },
+    "start": {
+      "session_flag": "--session-id",
+      "stream_flags": ["--verbose", "--output-format", "stream-json", "--include-partial-messages"]
+    },
+    "resume": { "session_flag": "--resume" },
+    "stream": { "transport": "stdout-jsonl" },
+    "interrupt": { "mechanism": "signal", "signal": "SIGINT" },
+    "inspect": { "mechanism": "native-session-store" },
+    "permission_policy": "claude-permission-mode-and-prompt-tool",
+    "capabilities": {
+      "exact_session_resume": true,
+      "structured_streaming": true,
+      "interruption": true,
+      "interactive_permission_response": false,
+      "server_backed": false,
+      "session_inspection": true
+    }
+  },
   "merge_json": {
     ".claude/settings.local.json": {
       "hooks": {

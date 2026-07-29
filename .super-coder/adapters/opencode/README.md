@@ -67,3 +67,18 @@ The adapter adds the harness-specific config file and launch command.
 - session-storage paths (doc 404'd at research time)
 
 None block the contract; confirm during real-repo testing.
+
+## Conversation capability
+
+Feature #24 selected `opencode serve` as the conversation driver. The broker
+creates a session through the local authenticated HTTP API, stores the returned
+opaque `id`, submits later turns to that exact session, consumes `/event` SSE,
+interrupts through the session abort resource, and inspects the session
+resource during recovery. The server stays bound to `127.0.0.1`; credentials
+remain engine-side.
+
+The contract was live-probed on 1.18.9. Two sessions in `/tmp` retained
+different nonce values, and resuming the first by `sessionID` after the second
+ran returned only the first nonce. An asynchronous prompt emitted
+`session.status=busy`; `POST /session/:id/abort` returned `true`, emitted a
+`MessageAbortedError`, and returned the session to `idle`.
