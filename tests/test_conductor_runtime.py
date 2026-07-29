@@ -599,6 +599,43 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         self.assertIn("PLN1", result["escalation"]["command"])
         self.assertNotIn("DEV1", result["escalation"]["command"])
 
+    def test_refusal_persists_when_planner_escalation_launch_fails(self):
+        self.set_unit("working")
+        self.set_unit("merged", review_head="approved-head")
+        directive_id = self.emit(
+            "planner",
+            "re-task",
+            {
+                "to": "DEV1",
+                "instruction": "revise the merged implementation",
+                "reason": "integrated conformance finding",
+            },
+        )
+        self.con.commit()
+
+        def failing_launcher(_command):
+            raise runtime.ConductorLaunchError(
+                "planner slot cannot launch on a closed sprint"
+            )
+
+        result = runtime.act(
+            self.con, directive_id, 1, launcher=failing_launcher
+        )
+
+        self.assertEqual(result["status"], "refused")
+        self.assertIn("add a follow-up unit", result["reason"])
+        self.assertEqual(
+            result["escalation"],
+            {"error": "planner slot cannot launch on a closed sprint"},
+        )
+        row = self.con.execute(
+            "SELECT status,refusal_reason FROM directives "
+            "WHERE directive_id=?",
+            (directive_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "refused")
+        self.assertIn("add a follow-up unit", row["refusal_reason"])
+
     def test_handoff_slot_waits_for_the_act_transaction_to_commit(self):
         self.set_declared()
         directive_id = self.emit("planner", "handoff", {}, unit=False)

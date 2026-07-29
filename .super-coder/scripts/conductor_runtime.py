@@ -1043,7 +1043,7 @@ def _act_locked(
                 model=model,
             )
             escalation = {"command": command, "pid": launcher(command)}
-        except DirectiveRefused as escalation_error:
+        except (DirectiveRefused, ConductorLaunchError) as escalation_error:
             escalation = {"error": str(escalation_error)}
         _trail(
             con,
