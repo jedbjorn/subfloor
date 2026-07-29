@@ -78,6 +78,8 @@ SLOT_SKILLS = {
     "rev": ("reviewer", "sprint_rev"),
 }
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
+SPRINT_ACTIVATION_WAIT_SECONDS = 30.0
+SPRINT_ACTIVATION_POLL_SECONDS = 0.05
 
 
 def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
@@ -702,6 +704,40 @@ class SlotRequestError(ValueError):
     """A slot launch that cannot resolve one unambiguous sprint assignment."""
 
 
+def await_sprint_active(
+    con,
+    sprint_ref: int,
+    *,
+    timeout_seconds: float = SPRINT_ACTIVATION_WAIT_SECONDS,
+) -> bool:
+    """Wait for a Conductor handoff transaction to become visible.
+
+    Conductor validates the board, activates the sprint, and releases its
+    ready units in one transaction. Slot children start before that transaction
+    commits so launch failures can still roll it back. A child launched through
+    that boundary must therefore wait on a fresh read instead of rejecting the
+    still-visible ``declared`` state.
+
+    Return False on timeout or when the sprint is absent/in another state;
+    ``resolve_slot_context`` then emits the ordinary fail-closed diagnosis.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        row = con.execute(
+            "SELECT state FROM sprints WHERE sprint_doc_id=?",
+            (sprint_ref,),
+        ).fetchone()
+        state = row["state"] if row is not None else None
+        if state == "active":
+            return True
+        if state != "declared" or time.monotonic() >= deadline:
+            return False
+        # End any read transaction before polling so a separate SQLite
+        # connection's activation commit becomes visible.
+        con.rollback()
+        time.sleep(SPRINT_ACTIVATION_POLL_SECONDS)
+
+
 def resolve_slot_context(con, shell, slot: str, sprint_ref: int,
                          unit_ref: "str | None" = None) -> dict:
     """Validate and load the deterministic context for one ephemeral slot.
@@ -1319,10 +1355,15 @@ def main() -> None:
     slot = None
     slot_sprint = None
     slot_unit = None
+    await_active = False
     positional = []
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--await-sprint-active":
+            await_active = True
+            i += 1
+            continue
         if a == "--harness":
             flag_harness = args[i + 1] if i + 1 < len(args) else None
             i += 2
@@ -1387,12 +1428,18 @@ def main() -> None:
             sys.exit("sc run: --sprint must be a positive integer")
         if slot_sprint <= 0:
             sys.exit("sc run: --sprint must be a positive integer")
+    if await_active and (not headless or slot is None or slot_sprint is None):
+        sys.exit(
+            "sc run: --await-sprint-active requires a headless sprint slot"
+        )
 
     # Wordmark banner — interactive boots only; headless/verify logs stay clean.
     if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():
         print(style.banner(REPO_ROOT.name))
 
     con = open_db()
+    if await_active:
+        await_sprint_active(con, slot_sprint)
     # Self-heal stale engine skills before anything this boot reads them
     # (compose's SKILLS block, render_skill_md). A DB stranded by an in-place
     # `0001` regen repairs itself from assets/skills/ instead of needing a manual

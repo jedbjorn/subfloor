@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -175,6 +178,40 @@ class SlotContextTest(unittest.TestCase):
             run.resolve_slot_context(
                 self.con, self.shell(2), "dev", 25)
 
+    def test_conductor_slot_wait_observes_activation_from_another_connection(
+            self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sc_slot_activation_") as td:
+            path = Path(td) / "runtime.db"
+            setup = sqlite3.connect(path)
+            setup.execute(
+                "CREATE TABLE sprints (sprint_doc_id INTEGER PRIMARY KEY,"
+                " state TEXT NOT NULL)"
+            )
+            setup.execute("INSERT INTO sprints VALUES (25,'declared')")
+            setup.commit()
+            setup.close()
+
+            def activate() -> None:
+                time.sleep(0.05)
+                writer = sqlite3.connect(path)
+                writer.execute(
+                    "UPDATE sprints SET state='active' WHERE sprint_doc_id=25"
+                )
+                writer.commit()
+                writer.close()
+
+            thread = threading.Thread(target=activate)
+            thread.start()
+            reader = sqlite3.connect(path)
+            reader.row_factory = sqlite3.Row
+            try:
+                self.assertTrue(
+                    run.await_sprint_active(reader, 25, timeout_seconds=1.0)
+                )
+            finally:
+                reader.close()
+                thread.join()
+
     def test_slot_boot_section_inlines_context_and_complete_skill(self) -> None:
         ctx = run.resolve_slot_context(
             self.con, self.shell(2), "dev", 25, "U1")
@@ -250,7 +287,8 @@ class SlotLaunchIntegrationTest(unittest.TestCase):
                 mock.patch.object(
                     run.sys, "argv",
                     ["run.py", "--headless", "DEV1", "--harness", "claude",
-                     "--slot", "dev", "--sprint", "25", "--unit", "U1"]), \
+                     "--slot", "dev", "--sprint", "25", "--unit", "U1",
+                     "--await-sprint-active"]), \
                 mock.patch.object(run, "open_db", return_value=con), \
                 mock.patch.object(
                     run, "authenticate", return_value={"user_id": 1}), \

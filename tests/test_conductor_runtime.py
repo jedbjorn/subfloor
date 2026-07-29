@@ -499,6 +499,19 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             "refused",
         )
 
+    def test_handoff_slot_waits_for_the_act_transaction_to_commit(self):
+        self.set_declared()
+        directive_id = self.emit("planner", "handoff", {}, unit=False)
+        self.con.commit()
+
+        result = runtime.act(
+            self.con, directive_id, 1, launcher=self.launcher
+        )
+
+        self.assertEqual(result["status"], "executed")
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertIn("--await-sprint-active", result["launches"][0])
+
     def test_refusal_rolls_back_partial_board_changes(self):
         self.set_unit("working")
         self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=4")
