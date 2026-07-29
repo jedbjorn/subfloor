@@ -172,6 +172,43 @@ class ConductorContractTests(unittest.TestCase):
         self.assertEqual(status, 201)
         wake.assert_called_once()
 
+    def test_planner_handoff_waits_for_explicit_fnb_conductor_boot(self):
+        planner_id = self.con.execute(
+            "INSERT INTO shells "
+            "(display_name,shortname,flavor,system_prompt,api_key) "
+            "VALUES ('Planner','pln','planner','x','planner-token')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO documents "
+            "(document_id,kind,title,body) "
+            "VALUES (100,'doc','SPRINT: activation gate','x')"
+        )
+        self.con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,planner_shell_id,state,legacy) "
+            "VALUES (100,?,'declared',1)",
+            (planner_id,),
+        )
+        self.con.commit()
+
+        with mock.patch.object(
+                conductor_routes.conductor_runtime,
+                "maybe_wake",
+        ) as wake:
+            status, item = self.post(
+                {
+                    "kind": "handoff",
+                    "target": "conductor",
+                    "sprint_doc_id": 100,
+                    "payload": {},
+                },
+                token="planner-token",
+            )
+
+        self.assertEqual(status, 201)
+        self.assertEqual(item["status"], "pending")
+        wake.assert_not_called()
+
     def test_act_requires_conductor_token_and_calls_mechanical_runtime(self):
         conductor_id = self.con.execute(
             "INSERT INTO shells "
