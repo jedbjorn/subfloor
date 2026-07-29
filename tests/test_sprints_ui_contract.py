@@ -148,8 +148,17 @@ def payload(*, count=1, started_at="2026-07-26T20:00:00Z", units=None):
         "sprints": [] if count == 0 else [{
             "document_id": 77,
             "title": "SPRINT: Active sprint flow board",
+            "state": "active",
             "started_at": started_at,
             "planner": {"shell_id": 10, "shortname": "PLN2"},
+            "planner_route": "planner/gpt-5.6",
+            "dev_route": "dev/gpt-5.6",
+            "reviewer_route": "reviewer/gpt-5.6",
+            "qaqc": {
+                "review_id": 28,
+                "verdict": "approved",
+                "body_sha256": "a" * 64,
+            },
             "feature": {"feature_id": 33, "title": "Active sprint flow board"},
             "units": [{
                 "seq": "U3",
@@ -267,7 +276,13 @@ out({
     assert result["hidden"] is False
     assert "sprint: rendered verbatim" in result["text"]
     assert "Doc #77" in result["text"]
+    assert "active" in result["text"]
     assert "Planner: PLN2" in result["text"]
+    assert "QAQC: approved #28" in result["text"]
+    assert (
+        "Routes: Planner planner/gpt-5.6 · Dev dev/gpt-5.6 · "
+        "Reviewer reviewer/gpt-5.6"
+    ) in result["text"]
     assert "Feature: #33 Active sprint flow board" in result["text"]
     assert "Planner: Unbound" in result["text"]
     assert "Feature: Unlinked" in result["text"]

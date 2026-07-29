@@ -28,7 +28,7 @@ def build_file_db(path: Path, *, include_step4: bool = True) -> sqlite3.Connecti
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA.read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
-        if migration == STEP4 and not include_step4:
+        if not include_step4 and migration.name >= STEP4.name:
             continue
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")

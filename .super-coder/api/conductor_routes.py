@@ -25,6 +25,7 @@ DB_PATH = ENGINE / "shell_db.db"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conductor_runtime  # noqa: E402
 import db_driver  # noqa: E402
+import sprint_lifecycle  # noqa: E402
 
 _ALLOWED_HOST_SET = frozenset(("127.0.0.1", "localhost", "::1"))
 _STATUSES = frozenset(("pending", "executed", "refused"))
@@ -260,6 +261,17 @@ def _create_directive(con, headers, body):
         if linked is None:
             return _err(422, "unit_sprint_mismatch",
                         "unit_id does not belong to sprint_doc_id")
+    if flavor == "planner" and sprint is not None:
+        try:
+            owner = sprint_lifecycle.planner_for_sprint(con, sprint)
+        except sprint_lifecycle.SprintLifecycleError as exc:
+            return _err(409, "sprint_owner_required", str(exc))
+        if owner["shell_id"] != shell_id:
+            return _err(
+                403,
+                "not_sprint_owner",
+                f"shell {shell_id} is not sprint {sprint}'s originating Planner",
+            )
     try:
         cur = con.execute(
             "INSERT INTO directives "

@@ -58,6 +58,7 @@ Run from the repo root, like every engine command:
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
     ./sc mem doc freeze <document_id>
+    ./sc mem doc qaqc <spec_document_id> --verdict approved|changes_requested [--findings-doc ID]
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--sprint DOC_ID]
@@ -252,7 +253,8 @@ _DOC_WRITE_TIMEOUT = 420
 
 def _api(method: str, path: str, payload: "dict | None" = None,
          idempotent: "bool | None" = None,
-         timeout: "float | None" = None) -> dict:
+         timeout: "float | None" = None,
+         idem_key: "str | None" = None) -> dict:
     """POST/PATCH/GET to the engine API; die loud on any error.
 
     Retries (#331 — multi-shell write contention on the engine DB):
@@ -274,6 +276,8 @@ def _api(method: str, path: str, payload: "dict | None" = None,
     headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
     if data is not None:
         headers["Content-Type"] = "application/json"
+    if idem_key is not None:
+        headers["Idempotency-Key"] = idem_key
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     for attempt in range(1 + _RETRIES):
         last = attempt == _RETRIES
@@ -330,7 +334,7 @@ def cmd_which(args) -> int:
 
 GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
                 "roadmap", "narrative", "messages",
-                "projects", "documents", "tasks", "shells")
+                "projects", "documents", "tasks", "shells", "qaqc")
 
 # The write surface is `sc mem doc …` and boot docs say "doc" — accept the
 # obvious short forms on the read side too instead of costing a round-trip.
@@ -473,6 +477,22 @@ def _render_get(surface: str, data: dict) -> int:
             if t.get("resolution_notes"):
                 print("  ⤷ " + t["resolution_notes"])
         return 0
+    if surface == "qaqc":
+        reviews = data.get("reviews", [])
+        if not reviews:
+            print("mem: no QAQC reviews")
+            return 0
+        for review in reviews:
+            reviewer = (
+                review.get("reviewer_shortname")
+                or f"shell #{review['reviewer_shell_id']}"
+            )
+            print(
+                f"#{review['review_id']} [{review['verdict']}] "
+                f"spec #{review['spec_doc_id']} · {reviewer} · "
+                f"{review['body_sha256']} · {review['completed_at']}"
+            )
+        return 0
     if surface == "messages":
         msgs = data.get("messages", [])
         if not msgs:
@@ -510,6 +530,10 @@ def cmd_get(args) -> int:
             path = f"/_sc/mem/tasks?feature={args.feature}"
         else:
             die("get tasks needs --doc <id> or --feature <id>")
+    elif surface == "qaqc":
+        if args.doc is None:
+            die("get qaqc needs --doc <spec_document_id>")
+        path = f"/api/spec-qaqc-reviews?spec_doc_id={args.doc}"
     data = _api("GET", path)
     if args.json:
         print(json.dumps(data, indent=2, default=str))
@@ -754,6 +778,24 @@ def cmd_oriented(args) -> int:
 
 
 def cmd_doc(args) -> int:
+    if args.doc_cmd == "qaqc":
+        payload = {
+            "spec_doc_id": args.document_id,
+            "verdict": args.verdict,
+        }
+        if args.findings_doc is not None:
+            payload["findings_doc_id"] = args.findings_doc
+        review = _api(
+            "POST",
+            "/api/spec-qaqc-reviews",
+            payload,
+            idempotent=True,
+            idem_key=f"qaqc|{args.document_id}|{uuid.uuid4()}",
+        )
+        return _finish_api(
+            f"mem: QAQC review #{review['review_id']} → {review['verdict']} "
+            f"for spec #{args.document_id} at {review['body_sha256']}"
+        )
     if args.doc_cmd == "freeze":
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze",
                  timeout=_DOC_WRITE_TIMEOUT)
@@ -1030,6 +1072,17 @@ def build_parser() -> argparse.ArgumentParser:
     de.add_argument("--render-path", dest="render_path")
     df = dsub.add_parser("freeze")
     df.add_argument("document_id", type=int)
+    dq = dsub.add_parser(
+        "qaqc",
+        help="record an append-only review of the spec's current canonical body",
+    )
+    dq.add_argument("document_id", type=int)
+    dq.add_argument(
+        "--verdict",
+        required=True,
+        choices=("approved", "changes_requested"),
+    )
+    dq.add_argument("--findings-doc", dest="findings_doc", type=int)
     sp.set_defaults(fn=cmd_doc)
 
     sp = sub.add_parser("narrative", help="append a [HH:MM] line to the active archive")

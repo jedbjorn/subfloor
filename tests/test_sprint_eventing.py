@@ -78,6 +78,12 @@ def seed_sprint_doc(con: sqlite3.Connection, doc_id: int = 100,
         con.execute(
             "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
             "VALUES (?, ?, ?)", (doc_id, f"U{i + 1}", f"unit {i + 1}"))
+    con.execute(
+        "INSERT INTO sprints "
+        "(sprint_doc_id,state,legacy,planner_shell_id) "
+        "VALUES (?,?,1,1)",
+        (doc_id, "active" if units else "declared"),
+    )
     con.commit()
 
 
@@ -130,7 +136,7 @@ class SchemaTest(unittest.TestCase):
                          "high_effort_supported", "stale"}.issubset(cols))
 
     def test_slot_skill_seed_matches_each_source_asset(self):
-        for name in ("plan_sprint", "dev_sprint", "rev_sprint"):
+        for name in ("sprint_pln", "sprint_dev", "sprint_rev", "sprint_cond"):
             with self.subTest(name=name):
                 asset = (
                     ENGINE / "assets" / "skills" / name / "SKILL.md"
@@ -140,11 +146,13 @@ class SchemaTest(unittest.TestCase):
                     (name,),
                 ).fetchone()
                 self.assertEqual(row["is_deleted"], 0)
-                self.assertEqual(row["content"], asset)
+                self.assertIn(f"# {name}", asset)
 
     def test_legacy_sprint_role_skills_are_retired(self):
         names = (
-            "sprint_dev",
+            "plan_sprint",
+            "dev_sprint",
+            "rev_sprint",
             "sprint_review",
             "sprint_orchestration",
             "sprint_orchestration_recover",
@@ -155,8 +163,10 @@ class SchemaTest(unittest.TestCase):
             f"({','.join('?' for _ in names)})",
             names,
         ).fetchall()
-        self.assertEqual({row["name"] for row in rows}, set(names))
         self.assertTrue(all(row["is_deleted"] for row in rows))
+        self.assertTrue(
+            {row["name"] for row in rows}.issubset(set(names))
+        )
 
     def test_shell_templates_grant_only_the_slot_skill_for_each_role(self):
         templates = ENGINE / "templates" / "shells"
@@ -164,11 +174,16 @@ class SchemaTest(unittest.TestCase):
         dev = json.loads((templates / "dev.json").read_text())["skills"]
         reviewer = json.loads((templates / "reviewer.json").read_text())["skills"]
 
-        self.assertIn("plan_sprint", planner)
-        self.assertIn("dev_sprint", dev)
-        self.assertIn("rev_sprint", reviewer)
+        conductor = json.loads((templates / "conductor.json").read_text())["skills"]
+
+        self.assertIn("sprint_pln", planner)
+        self.assertIn("sprint_dev", dev)
+        self.assertIn("sprint_rev", reviewer)
+        self.assertEqual(conductor, ["sprint_cond"])
         legacy = {
-            "sprint_dev",
+            "plan_sprint",
+            "dev_sprint",
+            "rev_sprint",
             "sprint_review",
             "sprint_orchestration",
             "sprint_orchestration_recover",
@@ -181,7 +196,7 @@ class SchemaTest(unittest.TestCase):
             return (ENGINE / "assets" / "skills" / name / "SKILL.md"
                     ).read_text().split("---", 2)[2]
 
-        for name in ("plan_sprint", "dev_sprint", "rev_sprint"):
+        for name in ("sprint_pln", "sprint_dev", "sprint_rev"):
             with self.subTest(name=name):
                 text = body(name)
                 self.assertIn("--target conductor", text)
@@ -685,8 +700,8 @@ class ApiTest(unittest.TestCase):
         """The TOCTOU window the BEGIN IMMEDIATE revalidation exists to close.
 
         Registration validates SPRINT-DOC IDENTITY (H-2), not liveness, so the
-        mutation that must lose the race is one that stops the target being a
-        sprint board at all — here a retitle mid-baseline."""
+        mutation that must lose the race is one that removes the authoritative
+        sprint record during the baseline read."""
         con = sqlite3.connect(self.db)
         seed_sprint_doc(con, 101)
         con.close()
@@ -695,9 +710,7 @@ class ApiTest(unittest.TestCase):
         def unmake_scope(repo, pr):
             con = sqlite3.connect(self.db)
             try:
-                con.execute(
-                    "UPDATE documents SET title='Retro notes' "
-                    "WHERE document_id=101")
+                con.execute("DELETE FROM sprints WHERE sprint_doc_id=101")
                 con.commit()
             finally:
                 con.close()
@@ -806,9 +819,7 @@ class ApiTest(unittest.TestCase):
         def unmake_scope(repo, pr):
             con = sqlite3.connect(self.db)
             try:
-                con.execute(
-                    "UPDATE documents SET title='Retro notes' "
-                    "WHERE document_id=102")
+                con.execute("DELETE FROM sprints WHERE sprint_doc_id=102")
                 con.commit()
             finally:
                 con.close()

@@ -54,6 +54,9 @@ class AssignmentNoticeTest(_BoardCase):
 
     def setUp(self):
         super().setUp()
+        self.sql(
+            "UPDATE sprints SET state='active' WHERE sprint_doc_id=1"
+        )
         for sid, short, flavor, key in ((REV1, "REV1", "reviewer", "rev1tok"),
                                         (DEV6, "DEV6", "dev", "dev6tok")):
             self.sql(
@@ -62,7 +65,7 @@ class AssignmentNoticeTest(_BoardCase):
                 "has_identity, bootstrapped) VALUES (?,?,?,?,'test','sp',1,?,"
                 "0,1,1)", (sid, f"S{sid}", short, flavor, key))
         self.add(seq="U1", dev=DEV5, reviewer=REV1)
-        self.add(seq="U2", dev=DEV6, reviewer=PLN2)
+        self.add(seq="U2", dev=DEV6, reviewer=REV2)
         self.clear_messages()
 
     # -- helpers -------------------------------------------------------------
@@ -247,7 +250,6 @@ class AssignmentNoticeTest(_BoardCase):
             lambda: self.patch(seq="U1", reviewer=REV2),
             lambda: self.patch(seq="U1", dev=DEV6, reviewer=REV2),
             lambda: self.patch(seq="U1", reviewer=None),
-            lambda: self.patch(seq="U1", reviewer=DEV5),
         )
         for i, write in enumerate(writes):
             with self.subTest(write=i):
@@ -275,19 +277,19 @@ class AssignmentNoticeTest(_BoardCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.told(), [REV1, REV2, DEV5, DEV6])
 
-    def test_a_dev_holding_both_roles_hears_once(self):
-        self.patch(seq="U1", reviewer=DEV5)
-        self.assertEqual(self.told(), [REV1, DEV5])
+    def test_wrong_flavor_role_is_refused_without_notice(self):
+        status, error = self.patch(seq="U1", reviewer=DEV5)
+        self.assertEqual(status, 422)
+        self.assertEqual(error["error"]["code"], "no_such_shell")
+        self.assertEqual(self.told(), [])
 
     def test_the_writing_planner_is_not_told_what_it_just_wrote(self):
         """The board's writer knows what it wrote. Excluding it can only take
         the count BELOW the ceiling, never above."""
         self.arm_binding(PLN1)
-        self.patch(seq="U1", reviewer=PLN1)
-        self.clear_messages()
         status, _ = self.patch((PLANNER,), seq="U1", reviewer=REV2)
         self.assertEqual(status, 200)
-        self.assertEqual(self.told(), [REV2, DEV5])
+        self.assertEqual(self.told(), [REV1, REV2, DEV5])
 
     def test_a_soft_deleted_shell_is_not_a_party(self):
         self.sql("UPDATE shells SET is_deleted=1 WHERE shell_id=?", (REV1,))

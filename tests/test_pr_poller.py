@@ -71,6 +71,12 @@ def seed_sprint_doc(con, doc_id: int, status: str = "ACTIVE", frozen: int = 0,
         con.execute(
             "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
             "VALUES (?, ?, ?)", (doc_id, f"U{i + 1}", f"unit {i + 1}"))
+    if kind == "doc" and title.upper().startswith("SPRINT:"):
+        con.execute(
+            "INSERT INTO sprints (sprint_doc_id,state,legacy) "
+            "VALUES (?,?,1)",
+            (doc_id, "active" if units else "declared"),
+        )
     con.commit()
 
 
@@ -128,10 +134,9 @@ class SprintScopingTest(unittest.TestCase):
             with self.subTest(doc_id=doc_id):
                 self.assertIs(sprint_state.is_live_sprint(self.con, doc_id), live)
 
-    def test_declaring_the_first_unit_is_what_makes_a_sprint_live(self):
-        """The ordering H-1 creates: board first, then arm. A unit-less sprint
-        doc is a real document that simply is not live yet, and the poller must
-        read it that way rather than as a missing one."""
+    def test_handoff_not_first_unit_is_what_makes_a_sprint_live(self):
+        """A declared sprint accepts its first unit but becomes live only at
+        the explicit authoritative handoff."""
         seed_sprint_doc(self.con, 100, units=0)
         self.assertFalse(sprint_state.is_live_sprint(self.con, 100))
         self.assertTrue(sprint_state.is_sprint_doc(self.con, 100))
@@ -139,6 +144,11 @@ class SprintScopingTest(unittest.TestCase):
         self.con.execute(
             "INSERT INTO sprint_units (sprint_doc_id, seq, unit_title) "
             "VALUES (100, 'U1', 'first')")
+        self.con.commit()
+        self.assertFalse(sprint_state.is_live_sprint(self.con, 100))
+        self.con.execute(
+            "UPDATE sprints SET state='active' WHERE sprint_doc_id=100"
+        )
         self.con.commit()
         self.assertTrue(sprint_state.is_live_sprint(self.con, 100))
 

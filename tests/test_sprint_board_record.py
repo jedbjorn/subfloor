@@ -138,7 +138,8 @@ def seed_fixtures(con) -> None:
             (8, "REV2", "reviewer", "revtok"),
             (9, "PLN1", "planner", "plntok"),
             (10, "PLN2", "planner", "pln2tok"),
-            (11, "DEV5", "dev", "devtok")):
+            (11, "DEV5", "dev", "devtok"),
+            (13, "REV3", "reviewer", "rev3tok")):
         con.execute(
             "INSERT INTO shells (shell_id, display_name, shortname, flavor, "
             "mandate, system_prompt, user_id, api_key, is_shared, "
@@ -148,6 +149,14 @@ def seed_fixtures(con) -> None:
     con.execute(
         "INSERT INTO documents (document_id, kind, title, body) "
         "VALUES (1,'doc','SPRINT: test',?)", (DOC_BODY,))
+    # Post-0123 a document title is prose, not sprint identity.  This fixture
+    # represents a deliberately adopted legacy board: Planner 9 is the one
+    # stored owner, and state=declared permits provisioning before handoff.
+    con.execute(
+        "INSERT INTO sprints "
+        "(sprint_doc_id,planner_shell_id,state,legacy) "
+        "VALUES (1,9,'declared',1)"
+    )
     con.commit()
 
 
@@ -395,7 +404,7 @@ class BoardRecordTest(_BoardCase):
         self.arm_binding()
         status, err = self.add((DEV,), seq="U9")
         self.assertEqual(status, 403)
-        self.assertEqual(err["error"]["code"], "not_the_planner")
+        self.assertEqual(err["error"]["code"], "not_sprint_owner")
         self.assertIsNone(self.row("U9"), "the refused write still landed")
 
     def test_dev_cannot_move_its_own_unit_to_merged(self):
@@ -406,7 +415,7 @@ class BoardRecordTest(_BoardCase):
         self.add(dev="DEV5", reviewer="REV2")
         status, err = self.patch((DEV,), state="merged")
         self.assertEqual(status, 403)
-        self.assertEqual(err["error"]["code"], "not_the_planner")
+        self.assertEqual(err["error"]["code"], "not_sprint_owner")
         self.assertEqual(self.row()["state"], "pending")
 
     def test_reviewer_cannot_write_the_board_either(self):
@@ -427,27 +436,27 @@ class BoardRecordTest(_BoardCase):
             self.assertEqual(len(out["units"]), 1)
             self.assertEqual(out["units"][0]["reviewer_shortname"], "REV2")
 
-    def test_planner_flavor_writes_without_interface_binding_truth(self):
-        """Step 3 retires bindings as an authority source. Until the explicit
-        Conductor contract lands, planner flavor is the complete write fence;
-        both planner shells may write and workers still may not."""
+    def test_only_the_recorded_planner_writes_the_board(self):
+        """Planner flavor is not ownership; the declaration names one writer."""
         binding_id = self.arm_binding(planner_shell_id=9)
         self.release(binding_id)
         status, _ = self.add((PLANNER,), dev="DEV5")
         self.assertEqual(status, 201)
-        status, _ = self.patch((PLANNER2,), state="working")
-        self.assertEqual(status, 200)
-        self.assertEqual(self.row()["state"], "working")
-
-    def test_unbound_sprint_falls_back_to_planner_flavor_not_to_anyone(self):
-        """The spec's fallback is 'the sprint doc's author', which `documents`
-        has no column for. Flavor is the stand-in — and it must still exclude
-        workers, or the fence is decorative before a binding is armed."""
-        status, _ = self.add((PLANNER2,), dev="DEV5")
-        self.assertEqual(status, 201)
-        status, _err = self.patch((DEV,), branch="feat/x")
+        status, err = self.patch((PLANNER2,), state="working")
         self.assertEqual(status, 403)
-        self.assertIsNone(self.row()["branch"])
+        self.assertEqual(err["error"]["code"], "not_sprint_owner")
+        self.assertEqual(self.row()["state"], "pending")
+
+    def test_a_sprint_without_an_owner_fails_closed(self):
+        """No fleet-wide Planner fallback survives the declaration contract."""
+        self.sql("DELETE FROM sprints WHERE sprint_doc_id=1")
+        self.sql(
+            "INSERT INTO sprints (sprint_doc_id,state,legacy) "
+            "VALUES (1,'needs_owner',1)"
+        )
+        status, err = self.add((PLANNER2,), dev="DEV5")
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"]["code"], "sprint_needs_owner")
 
     # -- belief must not be corrupted quietly --------------------------------
 
@@ -464,7 +473,7 @@ class BoardRecordTest(_BoardCase):
     def test_add_is_not_an_upsert_and_leaves_the_live_row_intact(self):
         self.add(dev="DEV5", reviewer="REV2", branch="feat/real")
         self.patch(state="working")
-        status, err = self.add(unit_title="typo redeclare", dev="PLN2")
+        status, err = self.add(unit_title="typo redeclare", dev="DEV5")
         self.assertEqual(status, 409)
         self.assertEqual(err["error"]["code"], "unit_exists")
         live = self.row()
@@ -531,7 +540,7 @@ class BoardRecordTest(_BoardCase):
         self.patch(branch="feat/x")
         self.assertEqual(self.row()["assigned_at"], "2020-01-01 00:00:00",
                          "a branch edit counted as a reassignment")
-        self.patch(reviewer="PLN2")
+        self.patch(reviewer="REV3")
         self.assertNotEqual(self.row()["assigned_at"], "2020-01-01 00:00:00")
 
     def test_the_db_refuses_a_state_outside_the_declared_set(self):
@@ -792,7 +801,7 @@ class BoardRecordTest(_BoardCase):
             sprint_cli.cmd_unit_add(_unit_args(dev="DEV5", branch="feat/real"))
             with self.assertRaises(SystemExit) as dup:
                 sprint_cli.cmd_unit_add(
-                    _unit_args(title="typo redeclare", dev="PLN2"))
+                    _unit_args(title="typo redeclare", dev="DEV5"))
 
         told = str(dup.exception)
         self.assertIn("409", told)

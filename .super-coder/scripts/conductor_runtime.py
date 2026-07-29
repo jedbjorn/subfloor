@@ -2,9 +2,10 @@
 """Deterministic Conductor mechanics.
 
 The OpenCode Conductor shell reads the transition table rendered from this
-module and calls ``./sc directives act <id>``.  All authority stays here:
-payload validation, board transitions, role-slot launches, refusal, and the
-durable action trail are code, not model judgement.
+module plus the matching ``sprint_cond`` skill and calls
+``sc directives act <id>``. All authority stays here: payload validation,
+board transitions, role-slot launches, refusal, and the durable action trail
+are code, not model judgement.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import shell_liveness
+import sprint_lifecycle
 import sprint_state
 from sprint_units import SPRINT_UNIT_EDGES, SprintTransitionError, check_transition
 
@@ -63,20 +65,20 @@ TRANSITIONS = (
     (
         "dev",
         "ask-planner",
-        "move blocked; boot planner with evidence",
-        "planner slot receives the question",
+        "move blocked; boot recorded originating Planner with evidence",
+        "originating Planner receives the question",
     ),
     (
         "dev",
         "merged",
-        "move merged; boot planner",
-        "unit is terminal and planner receives the merge",
+        "move merged; release every newly dependency-ready unit",
+        "normal merge never boots Planner",
     ),
     (
         "dev",
         "unit-report",
-        "relay report to planner",
-        "planner slot receives the structured report",
+        "record report; boot originating Planner only when all units are terminal",
+        "ordinary reports never boot Planner",
     ),
     (
         "reviewer",
@@ -93,8 +95,14 @@ TRANSITIONS = (
     (
         "reviewer",
         "ask-planner",
-        "move blocked; boot planner with evidence",
-        "planner slot receives the question",
+        "move blocked; boot recorded originating Planner with evidence",
+        "originating Planner receives the question",
+    ),
+    (
+        "planner",
+        "handoff",
+        "validate board; activate sprint; boot every dependency-ready developer",
+        "authoritative state is active and each released unit is working",
     ),
     (
         "planner",
@@ -142,20 +150,20 @@ TRANSITIONS = (
     (
         "system",
         "pr-merged",
-        "move merged; boot planner",
-        "board and planner receive the merge",
+        "move merged; release every newly dependency-ready unit",
+        "normal merge never boots Planner",
     ),
     (
         "system",
         "stall",
-        "move blocked when legal; boot planner",
-        "planner receives the full dwell snapshot",
+        "move blocked when legal; boot originating Planner",
+        "originating Planner receives the full dwell snapshot",
     ),
     (
         "system",
         "dead-shell",
-        "move blocked when legal; boot planner",
-        "planner receives the liveness snapshot",
+        "move blocked when legal; boot originating Planner",
+        "originating Planner receives the liveness snapshot",
     ),
 )
 _TRANSITION_SET = {(issuer, kind) for issuer, kind, _action, _pass in TRANSITIONS}
@@ -217,16 +225,23 @@ def doctor(
         raise ConductorConfigError(
             f"conductor shell {config.shell!r} has no API credential"
         )
-    grants = con.execute(
-        "SELECT COUNT(*) FROM flavor_skills WHERE flavor='conductor'"
-    ).fetchone()[0]
+    grants = [
+        row[0]
+        for row in con.execute(
+            "SELECT sk.name FROM flavor_skills fs "
+            "JOIN skills sk ON sk.skill_id=fs.skill_id "
+            "WHERE fs.flavor='conductor' AND COALESCE(sk.is_deleted,0)=0 "
+            "ORDER BY sk.name"
+        )
+    ]
     direct = con.execute(
         "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?",
         (shell["shell_id"],),
     ).fetchone()[0]
-    if grants or direct:
+    if grants != ["sprint_cond"] or direct:
         raise ConductorConfigError(
-            "conductor must have zero skills; remove flavor and direct grants"
+            "conductor must have exactly the sprint_cond flavor skill and no "
+            "direct grants"
         )
     try:
         models = run(
@@ -328,8 +343,8 @@ def maybe_wake(
             return {**checked, "launched": False, "reason": "already-live"}
         prompt = (
             "Process pending Conductor directives in ascending id order. "
-            "For each id run `./sc directives act <id>`, inspect the result, "
-            "and continue until `./sc directives list --status pending` is empty."
+            "For each id run `sc directives act <id>`, inspect the result, "
+            "and continue until `sc directives list --status pending` is empty."
         )
         command = [
             str(REPO_ROOT / "sc"),
@@ -403,17 +418,19 @@ def _shell(con, shortname: str, flavor: str | None = None):
     return row
 
 
-def _only_shell(con, flavor: str):
-    rows = con.execute(
-        "SELECT shell_id,shortname,flavor FROM shells "
-        "WHERE flavor=? AND COALESCE(is_deleted,0)=0 ORDER BY shell_id",
-        (flavor,),
-    ).fetchall()
-    if len(rows) != 1:
-        raise DirectiveRefused(
-            f"expected exactly one active {flavor} shell, found {len(rows)}"
-        )
-    return rows[0]
+def _planner_for_sprint(con, sprint_id: int):
+    try:
+        return sprint_lifecycle.planner_for_sprint(con, sprint_id)
+    except sprint_lifecycle.SprintLifecycleError as exc:
+        raise DirectiveRefused(str(exc)) from exc
+
+
+def _route_for_slot(con, sprint_id: int, slot: str) -> tuple[str, str]:
+    role = {"plan": "planner", "dev": "dev", "rev": "reviewer"}[slot]
+    try:
+        return sprint_lifecycle.route_for_role(con, sprint_id, role)
+    except sprint_lifecycle.SprintLifecycleError as exc:
+        raise DirectiveRefused(str(exc)) from exc
 
 
 def _assert_issuer_assignment(row, unit) -> None:
@@ -452,7 +469,8 @@ def _slot_command(
     *,
     unit_seq: str | None,
     prompt: str,
-    model: str | None = None,
+    harness: str,
+    model: str,
 ) -> list[str]:
     command = [
         str(REPO_ROOT / "sc"),
@@ -462,16 +480,19 @@ def _slot_command(
         slot,
         "--sprint",
         str(sprint_id),
+        "--harness",
+        harness,
+        "--model",
+        model,
     ]
     if unit_seq is not None:
         command += ["--unit", unit_seq]
-    if model:
-        command += ["--model", model]
     command += ["--prompt", prompt]
     return command
 
 
 def _spawn(
+    con,
     launches: list[list[str]],
     shell,
     slot: str,
@@ -479,7 +500,6 @@ def _spawn(
     payload: dict,
     *,
     unit=None,
-    model: str | None = None,
 ) -> None:
     prompt = json.dumps(
         {
@@ -490,6 +510,7 @@ def _spawn(
         },
         sort_keys=True,
     )
+    harness, model = _route_for_slot(con, row["sprint_doc_id"], slot)
     launches.append(
         _slot_command(
             shell,
@@ -497,9 +518,118 @@ def _spawn(
             row["sprint_doc_id"],
             unit_seq=unit["seq"] if unit is not None else None,
             prompt=prompt,
+            harness=harness,
             model=model,
         )
     )
+
+
+def _dependency_tokens(raw: str | None) -> list[str]:
+    return [token.strip() for token in (raw or "").split(",") if token.strip()]
+
+
+def _all_units_terminal(con, sprint_id: int) -> bool:
+    return con.execute(
+        "SELECT COUNT(*) FROM sprint_units WHERE sprint_doc_id=? "
+        "AND state NOT IN ('merged','cancelled')",
+        (sprint_id,),
+    ).fetchone()[0] == 0
+
+
+def _ready_pending_units(con, sprint_id: int):
+    units = con.execute(
+        "SELECT * FROM sprint_units WHERE sprint_doc_id=? ORDER BY unit_id",
+        (sprint_id,),
+    ).fetchall()
+    by_seq = {unit["seq"]: unit for unit in units}
+    ready = []
+    for unit in units:
+        if unit["state"] != "pending":
+            continue
+        deps = _dependency_tokens(unit["depends_on"])
+        if all(
+            dep in by_seq and by_seq[dep]["state"] in ("merged", "cancelled")
+            for dep in deps
+        ):
+            ready.append(unit)
+    return ready
+
+
+def _release_ready_units(con, launches, row, payload, actor_shell_id: int):
+    released = []
+    for unit in _ready_pending_units(con, row["sprint_doc_id"]):
+        dev = con.execute(
+            "SELECT shell_id,shortname,flavor FROM shells "
+            "WHERE shell_id=? AND flavor='dev' AND COALESCE(is_deleted,0)=0",
+            (unit["dev_shell_id"],),
+        ).fetchone()
+        if dev is None:
+            raise DirectiveRefused(
+                f"unit {unit['seq']} has no active assigned developer"
+            )
+        _move(con, unit, "working", actor_shell_id)
+        _spawn(con, launches, dev, "dev", row, payload, unit=unit)
+        released.append(unit["seq"])
+    return released
+
+
+def _validate_handoff_board(con, sprint_id: int) -> None:
+    units = con.execute(
+        "SELECT seq,state,dev_shell_id,reviewer_shell_id,depends_on "
+        "FROM sprint_units WHERE sprint_doc_id=? ORDER BY unit_id",
+        (sprint_id,),
+    ).fetchall()
+    if not units:
+        raise DirectiveRefused("handoff requires a non-empty sprint board")
+    seqs = {unit["seq"] for unit in units}
+    gaps = []
+    dependencies = {}
+    for unit in units:
+        if unit["state"] != "pending":
+            gaps.append(f"{unit['seq']} is {unit['state']}, not pending")
+        if unit["dev_shell_id"] is None:
+            gaps.append(f"{unit['seq']} missing developer")
+        elif con.execute(
+            "SELECT 1 FROM shells WHERE shell_id=? AND flavor='dev' "
+            "AND COALESCE(is_deleted,0)=0",
+            (unit["dev_shell_id"],),
+        ).fetchone() is None:
+            gaps.append(f"{unit['seq']} developer is not an active dev shell")
+        if unit["reviewer_shell_id"] is None:
+            gaps.append(f"{unit['seq']} missing reviewer")
+        elif con.execute(
+            "SELECT 1 FROM shells WHERE shell_id=? AND flavor='reviewer' "
+            "AND COALESCE(is_deleted,0)=0",
+            (unit["reviewer_shell_id"],),
+        ).fetchone() is None:
+            gaps.append(
+                f"{unit['seq']} reviewer is not an active reviewer shell"
+            )
+        dependencies[unit["seq"]] = set(_dependency_tokens(unit["depends_on"]))
+        for dep in dependencies[unit["seq"]]:
+            if dep == unit["seq"]:
+                gaps.append(f"{unit['seq']} depends on itself")
+            elif dep not in seqs:
+                gaps.append(f"{unit['seq']} names unknown dependency {dep}")
+    if gaps:
+        raise DirectiveRefused("handoff board invalid: " + "; ".join(gaps))
+    remaining = {seq: set(deps) for seq, deps in dependencies.items()}
+    while remaining:
+        roots = {seq for seq, deps in remaining.items() if not deps}
+        if not roots:
+            cycle = ", ".join(sorted(remaining))
+            raise DirectiveRefused(
+                f"handoff board has a dependency cycle among: {cycle}"
+            )
+        remaining = {
+            seq: deps - roots
+            for seq, deps in remaining.items()
+            if seq not in roots
+        }
+    if not _ready_pending_units(con, sprint_id):
+        raise DirectiveRefused(
+            "handoff board has no dependency-ready unit (dependency cycle)"
+        )
 
 
 def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
@@ -509,8 +639,22 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
     if row["target"] != "conductor":
         raise DirectiveRefused("directive target must be conductor")
     sprint_id = row["sprint_doc_id"]
-    if sprint_id is None or not sprint_state.is_live_sprint(con, sprint_id):
-        raise DirectiveRefused("directive requires an active, unfrozen sprint")
+    sprint = (
+        sprint_lifecycle.sprint_row(con, sprint_id)
+        if sprint_id is not None else None
+    )
+    required_state = "declared" if (issuer, kind) == ("planner", "handoff") \
+        else "active"
+    if sprint is None or sprint["state"] != required_state:
+        raise DirectiveRefused(
+            f"directive requires a {required_state} authoritative sprint"
+        )
+    if issuer == "planner":
+        planner = _planner_for_sprint(con, sprint_id)
+        if row["issuer_shell_id"] != planner["shell_id"]:
+            raise DirectiveRefused(
+                f"planner issuer is not sprint {sprint_id}'s originating Planner"
+            )
     launches: list[list[str]] = []
 
     if issuer == "dev":
@@ -537,11 +681,14 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             ).fetchone()
             if reviewer is None:
                 raise DirectiveRefused("unit has no assigned reviewer")
-            _spawn(launches, reviewer, "rev", row, payload, unit=unit)
+            _spawn(con, launches, reviewer, "rev", row, payload, unit=unit)
         elif kind == "ask-planner":
             _text(payload, "question")
             _block_when_legal(con, unit, actor_shell_id)
-            _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+            _spawn(
+                con, launches, _planner_for_sprint(con, sprint_id),
+                "plan", row, payload,
+            )
         elif kind == "merged":
             pr_number = _integer(payload, "pr_number")
             head = _text(payload, "head")
@@ -553,10 +700,14 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     "merged head does not match the recorded review head"
                 )
             _move(con, unit, "merged", actor_shell_id)
-            _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+            _release_ready_units(con, launches, row, payload, actor_shell_id)
         elif kind == "unit-report":
             _text(payload, "shipped")
-            _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+            if _all_units_terminal(con, sprint_id):
+                _spawn(
+                    con, launches, _planner_for_sprint(con, sprint_id),
+                    "plan", row, payload,
+                )
         return launches
 
     if issuer == "reviewer":
@@ -567,7 +718,10 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             _text(payload, "question")
             if unit is not None:
                 _block_when_legal(con, unit, actor_shell_id)
-            _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+            _spawn(
+                con, launches, _planner_for_sprint(con, sprint_id),
+                "plan", row, payload,
+            )
         elif kind == "review-clean":
             if unit is None:
                 if payload.get("mode") != "conformance":
@@ -575,7 +729,10 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                         "unitless review-clean requires mode=conformance"
                     )
                 _text(payload, "main_sha")
-                _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+                _spawn(
+                    con, launches, _planner_for_sprint(con, sprint_id),
+                    "plan", row, payload,
+                )
             else:
                 if unit["state"] != "in_review":
                     raise DirectiveRefused("review-clean requires an in_review unit")
@@ -590,19 +747,22 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     "SELECT shell_id,shortname,flavor FROM shells WHERE shell_id=?",
                     (unit["dev_shell_id"],),
                 ).fetchone()
-                _spawn(launches, dev, "dev", row, payload, unit=unit)
+                _spawn(con, launches, dev, "dev", row, payload, unit=unit)
         elif kind == "findings":
             findings = payload.get("findings")
             if not isinstance(findings, list) or not findings:
                 raise DirectiveRefused("payload.findings must be a nonempty array")
             if unit is None:
-                _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+                _spawn(
+                    con, launches, _planner_for_sprint(con, sprint_id),
+                    "plan", row, payload,
+                )
             else:
                 dev = con.execute(
                     "SELECT shell_id,shortname,flavor FROM shells WHERE shell_id=?",
                     (unit["dev_shell_id"],),
                 ).fetchone()
-                _spawn(launches, dev, "dev", row, payload, unit=unit)
+                _spawn(con, launches, dev, "dev", row, payload, unit=unit)
         return launches
 
     if issuer == "planner":
@@ -610,11 +770,18 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
         if sprint_id is None:
             raise DirectiveRefused("planner directive requires sprint_doc_id")
         unit = _unit(con, row) if row["unit_id"] is not None else None
-        if kind == "kickoff":
+        if kind == "handoff":
+            if unit is not None:
+                raise DirectiveRefused("handoff is sprint-scoped, not unit-scoped")
+            if payload not in ({}, {"verified": True}):
+                raise DirectiveRefused(
+                    "handoff payload must be empty or {'verified': true}"
+                )
+            _validate_handoff_board(con, sprint_id)
+            sprint_lifecycle.transition(con, sprint_id, "active")
+            _release_ready_units(con, launches, row, payload, actor_shell_id)
+        elif kind == "kickoff":
             target = _shell(con, _text(payload, "to"))
-            model = payload.get("model")
-            if model is not None:
-                model = _text(payload, "model")
             if target["flavor"] == "dev":
                 if unit is None:
                     raise DirectiveRefused("dev kickoff requires unit_id")
@@ -625,13 +792,13 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     )
                 if unit["state"] in ("pending", "blocked"):
                     _move(con, unit, "working", actor_shell_id)
-                _spawn(launches, target, "dev", row, payload, unit=unit, model=model)
+                _spawn(con, launches, target, "dev", row, payload, unit=unit)
             elif target["flavor"] == "reviewer":
                 if unit is None and payload.get("mode") != "conformance":
                     raise DirectiveRefused(
                         "unitless reviewer kickoff requires mode=conformance"
                     )
-                _spawn(launches, target, "rev", row, payload, unit=unit, model=model)
+                _spawn(con, launches, target, "rev", row, payload, unit=unit)
             else:
                 raise DirectiveRefused("kickoff target must be dev or reviewer")
         elif kind == "hold":
@@ -648,7 +815,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                 raise DirectiveRefused(f"{kind} target is not the assigned developer")
             if unit["state"] == "blocked":
                 _move(con, unit, "working", actor_shell_id)
-            _spawn(launches, target, "dev", row, payload, unit=unit)
+            _spawn(con, launches, target, "dev", row, payload, unit=unit)
         elif kind == "answer":
             if unit is None:
                 raise DirectiveRefused("answer requires unit_id")
@@ -658,7 +825,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             if target["flavor"] == "dev":
                 if unit["state"] == "blocked":
                     _move(con, unit, "working", actor_shell_id)
-                _spawn(launches, target, "dev", row, payload, unit=unit)
+                _spawn(con, launches, target, "dev", row, payload, unit=unit)
             elif target["flavor"] == "reviewer":
                 if unit["state"] == "blocked":
                     _move(con, unit, "working", actor_shell_id)
@@ -667,7 +834,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                         (unit["unit_id"],),
                     ).fetchone()
                     _move(con, unit, "in_review", actor_shell_id)
-                _spawn(launches, target, "rev", row, payload, unit=unit)
+                _spawn(con, launches, target, "rev", row, payload, unit=unit)
             else:
                 raise DirectiveRefused("answer target must be dev or reviewer")
         elif kind == "close":
@@ -714,6 +881,8 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                 "updated_at=datetime('now') WHERE document_id=?",
                 (sprint_id,),
             )
+            sprint_lifecycle.transition(con, sprint_id, "closing")
+            sprint_lifecycle.transition(con, sprint_id, "closed")
         return launches
 
     unit = _unit(con, row)
@@ -726,7 +895,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
         ).fetchone()
         if reviewer is None:
             raise DirectiveRefused("unit has no assigned reviewer")
-        _spawn(launches, reviewer, "rev", row, payload, unit=unit)
+        _spawn(con, launches, reviewer, "rev", row, payload, unit=unit)
     elif kind == "pr-red":
         if unit["state"] != "working":
             _move(con, unit, "working", actor_shell_id)
@@ -734,13 +903,21 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             "SELECT shell_id,shortname,flavor FROM shells WHERE shell_id=?",
             (unit["dev_shell_id"],),
         ).fetchone()
-        _spawn(launches, dev, "dev", row, payload, unit=unit)
+        _spawn(con, launches, dev, "dev", row, payload, unit=unit)
     elif kind == "pr-merged":
         _move(con, unit, "merged", actor_shell_id)
-        _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+        _release_ready_units(con, launches, row, payload, actor_shell_id)
+        if _all_units_terminal(con, sprint_id):
+            _spawn(
+                con, launches, _planner_for_sprint(con, sprint_id),
+                "plan", row, payload,
+            )
     elif kind in ("stall", "dead-shell"):
         _block_when_legal(con, unit, actor_shell_id)
-        _spawn(launches, _only_shell(con, "planner"), "plan", row, payload)
+        _spawn(
+            con, launches, _planner_for_sprint(con, sprint_id),
+            "plan", row, payload,
+        )
     return launches
 
 
@@ -824,9 +1001,12 @@ def _act_locked(
         )
         escalation = None
         try:
-            planner = _only_shell(con, "planner")
             if row["sprint_doc_id"] is None:
                 raise DirectiveRefused("cannot escalate without sprint_doc_id")
+            planner = _planner_for_sprint(con, row["sprint_doc_id"])
+            harness, model = _route_for_slot(
+                con, row["sprint_doc_id"], "plan"
+            )
             prompt = json.dumps(
                 {
                     "directive_id": directive_id,
@@ -843,6 +1023,8 @@ def _act_locked(
                 row["sprint_doc_id"],
                 unit_seq=None,
                 prompt=prompt,
+                harness=harness,
+                model=model,
             )
             escalation = {"command": command, "pid": launcher(command)}
         except DirectiveRefused as escalation_error:
@@ -885,7 +1067,7 @@ def act(
 
 
 def render_boot(con, shell) -> str:
-    """Render the Conductor's complete, no-skill transition-table boot doc."""
+    """Render the Conductor's complete transition-table boot doc."""
     pending = con.execute(
         "SELECT directive_id,issuer_flavor,kind,sprint_doc_id,unit_id "
         "FROM directives WHERE status='pending' AND target='conductor' "
@@ -896,10 +1078,11 @@ def render_boot(con, shell) -> str:
         "",
         "| Invariant | Required result |",
         "|---|---|",
-        "| Never decide | Execute only a row below through `./sc directives act <id>` |",
+        "| Never decide | Execute only a row below through `sc directives act <id>` |",
         "| Never invent data | A missing/malformed payload is refused and escalated by the command |",
         "| Never poll | Drain the current pending list once, then exit |",
         "| Never write directly | Board/session changes occur only inside the authenticated act command |",
+        "| Never select an owner or route | Use the recorded originating Planner and each stored role route |",
         "",
         "| Issuer | Kind | Mechanical action | Pass |",
         "|---|---|---|---|",
@@ -922,11 +1105,11 @@ def render_boot(con, shell) -> str:
         lines.append("| — | — | — | — | — |")
     lines += [
         "",
-        "1. Run `./sc directives list --status pending`.",
-        "2. For each id in ascending order run `./sc directives act <id>`.",
+        "1. Run `sc directives list --status pending`.",
+        "2. For each id in ascending order run `sc directives act <id>`.",
         "3. Inspect every result; continue after executed or refused.",
         "4. Exit when the pending list is empty.",
         "",
-        f"Shell: `{shell['shortname']}` · flavor: `conductor` · skills: `0`",
+        f"Shell: `{shell['shortname']}` · flavor: `conductor` · skill: `sprint_cond`",
     ]
     return "\n".join(lines) + "\n"

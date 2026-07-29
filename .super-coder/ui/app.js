@@ -2469,7 +2469,8 @@ function sprintsUpdateNav(payload) {
 function sprintsHeader(sprint) {
   const header = el("div", { className: "sprint-header" },
     el("h2", {}, sprint.title),
-    el("span", { className: "pill" }, `Doc #${sprint.document_id}`));
+    el("span", { className: "pill" }, `Doc #${sprint.document_id}`),
+    el("span", { className: "pill" }, sprint.state || "unknown"));
   const planner = sprint.planner
     ? sprint.planner.shortname : "Unbound";
   const feature = sprint.feature
@@ -2477,6 +2478,19 @@ function sprintsHeader(sprint) {
   const meta = el("div", { className: "row sprint-meta" },
     el("span", {}, `Planner: ${planner}`),
     el("span", {}, `Feature: ${feature}`));
+  if (sprint.qaqc) {
+    meta.append(el(
+      "span",
+      { title: sprint.qaqc.body_sha256 },
+      `QAQC: ${sprint.qaqc.verdict} #${sprint.qaqc.review_id}`,
+    ));
+  }
+  const routes = [
+    sprint.planner_route && `Planner ${sprint.planner_route}`,
+    sprint.dev_route && `Dev ${sprint.dev_route}`,
+    sprint.reviewer_route && `Reviewer ${sprint.reviewer_route}`,
+  ].filter(Boolean);
+  if (routes.length) meta.append(el("span", {}, `Routes: ${routes.join(" · ")}`));
   if (sprint.started_at) {
     const started = new Date(sprint.started_at);
     const duration = sprintsDuration(sprint.started_at);
@@ -2817,7 +2831,16 @@ function sprintsRenderedProjection(payload) {
   return (payload?.sprints || []).map((sprint) => ({
     document_id: sprint.document_id,
     title: sprint.title,
+    state: sprint.state,
     started_at: sprint.started_at,
+    planner_route: sprint.planner_route,
+    dev_route: sprint.dev_route,
+    reviewer_route: sprint.reviewer_route,
+    qaqc: sprint.qaqc ? {
+      review_id: sprint.qaqc.review_id,
+      verdict: sprint.qaqc.verdict,
+      body_sha256: sprint.qaqc.body_sha256,
+    } : null,
     planner: sprint.planner
       ? { shortname: sprint.planner.shortname } : null,
     feature: sprint.feature ? {

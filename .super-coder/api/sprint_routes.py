@@ -35,6 +35,7 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import sprint_lifecycle  # noqa: E402
 import sprint_state  # noqa: E402
 from sprint_units import SPRINT_UNIT_EDGES  # noqa: E402
 from sprint_units import SprintTransitionError  # noqa: E402
@@ -206,6 +207,81 @@ def _idempotent(con, actor: _Actor, operation: str, headers, body_obj,
     return _json(status, obj)
 
 
+def _idempotent_atomic(con, actor: _Actor, operation: str, headers, body_obj,
+                       produce, response_headers=None):
+    """Idempotency plus one transaction for lifecycle resource creation.
+
+    Unlike the older board helper, ``produce`` never commits. A failed
+    declaration is rolled back to its savepoint before its error receipt is
+    stored, so no orphan document/review/sprint row can survive.
+    """
+    key = headers.get("Idempotency-Key") or ""
+    if not key:
+        return _err(
+            422,
+            "idempotency_key_required",
+            "Idempotency-Key header is required for this mutation",
+        )
+    canonical = hashlib.sha256(
+        json.dumps(body_obj, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    con.execute(
+        "DELETE FROM interface_idempotency_keys "
+        "WHERE expires_at <= datetime('now')"
+    )
+    row = con.execute(
+        "SELECT request_hash,response_status,response_resource "
+        "FROM interface_idempotency_keys "
+        "WHERE actor_scope=? AND operation=? AND idem_key=?",
+        (actor.scope, operation, key),
+    ).fetchone()
+    if row is not None:
+        if row[0] != canonical:
+            con.commit()
+            return _err(
+                409,
+                "idempotency_conflict",
+                "Idempotency-Key reused with a different request body",
+            )
+        obj = json.loads(row[2])
+        con.commit()
+        extra = response_headers(obj) if response_headers else None
+        return _json(row[1], obj, extra)
+
+    con.execute("SAVEPOINT sprint_resource")
+    savepoint_open = True
+    try:
+        status, obj = produce()
+        if status >= 400:
+            con.execute("ROLLBACK TO sprint_resource")
+        con.execute("RELEASE sprint_resource")
+        savepoint_open = False
+        con.execute(
+            "INSERT INTO interface_idempotency_keys "
+            "(actor_scope,operation,idem_key,request_hash,response_status,"
+            " response_resource,expires_at) "
+            "VALUES (?,?,?,?,?,?,datetime('now',?))",
+            (
+                actor.scope,
+                operation,
+                key,
+                canonical,
+                status,
+                json.dumps(obj, default=str),
+                f"+{IDEM_TTL_S} seconds",
+            ),
+        )
+        con.commit()
+    except Exception:
+        if savepoint_open:
+            con.execute("ROLLBACK TO sprint_resource")
+            con.execute("RELEASE sprint_resource")
+        con.rollback()
+        raise
+    extra = response_headers(obj) if response_headers else None
+    return _json(status, obj, extra)
+
+
 # ------------------------------------------------------- the board as a record
 
 # The board's columns as the planner edits them, minus `state` — which is
@@ -336,15 +412,30 @@ def _may_write_board(con, actor, sprint_doc_id: int):
     value is the disagreement. Returns an error tuple, or None to allow."""
     if actor.kind != "shell":
         return None                       # the operator owns everything
-    flavor = con.execute(
-        "SELECT flavor FROM shells WHERE shell_id=?",
-        (actor.shell_id,)).fetchone()
-    if flavor is not None and flavor[0] == "planner":
+    owner = con.execute(
+        "SELECT planner_shell_id,state FROM sprints WHERE sprint_doc_id=?",
+        (sprint_doc_id,),
+    ).fetchone()
+    if owner is None:
+        return _err(
+            422,
+            "undeclared_sprint",
+            f"document {sprint_doc_id} has no authoritative sprint record",
+        )
+    if owner["state"] == "needs_owner":
+        return _err(
+            409,
+            "sprint_needs_owner",
+            f"legacy sprint {sprint_doc_id} must be adopted before board writes",
+        )
+    if owner["planner_shell_id"] == actor.shell_id:
         return None
-    return _err(403, "not_the_planner",
-                f"shell {actor.shell_id} is not a planner — only a planner "
-                f"writes sprint {sprint_doc_id}'s board; workers work and "
-                "message, and a planner moves the board")
+    return _err(
+        403,
+        "not_sprint_owner",
+        f"shell {actor.shell_id} is not sprint {sprint_doc_id}'s originating "
+        "Planner",
+    )
 
 
 def _resolve_shell(con, value):
@@ -371,6 +462,19 @@ def _resolve_shell(con, value):
             raise _BadShell(f"no such shell: {value.strip()!r}")
         return row[0]
     raise _BadShell(f"not a shell reference: {value!r}")
+
+
+def _resolve_role_shell(con, value, role: str):
+    shell_id = _resolve_shell(con, value)
+    if shell_id is None:
+        return None
+    row = con.execute(
+        "SELECT flavor FROM shells WHERE shell_id=?",
+        (shell_id,),
+    ).fetchone()
+    if row is None or row["flavor"] != role:
+        raise _BadShell(f"shell {value!r} is not an active {role} shell")
+    return shell_id
 
 
 class _BadShell(Exception):
@@ -553,6 +657,514 @@ def _now(con) -> str:
     return con.execute("SELECT datetime('now')").fetchone()[0]
 
 
+# ------------------------------------------------ reviewed spec + declaration
+
+_QAQC_FIELDS = frozenset(("spec_doc_id", "verdict", "findings_doc_id"))
+_DECLARE_FIELDS = frozenset(
+    ("spec_doc_id", "title", "planner_route", "dev_route", "reviewer_route")
+)
+_ADOPT_FIELDS = frozenset(
+    (
+        "planner",
+        "spec_doc_id",
+        "planner_route",
+        "dev_route",
+        "reviewer_route",
+        "evidence",
+    )
+)
+
+
+def _unknown_fields(body: dict, allowed: frozenset, resource: str):
+    unknown = sorted(set(body) - allowed)
+    if not unknown:
+        return None
+    return _err(
+        422,
+        "validation",
+        f"unknown {resource} field(s): {', '.join(unknown)}",
+    )
+
+
+def _actor_flavor(con, actor: _Actor):
+    if actor.kind != "shell":
+        return None
+    return con.execute(
+        "SELECT flavor FROM shells WHERE shell_id=? "
+        "AND COALESCE(is_deleted,0)=0",
+        (actor.shell_id,),
+    ).fetchone()
+
+
+def _review_projection(con, review_id: int) -> dict:
+    row = con.execute(
+        "SELECT q.review_id,q.spec_doc_id,q.reviewer_shell_id,"
+        "q.body_sha256,q.verdict,q.findings_doc_id,q.completed_at,"
+        "s.shortname AS reviewer_shortname "
+        "FROM spec_qaqc_reviews q "
+        "JOIN shells s ON s.shell_id=q.reviewer_shell_id "
+        "WHERE q.review_id=?",
+        (review_id,),
+    ).fetchone()
+    return dict(row)
+
+
+def _create_qaqc(actor: _Actor, headers, body: dict):
+    bad = _unknown_fields(body, _QAQC_FIELDS, "QAQC")
+    if bad is not None:
+        return bad
+    spec_doc_id = body.get("spec_doc_id")
+    verdict = body.get("verdict")
+    findings_doc_id = body.get("findings_doc_id")
+    if not _is_int(spec_doc_id):
+        return _err(422, "validation", "spec_doc_id must be an integer")
+    if verdict not in ("approved", "changes_requested"):
+        return _err(
+            422,
+            "validation",
+            "verdict must be approved or changes_requested",
+        )
+    if findings_doc_id is not None and not _is_int(findings_doc_id):
+        return _err(422, "validation", "findings_doc_id must be an integer")
+    con = _db()
+    try:
+        flavor = _actor_flavor(con, actor)
+        if flavor is None or flavor[0] != "reviewer":
+            return _err(
+                403,
+                "reviewer_required",
+                "QAQC completion requires an active reviewer shell token",
+            )
+
+        def produce():
+            spec = con.execute(
+                "SELECT kind,body FROM documents WHERE document_id=?",
+                (spec_doc_id,),
+            ).fetchone()
+            if spec is None or spec["kind"] != "spec":
+                return 422, _err_obj(
+                    "not_a_spec",
+                    f"document {spec_doc_id} is not a spec",
+                )
+            if findings_doc_id is not None:
+                findings = con.execute(
+                    "SELECT kind FROM documents WHERE document_id=?",
+                    (findings_doc_id,),
+                ).fetchone()
+                if findings is None or findings["kind"] != "doc":
+                    return 422, _err_obj(
+                        "invalid_findings_doc",
+                        "findings_doc_id must name a doc document",
+                    )
+            cur = con.execute(
+                "INSERT INTO spec_qaqc_reviews "
+                "(spec_doc_id,reviewer_shell_id,body_sha256,verdict,"
+                " findings_doc_id) VALUES (?,?,?,?,?)",
+                (
+                    spec_doc_id,
+                    actor.shell_id,
+                    sprint_lifecycle.body_sha256(spec["body"]),
+                    verdict,
+                    findings_doc_id,
+                ),
+            )
+            return 201, _review_projection(con, cur.lastrowid)
+
+        return _idempotent_atomic(
+            con, actor, "spec_qaqc_review_create", headers, body, produce
+        )
+    finally:
+        con.close()
+
+
+def _list_qaqc(query: dict):
+    raw = query.get("spec_doc_id", [None])[0]
+    try:
+        spec_doc_id = int(raw)
+    except (TypeError, ValueError):
+        return _err(
+            422,
+            "validation",
+            "spec_doc_id query parameter is required and must be an integer",
+        )
+    con = _db()
+    try:
+        ids = con.execute(
+            "SELECT review_id FROM spec_qaqc_reviews "
+            "WHERE spec_doc_id=? ORDER BY review_id",
+            (spec_doc_id,),
+        ).fetchall()
+        return _json(
+            200,
+            {"reviews": [_review_projection(con, row[0]) for row in ids]},
+        )
+    finally:
+        con.close()
+
+
+def _validate_route(con, route, field: str):
+    try:
+        harness, selector = sprint_lifecycle.split_route(route)
+    except sprint_lifecycle.SprintLifecycleError as exc:
+        return None, _err_obj("invalid_route", f"{field}: {exc}")
+    row = con.execute(
+        "SELECT availability,headless_supported FROM model_routes "
+        "WHERE harness=? AND selector=?",
+        (harness, selector),
+    ).fetchone()
+    if row is None or row["availability"] != "available" \
+            or not row["headless_supported"]:
+        return None, _err_obj(
+            "route_not_runnable",
+            f"{field} route {harness}/{selector} is not locally headless-runnable",
+        )
+    return f"{harness}/{selector}", None
+
+
+def _sprint_projection(con, sprint_doc_id: int):
+    row = con.execute(
+        "SELECT sp.*,d.title AS sprint_title,d.feature_id,d.frozen,"
+        "d.created_at,feature.title AS feature_title,"
+        "CASE WHEN sp.handed_off_at LIKE '____-__-__%' "
+        "THEN strftime('%Y-%m-%dT%H:%M:%SZ',sp.handed_off_at) "
+        "ELSE NULL END AS projected_started_at,"
+        "spec.title AS spec_title,planner.shortname AS planner_shortname,"
+        "q.body_sha256 AS qaqc_body_sha256,q.verdict AS qaqc_verdict,"
+        "q.completed_at AS qaqc_completed_at "
+        "FROM sprints sp "
+        "JOIN documents d ON d.document_id=sp.sprint_doc_id "
+        "LEFT JOIN roadmap feature ON feature.feature_id=d.feature_id "
+        "LEFT JOIN documents spec ON spec.document_id=sp.spec_doc_id "
+        "LEFT JOIN shells planner ON planner.shell_id=sp.planner_shell_id "
+        "LEFT JOIN spec_qaqc_reviews q ON q.review_id=sp.qaqc_review_id "
+        "WHERE sp.sprint_doc_id=?",
+        (sprint_doc_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    title = row["sprint_title"]
+    if title is not None and title.upper().startswith("SPRINT:") \
+            and not title[len("SPRINT:"):].strip():
+        title = f"Sprint #{row['sprint_doc_id']}"
+    out = {
+        "document_id": row["sprint_doc_id"],
+        "sprint_doc_id": row["sprint_doc_id"],
+        "title": title,
+        "state": row["state"],
+        "legacy": bool(row["legacy"]),
+        "declared_at": row["declared_at"],
+        "handed_off_at": row["handed_off_at"],
+        "started_at": row["projected_started_at"],
+        "closed_at": row["closed_at"],
+        "planner_route": row["planner_route"],
+        "dev_route": row["dev_route"],
+        "reviewer_route": row["reviewer_route"],
+        "planner": (
+            None
+            if row["planner_shell_id"] is None
+            else {
+                "shell_id": row["planner_shell_id"],
+                "shortname": row["planner_shortname"],
+            }
+        ),
+        "feature": (
+            None
+            if row["feature_id"] is None
+            else {
+                "feature_id": row["feature_id"],
+                "title": row["feature_title"],
+            }
+        ),
+        "spec": (
+            None
+            if row["spec_doc_id"] is None
+            else {
+                "document_id": row["spec_doc_id"],
+                "title": row["spec_title"],
+            }
+        ),
+        "qaqc": (
+            None
+            if row["qaqc_review_id"] is None
+            else {
+                "review_id": row["qaqc_review_id"],
+                "body_sha256": row["qaqc_body_sha256"],
+                "verdict": row["qaqc_verdict"],
+                "completed_at": row["qaqc_completed_at"],
+            }
+        ),
+        "units": [],
+    }
+    unit_ids = con.execute(
+        "SELECT unit_id FROM sprint_units WHERE sprint_doc_id=? "
+        "ORDER BY LENGTH(seq),seq",
+        (sprint_doc_id,),
+    ).fetchall()
+    for unit_id in unit_ids:
+        unit = _unit_projection(con, unit_id[0])
+        unit["state_recognized"] = unit["state"] in _UNIT_STATES
+        out["units"].append(unit)
+    return out
+
+
+def _create_sprint(actor: _Actor, headers, body: dict):
+    bad = _unknown_fields(body, _DECLARE_FIELDS, "sprint")
+    if bad is not None:
+        return bad
+    spec_doc_id = body.get("spec_doc_id")
+    title = body.get("title")
+    if not _is_int(spec_doc_id):
+        return _err(422, "validation", "spec_doc_id must be an integer")
+    if not isinstance(title, str) or not title.strip():
+        return _err(422, "validation", "title must be a nonblank string")
+    title = title.strip()
+    if title.upper().startswith("SPRINT:"):
+        return _err(
+            422,
+            "validation",
+            "title must omit the SPRINT: prefix; the server owns it",
+        )
+    con = _db()
+    try:
+        flavor = _actor_flavor(con, actor)
+        if flavor is None or flavor[0] != "planner":
+            return _err(
+                403,
+                "planner_required",
+                "sprint declaration requires an active Planner shell token",
+            )
+        def produce():
+            routes = {}
+            for field in ("planner_route", "dev_route", "reviewer_route"):
+                route, error = _validate_route(con, body.get(field), field)
+                if error is not None:
+                    return 422, error
+                routes[field] = route
+            spec = con.execute(
+                "SELECT feature_id,kind,body FROM documents WHERE document_id=?",
+                (spec_doc_id,),
+            ).fetchone()
+            if spec is None or spec["kind"] != "spec":
+                return 422, _err_obj(
+                    "not_a_spec",
+                    f"document {spec_doc_id} is not a spec",
+                )
+            current_hash = sprint_lifecycle.body_sha256(spec["body"])
+            review = con.execute(
+                "SELECT review_id FROM spec_qaqc_reviews "
+                "WHERE spec_doc_id=? AND verdict='approved' AND body_sha256=? "
+                "ORDER BY review_id DESC LIMIT 1",
+                (spec_doc_id, current_hash),
+            ).fetchone()
+            if review is None:
+                return 409, _err_obj(
+                    "qaqc_required",
+                    "sprint declaration requires reviewer approval for the "
+                    "spec's current body",
+                    {"spec_doc_id": spec_doc_id, "body_sha256": current_hash},
+                )
+            seq = con.execute(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM documents "
+                "WHERE kind='doc' AND feature_id IS ?",
+                (spec["feature_id"],),
+            ).fetchone()[0]
+            sprint_title = f"SPRINT: {title}"
+            prose = (
+                f"# {sprint_title}\n\n"
+                f"Governing spec: document #{spec_doc_id}\n\n"
+                "Lifecycle state is stored in the authoritative `sprints` row.\n"
+            )
+            cur = con.execute(
+                "INSERT INTO documents "
+                "(feature_id,kind,seq,title,body) VALUES (?,'doc',?,?,?)",
+                (spec["feature_id"], seq, sprint_title, prose),
+            )
+            sprint_doc_id = cur.lastrowid
+            con.execute(
+                "INSERT INTO sprints "
+                "(sprint_doc_id,spec_doc_id,planner_shell_id,qaqc_review_id,"
+                " planner_route,dev_route,reviewer_route,state,legacy) "
+                "VALUES (?,?,?,?,?,?,?,'declared',0)",
+                (
+                    sprint_doc_id,
+                    spec_doc_id,
+                    actor.shell_id,
+                    review["review_id"],
+                    routes["planner_route"],
+                    routes["dev_route"],
+                    routes["reviewer_route"],
+                ),
+            )
+            return 201, _sprint_projection(con, sprint_doc_id)
+
+        return _idempotent_atomic(
+            con,
+            actor,
+            "sprint_declare",
+            headers,
+            body,
+            produce,
+            response_headers=lambda obj: [
+                ("Location", f"/api/sprints/{obj['sprint_doc_id']}")
+            ] if "sprint_doc_id" in obj else [],
+        )
+    finally:
+        con.close()
+
+
+def _resolve_planner(con, value):
+    try:
+        shell_id = _resolve_shell(con, value)
+    except _BadShell as exc:
+        return None, str(exc)
+    row = con.execute(
+        "SELECT shell_id FROM shells WHERE shell_id=? AND flavor='planner' "
+        "AND COALESCE(is_deleted,0)=0",
+        (shell_id,),
+    ).fetchone()
+    if row is None:
+        return None, f"shell {value!r} is not an active Planner"
+    return shell_id, None
+
+
+def _adopt_sprint(actor: _Actor, headers, sprint_doc_id: int, body: dict):
+    if actor.kind != "operator":
+        return _err(
+            403,
+            "operator_required",
+            "legacy sprint adoption is operator-only",
+        )
+    bad = _unknown_fields(body, _ADOPT_FIELDS, "adoption")
+    if bad is not None:
+        return bad
+    if not _is_int(body.get("spec_doc_id")):
+        return _err(422, "validation", "spec_doc_id must be an integer")
+    evidence = body.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        return _err(422, "validation", "evidence must be a nonblank string")
+    con = _db()
+    try:
+        planner_id, error = _resolve_planner(con, body.get("planner"))
+        if error is not None:
+            return _err(422, "invalid_planner", error)
+        def produce():
+            routes = {}
+            for field in ("planner_route", "dev_route", "reviewer_route"):
+                route, route_error = _validate_route(
+                    con, body.get(field), field
+                )
+                if route_error is not None:
+                    return 422, route_error
+                routes[field] = route
+            sprint = con.execute(
+                "SELECT sp.state,sp.legacy,d.frozen "
+                "FROM sprints sp JOIN documents d "
+                "ON d.document_id=sp.sprint_doc_id "
+                "WHERE sp.sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone()
+            if sprint is None:
+                return 404, _err_obj(
+                    "not_found", f"no sprint declaration {sprint_doc_id}"
+                )
+            if sprint["state"] != "needs_owner" or not sprint["legacy"]:
+                return 409, _err_obj(
+                    "not_adoptable",
+                    f"sprint {sprint_doc_id} is not a migrated needs_owner board",
+                )
+            spec = con.execute(
+                "SELECT 1 FROM documents WHERE document_id=? AND kind='spec'",
+                (body["spec_doc_id"],),
+            ).fetchone()
+            if spec is None:
+                return 422, _err_obj(
+                    "not_a_spec",
+                    f"document {body['spec_doc_id']} is not a spec",
+                )
+            state = "closed" if sprint["frozen"] else "declared"
+            con.execute(
+                "UPDATE sprints SET spec_doc_id=?,planner_shell_id=?,"
+                "planner_route=?,dev_route=?,reviewer_route=?,state=?,"
+                "closed_at=CASE WHEN ?='closed' THEN datetime('now') "
+                "ELSE closed_at END WHERE sprint_doc_id=?",
+                (
+                    body["spec_doc_id"],
+                    planner_id,
+                    routes["planner_route"],
+                    routes["dev_route"],
+                    routes["reviewer_route"],
+                    state,
+                    state,
+                    sprint_doc_id,
+                ),
+            )
+            con.execute(
+                "INSERT INTO sentinel_events "
+                "(event_kind,shell_id,sprint_doc_id,evidence) "
+                "VALUES ('sprint-adopted',?,?,?)",
+                (
+                    planner_id,
+                    sprint_doc_id,
+                    json.dumps(
+                        {"evidence": evidence.strip(), "state": state},
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            return 200, _sprint_projection(con, sprint_doc_id)
+
+        return _idempotent_atomic(
+            con,
+            actor,
+            f"sprint_adopt:{sprint_doc_id}",
+            headers,
+            body,
+            produce,
+        )
+    finally:
+        con.close()
+
+
+def _list_sprints(query: dict):
+    state = query.get("status", [None])[0]
+    if state is not None and state not in sprint_lifecycle.SPRINT_STATES:
+        return _err(
+            422,
+            "validation",
+            "status must be one of " + ", ".join(sprint_lifecycle.SPRINT_STATES),
+        )
+    con = _db()
+    try:
+        sql = "SELECT sprint_doc_id FROM sprints"
+        params = ()
+        if state is not None:
+            sql += " WHERE state=?"
+            params = (state,)
+        sql += " ORDER BY sprint_doc_id"
+        sprints = [
+            _sprint_projection(con, row[0])
+            for row in con.execute(sql, params)
+        ]
+        return _json(
+            200,
+            {"active_count": sum(s["state"] == "active" for s in sprints),
+             "sprints": sprints},
+        )
+    finally:
+        con.close()
+
+
+def _get_sprint(sprint_doc_id: int):
+    con = _db()
+    try:
+        sprint = _sprint_projection(con, sprint_doc_id)
+        return _json(200, sprint) if sprint else _err(
+            404, "not_found", f"no sprint declaration {sprint_doc_id}"
+        )
+    finally:
+        con.close()
+
+
 def _add_sprint_unit(actor, headers, body):
     """POST /api/sprint-units — declare one unit on a sprint's board.
 
@@ -622,7 +1234,8 @@ def _add_sprint_unit(actor, headers, body):
                     "(they read the sprint doc) while its units are watched "
                     "all the same; check the --sprint id")
             try:
-                roles = {col: _resolve_shell(con, body.get(role))
+                roles = {
+                    col: _resolve_role_shell(con, body.get(role), role)
                          for role, col in _UNIT_ROLES.items()}
             except _BadShell as exc:
                 return 422, _err_obj("no_such_shell", str(exc))
@@ -734,8 +1347,10 @@ def _patch_sprint_unit(actor, headers, body):
                     # another full window.
                     sets.append("state_changed_at=datetime('now')")
             try:
-                resolved = {_UNIT_ROLES[r]: _resolve_shell(con, v)
-                            for r, v in roles.items()}
+                resolved = {
+                    _UNIT_ROLES[r]: _resolve_role_shell(con, v, r)
+                    for r, v in roles.items()
+                }
             except _BadShell as exc:
                 return 422, _err_obj("no_such_shell", str(exc))
             for col, val in resolved.items():
@@ -807,4 +1422,24 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
         return _add_sprint_unit(actor, headers, data)
     if p == "/api/sprint-units" and method == "PATCH":
         return _patch_sprint_unit(actor, headers, data)
+    if p == "/api/spec-qaqc-reviews" and method == "GET":
+        return _list_qaqc(query)
+    if p == "/api/spec-qaqc-reviews" and method == "POST":
+        return _create_qaqc(actor, headers, data)
+    if p == "/api/sprints" and method == "GET":
+        return _list_sprints(query)
+    if p == "/api/sprints" and method == "POST":
+        return _create_sprint(actor, headers, data)
+    if p.startswith("/api/sprints/"):
+        parts = p.strip("/").split("/")
+        if len(parts) not in (3, 4):
+            return _err(404, "no_such_route", f"no route: {method} {p}")
+        try:
+            sprint_doc_id = int(parts[2])
+        except ValueError:
+            return _err(422, "validation", "sprint id must be an integer")
+        if len(parts) == 3 and method == "GET":
+            return _get_sprint(sprint_doc_id)
+        if len(parts) == 4 and parts[3] == "adopt" and method == "POST":
+            return _adopt_sprint(actor, headers, sprint_doc_id, data)
     return _err(404, "no_such_route", f"no route: {method} {p}")

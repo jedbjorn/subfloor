@@ -201,7 +201,7 @@ def main() -> int:
         }
         prompt = (
             "Follow AGENTS.md exactly. Drain every pending directive in "
-            "ascending id order with ./sc directives act <id>. Continue after "
+            "ascending id order with sc directives act <id>. Continue after "
             "both executed and refused results. Exit only when the pending "
             "list is empty, then reply MATRIX_COMPLETE."
         )

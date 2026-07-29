@@ -42,6 +42,9 @@ def seed_floor(con: sqlite3.Connection, *, state="working") -> int:
         "INSERT INTO documents "
         "(document_id,kind,title,body,frozen) "
         "VALUES (100,'doc','SPRINT: Sentinel','# sprint',0);"
+        "INSERT INTO sprints "
+        "(sprint_doc_id,state,legacy,planner_shell_id) "
+        "VALUES (100,'active',1,1);"
     )
     unit_id = con.execute(
         "INSERT INTO sprint_units "

@@ -85,7 +85,7 @@ class SprintDecouplingTest(unittest.TestCase):
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
                 parser_verbs.add(value.value)
         self.assertEqual(
-            {"unit", "board", "add", "set", "state", "list"},
+            {"declare", "unit", "board", "add", "set", "state", "list"},
             parser_verbs,
         )
 
