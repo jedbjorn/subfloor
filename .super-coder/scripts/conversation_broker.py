@@ -138,17 +138,6 @@ class BrokerStore:
         return _stamp(now), _stamp(now + timedelta(seconds=self.lease_seconds))
 
     @staticmethod
-    def _begin(con) -> None:
-        con.execute("BEGIN IMMEDIATE")
-
-    @staticmethod
-    def _rollback(con) -> None:
-        try:
-            con.rollback()
-        except Exception:
-            pass
-
-    @staticmethod
     def _payload(payload: Mapping[str, Any] | None) -> str:
         encoded = json.dumps(
             dict(payload or {}),
@@ -240,118 +229,112 @@ class BrokerStore:
         con = self.connect()
         now, expires = self._times()
         try:
-            self._begin(con)
-            row = con.execute(
-                "SELECT o.outbox_id,o.conversation_id,o.message_id,o.attempts,"
-                "c.shell_id,c.harness,c.provider,c.model,c.effort,c.worktree,"
-                "c.title,c.harness_session_ref,m.body,m.state AS message_state "
-                "FROM conversation_outbox o "
-                "JOIN conversations c "
-                " ON c.conversation_id=o.conversation_id "
-                "JOIN conversation_messages m ON m.message_id=o.message_id "
-                "WHERE o.state='pending' AND c.state='queued' "
-                "AND m.state IN ('accepted','queued') "
-                "AND NOT EXISTS ("
-                " SELECT 1 FROM conversation_messages earlier "
-                " WHERE earlier.conversation_id=m.conversation_id "
-                " AND earlier.message_id<m.message_id "
-                " AND earlier.state IN ('accepted','queued','running')) "
-                "AND NOT EXISTS ("
-                " SELECT 1 FROM conversation_runs live "
-                " WHERE live.shell_id=c.shell_id "
-                " AND live.state IN ('leased','starting','running')) "
-                "ORDER BY o.outbox_id LIMIT 1"
-            ).fetchone()
-            if row is None:
-                con.commit()
-                return None
+            with db_driver.write_transaction(con, "conversation.broker.claim"):
+                row = con.execute(
+                    "SELECT o.outbox_id,o.conversation_id,o.message_id,o.attempts,"
+                    "c.shell_id,c.harness,c.provider,c.model,c.effort,c.worktree,"
+                    "c.title,c.harness_session_ref,m.body,m.state AS message_state "
+                    "FROM conversation_outbox o "
+                    "JOIN conversations c "
+                    " ON c.conversation_id=o.conversation_id "
+                    "JOIN conversation_messages m ON m.message_id=o.message_id "
+                    "WHERE o.state='pending' AND c.state='queued' "
+                    "AND m.state IN ('accepted','queued') "
+                    "AND NOT EXISTS ("
+                    " SELECT 1 FROM conversation_messages earlier "
+                    " WHERE earlier.conversation_id=m.conversation_id "
+                    " AND earlier.message_id<m.message_id "
+                    " AND earlier.state IN ('accepted','queued','running')) "
+                    "AND NOT EXISTS ("
+                    " SELECT 1 FROM conversation_runs live "
+                    " WHERE live.shell_id=c.shell_id "
+                    " AND live.state IN ('leased','starting','running')) "
+                    "ORDER BY o.outbox_id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return None
 
-            updated = con.execute(
-                "UPDATE conversation_outbox SET state='claimed',claim_owner=?,"
-                "claimed_at=?,lease_expires_at=?,attempts=attempts+1 "
-                "WHERE outbox_id=? AND state='pending'",
-                (owner, now, expires, row["outbox_id"]),
-            ).rowcount
-            if updated != 1:
-                con.rollback()
-                return None
+                updated = con.execute(
+                    "UPDATE conversation_outbox SET state='claimed',claim_owner=?,"
+                    "claimed_at=?,lease_expires_at=?,attempts=attempts+1 "
+                    "WHERE outbox_id=? AND state='pending'",
+                    (owner, now, expires, row["outbox_id"]),
+                ).rowcount
+                if updated != 1:
+                    return None
 
-            attempt = int(row["attempts"]) + 1
-            if row["message_state"] == "accepted":
-                require_transition("message", "accepted", "queued")
+                attempt = int(row["attempts"]) + 1
+                if row["message_state"] == "accepted":
+                    require_transition("message", "accepted", "queued")
+                    con.execute(
+                        "UPDATE conversation_messages SET state='queued' "
+                        "WHERE message_id=?",
+                        (row["message_id"],),
+                    )
+                require_transition("message", "queued", "running")
                 con.execute(
-                    "UPDATE conversation_messages SET state='queued' "
+                    "UPDATE conversation_messages SET state='running' "
                     "WHERE message_id=?",
                     (row["message_id"],),
                 )
-            require_transition("message", "queued", "running")
-            con.execute(
-                "UPDATE conversation_messages SET state='running' WHERE message_id=?",
-                (row["message_id"],),
-            )
 
-            cur = con.execute(
-                "INSERT INTO conversation_runs "
-                "(conversation_id,shell_id,trigger_message_id,attempt,"
-                "harness_session_before,state,lease_owner,lease_expires_at,"
-                "heartbeat_at) VALUES (?,?,?,?,?,'leased',?,?,?)",
-                (
-                    row["conversation_id"],
-                    row["shell_id"],
-                    row["message_id"],
-                    attempt,
-                    row["harness_session_ref"],
-                    owner,
-                    expires,
-                    now,
-                ),
-            )
-            run_id = int(cur.lastrowid)
-            require_transition("outbox", "claimed", "dispatched")
-            con.execute(
-                "UPDATE conversation_outbox SET state='dispatched',run_id=?,"
-                "dispatched_at=? WHERE outbox_id=?",
-                (run_id, now, row["outbox_id"]),
-            )
-            require_transition("conversation", "queued", "running")
-            con.execute(
-                "UPDATE conversations SET state='running',"
-                "last_activity_at=?,version=version+1 "
-                "WHERE conversation_id=?",
-                (now, row["conversation_id"]),
-            )
-            con.commit()
-            return BrokerRun(
-                run_id=run_id,
-                conversation_id=row["conversation_id"],
-                message_id=int(row["message_id"]),
-                shell_id=int(row["shell_id"]),
-                harness=row["harness"],
-                provider=row["provider"],
-                model=row["model"],
-                effort=row["effort"],
-                worktree=Path(row["worktree"]),
-                title=row["title"],
-                body=row["body"],
-                session_before=row["harness_session_ref"],
-                session_after=None,
-                runner_ref=None,
-                state="leased",
-            )
+                cur = con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,attempt,"
+                    "harness_session_before,state,lease_owner,lease_expires_at,"
+                    "heartbeat_at) VALUES (?,?,?,?,?,'leased',?,?,?)",
+                    (
+                        row["conversation_id"],
+                        row["shell_id"],
+                        row["message_id"],
+                        attempt,
+                        row["harness_session_ref"],
+                        owner,
+                        expires,
+                        now,
+                    ),
+                )
+                run_id = int(cur.lastrowid)
+                require_transition("outbox", "claimed", "dispatched")
+                con.execute(
+                    "UPDATE conversation_outbox SET state='dispatched',run_id=?,"
+                    "dispatched_at=? WHERE outbox_id=?",
+                    (run_id, now, row["outbox_id"]),
+                )
+                require_transition("conversation", "queued", "running")
+                con.execute(
+                    "UPDATE conversations SET state='running',"
+                    "last_activity_at=?,version=version+1 "
+                    "WHERE conversation_id=?",
+                    (now, row["conversation_id"]),
+                )
+                return BrokerRun(
+                    run_id=run_id,
+                    conversation_id=row["conversation_id"],
+                    message_id=int(row["message_id"]),
+                    shell_id=int(row["shell_id"]),
+                    harness=row["harness"],
+                    provider=row["provider"],
+                    model=row["model"],
+                    effort=row["effort"],
+                    worktree=Path(row["worktree"]),
+                    title=row["title"],
+                    body=row["body"],
+                    session_before=row["harness_session_ref"],
+                    session_after=None,
+                    runner_ref=None,
+                    state="leased",
+                )
         except db_driver.IntegrityError as exc:
             # A second broker can race the eligibility read. BEGIN IMMEDIATE
             # serializes normal SQLite writers; the unique live-run indexes
             # remain the final fail-closed fence.
-            self._rollback(con)
             detail = str(exc)
             if (
                 "conversation_runs.shell_id" in detail
                 or "conversation_runs.conversation_id" in detail
             ):
                 return None
-            raise
-        except Exception:
-            self._rollback(con)
             raise
         finally:
             con.close()
@@ -375,28 +358,25 @@ class BrokerStore:
         con = self.connect()
         now, expires = self._times()
         try:
-            self._begin(con)
-            selected = con.execute(
-                self._run_select() + "WHERE r.state IN ('leased','starting','running') "
-                "AND r.lease_expires_at<=? ORDER BY r.run_id LIMIT ?",
-                (now, limit),
-            ).fetchall()
-            adopted: list[BrokerRun] = []
-            for row in selected:
-                changed = con.execute(
-                    "UPDATE conversation_runs SET lease_owner=?,"
-                    "lease_expires_at=?,heartbeat_at=? "
-                    "WHERE run_id=? AND state IN "
-                    "('leased','starting','running')",
-                    (owner, expires, now, row["run_id"]),
-                ).rowcount
-                if changed:
-                    adopted.append(self._run_from_row(row))
-            con.commit()
-            return adopted
-        except Exception:
-            self._rollback(con)
-            raise
+            with db_driver.write_transaction(con, "conversation.broker.adopt"):
+                selected = con.execute(
+                    self._run_select()
+                    + "WHERE r.state IN ('leased','starting','running') "
+                    "AND r.lease_expires_at<=? ORDER BY r.run_id LIMIT ?",
+                    (now, limit),
+                ).fetchall()
+                adopted: list[BrokerRun] = []
+                for row in selected:
+                    changed = con.execute(
+                        "UPDATE conversation_runs SET lease_owner=?,"
+                        "lease_expires_at=?,heartbeat_at=? "
+                        "WHERE run_id=? AND state IN "
+                        "('leased','starting','running')",
+                        (owner, expires, now, row["run_id"]),
+                    ).rowcount
+                    if changed:
+                        adopted.append(self._run_from_row(row))
+                return adopted
         finally:
             con.close()
 
@@ -405,19 +385,16 @@ class BrokerStore:
         con = self.connect()
         now, _ = self._times()
         try:
-            self._begin(con)
-            count = con.execute(
-                "UPDATE conversation_outbox SET state='pending',"
-                "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL,"
-                "last_error='expired before durable run creation' "
-                "WHERE state='claimed' AND lease_expires_at<=? AND run_id IS NULL",
-                (now,),
-            ).rowcount
-            con.commit()
-            return int(count)
-        except Exception:
-            self._rollback(con)
-            raise
+            with db_driver.write_transaction(con, "conversation.broker.requeue"):
+                count = con.execute(
+                    "UPDATE conversation_outbox SET state='pending',"
+                    "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL,"
+                    "last_error='expired before durable run creation' "
+                    "WHERE state='claimed' AND lease_expires_at<=? "
+                    "AND run_id IS NULL",
+                    (now,),
+                ).rowcount
+                return int(count)
         finally:
             con.close()
 
@@ -425,29 +402,29 @@ class BrokerStore:
         con = self.connect()
         now, expires = self._times()
         try:
-            self._begin(con)
-            row = con.execute(
-                "SELECT state,lease_owner FROM conversation_runs WHERE run_id=?",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
-            require_transition("run", row["state"], "starting")
-            changed = con.execute(
-                "UPDATE conversation_runs SET state='starting',started_at=?,"
-                "heartbeat_at=?,lease_expires_at=? "
-                "WHERE run_id=? AND lease_owner=? AND state='leased'",
-                (now, now, expires, run_id, owner),
-            ).rowcount
-            if changed != 1:
-                raise BrokerError(
-                    "CONVERSATION_RUN_LEASE_LOST",
-                    f"run {run_id} is not leased by this broker",
-                )
-            con.commit()
-        except Exception:
-            self._rollback(con)
-            raise
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.mark_starting",
+            ):
+                row = con.execute(
+                    "SELECT state,lease_owner FROM conversation_runs "
+                    "WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                require_transition("run", row["state"], "starting")
+                changed = con.execute(
+                    "UPDATE conversation_runs SET state='starting',started_at=?,"
+                    "heartbeat_at=?,lease_expires_at=? "
+                    "WHERE run_id=? AND lease_owner=? AND state='leased'",
+                    (now, now, expires, run_id, owner),
+                ).rowcount
+                if changed != 1:
+                    raise BrokerError(
+                        "CONVERSATION_RUN_LEASE_LOST",
+                        f"run {run_id} is not leased by this broker",
+                    )
         finally:
             con.close()
 
@@ -455,18 +432,21 @@ class BrokerStore:
         """Attach the canonical shell session archive before native dispatch."""
         con = self.connect()
         try:
-            changed = con.execute(
-                "UPDATE conversation_runs SET archive_id=? "
-                "WHERE run_id=? AND lease_owner=? AND state='leased' "
-                "AND archive_id IS NULL",
-                (archive_id, run_id, owner),
-            ).rowcount
-            if changed != 1:
-                raise BrokerError(
-                    "CONVERSATION_RUN_LEASE_LOST",
-                    f"run {run_id} is not an unbound lease owned by this broker",
-                )
-            con.commit()
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.bind_archive",
+            ):
+                changed = con.execute(
+                    "UPDATE conversation_runs SET archive_id=? "
+                    "WHERE run_id=? AND lease_owner=? AND state='leased' "
+                    "AND archive_id IS NULL",
+                    (archive_id, run_id, owner),
+                ).rowcount
+                if changed != 1:
+                    raise BrokerError(
+                        "CONVERSATION_RUN_LEASE_LOST",
+                        f"run {run_id} is not an unbound lease owned by this broker",
+                    )
         finally:
             con.close()
 
@@ -477,75 +457,79 @@ class BrokerStore:
         turn: NativeTurn,
     ) -> None:
         """Capture exact native identity before consuming the event stream."""
+        # Filesystem normalization is external preparation, never writer-lock
+        # work. Conversation creation stores an already-resolved absolute path.
+        actual_worktree = Path(turn.worktree).resolve()
         con = self.connect()
         now, expires = self._times()
         try:
-            self._begin(con)
-            row = con.execute(
-                "SELECT r.state,r.conversation_id,c.harness_session_ref,"
-                "c.harness,c.worktree "
-                "FROM conversation_runs r JOIN conversations c "
-                "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
-            if turn.harness != row["harness"]:
-                raise BrokerInvariantError(
-                    "HARNESS_IDENTITY_MISMATCH",
-                    f"conversation uses {row['harness']}, "
-                    f"adapter returned {turn.harness}",
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.mark_native_started",
+            ):
+                row = con.execute(
+                    "SELECT r.state,r.conversation_id,c.harness_session_ref,"
+                    "c.harness,c.worktree "
+                    "FROM conversation_runs r JOIN conversations c "
+                    "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                if turn.harness != row["harness"]:
+                    raise BrokerInvariantError(
+                        "HARNESS_IDENTITY_MISMATCH",
+                        f"conversation uses {row['harness']}, "
+                        f"adapter returned {turn.harness}",
+                    )
+                if not turn.session_ref or not turn.run_ref:
+                    raise BrokerInvariantError(
+                        "HARNESS_IDENTITY_MISSING",
+                        "adapter returned an empty native session or run reference",
+                    )
+                expected_worktree = Path(row["worktree"])
+                if actual_worktree != expected_worktree:
+                    raise BrokerInvariantError(
+                        "HARNESS_WORKTREE_MISMATCH",
+                        f"conversation is bound to {expected_worktree}, "
+                        f"adapter returned {actual_worktree}",
+                    )
+                current_session = row["harness_session_ref"]
+                if (
+                    current_session is not None
+                    and current_session != turn.session_ref
+                ):
+                    raise BrokerInvariantError(
+                        "HARNESS_SESSION_MISMATCH",
+                        f"conversation is bound to {current_session}, "
+                        f"adapter returned {turn.session_ref}",
+                    )
+                require_transition("run", row["state"], "running")
+                changed = con.execute(
+                    "UPDATE conversation_runs SET state='running',"
+                    "harness_session_after=?,runner_ref=?,heartbeat_at=?,"
+                    "lease_expires_at=? WHERE run_id=? AND lease_owner=? "
+                    "AND state='starting'",
+                    (
+                        turn.session_ref,
+                        turn.run_ref,
+                        now,
+                        expires,
+                        run_id,
+                        owner,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise BrokerError(
+                        "CONVERSATION_RUN_LEASE_LOST",
+                        f"run {run_id} lost its starting lease",
+                    )
+                con.execute(
+                    "UPDATE conversations SET harness_session_ref=?,"
+                    "last_activity_at=?,version=version+1 "
+                    "WHERE conversation_id=?",
+                    (turn.session_ref, now, row["conversation_id"]),
                 )
-            if not turn.session_ref or not turn.run_ref:
-                raise BrokerInvariantError(
-                    "HARNESS_IDENTITY_MISSING",
-                    "adapter returned an empty native session or run reference",
-                )
-            expected_worktree = Path(row["worktree"]).resolve()
-            actual_worktree = Path(turn.worktree).resolve()
-            if actual_worktree != expected_worktree:
-                raise BrokerInvariantError(
-                    "HARNESS_WORKTREE_MISMATCH",
-                    f"conversation is bound to {expected_worktree}, "
-                    f"adapter returned {actual_worktree}",
-                )
-            current_session = row["harness_session_ref"]
-            if current_session is not None and current_session != turn.session_ref:
-                raise BrokerInvariantError(
-                    "HARNESS_SESSION_MISMATCH",
-                    f"conversation is bound to {current_session}, "
-                    f"adapter returned {turn.session_ref}",
-                )
-            require_transition("run", row["state"], "running")
-            changed = con.execute(
-                "UPDATE conversation_runs SET state='running',"
-                "harness_session_after=?,runner_ref=?,heartbeat_at=?,"
-                "lease_expires_at=? WHERE run_id=? AND lease_owner=? "
-                "AND state='starting'",
-                (
-                    turn.session_ref,
-                    turn.run_ref,
-                    now,
-                    expires,
-                    run_id,
-                    owner,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise BrokerError(
-                    "CONVERSATION_RUN_LEASE_LOST",
-                    f"run {run_id} lost its starting lease",
-                )
-            con.execute(
-                "UPDATE conversations SET harness_session_ref=?,"
-                "last_activity_at=?,version=version+1 "
-                "WHERE conversation_id=?",
-                (turn.session_ref, now, row["conversation_id"]),
-            )
-            con.commit()
-        except Exception:
-            self._rollback(con)
-            raise
         finally:
             con.close()
 
@@ -562,40 +546,39 @@ class BrokerStore:
         con = self.connect()
         now, _ = self._times()
         try:
-            self._begin(con)
-            row = con.execute(
-                "SELECT conversation_id,trigger_message_id,state "
-                "FROM conversation_runs WHERE run_id=?",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
-            if row["state"] not in LIVE_RUN_STATES:
-                raise BrokerError(
-                    "CONVERSATION_RUN_TERMINAL",
-                    f"run {run_id} is already {row['state']}",
-                )
-            payload = dict(event.payload)
-            if event.native_type:
-                payload["native_type"] = event.native_type
-            sequence = self._append_event(
+            with db_driver.write_transaction(
                 con,
-                conversation_id=row["conversation_id"],
-                event_type=event.type,
-                payload=payload,
-                message_id=row["trigger_message_id"],
-                run_id=run_id,
-            )
-            con.execute(
-                "UPDATE conversations SET last_activity_at=?,version=version+1 "
-                "WHERE conversation_id=?",
-                (now, row["conversation_id"]),
-            )
-            con.commit()
-            conversation_id = row["conversation_id"]
-        except Exception:
-            self._rollback(con)
-            raise
+                "conversation.broker.append_event",
+            ):
+                row = con.execute(
+                    "SELECT conversation_id,trigger_message_id,state "
+                    "FROM conversation_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                if row["state"] not in LIVE_RUN_STATES:
+                    raise BrokerError(
+                        "CONVERSATION_RUN_TERMINAL",
+                        f"run {run_id} is already {row['state']}",
+                    )
+                payload = dict(event.payload)
+                if event.native_type:
+                    payload["native_type"] = event.native_type
+                sequence = self._append_event(
+                    con,
+                    conversation_id=row["conversation_id"],
+                    event_type=event.type,
+                    payload=payload,
+                    message_id=row["trigger_message_id"],
+                    run_id=run_id,
+                )
+                con.execute(
+                    "UPDATE conversations SET last_activity_at=?,"
+                    "version=version+1 WHERE conversation_id=?",
+                    (now, row["conversation_id"]),
+                )
+                conversation_id = row["conversation_id"]
         finally:
             con.close()
         conversation_events.notify(conversation_id)
@@ -621,89 +604,87 @@ class BrokerStore:
         con = self.connect()
         now, _ = self._times()
         try:
-            self._begin(con)
-            row = con.execute(
-                "SELECT r.state,r.conversation_id,r.trigger_message_id,"
-                "c.state AS conversation_state "
-                "FROM conversation_runs r JOIN conversations c "
-                "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
-            if row["state"] in TERMINAL_RUN_STATES:
-                con.commit()
-                return False
-            require_transition("run", row["state"], outcome)
-            message_state = {
-                "succeeded": "completed",
-                "failed": "failed",
-                "cancelled": "cancelled",
-                "unknown": "failed",
-            }[outcome]
-            message_current = con.execute(
-                "SELECT state FROM conversation_messages WHERE message_id=?",
-                (row["trigger_message_id"],),
-            ).fetchone()[0]
-            require_transition("message", message_current, message_state)
-            pending = (
-                con.execute(
-                    "SELECT 1 FROM conversation_outbox "
-                    "WHERE conversation_id=? AND state IN ('pending','claimed') "
-                    "LIMIT 1",
-                    (row["conversation_id"],),
-                ).fetchone()
-                is not None
-            )
-            conversation_target = (
-                "error"
-                if outcome in {"failed", "unknown"}
-                else "queued"
-                if pending
-                else "idle"
-            )
-            require_transition(
-                "conversation",
-                row["conversation_state"],
-                conversation_target,
-            )
-            con.execute(
-                "UPDATE conversation_runs SET state=?,ended_at=?,exit_code=?,"
-                "error_code=?,error_detail=? WHERE run_id=?",
-                (
-                    outcome,
-                    now,
-                    exit_code,
-                    error_code,
-                    (error_detail or "")[:16384] or None,
-                    run_id,
-                ),
-            )
-            con.execute(
-                "UPDATE conversation_messages SET state=?,completed_at=? "
-                "WHERE message_id=?",
-                (message_state, now, row["trigger_message_id"]),
-            )
-            con.execute(
-                "UPDATE conversations SET state=?,last_activity_at=?,"
-                "version=version+1 WHERE conversation_id=?",
-                (conversation_target, now, row["conversation_id"]),
-            )
-            terminal_payload = dict(payload or {})
-            terminal_payload.setdefault("outcome", outcome)
-            self._append_event(
+            with db_driver.write_transaction(
                 con,
-                conversation_id=row["conversation_id"],
-                event_type=event_type,
-                payload=terminal_payload,
-                message_id=row["trigger_message_id"],
-                run_id=run_id,
-            )
-            con.commit()
-            conversation_id = row["conversation_id"]
-        except Exception:
-            self._rollback(con)
-            raise
+                "conversation.broker.finish_run",
+            ):
+                row = con.execute(
+                    "SELECT r.state,r.conversation_id,r.trigger_message_id,"
+                    "c.state AS conversation_state "
+                    "FROM conversation_runs r JOIN conversations c "
+                    "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                if row["state"] in TERMINAL_RUN_STATES:
+                    return False
+                require_transition("run", row["state"], outcome)
+                message_state = {
+                    "succeeded": "completed",
+                    "failed": "failed",
+                    "cancelled": "cancelled",
+                    "unknown": "failed",
+                }[outcome]
+                message_current = con.execute(
+                    "SELECT state FROM conversation_messages WHERE message_id=?",
+                    (row["trigger_message_id"],),
+                ).fetchone()[0]
+                require_transition("message", message_current, message_state)
+                pending = (
+                    con.execute(
+                        "SELECT 1 FROM conversation_outbox "
+                        "WHERE conversation_id=? "
+                        "AND state IN ('pending','claimed') LIMIT 1",
+                        (row["conversation_id"],),
+                    ).fetchone()
+                    is not None
+                )
+                conversation_target = (
+                    "error"
+                    if outcome in {"failed", "unknown"}
+                    else "queued"
+                    if pending
+                    else "idle"
+                )
+                require_transition(
+                    "conversation",
+                    row["conversation_state"],
+                    conversation_target,
+                )
+                con.execute(
+                    "UPDATE conversation_runs SET state=?,ended_at=?,"
+                    "exit_code=?,error_code=?,error_detail=? WHERE run_id=?",
+                    (
+                        outcome,
+                        now,
+                        exit_code,
+                        error_code,
+                        (error_detail or "")[:16384] or None,
+                        run_id,
+                    ),
+                )
+                con.execute(
+                    "UPDATE conversation_messages SET state=?,completed_at=? "
+                    "WHERE message_id=?",
+                    (message_state, now, row["trigger_message_id"]),
+                )
+                con.execute(
+                    "UPDATE conversations SET state=?,last_activity_at=?,"
+                    "version=version+1 WHERE conversation_id=?",
+                    (conversation_target, now, row["conversation_id"]),
+                )
+                terminal_payload = dict(payload or {})
+                terminal_payload.setdefault("outcome", outcome)
+                self._append_event(
+                    con,
+                    conversation_id=row["conversation_id"],
+                    event_type=event_type,
+                    payload=terminal_payload,
+                    message_id=row["trigger_message_id"],
+                    run_id=run_id,
+                )
+                conversation_id = row["conversation_id"]
         finally:
             con.close()
         conversation_events.notify(conversation_id)
@@ -716,15 +697,18 @@ class BrokerStore:
         now, expires = self._times()
         marks = ",".join("?" for _ in run_ids)
         try:
-            changed = con.execute(
-                "UPDATE conversation_runs SET heartbeat_at=?,"
-                "lease_expires_at=? WHERE lease_owner=? "
-                f"AND state IN ('leased','starting','running') "
-                f"AND run_id IN ({marks})",
-                (now, expires, owner, *run_ids),
-            ).rowcount
-            con.commit()
-            return int(changed)
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.renew_runs",
+            ):
+                changed = con.execute(
+                    "UPDATE conversation_runs SET heartbeat_at=?,"
+                    "lease_expires_at=? WHERE lease_owner=? "
+                    f"AND state IN ('leased','starting','running') "
+                    f"AND run_id IN ({marks})",
+                    (now, expires, owner, *run_ids),
+                ).rowcount
+                return int(changed)
         finally:
             con.close()
 
@@ -737,14 +721,17 @@ class BrokerStore:
         con = self.connect()
         now, expires = self._times()
         try:
-            con.execute(
-                "UPDATE conversation_runs SET heartbeat_at=?,"
-                "lease_expires_at=?,error_detail=? "
-                "WHERE run_id=? AND lease_owner=? "
-                "AND state IN ('starting','running')",
-                (now, expires, detail[:16384], run_id, owner),
-            )
-            con.commit()
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.note_reconcile_error",
+            ):
+                con.execute(
+                    "UPDATE conversation_runs SET heartbeat_at=?,"
+                    "lease_expires_at=?,error_detail=? "
+                    "WHERE run_id=? AND lease_owner=? "
+                    "AND state IN ('starting','running')",
+                    (now, expires, detail[:16384], run_id, owner),
+                )
         finally:
             con.close()
 
@@ -753,44 +740,43 @@ class BrokerStore:
         con = self.connect()
         now, _ = self._times()
         try:
-            self._begin(con)
-            row = con.execute(
-                "SELECT conversation_id,trigger_message_id,state "
-                "FROM conversation_runs WHERE run_id=?",
-                (run_id,),
-            ).fetchone()
-            if row is None:
-                raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
-            if row["state"] not in LIVE_RUN_STATES:
-                raise BrokerError(
-                    "CONVERSATION_RUN_NOT_ACTIVE",
-                    f"run {run_id} is {row['state']}",
-                )
-            exists = con.execute(
-                "SELECT 1 FROM conversation_events "
-                "WHERE run_id=? AND event_type='run.interrupt.requested'",
-                (run_id,),
-            ).fetchone()
-            if exists is None:
-                self._append_event(
-                    con,
-                    conversation_id=row["conversation_id"],
-                    event_type="run.interrupt.requested",
-                    payload={"requested_at": now},
-                    message_id=row["trigger_message_id"],
-                    run_id=run_id,
-                )
-                con.execute(
-                    "UPDATE conversations SET last_activity_at=?,"
-                    "version=version+1 WHERE conversation_id=?",
-                    (now, row["conversation_id"]),
-                )
-            con.commit()
-            conversation_id = row["conversation_id"]
-            created = exists is None
-        except Exception:
-            self._rollback(con)
-            raise
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.request_interrupt",
+            ):
+                row = con.execute(
+                    "SELECT conversation_id,trigger_message_id,state "
+                    "FROM conversation_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+                if row["state"] not in LIVE_RUN_STATES:
+                    raise BrokerError(
+                        "CONVERSATION_RUN_NOT_ACTIVE",
+                        f"run {run_id} is {row['state']}",
+                    )
+                exists = con.execute(
+                    "SELECT 1 FROM conversation_events "
+                    "WHERE run_id=? AND event_type='run.interrupt.requested'",
+                    (run_id,),
+                ).fetchone()
+                if exists is None:
+                    self._append_event(
+                        con,
+                        conversation_id=row["conversation_id"],
+                        event_type="run.interrupt.requested",
+                        payload={"requested_at": now},
+                        message_id=row["trigger_message_id"],
+                        run_id=run_id,
+                    )
+                    con.execute(
+                        "UPDATE conversations SET last_activity_at=?,"
+                        "version=version+1 WHERE conversation_id=?",
+                        (now, row["conversation_id"]),
+                    )
+                conversation_id = row["conversation_id"]
+                created = exists is None
         finally:
             con.close()
         if created:
@@ -800,14 +786,17 @@ class BrokerStore:
     def heartbeat_service(self, interval_seconds: int) -> None:
         con = self.connect()
         try:
-            con.execute(
-                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
-                "VALUES ('conversation-broker',datetime('now'),?) "
-                "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
-                "interval_s=excluded.interval_s",
-                (interval_seconds,),
-            )
-            con.commit()
+            with db_driver.write_transaction(
+                con,
+                "conversation.broker.heartbeat",
+            ):
+                con.execute(
+                    "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                    "VALUES ('conversation-broker',datetime('now'),?) "
+                    "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+                    "interval_s=excluded.interval_s",
+                    (interval_seconds,),
+                )
         finally:
             con.close()
 
