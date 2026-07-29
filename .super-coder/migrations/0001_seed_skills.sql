@@ -3945,7 +3945,7 @@ initial sprint activation is the FnB''s alpha gate. End the FnB-facing response
 with the exact operator action:
 
 ```sh
-./sc run CON1 -p "Process pending Conductor directives in ascending id order. Act each directive, inspect the result, and exit when the pending queue is empty."
+sc run CON1 -p "Process pending Conductor directives in ascending id order. Act each directive, inspect the result, and exit when the pending queue is empty."
 ```
 
 Tell the FnB that this one explicit boot activates the declared sprint.
