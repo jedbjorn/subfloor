@@ -136,8 +136,8 @@ Drop subfloor into an existing git repo and boot a shell:
 ```bash
 cd your-repo                                                  # an existing git repo
 
-# 1. Pull in the engine + entry script (files only, no history merge):
-git remote add super-coder https://github.com/jedbjorn/subfloor.git
+# 1. Pull in the engine + entry script (files only, main branch only, no history merge):
+git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 
