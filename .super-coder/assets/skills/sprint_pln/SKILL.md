@@ -116,6 +116,31 @@ Do not issue routine kickoff directives after handoff: Conductor releases
 dependency-ready developers itself. Do not boot shells, relay messages, poll,
 merge, or make mechanical state moves.
 
+### Post-merge conformance findings
+
+`merged` and `cancelled` units are terminal and must never be reopened with
+`re-task` or `re-scope`. When integrated conformance finds work after every
+declared unit is terminal:
+
+1. add a bounded follow-up unit with the next sequence, assigned developer and
+   reviewer, and dependencies on the merged work it corrects;
+2. emit `kickoff` for that new unit and its assigned developer;
+3. after the follow-up merges and reports, request integrated conformance again.
+
+```sh
+sc sprint unit add \
+  --sprint <id> --seq U<n> --title "<bounded conformance correction>" \
+  --dev DEV1 --reviewer REV1 \
+  --depends-on U1 --overlap "<owned correction surface>"
+sc directives emit kickoff \
+  --target conductor --sprint <id> --unit <new-unit-id> \
+  --payload '{"to":"DEV1","instruction":"<required correction>"}'
+```
+
+Use `re-task` or `re-scope` only for a non-terminal unit. A terminal-unit
+directive is refused and returned to you so the correction becomes a new,
+independently reviewed board record.
+
 ## Stop
 
 Declaration stops after an inspected `handoff`. Re-entry stops after the

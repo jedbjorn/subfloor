@@ -545,6 +545,60 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             "refused",
         )
 
+    def test_retask_returns_reviewed_unit_to_working_and_clears_review_head(self):
+        self.set_unit("working")
+        self.set_unit("in_review", review_head="approved-old-head")
+        directive_id = self.emit(
+            "planner",
+            "re-task",
+            {
+                "to": "DEV1",
+                "instruction": "revise the implementation",
+                "reason": "new evidence",
+            },
+        )
+        self.con.commit()
+
+        result = runtime.act(
+            self.con, directive_id, 1, launcher=self.launcher
+        )
+
+        self.assertEqual(result["status"], "executed")
+        unit = self.con.execute(
+            "SELECT state,review_head FROM sprint_units WHERE unit_id=10"
+        ).fetchone()
+        self.assertEqual(tuple(unit), ("working", None))
+        self.assertIn("DEV1", result["launches"][0])
+
+    def test_retask_refuses_merged_unit_before_worker_launch(self):
+        self.set_unit("working")
+        self.set_unit("merged", review_head="approved-head")
+        directive_id = self.emit(
+            "planner",
+            "re-task",
+            {
+                "to": "DEV1",
+                "instruction": "revise the merged implementation",
+                "reason": "integrated conformance finding",
+            },
+        )
+        self.con.commit()
+
+        result = runtime.act(
+            self.con, directive_id, 1, launcher=self.launcher
+        )
+
+        self.assertEqual(result["status"], "refused")
+        self.assertIn("add a follow-up unit", result["reason"])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprint_units WHERE unit_id=10"
+            ).fetchone()[0],
+            "merged",
+        )
+        self.assertIn("PLN1", result["escalation"]["command"])
+        self.assertNotIn("DEV1", result["escalation"]["command"])
+
     def test_handoff_slot_waits_for_the_act_transaction_to_commit(self):
         self.set_declared()
         directive_id = self.emit("planner", "handoff", {}, unit=False)
