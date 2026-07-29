@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
@@ -50,6 +49,8 @@ def test_new_shell_creator_offers_bespoke_without_a_flavor_template():
     assert "Bespoke — custom skill pack" in creator
     assert "flavor: fl.value || null" in creator
     assert '"shell type"' in creator
+    assert "footNodes: [cancel, create]" in creator
+    assert "footNodes: [create, cancel]" not in creator
 
 
 def test_skill_assignments_are_flavor_scoped_with_bespoke_exceptions():

@@ -254,8 +254,7 @@ async function openSkillContentModal(skill) {
   } catch (e) { toast("error: " + e.message); }
 }
 
-// New-shell form in a 600×300 modal — Create bottom-left, Cancel bottom-right,
-// same dialog pattern as the new-flag modal.
+// New-shell form in a 600×300 modal — Cancel bottom-left, Create bottom-right.
 function openNewShellModal(templates, root) {
   const fl = el("select", {});
   for (const t of templates)
@@ -271,7 +270,7 @@ function openNewShellModal(templates, root) {
     el("span", { className: "k" }, "shell type"), fl,
     el("span", { className: "k" }, "name"), nm);
   const close = openModal({ title: "New shell", bodyNode: form,
-    footNodes: [create, cancel], width: 600, height: 300 });
+    footNodes: [cancel, create], width: 600, height: 300 });
   create.onclick = async () => {
     if (!nm.value.trim()) return toast("name required");
     create.disabled = true; create.textContent = "Creating…";
