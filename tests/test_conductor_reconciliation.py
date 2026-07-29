@@ -21,12 +21,18 @@ import init_fork  # noqa: E402
 import shell_factory  # noqa: E402
 import update  # noqa: E402
 
+RECONCILE_MIGRATION = MIGRATIONS / "0130_conductor_reconciliation.sql"
 
-def build_db(path: Path) -> sqlite3.Connection:
+
+def build_db(
+    path: Path, *, through_0129: bool = False
+) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA.read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
+        if through_0129 and migration.name >= "0130_":
+            break
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")
     return con
@@ -132,6 +138,8 @@ class ConductorReconciliationTest(unittest.TestCase):
         shell_factory.create_shell(
             self.con, flavor="conductor", name="Conductor", shortname="CON1"
         )
+        # Simulate ambiguous legacy state from before the singleton trigger.
+        self.con.execute("DROP TRIGGER trg_singleton_conductor")
         shell_factory.create_shell(
             self.con, flavor="conductor", name="Conductor 2", shortname="CON2"
         )
@@ -143,6 +151,42 @@ class ConductorReconciliationTest(unittest.TestCase):
                 "WHERE flavor='conductor' AND is_deleted=0"
             ).fetchone()[0],
             2,
+        )
+
+    def test_migration_provisions_once_and_blocks_old_common_regrant(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="sc_conductor_migration_")
+        self.addCleanup(temporary.cleanup)
+        db_path = Path(temporary.name) / "pre-0130.db"
+        con = build_db(db_path, through_0129=True)
+        self.addCleanup(con.close)
+        con.execute(
+            "INSERT INTO users (user_id,username,is_active) VALUES (1,'Jed',1)"
+        )
+        con.execute(
+            "INSERT INTO shells "
+            "(display_name,shortname,system_prompt,flavor,user_id,api_key) "
+            "VALUES ('Planner','PLN1','prompt','planner',1,'planner-key')"
+        )
+        con.commit()
+
+        con.executescript(RECONCILE_MIGRATION.read_text())
+        con.executescript(RECONCILE_MIGRATION.read_text())
+        # This is the old update.py behavior that runs after newly materialized
+        # migrations in the same process. The trigger must keep it harmless.
+        con.execute(
+            "INSERT OR IGNORE INTO flavor_skills (flavor,skill_id) "
+            "SELECT 'conductor',skill_id FROM skills "
+            "WHERE is_deleted=0 AND common=1"
+        )
+        con.commit()
+
+        assert_conductor_contract(self, con)
+        self.assertEqual(
+            con.execute(
+                "SELECT COUNT(*) FROM shells "
+                "WHERE flavor='conductor' AND is_deleted=0"
+            ).fetchone()[0],
+            1,
         )
 
 
