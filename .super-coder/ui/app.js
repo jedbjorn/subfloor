@@ -3021,7 +3021,7 @@ async function renderSprints(root) {
 // A browser conversation owns the shell's single session slot until ended. It
 // uses the normal CLI preparation path server-side, but deliberately has no
 // terminal, tmux controls, or live hand-off between browser and CLI.
-const CHAT_HARNESSES = ["opencode", "claude", "codex"];
+const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"];
 const CHAT_FLAVOR_ORDER = [
   "cartographer", "admin", "conductor", "planner", "dev", "reviewer", "devops",
 ];

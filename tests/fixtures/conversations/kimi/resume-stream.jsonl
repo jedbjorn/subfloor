@@ -1,0 +1,2 @@
+{"role":"assistant","content":"KIMI_PROBE_RESUME"}
+{"role":"meta","type":"session.resume_hint","session_id":"session_11111111-1111-4111-8111-111111111111","command":"kimi -r session_11111111-1111-4111-8111-111111111111","content":"To resume this session: kimi -r session_11111111-1111-4111-8111-111111111111"}

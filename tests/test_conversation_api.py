@@ -350,6 +350,74 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 201, created)
         self.assertEqual(created["route"]["model"], "openai/gpt-connected")
 
+    def test_kimi_create_allows_native_default_model_and_resolves_route(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            conversation_routes.run_mod,
+            "flavor_defaults",
+            return_value={
+                "dev": {
+                    "default_harness": "kimi",
+                    "models": {},
+                }
+            },
+        ):
+            status, _, created = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "kimi"},
+                key="kimi-native-default",
+            )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(
+            created["route"],
+            {
+                "harness": "kimi",
+                "provider": "kimi",
+                "model": None,
+                "effort": "high",
+            },
+        )
+        con = self.connect()
+        try:
+            row = con.execute(
+                "SELECT harness,provider,model,effort FROM conversations "
+                "WHERE conversation_id=?",
+                (created["conversation_id"],),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(
+            tuple(row),
+            ("kimi", "kimi", None, "high"),
+        )
+
+    def test_conductor_shell_rejects_kimi_without_creating_a_chat(self) -> None:
+        con = self.connect()
+        try:
+            con.execute("UPDATE shells SET flavor='conductor' WHERE shell_id=1")
+            con.commit()
+        finally:
+            con.close()
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "kimi"},
+            key="conductor-kimi",
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(error["error"]["code"], "HARNESS_ROUTE_INVALID")
+        self.assertIn("opencode", error["error"]["message"].lower())
+        con = self.connect()
+        try:
+            count = con.execute(
+                "SELECT COUNT(*) FROM conversations"
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(count, 0)
+
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
         first = self.create(title="API")
         second = self.create(title="API")

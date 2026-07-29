@@ -62,16 +62,27 @@
         "resume_after_server_restart": true,
         "unrestricted_permission_policy": true
       }
-    }
-  },
-  "reference_only": {
+    },
     "kimi": {
-      "session_ref_shape": "session_<uuid>",
-      "state_store": "~/.kimi-code/sessions/wd_<name>_<hash>/session_<uuid>/state.json",
-      "wire_store": "agents/main/wire.jsonl",
-      "exact_worktree_field": "workDir",
-      "observed_events": ["turn.prompt", "llm.request", "turn.cancel", "usage.record"],
-      "release_gate_member": false
+      "verified_cli_version": "0.30.0",
+      "driver": "kimi-print",
+      "native_ref_shape": "session_<uuid>",
+      "observed_events": [
+        "assistant",
+        "session.resume_hint",
+        "turn.prompt",
+        "llm.request",
+        "turn.cancel",
+        "usage.record"
+      ],
+      "proof": {
+        "two_turn_exact_resume": true,
+        "same_worktree_isolation": true,
+        "structured_streaming": true,
+        "interruption": true,
+        "resume_after_compute_exit": true,
+        "session_inspection": true
+      }
     }
   }
 }

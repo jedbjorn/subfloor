@@ -1,0 +1,10 @@
+{"type":"config.update","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1785365142346}
+{"type":"turn.prompt","input":[{"type":"text","text":"Reply with exactly KIMI_PROBE_NEW."}],"origin":{"kind":"user"},"time":1785365142363}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1785365143069}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":2212,"output":24,"inputCacheRead":19200,"inputCacheCreation":0},"usageScope":"turn","time":1785365146252}
+{"type":"turn.prompt","input":[{"type":"text","text":"Reply with exactly KIMI_PROBE_RESUME."}],"origin":{"kind":"user"},"time":1785365151620}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1785365151652}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":332,"output":21,"inputCacheRead":21248,"inputCacheCreation":0},"usageScope":"turn","time":1785365154839}
+{"type":"turn.prompt","input":[{"type":"text","text":"Use the shell tool to run sleep 120, then reply KIMI_PROBE_INTERRUPT_DONE."}],"origin":{"kind":"user"},"time":1785365164354}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1785365164380}
+{"type":"turn.cancel","time":1785365169604}
