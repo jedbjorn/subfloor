@@ -10,6 +10,30 @@
     "model_flag": "-m",
     "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" }
   },
+  "conversation": {
+    "minimum_cli_version": "0.145.0",
+    "verified_cli_version": "0.145.0",
+    "driver": "codex-app-server",
+    "session_ref": { "source": "thread.start", "field": "thread.id" },
+    "start": { "method": "thread/start" },
+    "resume": { "method": "thread/resume", "session_field": "threadId" },
+    "stream": { "transport": "jsonl-rpc-notifications" },
+    "interrupt": { "method": "turn/interrupt" },
+    "inspect": { "method": "thread/read" },
+    "permission_policy": "approvalPolicy-and-sandbox",
+    "permission_values": {
+      "approval": "never",
+      "unrestricted": "danger-full-access"
+    },
+    "capabilities": {
+      "exact_session_resume": true,
+      "structured_streaming": true,
+      "interruption": true,
+      "interactive_permission_response": true,
+      "server_backed": true,
+      "session_inspection": true
+    }
+  },
   "sandbox": {
     "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"],
     "headless_flags": ["--dangerously-bypass-approvals-and-sandbox"]

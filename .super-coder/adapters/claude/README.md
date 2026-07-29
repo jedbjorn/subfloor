@@ -44,3 +44,19 @@ before it. Re-emitted (idempotently) each launch, so it survives `./sc update`.
 `scripts/branch-guard.sh` is the **one** branch-decision script shared by all four
 harnesses (claude + codex hooks, the opencode plugin, the git pre-commit backstop)
 — so `SC_PROTECTED_BRANCHES` and the message stay identical everywhere.
+
+## Conversation capability
+
+Feature #24 selected process-per-turn print mode. A new conversation supplies a
+broker-generated UUID through `--session-id`; every later process uses
+`--resume <uuid>`. Structured streaming requires all of `--print --verbose
+--output-format stream-json`; `--include-partial-messages` adds text deltas.
+The `system.init.session_id` field is the captured native reference.
+
+The contract was live-probed on 2.1.220. Two UUIDs in the same cwd retained
+different nonce values and exact resume returned the requested conversation.
+Sending `SIGINT` produced an `aborted_streaming` result with an explicit
+interruption record; a fresh process resumed that UUID and retained the
+interrupted prompt. Browser-mediated permission responses remain unproven, so
+the manifest advertises that capability as false until the adapter has a typed
+permission bridge.
