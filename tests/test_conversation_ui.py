@@ -85,6 +85,25 @@ def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
     assert '"run.unknown"' in activity
 
 
+def test_transcript_follow_pauses_for_reading_and_offers_jump_to_latest():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert (
+        "transcript.scrollHeight - transcript.scrollTop "
+        "- transcript.clientHeight <= 32"
+    ) in interface
+    assert "const previousTop = transcript.scrollTop" in interface
+    assert (
+        "transcript.scrollTop = shouldFollow() "
+        "? transcript.scrollHeight : previousTop"
+    ) in interface
+    assert 'className: "chat-jump-latest"' in interface
+    assert 'ariaLabel: "Jump to latest message"' in interface
+    assert "transcript.onscroll = updateTranscriptFollow" in interface
+    assert "jumpToLatest.hidden = followTranscriptTail" in interface
+    assert "transcript.scrollTop = transcript.scrollHeight" in interface
+
+
 def test_composer_is_retry_safe_and_has_turn_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
@@ -95,6 +114,13 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'textContent: "Retry"' in interface
     assert 'textContent: "Close"' in interface
     assert 'textContent: "Analytics"' in interface
+    assert 'textContent: "Stop"' in interface
+    stop_control = interface[
+        interface.index("const stop ="):
+        interface.index("const pending =", interface.index("const stop ="))
+    ]
+    assert "disabled: true" in stop_control
+    assert ".onclick" not in stop_control
     assert 'className: "chat-title-button"' in interface
     assert 'title: "Rename conversation"' in interface
     assert 'textContent: "Rename"' not in interface
@@ -131,6 +157,9 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-bubble.chat-user",
         ".chat-bubble.chat-assistant",
         ".chat-composer",
+        ".chat-jump-latest",
+        ".chat-jump-latest[hidden]",
+        ".chat-compose-actions .chat-stop:disabled",
         ".chat-title-button",
         ".chat-shell.active-chat::before",
     ):

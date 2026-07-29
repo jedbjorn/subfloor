@@ -3150,8 +3150,14 @@ function chatBubble(kind, body, meta = "", conversation = null) {
   return bubble;
 }
 
-function chatPaintTranscript(host, messages, events, conversation, retry) {
-  const transcript = el("div", { className: "chat-transcript" });
+function chatTranscriptAtBottom(transcript) {
+  return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight <= 32;
+}
+
+function chatPaintTranscript(
+  transcript, messages, events, conversation, retry, shouldFollow, onPosition,
+) {
+  const previousTop = transcript.scrollTop;
   const assistants = chatAssistantRuns(events);
   const activities = chatActivity(events);
   const items = [];
@@ -3204,14 +3210,19 @@ function chatPaintTranscript(host, messages, events, conversation, retry) {
       button.onclick = () => retry(item.text);
       item.node.append(button);
     }
-    transcript.append(item.node);
   }
   if (!items.length) {
-    transcript.append(el("div", { className: "chat-empty" },
-      `Start a conversation with ${conversation.shell.display_name}.`));
+    items.push({
+      node: el("div", { className: "chat-empty" },
+        `Start a conversation with ${conversation.shell.display_name}.`),
+      failed: false,
+    });
   }
-  host.replaceChildren(transcript);
-  requestAnimationFrame(() => { transcript.scrollTop = transcript.scrollHeight; });
+  transcript.replaceChildren(...items.map((item) => item.node));
+  requestAnimationFrame(() => {
+    transcript.scrollTop = shouldFollow() ? transcript.scrollHeight : previousTop;
+    onPosition();
+  });
 }
 
 async function chatRefreshConversation(conversationId, generation, onUpdate) {
@@ -3366,15 +3377,42 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const streamState = el("span", { className: "chat-stream-state" }, "connecting");
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
+  const transcript = el("div", { className: "chat-transcript" });
+  const jumpToLatest = el("button", {
+    className: "chat-jump-latest",
+    type: "button",
+    title: "Jump to latest",
+    ariaLabel: "Jump to latest message",
+    textContent: "↓",
+    hidden: true,
+  });
+  transcriptHost.append(transcript, jumpToLatest);
+  let followTranscriptTail = true;
+  const updateTranscriptFollow = () => {
+    followTranscriptTail = chatTranscriptAtBottom(transcript);
+    jumpToLatest.hidden = followTranscriptTail;
+  };
+  transcript.onscroll = updateTranscriptFollow;
+  jumpToLatest.onclick = () => {
+    transcript.scrollTop = transcript.scrollHeight;
+    updateTranscriptFollow();
+  };
   const composer = el("textarea", {
     className: "chat-composer-input",
     placeholder: "Message this shell…",
     rows: 3,
   });
   const send = el("button", { className: "act primary", type: "button", textContent: "Send" });
+  const stop = el("button", {
+    className: "act danger chat-stop",
+    type: "button",
+    textContent: "Stop",
+    title: "Reserved for future stream control",
+    disabled: true,
+  });
   const pending = el("div", { className: "chat-pending", hidden: true });
   const composerRow = el("div", { className: "chat-composer" },
-    composer, el("div", { className: "chat-compose-actions" }, pending, send));
+    composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
 
   const retry = async (text) => {
     composer.value = text;
@@ -3411,7 +3449,15 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     interrupt.disabled = !["queued", "running", "waiting"].includes(conversation.state);
     close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
     composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
-    chatPaintTranscript(transcriptHost, messages, events, conversation, retry);
+    chatPaintTranscript(
+      transcript,
+      messages,
+      events,
+      conversation,
+      retry,
+      () => followTranscriptTail,
+      updateTranscriptFollow,
+    );
   };
   const refresh = () => chatRefreshConversation(
     conversation.conversation_id,
