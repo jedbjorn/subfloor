@@ -3516,7 +3516,7 @@ async function renderInterface(root) {
     (item) => item.state !== "closed");
   const shell = shells.find((item) => item.shortname === chatRouteShell)
     || (!chatRouteShell && openConversation
-      ? shells.find((item) => item.shell.shell_id === openConversation.shell.shell_id)
+      ? shells.find((item) => item.shell_id === openConversation.shell.shell_id)
       : null)
     || shells[0];
   const conversations = allConversations.items.filter(
