@@ -2,8 +2,8 @@
 """Tests for the model-catalog service (api/model_catalog.py).
 
 The catalog is layered and best-effort: models.dev (keyless, all five
-harnesses) → provider APIs (only with env keys) → `opencode models` CLI →
-cache → static floor. Payload v3 retains family metadata for compatibility:
+harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
+projection → cache → static floor. Payload v4 retains family metadata:
 (newest-first; claude families with a CLI alias resolve `latest` to the
 alias) plus the flat `models` list for sub-version search. These tests pin
 that contract: harness→provider mapping and opencode prefixing, family
@@ -120,17 +120,44 @@ class BuildTest(NoCLI):
         got = mc.build(fetch=fetch, env={"OPENAI_API_KEY": "bad"}, run=None)
         self.assertEqual(got["sources"], ["models.dev"])
 
-    def test_opencode_cli_merges_ollama_cloud_first(self):
+    def test_opencode_live_overlay_keeps_only_connected_provider_models(self):
         with mock.patch.object(mc.shutil, "which", return_value="/usr/bin/opencode"):
-            def run(cmd, **kw):
-                return mock.Mock(returncode=0,
-                                 stdout="zprovider/zeta\nollama-cloud/glm-5.1\n"
-                                        "not a model line\n")
-            got = mc.build(fetch=fetch_ok, env={}, run=run)
+            got = mc._with_live_opencode(
+                mc.build(fetch=fetch_ok, env={}, run=None),
+                lambda: [
+                    {
+                        "id": "openai/gpt-connected",
+                        "provider": "openai",
+                        "provider_model": "gpt-connected",
+                        "name": "GPT Connected",
+                        "family": "gpt",
+                        "release_date": "2026-07-01",
+                    },
+                    {
+                        "id": "ollama-cloud/glm-connected",
+                        "provider": "ollama-cloud",
+                        "provider_model": "glm-connected",
+                        "name": "GLM Connected",
+                        "family": "glm",
+                        "release_date": "2026-06-01",
+                    },
+                ],
+            )
         self.assertEqual(ids(got["harnesses"]["opencode"]),
-                         ["ollama-cloud/glm-5.1", "zprovider/zeta",
-                          "ollama-cloud/deepseek-v4-pro"])
-        self.assertIn("opencode-cli", got["sources"])
+                         ["openai/gpt-connected",
+                          "ollama-cloud/glm-connected"])
+        self.assertTrue(all(
+            model["availability"] == "available"
+            for model in got["harnesses"]["opencode"]["models"]
+        ))
+        self.assertIn("opencode-provider-api", got["sources"])
+
+    def test_opencode_without_local_runtime_exposes_no_available_routes(self):
+        got = mc._with_live_opencode(
+            mc.build(fetch=fetch_ok, env={}, run=None),
+            lambda: self.fail("provider API must not run without opencode"),
+        )
+        self.assertEqual(ids(got["harnesses"]["opencode"]), [])
 
     def test_all_sources_down_raises(self):
         with self.assertRaises(RuntimeError):
@@ -256,6 +283,45 @@ class CatalogCacheTest(NoCLI):
         self.assertFalse(second["stale"], "fresh cache must serve without a fetch")
         self.assertEqual(second["harnesses"], first["harnesses"])
 
+    def test_fresh_cache_still_refreshes_connected_opencode_models(self):
+        provider_models = mock.Mock(side_effect=[
+            [{
+                "id": "openai/first",
+                "provider": "openai",
+                "provider_model": "first",
+            }],
+            [{
+                "id": "anthropic/second",
+                "provider": "anthropic",
+                "provider_model": "second",
+            }],
+        ])
+        with mock.patch.object(
+            mc.shutil, "which", return_value="/usr/bin/opencode"
+        ):
+            first = mc.catalog(
+                fetch=fetch_ok,
+                env={},
+                run=None,
+                opencode_provider=provider_models,
+            )
+            second = mc.catalog(
+                fetch=fetch_down,
+                env={},
+                run=None,
+                opencode_provider=provider_models,
+            )
+        self.assertEqual(
+            ids(first["harnesses"]["opencode"]),
+            ["openai/first"],
+        )
+        self.assertEqual(
+            ids(second["harnesses"]["opencode"]),
+            ["anthropic/second"],
+        )
+        self.assertFalse(second["stale"], "the base cache remains fresh")
+        self.assertEqual(provider_models.call_count, 2)
+
     def test_stale_cache_served_when_refresh_fails(self):
         mc.catalog(fetch=fetch_ok, env={}, run=None)
         aged = json.loads(mc.CACHE.read_text())
@@ -289,8 +355,13 @@ class CatalogCacheTest(NoCLI):
         got = mc.catalog(fetch=fetch_down, env={}, run=None)
         self.assertTrue(got["stale"])
         self.assertEqual(got["sources"], ["static"])
-        for harness in ("claude", "codex", "vibe", "opencode"):
+        for harness in ("claude", "codex", "vibe"):
             self.assertTrue(got["harnesses"][harness]["models"])
+        self.assertEqual(
+            got["harnesses"]["opencode"]["models"],
+            [],
+            "OpenCode never promotes a static route without a connected provider",
+        )
         floor_fams = {f["family"]: f["latest"]
                       for f in got["harnesses"]["claude"]["families"]}
         self.assertEqual(floor_fams.get("opus"), "opus",

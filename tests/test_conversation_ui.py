@@ -26,6 +26,10 @@ def test_start_chat_exposes_shell_harness_and_model_without_terminal_controls():
     assert 'const CHAT_HARNESSES = ["opencode", "claude", "codex"]' in interface
     assert "Use shell default" in interface
     assert "Use harness default" in interface
+    assert 'harness !== "opencode" || connectedDefault' in interface
+    assert "No connected provider models available" in interface
+    assert "providers connected in OpenCode" in interface
+    assert "submit.disabled = !ready" in interface
     assert '"Start chat"' in interface
     assert "shell_id: shell.shell_id" in interface
     assert "harness: harnessSelect.value" in interface

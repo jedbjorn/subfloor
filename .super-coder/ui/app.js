@@ -3210,17 +3210,30 @@ function chatOpenStream(conversationId, generation, onEvent, onState) {
 
 function chatModelOptions(select, catalog, harness, defaultModel) {
   select.replaceChildren();
-  select.append(el("option", {
-    value: "",
-    textContent: defaultModel
-      ? `Use shell default — ${defaultModel}`
-      : "Use harness default",
-  }));
   const models = catalog.harnesses?.[harness]?.models || [];
-  for (const model of models) {
-    if (model.availability !== "available") continue;
+  const available = models.filter((model) => model.availability === "available");
+  const connectedDefault = Boolean(
+    defaultModel && available.some((model) => model.id === defaultModel));
+  if (harness !== "opencode" || connectedDefault) {
+    select.append(el("option", {
+      value: "",
+      textContent: defaultModel
+        ? `Use shell default — ${defaultModel}`
+        : "Use harness default",
+    }));
+  }
+  for (const model of available) {
     select.append(el("option", { value: model.id, textContent: model.id }));
   }
+  if (!select.options.length) {
+    select.append(el("option", {
+      value: "",
+      textContent: "No connected provider models available",
+      disabled: true,
+      selected: true,
+    }));
+  }
+  return harness !== "opencode" || available.length > 0;
 }
 
 async function chatRenderNew(host, shell, defaults, catalog) {
@@ -3241,12 +3254,6 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     }));
   }
   const modelSelect = el("select");
-  const paintModels = () => {
-    harness = harnessSelect.value;
-    chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
-  };
-  harnessSelect.onchange = paintModels;
-  paintModels();
   const title = el("input", {
     type: "text",
     placeholder: "Optional chat title",
@@ -3257,6 +3264,18 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     type: "submit",
     textContent: "Start chat",
   });
+  const routeNote = el("div", { className: "chat-route-note" });
+  const paintModels = () => {
+    harness = harnessSelect.value;
+    const ready = chatModelOptions(
+      modelSelect, catalog, harness, byHarness[harness]?.model);
+    submit.disabled = !ready;
+    routeNote.textContent = harness === "opencode"
+      ? "OpenCode models come only from providers connected in OpenCode."
+      : "Choose an exact installed model, or keep the shell/harness default.";
+  };
+  harnessSelect.onchange = paintModels;
+  paintModels();
   form.append(
     el("div", { className: "chat-new-copy" },
       el("h2", {}, `Start a chat with ${shell.display_name}`),
@@ -3264,8 +3283,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
         "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
     el("label", { className: "k" }, "Harness"), harnessSelect,
     el("label", { className: "k" }, "Model"), modelSelect,
-    el("div", { className: "chat-route-note" },
-      "Choose an exact installed model, or keep the shell/harness default."),
+    routeNote,
     el("label", { className: "k" }, "Title"), title,
     submit,
   );

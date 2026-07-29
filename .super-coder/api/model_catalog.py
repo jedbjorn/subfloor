@@ -10,7 +10,9 @@ of this is load-bearing — a source that fails just thins the suggestions:
      newest-first sorting.
   2. Provider list-models APIs — only when the matching env key is present.
      Harness logins are OAuth, not API keys, so these are usually absent.
-  3. `opencode models` CLI — exactly what the local install can resolve.
+  3. OpenCode's loopback `/provider` projection — only providers OpenCode
+     reports as connected, with exactly the models each connected provider
+     exposes. This live overlay is refreshed on every served catalog.
   4. A static floor (the ids the engine ships in flavor_defaults) when every
      live source fails and no cache exists.
 
@@ -19,7 +21,7 @@ Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
 dirty the tree and trip the publish guard) with a TTL; a failed refresh serves
 the stale cache and says so.
 
-Payload v3 exposes the flat `models` list consumed by the shared searchable
+Payload v4 exposes the flat `models` list consumed by the shared searchable
 picker. Legacy `families` metadata remains for API compatibility but is not a
 selection surface: the harness is the only picker prefilter, and family-null
 local routes are ordinary results. Entries carry their route source, local
@@ -31,10 +33,14 @@ import json
 import os
 import shutil
 import subprocess
-import tomllib
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+import tomllib
+from conversation_adapters.opencode import (
+    connected_models as opencode_connected_models,
+)
 
 ENGINE = Path(__file__).resolve().parents[1]
 CACHE = ENGINE / "logs" / "model_catalog.json"
@@ -65,7 +71,7 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # Bump when the response/cache shape changes — a cached payload from another
 # version is ignored (treated as no cache) instead of being served to a
 # client that expects the new shape.
-PAYLOAD_VERSION = 3
+PAYLOAD_VERSION = 4
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -129,7 +135,7 @@ def _from_models_dev(fetch) -> dict[str, list[dict]]:
 
 
 def _families(harness: str, entries: list[dict]) -> list[dict]:
-    """Retained v3 compatibility metadata, not a picker selection surface.
+    """Retained compatibility metadata, not a picker selection surface.
 
     `latest` is the newest
     release in the family — except claude families with a CLI alias
@@ -169,28 +175,6 @@ def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
                 _entry(i, source=f"{HARNESS_PROVIDER[harness]}-api",
                        provider=HARNESS_PROVIDER[harness]) for i in ids]
     return out
-
-
-def _from_opencode_cli(run) -> list[dict]:
-    """`opencode models` lists provider/model ids the LOCAL install resolves —
-    the most accurate opencode source, merged in when the binary exists."""
-    if not shutil.which("opencode"):
-        return []
-    try:
-        r = run(["opencode", "models"], capture_output=True, text=True,
-                timeout=15)
-    except Exception:
-        return []
-    if r.returncode != 0:
-        return []
-    # The CLI lists every provider/model the install resolves (hundreds).
-    # ollama-cloud leads (the engine's opencode defaults live there), the
-    # rest sorted — the datalist filters as the operator types.
-    ids = sorted({line.strip() for line in r.stdout.splitlines()
-                  if "/" in line.strip() and " " not in line.strip()},
-                 key=lambda i: (not i.startswith("ollama-cloud/"), i))
-    return [_entry(i, source="opencode-cli", availability="available",
-                   provider=i.split("/", 1)[0]) for i in ids]
 
 
 def _cli_version(binary: str, run) -> str | None:
@@ -304,10 +288,6 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     for harness, extra in _from_provider_apis(fetch, env).items():
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
-    oc = _from_opencode_cli(run)
-    if oc:
-        harnesses["opencode"] = _prefer(oc, harnesses.get("opencode", []))
-        sources.append("opencode-cli")
     local = {
         "claude": _from_claude_cli(run),
         "codex": _from_codex_cache(env, run),
@@ -417,8 +397,47 @@ def _served(payload: dict, con=None) -> dict:
     return payload
 
 
+def _with_live_opencode(payload: dict, provider_models) -> dict:
+    """Replace advisory OpenCode routes with its live connected-provider set."""
+    result = {**payload}
+    harnesses = dict(payload.get("harnesses") or {})
+    sources = [
+        source for source in (payload.get("sources") or [])
+        if source != "opencode-provider-api"
+    ]
+    entries = []
+    error = None
+    if shutil.which("opencode"):
+        try:
+            entries = [
+                _entry(
+                    model["id"],
+                    model.get("release_date") or "",
+                    model.get("name") or model["id"],
+                    model.get("family"),
+                    source="opencode-provider-api",
+                    availability="available",
+                    provider=model.get("provider"),
+                    provider_model=model.get("provider_model"),
+                )
+                for model in provider_models()
+            ]
+            sources.append("opencode-provider-api")
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+    harnesses["opencode"] = {
+        "families": _families("opencode", entries),
+        "models": entries,
+        **({"error": error} if error else {}),
+    }
+    result["harnesses"] = harnesses
+    result["sources"] = sources
+    return result
+
+
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
-            run=subprocess.run, con=None) -> dict:
+            run=subprocess.run, con=None,
+            opencode_provider=opencode_connected_models) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -426,15 +445,23 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     carries `stale` + `fetched_at` so the GUI can say how current it is."""
     cached = _load_cache()
     if cached and not refresh and _fresh(cached):
-        return _served({**cached, "stale": False}, con)
+        return _served(_with_live_opencode(
+            {**cached, "stale": False}, opencode_provider), con)
     try:
         fresh = build(fetch, env, run)
     except Exception as e:  # noqa: BLE001
         if cached:
-            return _served({**cached, "stale": True, "error": str(e)}, con)
-        return _served({"v": PAYLOAD_VERSION, "fetched_at": None,
-                        "sources": ["static"], "stale": True,
-                        "error": str(e), "harnesses": _floor()}, con)
+            return _served(_with_live_opencode(
+                {**cached, "stale": True, "error": str(e)},
+                opencode_provider,
+            ), con)
+        return _served(_with_live_opencode(
+            {"v": PAYLOAD_VERSION, "fetched_at": None,
+             "sources": ["static"], "stale": True,
+             "error": str(e), "harnesses": _floor()},
+            opencode_provider,
+        ), con)
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(fresh, indent=1) + "\n")
-    return _served({**fresh, "stale": False}, con)
+    return _served(_with_live_opencode(
+        {**fresh, "stale": False}, opencode_provider), con)
