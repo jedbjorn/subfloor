@@ -371,6 +371,8 @@ def sync_worktree(work_dir: Path, shortname: str) -> str:
     default = (os.environ.get("SC_PROTECTED_BRANCHES") or "main").split()[0]
     upstream = f"origin/{default}"
     try:
+        if _git(work_dir, "remote", "get-url", "origin").returncode != 0:
+            return "drift check skipped (no 'origin' remote — local-only repo)"
         if _git(work_dir, "fetch", "origin", default, "--quiet",
                 timeout=20).returncode != 0:
             return f"drift check skipped (could not fetch {upstream} — offline?)"
