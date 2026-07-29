@@ -3874,6 +3874,7 @@ Explain the lifecycle before asking for routes:
 
 ```text
 reviewed spec → Planner declaration + complete board → explicit handoff →
+Planner tells FnB how to boot Conductor → FnB activates the sprint →
 Conductor runs workers mechanically → Planner re-enters only for decisions →
 independent conformance → close
 ```
@@ -3939,7 +3940,17 @@ sc directives emit handoff \
 ```
 
 Inspect the directive, then exit. Never boot a worker yourself and never remain
-resident after handoff.
+resident after handoff. The handoff deliberately does **not** boot Conductor:
+initial sprint activation is the FnB''s alpha gate. End the FnB-facing response
+with the exact operator action:
+
+```sh
+./sc run CON1 -p "Process pending Conductor directives in ascending id order. Act each directive, inspect the result, and exit when the pending queue is empty."
+```
+
+Tell the FnB that this one explicit boot activates the declared sprint.
+Post-activation directive/sentinel wakes remain engine-managed when enabled;
+the FnB is not the sprint''s message relay.
 
 ## Decision re-entry
 
@@ -3996,9 +4007,10 @@ independently reviewed board record.
 
 ## Stop
 
-Declaration stops after an inspected `handoff`. Re-entry stops after the
-requested directive is inspected. The originating Planner never becomes the
-active sprint runner.',
+Declaration stops after an inspected `handoff` and the exact Conductor boot
+command has been given to the FnB. Re-entry stops after the requested directive
+is inspected. The originating Planner never becomes the active sprint runner
+and never executes the boot command itself.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

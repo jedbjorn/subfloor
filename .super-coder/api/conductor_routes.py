@@ -285,7 +285,12 @@ def _create_directive(con, headers, body):
         con.rollback()
         return _err(422, "directive_invalid", str(exc))
     item = _directive(con, cur.lastrowid)
-    conductor_runtime.maybe_wake(con)
+    # Alpha activation is an explicit FnB gate: Planner leaves a durable
+    # handoff for the operator to inspect, then the FnB boots Conductor.
+    # Once the sprint is active, ordinary worker/system directives retain the
+    # config-gated autonomous wake path.
+    if not (flavor == "planner" and kind == "handoff"):
+        conductor_runtime.maybe_wake(con)
     return _json(201, item)
 
 
