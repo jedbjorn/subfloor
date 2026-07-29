@@ -636,6 +636,53 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         self.assertEqual(row["status"], "refused")
         self.assertIn("add a follow-up unit", row["refusal_reason"])
 
+    def test_worker_launch_failure_rolls_back_and_is_durably_refused(self):
+        self.set_unit("working")
+        self.set_unit("blocked")
+        directive_id = self.emit(
+            "planner",
+            "answer",
+            {
+                "to": "DEV1",
+                "question_directive_id": 42,
+                "answer": "resume the unit",
+            },
+        )
+        self.con.commit()
+        calls = []
+
+        def fail_worker_then_launch_planner(command):
+            calls.append(command)
+            if len(calls) == 1:
+                raise runtime.ConductorLaunchError(
+                    "worker slot is no longer live"
+                )
+            return 31337
+
+        result = runtime.act(
+            self.con,
+            directive_id,
+            1,
+            launcher=fail_worker_then_launch_planner,
+        )
+
+        self.assertEqual(result["status"], "refused")
+        self.assertEqual(result["reason"], "worker slot is no longer live")
+        self.assertEqual(result["escalation"]["pid"], 31337)
+        self.assertIn("PLN1", result["escalation"]["command"])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprint_units WHERE unit_id=10"
+            ).fetchone()[0],
+            "blocked",
+        )
+        row = self.con.execute(
+            "SELECT status,refusal_reason FROM directives "
+            "WHERE directive_id=?",
+            (directive_id,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("refused", "worker slot is no longer live"))
+
     def test_handoff_slot_waits_for_the_act_transaction_to_commit(self):
         self.set_declared()
         directive_id = self.emit("planner", "handoff", {}, unit=False)

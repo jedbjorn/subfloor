@@ -1006,7 +1006,7 @@ def _act_locked(
             "launches": launches,
             "pids": pids,
         }
-    except DirectiveRefused as exc:
+    except (DirectiveRefused, ConductorLaunchError) as exc:
         con.execute("ROLLBACK TO conductor_act")
         con.execute("RELEASE conductor_act")
         reason = str(exc)
