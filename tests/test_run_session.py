@@ -310,6 +310,99 @@ class OpenSessionContentionTest(unittest.TestCase):
 
 
 class HeadlessSessionFailureTest(unittest.TestCase):
+    def test_conductor_rejects_cli_harness_override_before_launch_side_effects(
+            self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 11, "shortname": "CON1", "flavor": "conductor"}
+        fdefaults = {
+            "conductor": {
+                "default_harness": "opencode",
+                "models": {"opencode": "openai/gpt-5.6-luna"},
+            }
+        }
+        load_adapter = mock.Mock()
+        open_session = mock.Mock()
+        ensure_worktree = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys, "argv",
+                    ["run.py", "--headless", "CON1", "--harness", "codex"]), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(
+                    run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(
+                    run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "list_shells", return_value=[chosen]), \
+                mock.patch.object(run, "pick_shell", return_value=chosen), \
+                mock.patch.object(
+                    run.shell_liveness, "compute",
+                    return_value={"supported": False, "indeterminate": 0}), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(run, "load_adapter", load_adapter), \
+                mock.patch.object(run, "open_session", open_session), \
+                mock.patch.object(run, "ensure_worktree", ensure_worktree), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertIn(
+            "conductor requires harness 'opencode'",
+            str(raised.exception),
+        )
+        con.close.assert_called_once_with()
+        load_adapter.assert_not_called()
+        open_session.assert_not_called()
+        ensure_worktree.assert_not_called()
+
+    def test_engine_prepared_conductor_rejects_non_opencode_before_session(
+            self) -> None:
+        con = mock.Mock()
+        con.execute.return_value.fetchone.return_value = {
+            "shell_id": 11,
+            "display_name": "Maestro",
+            "shortname": "CON1",
+            "mandate": "relay",
+            "is_shared": 1,
+            "flavor": "conductor",
+            "current_state": "",
+        }
+        fdefaults = {
+            "conductor": {
+                "default_harness": "opencode",
+                "models": {"opencode": "openai/gpt-5.6-luna"},
+            }
+        }
+        load_adapter = mock.Mock()
+        open_session = mock.Mock()
+        ensure_worktree = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {"RENDER_ONLY": "1"}, clear=True), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(
+                    run, "authenticate",
+                    return_value={"user_id": 1, "username": "Jed"}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(run, "load_adapter", load_adapter), \
+                mock.patch.object(run, "open_session", open_session), \
+                mock.patch.object(run, "ensure_worktree", ensure_worktree), \
+                self.assertRaisesRegex(
+                    run.LaunchError,
+                    "conductor requires harness 'opencode'",
+                ):
+            run.prepare_launch(
+                shell_id=11,
+                harness="codex",
+                model="gpt-5.6-sol",
+                headless_prompt="act",
+            )
+
+        con.close.assert_called_once_with()
+        load_adapter.assert_not_called()
+        open_session.assert_not_called()
+        ensure_worktree.assert_not_called()
+
     def test_sc_run_exits_before_worktree_or_harness_artifacts(self) -> None:
         con = mock.Mock()
         # No armed sprint binding — resolve_sprint_ref stamps nothing.

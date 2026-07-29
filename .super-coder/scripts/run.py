@@ -55,6 +55,7 @@ import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import conductor_policy  # noqa: E402
 import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
@@ -1176,6 +1177,11 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     ensure_harness_path()
     harness = (harness or (fdef["default_harness"] if fdef else None)
                or _configured_harness() or "claude")
+    try:
+        conductor_policy.require_harness(chosen["flavor"], harness)
+    except ValueError as exc:
+        con.close()
+        raise LaunchError(str(exc)) from exc
     adapter = load_adapter(harness)
 
     # Model route: an explicit model wins; else the (flavor, harness) cell,
@@ -1527,6 +1533,11 @@ def main() -> None:
     harness = (flag_harness or os.environ.get("HARNESS")
                or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
+    try:
+        conductor_policy.require_harness(chosen["flavor"], harness)
+    except ValueError as exc:
+        con.close()
+        sys.exit(f"sc run: {exc}")
 
     # Resolve + validate the complete headless route before opening a session.
     # `sc run` is the sprint-worker primitive, so high effort is the default

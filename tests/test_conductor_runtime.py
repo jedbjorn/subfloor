@@ -22,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(RENDER))
 
 import compose
+import conductor_policy
 import conductor_runtime as runtime
 import run
 
@@ -148,6 +149,7 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
         return probe
 
     def test_template_migration_and_boot_have_exact_skill_and_are_exhaustive(self):
+        self.assertEqual(runtime.CONDUCTOR_HARNESS, "opencode")
         self.assertEqual(
             runtime.DEFAULT_CONDUCTOR_MODEL,
             "openai/gpt-5.6-luna",
@@ -189,6 +191,16 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
             1,
         )
         self.assertEqual(composed, rendered)
+
+    def test_conductor_harness_policy_rejects_every_non_opencode_route(self):
+        conductor_policy.require_harness("conductor", "opencode")
+        conductor_policy.require_harness("dev", "codex")
+        for harness in ("claude", "codex", "kimi", "vibe"):
+            with (
+                self.subTest(harness=harness),
+                self.assertRaisesRegex(ValueError, "requires harness 'opencode'"),
+            ):
+                conductor_policy.require_harness("conductor", harness)
 
     def test_luna_migration_upgrades_only_the_shipped_conductor_route(self):
         self.con.execute(

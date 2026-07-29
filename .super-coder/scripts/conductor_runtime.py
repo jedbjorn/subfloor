@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from conductor_policy import CONDUCTOR_HARNESS, DEFAULT_CONDUCTOR_MODEL
 import shell_liveness
 import sprint_lifecycle
 import sprint_state
@@ -28,8 +29,6 @@ from sprint_units import SPRINT_UNIT_EDGES, SprintTransitionError, check_transit
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 INSTANCE_CONFIG = ENGINE / "instance.json"
-CONDUCTOR_HARNESS = "opencode"
-DEFAULT_CONDUCTOR_MODEL = "openai/gpt-5.6-luna"
 _LAUNCH_GUARD_SECONDS = 20
 LAUNCH_LOG = ENGINE / "logs" / "conductor-launches.log"
 
