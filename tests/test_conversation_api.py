@@ -481,6 +481,48 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 409)
         self.assertEqual(conflict["error"]["code"], "MESSAGE_IDEMPOTENCY_CONFLICT")
 
+    def test_message_stacked_during_run_queues_without_interrupting(self) -> None:
+        conversation_id = self.create()["conversation_id"]
+        status, _, first = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "keep working"},
+            key="message-active",
+        )
+        self.assertEqual(status, 202, first)
+        run = conversation_broker.BrokerStore(self.db_path).claim_next("test")
+        self.assertIsNotNone(run)
+
+        status, _, stacked = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "do this next"},
+            key="message-stacked",
+        )
+        self.assertEqual(status, 202, stacked)
+        self.assertEqual(stacked["queue_position"], 1)
+        self.assertEqual(stacked["message"]["state"], "queued")
+
+        con = self.connect()
+        conversation_state = con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+        interrupt_events = con.execute(
+            "SELECT COUNT(*) FROM conversation_events "
+            "WHERE conversation_id=? AND event_type='run.interrupt.requested'",
+            (conversation_id,),
+        ).fetchone()[0]
+        control_messages = con.execute(
+            "SELECT COUNT(*) FROM conversation_messages "
+            "WHERE conversation_id=? AND message_kind='control'",
+            (conversation_id,),
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(conversation_state, "running")
+        self.assertEqual(interrupt_events, 0)
+        self.assertEqual(control_messages, 0)
+
     def test_cursor_pages_have_no_duplicates_and_patch_uses_version(self) -> None:
         created = [
             self.create(key=f"create-{number}")

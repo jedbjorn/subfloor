@@ -3076,7 +3076,28 @@ function chatStatePill(state) {
     queued: "queued", running: "working", waiting: "waiting",
     error: "failed", idle: "idle", closed: "closed",
   }[state] || state;
-  return el("span", { className: `chat-state state-${state || "idle"}` }, label);
+  const pill = el("span", {
+    className: `chat-state state-${state || "idle"}`,
+  });
+  if (state !== "running") {
+    pill.textContent = label;
+    return pill;
+  }
+  pill.append(
+    label,
+    el("span", { className: "chat-working-dots", ariaHidden: "true" },
+      el("span", {}, "."),
+      el("span", {}, "."),
+      el("span", {}, ".")),
+  );
+  return pill;
+}
+
+function chatQueuedCount(messages) {
+  return messages.filter(
+    (message) => message.message_kind !== "control"
+      && ["accepted", "queued"].includes(message.state)
+  ).length;
 }
 
 function chatConversationName(conversation) {
@@ -3086,7 +3107,7 @@ function chatConversationName(conversation) {
 async function chatCloseForSwitch(conversation) {
   if (!conversation || conversation.state === "closed") return true;
   if (!["idle", "waiting", "error"].includes(conversation.state)) {
-    toast("Finish or interrupt the current turn before switching chats.");
+    toast("Finish the current turn and queued messages before switching chats.");
     return false;
   }
   try {
@@ -3226,8 +3247,11 @@ function chatPaintTranscript(
 
 async function chatRefreshConversation(conversationId, generation, onUpdate) {
   try {
-    const next = await chatApi(`/conversations/${conversationId}`);
-    if (generation === chatRenderGeneration) onUpdate(next);
+    const [next, messagePage] = await Promise.all([
+      chatApi(`/conversations/${conversationId}`),
+      chatApi(`/conversations/${conversationId}/messages?limit=100`),
+    ]);
+    if (generation === chatRenderGeneration) onUpdate(next, messagePage.items);
   } catch { /* SSE remains authoritative enough to keep the open view usable. */ }
 }
 
@@ -3373,6 +3397,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
   const state = el("div", { className: "chat-pane-state" });
+  const queueState = el("span", { className: "chat-queue-state", hidden: true });
   const streamState = el("span", { className: "chat-stream-state" }, "connecting");
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
@@ -3441,7 +3466,11 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
         el("span", {}, chatStartedLabel(conversation)),
         el("span", { className: "chat-context-separator" }, " | "),
         rename));
-    state.replaceChildren(chatStatePill(conversation.state), streamState);
+    const queued = chatQueuedCount(messages);
+    queueState.hidden = queued === 0;
+    queueState.textContent = `${queued} queued`;
+    state.replaceChildren(
+      chatStatePill(conversation.state), queueState, streamState);
     const closed = conversation.state === "closed";
     composer.disabled = closed;
     send.disabled = closed;
@@ -3461,7 +3490,11 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const refresh = () => chatRefreshConversation(
     conversation.conversation_id,
     generation,
-    (next) => { conversation = next; paint(); });
+    (next, nextMessages) => {
+      conversation = next;
+      messages = nextMessages;
+      paint();
+    });
 
   const analytics = el("button", { className: "act", type: "button", textContent: "Analytics" });
   analytics.onclick = () => {
@@ -3519,7 +3552,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       chatPendingSend = null;
       composer.value = "";
       pending.hidden = true;
-      conversation.state = "queued";
+      if (conversation.state !== "running") conversation.state = "queued";
       paint();
       refresh();
     } catch (error) {
@@ -3547,22 +3580,26 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       seen.add(event.sequence);
       events.push(event);
       if (event.run_id) latestRunId = event.run_id;
-      if (event.event_type === "message.accepted") conversation.state = "queued";
-      if (event.event_type === "run.started") conversation.state = "running";
-      if (["permission.requested", "input.requested"].includes(event.event_type))
-        conversation.state = "waiting";
-      if (["run.completed", "run.interrupted"].includes(event.event_type))
-        conversation.state = "idle";
-      if (["run.failed", "run.unknown"].includes(event.event_type))
-        conversation.state = "error";
       const message = messages.find((item) => item.message_id === event.message_id);
+      if (message && event.event_type === "run.started") message.state = "running";
       if (message && event.event_type === "run.completed") message.state = "completed";
       if (message && ["run.failed", "run.unknown"].includes(event.event_type))
         message.state = "failed";
       if (message && event.event_type === "run.interrupted")
         message.state = "cancelled";
+      if (event.event_type === "message.accepted"
+          && conversation.state !== "running")
+        conversation.state = "queued";
+      if (event.event_type === "run.started") conversation.state = "running";
+      if (["permission.requested", "input.requested"].includes(event.event_type))
+        conversation.state = "waiting";
+      if (["run.completed", "run.interrupted"].includes(event.event_type))
+        conversation.state = chatQueuedCount(messages) ? "queued" : "idle";
+      if (["run.failed", "run.unknown"].includes(event.event_type))
+        conversation.state = "error";
       paint();
-      if (["run.completed", "run.failed", "run.interrupted", "run.unknown",
+      if (["message.accepted", "run.completed", "run.failed",
+           "run.interrupted", "run.unknown",
            "conversation.renamed", "conversation.closed"].includes(event.event_type))
         refresh();
     },
