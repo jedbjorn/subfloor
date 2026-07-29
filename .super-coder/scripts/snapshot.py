@@ -102,6 +102,15 @@ PER_INSTANCE_TABLES = [
     "directives",
     "sentinel_events",
     "wake_machine_retirements",
+    # Browser-native conversations are durable instance truth: the exact
+    # harness ref, message queue, recovery evidence, replay events, and pending
+    # outbox must all survive update/rebuild. Parents precede children so a
+    # snapshot remains readable and foreign-key-valid when loaded.
+    "conversations",
+    "conversation_messages",
+    "conversation_runs",
+    "conversation_events",
+    "conversation_outbox",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/local/map/content.sql by snapshot_map() below, not here.
