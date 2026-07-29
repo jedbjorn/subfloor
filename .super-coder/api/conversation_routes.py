@@ -408,7 +408,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     request_hash = _request_hash(body)
     shell_id = _integer(body.get("shell_id"), "shell_id")
 
-    con.execute("BEGIN IMMEDIATE")
+    # Cheap idempotent replay and all external preparation happen before the
+    # write reservation. The transaction repeats every authoritative DB read.
     existing = con.execute(
         "SELECT conversation_id,creation_request_hash FROM conversations "
         "WHERE mode='normal' AND owner_user_id=? "
@@ -417,7 +418,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     ).fetchone()
     if existing is not None:
         if existing["creation_request_hash"] != request_hash:
-            con.rollback()
             raise ApiError(
                 409,
                 "CONVERSATION_IDEMPOTENCY_CONFLICT",
@@ -426,7 +426,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         row = _require_conversation(
             con, existing["conversation_id"], operator["user_id"]
         )
-        con.commit()
         return _json(
             201,
             _conversation_projection(row),
@@ -440,7 +439,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         (shell_id, operator["user_id"]),
     ).fetchone()
     if shell is None:
-        con.rollback()
         raise ApiError(
             422,
             "SHELL_NOT_LAUNCHABLE",
@@ -455,7 +453,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     if not open_conversations:
         live_state = _wait_for_cli_release(shell)
         if live_state is not None:
-            con.rollback()
             raise ApiError(
                 409,
                 "SHELL_BUSY",
@@ -474,7 +471,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         )
     harness = _nonblank(harness, "harness", maximum=64)
     if harness not in ADAPTER_TYPES:
-        con.rollback()
         raise ApiError(
             422,
             "HARNESS_CONVERSATION_UNSUPPORTED",
@@ -483,7 +479,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     try:
         run_mod.conductor_policy.require_harness(shell["flavor"], harness)
     except ValueError as exc:
-        con.rollback()
         raise ApiError(422, "HARNESS_ROUTE_INVALID", str(exc)) from exc
 
     model = body.get("model")
@@ -491,7 +486,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         model = defaults["models"].get(harness)
     model = _nonblank(model, "model", maximum=255, optional=True)
     if harness == "opencode" and model is None:
-        con.rollback()
         raise ApiError(
             422,
             "HARNESS_MODEL_REQUIRED",
@@ -505,13 +499,11 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     try:
         run_mod.validate_headless_request(adapter, model, effort)
     except ValueError as exc:
-        con.rollback()
         raise ApiError(422, "HARNESS_ROUTE_INVALID", str(exc)) from exc
     title = _nonblank(body.get("title"), "title", maximum=200, optional=True)
     worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
     worktree = worktree.resolve(strict=False)
     if worktree.exists() and not worktree.is_dir():
-        con.rollback()
         raise ApiError(
             422,
             "HARNESS_WORKTREE_MISSING",
@@ -521,64 +513,125 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
     conversation_id = "cv_" + uuid.uuid4().hex
     provider = run_mod.session_provider(harness, model)
-    running = [
-        row for row in open_conversations
-        if row["state"] in ("queued", "running")
-    ]
-    if running:
-        con.rollback()
-        raise ApiError(
-            409,
-            "BROWSER_CHAT_BUSY",
-            "the open browser chat has a turn in progress",
-            {"conversation_id": running[0]["conversation_id"]},
-        )
     auto_closed = []
-    for row in open_conversations:
+    with db_driver.write_transaction(con, "conversation.create"):
+        existing = con.execute(
+            "SELECT conversation_id,creation_request_hash FROM conversations "
+            "WHERE mode='normal' AND owner_user_id=? "
+            "AND creation_idempotency_key=?",
+            (operator["user_id"], key),
+        ).fetchone()
+        if existing is not None:
+            if existing["creation_request_hash"] != request_hash:
+                raise ApiError(
+                    409,
+                    "CONVERSATION_IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was reused with a different request",
+                )
+            row = _require_conversation(
+                con, existing["conversation_id"], operator["user_id"]
+            )
+            return _json(
+                201,
+                _conversation_projection(row),
+                [("Location", f"/api/conversations/{row['conversation_id']}")],
+            )
+
+        current_shell = con.execute(
+            "SELECT shell_id,display_name,shortname,flavor FROM shells "
+            "WHERE shell_id=? AND (user_id=? OR is_shared=1) "
+            "AND COALESCE(is_deleted,0)=0",
+            (shell_id, operator["user_id"]),
+        ).fetchone()
+        if current_shell is None:
+            raise ApiError(
+                422,
+                "SHELL_NOT_LAUNCHABLE",
+                "shell is unknown, deleted, or unavailable to this operator",
+            )
+        if (
+            current_shell["shortname"] != shell["shortname"]
+            or current_shell["flavor"] != shell["flavor"]
+        ):
+            raise ApiError(
+                409,
+                "SHELL_CHANGED",
+                "shell routing changed while the browser chat was prepared; retry",
+                {"shell_id": shell_id},
+            )
+
+        open_conversations = con.execute(
+            "SELECT conversation_id,state FROM conversations "
+            "WHERE mode='normal' AND shell_id=? AND state!='closed'",
+            (shell_id,),
+        ).fetchall()
+        if not open_conversations:
+            live_state = _live_shell_session(current_shell)
+            if live_state is not None:
+                raise ApiError(
+                    409,
+                    "SHELL_BUSY",
+                    f"shell {current_shell['shortname']!r} has a live CLI session; "
+                    "close it before opening a browser chat",
+                    {"shell_id": shell_id, "state": live_state},
+                )
+
+        running = [
+            row for row in open_conversations
+            if row["state"] in ("queued", "running")
+        ]
+        if running:
+            raise ApiError(
+                409,
+                "BROWSER_CHAT_BUSY",
+                "the open browser chat has a turn in progress",
+                {"conversation_id": running[0]["conversation_id"]},
+            )
+        for row in open_conversations:
+            con.execute(
+                "UPDATE conversations SET state='closed',"
+                "closed_at=datetime('now'),last_activity_at=datetime('now'),"
+                "version=version+1 WHERE conversation_id=?",
+                (row["conversation_id"],),
+            )
+            _append_event(
+                con,
+                row["conversation_id"],
+                "conversation.closed",
+                {"status": "closed", "reason": "another browser chat opened"},
+            )
+            auto_closed.append(row["conversation_id"])
         con.execute(
-            "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
-            "last_activity_at=datetime('now'),version=version+1 "
-            "WHERE conversation_id=?",
-            (row["conversation_id"],),
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,owner_user_id,harness,provider,model,"
+            "effort,worktree,title,creation_idempotency_key,"
+            "creation_request_hash) VALUES (?,?,'normal',?,?,?,?,?,?,?,?,?)",
+            (
+                conversation_id,
+                shell_id,
+                operator["user_id"],
+                harness,
+                provider,
+                model,
+                effort,
+                str(worktree),
+                title,
+                key,
+                request_hash,
+            ),
         )
         _append_event(
             con,
-            row["conversation_id"],
-            "conversation.closed",
-            {"status": "closed", "reason": "another browser chat opened"},
-        )
-        auto_closed.append(row["conversation_id"])
-    con.execute(
-        "INSERT INTO conversations "
-        "(conversation_id,shell_id,mode,owner_user_id,harness,provider,model,"
-        "effort,worktree,title,creation_idempotency_key,"
-        "creation_request_hash) VALUES (?,?,'normal',?,?,?,?,?,?,?,?,?)",
-        (
             conversation_id,
-            shell_id,
-            operator["user_id"],
-            harness,
-            provider,
-            model,
-            effort,
-            str(worktree),
-            title,
-            key,
-            request_hash,
-        ),
-    )
-    _append_event(
-        con,
-        conversation_id,
-        "conversation.created",
-        {
-            "shell_id": shell_id,
-            "harness": harness,
-            "model": model,
-            "effort": effort,
-        },
-    )
-    con.commit()
+            "conversation.created",
+            {
+                "shell_id": shell_id,
+                "harness": harness,
+                "model": model,
+                "effort": effort,
+            },
+        )
+
     for closed_id in auto_closed:
         conversation_events.notify(closed_id)
     conversation_events.notify(conversation_id)
@@ -666,63 +719,62 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
     if "state" in body and body["state"] != "closed":
         raise ApiError(422, "VALIDATION_ERROR", "state may only be changed to closed")
 
-    con.execute("BEGIN IMMEDIATE")
-    row = _require_conversation(con, conversation_id, operator["user_id"])
-    if int(row["version"]) != version:
-        con.rollback()
-        raise ApiError(
-            409,
-            "CONVERSATION_VERSION_CONFLICT",
-            "conversation version does not match",
-            {"expected": int(row["version"]), "received": version},
+    with db_driver.write_transaction(con, "conversation.patch"):
+        row = _require_conversation(con, conversation_id, operator["user_id"])
+        if int(row["version"]) != version:
+            raise ApiError(
+                409,
+                "CONVERSATION_VERSION_CONFLICT",
+                "conversation version does not match",
+                {"expected": int(row["version"]), "received": version},
+            )
+        closing = body.get("state") == "closed"
+        if row["state"] == "closed":
+            raise ApiError(
+                409,
+                "CONVERSATION_CLOSED",
+                "conversation is already closed",
+            )
+        if closing and row["state"] not in ("idle", "waiting", "error"):
+            raise ApiError(
+                409,
+                "BROWSER_CHAT_BUSY",
+                "a queued or running conversation cannot be closed",
+                {"state": row["state"]},
+            )
+        sets = ["version=version+1", "last_activity_at=datetime('now')"]
+        params: list = []
+        if "title" in body:
+            sets.append("title=?")
+            params.append(title)
+        if closing:
+            sets.extend(("state='closed'", "closed_at=datetime('now')"))
+        changed = con.execute(
+            f"UPDATE conversations SET {','.join(sets)} "
+            "WHERE conversation_id=? AND owner_user_id=? AND version=?",
+            (*params, conversation_id, operator["user_id"], version),
+        ).rowcount
+        if changed != 1:
+            raise ApiError(
+                409,
+                "CONVERSATION_VERSION_CONFLICT",
+                "conversation changed concurrently",
+            )
+        _append_event(
+            con,
+            conversation_id,
+            (
+                "conversation.updated"
+                if "title" in body and closing
+                else "conversation.closed"
+                if closing
+                else "conversation.renamed"
+            ),
+            {
+                **({"title": title} if "title" in body else {}),
+                **({"state": "closed"} if closing else {}),
+            },
         )
-    closing = body.get("state") == "closed"
-    if row["state"] == "closed":
-        con.rollback()
-        raise ApiError(409, "CONVERSATION_CLOSED", "conversation is already closed")
-    if closing and row["state"] not in ("idle", "waiting", "error"):
-        con.rollback()
-        raise ApiError(
-            409,
-            "BROWSER_CHAT_BUSY",
-            "a queued or running conversation cannot be closed",
-            {"state": row["state"]},
-        )
-    sets = ["version=version+1", "last_activity_at=datetime('now')"]
-    params: list = []
-    if "title" in body:
-        sets.append("title=?")
-        params.append(title)
-    if closing:
-        sets.extend(("state='closed'", "closed_at=datetime('now')"))
-    changed = con.execute(
-        f"UPDATE conversations SET {','.join(sets)} "
-        "WHERE conversation_id=? AND owner_user_id=? AND version=?",
-        (*params, conversation_id, operator["user_id"], version),
-    ).rowcount
-    if changed != 1:
-        con.rollback()
-        raise ApiError(
-            409,
-            "CONVERSATION_VERSION_CONFLICT",
-            "conversation changed concurrently",
-        )
-    _append_event(
-        con,
-        conversation_id,
-        (
-            "conversation.updated"
-            if "title" in body and closing
-            else "conversation.closed"
-            if closing
-            else "conversation.renamed"
-        ),
-        {
-            **({"title": title} if "title" in body else {}),
-            **({"state": "closed"} if closing else {}),
-        },
-    )
-    con.commit()
     conversation_events.notify(conversation_id)
     return _json(
         200,
@@ -739,78 +791,86 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
     normalized = {"text": text}
     request_hash = _request_hash(normalized)
 
-    con.execute("BEGIN IMMEDIATE")
-    conversation = _require_conversation(con, conversation_id, operator["user_id"])
-    existing = con.execute(
-        "SELECT message_id,request_hash FROM conversation_messages "
-        "WHERE conversation_id=? AND idempotency_key=?",
-        (conversation_id, key),
-    ).fetchone()
-    if existing is not None:
-        if existing["request_hash"] != request_hash:
-            con.rollback()
+    with db_driver.write_transaction(con, "conversation.message.create"):
+        conversation = _require_conversation(
+            con,
+            conversation_id,
+            operator["user_id"],
+        )
+        existing = con.execute(
+            "SELECT message_id,request_hash FROM conversation_messages "
+            "WHERE conversation_id=? AND idempotency_key=?",
+            (conversation_id, key),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_hash"] != request_hash:
+                raise ApiError(
+                    409,
+                    "MESSAGE_IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was reused with a different message",
+                )
+            message = _message_projection(
+                _message_row(con, int(existing["message_id"]))
+            )
+            return _json(
+                202,
+                {
+                    "message": message,
+                    "queue_position": _accepted_queue_position(
+                        con,
+                        message["message_id"],
+                    ),
+                },
+                [("Location", f"/api/conversations/{conversation_id}/messages")],
+            )
+        if conversation["state"] == "closed":
             raise ApiError(
                 409,
-                "MESSAGE_IDEMPOTENCY_CONFLICT",
-                "Idempotency-Key was reused with a different message",
+                "CONVERSATION_CLOSED",
+                "closed conversations reject messages",
             )
-        message = _message_projection(_message_row(con, int(existing["message_id"])))
-        con.commit()
-        return _json(
-            202,
-            {
-                "message": message,
-                "queue_position": _accepted_queue_position(con, message["message_id"]),
-            },
-            [("Location", f"/api/conversations/{conversation_id}/messages")],
+        target_state = (
+            conversation["state"]
+            if conversation["state"] in ("queued", "running")
+            else "queued"
         )
-    if conversation["state"] == "closed":
-        con.rollback()
-        raise ApiError(
-            409, "CONVERSATION_CLOSED", "closed conversations reject messages"
+        message_id = int(
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'user',?,'prompt',?,?,?,'queued')",
+                (
+                    conversation_id,
+                    str(operator["user_id"]),
+                    text,
+                    key,
+                    request_hash,
+                ),
+            ).lastrowid
         )
-    target_state = (
-        conversation["state"]
-        if conversation["state"] in ("queued", "running")
-        else "queued"
-    )
-    message_id = int(
         con.execute(
-            "INSERT INTO conversation_messages "
-            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
-            "idempotency_key,request_hash,state) "
-            "VALUES (?,'user',?,'prompt',?,?,?,'queued')",
-            (
-                conversation_id,
-                str(operator["user_id"]),
-                text,
-                key,
-                request_hash,
-            ),
-        ).lastrowid
-    )
-    con.execute(
-        "INSERT INTO conversation_outbox (conversation_id,message_id) VALUES (?,?)",
-        (conversation_id, message_id),
-    )
-    con.execute(
-        "UPDATE conversations SET state=?,last_activity_at=datetime('now'),"
-        "version=version+1 WHERE conversation_id=?",
-        (target_state, conversation_id),
-    )
-    position = _queue_position(con, message_id)
-    _append_event(
-        con,
-        conversation_id,
-        "message.accepted",
-        {
-            "message_id": message_id,
-            "queue_state": "queued",
-            "queue_position": position,
-        },
-        message_id=message_id,
-    )
-    con.commit()
+            "INSERT INTO conversation_outbox (conversation_id,message_id) "
+            "VALUES (?,?)",
+            (conversation_id, message_id),
+        )
+        con.execute(
+            "UPDATE conversations SET state=?,last_activity_at=datetime('now'),"
+            "version=version+1 WHERE conversation_id=?",
+            (target_state, conversation_id),
+        )
+        position = _queue_position(con, message_id)
+        _append_event(
+            con,
+            conversation_id,
+            "message.accepted",
+            {
+                "message_id": message_id,
+                "queue_state": "queued",
+                "queue_position": position,
+            },
+            message_id=message_id,
+        )
     conversation_events.notify(conversation_id)
     conversation_broker.notify_commit()
     return _json(
@@ -920,80 +980,79 @@ def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
     normalized = {"run_id": requested_run}
     request_hash = _request_hash(normalized)
 
-    con.execute("BEGIN IMMEDIATE")
-    _require_conversation(con, conversation_id, operator["user_id"])
-    existing = con.execute(
-        "SELECT message_id,request_hash,body FROM conversation_messages "
-        "WHERE conversation_id=? AND idempotency_key=?",
-        (conversation_id, key),
-    ).fetchone()
-    if existing is not None:
-        if existing["request_hash"] != request_hash:
-            con.rollback()
-            raise ApiError(
-                409,
-                "MESSAGE_IDEMPOTENCY_CONFLICT",
-                "Idempotency-Key was reused with a different interruption",
+    replay = False
+    with db_driver.write_transaction(con, "conversation.interrupt.create"):
+        _require_conversation(con, conversation_id, operator["user_id"])
+        existing = con.execute(
+            "SELECT message_id,request_hash,body FROM conversation_messages "
+            "WHERE conversation_id=? AND idempotency_key=?",
+            (conversation_id, key),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_hash"] != request_hash:
+                raise ApiError(
+                    409,
+                    "MESSAGE_IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was reused with a different interruption",
+                )
+            audit = _message_projection(
+                _message_row(con, int(existing["message_id"]))
             )
-        audit = _message_projection(_message_row(con, int(existing["message_id"])))
-        run_id = int(json.loads(existing["body"])["run_id"])
-        con.commit()
-        _request_interrupt(run_id, replay=True)
-        return _json(202, {"interruption": audit, "run_id": run_id})
-
-    clauses = [
-        "conversation_id=?",
-        "state IN ('leased','starting','running')",
-    ]
-    params: list = [conversation_id]
-    if requested_run is not None:
-        clauses.append("run_id=?")
-        params.append(requested_run)
-    active = con.execute(
-        "SELECT run_id FROM conversation_runs WHERE "
-        + " AND ".join(clauses)
-        + " ORDER BY run_id DESC LIMIT 1",
-        params,
-    ).fetchone()
-    if active is None:
-        con.rollback()
-        raise ApiError(
-            409,
-            "RUN_ALREADY_TERMINAL",
-            "no matching active run can be interrupted",
-        )
-    run_id = int(active["run_id"])
-    audit_body = json.dumps(
-        {"kind": "interrupt", "run_id": run_id},
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    message_id = int(
-        con.execute(
-            "INSERT INTO conversation_messages "
-            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
-            "idempotency_key,request_hash,state,completed_at) "
-            "VALUES (?,'user',?,'control',?,?,?,'completed',datetime('now'))",
-            (
-                conversation_id,
-                str(operator["user_id"]),
-                audit_body,
-                key,
-                request_hash,
-            ),
-        ).lastrowid
-    )
-    con.execute(
-        "UPDATE conversations SET last_activity_at=datetime('now'),"
-        "version=version+1 WHERE conversation_id=?",
-        (conversation_id,),
-    )
-    con.commit()
-    _request_interrupt(run_id, replay=False)
+            run_id = int(json.loads(existing["body"])["run_id"])
+            replay = True
+        else:
+            clauses = [
+                "conversation_id=?",
+                "state IN ('leased','starting','running')",
+            ]
+            params: list = [conversation_id]
+            if requested_run is not None:
+                clauses.append("run_id=?")
+                params.append(requested_run)
+            active = con.execute(
+                "SELECT run_id FROM conversation_runs WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY run_id DESC LIMIT 1",
+                params,
+            ).fetchone()
+            if active is None:
+                raise ApiError(
+                    409,
+                    "RUN_ALREADY_TERMINAL",
+                    "no matching active run can be interrupted",
+                )
+            run_id = int(active["run_id"])
+            audit_body = json.dumps(
+                {"kind": "interrupt", "run_id": run_id},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            message_id = int(
+                con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'user',?,'control',?,?,?,'completed',datetime('now'))",
+                    (
+                        conversation_id,
+                        str(operator["user_id"]),
+                        audit_body,
+                        key,
+                        request_hash,
+                    ),
+                ).lastrowid
+            )
+            con.execute(
+                "UPDATE conversations SET last_activity_at=datetime('now'),"
+                "version=version+1 WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            audit = _message_projection(_message_row(con, message_id))
+    _request_interrupt(run_id, replay=replay)
     return _json(
         202,
         {
-            "interruption": _message_projection(_message_row(con, message_id)),
+            "interruption": audit,
             "run_id": run_id,
         },
     )
@@ -1066,6 +1125,21 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
             if con.in_transaction:
                 con.rollback()
             return _api_error(exc)
+        except db_driver.OperationalError as exc:
+            if con.in_transaction:
+                con.rollback()
+            if db_driver.is_busy_error(exc):
+                return _err(
+                    503,
+                    "ENGINE_DB_BUSY",
+                    "engine database is busy; retry this request",
+                    {"retry_after": 2},
+                )
+            return _err(
+                500,
+                "INTERNAL_ERROR",
+                "conversation request failed",
+            )
         except Exception:  # noqa: BLE001 — uniform boundary for handler faults
             if con.in_transaction:
                 con.rollback()

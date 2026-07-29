@@ -91,6 +91,11 @@ class ConversationApiCase(unittest.TestCase):
                 "_wait_for_cli_release",
                 return_value=None,
             ),
+            mock.patch.object(
+                conversation_routes,
+                "_live_shell_session",
+                return_value=None,
+            ),
         )
         for patch in patches:
             patch.start()
@@ -157,6 +162,56 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
+    def test_write_contention_returns_a_retryable_service_error(self) -> None:
+        with mock.patch.object(
+            conversation_routes.db_driver,
+            "write_transaction",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex"},
+                key="busy-create",
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(error["error"]["code"], "ENGINE_DB_BUSY")
+        self.assertEqual(error["error"]["details"]["retry_after"], 2)
+
+    def test_cli_release_drain_runs_before_the_write_transaction(self) -> None:
+        def assert_writer_is_unlocked(shell) -> None:
+            contender = self.connect()
+            try:
+                contender.execute("PRAGMA busy_timeout=10")
+                contender.execute("BEGIN IMMEDIATE")
+                contender.rollback()
+            finally:
+                contender.close()
+            return None
+
+        with mock.patch.object(
+            conversation_routes,
+            "_wait_for_cli_release",
+            side_effect=assert_writer_is_unlocked,
+        ):
+            created = self.create(key="drain-before-write-lock")
+        self.assertEqual(created["state"], "idle")
+
+    def test_create_rechecks_cli_owner_after_the_drain(self) -> None:
+        with mock.patch.object(
+            conversation_routes,
+            "_live_shell_session",
+            return_value="busy",
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex"},
+                key="cli-raced-after-drain",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_BUSY")
+
     def test_creating_a_chat_refuses_a_live_cli_owner(self) -> None:
         with mock.patch.object(
             conversation_routes,
