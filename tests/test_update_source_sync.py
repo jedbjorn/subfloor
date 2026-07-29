@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Source-repo update fast-forwards its checkout before reconciling from it.
+"""Update fast-forwards its checkout before reconciling the engine.
 
-In the source repo `./sc update` skips fetch/materialize and lays the floor FROM
-THE WORKING TREE, so a stale checkout reconciles stale code and reports success.
-These pin the sync that closes that, and — just as load-bearing — the two cases
-where it must REFUSE rather than touch the tree.
+The source repo lays the floor FROM THE WORKING TREE, while installed forks can
+carry app changes that accompany a newer engine. These pin the checkout sync and
+the cases where it must warn rather than touch the tree.
 """
 from __future__ import annotations
 
@@ -53,7 +52,7 @@ class SourceSyncCase(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.object(update, "REPO_ROOT", self.work), \
                 contextlib.redirect_stdout(buf):
-            update.sync_source_checkout()
+            update.sync_repo_checkout()
         return buf.getvalue()
 
     def fall_behind(self, n: int = 1) -> str:
@@ -93,31 +92,50 @@ class SourceSyncCase(unittest.TestCase):
         parents = git(self.work, "rev-list", "--parents", "-n", "1", "HEAD").split()
         self.assertEqual(len(parents), 2, f"HEAD is not a linear commit: {parents}")
 
+    def test_sync_invokes_pull_with_explicit_ff_only(self):
+        self.fall_behind()
+        with mock.patch.object(update, "REPO_ROOT", self.work), \
+                mock.patch.object(update, "git", wraps=update.git) as git_spy, \
+                contextlib.redirect_stdout(io.StringIO()):
+            update.sync_repo_checkout()
+        self.assertIn(
+            mock.call("pull", "--ff-only", check=False),
+            git_spy.call_args_list,
+        )
+
     def test_already_current_is_a_quiet_noop(self):
         before = self.head()
         out = self.sync()
         self.assertEqual(self.head(), before)
         self.assertIn("already current", out)
 
-    # ── the declines: warn, leave the tree alone, let the update through ─────
+    # ── local work: pull when safe, warn and continue when Git refuses ────────
     #
     # ADVISORY, NEVER BLOCKING (FnB ruling 2026-07-27): an operator who cannot
     # update is a worse failure than one updating a commit behind. Each leg
     # asserts BOTH halves — the tree is untouched AND the update is not stopped.
 
-    def test_uncommitted_work_warns_and_does_not_block(self):
-        """The main checkout is the running server's tree — never fast-forward
-        one holding work in flight. But never refuse the update over it."""
+    def test_nonoverlapping_uncommitted_work_allows_fast_forward(self):
+        """Git can preserve unrelated work while applying a safe ff-only pull."""
         tip = self.fall_behind()
         (self.work / "scratch.txt").write_text("operator work in flight\n")
-        before = self.head()
-        out = self.sync()   # must NOT raise — SystemExit would fail the test here
-        self.assertEqual(self.head(), before, "fast-forwarded over work in flight")
-        self.assertNotEqual(self.head(), tip)
+        out = self.sync()
+        self.assertEqual(self.head(), tip, "safe fast-forward was skipped")
         self.assertTrue((self.work / "scratch.txt").exists(),
                         "the operator's file was discarded")
-        self.assertIn("uncommitted changes", out)
-        self.assertIn("stale", out, "the warning must say the floor will be stale")
+        self.assertIn("fast-forwarded", out)
+
+    def test_overlapping_uncommitted_work_warns_without_blocking(self):
+        """Git refuses an unsafe pull; update keeps its recovery path open."""
+        tip = self.fall_behind()
+        (self.work / "a.txt").write_text("operator edit\n")
+        before = self.head()
+        out = self.sync()   # must NOT raise — SystemExit would fail the test here
+        self.assertEqual(self.head(), before)
+        self.assertNotEqual(self.head(), tip)
+        self.assertEqual((self.work / "a.txt").read_text(), "operator edit\n")
+        self.assertIn("git pull --ff-only", out)
+        self.assertIn("Updating anyway", out)
 
     def test_diverged_warns_without_merging_resetting_or_blocking(self):
         tip = self.fall_behind()
@@ -127,7 +145,7 @@ class SourceSyncCase(unittest.TestCase):
         before = self.head()
         out = self.sync()   # must NOT raise
         self.assertEqual(self.head(), before, "diverged branch was moved")
-        self.assertIn("diverged", out)
+        self.assertIn("git pull --ff-only", out)
         # the upstream commit must NOT have been merged in
         merged = git(self.work, "branch", "--contains", tip, "--format=%(refname)")
         self.assertEqual(merged, "", "upstream commit was merged despite divergence")
@@ -176,23 +194,43 @@ class SourceSyncWiringCase(unittest.TestCase):
 
     def test_source_repo_update_syncs_before_reconciling(self):
         with mock.patch.object(update, "is_source_repo", return_value=True), \
-                mock.patch.object(update, "preflight_live_state"), \
                 mock.patch.object(update, "ensure_workflows", side_effect=Stop), \
-                mock.patch.object(update, "sync_source_checkout",
+                mock.patch.object(update, "sync_repo_checkout",
                                   side_effect=Stop) as sync, \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(Stop):
                 update.main([])
         sync.assert_called_once()
 
+    def test_installed_fork_syncs_checkout_before_fetching_engine(self):
+        order = []
+
+        def stop_after_fetch(*_args, **_kwargs):
+            order.append("fetch")
+            raise Stop
+
+        with mock.patch.object(update, "is_source_repo", return_value=False), \
+                mock.patch.object(
+                    update, "sync_repo_checkout",
+                    side_effect=lambda: order.append("pull"),
+                ) as sync, mock.patch.object(
+                    update, "fetch_update_ref",
+                    side_effect=stop_after_fetch,
+                ) as fetch, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(Stop):
+                update.main([])
+        sync.assert_called_once()
+        fetch.assert_called_once_with("main", ref=None)
+        self.assertEqual(order, ["pull", "fetch"])
+
     def test_no_fetch_opts_out_of_the_sync(self):
         """--no-fetch means touch no network; it stays the escape hatch for
         reconciling a tree deliberately. Positive control: the test above shows
         this same harness DOES reach the sync without the flag."""
         with mock.patch.object(update, "is_source_repo", return_value=True), \
-                mock.patch.object(update, "preflight_live_state"), \
+                mock.patch.object(update, "warn_live_state"), \
                 mock.patch.object(update, "ensure_workflows", side_effect=Stop), \
-                mock.patch.object(update, "sync_source_checkout") as sync, \
+                mock.patch.object(update, "sync_repo_checkout") as sync, \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(Stop):
                 update.main(["--no-fetch"])

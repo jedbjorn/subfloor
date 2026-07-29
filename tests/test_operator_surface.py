@@ -162,6 +162,16 @@ class EnterPreAttachPrintTest(unittest.TestCase):
 class HelpChartTest(unittest.TestCase):
     """A live verb absent from the chart is a verb its operator cannot find."""
 
+    def test_update_help_matches_warning_and_ff_only_runtime_contract(self):
+        help_text = sc("help").stdout
+        update_block = help_text.split("./sc update", 1)[1].split(
+            "./sc update-harnesses", 1
+        )[0]
+        self.assertIn("ACTIVE sprints warn and continue", update_block)
+        self.assertIn("git pull --ff-only", update_block)
+        self.assertIn("engine update continues", update_block)
+        self.assertNotIn("refuses while any sprint", update_block)
+
     def test_every_dispatch_verb_is_charted(self):
         help_text = sc("help").stdout
         uncharted = [

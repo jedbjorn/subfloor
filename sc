@@ -1573,11 +1573,11 @@ super-coder — forkable shell substrate
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
-                             refuses while any sprint is ACTIVE
+                             ACTIVE sprints warn and continue; their rows and board state are preserved
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
-                             source repo: no materialize — the floor is reconciled FROM the checkout, so it is fast-forwarded first.
-                             Advisory, never blocking: a tree it cannot fast-forward (uncommitted work, or diverged) WARNS that the
-                             floor will be stale and updates anyway. Never merges, rebases or resets. --no-fetch skips the sync.
+                             first runs git pull --ff-only for any tracked checkout; source repos then reconcile FROM that tree.
+                             Advisory, never blocking: an unsafe/offline pull WARNS and engine update continues from the current
+                             checkout. Update never merges, rebases or resets. --no-fetch skips checkout and engine network sync.
   ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
                              (they are baked, never mounted — so a running sandbox keeps the old ones until ./sc restart)
                              without docker, updates this host's CLIs instead — there the host IS the runtime
