@@ -73,26 +73,28 @@ main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
 /* ── Browser-native Interface ───────────────────────────────────────────────
    The old Interface rail/transcript silhouette, without its embedded terminal
    or tmux/session-management layer. */
-body.interface-view main { display: flex; padding: 0; min-height: calc(100dvh - 52px); }
+body.interface-view { height: 100dvh; overflow: hidden; }
+body.interface-view main {
+  display: flex; flex: 1 1 auto; height: calc(100dvh - 52px);
+  min-height: 0; padding: 0; overflow: hidden;
+}
 #view-interface {
-  max-width: none; margin: 0; gap: 0; min-height: calc(100dvh - 52px);
+  max-width: none; height: 100%; min-height: 0; margin: 0; gap: 0;
 }
 .chat-loading { color: var(--dim); padding: 2rem; }
 .chat-layout {
-  display: grid; grid-template-columns: 198px 260px minmax(0, 1fr);
-  min-height: calc(100dvh - 52px); background: var(--panel2);
+  display: grid; grid-template-columns: 260px 260px minmax(0, 1fr);
+  height: 100%; min-height: 0; background: var(--panel2);
 }
 .chat-rail, .chat-history {
   min-width: 0; border-right: 1px solid var(--line); background: var(--bg);
-  overflow-y: auto;
 }
-.chat-rail { padding: .8rem .6rem; }
-.chat-rail-title, .chat-shell-group {
+.chat-rail { padding: .8rem .6rem; overflow-y: auto; }
+.chat-rail-title {
   color: var(--dim); font-size: .66rem; text-transform: uppercase;
   letter-spacing: .14em; padding: .35rem .55rem;
 }
 .chat-rail-title { color: var(--ink); font-size: .74rem; margin-bottom: .45rem; }
-.chat-shell-group { margin-top: .65rem; border-top: 1px solid var(--line-soft); padding-top: .7rem; }
 .chat-shell {
   position: relative; width: 100%; display: flex; align-items: center; gap: .45rem;
   background: transparent; border: 1px solid transparent; color: var(--dim);
@@ -110,24 +112,26 @@ body.interface-view main { display: flex; padding: 0; min-height: calc(100dvh - 
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none;
 }
 .chat-shell.selected .chat-shell-shortname { color: rgba(255,255,255,.72); }
-.chat-history { background: var(--panel); display: flex; flex-direction: column; }
+.chat-history {
+  min-height: 0; overflow: hidden; background: var(--panel);
+  display: flex; flex-direction: column;
+}
 .chat-history-head {
   padding: .8rem; border-bottom: 1px solid var(--line);
-  display: flex; align-items: center; gap: .6rem; min-height: 67px;
+  display: flex; flex: none; align-items: center; gap: .6rem; min-height: 67px;
 }
-.chat-history-shell { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; }
-.chat-history-actions {
-  display: flex; flex-direction: column; align-items: stretch; gap: .1rem; flex: none;
+.chat-history-shell {
+  min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis;
 }
-.chat-history-actions .act { margin: 0; padding: .34rem .65rem; white-space: nowrap; }
+.chat-history-head > .act { margin: 0; padding: .34rem .65rem; white-space: nowrap; }
 .chat-configure {
-  background: transparent; border: 0; color: var(--accent); cursor: pointer;
-  font: inherit; font-size: .67rem; padding: .08rem .25rem;
+  display: block; background: transparent; border: 0; color: var(--accent);
+  cursor: pointer; font: inherit; font-size: .67rem; padding: .08rem 0;
 }
 .chat-configure:hover { color: #fff; }
 .chat-configure:disabled { cursor: default; opacity: .45; }
 .chat-shortname { color: var(--dim); font: .76rem ui-monospace, monospace; }
-.chat-history-list { overflow-y: auto; padding: .5rem; }
+.chat-history-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: .5rem; }
 .chat-history-item {
   width: 100%; background: transparent; color: var(--dim); border: 1px solid transparent;
   border-radius: 9px; padding: .6rem; cursor: pointer; text-align: left;
@@ -259,7 +263,7 @@ body.interface-view main { display: flex; padding: 0; min-height: calc(100dvh - 
 .chat-new-form .act { margin-top: 1rem; }
 
 @media (max-width: 900px) {
-  .chat-layout { grid-template-columns: 145px 210px minmax(0, 1fr); }
+  .chat-layout { grid-template-columns: 210px 210px minmax(0, 1fr); }
   .chat-actions { flex-wrap: wrap; justify-content: flex-end; }
   .chat-pane-head { align-items: start; }
 }

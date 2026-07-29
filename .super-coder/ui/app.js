@@ -3653,30 +3653,33 @@ async function renderInterface(root) {
     ...[...new Set(shells.map((item) => item.flavor || "bespoke"))]
       .filter((flavor) => !CHAT_FLAVOR_ORDER.includes(flavor)).sort(),
   ];
-  for (const flavor of orderedFlavors) {
-    rail.append(el("div", { className: "chat-shell-group" }, flavor || "bespoke"));
-    for (const item of shells.filter((candidate) => (candidate.flavor || "bespoke") === flavor)) {
-      const active = allConversations.items.find(
-        (conversation) => conversation.shell.shell_id === item.shell_id
-          && conversation.state !== "closed");
-      const button = el("button", {
-        className: "chat-shell"
-          + (item.shell_id === shell.shell_id ? " selected" : "")
-          + (active ? " active-chat" : ""),
-        type: "button",
-      },
-      el("span", { className: "chat-shell-name" }, item.display_name),
-      el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
-      button.onclick = () => {
-        if (item.shell_id === shell.shell_id) return;
-        location.hash = chatHash(item.shortname);
-      };
-      rail.append(button);
-    }
+  const orderedShells = orderedFlavors.flatMap((flavor) =>
+    shells.filter((item) => (item.flavor || "bespoke") === flavor));
+  for (const item of orderedShells) {
+    const active = allConversations.items.find(
+      (conversation) => conversation.shell.shell_id === item.shell_id
+        && conversation.state !== "closed");
+    const button = el("button", {
+      className: "chat-shell"
+        + (item.shell_id === shell.shell_id ? " selected" : "")
+        + (active ? " active-chat" : ""),
+      type: "button",
+    },
+    el("span", { className: "chat-shell-name" }, item.display_name),
+    el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
+    button.onclick = () => {
+      if (item.shell_id === shell.shell_id) return;
+      location.hash = chatHash(item.shortname);
+    };
+    rail.append(button);
   }
 
   const side = el("aside", { className: "chat-history" });
-  const newChat = el("button", { className: "act primary", type: "button", textContent: "＋ New chat" });
+  const newChat = el("button", {
+    className: "act primary",
+    type: "button",
+    textContent: "＋ Chat",
+  });
   const configure = el("button", {
     className: "chat-configure",
     type: "button",
@@ -3694,7 +3697,7 @@ async function renderInterface(root) {
       toast(`${error.code}: ${error.message}`);
       newChat.disabled = false;
       configure.disabled = false;
-      newChat.textContent = "＋ New chat";
+      newChat.textContent = "＋ Chat";
     }
   };
   configure.onclick = async () => {
@@ -3706,9 +3709,11 @@ async function renderInterface(root) {
     location.hash = chatHash(shell.shortname, CHAT_CONFIGURE_ROUTE);
   };
   side.append(el("div", { className: "chat-history-head" },
-    el("div", { className: "chat-history-shell" }, el("b", {}, shell.display_name),
-      el("span", { className: "chat-shortname" }, ` /${shell.shortname}`)),
-    el("div", { className: "chat-history-actions" }, newChat, configure)));
+    el("div", { className: "chat-history-shell" },
+      el("div", {}, el("b", {}, shell.display_name),
+        el("span", { className: "chat-shortname" }, ` /${shell.shortname}`)),
+      configure),
+    newChat));
   const history = el("div", { className: "chat-history-list" });
   for (const conversation of conversations) {
     const button = el("button", {
