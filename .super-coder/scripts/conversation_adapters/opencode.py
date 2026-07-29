@@ -301,10 +301,8 @@ class OpenCodeAdapter(ConversationAdapter):
         session_ref: str,
         context: ConversationContext,
         message: str,
-        run_ref: str,
     ) -> None:
         body: dict[str, Any] = {
-            "messageID": run_ref,
             "parts": [{"type": "text", "text": message}],
         }
         route = self._route(context)
@@ -353,7 +351,7 @@ class OpenCodeAdapter(ConversationAdapter):
                 "resumed": resumed,
             },
         )
-        self._prompt(session_ref, context, message, run_ref)
+        self._prompt(session_ref, context, message)
         return turn
 
     def start(self, context: ConversationContext, message: str) -> NativeTurn:

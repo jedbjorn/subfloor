@@ -534,6 +534,11 @@ class ConversationAdapterTest(unittest.TestCase):
             if request[1].endswith("/message")
         )
         self.assertEqual(prompt[2]["directory"], str(self.root))
+        self.assertNotIn(
+            "messageID",
+            prompt[3],
+            "OpenCode must generate its own ordered native message id",
+        )
         self.assertEqual(
             prompt[3]["model"],
             {"providerID": "openrouter", "modelID": "test-model"},
