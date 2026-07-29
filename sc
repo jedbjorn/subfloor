@@ -173,9 +173,10 @@ dnet() {
 
 # Sandbox harness freshness. The harness CLIs are baked into the image (their
 # binaries are host-ABI artifacts — see install.py's harness-epoch note for why
-# they can never be mounted in like creds), and docker serves those installer
-# layers from cache forever. The epoch is their expiry: rolling it re-runs the
-# installers on the next build, and nothing else in the image is invalidated.
+# host state mounts must never choose them), and docker serves those installer
+# layers from cache forever. The epoch is their cache key: rolling it re-runs
+# the installers on the next build, and nothing else above the harness seam is
+# invalidated.
 # install.py owns the value + its file; these are thin readers so there is one
 # implementation of it, not two that can disagree.
 harness_epoch()      { "$PY" "$S/install.py" --harness-epoch; }
@@ -1151,18 +1152,20 @@ case "$cmd" in
   update)            exec "$PY" "$S/update.py" "$@" ;;
   # Refresh the harness CLIs the SHELLS run — which, on the docker path, means
   # the image and nothing else. Running the installers on the host here is what
-  # this command used to do, and it reported success while changing nothing: the
-  # container mounts creds (~/.claude, ~/.codex, …), never binaries, and every
-  # launch `docker rm -f`s the writable layer that an in-container install would
-  # land in. So: roll the epoch, rebuild, and name the restart that runs it.
+  # this command used to do, and it reported success while changing nothing:
+  # the container mounts harness state homes but image-owned launchers must
+  # resolve image-owned binaries, and every launch `docker rm -f`s the writable
+  # layer that an in-container install would land in. So: roll the epoch,
+  # rebuild, and name the no-rebuild bounce that activates exactly this image.
   # Without docker the host IS the runtime, so the installers are correct there.
   update-harnesses)
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-      echo "→ harness epoch rolled to $(harness_epoch_roll)"
+      epoch="$(harness_epoch_roll)"
+      echo "→ harness epoch rolled to $epoch"
       dbuild
       echo "→ image rebuilt with fresh harness CLIs"
       sc_harness_status || true
-      echo "  running sandboxes keep the OLD image until they restart: ./sc restart"
+      echo "  running sandboxes keep the OLD image until they restart: ./sc restart --no-build"
     else
       echo "→ no docker — updating this host's harness CLIs (the no-docker runtime)"
       "$PY" "$S/install.py" --update-harnesses
@@ -1478,9 +1481,10 @@ case "$cmd" in
   # dos-e), so: typed confirmation (only YES / Yes / yes proceed — anything
   # else, including a closed stdin, aborts) + a WAL-safe DB backup BEFORE
   # anything is torn down. --yes/-y skips the prompt for scripted callers.
-  # --no-build validates the existing image before down; the default path
-  # likewise completes its build before down, so a known preflight failure
-  # cannot strand a healthy fork offline.
+  # --no-build validates and deliberately reuses the existing image. The
+  # default path gives every harness installer a fresh cache key, then completes
+  # that build before down, so a network/install failure cannot strand a
+  # healthy fork offline.
   restart)
     assume_yes=""
     no_build=""
@@ -1490,6 +1494,7 @@ case "$cmd" in
         --no-build) no_build=1 ;;
         -h|--help)
           echo "usage: ./sc restart [-y|--yes] [--no-build]"
+          echo "  default     refresh harness CLIs, rebuild the image, then bounce"
           echo "  --no-build  reuse the existing $IMG:latest image; preflight before down"
           exit 0 ;;
         *)
@@ -1508,7 +1513,13 @@ case "$cmd" in
       esac
     fi
     dcheck
-    if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
+    if [ -n "$no_build" ]; then
+      dimage_preflight
+    else
+      epoch="$(harness_epoch_roll)"
+      echo "→ refresh harnesses for restart (epoch $epoch)"
+      dbuild
+    fi
     backup_dir="$(sc_db_backup_preflight)"
     sc_db_backup prerestart "$backup_dir"
     if ! "$0" down; then
@@ -1523,7 +1534,10 @@ case "$cmd" in
   build)
     dcheck
     case "${1:-}" in
-      --harnesses) echo "→ harness epoch rolled to $(harness_epoch_roll)"; shift ;;
+      --harnesses)
+        epoch="$(harness_epoch_roll)"
+        echo "→ harness epoch rolled to $epoch"
+        shift ;;
       "") : ;;
       *) echo "sc build: unknown argument '$1' (usage: ./sc build [--harnesses])" >&2; exit 2 ;;
     esac
@@ -1579,7 +1593,7 @@ super-coder — forkable shell substrate
                              Advisory, never blocking: an unsafe/offline pull WARNS and engine update continues from the current
                              checkout. Update never merges, rebases or resets. --no-fetch skips checkout and engine network sync.
   ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
-                             (they are baked, never mounted — so a running sandbox keeps the old ones until ./sc restart)
+                             (they are image-owned — activate that exact build with ./sc restart --no-build)
                              without docker, updates this host's CLIs instead — there the host IS the runtime
   ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
                              (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
@@ -1673,7 +1687,8 @@ super-coder — forkable shell substrate
                              refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services
-                             --yes skips the prompt · --no-build preflights/reuses the existing image
+                             default refreshes every image-owned harness before teardown
+                             --yes skips the prompt · --no-build preflights/reuses the existing image without refreshing
   ./sc build               (re)build the sandbox image · --harnesses also expires the baked harness CLIs so they reinstall
   ./sc logs                tail the sandbox server logs
 

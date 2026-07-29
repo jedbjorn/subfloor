@@ -792,8 +792,9 @@ def expire_sandbox_harnesses() -> str | None:
 
     `ensure_harnesses()` installs into THIS machine's $HOME, which is the whole
     runtime on the no-docker path and none of it on the docker path: the sandbox
-    mounts creds, never binaries, so the CLIs shells actually run are the ones
-    baked into the image — behind a docker layer cache with no expiry of its own.
+    mounts harness state homes, but its launchers must resolve image-owned
+    binaries. Those binaries sit behind a docker layer cache with no expiry of
+    its own.
     An update therefore used to lay a new engine floor on top of harness CLIs
     frozen at whenever the image was first built, with no command able to move
     them (a claude one release short of Opus 5 survived exactly that).
@@ -896,7 +897,7 @@ def main(argv: list[str]) -> int:
     epoch = expire_sandbox_harnesses()
     if epoch:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
-        print("  they reinstall on the next image build — `./sc restart` / `make dos-r`")
+        print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
     migrate_or_rebuild(live_warning_done=True)
 

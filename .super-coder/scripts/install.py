@@ -41,7 +41,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -200,8 +200,9 @@ HARNESS_INSTALL = {
 # Where each installer drops its binary. Checked post-install because the new
 # bin dir is NOT on this process's PATH — the installer edits shell rc files,
 # which only a fresh shell picks up. shutil.which alone would miss a just-
-# installed CLI. (codex's native installer drops into ~/.local/bin, same as
-# claude; ~/.codex is its config/auth home, not the binary.)
+# installed CLI. Codex's native installer drops a launcher into ~/.local/bin,
+# but its standalone package lives under ~/.codex; the Dockerfile relocates
+# that executable because the runtime mounts ~/.codex for durable state.)
 HARNESS_BIN = {
     "claude":   Path.home() / ".local" / "bin" / "claude",
     "opencode": Path.home() / ".opencode" / "bin" / "opencode",
@@ -219,8 +220,9 @@ def _harness_installed(name: str) -> bool:
 # The functions above install harnesses on THIS machine's $HOME. That is the
 # right thing on the no-docker path, where the host IS the runtime — and a no-op
 # for shells on the docker path, where the harness binaries are baked into the
-# `super-coder-sandbox` image and the container mounts only creds (~/.claude,
-# ~/.codex, …), never binaries. Binaries cannot be mounted in: they are host-ABI
+# `super-coder-sandbox` image. The container mounts harness state homes
+# (~/.claude, ~/.codex, …), but an image launcher must never resolve a binary
+# from those mounts. Binaries cannot be host-selected: they are host-ABI
 # artifacts (a darwin binary is fatal in a linux container, vibe's entry point
 # carries an absolute shebang into a host uv interpreter, glibc baselines differ
 # across the distros we support), which is why the Dockerfile bakes them.
@@ -231,17 +233,19 @@ def _harness_installed(name: str) -> bool:
 # update. A claude one release behind Opus 5 therefore stayed one release behind
 # through an update, a harness update, and a restart.
 #
-# The epoch is that layer's expiry. `./sc update` and `./sc update-harnesses`
-# roll it to today; `./sc build` passes it as SC_HARNESS_EPOCH; the Dockerfile
-# references it inside both harness RUNs, so a changed value re-runs the
-# installers (which resolve "latest" themselves — the epoch is an expiry, never
-# a version pin).
+# The epoch is that layer's cache key. `./sc restart`, `./sc update`, and
+# `./sc update-harnesses` roll it; `./sc build` passes it as
+# SC_HARNESS_EPOCH; the Dockerfile references it inside both harness RUNs, so a
+# changed value re-runs the installers (which resolve "latest" themselves —
+# the epoch is an expiry token, never a version pin).
 #
 # MACHINE-scoped, not per-repo: every fork on a host shares the image tag, so
 # the harness layer is a machine fact and a per-repo file would let one fork
-# roll an epoch its neighbours never see. Because the value is a DATE, two forks
-# updating the same day produce the same build arg and the second cache-hits.
-# The path follows the engine's existing host-state idiom (XDG_CONFIG_HOME).
+# roll an epoch its neighbours never see. Every explicit refresh gets a unique
+# UTC token: a normal restart means "ask every installer for current now", even
+# after another refresh earlier the same day. Plain launch/build remain
+# cache-warm; restart --no-build deliberately pins the existing image. The path
+# follows the engine's existing host-state idiom (XDG_CONFIG_HOME).
 HARNESS_EPOCH_UNSET = "0"  # the Dockerfile's default — "never rolled here"
 
 
@@ -265,10 +269,13 @@ def harness_epoch() -> str:
 
 
 def roll_harness_epoch() -> str:
-    """Expire the image's harness layers as of today, and return the value.
-    Idempotent within a day: rolling twice writes the same string, so a second
-    fork's build on the same day still cache-hits instead of re-downloading."""
-    value = date.today().isoformat()
+    """Give the image's harness layers a fresh cache key and return it.
+
+    Each explicit refresh must be unique: restart is the operator's convergence
+    boundary, so a second restart on the same day still asks the official
+    installers for current releases. Microseconds make sequential calls unique
+    while keeping the image label human-readable."""
+    value = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     path = harness_epoch_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value + "\n")

@@ -25,14 +25,13 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from datetime import date
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 INSTALL_PY = ENGINE / "scripts" / "install.py"
-TODAY = date.today().isoformat()
+EPOCH_RE = re.compile(r"\A\d{8}T\d{6}\.\d{6}Z\Z")
 
 
 def run_install(*args: str, epoch_file: Path) -> subprocess.CompletedProcess[str]:
@@ -58,24 +57,25 @@ class HarnessEpochValue(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "0")
 
-    def test_roll_writes_today_and_creates_its_parent_directory(self):
+    def test_roll_writes_unique_utc_token_and_creates_parent(self):
         result = run_install("--roll-harness-epoch", epoch_file=self.epoch_file)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), TODAY)
-        self.assertEqual(self.epoch_file.read_text().strip(), TODAY)
+        value = result.stdout.strip()
+        self.assertRegex(value, EPOCH_RE)
+        self.assertEqual(self.epoch_file.read_text().strip(), value)
 
-    def test_roll_is_idempotent_within_a_day(self):
-        """The value is a DATE on purpose: every fork on a machine shares the
-        image tag, so a second fork updating the same day must produce the same
-        build arg and cache-hit instead of re-downloading five installers."""
+    def test_every_explicit_roll_is_unique(self):
+        """A second same-day restart still asks installers for current."""
         first = run_install("--roll-harness-epoch", epoch_file=self.epoch_file)
         second = run_install("--roll-harness-epoch", epoch_file=self.epoch_file)
-        self.assertEqual(first.stdout.strip(), second.stdout.strip())
+        self.assertNotEqual(first.stdout.strip(), second.stdout.strip())
 
     def test_stored_value_reads_back(self):
-        run_install("--roll-harness-epoch", epoch_file=self.epoch_file)
+        rolled = run_install(
+            "--roll-harness-epoch", epoch_file=self.epoch_file
+        ).stdout.strip()
         result = run_install("--harness-epoch", epoch_file=self.epoch_file)
-        self.assertEqual(result.stdout.strip(), TODAY)
+        self.assertEqual(result.stdout.strip(), rolled)
 
     def test_unreadable_store_reads_as_unrolled_rather_than_failing(self):
         """A build must never be blocked by the freshness bookkeeping — an
@@ -156,6 +156,31 @@ class HarnessEpochDockerfile(unittest.TestCase):
         for costly in ("playwright", "nodesource"):
             with self.subTest(layer=costly):
                 self.assertLess(self.text.index(costly), arg_at)
+
+    def test_codex_launcher_resolves_outside_mounted_state_home(self):
+        """The mounted ~/.codex may contain an older standalone package."""
+        codex_run = next(
+            run for run in self.harness_runs()
+            if "chatgpt.com/codex/install.sh" in run
+        )
+        self.assertIn(
+            'readlink -f "$HOME/.local/bin/codex"', codex_run
+        )
+        self.assertIn(
+            'install -m 0755 "$codex_installed" '
+            '"$HOME/.local/libexec/codex"',
+            codex_run,
+        )
+        self.assertIn(
+            'ln -sfn "$HOME/.local/libexec/codex" '
+            '"$HOME/.local/bin/codex"',
+            codex_run,
+        )
+        self.assertIn(
+            '-v "$HOME/.codex:$HOME/.codex"',
+            (ROOT / "sc").read_text(),
+            "durable Codex state stays mounted; isolate its executable",
+        )
 
 
 class ScFixture:
@@ -269,12 +294,14 @@ class ScHarnessCommands(unittest.TestCase):
     def test_build_harnesses_rolls_first_so_the_layers_expire(self):
         result = self.fx.run("build", "--harnesses")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.fx.build_args().get("SC_HARNESS_EPOCH"), TODAY)
-        self.assertEqual(self.fx.epoch_file.read_text().strip(), TODAY)
+        epoch = self.fx.epoch_file.read_text().strip()
+        self.assertRegex(epoch, EPOCH_RE)
+        self.assertEqual(
+            self.fx.build_args().get("SC_HARNESS_EPOCH"), epoch
+        )
 
     def test_plain_build_does_not_roll(self):
-        """`build` is on the launch/restart path — it must stay a cache-warm
-        no-op, or every restart would re-download five installers."""
+        """Plain build/launch stay cache-warm; restart owns refresh."""
         self.fx.run("build")
         self.assertFalse(self.fx.epoch_file.exists())
 
@@ -283,14 +310,41 @@ class ScHarnessCommands(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertFalse([c for c in self.fx.calls() if c.startswith("docker build")])
 
+    def test_build_harnesses_requires_epoch_persistence_before_build(self):
+        self.fx.epoch_file.parent.mkdir(parents=True)
+        self.fx.epoch_file.mkdir()
+
+        result = self.fx.run("build", "--harnesses")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(
+            [c for c in self.fx.calls() if c.startswith("docker build")]
+        )
+
     def test_update_harnesses_rolls_and_rebuilds_on_the_docker_path(self):
         result = self.fx.run("update-harnesses")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.fx.build_args().get("SC_HARNESS_EPOCH"), TODAY)
+        epoch = self.fx.epoch_file.read_text().strip()
+        self.assertRegex(epoch, EPOCH_RE)
+        self.assertEqual(
+            self.fx.build_args().get("SC_HARNESS_EPOCH"), epoch
+        )
+
+    def test_update_harnesses_requires_epoch_persistence_before_build(self):
+        self.fx.epoch_file.parent.mkdir(parents=True)
+        self.fx.epoch_file.mkdir()
+
+        result = self.fx.run("update-harnesses")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(
+            [c for c in self.fx.calls() if c.startswith("docker build")]
+        )
 
     def test_update_harnesses_does_not_install_onto_the_host_when_docker_runs(self):
         """The old behavior: run the installers here, report success, change
-        nothing a shell can see. The container mounts creds, never binaries.
+        nothing a shell can see. State homes are mounted, but executables stay
+        image-owned.
         Asserted on the stubbed curl rather than on output text, so a regression
         is caught by what the command TRIED to do — and cannot reach the network
         from a test run either way."""
@@ -304,7 +358,7 @@ class ScHarnessCommands(unittest.TestCase):
         keeps the old one until it is bounced. Say so, or the operator reads
         'rebuilt' as 'done' (which is how this bug was reported)."""
         result = self.fx.run("update-harnesses")
-        self.assertIn("./sc restart", result.stdout)
+        self.assertIn("./sc restart --no-build", result.stdout)
 
     def test_harness_status_reports_the_versions_inside_the_sandbox(self):
         result = self.fx.run("harness-status")
@@ -321,13 +375,16 @@ class ScHarnessCommands(unittest.TestCase):
         )
 
     def test_harness_status_flags_an_image_that_owes_a_rebuild(self):
-        self.fx.run("build", "--harnesses")          # epoch rolled to today…
+        self.fx.run("build", "--harnesses")
         result = self.fx.run("harness-status", SC_TEST_LABEL="2020-01-01")
         self.assertIn("predates the stored epoch", result.stdout)
 
     def test_harness_status_is_quiet_when_the_image_matches(self):
         self.fx.run("build", "--harnesses")
-        result = self.fx.run("harness-status", SC_TEST_LABEL=TODAY)
+        result = self.fx.run(
+            "harness-status",
+            SC_TEST_LABEL=self.fx.epoch_file.read_text().strip(),
+        )
         self.assertNotIn("predates the stored epoch", result.stdout)
 
     def test_harness_status_does_not_claim_currency_for_an_unlabelled_image(self):
@@ -357,13 +414,14 @@ class UpdateExpiresSandboxHarnesses(unittest.TestCase):
         self.addCleanup(setattr, self.update_mod.install_mod, "docker_status", real)
 
     def test_update_rolls_the_epoch(self):
-        self.assertEqual(self.update_mod.expire_sandbox_harnesses(), TODAY)
-        self.assertEqual(self.epoch_file.read_text().strip(), TODAY)
+        value = self.update_mod.expire_sandbox_harnesses()
+        self.assertRegex(value, EPOCH_RE)
+        self.assertEqual(self.epoch_file.read_text().strip(), value)
 
     def test_no_docker_rolls_silently_instead_of_describing_a_missing_runtime(self):
         self.docker = {"state": "absent"}
         self.assertIsNone(self.update_mod.expire_sandbox_harnesses())
-        self.assertEqual(self.epoch_file.read_text().strip(), TODAY)
+        self.assertRegex(self.epoch_file.read_text().strip(), EPOCH_RE)
 
 
 if __name__ == "__main__":

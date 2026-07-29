@@ -23,13 +23,14 @@ shows aliases, never the build behind them.
 
 ## Where harnesses actually live
 
-**Baked into the sandbox image, not mounted from the host.** This is the fact
-every wrong guess about this system comes from.
+**Harness executables belong to the sandbox image, never the host mount.** This
+is the fact every wrong guess about this system comes from.
 
-`./sc launch` bind-mounts your harness **creds** — `~/.claude`, `~/.claude.json`,
-`~/.codex`, `~/.vibe`, `~/.kimi-code`, opencode's two dirs — so the container
-reuses the login you already did. It mounts **no binaries**. The CLIs come from
-the image (`.super-coder/Dockerfile`).
+`./sc launch` bind-mounts harness state homes — `~/.claude`, `~/.claude.json`,
+`~/.codex`, `~/.vibe`, `~/.kimi-code`, opencode's two dirs — so authentication,
+sessions, goals, plugins, and other durable state survive container replacement.
+The launchers must still resolve image-owned executables from
+`.super-coder/Dockerfile`.
 
 Three reasons it must stay that way, each of which has already bitten someone:
 
@@ -42,13 +43,18 @@ Three reasons it must stay that way, each of which has already bitten someone:
   without that interpreter tree gives you a dangling shebang.
 - **libc baselines differ.** We support Arch, Ubuntu and macOS hosts against a
   Debian container. Auth is portable JSON; native binaries are not.
+- **State homes can grow packages.** Codex's installer now stores its standalone
+  package under `~/.codex/packages`, inside the state tree we mount. The
+  Dockerfile copies the installed executable to image-owned
+  `~/.local/libexec/codex` and repoints its launcher there, so an older host
+  package cannot mask a newer image package.
 
 The cost of baking is that the CLIs are only as new as the image, and docker
 serves those installer layers from cache indefinitely. Hence the epoch.
 
 ## The harness epoch
 
-`SC_HARNESS_EPOCH` is the **expiry date on the image's harness layers**. It is
+`SC_HARNESS_EPOCH` is the **cache key on the image's harness layers**. It is
 referenced inside both harness `RUN` instructions, so changing it re-runs the
 vendor installers (which resolve "latest" themselves — the epoch is an expiry,
 never a version pin). It sits below the node/playwright/pip layers, so rolling
@@ -58,7 +64,7 @@ it costs the harness downloads and nothing else.
 |---|---|
 | Stored at | `${XDG_CONFIG_HOME:-~/.config}/super-coder/harness-epoch` |
 | Scope | **The machine**, not the repo — every fork shares the `super-coder-sandbox` image tag |
-| Value | Today's date, so two forks rolling on the same day produce one build arg and the second cache-hits |
+| Value | A unique UTC token for every explicit refresh |
 | Unrolled | `0` — the Dockerfile default, so an untouched machine builds exactly what it always did |
 | Recorded in the image | `LABEL sc.harness_epoch`, which is how `harness-status` knows whether a build is owed |
 
@@ -67,21 +73,28 @@ it costs the harness downloads and nothing else.
 | Command | What it does |
 |---|---|
 | `./sc harness-status` / `make dos-harness-status` | Versions **inside the sandbox** + whether the image owes a rebuild |
-| `./sc update-harnesses` / `make dos-update-harnesses` | Roll the epoch, rebuild the image. Says which restart runs it |
-| `./sc build --harnesses` | Same rebuild without the rest of `update-harnesses`' output |
+| `./sc restart` / `make dos-r` | Roll a fresh epoch, rebuild the image, then bounce into it |
+| `./sc restart --no-build` | Deliberately reuse the existing image; no refresh and no build |
+| `./sc update-harnesses` / `make dos-update-harnesses` | Roll and rebuild without bouncing; activate that exact build with `restart --no-build` |
+| `./sc build --harnesses` | Same staged refresh without the rest of `update-harnesses`' output |
 | `./sc build` | Ordinary rebuild — passes the **stored** epoch, so it stays cache-warm |
-| `./sc update` / `make dos-u` | Rolls the epoch as part of the update; the rebuild rides the relaunch you already owe |
+| `./sc update` / `make dos-u` | Marks harness layers stale as part of the update; the normal restart refreshes and activates them |
 
 ## Routine cadence
 
-Nothing to remember. `dos-u` rolls the epoch, and the restart an update already
-requires bakes fresh CLIs. Between updates, `dos-update-harnesses` + `dos-r`.
+Nothing to remember. A normal restart is the convergence boundary: it asks each
+official installer for current, finishes the image build, and only then tears
+down the running sandbox.
 
 ```
-make dos-u                 # engine floor + epoch rolled
-make dos-r                 # rebuild bakes fresh harnesses, sandbox comes back current
+make dos-u                 # update the engine floor
+make dos-r                 # fresh harnesses + safe bounce
 make dos-harness-status    # confirm
 ```
+
+To stage the potentially slow/networked build while the old sandbox keeps
+running, use `make dos-update-harnesses`, then activate that exact image later
+with `./sc restart --no-build`.
 
 ## Runbook: a shell cannot reach a model that exists
 
@@ -105,8 +118,7 @@ docker exec sc-<repo> sh -c 'grep -c "claude-opus-5" "$(readlink -f "$(command -
 **3. Refresh and bounce.**
 
 ```
-make dos-update-harnesses   # rolls the epoch + rebuilds the image
-make dos-r                  # the running container keeps the OLD image until this
+make dos-r                  # refreshes harnesses, builds, then safely bounces
 make dos-harness-status     # verify the new build is what shells got
 ```
 
@@ -118,12 +130,18 @@ CLI-probed routes `available` and models.dev-sourced ones `advisory`.
 ## Gotchas
 
 - **A rebuilt image is not a refreshed sandbox.** Running containers keep the
-  image they started with until `./sc restart`. `harness-status` tells you when
-  those two disagree.
+  image they started with until a bounce. After a staged
+  `update-harnesses`/`build --harnesses`, use `restart --no-build` to activate
+  exactly that image without downloading the harnesses again.
 - **Restart discards in-container installs.** `launch`/`restart` do
   `docker rm -f`, destroying the writable layer. Installing a harness inside a
   running container "works" and then evaporates at the next bounce — which is
-  exactly how a fixed sandbox appears to un-fix itself. Roll the epoch instead.
+  exactly how a fixed sandbox appears to un-fix itself. Let normal restart
+  rebuild the image instead.
+- **Normal restart needs the network.** It refreshes all official installers
+  before teardown. If that build fails, the healthy container remains running
+  and the stored epoch records that a build is still owed. Use `--no-build`
+  only when deliberately pinning/reusing the existing image.
 - **`update-harnesses` without docker does something different, on purpose.**
   There the host *is* the runtime, so it runs the vendor installers against
   `$HOME` as it always did.
@@ -136,9 +154,9 @@ CLI-probed routes `available` and models.dev-sourced ones `advisory`.
 ## Several forks on one machine
 
 They share the image tag, so harnesses are installed **once for all of them** —
-there is no per-container install to repeat. The first fork to roll the epoch on
-a given day rebuilds; every other fork's build that day cache-hits and picks up
-the same CLIs on its next restart.
+there is no per-container installation. Every normal restart deliberately
+requests a fresh image-wide harness build; all later containers use that shared
+image until another explicit refresh changes it.
 
 To see the fleet's drift at a glance:
 
@@ -159,5 +177,6 @@ existed, **nothing anywhere printed the harness CLI version**. The picker and th
 model catalogue show aliases (`opus`, `sonnet`); the launch banner showed ports.
 A sandbox one release behind a new model looked identical to a current one, and
 three separate commands (`update`, `update-harnesses`, `restart`) each reported
-success while changing nothing a shell could see. `./sc launch` now names the
-claude build in its banner, and `harness-status` answers the rest.
+success while changing nothing a shell could see. Normal restart now expires
+the installer layers; `./sc launch` names the Claude build in its banner, and
+`harness-status` answers the rest.
