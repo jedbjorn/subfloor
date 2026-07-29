@@ -69,6 +69,19 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "mdBlock(body)" in interface
 
 
+def test_connection_status_is_encoded_in_the_idle_pill_without_visible_copy():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert 'let streamStatus = "connecting"' in interface
+    assert 'source.onopen = () => onState("connected")' in interface
+    assert 'source.onerror = () => onState("reconnecting")' in interface
+    assert "pill.title = `Connection: ${connectionLabel}`" in interface
+    assert '"stream-disconnected"' in interface
+    assert 'className: "chat-stream-state"' not in interface
+    assert ".chat-stream-state" not in STYLE
+    assert ".chat-state.state-idle.stream-disconnected" in STYLE
+
+
 def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]

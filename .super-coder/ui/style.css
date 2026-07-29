@@ -172,6 +172,9 @@ body.interface-view main {
 .chat-state.state-waiting { color: var(--warn); border-color: rgba(212,145,74,.45); }
 .chat-state.state-error { color: #ef7d86; border-color: rgba(239,125,134,.45); }
 .chat-state.state-idle { color: var(--ok); border-color: rgba(76,175,125,.4); }
+.chat-state.state-idle.stream-disconnected {
+  color: var(--warn); border-color: rgba(212,145,74,.45);
+}
 .chat-state.state-closed { opacity: .6; }
 .chat-pane {
   min-width: 0; min-height: 0; display: grid;
@@ -196,8 +199,6 @@ body.interface-view main {
 .chat-title-button:hover { color: var(--accent); text-decoration: underline; }
 .chat-pane-state { display: flex; align-items: center; gap: .5rem; }
 .chat-queue-state { color: var(--accent); font-size: .68rem; white-space: nowrap; }
-.chat-stream-state { color: var(--dim); font-size: .68rem; }
-.chat-stream-state.reconnecting { color: var(--warn); }
 .chat-actions { display: flex; align-items: center; gap: .35rem; }
 .chat-actions .act { margin: 0; padding: .3rem .65rem; font-size: .72rem; }
 .chat-actions .danger { color: #ef7d86; }

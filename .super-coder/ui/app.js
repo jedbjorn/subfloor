@@ -3394,12 +3394,12 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   let messages = [...initialMessages];
   const events = [];
   const seen = new Set();
+  let streamStatus = "connecting";
 
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
   const state = el("div", { className: "chat-pane-state" });
   const queueState = el("span", { className: "chat-queue-state", hidden: true });
-  const streamState = el("span", { className: "chat-stream-state" }, "connecting");
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
   const transcript = el("div", { className: "chat-transcript" });
@@ -3438,6 +3438,23 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const pending = el("div", { className: "chat-pending", hidden: true });
   const composerRow = el("div", { className: "chat-composer" },
     composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
+  const updateStreamStatus = () => {
+    const pill = state.querySelector(".chat-state");
+    if (!pill) return;
+    const connected = streamStatus === "connected";
+    const connectionLabel = connected
+      ? "Connected"
+      : streamStatus === "reconnecting" ? "Reconnecting" : "Connecting";
+    pill.title = `Connection: ${connectionLabel}`;
+    pill.setAttribute(
+      "aria-label",
+      `${pill.textContent}; connection ${connectionLabel.toLowerCase()}`,
+    );
+    pill.classList.toggle(
+      "stream-disconnected",
+      conversation.state === "idle" && !connected,
+    );
+  };
 
   const retry = async (text) => {
     composer.value = text;
@@ -3470,8 +3487,8 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     const queued = chatQueuedCount(messages);
     queueState.hidden = queued === 0;
     queueState.textContent = `${queued} queued`;
-    state.replaceChildren(
-      chatStatePill(conversation.state), queueState, streamState);
+    state.replaceChildren(chatStatePill(conversation.state), queueState);
+    updateStreamStatus();
     const closed = conversation.state === "closed";
     composer.disabled = closed;
     send.disabled = closed;
@@ -3594,8 +3611,8 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
         refresh();
     },
     (value) => {
-      streamState.textContent = value;
-      streamState.classList.toggle("reconnecting", value === "reconnecting");
+      streamStatus = value;
+      updateStreamStatus();
     },
   );
 }
