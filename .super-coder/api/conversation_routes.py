@@ -482,6 +482,38 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
     conversation_id = "cv_" + uuid.uuid4().hex
     provider = run_mod.session_provider(harness, model)
+    open_conversations = con.execute(
+        "SELECT conversation_id,state FROM conversations "
+        "WHERE mode='normal' AND owner_user_id=? AND state!='closed'",
+        (operator["user_id"],),
+    ).fetchall()
+    running = [
+        row for row in open_conversations
+        if row["state"] in ("queued", "running")
+    ]
+    if running:
+        con.rollback()
+        raise ApiError(
+            409,
+            "BROWSER_CHAT_BUSY",
+            "the open browser chat has a turn in progress",
+            {"conversation_id": running[0]["conversation_id"]},
+        )
+    auto_closed = []
+    for row in open_conversations:
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
+            "last_activity_at=datetime('now'),version=version+1 "
+            "WHERE conversation_id=?",
+            (row["conversation_id"],),
+        )
+        _append_event(
+            con,
+            row["conversation_id"],
+            "conversation.closed",
+            {"status": "closed", "reason": "another browser chat opened"},
+        )
+        auto_closed.append(row["conversation_id"])
     con.execute(
         "INSERT INTO conversations "
         "(conversation_id,shell_id,mode,owner_user_id,harness,provider,model,"
@@ -513,6 +545,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         },
     )
     con.commit()
+    for closed_id in auto_closed:
+        conversation_events.notify(closed_id)
     conversation_events.notify(conversation_id)
     row = _require_conversation(con, conversation_id, operator["user_id"])
     return _json(

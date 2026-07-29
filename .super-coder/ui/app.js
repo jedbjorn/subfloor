@@ -3019,8 +3019,8 @@ async function renderSprints(root) {
 }
 
 // ── Interface / browser-native conversations ────────────────────────────────
-// A browser conversation is a second, independent way to use a shell. It uses
-// the normal CLI preparation path server-side, but deliberately has no
+// A browser conversation owns the shell's single session slot until ended. It
+// uses the normal CLI preparation path server-side, but deliberately has no
 // terminal, tmux controls, or live hand-off between browser and CLI.
 const CHAT_HARNESSES = ["opencode", "claude", "codex"];
 const CHAT_FLAVOR_ORDER = ["cartographer", "admin", "planner", "dev", "reviewer", "devops"];
@@ -3058,6 +3058,26 @@ function chatConversationName(conversation) {
   return conversation.title
     || `Chat · ${conversation.route?.harness || "harness"} · `
       + new Date(`${conversation.created_at}Z`).toLocaleString();
+}
+
+async function chatCloseForSwitch(conversation) {
+  if (!conversation || conversation.state === "closed") return true;
+  if (!["idle", "waiting", "error"].includes(conversation.state)) {
+    toast("Finish or interrupt the current turn before switching chats.");
+    return false;
+  }
+  try {
+    await chatApi(
+      `/conversations/${conversation.conversation_id}`,
+      "PATCH",
+      { version: conversation.version, state: "closed" },
+    );
+    conversation.state = "closed";
+    return true;
+  } catch (error) {
+    toast(`${error.code}: ${error.message}`);
+    return false;
+  }
 }
 
 function chatActivity(events) {
@@ -3382,9 +3402,15 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     } catch (error) { toast(`${error.code}: ${error.message}`); }
     finally { interrupt.disabled = false; }
   };
-  const close = el("button", { className: "act danger", type: "button", textContent: "Close" });
+  const close = el("button", {
+    className: "act danger",
+    type: "button",
+    textContent: "Close",
+  });
   close.onclick = async () => {
-    if (!confirm("Close this conversation? Its transcript will remain available.")) return;
+    if (!confirm(
+      "Close this conversation? Its transcript will remain available."
+    )) return;
     try {
       conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
         "PATCH", { version: conversation.version, state: "closed" });
@@ -3486,12 +3512,22 @@ async function renderInterface(root) {
     root.replaceChildren(el("div", { className: "card muted" }, "No shells."));
     return;
   }
-  const shell = shells.find((item) => item.shortname === chatRouteShell) || shells[0];
+  const openConversation = allConversations.items.find(
+    (item) => item.state !== "closed");
+  const shell = shells.find((item) => item.shortname === chatRouteShell)
+    || (!chatRouteShell && openConversation
+      ? shells.find((item) => item.shell.shell_id === openConversation.shell.shell_id)
+      : null)
+    || shells[0];
   const conversations = allConversations.items.filter(
     (item) => item.shell.shell_id === shell.shell_id);
-  let selectedId = chatRouteConversation;
+  let selectedId = chatRouteConversation
+    || conversations.find((item) => item.state !== "closed")?.conversation_id
+    || "";
   if (selectedId && !conversations.some((item) => item.conversation_id === selectedId))
     selectedId = "";
+  const selectedConversation = allConversations.items.find(
+    (item) => item.conversation_id === selectedId);
 
   const layout = el("div", { className: "chat-layout" });
   const rail = el("aside", { className: "chat-rail" });
@@ -3511,17 +3547,20 @@ async function renderInterface(root) {
         type: "button",
       }, el("span", { className: "chat-shell-name" }, item.display_name));
       if (latest) button.append(chatStatePill(latest.state));
-      button.onclick = () => { location.hash = chatHash(item.shortname); };
+      button.onclick = async () => {
+        if (item.shell_id === shell.shell_id) return;
+        if (await chatCloseForSwitch(selectedConversation))
+          location.hash = chatHash(item.shortname);
+      };
       rail.append(button);
     }
   }
 
   const side = el("aside", { className: "chat-history" });
   const newChat = el("button", { className: "act primary", type: "button", textContent: "＋ New chat" });
-  newChat.onclick = () => {
-    chatRouteConversation = "";
-    history.replaceChildren();
-    chatRenderNew(pane, shell, defaults, catalog);
+  newChat.onclick = async () => {
+    if (await chatCloseForSwitch(selectedConversation))
+      location.hash = chatHash(shell.shortname);
   };
   side.append(el("div", { className: "chat-history-head" },
     el("div", {}, el("b", {}, shell.display_name),
@@ -3538,8 +3577,10 @@ async function renderInterface(root) {
       chatConversationName(conversation)),
       el("span", { className: "chat-history-route" }, chatRouteLabel(conversation)),
       chatStatePill(conversation.state));
-    button.onclick = () => {
-      location.hash = chatHash(shell.shortname, conversation.conversation_id);
+    button.onclick = async () => {
+      if (conversation.conversation_id === selectedId) return;
+      if (await chatCloseForSwitch(selectedConversation))
+        location.hash = chatHash(shell.shortname, conversation.conversation_id);
     };
     history.append(button);
   }

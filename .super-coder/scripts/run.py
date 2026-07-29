@@ -597,11 +597,11 @@ def open_db():
 
 
 def browser_conversation_active(con, shell_id: int) -> bool:
-    """Does a durable browser turn currently own this shell's mutation slot?"""
+    """Does an open browser chat own this shell's single session slot?"""
     try:
         row = con.execute(
-            "SELECT COUNT(*) FROM conversation_runs WHERE shell_id=? "
-            "AND state IN ('leased','starting','running')",
+            "SELECT COUNT(*) FROM conversations WHERE shell_id=? "
+            "AND state!='closed'",
             (shell_id,),
         ).fetchone()
         return row is not None and int(row[0]) > 0
@@ -609,7 +609,7 @@ def browser_conversation_active(con, shell_id: int) -> bool:
         # An older, not-yet-migrated fork has no conversation tables. Its
         # existing CLI launch path must remain usable. Other DB failures must
         # stay fail-closed instead of silently permitting a second surface.
-        if "no such table: conversation_runs" in str(exc):
+        if "no such table: conversations" in str(exc):
             return False
         raise
     except (IndexError, KeyError, TypeError, ValueError):
@@ -1528,9 +1528,8 @@ def main() -> None:
     if browser_conversation_active(con, chosen["shell_id"]):
         con.close()
         sys.exit(
-            f"shell '{chosen['shortname']}' has an active browser turn — "
-            "wait for it to finish or interrupt it in Interface before "
-            "starting a CLI session"
+            f"shell '{chosen['shortname']}': Browser chat is open. "
+            "End it in Interface before starting a CLI session."
         )
     slot_context = None
     if slot is not None:

@@ -10,17 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 
-from conversation_broker import BrokerRun, BrokerStore  # noqa: E402
+import run as run_mod  # noqa: E402
+from conversation_broker import BrokerRun  # noqa: E402
 from conversation_launch import (  # noqa: E402
     ConversationLaunchError,
     ConversationLaunchPreparer,
 )
-import run as run_mod  # noqa: E402
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -126,6 +125,7 @@ def test_preparer_refuses_a_cli_process_holding_the_shell(launch_case):
                 "claimed": False,
             }],
         },
+        liveness_retries=0,
     )
     with pytest.raises(ConversationLaunchError) as caught:
         preparer(make_run(worktree))
@@ -148,6 +148,7 @@ def test_preparer_refuses_an_admin_cli_process_at_the_repo_root(launch_case):
             "processes": [],
             "admin_root_pids": [99],
         },
+        liveness_retries=0,
     )
     with pytest.raises(ConversationLaunchError) as caught:
         preparer(make_run(worktree))
@@ -200,39 +201,69 @@ def test_preparer_rechecks_liveness_after_canonical_preparation(launch_case):
             env={},
         ),
         liveness=lambda: next(snapshots),
+        liveness_retries=0,
     )
     with pytest.raises(ConversationLaunchError) as caught:
         preparer(make_run(worktree))
     assert caught.value.code == "SHELL_BUSY"
 
 
-def test_cli_launch_sees_a_leased_browser_turn(launch_case):
+def test_preparer_waits_for_a_prior_browser_process_to_exit(launch_case):
+    db_path, worktree = launch_case
+    busy = {
+        "supported": True,
+        "processes": [{
+            "pid": 100,
+            "shortname": "dev",
+            "orphaned": False,
+            "claimed": True,
+        }],
+    }
+    clear = {"supported": True, "processes": []}
+    snapshots = iter((busy, clear, clear))
+    sleeps = []
+    preparer = ConversationLaunchPreparer(
+        db_path,
+        prepare_launch=lambda **_: SimpleNamespace(
+            cwd=str(worktree),
+            archive_id=42,
+            harness="codex",
+            model="gpt-test",
+            effort="high",
+            env={},
+        ),
+        liveness=lambda: next(snapshots),
+        liveness_retries=1,
+        liveness_delay=0.05,
+        sleep=sleeps.append,
+    )
+
+    context, archive_id = preparer(make_run(worktree))
+
+    assert context.worktree == worktree
+    assert archive_id == 42
+    assert sleeps == [0.05]
+
+
+def test_cli_launch_is_reserved_until_the_browser_chat_is_ended(launch_case):
     db_path, worktree = launch_case
     con = sqlite3.connect(db_path)
     con.execute(
-        "INSERT INTO conversations "
-        "(conversation_id,shell_id,owner_user_id,harness,worktree,state,"
-        "creation_idempotency_key,creation_request_hash) "
-        "VALUES (?,?,1,'codex',?,'queued','create','hash')",
-        ("cv_" + "b" * 32, 1, str(worktree)),
-    )
-    message_id = con.execute(
-        "INSERT INTO conversation_messages "
-        "(conversation_id,sender_kind,sender_ref,message_kind,body,idempotency_key,"
-        "request_hash,state) VALUES (?,'user','1','prompt','hello','message','hash','queued')",
-        ("cv_" + "b" * 32,),
-    ).lastrowid
-    con.execute(
-        "INSERT INTO conversation_outbox (conversation_id,message_id) VALUES (?,?)",
-        ("cv_" + "b" * 32, message_id),
-    )
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,state,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,?,1,'codex',?,'idle','create','hash')",
+            ("cv_" + "b" * 32, 1, str(worktree)),
+        )
     con.commit()
-    con.close()
-    assert BrokerStore(db_path).claim_next("browser") is not None
-
-    con = sqlite3.connect(db_path)
     try:
         assert run_mod.browser_conversation_active(con, 1)
         assert not run_mod.browser_conversation_active(con, 999)
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE shell_id=1"
+        )
+        con.commit()
+        assert not run_mod.browser_conversation_active(con, 1)
     finally:
         con.close()

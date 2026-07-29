@@ -63,6 +63,9 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'textContent: "Rename"' in interface
     assert 'textContent: "Close"' in interface
     assert 'textContent: "Analytics"' in interface
+    assert "chatCloseForSwitch(selectedConversation)" in interface
+    assert "Finish or interrupt the current turn before switching chats." in interface
+    assert 'item.state !== "closed"' in interface
 
 
 def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
