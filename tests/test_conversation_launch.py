@@ -248,6 +248,7 @@ def test_preparer_waits_for_a_prior_browser_process_to_exit(launch_case):
 def test_cli_launch_is_reserved_until_the_browser_chat_is_ended(launch_case):
     db_path, worktree = launch_case
     con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
     con.execute(
             "INSERT INTO conversations "
             "(conversation_id,shell_id,owner_user_id,harness,worktree,state,"
@@ -259,11 +260,19 @@ def test_cli_launch_is_reserved_until_the_browser_chat_is_ended(launch_case):
     try:
         assert run_mod.browser_conversation_active(con, 1)
         assert not run_mod.browser_conversation_active(con, 999)
+        assert [
+            (shell["shortname"], shell["browser_active"])
+            for shell in run_mod.list_shells(con, 1)
+        ] == [("dev", True)]
         con.execute(
             "UPDATE conversations SET state='closed',closed_at=datetime('now') "
             "WHERE shell_id=1"
         )
         con.commit()
         assert not run_mod.browser_conversation_active(con, 1)
+        assert [
+            (shell["shortname"], shell["browser_active"])
+            for shell in run_mod.list_shells(con, 1)
+        ] == [("dev", False)]
     finally:
         con.close()

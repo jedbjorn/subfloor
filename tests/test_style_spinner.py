@@ -96,6 +96,15 @@ class ShellStatusTest(unittest.TestCase):
         self.assertEqual("Unknown     ", run._shell_status(self.shell, partial))
         self.assertEqual("Unknown     ", run._shell_status(self.shell, unsupported))
 
+    def test_browser_chat_replaces_available_status(self) -> None:
+        browser_shell = {**self.shell, "browser_active": True}
+        with mock.patch.object(style, "ON", True), mock.patch.object(
+                run.shell_liveness, "session_state", return_value=None):
+            self.assertEqual(
+                "\x1b[31mBROWSER\x1b[0m     ",
+                run._shell_status(browser_shell, self.snap),
+            )
+
     def test_sprint_reservation_replaces_only_available(self) -> None:
         sprint_shell = {
             **self.shell,

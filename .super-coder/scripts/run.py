@@ -617,6 +617,19 @@ def browser_conversation_active(con, shell_id: int) -> bool:
         return False
 
 
+def browser_conversation_shell_ids(con) -> set[int]:
+    """Shells whose single session slot is owned by an open browser chat."""
+    try:
+        rows = con.execute(
+            "SELECT DISTINCT shell_id FROM conversations WHERE state!='closed'"
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+    except db_driver.OperationalError as exc:
+        if "no such table: conversations" in str(exc):
+            return set()
+        raise
+
+
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
 def authenticate(con, interactive: bool = True):
@@ -655,6 +668,7 @@ def list_shells(con, user_id: int) -> list:
         "ORDER BY flavor IS NULL, flavor, shell_id",
         (user_id,),
     ).fetchall()]
+    browser_shell_ids = browser_conversation_shell_ids(con)
     refs_by_shell = [_sprint_doc_refs(shell) for shell in shells]
     referenced = set().union(*refs_by_shell)
     active = set()
@@ -669,6 +683,7 @@ def list_shells(con, user_id: int) -> list:
                   if _sprint_doc_is_active(doc)}
     for shell, refs in zip(shells, refs_by_shell):
         shell["sprint_reserved"] = bool(refs & active)
+        shell["browser_active"] = shell["shell_id"] in browser_shell_ids
     return shells
 
 
@@ -899,6 +914,8 @@ def _shell_status(shell, snap: "dict | None") -> str:
     """Styled picker status derived from liveness plus sprint reservation."""
     if shell["flavor"] == "admin":
         label, paint = "Exempt", style.dim
+    elif dict(shell).get("browser_active"):
+        label, paint = "BROWSER", style.red
     elif not snap or not snap.get("supported"):
         label, paint = "Unknown", style.dim
     else:
@@ -1517,8 +1534,8 @@ def main() -> None:
     user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
     # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
-    # boot list can show shell status — Busy / Orphaned / Sprint / Available /
-    # Exempt — and
+    # boot list can show shell status — BROWSER / Busy / Orphaned / Sprint /
+    # Available / Exempt — and
     # confirm before booting into a live worktree. Headless keeps its own lazy
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
