@@ -52,7 +52,7 @@ TEAM_ROSTER = [
     "reviewer",
 ]
 
-from shell_factory import create_shell, flavors  # noqa: E402
+from shell_factory import create_shell, flavors, reconcile_conductor  # noqa: E402
 
 
 def already_seeded(con) -> bool:
@@ -152,6 +152,9 @@ def main(argv: list[str]) -> int:
             cart_id = create_shell(
                 con, flavor="cartographer", name="Cartographer",
                 partner=a.partner or username, repo=repo)
+        conductor_id, _ = reconcile_conductor(
+            con, partner=a.partner or username, repo=repo
+        )
         con.commit()
 
         def _sn(sid):
@@ -168,7 +171,11 @@ def main(argv: list[str]) -> int:
         if cart_id:
             print(f"init_fork: created '{_sn(cart_id)}' (cartographer, shell_id={cart_id}) "
                   "— owns the repo map.")
-        total = 1 + len(team) + (1 if cart_id else 0)
+        print(
+            f"init_fork: created '{_sn(conductor_id)}' "
+            f"(conductor, shell_id={conductor_id}) — role-only sprint relay."
+        )
+        total = 2 + len(team) + (1 if cart_id else 0)
         print(f"init_fork: seeded a {total}-shell team. "
               "next -> `SC_ADMIN=1 ./sc snapshot` (serialize), then `./sc launch`.")
     finally:

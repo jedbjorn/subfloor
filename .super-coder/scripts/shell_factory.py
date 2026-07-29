@@ -101,6 +101,49 @@ def load_flavor(flavor: str) -> dict:
     return _apply_overlay(tpl, ov) if ov else tpl
 
 
+def reconcile_flavor_pack(con, flavor: str) -> int:
+    """Converge one shipped flavor's engine-owned skill baseline.
+
+    Common-inheriting packs keep operator-added opt-ins and receive any new
+    common/template skills. Opt-out packs are exact: anything outside the
+    template's explicit list is removed. This makes
+    ``inherit_common_skills: false`` durable across install, update, and
+    catalogue reseeds.
+    """
+    template = load_flavor(flavor)
+    explicit = tuple(template.get("skills", ()))
+    changed = 0
+    if not template.get("inherit_common_skills", True):
+        if explicit:
+            placeholders = ",".join("?" for _ in explicit)
+            cur = con.execute(
+                "DELETE FROM flavor_skills WHERE flavor=? AND skill_id NOT IN ("
+                f"SELECT skill_id FROM skills WHERE name IN ({placeholders})"
+                ")",
+                (flavor, *explicit),
+            )
+        else:
+            cur = con.execute(
+                "DELETE FROM flavor_skills WHERE flavor=?", (flavor,)
+            )
+        changed += cur.rowcount
+    else:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO flavor_skills (flavor,skill_id) "
+            "SELECT ?,skill_id FROM skills WHERE is_deleted=0 AND common=1",
+            (flavor,),
+        )
+        changed += cur.rowcount
+    for name in explicit:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO flavor_skills (flavor,skill_id) "
+            "SELECT ?,skill_id FROM skills WHERE name=? AND is_deleted=0",
+            (flavor, name),
+        )
+        changed += cur.rowcount
+    return changed
+
+
 def _auto_shortname(con, abbr: str) -> str:
     """Default shortname when the caller gives none: <ABBR><n> — the flavor's
     abbreviation + the next integer (e.g. DEV3, PLN1). Numbered max-suffix + 1
@@ -186,3 +229,80 @@ def create_shell(con, *, flavor: str | None, name: str,
 
     open_session(con, shell_id)
     return shell_id
+
+
+def reconcile_conductor(
+    con, *, partner: str | None = None, repo: str | None = None
+) -> tuple[int, bool]:
+    """Provision exactly one live, role-only ``CON1`` and its exact skill pack.
+
+    Repeated calls are idempotent. Multiple live Conductors or personal
+    identity on an operational Conductor are refused instead of guessed away.
+    """
+    rows = con.execute(
+        "SELECT shell_id,shortname,has_identity,lineage_seed,api_key "
+        "FROM shells WHERE flavor='conductor' AND is_deleted=0 "
+        "ORDER BY shell_id"
+    ).fetchall()
+    if len(rows) > 1:
+        raise ValueError(
+            "multiple live conductor shells found — delete the unintended "
+            "duplicate before reconciliation"
+        )
+    created = not rows
+    if created:
+        occupied = con.execute(
+            "SELECT shell_id FROM shells "
+            "WHERE shortname='CON1' AND is_deleted=0"
+        ).fetchone()
+        if occupied is not None:
+            raise ValueError(
+                "CON1 is already assigned to a non-conductor shell"
+            )
+        shell_id = create_shell(
+            con,
+            flavor="conductor",
+            name="Conductor",
+            shortname="CON1",
+            partner=partner,
+            repo=repo,
+        )
+    else:
+        row = rows[0]
+        shell_id = row["shell_id"]
+        identity_count = con.execute(
+            "SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=?",
+            (shell_id,),
+        ).fetchone()[0]
+        if row["has_identity"] or row["lineage_seed"] or identity_count:
+            raise ValueError(
+                "conductor shell carries personal identity — refusing to "
+                "delete seed or lineage during role-only reconciliation"
+            )
+        if row["shortname"] != "CON1":
+            occupied = con.execute(
+                "SELECT shell_id FROM shells "
+                "WHERE shortname='CON1' AND is_deleted=0 AND shell_id<>?",
+                (shell_id,),
+            ).fetchone()
+            if occupied is not None:
+                raise ValueError(
+                    "CON1 is already assigned to another live shell"
+                )
+            con.execute(
+                "UPDATE shells SET shortname='CON1' WHERE shell_id=?",
+                (shell_id,),
+            )
+        if not row["api_key"]:
+            con.execute(
+                "UPDATE shells SET api_key=?,api_key_rotated_at=datetime('now') "
+                "WHERE shell_id=?",
+                (secrets.token_urlsafe(32), shell_id),
+            )
+
+    # Flavored shells must not retain stale direct rows: the server doctor
+    # treats them as an authority-boundary violation even though the resolved
+    # skill view ignores them.
+    con.execute("DELETE FROM shell_skills WHERE shell_id=?", (shell_id,))
+    reconcile_flavor_pack(con, "conductor")
+    return shell_id, created

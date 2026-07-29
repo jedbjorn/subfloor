@@ -290,6 +290,47 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
         self.assertIn("opencode", self.commands[0])
         self.assertIn(runtime.DEFAULT_CONDUCTOR_MODEL, self.commands[0])
 
+    def test_declared_handoff_is_not_eligible_for_automatic_wake(self):
+        self.set_declared()
+        directive_id = self.emit("planner", "handoff", {}, unit=False)
+        self.con.commit()
+
+        config = runtime.ConductorConfig(
+            True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL
+        )
+        with mock.patch.object(
+            runtime,
+            "doctor",
+            return_value={
+                "enabled": True,
+                "ok": True,
+                "shell_id": 1,
+                "shell": "CON1",
+                "harness": "opencode",
+                "model": runtime.DEFAULT_CONDUCTOR_MODEL,
+            },
+        ):
+            result = runtime.maybe_wake(
+                self.con, config=config, launcher=self.launcher
+            )
+
+        self.assertFalse(result["launched"])
+        self.assertEqual(result["reason"], "no-pending")
+        self.assertEqual(self.commands, [])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT status FROM directives WHERE directive_id=?",
+                (directive_id,),
+            ).fetchone()[0],
+            "pending",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprints WHERE sprint_doc_id=100"
+            ).fetchone()[0],
+            "declared",
+        )
+
     def test_opencode_headless_route_does_not_invent_effort(self):
         adapter = run.load_adapter("opencode")
         self.assertIsNone(run.default_headless_effort(adapter))

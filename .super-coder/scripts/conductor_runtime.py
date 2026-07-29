@@ -280,9 +280,11 @@ def _pending_ids(con) -> list[int]:
     return [
         row[0]
         for row in con.execute(
-            "SELECT directive_id FROM directives "
-            "WHERE status='pending' AND target='conductor' "
-            "ORDER BY directive_id"
+            "SELECT d.directive_id FROM directives d "
+            "JOIN sprints sp ON sp.sprint_doc_id=d.sprint_doc_id "
+            "WHERE d.status='pending' AND d.target='conductor' "
+            "AND sp.state='active' "
+            "ORDER BY d.directive_id"
         )
     ]
 
