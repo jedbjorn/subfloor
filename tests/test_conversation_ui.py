@@ -110,6 +110,11 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert "chatPendingSend.key" in interface
     assert "retry keeps this exact send" in interface
     assert 'event.key === "Enter" && !event.shiftKey' in interface
+    assert "function chatQueuedCount(messages)" in interface
+    assert 'className: "chat-queue-state"' in interface
+    assert 'queueState.textContent = `${queued} queued`' in interface
+    assert 'conversation.state !== "running"' in interface
+    assert 'event.event_type === "run.started") message.state = "running"' in interface
     assert 'textContent: "Interrupt"' in interface
     assert 'textContent: "Retry"' in interface
     assert 'textContent: "Close"' in interface
@@ -126,7 +131,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'textContent: "Rename"' not in interface
     assert "actions.append(analytics, interrupt, close)" in interface
     assert "chatCloseForSwitch(selectedConversation)" in interface
-    assert "Finish or interrupt the current turn before switching chats." in interface
+    assert "Finish the current turn and queued messages before switching chats." in interface
     assert 'item.state !== "closed"' in interface
     shell_switch = interface[
         interface.index('button.onclick = () => {', interface.index("chat-shell-name")):
@@ -167,3 +172,6 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
     assert "grid-template-columns: 198px 260px minmax(0, 1fr)" in STYLE
     assert "grid-template-columns: 145px 210px minmax(0, 1fr)" in STYLE
     assert "grid-template-columns: 101px minmax(0, 1fr)" in STYLE
+    assert ".chat-working-dots" in STYLE
+    assert "@keyframes chat-working-dot" in STYLE
+    assert ".chat-queue-state" in STYLE
