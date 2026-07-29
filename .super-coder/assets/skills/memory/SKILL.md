@@ -11,8 +11,8 @@ All memory = DB rows; no flat files. Write at the moment it matters, never in a
 close ritual.
 
 Every write goes through `sc mem` -> lands in the live shared engine DB, visible
-to all shells on commit. It always targets your own shell (identity resolved
-from your token) — never name a shell.
+to all shells on commit. It always targets your own shell (the engine resolves
+API identity for you) — never name a shell.
 
 ## current_state — rolling status, NOT a log
 

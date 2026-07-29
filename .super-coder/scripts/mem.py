@@ -28,7 +28,7 @@ Discovery still calls the API; it is never a direct-DB path.
 
 Run from the repo root, like every engine command:
 
-    ./sc mem which                                 # confirm API reachability + who your token resolves to
+    ./sc mem which                                 # confirm the memory API is reachable + which shell this session resolves as
     ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
     ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
                                                    # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
@@ -328,7 +328,7 @@ def cmd_which(args) -> int:
     if _DISCOVERED_FROM is not None:
         print(f"credential : discovered from runtime artifact {_DISCOVERED_FROM}")
     else:
-        print("identity   : resolved from your bearer token (SC_API_TOKEN), server-side")
+        print("identity   : resolved by the engine for this launched shell, server-side")
     return 0
 
 
@@ -914,7 +914,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sc mem", description="engine memory surface (over the API)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("which", help="confirm API reachability + who your token resolves to") \
+    sub.add_parser("which", help="confirm the memory API is reachable + which shell this session resolves as") \
        .set_defaults(fn=cmd_which)
 
     sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)}; doc/docs = documents)")
