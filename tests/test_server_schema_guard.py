@@ -331,8 +331,14 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
             ws_handler,
             log=print,
             on_started=None,
+            stream_handler=None,
         ):
             served.append(host)
+            self.assertIs(
+                stream_handler,
+                server.conversation_routes.stream_events,
+                "startup did not wire browser conversation SSE to transport",
+            )
             if on_started is not None:
                 on_started()
             return port
