@@ -147,12 +147,14 @@ git checkout super-coder/main -- .super-coder sc
 # 3. Sign in to your harness once, on the HOST (not inside the sandbox):
 claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
 
-# 4. Launch the sandbox (server + GUI) and attach a session:
+# 4. Launch the sandbox (server + GUI):
 ./sc launch
-./sc enter                      # auth + pick a shell + pick a harness + boot
 
-# 5. Commit the install (engine is gitignored — only sc + .sc-state + config track):
+# 5. Commit the install before creating shell worktrees:
 git add -A && git commit -m "chore: install subfloor"
+
+# 6. Attach a session:
+./sc enter                      # auth + pick a shell + pick a harness + boot
 ```
 
 That's the happy path — you're talking to a planner shell in your repo, with a

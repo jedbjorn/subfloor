@@ -40,14 +40,14 @@ different ways, so keep them straight:
   confirms the API is reachable and who your token resolves to. `sc mem` routes
   through the engine API (no direct-DB fallback). If it reports "API unreachable",
   the engine server is down — surface this to FnB; they restart it with
-  `./sc restart` / `make dos-r`. Do not retry silently; surface the error and stop.
+  `sc restart` / `make dos-r`. Do not retry silently; surface the error and stop.
 - **App product DB** — the database of the product *this repo* builds. Its name
   and path **vary per fork** and live **outside** `.super-coder/`. Holds the
   product's runtime data + schema. Change it the way the product does — schema
   migrations + app code — never by hand-editing rows. Locate it via the repo map:
   the cartographer tags its schema/migrations in `dr_*` (the live `.db` is often
   gitignored, so the schema is the durable anchor). In a sandbox this may be a
-  Postgres sidecar at `$DATABASE_URL` (`./sc launch` starts it); a *set* but empty
+  Postgres sidecar at `$DATABASE_URL` (`sc launch` starts it); a *set* but empty
   `DATABASE_URL` means provision-me via the app's migrations — never "no DB" — see
   the `dev_kit` skill.
 
@@ -189,7 +189,7 @@ host-supervised stack, outside your container. So there are two runtimes with tw
 homes — keep them apart:
 
 - **Project dev servers** (vite, `npm run dev`, etc.) belong in the **sandbox**,
-  bound to `0.0.0.0:$SC_DEV_PORT` — the per-fork port `./sc launch` publishes to
+  bound to `0.0.0.0:$SC_DEV_PORT` — the per-fork port `sc launch` publishes to
   the host for exactly this. Reach it at `http://127.0.0.1:$SC_DEV_PORT`.
 - **A process-supervised host stack** (pm2 / `make`) is owned by its supervisor.
   Start/stop/restart only through it (`make up`, `make restart`) — never a bare
