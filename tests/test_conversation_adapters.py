@@ -81,6 +81,10 @@ class FakeOpenCode:
                     },
                 },
                 {
+                    "type": "session.idle",
+                    "properties": {"sessionID": self.session_ref},
+                },
+                {
                     "type": "session.status",
                     "properties": {
                         "sessionID": self.session_ref,
@@ -531,6 +535,11 @@ class ConversationAdapterTest(unittest.TestCase):
         events = list(adapter.stream(turn))
         self.assertNotIn("wrong", repr(events))
         self.assertIn("permission.requested", [event.type for event in events])
+        self.assertEqual(
+            [event.type for event in events].count("run.completed"),
+            1,
+            "the pre-dispatch idle event must not terminate the new turn",
+        )
 
         fresh = adapter.resume(turn.session_ref, self.context, "again")
         permission_patch = next(

@@ -582,11 +582,27 @@ class OpenCodeAdapter(ConversationAdapter):
             },
             "session.create-or-resume",
         )
+        observed_activity = False
         for raw in native_stream:
             event_session = self._session_of(raw)
             if event_session and event_session != turn.session_ref:
                 continue
             for event in self._normalize(raw):
+                # Opening `/event` for an existing session can enqueue its
+                # current idle state before prompt_async is dispatched. That
+                # idle belongs to the previous turn; accepting it would mark
+                # the new message complete without ever generating a reply.
+                if event.type == "run.completed" and not observed_activity:
+                    continue
+                if event.type in {
+                    "run.started",
+                    "assistant.delta",
+                    "tool.started",
+                    "tool.completed",
+                    "permission.requested",
+                    "input.requested",
+                }:
+                    observed_activity = True
                 if event.type in TERMINAL_EVENTS:
                     turn.metadata["terminal"] = event.type
                 yield event
