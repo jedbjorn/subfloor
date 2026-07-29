@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
+LUNA_MIGRATION = MIGRATIONS / "0127_conductor_luna_default.sql"
 SCRIPTS = ENGINE / "scripts"
 RENDER = ENGINE / "render"
 sys.path.insert(0, str(SCRIPTS))
@@ -81,7 +82,7 @@ class RuntimeFixture(unittest.TestCase):
             "(harness,selector,provider,provider_model,source,availability,"
             "stale,headless_supported,high_effort_supported,"
             "supported_efforts,last_seen_at) "
-            "VALUES ('opencode',?,'ollama-cloud','gpt-oss:20b',"
+            "VALUES ('opencode',?,'openai','gpt-5.6-luna',"
             "'opencode-cli','available',0,1,0,'[]',datetime('now'))",
             (runtime.DEFAULT_CONDUCTOR_MODEL,),
         )
@@ -147,6 +148,10 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
         return probe
 
     def test_template_migration_and_boot_have_exact_skill_and_are_exhaustive(self):
+        self.assertEqual(
+            runtime.DEFAULT_CONDUCTOR_MODEL,
+            "openai/gpt-5.6-luna",
+        )
         template = json.loads((ENGINE / "templates/shells/conductor.json").read_text())
         self.assertEqual(template["flavor"], "conductor")
         self.assertEqual(template["skills"], ["sprint_cond"])
@@ -184,6 +189,35 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
             1,
         )
         self.assertEqual(composed, rendered)
+
+    def test_luna_migration_upgrades_only_the_shipped_conductor_route(self):
+        self.con.execute(
+            "UPDATE flavor_defaults SET model='ollama-cloud/gpt-oss:20b' "
+            "WHERE flavor='conductor' AND harness='opencode'"
+        )
+        self.con.commit()
+        self.con.executescript(LUNA_MIGRATION.read_text())
+        self.assertEqual(
+            self.con.execute(
+                "SELECT model FROM flavor_defaults "
+                "WHERE flavor='conductor' AND harness='opencode'"
+            ).fetchone()[0],
+            runtime.DEFAULT_CONDUCTOR_MODEL,
+        )
+
+        self.con.execute(
+            "UPDATE flavor_defaults SET model='ollama-cloud/gpt-oss:120b' "
+            "WHERE flavor='conductor' AND harness='opencode'"
+        )
+        self.con.commit()
+        self.con.executescript(LUNA_MIGRATION.read_text())
+        self.assertEqual(
+            self.con.execute(
+                "SELECT model FROM flavor_defaults "
+                "WHERE flavor='conductor' AND harness='opencode'"
+            ).fetchone()[0],
+            "ollama-cloud/gpt-oss:120b",
+        )
 
     def test_doctor_proves_cli_shell_exact_skill_and_route(self):
         config = runtime.ConductorConfig(True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL)

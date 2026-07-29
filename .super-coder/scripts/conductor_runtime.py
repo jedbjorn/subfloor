@@ -29,7 +29,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 INSTANCE_CONFIG = ENGINE / "instance.json"
 CONDUCTOR_HARNESS = "opencode"
-DEFAULT_CONDUCTOR_MODEL = "ollama-cloud/gpt-oss:20b"
+DEFAULT_CONDUCTOR_MODEL = "openai/gpt-5.6-luna"
 _LAUNCH_GUARD_SECONDS = 20
 LAUNCH_LOG = ENGINE / "logs" / "conductor-launches.log"
 
