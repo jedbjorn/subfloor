@@ -18,6 +18,7 @@ from .base import (
 )
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter, JsonLineRpcProcess, RpcTransport
+from .kimi import KimiAdapter
 from .opencode import OpenCodeAdapter
 
 
@@ -25,6 +26,7 @@ ADAPTER_TYPES = {
     "opencode": OpenCodeAdapter,
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
+    "kimi": KimiAdapter,
 }
 
 
@@ -49,6 +51,7 @@ __all__ = [
     "ConversationContext",
     "InterruptResult",
     "JsonLineRpcProcess",
+    "KimiAdapter",
     "NativeTurn",
     "NormalizedEvent",
     "OpenCodeAdapter",

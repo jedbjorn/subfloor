@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTERS = ROOT / ".super-coder" / "adapters"
 PROBES = ROOT / "tests" / "fixtures" / "conversations" / "capability_probes.json"
-REQUIRED = ("opencode", "claude", "codex")
+REQUIRED = ("opencode", "claude", "codex", "kimi")
 CAPABILITIES = {
     "exact_session_resume",
     "structured_streaming",
@@ -135,11 +135,39 @@ class ConversationCapabilityContractTest(unittest.TestCase):
             ["resume_after_server_restart"]
         )
 
-    def test_kimi_reference_does_not_widen_the_release_gate(self) -> None:
-        kimi = self.probes["reference_only"]["kimi"]
-        self.assertEqual(kimi["exact_worktree_field"], "workDir")
-        self.assertIn("turn.cancel", kimi["observed_events"])
-        self.assertFalse(kimi["release_gate_member"])
+    def test_kimi_uses_prompt_mode_and_native_store_identity(self) -> None:
+        conversation = self.adapter("kimi")["conversation"]
+        probe = self.probes["required_harnesses"]["kimi"]
+        self.assertEqual(conversation["driver"], "kimi-print")
+        self.assertEqual(conversation["session_ref"], {
+            "source": "native-session-store",
+            "field": "session-directory-name",
+        })
+        self.assertEqual(
+            conversation["start"]["identity_source"],
+            "new-main-wire-turn.prompt",
+        )
+        self.assertEqual(
+            conversation["resume"],
+            {
+                "session_flag": "-S",
+                "identity_source": "appended-main-wire-turn.prompt",
+            },
+        )
+        self.assertEqual(
+            conversation["stream"]["transport"],
+            "stdout-jsonl-with-raw-interleave",
+        )
+        self.assertEqual(
+            conversation["permission_policy"],
+            "kimi-prompt-auto-mode",
+        )
+        self.assertFalse(
+            conversation["capabilities"]["interactive_permission_response"]
+        )
+        self.assertFalse(conversation["capabilities"]["server_backed"])
+        self.assertIn("session.resume_hint", probe["observed_events"])
+        self.assertIn("turn.cancel", probe["observed_events"])
 
 
 if __name__ == "__main__":

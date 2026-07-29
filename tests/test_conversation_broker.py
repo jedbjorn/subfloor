@@ -49,12 +49,18 @@ class FakeAdapter:
         terminal: str = "run.completed",
         reconcile: ReconcileResult | None = None,
         block: bool = False,
+        harness: str = "codex",
+        native_session_ref: str = "native-session",
+        native_run_ref: str | None = None,
     ) -> None:
+        self.harness = harness
         self.terminal = terminal
         self.reconcile_result = reconcile or ReconcileResult(
             "succeeded", True, "fake exact run completed"
         )
         self.block = block
+        self.native_session_ref = native_session_ref
+        self.native_run_ref = native_run_ref
         self.interrupted = threading.Event()
         self.started = 0
         self.resumed = 0
@@ -69,8 +75,8 @@ class FakeAdapter:
         self.started += 1
         return NativeTurn(
             harness=self.harness,
-            session_ref="native-session",
-            run_ref=f"native-run-{self.started}",
+            session_ref=self.native_session_ref,
+            run_ref=self.native_run_ref or f"native-run-{self.started}",
             worktree=context.checked_worktree(),
         )
 
@@ -166,6 +172,7 @@ class ConversationBrokerCase(unittest.TestCase):
         shell_id: int = 1,
         state: str = "queued",
         session_ref: str | None = None,
+        harness: str = "codex",
     ) -> str:
         self.serial += 1
         key = f"conversation-{self.serial}"
@@ -174,9 +181,10 @@ class ConversationBrokerCase(unittest.TestCase):
             "INSERT INTO conversations "
             "(shell_id,owner_user_id,harness,worktree,state,"
             "harness_session_ref,creation_idempotency_key,"
-            "creation_request_hash) VALUES (?,1,'codex',?,?,?,?,?)",
+            "creation_request_hash) VALUES (?,1,?,?,?,?,?,?)",
             (
                 shell_id,
+                harness,
                 str(self.worktree),
                 state,
                 session_ref,
@@ -545,6 +553,64 @@ class ServiceContractTest(ConversationBrokerCase):
             self.fail("post-commit notification did not dispatch the turn")
         self.assertEqual(len(adapters), 1)
         self.assertEqual(adapters[0].started, 1)
+
+    def test_kimi_native_identities_are_persisted_before_first_event(
+        self,
+    ) -> None:
+        session_ref = (
+            "session_11111111-1111-4111-8111-111111111111"
+        )
+        run_ref = "kimi-1785365142363-22866"
+        adapter = FakeAdapter(
+            harness="kimi",
+            native_session_ref=session_ref,
+            native_run_ref=run_ref,
+        )
+        broker = self.start_broker(lambda harness: (
+            adapter if harness == "kimi" else None
+        ))
+        order: list[tuple[str, str, str | None]] = []
+        mark_native_started = broker.store.mark_native_started
+        append_event = broker.store.append_event
+
+        def record_native(run_id, owner, turn):
+            order.append(("native", turn.session_ref, turn.run_ref))
+            return mark_native_started(run_id, owner, turn)
+
+        def record_event(run_id, event):
+            order.append(("event", event.type, None))
+            return append_event(run_id, event)
+
+        broker.store.mark_native_started = record_native
+        broker.store.append_event = record_event
+        conversation_id = self.add_conversation(harness="kimi")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        run_id = None
+        while time.monotonic() < deadline:
+            con = self.connect()
+            row = con.execute(
+                "SELECT run_id,state,harness_session_after,runner_ref "
+                "FROM conversation_runs WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            con.close()
+            if row is not None and row["state"] == "succeeded":
+                run_id = row["run_id"]
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(run_id)
+        self.assertEqual(
+            order[0],
+            ("native", session_ref, run_ref),
+        )
+        self.assertEqual(order[1][0], "event")
+        self.assertEqual(
+            (row["harness_session_after"], row["runner_ref"]),
+            (session_ref, run_ref),
+        )
 
     def test_interrupt_intent_precedes_terminal_interruption(self) -> None:
         adapter = FakeAdapter(block=True)

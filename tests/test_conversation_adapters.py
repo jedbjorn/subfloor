@@ -21,9 +21,13 @@ from conversation_adapters import (  # noqa: E402
     ClaudeAdapter,
     CodexAdapter,
     ConversationContext,
+    KimiAdapter,
+    NativeTurn,
     OpenCodeAdapter,
     adapter_for,
 )
+
+KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 
 
 class FakeOpenCode:
@@ -241,6 +245,207 @@ class FakeClaudeRunner:
         return process
 
 
+class FakeKimiProcess:
+    def __init__(
+        self,
+        stdout_lines: list[Any],
+        *,
+        wait_code: int = 0,
+        exit_before_identity: bool = False,
+        stderr: str = "",
+        cancel_wire: Path | None = None,
+    ) -> None:
+        encoded = [
+            line if isinstance(line, str) else json.dumps(line)
+            for line in stdout_lines
+        ]
+        self.stdout = io.StringIO("".join(line + "\n" for line in encoded))
+        self.stderr = io.StringIO(stderr)
+        self.pid = 9876
+        self.returncode: int | None = (
+            wait_code if exit_before_identity else None
+        )
+        self.wait_code = wait_code
+        self.cancel_wire = cancel_wire
+        self.signals: list[int] = []
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = self.wait_code
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -signal.SIGTERM
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -signal.SIGKILL
+
+    def send_signal(self, value: int) -> None:
+        self.signals.append(value)
+        if value == signal.SIGINT and self.cancel_wire is not None:
+            with self.cancel_wire.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps({"type": "turn.cancel", "time": 9000}) + "\n"
+                )
+            self.returncode = -signal.SIGINT
+
+
+class FakeKimiRunner:
+    def __init__(
+        self,
+        sessions_root: Path | None,
+        worktree: Path,
+    ) -> None:
+        self.sessions_root = sessions_root
+        self.worktree = worktree
+        self.calls: list[tuple[list[str], Path, dict[str, str]]] = []
+        self.processes: list[FakeKimiProcess] = []
+        self.plans: list[dict[str, Any]] = []
+        self.serial = 0
+
+    def queue(self, **plan: Any) -> None:
+        self.plans.append(plan)
+
+    def root_for(self, env: Mapping[str, str], cwd: Path) -> Path:
+        if self.sessions_root is not None:
+            return self.sessions_root
+        configured = env.get("KIMI_CODE_HOME", "").strip()
+        merged_home = Path(env.get("HOME", str(Path.home())))
+        if configured == "~":
+            data_root = merged_home
+        elif configured.startswith("~/"):
+            data_root = merged_home / configured[2:]
+        elif configured:
+            data_root = Path(configured)
+            if not data_root.is_absolute():
+                data_root = cwd / data_root
+        else:
+            data_root = merged_home / ".kimi-code"
+        return data_root / "sessions"
+
+    def session_ref(self) -> str:
+        self.serial += 1
+        return (
+            "session_00000000-0000-4000-8000-"
+            f"{self.serial:012d}"
+        )
+
+    def write_session(
+        self,
+        root: Path,
+        session_ref: str,
+        worktree: Path,
+        message: str,
+        *,
+        prompt_time: int,
+        malformed_prompt: bool = False,
+        after_prompt: list[dict[str, Any]] | None = None,
+        directory: str = "wd_test",
+        append: bool = False,
+    ) -> tuple[Path, Path]:
+        session = root / directory / session_ref
+        wire = session / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True, exist_ok=True)
+        (session / "state.json").write_text(
+            json.dumps({"workDir": str(worktree)}),
+            encoding="utf-8",
+        )
+        prompt = (
+            {"type": "turn.prompt", "input": [{"type": "text", "text": message}]}
+            if malformed_prompt
+            else {
+                "type": "turn.prompt",
+                "input": [{"type": "text", "text": message}],
+                "origin": {"kind": "user"},
+                "time": prompt_time,
+            }
+        )
+        mode = "a" if append else "w"
+        with wire.open(mode, encoding="utf-8") as stream:
+            for row in [prompt, *(after_prompt or [])]:
+                stream.write(json.dumps(row) + "\n")
+        return session, wire
+
+    def spawn(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+    ) -> FakeKimiProcess:
+        plan = self.plans.pop(0) if self.plans else {}
+        root = self.root_for(env, cwd)
+        message = argv[argv.index("-p") + 1]
+        resume = "-S" in argv
+        session_ref = (
+            argv[argv.index("-S") + 1]
+            if resume
+            else plan.get("session_ref", self.session_ref())
+        )
+        prompt_time = plan.get("prompt_time", 1000 + len(self.calls))
+        wire: Path | None = None
+        if plan.get("write_identity", True):
+            worktrees = plan.get("candidate_worktrees", [cwd])
+            for index, stored_worktree in enumerate(worktrees):
+                candidate_ref = (
+                    session_ref if index == 0 else self.session_ref()
+                )
+                _session, candidate_wire = self.write_session(
+                    root,
+                    candidate_ref,
+                    stored_worktree,
+                    message,
+                    prompt_time=prompt_time,
+                    malformed_prompt=plan.get("malformed_prompt", False),
+                    after_prompt=plan.get("after_prompt"),
+                    directory=f"wd_test_{index}",
+                    append=resume and index == 0,
+                )
+                if index == 0:
+                    wire = candidate_wire
+        hint_ref = plan.get("hint_ref", session_ref)
+        stdout_lines = plan.get(
+            "stdout_lines",
+            [
+                {
+                    "role": "assistant",
+                    "content": "hello",
+                    "tool_calls": [
+                        {
+                            "id": "tool-default",
+                            "function": {"name": "Shell"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "tool-default"},
+                {
+                    "role": "meta",
+                    "type": "session.resume_hint",
+                    "session_id": hint_ref,
+                },
+            ],
+        )
+        process = FakeKimiProcess(
+            stdout_lines,
+            wait_code=plan.get("wait_code", 0),
+            exit_before_identity=plan.get("exit_before_identity", False),
+            stderr=plan.get("stderr", ""),
+            cancel_wire=wire,
+        )
+        self.calls.append((list(argv), cwd, dict(env)))
+        self.processes.append(process)
+        return process
+
+
 class FakeCodexRpc:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict[str, Any]]] = []
@@ -383,6 +588,8 @@ class ConversationAdapterTest(unittest.TestCase):
             effort="high",
         )
         self.claude_config = self.root / "claude-config"
+        self.kimi_sessions = self.root / "kimi-sessions"
+        self.kimi_runner_serial = 0
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -429,6 +636,20 @@ class ConversationAdapterTest(unittest.TestCase):
                 ),
                 native,
             )
+        if harness == "kimi":
+            self.kimi_runner_serial += 1
+            sessions_root = (
+                self.kimi_sessions / f"runner-{self.kimi_runner_serial}"
+            )
+            native = FakeKimiRunner(sessions_root, self.root)
+            return (
+                KimiAdapter(
+                    runner=native,
+                    sessions_root=sessions_root,
+                    identity_timeout=0.1,
+                ),
+                native,
+            )
         native = FakeCodexRpc()
         return CodexAdapter(rpc=native), native
 
@@ -453,9 +674,9 @@ class ConversationAdapterTest(unittest.TestCase):
     def test_identical_contract_start_stream_interrupt_resume_reconcile(
         self,
     ) -> None:
-        for harness in ("opencode", "claude", "codex"):
+        for harness in ("opencode", "claude", "codex", "kimi"):
             with self.subTest(harness=harness):
-                adapter, native = self.build(harness)
+                adapter, _native = self.build(harness)
                 turn = adapter.start(self.context, "first")
                 self.assertEqual(turn.harness, harness)
                 self.assertEqual(turn.worktree, self.root)
@@ -529,6 +750,43 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(thread_params["approvalPolicy"], "never")
         self.assertEqual(thread_params["sandbox"], "danger-full-access")
         self.assertNotIn("--sandbox", repr(codex_native.requests))
+
+        kimi, kimi_native = self.build("kimi")
+        kimi.start(self.context, "work")
+        kimi_argv, _cwd, kimi_env = kimi_native.calls[-1]
+        self.assertNotIn("--yolo", kimi_argv)
+        self.assertNotIn("--auto", kimi_argv)
+        self.assertEqual(kimi_env["KIMI_MODEL_THINKING_EFFORT"], "high")
+        self.assertIn("-m", kimi_argv)
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_PERMISSION_RESPONSE_UNSUPPORTED",
+        ):
+            kimi.start(
+                ConversationContext(
+                    worktree=self.root,
+                    permission_mode="interactive",
+                ),
+                "work",
+            )
+        no_effort_root = self.kimi_sessions / "no-effort"
+        no_effort_native = FakeKimiRunner(no_effort_root, self.root)
+        no_effort = KimiAdapter(
+            runner=no_effort_native,
+            sessions_root=no_effort_root,
+            identity_timeout=0.1,
+        )
+        no_effort.start(
+            ConversationContext(
+                worktree=self.root,
+                env={"KIMI_MODEL_THINKING_EFFORT": "ambient"},
+            ),
+            "work",
+        )
+        self.assertNotIn(
+            "KIMI_MODEL_THINKING_EFFORT",
+            no_effort_native.calls[-1][2],
+        )
 
     def test_opencode_exact_resources_filtering_and_unknown_recovery(
         self,
@@ -625,6 +883,437 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertNotIn("--session-id", argv)
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
+
+    def test_kimi_discovers_native_identity_before_stream_and_resumes_exactly(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        captured_ref = "session_11111111-1111-4111-8111-111111111111"
+        runner.queue(
+            session_ref=captured_ref,
+            stdout_lines=(
+                KIMI_FIXTURES / "new-stream.jsonl"
+            ).read_text().splitlines(),
+        )
+        first = adapter.start(self.context, "first")
+        self.assertEqual(first.session_ref, captured_ref)
+        self.assertRegex(
+            first.session_ref,
+            r"^session_[0-9a-f-]{36}$",
+        )
+        self.assertRegex(first.run_ref, r"^kimi-\d+-\d+$")
+        self.assertIsNone(first.opaque.poll())
+        wire = Path(first.metadata["wire_path"])
+        with wire.open("rb") as stream:
+            stream.seek(first.metadata["prompt_offset"])
+            prompt = json.loads(stream.readline())
+        self.assertEqual(prompt["time"], first.metadata["prompt_time"])
+        self.assertEqual(prompt["input"][0]["text"], "first")
+        list(adapter.stream(first))
+
+        runner.queue(
+            prompt_time=first.metadata["prompt_time"],
+            stdout_lines=(
+                KIMI_FIXTURES / "resume-stream.jsonl"
+            ).read_text().splitlines(),
+        )
+        resumed = adapter.resume(first.session_ref, self.context, "second")
+        argv = runner.calls[-1][0]
+        self.assertEqual(
+            argv[argv.index("-S") + 1],
+            first.session_ref,
+        )
+        self.assertEqual(resumed.session_ref, first.session_ref)
+        self.assertNotEqual(resumed.run_ref, first.run_ref)
+        self.assertEqual(
+            resumed.metadata["prompt_time"],
+            first.metadata["prompt_time"],
+            "the binary offset must distinguish same-millisecond prompts",
+        )
+        self.assertGreater(
+            resumed.metadata["prompt_offset"],
+            first.metadata["prompt_offset"],
+        )
+        self.assertEqual(
+            list(adapter.stream(resumed))[-1].type,
+            "run.completed",
+        )
+
+    def test_kimi_new_session_discovery_filters_and_reaps_failures(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        preexisting = (
+            "session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        )
+        runner.write_session(
+            runner.sessions_root,
+            preexisting,
+            self.root,
+            "target",
+            prompt_time=50,
+            directory="wd_preexisting",
+        )
+        other = self.root / "other"
+        other.mkdir()
+        runner.queue(candidate_worktrees=[other, self.root])
+        turn = adapter.start(self.context, "target")
+        self.assertNotEqual(turn.session_ref, preexisting)
+        self.assertEqual(
+            json.loads(
+                (Path(turn.metadata["session_path"]) / "state.json").read_text()
+            )["workDir"],
+            str(self.root),
+        )
+
+        ambiguous, ambiguous_runner = self.build("kimi")
+        ambiguous_runner.queue(candidate_worktrees=[self.root, self.root])
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_SESSION_DISCOVERY_FAILED",
+        ):
+            ambiguous.start(self.context, "ambiguous")
+        self.assertTrue(ambiguous_runner.processes[-1].terminated)
+        self.assertTrue(ambiguous_runner.processes[-1].waited)
+
+        timeout_runner = FakeKimiRunner(self.kimi_sessions / "timeout", self.root)
+        timeout_runner.queue(write_identity=False)
+        timeout_adapter = KimiAdapter(
+            runner=timeout_runner,
+            sessions_root=self.kimi_sessions / "timeout",
+            identity_timeout=0.03,
+        )
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_SESSION_DISCOVERY_FAILED",
+        ):
+            timeout_adapter.start(self.context, "missing")
+        self.assertTrue(timeout_runner.processes[-1].terminated)
+        self.assertTrue(timeout_runner.processes[-1].waited)
+
+        malformed_runner = FakeKimiRunner(
+            self.kimi_sessions / "malformed",
+            self.root,
+        )
+        malformed_runner.queue(
+            malformed_prompt=True,
+            exit_before_identity=True,
+            wait_code=1,
+        )
+        malformed_adapter = KimiAdapter(
+            runner=malformed_runner,
+            sessions_root=self.kimi_sessions / "malformed",
+            identity_timeout=0.03,
+        )
+        with self.assertRaisesRegex(
+            AdapterError,
+            "malformed turn.prompt",
+        ):
+            malformed_adapter.start(self.context, "malformed")
+        self.assertTrue(malformed_runner.processes[-1].waited)
+
+    def test_kimi_store_root_commands_and_resume_validation(self) -> None:
+        data_home = self.root / "kimi-home"
+        runner = FakeKimiRunner(None, self.root)
+        adapter = KimiAdapter(runner=runner, identity_timeout=0.1)
+        context = ConversationContext(
+            worktree=self.root,
+            env={"KIMI_CODE_HOME": str(data_home)},
+        )
+        turn = adapter.start(context, "root")
+        self.assertEqual(
+            Path(turn.metadata["session_path"]).parents[1],
+            data_home / "sessions",
+        )
+        self.assertNotIn("--yolo", runner.calls[-1][0])
+        self.assertNotIn("--auto", runner.calls[-1][0])
+
+        merged_home = self.root / "merged-home"
+        home_runner = FakeKimiRunner(None, self.root)
+        home_adapter = KimiAdapter(
+            runner=home_runner,
+            identity_timeout=0.1,
+        )
+        home_turn = home_adapter.start(
+            ConversationContext(
+                worktree=self.root,
+                env={"HOME": str(merged_home), "KIMI_CODE_HOME": ""},
+            ),
+            "merged home",
+        )
+        self.assertEqual(
+            Path(home_turn.metadata["session_path"]).parents[1],
+            merged_home / ".kimi-code" / "sessions",
+        )
+        self.assertNotIn("KIMI_CODE_HOME", home_runner.calls[-1][2])
+
+        before = len(runner.calls)
+        with self.assertRaisesRegex(AdapterError, "HARNESS_SESSION_LOST"):
+            adapter.resume("not-a-session", context, "again")
+        with self.assertRaisesRegex(AdapterError, "HARNESS_SESSION_LOST"):
+            adapter.resume(
+                "session_ffffffff-ffff-4fff-8fff-ffffffffffff",
+                context,
+                "again",
+            )
+        self.assertEqual(
+            len(runner.calls),
+            before,
+            "invalid and missing refs must fail before spawning",
+        )
+
+        wrong = self.root / "wrong-worktree"
+        wrong.mkdir()
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_WORKTREE_MISMATCH",
+        ):
+            adapter.resume(
+                turn.session_ref,
+                ConversationContext(
+                    worktree=wrong,
+                    env={"KIMI_CODE_HOME": str(data_home)},
+                ),
+                "again",
+            )
+        self.assertEqual(len(runner.calls), before)
+
+    def test_kimi_stream_normalizes_live_capture_and_exact_slice_usage(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        captured = (
+            KIMI_FIXTURES / "new-stream.jsonl"
+        ).read_text().splitlines()
+        runner.queue(
+            session_ref="session_11111111-1111-4111-8111-111111111111",
+            stdout_lines=[
+                "raw subprocess output",
+                {"unrecognized": True},
+                {
+                    "role": "assistant",
+                    "content": "chunk",
+                    "tool_calls": [
+                        {
+                            "id": "tool-1",
+                            "function": {"name": "Shell"},
+                        },
+                        {
+                            "id": "tool-2",
+                            "function": {"name": "Read"},
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "tool-1",
+                    "content": "done",
+                },
+                *captured,
+            ],
+            after_prompt=[
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {
+                        "inputOther": 10,
+                        "output": 2,
+                        "inputCacheRead": 3,
+                    },
+                },
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {
+                        "inputOther": 5,
+                        "inputCacheCreation": 7,
+                    },
+                },
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "later"}],
+                    "time": 9999,
+                },
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"output": 999},
+                },
+            ],
+        )
+        turn = adapter.start(self.context, "normalize")
+        events = list(adapter.stream(turn))
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "tool.started",
+                "tool.started",
+                "tool.completed",
+                "assistant.delta",
+                "usage",
+                "run.completed",
+            ],
+        )
+        self.assertEqual(events[2].payload["text"], "chunk")
+        self.assertEqual(events[3].payload["tool_ref"], "tool-1")
+        self.assertEqual(events[4].payload["tool_ref"], "tool-2")
+        usage = next(event for event in events if event.type == "usage")
+        self.assertEqual(
+            usage.payload["tokens"],
+            {
+                "input_tokens": 15,
+                "output_tokens": 2,
+                "cache_read_tokens": 3,
+                "cache_write_tokens": 7,
+            },
+        )
+        self.assertNotIn("999", repr(events))
+
+        missing_usage, _missing_runner = self.build("kimi")
+        completed = list(missing_usage.stream(
+            missing_usage.start(self.context, "no usage")
+        ))
+        self.assertEqual(
+            [event.type for event in completed if event.type == "usage"],
+            [],
+        )
+        self.assertEqual(completed[-1].type, "run.completed")
+
+        failed, failed_runner = self.build("kimi")
+        failed_runner.queue(
+            wait_code=3,
+            stderr="native failure detail" + ("x" * 20000),
+        )
+        failed_events = list(failed.stream(
+            failed.start(self.context, "fail")
+        ))
+        self.assertEqual(failed_events[-1].type, "run.failed")
+        self.assertEqual(failed_events[-1].payload["exit_code"], 3)
+        self.assertEqual(
+            len(failed_events[-1].payload["error"]),
+            16384,
+        )
+        self.assertTrue(
+            failed_events[-1].payload["error"].startswith(
+                "native failure detail"
+            )
+        )
+
+    def test_kimi_identity_mismatch_blocks_usage_reconciliation(self) -> None:
+        adapter, runner = self.build("kimi")
+        runner.queue(
+            hint_ref="session_ffffffff-ffff-4fff-8fff-ffffffffffff",
+            after_prompt=[
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 10, "output": 2},
+                }
+            ],
+        )
+        turn = adapter.start(self.context, "mismatch")
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_SESSION_MISMATCH",
+        ):
+            list(adapter.stream(turn))
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual(result.outcome, "unknown")
+        self.assertFalse(result.proven)
+        self.assertTrue(turn.metadata["identity_mismatch"])
+
+    def test_kimi_inspect_and_reconcile_use_only_main_exact_run_slice(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        runner.queue(
+            prompt_time=7000,
+            after_prompt=[
+                {
+                    "type": "config.update",
+                    "modelAlias": "kimi-code/k3",
+                    "thinkingEffort": "high",
+                },
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "later"}],
+                    "time": 7001,
+                },
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 99},
+                },
+            ],
+        )
+        turn = adapter.start(self.context, "current")
+        session = Path(turn.metadata["session_path"])
+        subagent = session / "agents" / "agent-0" / "wire.jsonl"
+        subagent.parent.mkdir(parents=True)
+        subagent.write_text(
+            json.dumps({"type": "turn.cancel", "time": 7002}) + "\n",
+            encoding="utf-8",
+        )
+        turn.opaque.returncode = 0
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual(result.outcome, "unknown")
+        self.assertFalse(result.proven)
+
+        inspection = adapter.inspect(turn.session_ref, self.context)
+        self.assertEqual(inspection.state, "idle")
+        self.assertEqual(inspection.metadata["model"], "kimi-code/k3")
+        self.assertEqual(inspection.metadata["effort"], "high")
+        self.assertEqual(inspection.metadata["last_prompt"], "later")
+
+        captured = (
+            KIMI_FIXTURES / "interrupted-main-wire.jsonl"
+        ).read_bytes()
+        captured_ref = "session_cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        captured_session = (
+            runner.sessions_root / "wd_capture" / captured_ref
+        )
+        captured_wire = (
+            captured_session / "agents" / "main" / "wire.jsonl"
+        )
+        captured_wire.parent.mkdir(parents=True)
+        (captured_session / "state.json").write_text(
+            json.dumps({"workDir": str(self.root)}),
+            encoding="utf-8",
+        )
+        captured_wire.write_bytes(captured)
+        marker = (
+            b'{"type":"turn.prompt","input":[{"type":"text","text":'
+            b'"Use the shell tool to run sleep 120'
+        )
+        offset = captured.index(marker)
+        captured_turn = NativeTurn(
+            "kimi",
+            captured_ref,
+            f"kimi-1785365164354-{offset}",
+            self.root,
+            metadata={
+                "wire_path": str(captured_wire),
+                "prompt_time": 1785365164354,
+                "prompt_offset": offset,
+            },
+            opaque=FakeKimiProcess([], exit_before_identity=True),
+        )
+        interrupted = adapter.reconcile(captured_turn, self.context)
+        self.assertEqual(interrupted.outcome, "cancelled")
+        self.assertTrue(interrupted.proven)
+
+    def test_kimi_sigint_and_run_cancel_normalize_to_interrupted(self) -> None:
+        adapter, _runner = self.build("kimi")
+        turn = adapter.start(self.context, "interrupt")
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+        self.assertEqual(turn.opaque.signals, [signal.SIGINT])
+        events = list(adapter.stream(turn))
+        self.assertEqual(events[-1].type, "run.interrupted")
+        self.assertEqual(adapter.reconcile(turn, self.context).outcome, "cancelled")
+        self.assertFalse(adapter.interrupt(turn).acknowledged)
 
     def test_codex_uses_exact_rpc_methods_and_read_reconciliation(
         self,

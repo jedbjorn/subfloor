@@ -34,7 +34,14 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
 def test_start_chat_has_default_and_configured_paths_without_terminal_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    assert 'const CHAT_HARNESSES = ["opencode", "claude", "codex"]' in interface
+    assert (
+        'const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"]'
+        in interface
+    )
+    assert (
+        'shell.flavor === "conductor"\n    ? ["opencode"] : CHAT_HARNESSES'
+        in interface
+    )
     assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
     assert 'textContent: "＋ Chat"' in interface
     assert 'textContent: "Configure"' in interface
