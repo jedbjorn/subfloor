@@ -245,7 +245,7 @@ _RETRY_PAUSE = 2.0    # seconds between attempts (503 may override via Retry-Aft
 _TIMEOUT = 10         # default per-request HTTP timeout (seconds)
 # Doc add/edit/freeze commit fast but then SYNCHRONOUSLY run snapshot+render
 # server-side (each subprocess capped at 180s — up to ~360s, plus queueing on
-# the shared content-write lock behind another serialize or a Publish). With
+# the shared content-write lock behind another local serialize). With
 # the generic timeout a slow success surfaced as "API unreachable" and a PATCH
 # retry re-ran the whole serialize (SC-013). Doc writes carry their own budget.
 _DOC_WRITE_TIMEOUT = 420
@@ -834,14 +834,14 @@ def cmd_doc(args) -> int:
 
 def _note_serialize(r: dict) -> int:
     """Surface the server-side snapshot+render that follows a doc write
-    (subfloor#434): the flat file + content.sql refresh headlessly on the main
-    checkout. A failed serialize never fails the write — it prints a warning
+    (subfloor#434): the ignored flat render + local content.sql refresh
+    headlessly. A failed serialize never fails the write — it prints a warning
     and exits nonzero so the drift is visible, not silent."""
     s = r.get("serialize") if isinstance(r, dict) else None
     if not s:
         return 0
     if s.get("ok"):
-        print("  (snapshot + flat render refreshed on the main checkout)")
+        print("  (local snapshot + flat render refreshed)")
         return 0
     print(f"  WARNING: post-write snapshot/render failed — the DB row is live "
           f"but the flat file + content.sql did not refresh:\n{s.get('output')}")

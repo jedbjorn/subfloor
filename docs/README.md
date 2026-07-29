@@ -64,10 +64,8 @@ label: Per-repo port band
 .super-coder/         the engine — a gitignored, materialized DEPENDENCY in a
                       fork (see .super-coder/README.md); tracked only in this
                       source repo, where the engine IS the project
-.sc-state/            fork-owned, tracked: content.sql (DB serialization / memory)
-                      + engine.ref (the upstream SHA the engine is pinned at)
-specs_sc/ docs_sc/    rendered from the DB, read-only (the _sc suffix = provenance)
-skills_sc/ roadmap_sc.md
+.sc-state/            fork-owned: tracked engine.ref (the upstream SHA pin)
+                      + ignored local/ (DB snapshot, map, flat renders)
 .claude/skills/       per-shell skills, rendered at boot — gitignored
 .sc-worktrees/        one git worktree per shell — gitignored (admin excepted;
                       see "How shells share one repo")
@@ -75,8 +73,9 @@ CLAUDE.md / AGENTS.md boot artifact — gitignored, rebuilt at launch
 ```
 
 A fork's git surfaces show **only its project** — the engine is a dependency,
-not committed source, exactly like `node_modules/`. The one fork-owned artifact
-that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
+not committed source, exactly like `node_modules/`. Instance identity, memory,
+maps, and renders stay local. A fresh clone is a new instance; it does not clone
+another installation's shells or memory.
 
 ## Install
 
@@ -326,11 +325,11 @@ it owns:
     branch. *(operator gate; no shell skill · UI: Worktrees)*
 11. **Freeze spec + write docs** — on ship, the spec freezes (`frozen=1`,
     immutable; the next stage opens a fresh `seq`) and the feature doc is authored
-    — both via `docs`. `snapshot` + `./sc render` write read-only `specs_sc/` +
-    `docs_sc/`. *(planner / dev · `docs`, `snapshot` · UI: Docs)*
+    — both via `docs`. `snapshot` + `./sc render` write read-only local renders.
+    *(planner / dev · `docs`, `snapshot` · UI: Docs)*
 12. **Verify git trees clean** — the admin's `git_cleanup` triages every worktree
     (clean trees, prunable merged branches, preserved work); `./sc render-check`
-    (committed `_sc` must match the DB render) and `./sc verify` (rebuild +
+    (local `_sc` must match the DB render) and `./sc verify` (rebuild +
     headless boot) are the operator-run proofs.
     *(admin · `git_cleanup`, `snapshot` · UI: Worktrees)*
 13. **Re-map** — the cartographer re-runs (auto on pull, or `./sc map`) so the
@@ -854,7 +853,7 @@ floor with every row intact. (The shell-facing version of this is the
 
 ```bash
 ./sc update                     # fetch + materialize the engine, reconcile in place
-git add -A && git commit -m "chore: update subfloor"   # commits only .sc-state/ + _sc
+git add .sc-state/engine.ref sc && git commit -m "chore: update subfloor"
 ```
 
 `./sc update` fetches the engine from the `super-coder` remote and
@@ -866,9 +865,9 @@ live DB, **applies pending migrations in place** (never a rebuild-from-snapshot 
 your unsnapshotted in-session writes survive), syncs the skills catalogue
 (id-stable, so grants stay valid), re-grants any new common skills, refreshes the
 repo map, and re-snapshots the live state. Nothing under `.super-coder/` is
-committed — you commit only `.sc-state/` (refreshed `content.sql` + bumped
-`engine.ref`) and any `_sc` renders. Then restart the session to boot onto the
-new floor.
+committed — you commit only the bumped `.sc-state/engine.ref` and any
+deliberately authored project changes. Generated snapshots and `_sc` renders
+remain ignored. Then restart the session to boot onto the new floor.
 
 - `./sc update --no-fetch` reconciles against the current working tree (offline /
   dev) — engine + `engine.ref` unchanged. `--branch <name>` to track a non-`main`
@@ -984,9 +983,9 @@ sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` 
 ./sc persist             # reboot-proof the host daemons: install every applicable systemd --user unit
 ./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
-./sc render              # regenerate the tracked flat _sc files from the DB
-./sc render-check        # fail if the committed _sc files drift from the DB render (CI guard)
-./sc snapshot            # serialize per-instance tables → .sc-state/content.sql
+./sc render              # regenerate ignored flat _sc files beneath .sc-state/local/
+./sc render-check        # fail if the local _sc files drift from the DB render
+./sc snapshot            # serialize per-instance tables → .sc-state/local/content.sql
 ./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
@@ -1431,11 +1430,8 @@ no build step. Its ten tabs are the windows the workflow above refers to:
 | **Analytics** | Token & session analytics — per-class spend cards, a local-day graph, and the session history swept from each harness's on-disk usage data (see [Token & session analytics](#token--session-analytics)). |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
-The header's **snapshot ⤓** / **publish ⤴** buttons serialize the DB and open a
-rolling content PR. How they authenticate to GitHub (`gh auth login` or a scoped
-`SC_GH_TOKEN`), and the rolling event log (`.super-coder/logs/webapp.log` /
-`GET /api/logs`, last 20 events) for seeing what a publish actually did:
-[`.super-coder/docs/publish-and-gh-auth.md`](../.super-coder/docs/publish-and-gh-auth.md).
+The header's **save locally ⤓** button refreshes the ignored DB snapshot and
+flat renders. Generated artifacts are never committed or published.
 
 ![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-tab.png)
 
@@ -1488,19 +1484,18 @@ operational fields (`current_state`, `connections`, `workspace`) and skill
 grants; edit the roadmap (linear status buckets, with toggle-filters) and
 **non-frozen** documents; create and resolve flags. **seed and L&S are
 read-only** — the laws say the shell curates them, so the API ships no endpoint
-to write them at all. A `snapshot ⤓` button re-serializes + renders after
-edits; **publish** goes one further — it snapshots, then commits your content
-edits onto an ephemeral `sc_gui_content` branch, force-pushes it, and opens (or
-refreshes) one PR to `main` — then returns to `main` and drops the local branch.
-No merge: `main` stays clean and merging the PR stays yours.
+to write them at all. A **save locally ⤓** button re-serializes + renders after
+edits into `.sc-state/local/`. There is no Git publication path for generated
+instance state.
 
 The **Scripts** tab lists the maintenance scripts (snapshot, render, seed-skills,
 migrate, rebuild) — each with a description and a **run** button, so the common
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
 since it discards un-snapshotted DB edits).
 
-The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
-git-tracked text. See `.super-coder/README.md` for the full model.
+The live `.super-coder/shell_db.db` is **gitignored** and rebuilt from authored
+schema/migrations plus the ignored local snapshot. See `.super-coder/README.md`
+for the full model.
 
 > [!class2]
 > **Spec:** the founding design lives in the roadmap (`super-coder` feature row) and renders to `specs_sc/`.

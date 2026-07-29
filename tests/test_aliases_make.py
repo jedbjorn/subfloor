@@ -281,8 +281,8 @@ class MakeAliasContractTest(unittest.TestCase):
           .sc-state/engine.ref.prev — the pair-restore is intent, not guarantee;
         - deps skips venv/pip entirely for a host-managed .venv, verifying the
           declared pins instead of installing anything into it;
-        - snapshot writes a SECOND artifact, the authored map layer, to
-          .sc-state/map_content.sql;
+        - snapshot writes a SECOND artifact, the authored map layer, to local
+          map/content.sql;
         - verify runs the fresh-fork init first when the rebuilt instance has
           no active user + shell.
 
@@ -295,7 +295,7 @@ class MakeAliasContractTest(unittest.TestCase):
         for target, marker in (
             ("dos-rollback", "engine.ref.prev"),
             ("dos-deps", "host-managed"),
-            ("dos-snapshot", "map_content.sql"),
+            ("dos-snapshot", "map/content.sql"),
             ("dos-verify", "empty instance"),
         ):
             with self.subTest(target=target):

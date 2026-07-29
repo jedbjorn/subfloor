@@ -303,7 +303,7 @@ def main() -> int:
     if _fork_mode():
         print("seed_skills: fork — the engine seed (0001) is upstream-owned; "
               "skipping regen. Local skills persist via `./sc snapshot` "
-              "(.sc-state/content.sql), not the seed.")
+              "(.sc-state/local/content.sql), not the seed.")
         _upsert_live(skills)
         return 0
 
@@ -312,7 +312,7 @@ def main() -> int:
         "-- System content: the engine catalogue propagates to every fork. Idempotent",
         "-- and ID-STABLE: UPSERTs each authored engine skill by name, but never",
         "-- retires names absent from assets/skills because those may be project-local",
-        "-- skills serialized by .sc-state/content.sql. Do not hand-edit; author",
+        "-- skills serialized by .sc-state/local/content.sql. Do not hand-edit; author",
         "-- assets/skills/<name>/SKILL.md then `./sc seed-skills`.",
         "",
         "BEGIN;",

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Serialize this fork's per-instance content + memory to text.
 
-Dumps the per-instance tables of the live `shell_db.db` to the active tracked
-or local content path as a deterministic, idempotent SQL script:
+Dumps the per-instance tables of the live `shell_db.db` to the gitignored local
+content path as a deterministic, idempotent SQL script:
 each table is `DELETE`d then re-`INSERT`ed in primary-key order, so re-running
 produces a byte-identical file (clean git diffs) and loading it is repeatable.
 
@@ -34,7 +34,7 @@ from _serialize_guard import require_admin  # noqa: E402
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
-# The artifact policy decides whether per-instance text is tracked or local.
+# Generated instance state is always local and gitignored.
 OUT_PATH = artifact_policy.content_path()
 # One-release cleanup: if a not-yet-migrated fork still carries the old in-engine
 # copy, remove it once we write the new one so it can't shadow or drift.
@@ -104,7 +104,7 @@ PER_INSTANCE_TABLES = [
     "wake_machine_retirements",
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
-    # .sc-state/map_content.sql by snapshot_map() below, not here.
+    # .sc-state/local/map/content.sql by snapshot_map() below, not here.
 ]
 
 SNAPSHOT_ROW_FILTERS = {
@@ -136,7 +136,7 @@ def engine_skill_names() -> list[str]:
     migrations/0001, upstream-materialized in a fork).
 
     Any live skill whose name is not in this set is project-local and belongs in
-    `.sc-state/content.sql`. Keyed off the seed, NOT asset-file presence (#253):
+    local `content.sql`. Keyed off the seed, NOT asset-file presence (#253):
     a fork-authored skill keeps its SKILL.md under assets/skills/ as authoring
     source, and classifying by asset presence would silently drop it from
     content.sql — losing it on the next update's materialize.
@@ -221,17 +221,15 @@ def dump_local_skills(con) -> list[str]:
     return lines
 
 
-# Columns that must NEVER be serialized to content.sql — content.sql is
-# git-tracked, and these are live credentials managed at runtime, not memory to
+# Columns that must NEVER be serialized to content.sql — these are live
+# credentials managed at runtime, not memory to
 # preserve across a rebuild. `api_key` is (re)provisioned at rebuild time
 # (rebuild.py's final backfill step) and again at server startup; `password_*`
 # are launcher auth fields. Omitting them from the INSERT means they load as NULL
 # on rebuild, which is correct: the key is re-minted by rebuild itself (so a
 # rebuilt DB is never NULL-keyed, even under an already-running server) and they
-# never reach git. Without this, a snapshot taken while keys are provisioned
-# writes every shell's bearer token into a committed file (the gitleaks default
-# ruleset does not catch the bare token format, so the gate would not flag it
-# either).
+# never enter the portable rebuild snapshot. This defense remains necessary
+# even though the snapshot itself is ignored.
 SENSITIVE_COLUMNS = {
     "shells": {"api_key", "api_key_rotated_at"},
     "users": {"password_hash", "password_salt"},

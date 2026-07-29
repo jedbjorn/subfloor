@@ -33,15 +33,14 @@ class FreshInstallShellContractTest(unittest.TestCase):
         ).read_text()
         self.assertNotIn("./sc mem", dogfood)
 
-    def test_cartographer_targets_canonical_root_and_admin_handoff(self) -> None:
+    def test_cartographer_targets_canonical_local_map_state(self) -> None:
         skill = (
             ROOT / ".super-coder" / "assets" / "skills" / "cartographer"
             / "SKILL.md"
         ).read_text()
-        self.assertIn("$SC_ROOT/.sc-state/map.config.json", skill)
         self.assertIn("$SC_ROOT/.sc-state/local/map/config.json", skill)
         self.assertIn("$SC_ROOT/.sc-state/map_extractors/", skill)
-        self.assertIn("send admin", skill)
+        self.assertIn("never a commit", skill)
         self.assertNotIn("**Commit** the config + hooks", skill)
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-mode persistence contract: tracked stays default, local never publishes."""
+"""Generated instance artifacts are always local and never publish to Git."""
 from __future__ import annotations
 
 import json
@@ -31,7 +31,7 @@ class ArtifactPolicyTest(unittest.TestCase):
             name: getattr(artifact_policy, name)
             for name in (
                 "ENGINE", "REPO_ROOT", "STATE_DIR", "LOCAL_DIR",
-                "INSTANCE_CONFIG", "SOURCE_POLICY",
+                "INSTANCE_CONFIG",
             )
         }
         artifact_policy.ENGINE = self.engine
@@ -39,7 +39,6 @@ class ArtifactPolicyTest(unittest.TestCase):
         artifact_policy.STATE_DIR = self.state
         artifact_policy.LOCAL_DIR = self.state / "local"
         artifact_policy.INSTANCE_CONFIG = self.engine / "instance.json"
-        artifact_policy.SOURCE_POLICY = self.engine / "source-policy.json"
         self.env = mock.patch.dict(os.environ, {}, clear=False)
         self.env.start()
         os.environ.pop("SC_ARTIFACT_MODE", None)
@@ -53,11 +52,15 @@ class ArtifactPolicyTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload))
 
-    def test_downstream_default_remains_tracked(self):
-        with mock.patch.object(artifact_policy, "_source_policy_is_tracked", return_value=False):
-            self.assertEqual(artifact_policy.mode(), "tracked")
-            self.assertEqual(artifact_policy.content_path(), self.state / "content.sql")
-            self.assertEqual(artifact_policy.render_root(), self.tmp)
+    def test_downstream_default_is_local_only(self):
+        self.assertEqual(artifact_policy.mode(), "local")
+        self.assertFalse(artifact_policy.tracks_local_artifacts())
+        self.assertEqual(
+            artifact_policy.content_path(), self.state / "local" / "content.sql"
+        )
+        self.assertEqual(
+            artifact_policy.render_root(), self.state / "local" / "renders"
+        )
 
     def test_instance_can_opt_into_local(self):
         self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "local"})
@@ -69,25 +72,27 @@ class ArtifactPolicyTest(unittest.TestCase):
             artifact_policy.render_root(), self.state / "local" / "renders"
         )
 
-    def test_tracked_source_policy_opts_out_only_when_tracked(self):
-        self.write_json(artifact_policy.SOURCE_POLICY, {"artifact_mode": "local"})
-        with mock.patch.object(artifact_policy, "_source_policy_is_tracked", return_value=False):
-            self.assertEqual(artifact_policy.mode(), "tracked")
-        with mock.patch.object(artifact_policy, "_source_policy_is_tracked", return_value=True):
-            self.assertEqual(artifact_policy.mode(), "local")
+    def test_legacy_tracked_instance_config_is_upgrade_input_only(self):
+        self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "tracked"})
+        self.assertEqual(artifact_policy.mode(), "local")
+
+    def test_tracked_environment_override_is_rejected(self):
+        os.environ["SC_ARTIFACT_MODE"] = "tracked"
+        with self.assertRaisesRegex(
+            artifact_policy.ArtifactPolicyError, "local-only"
+        ):
+            artifact_policy.mode()
 
     def test_invalid_explicit_mode_fails_closed(self):
         self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "maybe"})
         with self.assertRaises(artifact_policy.ArtifactPolicyError):
             artifact_policy.mode()
 
-    def test_set_mode_preserves_unrelated_instance_config(self):
-        self.write_json(artifact_policy.INSTANCE_CONFIG, {"port": 8801, "harness": "codex"})
-        artifact_policy.set_mode("local")
-        payload = json.loads(artifact_policy.INSTANCE_CONFIG.read_text())
-        self.assertEqual(payload["artifact_mode"], "local")
-        self.assertEqual(payload["port"], 8801)
-        self.assertEqual(payload["harness"], "codex")
+    def test_mode_switching_command_is_retired(self):
+        with self.assertRaisesRegex(
+            artifact_policy.ArtifactPolicyError, "mode switching retired"
+        ):
+            artifact_policy.main(["set", "tracked"])
 
     def test_path_command_exposes_active_map_db(self):
         self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "local"})

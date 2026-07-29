@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""Resolve per-instance artifact persistence without changing engine behavior.
-
-Downstream forks default to ``tracked`` for backward compatibility. An instance
-may opt into ``local`` through ``.super-coder/instance.json``:
-
-    {"artifact_mode": "local"}
-
-The super-coder source carries ``.super-coder/source-policy.json``. That policy
-applies only while the marker is tracked by the current repository; the same
-file is ignored engine material in downstream forks and cannot change their
-default.
-"""
+"""Resolve generated per-instance artifacts to ignored local storage."""
 from __future__ import annotations
 
 import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
@@ -26,11 +14,8 @@ REPO_ROOT = ENGINE.parent
 STATE_DIR = REPO_ROOT / ".sc-state"
 LOCAL_DIR = STATE_DIR / "local"
 INSTANCE_CONFIG = ENGINE / "instance.json"
-SOURCE_POLICY = ENGINE / "source-policy.json"
-
-TRACKED = "tracked"
 LOCAL = "local"
-VALID_MODES = {TRACKED, LOCAL}
+LEGACY_TRACKED = "tracked"
 
 
 class ArtifactPolicyError(RuntimeError):
@@ -49,81 +34,54 @@ def _read_mode(path: Path) -> str | None:
     value = payload.get("artifact_mode")
     if value is None:
         return None
-    if value not in VALID_MODES:
-        allowed = ", ".join(sorted(VALID_MODES))
+    if value not in {LOCAL, LEGACY_TRACKED}:
         raise ArtifactPolicyError(
-            f"invalid artifact_mode {value!r} in {path}; expected one of: {allowed}"
+            f"invalid artifact_mode {value!r} in {path}; generated artifacts "
+            "are local-only"
         )
     return value
 
 
-def _source_policy_is_tracked() -> bool:
-    """A materialized engine contains SOURCE_POLICY but does not track it."""
-    if not SOURCE_POLICY.exists():
-        return False
-    rel = SOURCE_POLICY.relative_to(REPO_ROOT)
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", str(rel)],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return False
-    return result.returncode == 0
-
-
 def mode() -> str:
     override = os.environ.get("SC_ARTIFACT_MODE")
-    if override is not None:
-        if override not in VALID_MODES:
-            allowed = ", ".join(sorted(VALID_MODES))
-            raise ArtifactPolicyError(
-                f"invalid SC_ARTIFACT_MODE {override!r}; expected one of: {allowed}"
-            )
-        return override
-    configured = _read_mode(INSTANCE_CONFIG)
-    if configured is not None:
-        return configured
-    if _source_policy_is_tracked():
-        configured = _read_mode(SOURCE_POLICY)
-        if configured is not None:
-            return configured
-    return TRACKED
+    if override not in (None, LOCAL):
+        raise ArtifactPolicyError(
+            f"SC_ARTIFACT_MODE={override!r} is unsupported; generated "
+            "artifacts are local-only"
+        )
+    # Read for validation and backward compatibility. A persisted legacy
+    # ``tracked`` value is upgrade input, never an active behavior.
+    _read_mode(INSTANCE_CONFIG)
+    return LOCAL
 
 
 def tracks_local_artifacts() -> bool:
-    return mode() == TRACKED
+    """Compatibility predicate: generated artifacts are never Git-tracked."""
+    mode()
+    return False
 
 
 def content_path() -> Path:
-    return STATE_DIR / "content.sql" if tracks_local_artifacts() else LOCAL_DIR / "content.sql"
+    return LOCAL_DIR / "content.sql"
 
 
 def render_root() -> Path:
-    return REPO_ROOT if tracks_local_artifacts() else LOCAL_DIR / "renders"
+    return LOCAL_DIR / "renders"
 
 
 def map_db_path() -> Path:
-    return STATE_DIR / "map.db" if tracks_local_artifacts() else LOCAL_DIR / "map" / "map.db"
+    return LOCAL_DIR / "map" / "map.db"
 
 
 def map_content_path() -> Path:
-    if tracks_local_artifacts():
-        return STATE_DIR / "map_content.sql"
     return LOCAL_DIR / "map" / "content.sql"
 
 
 def map_config_path() -> Path:
-    if tracks_local_artifacts():
-        return STATE_DIR / "map.config.json"
     return LOCAL_DIR / "map" / "config.json"
 
 
 def retired_skills_path() -> Path:
-    if tracks_local_artifacts():
-        return STATE_DIR / "skills_retired.json"
     return LOCAL_DIR / "skills_retired.json"
 
 
@@ -161,8 +119,6 @@ def prepare_local_state() -> list[Path]:
     Deletion/untracking stays a separate, reviewable Git change. A failed
     migration therefore leaves the old reconstruction source untouched.
     """
-    if tracks_local_artifacts():
-        return []
     copied: list[Path] = []
     pairs = [
         (STATE_DIR / "content.sql", LOCAL_DIR / "content.sql"),
@@ -185,28 +141,6 @@ def atomic_write_text(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
-def set_mode(value: str) -> list[Path]:
-    if value not in VALID_MODES:
-        allowed = " | ".join(sorted(VALID_MODES))
-        raise ArtifactPolicyError(f"usage: sc artifact-mode set <{allowed}>")
-    payload: dict = {}
-    if INSTANCE_CONFIG.exists():
-        try:
-            loaded = json.loads(INSTANCE_CONFIG.read_text())
-        except json.JSONDecodeError as exc:
-            raise ArtifactPolicyError(
-                f"cannot change artifact mode: {INSTANCE_CONFIG} is invalid JSON: {exc}"
-            ) from exc
-        if not isinstance(loaded, dict):
-            raise ArtifactPolicyError(
-                f"cannot change artifact mode: {INSTANCE_CONFIG} must contain a JSON object"
-            )
-        payload = loaded
-    payload["artifact_mode"] = value
-    atomic_write_text(INSTANCE_CONFIG, json.dumps(payload, indent=2) + "\n")
-    return prepare_local_state() if value == LOCAL else []
-
-
 def main(argv: list[str]) -> int:
     command = argv[0] if argv else "show"
     if command == "show":
@@ -214,7 +148,7 @@ def main(argv: list[str]) -> int:
             "artifact_mode": mode(),
             "snapshot": str(content_path().relative_to(REPO_ROOT)),
             "renders": str(render_root().relative_to(REPO_ROOT)),
-            "git_publication": tracks_local_artifacts(),
+            "git_publication": False,
         }, indent=2))
         return 0
     if command == "path" and len(argv) == 2:
@@ -233,15 +167,9 @@ def main(argv: list[str]) -> int:
             )
         print(resolver())
         return 0
-    if command == "set" and len(argv) == 2:
-        copied = set_mode(argv[1])
-        print(f"artifact_mode: {argv[1]}")
-        if copied:
-            print(f"localized {len(copied)} existing artifact(s) without deleting the originals")
-        print("next: SC_ADMIN=1 ./sc snapshot && SC_ADMIN=1 ./sc render")
-        return 0
     raise ArtifactPolicyError(
-        "usage: sc artifact-mode [show | set <tracked|local> | path <artifact>]"
+        "usage: sc artifact-mode [show | path <artifact>] "
+        "(mode switching retired; generated artifacts are local-only)"
     )
 
 

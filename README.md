@@ -120,7 +120,7 @@ graph TD
   REN --> BOOT[CLAUDE.md / AGENTS.md]:::class2
   BOOT --> H[harness loop]:::class3
   H --> REPO[your repo]:::class4
-  DB -.serialize.-> SQL[.sc-state/content.sql]:::class2
+  DB -.local snapshot.-> SQL[.sc-state/local/content.sql]:::class2
 ```
 
 How the overlay works — every property injected through an extension point the

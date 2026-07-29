@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests that `./sc rebuild` preserves shell api_keys instead of rotating them.
 
-content.sql never serializes api_key (secret in a git-tracked file), so a
+content.sql never serializes api_key (runtime credential), so a
 rebuild reloads every shell NULL-keyed. Before #265 the post-rebuild backfill
 then minted brand-new keys — an implicit rotation that orphaned the
 SC_API_TOKEN run.py injected into every live session at boot and 401'd all mem

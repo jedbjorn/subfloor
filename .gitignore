@@ -42,17 +42,20 @@
 # as untracked content in the main working tree.
 /.sc-worktrees/
 
-# Fork-owned state (B7): .sc-state/ is TRACKED (content.sql is the memory
-# serialization; engine.ref pins the engine version). Only the ephemeral
-# pre-update restore pointer is ignored. NOTE: this SOURCE repo deliberately
-# tracks all of .super-coder/ — the engine IS the project here; a *fork*
-# gitignores the whole engine dir (install.py writes that rule).
+# The engine pin is the only tracked .sc-state artifact. Per-instance snapshots,
+# map authorship, retire lists, and flat views are generated local state.
 /.sc-state/engine.ref.prev
-# Optional local artifact mode keeps durable snapshots and generated views here.
-# The mode changes publication, never persistence.
+/.sc-state/content.sql
+/.sc-state/map_content.sql
+/.sc-state/map.config.json
+/.sc-state/skills_retired.json
 /.sc-state/local/
-# The map DB is a derived cache of the repo (dr_*), rebuilt by `./sc map` from
-# the tree + its authored layer in .sc-state/map_content.sql (which IS tracked).
+# Flat visibility views are disposable local renders, never authored source.
+/roadmap_sc.md
+/docs_sc/
+/specs_sc/
+/skills_sc/
+# The map DB is a derived cache of the repo (dr_*), rebuilt by `./sc map`.
 /.sc-state/map.db
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm

@@ -1348,8 +1348,8 @@ case "$cmd" in
     p="$(port)"
     dp="$(devport)"
     dnet
-    # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
-    # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
+    # Forward GitHub auth for shells opening their own feature PRs. Prefer a
+    # repo-scoped SC_GH_TOKEN; else reuse the
     # host's gh login. NOTE: this widens the sandbox — anything in the container
     # can act as you on GitHub within the token's scope. A fine-grained,
     # single-repo PAT in SC_GH_TOKEN is the tighter option.
@@ -1590,11 +1590,11 @@ super-coder — forkable shell substrate
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
-  ./sc snapshot            dump per-instance tables under the active artifact policy
+  ./sc snapshot            dump per-instance tables to gitignored .sc-state/local/
                              live-state commands (rebuild · migrate · verify · snapshot · render · clean-db) act on the SHARED live
                              instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming
                              the target declined (decision #81); -h/--help still answers from any checkout. render-check is the
-                             source-pure one: it verifies the CALLER's tracked sources and names the checkout it read.
+                             source-pure one: it verifies the CALLER's engine sources and local artifacts, and names the checkout it read.
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
   ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
@@ -1646,7 +1646,7 @@ super-coder — forkable shell substrate
   ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
                              shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
                              list (active tracked/local retire path, rides updates); snapshot after writes to persist
-  ./sc artifact-mode       show · set tracked|local — tracked is the downstream default; local persists beneath ignored .sc-state/local/
+  ./sc artifact-mode       inspect the local-only artifact paths (mode switching is retired)
   ./sc render              render flat _sc files under the active artifact policy
   ./sc render-check        fail if the active flat _sc files drift from the DB render (hermetic check)
   ./sc analytics sweep     parse each harness's on-disk token usage for this repo into session_token_usage

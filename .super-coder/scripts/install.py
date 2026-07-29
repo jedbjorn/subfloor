@@ -495,8 +495,7 @@ _GITIGNORE_BLOCK = f"""
 {_GITIGNORE_MARKER}
 # The engine is a materialized, gitignored DEPENDENCY (B7) — fetched from
 # upstream, refreshed by `./sc update`, never committed to the fork. Your project
-# is everything ELSE in this repo. The one fork-owned artifact that must survive,
-# the DB serialization, lives in the tracked .sc-state/ below.
+# is everything ELSE in this repo.
 /.super-coder/
 # Boot artifacts + per-shell skill render — rebuilt at launch from the DB.
 /CLAUDE.md
@@ -510,14 +509,18 @@ _GITIGNORE_BLOCK = f"""
 /.codex/hooks.json
 # Shell worktrees — one per shell, linked inside the repo root.
 /.sc-worktrees/
-# .sc-state/ is TRACKED (content.sql + engine.ref). Only ephemeral/derived
-# state is ignored: the pre-update pointer, map cache, and local DB backups.
+# The engine pin is tracked. Every generated instance artifact is local-only.
 /.sc-state/engine.ref.prev
-# Opt-out artifact mode stores snapshots, map authorship, and flat renders here.
-# Tracked mode remains the default for downstream forks.
+/.sc-state/content.sql
+/.sc-state/map_content.sql
+/.sc-state/map.config.json
+/.sc-state/skills_retired.json
 /.sc-state/local/
-# Map DB — derived cache of the repo (dr_*), rebuilt by `./sc map`. Its authored
-# layer (sections) is tracked in .sc-state/map_content.sql.
+/roadmap_sc.md
+/docs_sc/
+/specs_sc/
+/skills_sc/
+# Map DB — derived cache of the repo (dr_*), rebuilt by `./sc map`.
 /.sc-state/map.db
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm

@@ -3,10 +3,10 @@
 
 Wraps `render/flat.py`. The boot launcher (`run.py`) calls the render functions
 directly for the chosen shell; this CLI is the standalone entry the sc dispatcher and
-the (later) commit→PR automation use.
+the dispatcher uses.
 
 Usage:
-    python3 .super-coder/scripts/render.py flat              # tracked _sc files
+    python3 .super-coder/scripts/render.py flat              # local ignored _sc files
     python3 .super-coder/scripts/render.py skills <shortname> # .claude/skills/ for a shell
     python3 .super-coder/scripts/render.py all <shortname>    # both
 """
@@ -44,10 +44,10 @@ def _resolve_shell(con, shortname: str) -> int:
 
 
 def _heal_fresh(con) -> None:
-    """Self-heal stale engine skills BEFORE rendering the tracked mirror.
+    """Self-heal stale engine skills BEFORE rendering the local mirror.
 
     Rendering from a DB whose engine skills lag assets/skills/ is exactly how a
-    shipped skill body silently gets DELETED from the committed `_sc` mirror.
+    shipped skill body silently gets deleted from the local `_sc` mirror.
     Rather than refuse, we repair the cache from assets first (the same heal the
     launcher runs at boot), so the mirror is always rendered from current engine
     skills. Project-local skills are untouched. A no-op on a fresh DB."""

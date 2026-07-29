@@ -12,13 +12,11 @@ Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
 map. You alone do three things: **configure** how this repo is mapped, **wire**
 the automation that keeps it fresh, **heal** both on drift.
 
-Map db = `.sc-state/map.db` in tracked mode or
-`.sc-state/local/map/map.db` in local mode, separate from the engine memory db
+Map db = `.sc-state/local/map/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
 map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
 map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/map_content.sql` (tracked mode) or
-`.sc-state/local/map/content.sql` (local mode) on snapshot (admin/GUI step — see Standing jobs)
+`.sc-state/local/map/content.sql` on snapshot (admin/GUI step — see Standing jobs)
 and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
@@ -50,8 +48,7 @@ and reload on a fresh map db.
    generated/vendored dir being indexed?
 
 2. **Author the active map config at the canonical live root** —
-   `$SC_ROOT/.sc-state/map.config.json` in tracked mode or
-   `$SC_ROOT/.sc-state/local/map/config.json` in local mode. The mapper
+   `$SC_ROOT/.sc-state/local/map/config.json`. The mapper
    deliberately reads the shared live checkout, not your shell worktree. It is
    per-instance and survives `sc update`. All keys optional; each merges over
    `map_repo.py` defaults:
@@ -89,12 +86,8 @@ and reload on a fresh map db.
 5. **Describe — NULLs and filler** — run the description worklist (Standing
    jobs § 2); leave only when it returns zero rows, NULLs and filler both.
 
-6. **Persist by mode.** Hook wiring is per-clone runtime state, never a commit.
-   In tracked mode, use the `messaging` skill to send admin the exact canonical
-   path (`.sc-state/map.config.json`) and verification result; only admin may
-   commit the main checkout. In local mode, the config is intentionally ignored
-   and needs no commit. Do not branch or commit the main checkout from the
-   cartographer shell. Then `sc mem state "…"` -> `sc mem oriented` (sets
+6. **Persist locally.** Hook wiring and map config are per-clone runtime state,
+   never a commit. Then `sc mem state "…"` -> `sc mem oriented` (sets
    `bootstrapped=1` — the write is live in the shared DB; it does NOT snapshot).
 
 ## Heal — run whenever the map looks wrong
@@ -243,10 +236,10 @@ Adopt one per stack:
    rewrite the match — target the dominant pattern, not 100%.
 3. **Run + verify:** `sc map` -> table populated, rows look right
    (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Hand off persistence** to admin via the `messaging` skill, naming each
-   changed `.sc-state/map_extractors/` path and the verification result. These
-   canonical-root files are normal tracked files; snapshotting the authored DB
-   layer remains the separate admin/GUI step above.
+4. **Hand off authored extractor code** to admin via the `messaging` skill,
+   naming each changed `.sc-state/map_extractors/` path and the verification
+   result. Extractor code is deliberate source; generated map DB/content stays
+   local.
 
 **Contract** (full version: `templates/map_extractors/README.md`): each module
 defines `extract(con, repo_root, cfg) -> str`. `con` = the live map db with
