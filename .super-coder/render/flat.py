@@ -255,23 +255,29 @@ def render_visibility(con: sqlite3.Connection, root: "Path | None" = None) -> di
 # ── Harness skill render (per booting shell; gitignored cache) ────────────────
 
 def render_skill_md(con: sqlite3.Connection, shell_id: int,
-                    work_dir: "Path | None" = None) -> dict:
-    """Render the booting shell's granted skills to `.claude/skills/<name>/SKILL.md`
-    (Agent Skills format: name + description frontmatter, content body).
+                    work_dir: "Path | None" = None,
+                    skills_dir: "Path | None" = None) -> dict:
+    """Render the booting shell's granted skills to
+    `<skills_dir>/<name>/SKILL.md` (Agent Skills format: name + description
+    frontmatter, content body). The default is `.claude/skills`; adapters may
+    request an additional native directory such as `.opencode/skills`.
 
     Harness-consumed and gitignored, like the boot artifact — rebuilt every
     launch for whichever shell boots. Stale skill folders (a grant since
     revoked, or another shell's skills) are pruned so the dir reflects exactly
     this shell's current grants.
 
-    work_dir overrides the write root (used for dev-shell worktrees)."""
+    work_dir overrides the write root (used for dev-shell worktrees).
+    skills_dir is relative to that root."""
     rows = con.execute(
         "SELECT s.name, s.description, s.content FROM skills s "
         "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
         "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
         (shell_id,),
     ).fetchall()
-    skills_root = (work_dir or REPO_ROOT) / ".claude" / "skills"
+    skills_root = (work_dir or REPO_ROOT) / (
+        skills_dir or Path(".claude/skills")
+    )
     written: list[Path] = []
     skipped: list[Path] = []
     current = {_skill_slug(r["name"]) for r in rows}

@@ -3,6 +3,7 @@
   "launch": ["opencode"],
   "boot_artifact": "AGENTS.md",
   "emit": ["opencode.json"],
+  "skill_dirs": [".claude/skills", ".opencode/skills"],
   "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" },
   "model": { "file": "opencode.json", "key": "model" },
   "headless": { "launch": ["opencode", "run"], "model_flag": "-m" },

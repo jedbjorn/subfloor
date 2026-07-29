@@ -363,6 +363,24 @@ class RenderAndSnapshotTest(unittest.TestCase):
                  / "engine_surgery" / "SKILL.md").exists()
             )
 
+    def test_skill_render_supports_a_harness_native_directory(self) -> None:
+        self.con.execute(
+            "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
+            (self.custom, self.kid),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            flat.render_skill_md(
+                self.con,
+                self.custom,
+                work_dir=Path(tmp),
+                skills_dir=Path(".opencode/skills"),
+            )
+
+            self.assertTrue(
+                (Path(tmp) / ".opencode" / "skills"
+                 / "engine_surgery" / "SKILL.md").exists()
+            )
+
     def test_snapshot_serializes_pack_grants_by_skill_name(self) -> None:
         self.con.execute(
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
