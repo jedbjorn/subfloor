@@ -116,7 +116,7 @@ PARTICIPANT_RULES = (
     "1. File findings, flags, verdicts, reports, PRs, and commits within your "
     "assigned authority.\n"
     "2. Send rulings and transitions to the planner as a scoped row: "
-    "`./sc mem message send <planner> \"…\" --kind result --sprint <doc-id>`.\n"
+    "`sc mem message send <planner> \"…\" --kind result --sprint <doc-id>`.\n"
     "3. When work remains, send a partial naming completed work, evidence, and "
     "the next uncompleted action before ending the turn.\n"
     "4. Nothing found is a result. Send it."
@@ -418,11 +418,11 @@ def render_skills(con, shell_id: int) -> str:
 
 def render_api(port: "int | None", api_key: "str | None") -> str:
     if port is None or not api_key:
-        return "(API not configured — run `./sc rebuild` to assign a key)"
+        return "(API not configured — run `sc rebuild` to assign a key)"
     return (
         f"- **Base URL:** `http://127.0.0.1:{port}`\n"
         "- **Token:** available as `$SC_API_TOKEN` in your environment (set at launch).\n\n"
-        "Write memory via `./sc mem` (proxied here automatically when `SC_API_TOKEN` is set). "
+        "Write memory via `sc mem` (proxied here automatically when `SC_API_TOKEN` is set). "
         "Read messages: `GET /_sc/mem/messages`. Command reference: the `memory` and `db_map` skills."
     )
 

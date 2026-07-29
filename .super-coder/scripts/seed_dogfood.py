@@ -57,19 +57,19 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
-Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
+Write as it happens, not at close. **Writes go through `sc mem`** (state · seed ·
 lns · decision · flag · roadmap · doc · narrative): it routes through the engine
 API, which resolves your identity from your token — no DB path, no direct-DB
 fallback. The write lands in the live engine DB — the single source of truth
 shared by every shell, durable and visible to all at once. That is the whole
 write: **you don't snapshot or render** — persisting to git is an admin/GUI step.
-`./sc mem which` to orient. See the `memory` and `db_map` skills.
+`sc mem which` to orient. See the `memory` and `db_map` skills.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
-`./sc render`. They are derived artifacts: a photograph of a DB row, not the row.
+`sc render`. They are derived artifacts: a photograph of a DB row, not the row.
 Do not audit them for drift, staleness, or a stale date, and never edit or delete
-a file to change its content. If one looks wrong or out of date, fix the DB (`./sc
+a file to change its content. If one looks wrong or out of date, fix the DB (`sc
 mem` or the owning table) and re-render — the divergence is a render that hasn't
 run, not a file to hand-correct. The DB is the authoritative content; the tree is
 its projection.
