@@ -1143,10 +1143,10 @@ through the engine API, via `sc mem`:
 
 There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
 If the API isn''t wired, `sc mem` fails loud instead of writing the DB behind
-its back. Your identity rides in your bearer token — the server resolves
-token -> shell; never name a shell in a write. Decisions read FLEET-WIDE
-(every row, tagged `@shortname`) so cross-shell citations resolve; every
-other identity surface reads as you.
+its back. `sc mem` is already wired to this launched shell — the engine
+resolves API identity for you; never name a shell in a write. Decisions read
+FLEET-WIDE (every row, tagged `@shortname`) so cross-shell citations
+resolve; every other identity surface reads as you.
 
 **The `sc sql` lane** (read-only; `sc sql-rw` gated) is real and blessed for
 what `sc mem` doesn''t cover: admin/reporting reads and sweep queries — the
@@ -1197,7 +1197,7 @@ are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
 
 Each routes through the engine API to the live shared DB. `sc mem which`
 orients; `sc mem <cmd> -h` shows flags. Writes always target your own shell —
-the server resolves it from your token.
+the engine resolves API identity for you.
 
 ```
 # current_state (rolling status, not a log — replaces in place):
@@ -2540,8 +2540,8 @@ All memory = DB rows; no flat files. Write at the moment it matters, never in a
 close ritual.
 
 Every write goes through `sc mem` -> lands in the live shared engine DB, visible
-to all shells on commit. It always targets your own shell (identity resolved
-from your token) — never name a shell.
+to all shells on commit. It always targets your own shell (the engine resolves
+API identity for you) — never name a shell.
 
 ## current_state — rolling status, NOT a log
 

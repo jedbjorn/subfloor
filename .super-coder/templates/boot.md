@@ -37,10 +37,11 @@ different ways, so keep them straight:
   `.super-coder/`. Holds your identity, memory, roadmap, specs, and the repo map.
   Gitignored and rebuilt from tracked text. **Write through `sc mem`** — the
   write lands in the live engine DB, durable and visible to all. `sc mem which`
-  confirms the API is reachable and who your token resolves to. `sc mem` routes
-  through the engine API (no direct-DB fallback). If it reports "API unreachable",
-  the engine server is down — surface this to FnB; they restart it with
-  `sc restart` / `make dos-r`. Do not retry silently; surface the error and stop.
+  confirms the API is reachable and which shell this session resolves as.
+  `sc mem` routes through the engine API (no direct-DB fallback). If it reports
+  "API unreachable", the engine server is down — surface this to FnB; they
+  restart it with `sc restart` / `make dos-r`. Do not retry silently; surface
+  the error and stop.
 - **App product DB** — the database of the product *this repo* builds. Its name
   and path **vary per fork** and live **outside** `.super-coder/`. Holds the
   product's runtime data + schema. Change it the way the product does — schema
