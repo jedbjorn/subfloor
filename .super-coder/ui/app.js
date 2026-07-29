@@ -3022,7 +3022,9 @@ async function renderSprints(root) {
 // uses the normal CLI preparation path server-side, but deliberately has no
 // terminal, tmux controls, or live hand-off between browser and CLI.
 const CHAT_HARNESSES = ["opencode", "claude", "codex"];
-const CHAT_FLAVOR_ORDER = ["cartographer", "admin", "planner", "dev", "reviewer", "devops"];
+const CHAT_FLAVOR_ORDER = [
+  "cartographer", "admin", "conductor", "planner", "dev", "reviewer", "devops",
+];
 const CHAT_CONFIGURE_ROUTE = "configure";
 let chatRouteShell = "";
 let chatRouteConversation = "";
@@ -3392,7 +3394,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   let messages = [...initialMessages];
   const events = [];
   const seen = new Set();
-  let latestRunId = null;
 
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
@@ -3474,7 +3475,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     const closed = conversation.state === "closed";
     composer.disabled = closed;
     send.disabled = closed;
-    interrupt.disabled = !["queued", "running", "waiting"].includes(conversation.state);
     close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
     composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
     chatPaintTranscript(
@@ -3502,15 +3502,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     anFilters.model = conversation.route.model || "";
     location.hash = "analytics";
   };
-  const interrupt = el("button", { className: "act", type: "button", textContent: "Interrupt" });
-  interrupt.onclick = async () => {
-    interrupt.disabled = true;
-    try {
-      await chatApi(`/conversations/${conversation.conversation_id}/interruptions`,
-        "POST", latestRunId ? { run_id: latestRunId } : {}, requestKey());
-    } catch (error) { toast(`${error.code}: ${error.message}`); }
-    finally { interrupt.disabled = false; }
-  };
   const close = el("button", {
     className: "act danger",
     type: "button",
@@ -3526,7 +3517,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
-  actions.append(analytics, interrupt, close);
+  actions.append(analytics, close);
   header.append(title, state, actions);
 
   async function submit() {
@@ -3579,7 +3570,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       if (seen.has(event.sequence)) return;
       seen.add(event.sequence);
       events.push(event);
-      if (event.run_id) latestRunId = event.run_id;
       const message = messages.find((item) => item.message_id === event.message_id);
       if (message && event.event_type === "run.started") message.state = "running";
       if (message && event.event_type === "run.completed") message.state = "completed";
@@ -3655,7 +3645,12 @@ async function renderInterface(root) {
   ];
   const orderedShells = orderedFlavors.flatMap((flavor) =>
     shells.filter((item) => (item.flavor || "bespoke") === flavor));
+  let previousFlavor = "";
   for (const item of orderedShells) {
+    const flavor = item.flavor || "bespoke";
+    if (previousFlavor && flavor !== previousFlavor)
+      rail.append(el("div", { className: "chat-shell-divider", role: "separator" }));
+    previousFlavor = flavor;
     const active = allConversations.items.find(
       (conversation) => conversation.shell.shell_id === item.shell_id
         && conversation.state !== "closed");

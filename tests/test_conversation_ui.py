@@ -115,7 +115,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'queueState.textContent = `${queued} queued`' in interface
     assert 'conversation.state !== "running"' in interface
     assert 'event.event_type === "run.started") message.state = "running"' in interface
-    assert 'textContent: "Interrupt"' in interface
+    assert 'textContent: "Interrupt"' not in interface
     assert 'textContent: "Retry"' in interface
     assert 'textContent: "Close"' in interface
     assert 'textContent: "Analytics"' in interface
@@ -129,7 +129,8 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'className: "chat-title-button"' in interface
     assert 'title: "Rename conversation"' in interface
     assert 'textContent: "Rename"' not in interface
-    assert "actions.append(analytics, interrupt, close)" in interface
+    assert "actions.append(analytics, close)" in interface
+    assert "/interruptions" not in interface
     assert "chatCloseForSwitch(selectedConversation)" in interface
     assert "Finish the current turn and queued messages before switching chats." in interface
     assert 'item.state !== "closed"' in interface
@@ -167,13 +168,21 @@ def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
     assert "height: 100%; overflow-y: auto;" in STYLE
 
 
-def test_shell_rail_is_flat_but_retains_flavor_order():
+def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
+    assert (
+        '"cartographer", "admin", "conductor", "planner", "dev", '
+        '"reviewer", "devops"'
+    ) in APP
     assert "const orderedShells = orderedFlavors.flatMap" in interface
     assert "for (const item of orderedShells)" in interface
+    assert 'const flavor = item.flavor || "bespoke"' in interface
+    assert "previousFlavor && flavor !== previousFlavor" in interface
+    assert 'className: "chat-shell-divider", role: "separator"' in interface
     assert 'className: "chat-shell-group"' not in interface
     assert ".chat-shell-group" not in STYLE
+    assert ".chat-shell-divider" in STYLE
 
 
 def test_history_header_places_configure_under_identity_and_centers_chat_action():

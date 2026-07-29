@@ -95,6 +95,9 @@ body.interface-view main {
   letter-spacing: .14em; padding: .35rem .55rem;
 }
 .chat-rail-title { color: var(--ink); font-size: .74rem; margin-bottom: .45rem; }
+.chat-shell-divider {
+  height: 1px; margin: .65rem .55rem; background: var(--line-soft);
+}
 .chat-shell {
   position: relative; width: 100%; display: flex; align-items: center; gap: .45rem;
   background: transparent; border: 1px solid transparent; color: var(--dim);
