@@ -69,11 +69,14 @@ class ConversationApiCase(unittest.TestCase):
         con.execute(
             "INSERT INTO shells "
             "(shell_id,display_name,shortname,flavor,system_prompt,user_id,"
-            "api_key) VALUES (1,'Dev','dev','dev','prompt',1,'shell-token')"
+            "api_key) VALUES "
+            "(1,'Dev','dev','dev','prompt',1,'shell-token'),"
+            "(2,'Review','review','dev','prompt',1,'review-token')"
         )
         con.commit()
         con.close()
         (self.root / ".sc-worktrees" / "dev").mkdir(parents=True)
+        (self.root / ".sc-worktrees" / "review").mkdir(parents=True)
 
         patches = (
             mock.patch.object(conversation_routes, "DB_PATH", self.db_path),
@@ -82,6 +85,11 @@ class ConversationApiCase(unittest.TestCase):
                 conversation_routes.conversation_broker,
                 "notify_commit",
                 return_value=True,
+            ),
+            mock.patch.object(
+                conversation_routes,
+                "_wait_for_cli_release",
+                return_value=None,
             ),
         )
         for patch in patches:
@@ -149,6 +157,109 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
+    def test_creating_a_chat_refuses_a_live_cli_owner(self) -> None:
+        with mock.patch.object(
+            conversation_routes,
+            "_wait_for_cli_release",
+            return_value="busy",
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex"},
+                key="cli-owned-shell",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_BUSY")
+        self.assertIn("live CLI session", error["error"]["message"])
+
+    def test_creating_a_chat_closes_the_previous_idle_chat(self) -> None:
+        first = self.create(key="first-chat", title="First")
+        second = self.create(key="second-chat", title="Second")
+        self.assertNotEqual(first["conversation_id"], second["conversation_id"])
+
+        con = self.connect()
+        try:
+            rows = con.execute(
+                "SELECT conversation_id,state,closed_at FROM conversations"
+            ).fetchall()
+        finally:
+            con.close()
+        by_id = {row["conversation_id"]: row for row in rows}
+        self.assertEqual(by_id[first["conversation_id"]]["state"], "closed")
+        self.assertIsNotNone(by_id[first["conversation_id"]]["closed_at"])
+        self.assertEqual(by_id[second["conversation_id"]]["state"], "idle")
+
+    def test_each_shell_may_keep_one_browser_chat_open(self) -> None:
+        first = self.create(key="first-shell-chat", title="Dev")
+        second = self.create(
+            key="second-shell-chat",
+            shell_id=2,
+            title="Review",
+        )
+
+        con = self.connect()
+        try:
+            rows = con.execute(
+                "SELECT conversation_id,shell_id,state FROM conversations "
+                "ORDER BY shell_id"
+            ).fetchall()
+        finally:
+            con.close()
+        by_id = {row["conversation_id"]: row for row in rows}
+        self.assertEqual(by_id[first["conversation_id"]]["state"], "idle")
+        self.assertEqual(by_id[second["conversation_id"]]["state"], "idle")
+        self.assertEqual(by_id[first["conversation_id"]]["shell_id"], 1)
+        self.assertEqual(by_id[second["conversation_id"]]["shell_id"], 2)
+
+    def test_creating_a_chat_refuses_while_the_open_turn_is_running(self) -> None:
+        first = self.create(key="running-chat")
+        con = self.connect()
+        try:
+            con.execute(
+                "UPDATE conversations SET state='queued' "
+                "WHERE conversation_id=?",
+                (first["conversation_id"],),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "title": "Second"},
+            key="blocked-second-chat",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "BROWSER_CHAT_BUSY")
+
+    def test_close_refuses_while_the_open_turn_is_running(self) -> None:
+        first = self.create(key="running-close")
+        con = self.connect()
+        try:
+            con.execute(
+                "UPDATE conversations SET state='queued' "
+                "WHERE conversation_id=?",
+                (first["conversation_id"],),
+            )
+            con.execute(
+                "UPDATE conversations SET state='running' "
+                "WHERE conversation_id=?",
+                (first["conversation_id"],),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        status, _, error = self.request(
+            "PATCH",
+            f"/api/conversations/{first['conversation_id']}",
+            body={"version": first["version"], "state": "closed"},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "BROWSER_CHAT_BUSY")
+
     def test_opencode_requires_an_exact_resolved_model(self) -> None:
         with mock.patch.object(
             conversation_routes.run_mod,
@@ -316,10 +427,11 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(conflict["error"]["code"], "MESSAGE_IDEMPOTENCY_CONFLICT")
 
     def test_cursor_pages_have_no_duplicates_and_patch_uses_version(self) -> None:
-        identifiers = {
-            self.create(key=f"create-{number}")["conversation_id"]
+        created = [
+            self.create(key=f"create-{number}")
             for number in range(3)
-        }
+        ]
+        identifiers = {item["conversation_id"] for item in created}
         seen = []
         cursor = None
         while True:
@@ -335,19 +447,25 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(set(seen), identifiers)
         self.assertEqual(len(seen), 3)
 
-        conversation_id = seen[0]
+        conversation_id = created[-1]["conversation_id"]
+        status, _, current = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}",
+        )
+        self.assertEqual(status, 200, current)
+        version = current["version"]
         status, _, updated = self.request(
             "PATCH",
             f"/api/conversations/{conversation_id}",
-            body={"version": 1, "title": "Renamed"},
+            body={"version": version, "title": "Renamed"},
         )
         self.assertEqual(status, 200, updated)
         self.assertEqual(updated["title"], "Renamed")
-        self.assertEqual(updated["version"], 2)
+        self.assertEqual(updated["version"], version + 1)
         status, _, conflict = self.request(
             "PATCH",
             f"/api/conversations/{conversation_id}",
-            body={"version": 1, "title": "Stale"},
+            body={"version": version, "title": "Stale"},
         )
         self.assertEqual(status, 409)
         self.assertEqual(conflict["error"]["code"], "CONVERSATION_VERSION_CONFLICT")

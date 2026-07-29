@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -37,10 +38,16 @@ class ConversationLaunchPreparer:
         *,
         prepare_launch: Callable[..., Any] = run_mod.prepare_launch,
         liveness: Callable[[], dict] = shell_liveness.compute,
+        liveness_retries: int = 40,
+        liveness_delay: float = 0.05,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.db_path = str(db_path)
         self.prepare_launch = prepare_launch
         self.liveness = liveness
+        self.liveness_retries = liveness_retries
+        self.liveness_delay = liveness_delay
+        self.sleep = sleep
 
     def _shell(self, shell_id: int) -> tuple[str, str | None]:
         con = db_driver.connect(self.db_path)
@@ -69,7 +76,19 @@ class ConversationLaunchPreparer:
                 else shell_liveness.session_state(shortname, snapshot)
             )
 
-        state = occupying_state()
+        def wait_for_free_slot() -> str | None:
+            state = occupying_state()
+            for _ in range(self.liveness_retries):
+                if state is None:
+                    return None
+                self.sleep(self.liveness_delay)
+                state = occupying_state()
+            return state
+
+        # Native harnesses can emit their terminal result just before their
+        # process disappears from /proc. Give that browser-owned teardown a
+        # short drain window; a genuinely occupied CLI slot remains a refusal.
+        state = wait_for_free_slot()
         if state is not None:
             raise ConversationLaunchError(
                 "SHELL_BUSY",
@@ -94,7 +113,7 @@ class ConversationLaunchPreparer:
         # Preparation renders and may create/sync the worktree. Recheck at the
         # dispatch edge so a CLI launch that raced that work is still refused
         # before the adapter can send the prompt.
-        state = occupying_state()
+        state = wait_for_free_slot()
         if state is not None:
             raise ConversationLaunchError(
                 "SHELL_BUSY",

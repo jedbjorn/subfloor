@@ -47,9 +47,15 @@ class FakeOpenCode:
             return {"healthy": True, "version": "1.18.9"}
         if method == "POST" and path == "/session":
             return {"id": self.session_ref, "title": "test"}
-        if path.endswith("/prompt_async"):
+        if path.endswith("/message"):
             self.status = "busy"
-            return None
+            return {
+                "info": {
+                    "role": "assistant",
+                    "sessionID": self.session_ref,
+                },
+                "parts": [{"type": "text", "text": "hello"}],
+            }
         if path.endswith("/abort"):
             self.status = "idle"
             return True
@@ -79,6 +85,10 @@ class FakeOpenCode:
                         "field": "text",
                         "delta": "wrong",
                     },
+                },
+                {
+                    "type": "session.idle",
+                    "properties": {"sessionID": self.session_ref},
                 },
                 {
                     "type": "session.status",
@@ -426,6 +436,20 @@ class ConversationAdapterTest(unittest.TestCase):
         if harness == "claude":
             self.write_claude_session(adapter, session_ref)
 
+    def test_claude_session_path_matches_native_project_encoding(self) -> None:
+        adapter = ClaudeAdapter(config_dir=self.claude_config)
+        worktree = Path("/home/j3d1/Repos/dos_app/.sc-worktrees/pln1")
+        self.assertEqual(
+            adapter._session_path(
+                "b6321ad5-9363-4529-980d-93a959000968",
+                worktree,
+            ),
+            self.claude_config
+            / "projects"
+            / "-home-j3d1-Repos-dos-app--sc-worktrees-pln1"
+            / "b6321ad5-9363-4529-980d-93a959000968.jsonl",
+        )
+
     def test_identical_contract_start_stream_interrupt_resume_reconcile(
         self,
     ) -> None:
@@ -521,9 +545,14 @@ class ConversationAdapterTest(unittest.TestCase):
         prompt = next(
             request
             for request in native.requests
-            if request[1].endswith("/prompt_async")
+            if request[1].endswith("/message")
         )
         self.assertEqual(prompt[2]["directory"], str(self.root))
+        self.assertNotIn(
+            "messageID",
+            prompt[3],
+            "OpenCode must generate its own ordered native message id",
+        )
         self.assertEqual(
             prompt[3]["model"],
             {"providerID": "openrouter", "modelID": "test-model"},
@@ -531,19 +560,16 @@ class ConversationAdapterTest(unittest.TestCase):
         events = list(adapter.stream(turn))
         self.assertNotIn("wrong", repr(events))
         self.assertIn("permission.requested", [event.type for event in events])
+        self.assertEqual(
+            [event.type for event in events].count("run.completed"),
+            1,
+            "the pre-dispatch idle event must not terminate the new turn",
+        )
 
         fresh = adapter.resume(turn.session_ref, self.context, "again")
-        permission_patch = next(
-            request
-            for request in native.requests
-            if request[:2] == (
-                "PATCH",
-                f"/session/{turn.session_ref}",
-            )
-        )
-        self.assertEqual(
-            permission_patch[3]["permission"][0]["action"],
-            "allow",
+        self.assertFalse(
+            any(request[0] == "PATCH" for request in native.requests),
+            "resume must reuse persisted permissions, not duplicate them",
         )
         native.status = "busy"
         recovered = adapter.reconcile(fresh, self.context)
@@ -572,7 +598,7 @@ class ConversationAdapterTest(unittest.TestCase):
         prompt = next(
             request
             for request in native.requests
-            if request[1].endswith("/prompt_async")
+            if request[1].endswith("/message")
         )
         self.assertEqual(
             create[3]["model"],

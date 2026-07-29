@@ -237,6 +237,7 @@ class OpenCodeAdapter(ConversationAdapter):
             self.transport = UrlHttpTransport(
                 endpoint,
                 password=password if password is not None else ensure_server(),
+                timeout=600.0,
             )
 
     def probe(self) -> ProbeResult:
@@ -300,10 +301,8 @@ class OpenCodeAdapter(ConversationAdapter):
         session_ref: str,
         context: ConversationContext,
         message: str,
-        run_ref: str,
     ) -> None:
         body: dict[str, Any] = {
-            "messageID": run_ref,
             "parts": [{"type": "text", "text": message}],
         }
         route = self._route(context)
@@ -314,7 +313,7 @@ class OpenCodeAdapter(ConversationAdapter):
             }
         self.transport.request(
             "POST",
-            f"/session/{session_ref}/prompt_async",
+            f"/session/{session_ref}/message",
             query=self._query(context.checked_worktree()),
             body=body,
         )
@@ -330,7 +329,12 @@ class OpenCodeAdapter(ConversationAdapter):
         worktree = context.checked_worktree()
         run_ref = f"msg_{uuid.uuid4().hex}"
         # `/event` is live rather than replayable. Open the subscription before
-        # dispatch so a fast generation cannot finish in the prompt/stream gap.
+        # the synchronous message dispatch so all native activity is buffered
+        # while `/message` waits for the completed assistant response.
+        #
+        # Do not use `/prompt_async`: OpenCode can lose async session state
+        # after the first turn, accept later user messages without running
+        # inference, and report those turns idle.
         event_stream = iter(
             self.transport.stream(
                 "/event",
@@ -347,7 +351,7 @@ class OpenCodeAdapter(ConversationAdapter):
                 "resumed": resumed,
             },
         )
-        self._prompt(session_ref, context, message, run_ref)
+        self._prompt(session_ref, context, message)
         return turn
 
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
@@ -385,7 +389,6 @@ class OpenCodeAdapter(ConversationAdapter):
         context: ConversationContext,
         message: str,
     ) -> NativeTurn:
-        worktree = context.checked_worktree()
         message = ensure_nonempty_message(message)
         inspected = self.inspect(session_ref, context)
         if not inspected.exists:
@@ -393,14 +396,9 @@ class OpenCodeAdapter(ConversationAdapter):
                 "HARNESS_SESSION_LOST",
                 f"OpenCode session does not exist: {session_ref}",
             )
-        permission = self._permission_rules(context)
-        if permission:
-            self.transport.request(
-                "PATCH",
-                f"/session/{session_ref}",
-                query=self._query(worktree),
-                body={"permission": permission},
-            )
+        # Session permissions are persisted from create. OpenCode's session
+        # PATCH contract is for mutable metadata such as title; repeatedly
+        # sending permission rules duplicates them in native session state.
         return self._turn(session_ref, context, message, resumed=True)
 
     @staticmethod
@@ -582,11 +580,27 @@ class OpenCodeAdapter(ConversationAdapter):
             },
             "session.create-or-resume",
         )
+        observed_activity = False
         for raw in native_stream:
             event_session = self._session_of(raw)
             if event_session and event_session != turn.session_ref:
                 continue
             for event in self._normalize(raw):
+                # Opening `/event` for an existing session can enqueue its
+                # current idle state before the message is dispatched. That
+                # idle belongs to the previous turn; accepting it would mark
+                # the new message complete without ever generating a reply.
+                if event.type == "run.completed" and not observed_activity:
+                    continue
+                if event.type in {
+                    "run.started",
+                    "assistant.delta",
+                    "tool.started",
+                    "tool.completed",
+                    "permission.requested",
+                    "input.requested",
+                }:
+                    observed_activity = True
                 if event.type in TERMINAL_EVENTS:
                     turn.metadata["terminal"] = event.type
                 yield event

@@ -16,6 +16,7 @@ import io
 import json
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -380,6 +381,27 @@ def _require_conversation(con, conversation_id: str, owner_user_id: int):
     return row
 
 
+def _live_shell_session(shell) -> str | None:
+    snapshot = run_mod.shell_liveness.compute()
+    if shell["flavor"] == "admin":
+        return "busy" if snapshot.get("admin_root_pids") else None
+    return run_mod.shell_liveness.session_state(
+        shell["shortname"] or "",
+        snapshot,
+    )
+
+
+def _wait_for_cli_release(shell) -> str | None:
+    """Drain a just-finished browser process, but never steal a live CLI slot."""
+    state = _live_shell_session(shell)
+    for _ in range(40):
+        if state is None:
+            return None
+        time.sleep(0.05)
+        state = _live_shell_session(shell)
+    return state
+
+
 def _create_conversation(con, operator: dict, headers, body: dict):
     _only_fields(body, {"shell_id", "title", "harness", "model", "effort"})
     key = _idempotency_key(headers)
@@ -424,6 +446,23 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "SHELL_NOT_LAUNCHABLE",
             "shell is unknown, deleted, or unavailable to this operator",
         )
+
+    open_conversations = con.execute(
+        "SELECT conversation_id,state FROM conversations "
+        "WHERE mode='normal' AND shell_id=? AND state!='closed'",
+        (shell_id,),
+    ).fetchall()
+    if not open_conversations:
+        live_state = _wait_for_cli_release(shell)
+        if live_state is not None:
+            con.rollback()
+            raise ApiError(
+                409,
+                "SHELL_BUSY",
+                f"shell {shell['shortname']!r} has a live CLI session; "
+                "close it before opening a browser chat",
+                {"shell_id": shell_id, "state": live_state},
+            )
 
     defaults = run_mod.flavor_defaults(con).get(shell["flavor"])
     harness = body.get("harness")
@@ -482,6 +521,33 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
     conversation_id = "cv_" + uuid.uuid4().hex
     provider = run_mod.session_provider(harness, model)
+    running = [
+        row for row in open_conversations
+        if row["state"] in ("queued", "running")
+    ]
+    if running:
+        con.rollback()
+        raise ApiError(
+            409,
+            "BROWSER_CHAT_BUSY",
+            "the open browser chat has a turn in progress",
+            {"conversation_id": running[0]["conversation_id"]},
+        )
+    auto_closed = []
+    for row in open_conversations:
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
+            "last_activity_at=datetime('now'),version=version+1 "
+            "WHERE conversation_id=?",
+            (row["conversation_id"],),
+        )
+        _append_event(
+            con,
+            row["conversation_id"],
+            "conversation.closed",
+            {"status": "closed", "reason": "another browser chat opened"},
+        )
+        auto_closed.append(row["conversation_id"])
     con.execute(
         "INSERT INTO conversations "
         "(conversation_id,shell_id,mode,owner_user_id,harness,provider,model,"
@@ -513,6 +579,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         },
     )
     con.commit()
+    for closed_id in auto_closed:
+        conversation_events.notify(closed_id)
     conversation_events.notify(conversation_id)
     row = _require_conversation(con, conversation_id, operator["user_id"])
     return _json(
@@ -616,7 +684,7 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
         con.rollback()
         raise ApiError(
             409,
-            "SHELL_BUSY",
+            "BROWSER_CHAT_BUSY",
             "a queued or running conversation cannot be closed",
             {"state": row["state"]},
         )
