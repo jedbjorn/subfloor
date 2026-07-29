@@ -179,6 +179,32 @@ def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     return written
 
 
+def render_harness_skills(con: sqlite3.Connection, shell_id: int,
+                          work_dir: Path, adapter: dict) -> dict:
+    """Render exact shell grants into every skill directory consumed by the
+    selected harness. Adapters default to the Claude-compatible path and may
+    add a native path where compatibility discovery is incomplete."""
+    skill_dirs = adapter.get("skill_dirs") or [".claude/skills"]
+    written: list[Path] = []
+    skipped: list[Path] = []
+    for raw_dir in skill_dirs:
+        skills_dir = Path(raw_dir)
+        if skills_dir.is_absolute() or ".." in skills_dir.parts:
+            raise LaunchError(
+                f"adapter skill_dirs entry must stay inside the worktree: {raw_dir}"
+            )
+        summary = flat.render_skill_md(
+            con, shell_id, work_dir, skills_dir=skills_dir
+        )
+        written.extend(summary["written"])
+        skipped.extend(summary["skipped"])
+    return {
+        "written": written,
+        "skipped": skipped,
+        "dirs": list(skill_dirs),
+    }
+
+
 def resolve_opencode_plugins(work_dir: Path) -> None:
     """Rewrite opencode.json `plugin` entries that point into the engine to
     ABSOLUTE paths. The template registers
@@ -1250,7 +1276,9 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                            source_mode=install.is_source_repo(),
                            api_key=full["api_key"],
                            api_port=api_port)
-    flat.render_skill_md(con, full["shell_id"], work_dir)
+    render_harness_skills(
+        con, full["shell_id"], work_dir, adapter
+    )
     con.close()
     for name in ("CLAUDE.md", "AGENTS.md"):
         atomic_write(work_dir / name, content)
@@ -1657,9 +1685,11 @@ def main() -> None:
                                api_port=api_port,
                                slot_context=slot_context)
 
-        # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
-        # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
-        skills = flat.render_skill_md(con, full["shell_id"], work_dir)
+        # Render this shell's granted skills to every directory declared by the
+        # selected harness — gitignored and rebuilt per boot.
+        skills = render_harness_skills(
+            con, full["shell_id"], work_dir, adapter
+        )
         con.close()
 
         # One compose, two outputs — Claude Code reads CLAUDE.md, the AGENTS.md
@@ -1690,7 +1720,8 @@ def main() -> None:
     if headless and api_port and full["api_key"]:
         print(f"→ api: http://127.0.0.1:{api_port} (SC_API_TOKEN set)")
     print(f"→ skills: {len(skills['written'])} written, "
-          f"{len(skills['skipped'])} unchanged → .claude/skills/")
+          f"{len(skills['skipped'])} unchanged → "
+          f"{', '.join(skills['dirs'])}")
 
     # Harness was resolved up front (override / picker / default); the adapter
     # seam owns the launch command + any harness-specific config to emit.

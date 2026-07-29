@@ -22,6 +22,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -1030,6 +1031,34 @@ class HeadlessTest(unittest.TestCase):
     def test_opencode_headless_argv(self):
         cmd = run.headless_command(self.adapter("opencode"), "p", "zai/glm")
         self.assertEqual(cmd, ["opencode", "run", "-m", "zai/glm", "p"])
+
+    def test_opencode_declares_native_skill_delivery(self):
+        adapter = self.adapter("opencode")
+        self.assertEqual(
+            adapter["skill_dirs"],
+            [".claude/skills", ".opencode/skills"],
+        )
+        self.assertEqual(adapter["env"]["OPENCODE_DISABLE_CLAUDE_CODE"], "1")
+
+    def test_opencode_renders_every_declared_skill_directory(self):
+        adapter = self.adapter("opencode")
+        with mock.patch.object(
+            run.flat,
+            "render_skill_md",
+            return_value={"written": [], "skipped": []},
+        ) as render:
+            summary = run.render_harness_skills(
+                object(), 7, Path("/tmp/work"), adapter
+            )
+
+        self.assertEqual(
+            [call.kwargs["skills_dir"] for call in render.call_args_list],
+            [Path(".claude/skills"), Path(".opencode/skills")],
+        )
+        self.assertEqual(
+            summary["dirs"],
+            [".claude/skills", ".opencode/skills"],
+        )
 
     def test_no_model_omits_the_flag(self):
         cmd = run.headless_command(self.adapter("claude"), "p")

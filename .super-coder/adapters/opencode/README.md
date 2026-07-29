@@ -1,9 +1,10 @@
 # adapters/opencode — OpenCode
 
-OpenCode consumes our Claude-format assets almost unchanged — it reads `AGENTS.md`
-at the repo root and `.claude/skills/<name>/SKILL.md` natively (Agent Skills
-format), both already emitted by the render chain. The adapter adds the one
-harness-specific file OpenCode wants and the launch command.
+OpenCode reads `AGENTS.md` at the repo root and discovers Agent Skills from its
+native `.opencode/skills/<name>/SKILL.md` tree. The render chain emits each
+shell's exact grants there for OpenCode while retaining the
+`.claude/skills/<name>/SKILL.md` mirror used by Claude-compatible harnesses.
+The adapter adds the harness-specific config file and launch command.
 
 - **`opencode.json`** (emitted to the repo root at launch, gitignored like the
   boot artifact) — points `instructions` at `AGENTS.md`, sets default tool
@@ -21,10 +22,12 @@ harness-specific file OpenCode wants and the launch command.
   `OPENCODE_DISABLE_LSP_DOWNLOAD=true` in the environment — OpenCode auto-fetches
   server binaries on first use, and this is the only knob for it (env-only, no
   JSON key), so we leave it to the env rather than forcing it off here.
-- **`env.OPENCODE_DISABLE_CLAUDE_CODE=1`** — best-effort: stop OpenCode from also
-  loading `CLAUDE.md` (we dual-write both with identical content; this avoids a
-  double-load). ⚠ The exact env name is a **research flag to verify on live
-  OpenCode** — if wrong it's a harmless no-op (the content is identical anyway).
+- **`skill_dirs`** — renders exact shell grants to both `.claude/skills` and
+  OpenCode's native `.opencode/skills`. Native delivery avoids depending on
+  version-sensitive project-local Claude compatibility.
+- **`env.OPENCODE_DISABLE_CLAUDE_CODE=1`** — disables Claude prompt and skill
+  compatibility so OpenCode sees only its native, exact-grant skill tree rather
+  than ambient global `~/.claude/skills`.
 - **`tool-discipline.md`** + its entry in `instructions` — a static, harness-level
   steer (not part of the render-chain-generated `AGENTS.md`, so it survives
   regeneration). It tells the model never to emit tool calls as text/XML and never
@@ -60,8 +63,7 @@ harness-specific file OpenCode wants and the launch command.
 
 ## Verify on live OpenCode (research flags from the spec)
 
-- skills dir spelling consumed (`.claude/skills/` ✓ vs any `agent(s)/` variant)
-- `OPENCODE_DISABLE_CLAUDE_CODE` env name (above)
+- native `.opencode/skills/` discovery
 - session-storage paths (doc 404'd at research time)
 
 None block the contract; confirm during real-repo testing.
