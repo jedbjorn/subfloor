@@ -1013,7 +1013,8 @@ def main() -> None:
 
         full = con.execute(
             "SELECT shell_id, display_name, shortname, partner, role, mandate, "
-            "current_state, system_prompt, connections, flavor, api_key FROM shells WHERE shell_id=?",
+            "current_state, system_prompt, connections, workspace, flavor, api_key "
+            "FROM shells WHERE shell_id=?",
             (chosen["shell_id"],),
         ).fetchone()
         api_port = ports_mod.resolve().get("port")
@@ -1057,6 +1058,7 @@ def main() -> None:
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
                                source_mode=install.is_source_repo(),
+                               work_repo=install.work_repo(),
                                sandbox_mode=bool(os.environ.get("SC_SANDBOX")),
                                api_key=full["api_key"],
                                api_port=api_port)

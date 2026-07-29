@@ -906,9 +906,9 @@ PUBLISH_PATHS = [
 REGENERABLE_PATHS = PUBLISH_PATHS + [".sc-state/map_content.sql"]
 
 
-def _git(*args):
+def _git(*args, env=None):
     return subprocess.run(["git", *args], cwd=str(REPO_ROOT),
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
 
 
 def _porcelain_paths(*pathspec) -> list[str]:
@@ -1128,7 +1128,10 @@ def _publish_content(out: list, state: dict) -> None:
     msg = (f"gui: publish content edits ({n} file{'s' if n != 1 else ''})\n\n"
            f"Serialized + rendered from the review GUI at {stamp}.\n\n"
            + "\n".join(f"- {f}" for f in staged.splitlines()))
-    c = _git("commit", "-m", msg)
+    # Engine-initiated commit = deliberate home maintenance by definition; the
+    # pre-commit home-repo guard (work_repo installs) must not block publish.
+    c = _git("commit", "-m", msg,
+             env={**os.environ, "SC_HOME_MAINTENANCE": "1"})
     if c.returncode != 0:
         state["ok"] = False
         out.append("✗ commit failed:\n" + (c.stderr or c.stdout).strip())
@@ -1148,8 +1151,10 @@ def _publish_content(out: list, state: dict) -> None:
     #    is safe and force-with-lease's tracking-ref dance is unnecessary.
     url = _origin_https()
     if not url:
-        state["ok"] = False
-        out.append("✗ no 'origin' remote to push to.")
+        # A local-only home substrate (remotes removed on purpose) publishes to
+        # disk + local git only — that is success, not an error.
+        out.append("✓ committed locally; no 'origin' remote — push/PR skipped "
+                   "(local-only repo)")
         return
     push_url = url.replace("https://", f"https://x-access-token:{token}@", 1)
     p = _git("push", "--force", push_url, f"{PUBLISH_BRANCH}:{PUBLISH_BRANCH}")

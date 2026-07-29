@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# super-coder pre-commit — universal branch-guard backstop.
+# super-coder pre-commit — universal branch-guard backstop + home-repo guard.
 #
 # Fires for EVERY harness (and the FnB) via core.hooksPath, so it is the only
 # real enforcement for vibe (which has no pre-tool hook) and a defense-in-depth
@@ -14,5 +14,39 @@
 # own path (core.hooksPath points at <engine>/hooks, so ../scripts is the engine
 # install). show-toplevel was wrong in a fork worktree, where .super-coder/ is
 # gitignored and absent — the same trap the harness hooks fell into.
-guard="${SC_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}/scripts/branch-guard.sh"
+engine="${SC_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
+guard="$engine/scripts/branch-guard.sh"
+
+# ── Home-repo guard ─────────────────────────────────────────────────────────
+# When instance.json declares a work_repo, THIS repo is only the shells' home
+# substrate — every commit belongs in the work repo, and the observed failure
+# is a shell resolving bare `git` to the home repo and committing here. Refuse
+# unless it is deliberate home maintenance: SC_HOME_MAINTENANCE=1 (exported by
+# engine-initiated flows like the GUI publish), or the admin flavor. Installs
+# without work_repo never reach the check. Repo identity is compared by
+# git-common-dir so every worktree of the home repo is covered.
+work_repo="$(python3 -c '
+import json, os, sys
+try:
+    raw = (json.load(open(sys.argv[1])).get("work_repo") or "").strip()
+    print(os.path.expanduser(raw))
+except Exception:
+    print("")
+' "$engine/instance.json" 2>/dev/null || echo "")"
+if [ -n "$work_repo" ] && [ "${SC_HOME_MAINTENANCE:-}" != "1" ] \
+   && [ "${SC_SHELL_FLAVOR:-}" != "admin" ]; then
+  here="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
+  home="$(git -C "$engine/.." rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
+  if [ -n "$here" ] && [ "$here" = "$home" ]; then
+    {
+      echo "Blocked: this commit targets the HOME substrate repo ('$(cd "$engine/.." && pwd)') — not your work repo."
+      echo "Your work repo is: $work_repo"
+      echo "    git -C $work_repo status    # branch, commit, and PR THERE"
+      echo "Home and work repo are different products — never retarget this work onto the home repo."
+      echo "Deliberate home maintenance only (with FnB approval): SC_HOME_MAINTENANCE=1 git commit …"
+    } >&2
+    exit 2
+  fi
+fi
+
 exec bash "$guard"

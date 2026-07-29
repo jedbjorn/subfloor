@@ -134,11 +134,11 @@ def git(*args: str) -> str | None:
 def is_source_repo() -> bool:
     """In a fork, .super-coder is infrastructure (skip it). In the SOURCE repo
     the engine IS the project, so map it too. Names canonical in
-    install.SOURCE_REPO_NAMES (super-coder → subfloor rename: both valid)."""
-    from install import SOURCE_REPO_NAMES
-    url = git("remote", "get-url", "origin")
-    return bool(url) and (url.rstrip("/").split("/")[-1].removesuffix(".git")
-                          in SOURCE_REPO_NAMES)
+    install.SOURCE_REPO_NAMES (super-coder → subfloor rename: both valid).
+    Delegates to install.is_source_repo() — one detection (origin basename OR
+    tracked engine, so a remote-less source repo still reads as source)."""
+    import install
+    return install.is_source_repo()
 
 
 # ── Dependency parsers (best-effort; each guarded) ───────────────────────────

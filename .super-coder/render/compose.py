@@ -61,6 +61,29 @@ PROJECT_VS_ENGINE_SOURCE = (
     "`.super-coder/`\" or \"report/file it upstream\", that guidance is for forks —\n"
     "here you author the fix directly instead."
 )
+# Third variant: this install's shells maintain a DIFFERENT repo (declared as
+# `work_repo` in instance.json — see install.work_repo()). The home repo then
+# exists only as their memory/identity substrate, and the #1 observed failure
+# is a shell resolving bare `git` to the home repo and building/committing
+# there. This block overrides BOTH other variants: work_repo > source > fork.
+PROJECT_VS_ENGINE_EXTERNAL = (
+    "**Your work repo is `{work_repo}` — NOT this repo.** This repo is your\n"
+    "HOME substrate: it hosts the engine (`.super-coder/` — memory, identity,\n"
+    "launcher) and nothing you are tasked to build.\n"
+    "\n"
+    "- Address the work repo explicitly in every git command:\n"
+    "  `git -C {work_repo} …`. Your cwd is a home worktree — a bare `git`\n"
+    "  command resolves HERE, the wrong repo.\n"
+    "- NEVER commit, branch, or open a PR in this repo. A pre-commit guard\n"
+    "  refuses home-repo commits; deliberate home maintenance only with\n"
+    "  `SC_HOME_MAINTENANCE=1` after explicit FnB approval.\n"
+    "- The VERSION CONTROL rules below govern the work repo, not this one.\n"
+    "- Memory writes are not commits — `sc mem`, as always.\n"
+    "- Home repo and work repo are different products with divergent\n"
+    "  histories. NEVER retarget a commit, branch, or diff from one onto the\n"
+    "  other — work built against the wrong repo is rebuilt from scratch in\n"
+    "  the right one."
+)
 RUNTIME_GUIDANCE_HOST = (
     "You run **directly on the host**. There is no container boundary: the host "
     "toolchain, network, credentials, services, and files available to your user "
@@ -85,6 +108,14 @@ RUNTIME_GUIDANCE_SANDBOX = (
     "declared broker skills for those resources.\n"
     "- Do not start a competing host-stack process from the container."
 )
+def pick_project_vs_engine(source_mode: bool,
+                           work_repo: "str | None" = None) -> str:
+    """Resolve the PROJECT vs ENGINE block: work_repo > source > fork."""
+    if work_repo:
+        return PROJECT_VS_ENGINE_EXTERNAL.replace("{work_repo}", work_repo)
+    return PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK
+
+
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 
@@ -268,7 +299,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
                  source_mode: bool = False,
-                 sandbox_mode: bool = False) -> str:
+                 sandbox_mode: bool = False,
+                 work_repo: "str | None" = None) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -278,12 +310,13 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     so a stale or divergent worktree is ambient knowledge, not something the
     shell must remember to check. source_mode flips PROJECT vs ENGINE to the
     source-repo variant (caller decides via install.is_source_repo() — compose
-    stays a pure render, no git).
+    stays a pure render, no git). work_repo (install.work_repo(): the separate
+    repo this install's shells maintain) overrides both modes with the
+    external-work variant.
     """
     template = TEMPLATE_PATH.read_text().rstrip()
-    template = template.replace(
-        "{{project_vs_engine}}",
-        PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK)
+    template = template.replace("{{project_vs_engine}}",
+                                pick_project_vs_engine(source_mode, work_repo))
     template = template.replace(
         "{{runtime_guidance}}",
         RUNTIME_GUIDANCE_SANDBOX if sandbox_mode else RUNTIME_GUIDANCE_HOST)
@@ -370,6 +403,14 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
             "directly (the only shell that does; every other shell works "
             "from a worktree and lands changes via PRs)")
 
+    # WORKSPACE: the shell's own repo-discriminator (shells.workspace) — which
+    # repos it works in and what each is. Rendered only when curated; rows
+    # without the column (older schemas) skip it.
+    workspace = ((shell["workspace"] or "").strip()
+                 if "workspace" in shell.keys() else "")
+    workspace_section = (
+        ["## WORKSPACE", "", workspace, "", "---", ""] if workspace else [])
+
     parts = [
         template,
         "",
@@ -381,6 +422,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "", "---", "",
         "## IDENTITY", "", render_identity(shell),
         "", "---", "",
+        *workspace_section,
         "## SYSTEM PROMPT", "", system_prompt,
         "", "---", "",
         "## CONNECTIONS", "", render_connections(map_con),

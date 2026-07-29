@@ -62,6 +62,31 @@ class ProjectVsEngineTest(unittest.TestCase):
         self.assertIn("gitignored dependency", fork_render)
         self.assertIn("you are upstream", source_render)
 
+    def test_external_block_redirects_to_the_work_repo(self):
+        ext = compose.PROJECT_VS_ENGINE_EXTERNAL
+        # the placeholder is the contract — pick_project_vs_engine substitutes it
+        self.assertIn("{work_repo}", ext)
+        rendered = compose.pick_project_vs_engine(True, "/w/subfloor")
+        self.assertNotIn("{work_repo}", rendered)
+        self.assertIn("`/w/subfloor`", rendered)
+        self.assertIn("NOT this repo", rendered)
+        self.assertIn("git -C /w/subfloor", rendered)
+        self.assertIn("NEVER commit, branch, or open a PR in this repo", rendered)
+        self.assertIn("SC_HOME_MAINTENANCE=1", rendered)  # names the guard's override
+        self.assertIn("NEVER retarget", rendered)
+
+    def test_work_repo_overrides_both_modes(self):
+        # work_repo > source > fork — regardless of source_mode
+        for source_mode in (True, False):
+            r = compose.pick_project_vs_engine(source_mode, "/w/subfloor")
+            self.assertIn("NOT this repo", r)
+            self.assertNotIn("you are upstream", r)
+            self.assertNotIn("gitignored dependency", r)
+        self.assertIn("you are upstream",
+                      compose.pick_project_vs_engine(True, None))
+        self.assertIn("gitignored dependency",
+                      compose.pick_project_vs_engine(False, None))
+
     def test_runtime_guidance_resolves_per_seat(self):
         self.assertEqual(self.template.count(RUNTIME_SLOT), 1)
         host = self.template.replace(RUNTIME_SLOT, compose.RUNTIME_GUIDANCE_HOST)

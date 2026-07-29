@@ -133,11 +133,39 @@ def origin_basename() -> str | None:
     return p.stdout.strip().rstrip("/").split("/")[-1].removesuffix(".git")
 
 
+def _engine_tracked() -> bool:
+    """Ground-truth source signal: the engine is TRACKED in this repo. Forks
+    gitignore `.super-coder/` wholesale, so a tracked engine source file means
+    this repo IS the engine source — independent of remotes (a local-only home
+    substrate has no origin yet must still read as source, or the fork-branch
+    untrack migration would git-rm-cache the engine)."""
+    p = sh("git", "-C", str(REPO_ROOT), "ls-files", "--",
+           str(Path(".super-coder") / "schema.sql"))
+    return p.returncode == 0 and bool(p.stdout.strip())
+
+
 def is_source_repo() -> bool:
     """The source repo's origin is …/super-coder or …/subfloor. A fork's origin
     is its own repo (the engine upstream is a separate, differently-named
-    remote)."""
-    return origin_basename() in SOURCE_REPO_NAMES
+    remote). Falls back to the tracked-engine test so a source repo with no
+    remotes still reads as source."""
+    return origin_basename() in SOURCE_REPO_NAMES or _engine_tracked()
+
+
+def work_repo() -> "str | None":
+    """Absolute path of the shells' WORK repo, when this install declares one.
+
+    Set `"work_repo": "~/path/to/repo"` in instance.json for an install whose
+    shells maintain a DIFFERENT repo — this repo is then only their home
+    substrate (memory + launcher). Drives the external-work PROJECT vs ENGINE
+    boot variant and the pre-commit home-repo guard. None = unset (normal
+    install: the work happens here)."""
+    cfg = ENGINE / "instance.json"
+    try:
+        raw = (json.loads(cfg.read_text()).get("work_repo") or "").strip()
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(Path(raw).expanduser()) if raw else None
 
 
 def seed_visual_qa_files(

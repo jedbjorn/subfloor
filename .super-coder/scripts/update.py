@@ -104,10 +104,10 @@ def is_source_repo() -> bool:
     its canonical source — it must NEVER untrack or materialize over it. A
     fork's origin is its own repo (the engine upstream is a separate remote).
     A miss here is destructive: the fork branch below git-rm-caches the
-    engine — exactly what hit the dogfood repo the day origin was renamed."""
-    url = git("remote", "get-url", "origin", check=False).stdout.strip()
-    return bool(url) and (url.rstrip("/").split("/")[-1].removesuffix(".git")
-                          in install_mod.SOURCE_REPO_NAMES)
+    engine — exactly what hit the dogfood repo the day origin was renamed.
+    Delegates to install.is_source_repo() — one detection (origin basename OR
+    tracked engine, so a remote-less source repo still reads as source)."""
+    return install_mod.is_source_repo()
 
 
 def _workflow_version(text: str) -> int | None:

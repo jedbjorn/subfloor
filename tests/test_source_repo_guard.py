@@ -34,7 +34,10 @@ class SourceRepoGuardTest(unittest.TestCase):
         self.assertIn("sc-cachy", install.SOURCE_REPO_NAMES)
 
     def test_install_accepts_source_names(self):
-        orig = install.origin_basename
+        # Fallback pinned False so ONLY the basename decision is under test —
+        # in this checkout the engine is tracked, which would mask a miss.
+        orig, orig_tracked = install.origin_basename, install._engine_tracked
+        install._engine_tracked = lambda: False
         try:
             for base, want in [("super-coder", True), ("subfloor", True),
                                ("subfloor-cli", True),
@@ -44,33 +47,49 @@ class SourceRepoGuardTest(unittest.TestCase):
                 self.assertEqual(install.is_source_repo(), want, base)
         finally:
             install.origin_basename = orig
+            install._engine_tracked = orig_tracked
+
+    def test_tracked_engine_reads_as_source_without_origin(self):
+        # A remote-less home substrate must still read as source (else the B7
+        # untrack fires on it) — the tracked-engine fallback is what saves it.
+        orig, orig_tracked = install.origin_basename, install._engine_tracked
+        try:
+            install.origin_basename = lambda: None
+            install._engine_tracked = lambda: True
+            self.assertTrue(install.is_source_repo())
+            install._engine_tracked = lambda: False
+            self.assertFalse(install.is_source_repo())
+        finally:
+            install.origin_basename = orig
+            install._engine_tracked = orig_tracked
 
     def test_update_accepts_source_names(self):
-        orig = update.git
+        # update.is_source_repo delegates to install's — one detection.
+        orig, orig_tracked = install.origin_basename, install._engine_tracked
+        install._engine_tracked = lambda: False
         try:
-            for url, want in [("https://github.com/jedbjorn/subfloor.git", True),
-                              ("https://github.com/jedbjorn/super-coder.git", True),
-                              ("https://github.com/jedbjorn/subfloor-cli.git", True),
-                              ("https://github.com/jedbjorn/sc-cachy.git", True),
-                              ("git@github.com:me/my-fork.git", False)]:
-                update.git = lambda *a, u=url, **k: SimpleNamespace(stdout=u + "\n",
-                                                                    returncode=0)
-                self.assertEqual(update.is_source_repo(), want, url)
+            for base, want in [("subfloor", True), ("super-coder", True),
+                               ("subfloor-cli", True), ("sc-cachy", True),
+                               ("my-fork", False)]:
+                install.origin_basename = lambda b=base: b
+                self.assertEqual(update.is_source_repo(), want, base)
         finally:
-            update.git = orig
+            install.origin_basename = orig
+            install._engine_tracked = orig_tracked
 
     def test_map_repo_accepts_source_names(self):
-        orig = map_repo.git
+        # map_repo.is_source_repo delegates to install's — one detection.
+        orig, orig_tracked = install.origin_basename, install._engine_tracked
+        install._engine_tracked = lambda: False
         try:
-            for url, want in [("https://github.com/jedbjorn/subfloor", True),
-                              ("https://github.com/jedbjorn/super-coder", True),
-                              ("https://github.com/jedbjorn/subfloor-cli", True),
-                              ("https://github.com/jedbjorn/sc-cachy", True),
-                              ("https://github.com/me/other", False)]:
-                map_repo.git = lambda *a, u=url: u
-                self.assertEqual(map_repo.is_source_repo(), want, url)
+            for base, want in [("subfloor", True), ("super-coder", True),
+                               ("subfloor-cli", True), ("sc-cachy", True),
+                               ("other", False)]:
+                install.origin_basename = lambda b=base: b
+                self.assertEqual(map_repo.is_source_repo(), want, base)
         finally:
-            map_repo.git = orig
+            install.origin_basename = orig
+            install._engine_tracked = orig_tracked
 
     def test_update_remote_matcher_accepts_renamed_url(self):
         orig = update.git
