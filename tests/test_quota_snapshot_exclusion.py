@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Asserts the quota tables never reach a freshly rendered content.sql.
 
-content.sql is git-tracked, and these are probe-rebuildable caches that do not
-belong in the repository — decision #65's ordinary hygiene, which was always
+These are probe-rebuildable caches that do not belong in the portable instance
+snapshot — decision #65's ordinary hygiene, which was always
 reason enough. So the guarantee is asserted here rather than assumed from
 `PER_INSTANCE_TABLES`.
 
@@ -15,7 +15,7 @@ Migration 0097 dropped the column, which retires that rationale AT ITS SOURCE
 It would then be easy to argue this test is now redundant. It is not, and it
 is kept at full strength deliberately: a test deleted because "the risk went
 away" is how the risk comes back, and the reason to exclude a rebuildable
-cache from a tracked file never depended on what the cache happened to hold.
+cache from a snapshot never depended on what the cache happened to hold.
 
 The distinction matters. A test that asserts `"harness_quota_account" not in
 snapshot.PER_INSTANCE_TABLES` is just the allowlist read twice: it stays green

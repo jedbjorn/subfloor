@@ -663,6 +663,45 @@ def migrate_engine_untrack() -> None:
         print("→ B7: added /.super-coder/ to .gitignore")
 
 
+LEGACY_GENERATED_PATHS = (
+    ".sc-state/content.sql",
+    ".sc-state/map_content.sql",
+    ".sc-state/map.config.json",
+    ".sc-state/skills_retired.json",
+    "roadmap_sc.md",
+    "docs_sc",
+    "specs_sc",
+    "skills_sc",
+)
+
+
+def migrate_generated_artifacts_local() -> None:
+    """Preserve legacy tracked state locally, then remove it from Git's index."""
+    copied = artifact_policy.prepare_local_state()
+    if copied:
+        print(f"→ artifacts: localized {len(copied)} legacy state file(s)")
+    tracked = [
+        path for path in LEGACY_GENERATED_PATHS
+        if git("ls-files", "--error-unmatch", "--", path,
+               check=False).returncode == 0
+    ]
+    if not tracked:
+        return
+    result = git(
+        "rm", "-r", "-f", "--cached", "--ignore-unmatch", "--", *tracked,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(
+            "update: localized legacy artifacts but could not untrack them:\n"
+            + result.stderr.strip()
+        )
+    print(
+        f"→ artifacts: untracked {len(tracked)} generated path(s); "
+        "local copies remain under .sc-state/local/"
+    )
+
+
 def migrate_or_rebuild(*, live_preflight_done: bool = False) -> None:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
@@ -815,6 +854,7 @@ def main(argv: list[str]) -> int:
         # so an already-installed fork never silently commits a new derived cache.
         if install_mod.ensure_gitignore():
             print("→ .gitignore: added engine ignore rule(s) for this release")
+        migrate_generated_artifacts_local()
 
     if no_fetch:
         print("→ --no-fetch: reconciling against the current working tree "
@@ -878,7 +918,7 @@ def main(argv: list[str]) -> int:
         # update` on `main` leaves the repin uncommitted on main. Spell out the
         # full flow so the operator lands a PR and returns to main instead of
         # sitting stranded on the repin branch (the engine is gitignored — only
-        # .sc-state/ + any _sc renders + a first-time Makefile include change).
+        # engine.ref + any genuinely authored install files).
         try:
             pin = (REPO_ROOT / ".sc-state" / "engine.ref").read_text().strip()[:12]
         except Exception:
@@ -886,11 +926,8 @@ def main(argv: list[str]) -> int:
         branch_hint = f"repin-{pin}" if pin else "repin-<sha>"
         print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
         print(f"    git checkout -b {branch_hint}")
-        if artifact_policy.tracks_local_artifacts():
-            print("    git add .sc-state/engine.ref .sc-state/content.sql   "
-                  "# + any _sc renders / Makefile")
-        else:
-            print("    git add .sc-state/engine.ref   # local artifacts stay ignored")
+        print("    git add .sc-state/engine.ref .gitignore   "
+              "# + Makefile/workflow changes when reported")
         print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")
         print("    gh pr create")
         print("    git checkout main        # return to main — don't stay stranded on the repin branch")

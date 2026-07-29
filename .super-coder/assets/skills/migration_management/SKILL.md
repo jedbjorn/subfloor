@@ -32,7 +32,7 @@ from you.
      `CREATE INDEX IF NOT EXISTS`, `DROP TABLE IF EXISTS` before recreate
    - Comment header: migration number + intent (+ doctrine notes if relevant)
    - Structure + system content only — per-instance data (shell memory,
-     grants, roadmap, flags) lives in `.sc-state/content.sql` via snapshot,
+     grants, roadmap, flags) lives in `.sc-state/local/content.sql` via snapshot,
      never in migrations
 
 3. **Apply locally:**
@@ -55,12 +55,12 @@ from you.
    ```bash
    SC_ADMIN=1 sc snapshot
    ```
-   Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
+   Commit only `migrations/NNNN_<slug>.sql`; the snapshot remains local.
    - **Content-seed migration** (seeds system content that renders — skills,
      flavor defaults) also changes the flat `_sc` mirrors, but only once the
      new rows are in the DB: after `sc update --no-fetch`, run
-     `SC_ADMIN=1 sc render && sc render-check` and commit the re-rendered `_sc` files
-     alongside the migration. A render against a DB predating the seed passes
+     `SC_ADMIN=1 sc render && sc render-check`. The `_sc` files remain ignored.
+     A render against a DB predating the seed passes
      locally while CI's hermetic rebuild goes red — the stale-mirror trap; see
      the `snapshot` skill.
 

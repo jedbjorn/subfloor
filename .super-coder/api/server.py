@@ -1395,15 +1395,14 @@ def script_list() -> list[dict]:
 
 
 def health_payload() -> dict:
-    """Runtime identity plus the artifact actions the Interface may offer."""
+    """Runtime identity plus the local artifact actions the UI may offer."""
     cfg = ports_mod.resolve()
-    active_mode = artifact_policy.mode()
     return {
         "ok": True,
         "repo": cfg.get("repo"),
         "port": cfg.get("port"),
-        "artifact_mode": active_mode,
-        "git_publication": active_mode == artifact_policy.TRACKED,
+        "artifact_mode": artifact_policy.mode(),
+        "git_publication": False,
     }
 
 
@@ -1425,9 +1424,7 @@ def run_script(key: str) -> dict | None:
 
 
 def run_snapshot_render() -> str:
-    """The header 'snapshot ⤓' shortcut — serialize then render. Raises on either
-    step's failure so publish can never commit/push stale flat files over a DB it
-    failed to serialize (the old code ignored returncode and returned anyway)."""
+    """The header 'save locally ⤓' shortcut — serialize then render."""
     snap = run_script("snapshot")
     if not snap["ok"]:
         raise RuntimeError("snapshot failed:\n" + snap["output"])
@@ -1438,26 +1435,20 @@ def run_snapshot_render() -> str:
 
 
 # ONE serialization boundary for every path that writes the non-atomic
-# snapshot/render outputs (content.sql + the flat-render mirror) or moves the
-# main checkout's branches: mem doc writes (serialize_doc_write), the header
-# '/api/snapshot' shortcut, and '/api/publish' (git_publish). These were once
-# per-path private locks — a doc write could interleave its content.sql/render
-# writes with a Publish's branch checkout/staging (SC-012). Held at the caller
-# level only: run_snapshot_render() itself never takes it, so nothing re-enters.
+# snapshot/render outputs (content.sql + the flat-render mirror): mem doc writes
+# (serialize_doc_write) and the header '/api/snapshot' shortcut. Held at the
+# caller level only: run_snapshot_render() itself never takes it.
 #
 # SINGLE-WRITER CONSTRAINT: this is an in-process lock only. It is sufficient
 # because rendered artifacts are created solely by manual admin-shell or GUI
-# actions — no concurrent writers exist in real use. Cross-process locking,
-# bounded lock-queueing, and concurrent-Publish races are explicitly out of
-# scope for v1 (FnB decision #20; tracked as roadmap #21). Do not add writers
-# outside this process without revisiting that decision.
+# actions — no concurrent writers exist in real use. Do not add writers outside
+# this process without first adding an appropriate cross-process lock.
 _CONTENT_WRITE_LOCK = threading.Lock()
 
 
 def serialize_doc_write() -> dict:
     """Re-snapshot + re-render after a mem doc write, so `sc mem doc add/edit/
-    freeze` lands on disk headlessly — the git-tracked flat render and
-    .sc-state/content.sql move with the write, no GUI Publish (subfloor#434).
+    freeze` lands in the gitignored local artifact cache headlessly.
     The API is the admin surface (run_script sets SC_ADMIN), and a doc write
     is rare enough that the synchronous pair costs nothing that matters.
     Never raises: the DB write is already committed, so a serialize failure
@@ -1582,6 +1573,12 @@ def _redact(s: str, token: str) -> str:
 
 
 def git_publish() -> dict:
+    """Compatibility tombstone: generated-artifact Git publication is retired."""
+    raise RuntimeError(
+        "Git publication of generated artifacts is retired; save locally instead"
+    )
+    # The legacy implementation remains below for one upgrade window so old
+    # installations can be diagnosed, but is deliberately unreachable.
     if not artifact_policy.tracks_local_artifacts():
         output = run_snapshot_render()
         message = (
@@ -3284,9 +3281,14 @@ class Handler(BaseHTTPRequestHandler):
                 log_event("snapshot", ok=True, detail=out)
                 return self._send(200, {"output": out})
             if path == "/api/publish":
-                with _CONTENT_WRITE_LOCK:
-                    r = git_publish()
-                return self._send(200 if r["ok"] else 500, r)
+                return self._send(410, {
+                    "error": {
+                        "code": "publish_retired",
+                        "message": "Git publication of generated artifacts is "
+                        "retired; use /api/snapshot to save locally",
+                        "details": {},
+                    }
+                })
             if path.startswith("/api/scripts/"):
                 r = run_script(path.rsplit("/", 1)[1])
                 if r is None:

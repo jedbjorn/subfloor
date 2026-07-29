@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Fail if the committed flat `_sc` mirror drifts from the committed SOURCE.
+"""Validate a local flat `_sc` mirror against this checkout's engine sources.
 
 `roadmap_sc.md` and everything under `specs_sc/`, `docs_sc/`, `skills_sc/` are
 RENDERED from the DB (documents/roadmap/skills; a skill's source is
 `assets/skills/<name>/SKILL.md` → seed migration → DB). Editing that source
-without re-rendering and committing the mirror drifts it silently — the DB and
-every shell's per-boot load stay correct, but the git-tracked browsable copy
-goes stale, and nothing else catches it.
+without re-rendering leaves the local browsable copy stale.
 
-HERMETIC by construction: this builds a throwaway DB from git-tracked text
-(schema + migrations + `.sc-state/content.sql`), renders the mirror from THAT
-into a temp tree, and diffs it against the committed `_sc` files. It never opens
+HERMETIC by construction: this builds a throwaway DB from authored engine text
+(schema + migrations) plus the local instance snapshot, renders the mirror from THAT
+into a temp tree, and diffs it against the active local `_sc` files. It never opens
 the live `shell_db.db` and never writes into the working tree. So — unlike the
 old version, which rendered from the live DB *into the tree* and then told you to
 `git add` whatever fell out — a stale or dirty local cache DB can no longer make
@@ -43,7 +41,7 @@ ACTIVE_ROOT = artifact_policy.render_root()
 
 
 def _build_tracked_db(path: Path) -> None:
-    """Materialize a DB from committed text only: schema → migrations →
+    """Materialize a DB from authored engine text plus local instance state:
     content.sql. No map step (the dr_* cache isn't part of the mirror) and no
     touch of the live DB. This is what a fresh `./sc rebuild` would produce, so
     its engine skills are always current — the mirror is a pure function of the
@@ -116,7 +114,7 @@ def main() -> int:
         finally:
             con.close()
 
-        # Drift = committed mirror != mirror rendered from committed source.
+        # Drift = active local mirror != mirror rendered from active sources.
         rendered = _rel_files(out)
         committed = _rel_files(ACTIVE_ROOT)
         drifted = sorted(
@@ -133,9 +131,7 @@ def main() -> int:
                 + "".join(f"{line}\n" for line in _target_lines())
                 + "\n  drifted:\n"
                 + "".join(f"    {p}\n" for p in drifted)
-                + "\n  fix:  ./sc rebuild && ./sc render flat"
-                + (" && git add " + " ".join(RENDERED)
-                   if artifact_policy.tracks_local_artifacts() else "") + "\n"
+                + "\n  fix:  ./sc rebuild && ./sc render flat\n"
             )
             return 1
     print("✓ render-check: flat _sc mirror matches the render of the active sources")

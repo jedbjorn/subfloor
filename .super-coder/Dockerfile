@@ -41,8 +41,7 @@ RUN apt-get update \
 # .venv.
 RUN pip install --no-cache-dir "websockets==16.1.1"
 
-# GitHub CLI (gh) — the in-container push/PR path: the GUI "publish" flow
-# (snapshot → render → commit → push → PR) and shells that open their own PRs.
+# GitHub CLI (gh) — shells open their own feature PRs from the sandbox.
 # Not in Debian's default repos, so add the official gh apt source. Auth is NOT
 # baked: the token arrives at runtime via GH_TOKEN (`./sc launch` forwards the
 # host's `gh auth token`, or a repo-scoped SC_GH_TOKEN) — never in the image.

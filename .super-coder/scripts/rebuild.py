@@ -51,7 +51,7 @@ def snapshot_path() -> Path:
 def read_existing_keys(db_path: Path | None = None) -> dict:
     """shell_id -> (api_key, api_key_rotated_at) from the outgoing DB.
 
-    content.sql never serializes api_key (secret in a git-tracked file), so
+    content.sql never serializes api_key (runtime credential), so
     without a carry-over every rebuild re-minted all keys — orphaning the
     SC_API_TOKEN run.py injected into each live session at boot and 401-ing
     every mem call engine-wide until the sessions re-entered (#265). Read the

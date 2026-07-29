@@ -47,6 +47,8 @@ AUDITED_REFERENCES = {
     "scripts/run.py": "docstring spec citation",
     "scripts/watch.py": "docstring spec citation",
     "scripts/seed_dogfood.py": "stores render_path as a WRITE destination",
+    "scripts/install.py": "adds generated mirror paths to the ignore policy",
+    "scripts/update.py": "untracks legacy generated mirror paths on upgrade",
 }
 
 # filesystem reads. `open` is a bare Name call; the rest are attribute calls.

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Tests that `./sc snapshot` never serializes live credentials to content.sql.
 
-content.sql is git-tracked. The `shells` table carries each shell's `api_key`
+The `shells` table carries each shell's `api_key`
 (its bearer token, provisioned by the server's startup backfill) and the `users`
 table carries `password_*` auth fields. A snapshot taken while keys are
-provisioned must NOT write those into the committed file — and the bare
+provisioned must NOT write those into the portable snapshot — and the bare
 `token_urlsafe` format is not caught by the gitleaks default ruleset, so the
 serializer is the only line of defense. These build a throwaway engine DB with a
 keyed shell + a user with password fields, run the real `snapshot.dump_table`,

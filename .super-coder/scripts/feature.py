@@ -22,7 +22,7 @@ also be procedure-only (`block: None`) — no infrastructure half at all, just
 grants; `app-deploy` is one.
 
 Grants land in shell_skills, which is fork memory — enable/disable therefore
-re-snapshots, so `.sc-state/content.sql` stays current and a rebuild keeps the
+re-snapshots, so `.sc-state/local/content.sql` stays current and a rebuild keeps the
 grants.
 
 Usage:

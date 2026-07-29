@@ -2,7 +2,7 @@
 """Resolve, open, and seed the map DB — the repo catalogue (dr_*).
 
 The map is a derived cache of the host repo, owned by the cartographer. It lives
-in its OWN sqlite file (`.sc-state/map.db`), separate from the engine memory DB
+in its OWN sqlite file (`.sc-state/local/map/map.db`), separate from the engine memory DB
 (`shell_db.db`), so an engine schema migration or a memory rebuild never touches
 it. This module is the single place that knows where the map DB is and how to
 bring a fresh one up to a usable state.
@@ -11,7 +11,7 @@ Layers:
 - DERIVED  (dr_repo / dr_filepath / dr_dependency / dr_env) — repopulated by
   map_repo on every map; nothing to persist.
 - AUTHORED (dr_section, and dr_filepath.desc) — cartographer-curated. dr_section
-  is serialized to `.sc-state/map_content.sql` (tracked) by snapshot.py and
+  is serialized to `.sc-state/local/map/content.sql` by snapshot.py and
   reloaded here when a fresh map DB has no sections yet.
 
 Transition shim: a fork created before the split has its authored dr_section in

@@ -117,13 +117,13 @@ class AssemblerSmokeTest(unittest.TestCase):
         self.assertFalse(out["git_publication"])
         self.assertEqual(out["repo"], "source")
 
-    def test_health_keeps_tracked_forks_publishable(self) -> None:
+    def test_health_never_offers_git_publication(self) -> None:
         with mock.patch.object(server.ports_mod, "resolve",
                                return_value={"repo": "fork", "port": 17172}), \
-             mock.patch.object(server.artifact_policy, "mode", return_value="tracked"):
+             mock.patch.object(server.artifact_policy, "mode", return_value="local"):
             out = server.health_payload()
-        self.assertEqual(out["artifact_mode"], "tracked")
-        self.assertTrue(out["git_publication"])
+        self.assertEqual(out["artifact_mode"], "local")
+        self.assertFalse(out["git_publication"])
 
     def test_get_roadmap_with_linked_flag_and_doc(self) -> None:
         # The regression: this path raised KeyError('feature_id') when a flag

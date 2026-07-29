@@ -43,11 +43,11 @@ import migrate as migrate_mod  # noqa: E402
 # state is the sentinel this module writes, never a real fork's.
 IGNORE = shutil.ignore_patterns(
     "__pycache__", "*.pyc", "shell_db.db*", "backups", "node_modules",
-    "logs", "source-policy.json",   # dropped -> fixture runs in TRACKED mode
+    "logs",
 )
 
-# A skill row renders to skills_sc/<slug>.md, so a migration only one checkout
-# holds becomes a file only that checkout's render-check can produce.
+# A skill row in a migration only one checkout holds exercises that checkout's
+# source independently. Generated mirrors are local-only and need not exist.
 SENTINEL_MIGRATION = "9999_worktree_sentinel.sql"
 SENTINEL_SKILL = "wt-sentinel-skill"
 ENGINE_PIN = "1234567890abcdef1234567890abcdef12345678"
@@ -311,16 +311,15 @@ class RenderCheckRunsCallerSourceTest(WorktreeFixture):
         body = done.stderr.split("drifted:", 1)
         return set(body[1].split()) if len(body) == 2 else set()
 
-    def test_a_worktree_only_migration_is_visible_to_the_worktree_alone(self):
+    def test_missing_local_render_cache_is_valid_in_each_checkout(self):
         from_wt = run_sc(self.wt, "render-check")
         from_root = run_sc(self.main, "render-check")
-        wt_files, root_files = self.drifted(from_wt), self.drifted(from_root)
-        sentinel = f"skills_sc/{SENTINEL_SKILL}.md"
-        self.assertIn(sentinel, wt_files,
-                      f"worktree render-check did not read its own migrations\n"
-                      f"{from_wt.stdout}\n{from_wt.stderr}")
-        self.assertNotIn(sentinel, root_files,
-                         "the root checkout has no such migration to see")
+        self.assertEqual(from_wt.returncode, 0, from_wt.stdout + from_wt.stderr)
+        self.assertEqual(from_root.returncode, 0, from_root.stdout + from_root.stderr)
+        self.assertIn("local artifact mode has no rendered instance state yet",
+                      from_wt.stdout)
+        self.assertIn("local artifact mode has no rendered instance state yet",
+                      from_root.stdout)
 
     def test_render_check_reports_the_caller_source_root_from_both_checkouts(self):
         for root in (self.wt, self.main):

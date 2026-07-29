@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -496,13 +497,11 @@ class ApiMemTest(unittest.TestCase):
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
-    # ── SC-012: doc write vs Publish — ONE shared serialization boundary ──────
-    def test_doc_write_and_publish_share_one_lock(self):
-        # Doc-write serialize, /api/snapshot, and Publish all write the same
-        # non-atomic files (content.sql + flat renders) and Publish switches
-        # branches — per-path private locks let them interleave. Force a Publish
-        # to sit inside its critical section, then prove a concurrent doc
-        # write's serialize cannot enter until the Publish releases the lock.
+    # ── doc write vs local save — ONE shared serialization boundary ───────────
+    def test_doc_write_and_snapshot_share_one_lock(self):
+        # Doc-write serialize and /api/snapshot both write the same non-atomic
+        # local files. Force a snapshot to sit inside its critical section, then
+        # prove a concurrent doc write waits for it.
         self.run_mem("roadmap", "add", "feat race")
         fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat race'")[0]
         body = self.tmp / "race.md"
@@ -511,50 +510,57 @@ class ApiMemTest(unittest.TestCase):
                      "--feature", str(fid))
         did = self.q("SELECT document_id FROM documents WHERE title='spec race'")[0]
         server.serialize_doc_write = self._real_serialize
-        real_publish = server.git_publish
         real_rsr = server.run_snapshot_render
-        in_publish = threading.Event()
+        in_snapshot = threading.Event()
         release = threading.Event()
         overlap = []
 
-        def fake_publish():
-            in_publish.set()
-            release.wait(5)
-            return {"ok": True, "output": "published (test stub)", "pr_url": None}
-
         def fake_rsr():
-            # runs inside serialize_doc_write's lock hold — if Publish is still
-            # inside ITS section (release unset), the two paths interleaved
-            overlap.append(in_publish.is_set() and not release.is_set())
+            if not in_snapshot.is_set():
+                in_snapshot.set()
+                release.wait(5)
+                return "snapshot endpoint (test stub)"
+            overlap.append(in_snapshot.is_set() and not release.is_set())
             return "snapshot+render (test stub)"
 
-        server.git_publish = fake_publish
         server.run_snapshot_render = fake_rsr
-        publish_rc = []
+        snapshot_rc = []
 
-        def do_publish():
+        def do_snapshot():
             req = urllib.request.Request(
-                f"http://127.0.0.1:{self.port}/api/publish", data=b"", method="POST")
+                f"http://127.0.0.1:{self.port}/api/snapshot", data=b"", method="POST")
             with urllib.request.urlopen(req, timeout=30) as resp:
-                publish_rc.append(resp.status)
+                snapshot_rc.append(resp.status)
 
         try:
-            t = threading.Thread(target=do_publish)
+            t = threading.Thread(target=do_snapshot)
             t.start()
-            self.assertTrue(in_publish.wait(5), "publish never entered its section")
-            # hold the Publish inside its section while the doc write arrives;
+            self.assertTrue(in_snapshot.wait(5), "snapshot never entered its section")
+            # hold the snapshot inside its section while the doc write arrives;
             # the timer releases it well after an unshared lock would overlap
             threading.Timer(0.5, release.set).start()
             self.assertEqual(
                 self.run_mem("doc", "edit", str(did), "--title", "spec race v2"), 0)
             t.join(10)
-            self.assertEqual(publish_rc, [200])
-            self.assertEqual(overlap, [False])  # serialize ran AFTER publish released
+            self.assertEqual(snapshot_rc, [200])
+            self.assertEqual(overlap, [False])
         finally:
             release.set()
-            server.git_publish = real_publish
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    def test_publish_endpoint_is_permanently_retired(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/publish",
+            data=b"",
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as failed:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(failed.exception.code, 410)
+        payload = json.loads(failed.exception.read())
+        self.assertEqual(payload["error"]["code"], "publish_retired")
+        self.assertIn("save locally", payload["error"]["message"])
 
     # ── SC-013: a slow successful serialize is still a successful write ────────
     def test_doc_write_slow_serializer_succeeds(self):

@@ -39,7 +39,6 @@ import rollback  # noqa: E402
 # ENGINE_PATHS comment in update.py.
 PER_INSTANCE = {
     "instance.json", "shell_db.db", "shell_db.db-wal", "shell_db.db-shm", "map.db",
-    "source-policy.json",  # source-repo-only artifact publication policy
     "engine.manifest",  # derived hash baseline — rewritten by each materialize
 }
 
@@ -48,6 +47,8 @@ PER_INSTANCE = {
 # ENGINE_PATHS comment in engine_manifest.py.
 NOT_MATERIALIZED = (
     ".super-coder/assets/seed/",
+    # Retired in this change; retained here so the source-tree coverage test
+    # also passes before the deletion is committed.
     ".super-coder/source-policy.json",
 )
 
@@ -708,6 +709,46 @@ class EnginePathsAtRefTest(unittest.TestCase):
             "a declared path absent at the target ref must stay out of the "
             "materialized file manifest",
         )
+
+class GeneratedArtifactMigrationTest(unittest.TestCase):
+    def test_legacy_artifacts_are_preserved_locally_then_untracked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / ".sc-state"
+            local = state / "local"
+            state.mkdir()
+            (state / "content.sql").write_text("legacy instance state\n")
+            (state / "engine.ref").write_text("a" * 40 + "\n")
+            (root / "roadmap_sc.md").write_text("legacy render\n")
+
+            _git(root, "init", "-b", "main")
+            _git(root, "config", "user.name", "Update Test")
+            _git(root, "config", "user.email", "update@example.invalid")
+            _git(root, "add", ".")
+            _git(root, "commit", "-m", "legacy tracked artifacts")
+            (root / ".gitignore").write_text(
+                "/.sc-state/content.sql\n/.sc-state/local/\n/roadmap_sc.md\n"
+            )
+
+            with mock.patch.object(update, "REPO_ROOT", root), \
+                 mock.patch.multiple(
+                     update.artifact_policy,
+                     REPO_ROOT=root,
+                     STATE_DIR=state,
+                     LOCAL_DIR=local,
+                 ):
+                update.migrate_generated_artifacts_local()
+
+            self.assertEqual(
+                (local / "content.sql").read_text(),
+                "legacy instance state\n",
+            )
+            self.assertTrue((state / "content.sql").exists())
+            self.assertTrue((root / "roadmap_sc.md").exists())
+            tracked = set(_git(root, "ls-files").splitlines())
+            self.assertNotIn(".sc-state/content.sql", tracked)
+            self.assertNotIn("roadmap_sc.md", tracked)
+            self.assertIn(".sc-state/engine.ref", tracked)
 
 
 if __name__ == "__main__":

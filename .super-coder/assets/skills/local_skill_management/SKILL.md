@@ -7,16 +7,16 @@ common: false
 
 # local_skill_management — fork-specific skills that survive
 
-Fork-specific skills live in the DB and persist via `.sc-state/content.sql`
+Fork-specific skills live in the DB and persist via `.sc-state/local/content.sql`
 (the snapshot). The asset file under `.super-coder/assets/skills/<name>/` is
 the **authoring source only** — it sits in gitignored engine territory, and
 that is safe: the engine/local boundary is the seed migration (0001,
 upstream-owned in a fork), not asset-file presence. The snapshot serializes
 your skill to content.sql whether or not the asset file is kept, and
-`sc update` neither manifests it nor heals over its DB row. **content.sql =
-the durable form; the asset file = your editor.**
+`sc update` neither manifests it nor heals over its DB row. **The live DB plus
+its local snapshot are durable; the asset file is your editor.**
 
-The path: **file -> seed -> grant -> snapshot -> commit**.
+The path: **file -> seed -> grant -> local snapshot**.
 
 ## Creating a fork-specific skill
 
@@ -58,20 +58,17 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn't
-   own) into the active snapshot (`.sc-state/content.sql` in tracked mode,
-   `.sc-state/local/content.sql` in local mode) — what survives `sc update` and
+   own) into `.sc-state/local/content.sql` — what survives `sc update` and
    `sc rebuild`; the row + flavor/Bespoke grants reconstruct from content.sql.
    Skip this -> the skill is lost on next update.
 
-5. **Finish.** Run `sc render-check` first — hermetic rebuild, fails if the
-   `skills_sc/` mirror drifts from the DB render (the CI guard; see the
-   `snapshot` skill). In tracked mode, stage `.sc-state/content.sql` +
-   `skills_sc/` together. In local mode both stay ignored; only engine-owned
-   assets/migrations are committed.
+5. **Finish.** Run `sc render-check` — it fails if the local `skills_sc/`
+   mirror drifts from the DB render. Snapshot and renders stay ignored; commit
+   only deliberately authored engine assets/migrations in the source repo.
 
 ## Updating a skill
 
-Edit the asset file -> repeat seed -> snapshot -> commit (steps 2, 4, 5).
+Edit the asset file -> repeat seed -> snapshot (steps 2, 4, 5).
 Asset file gone (removed / authored elsewhere) -> recreate it from the DB body
 first: `sc sql "SELECT content FROM skills WHERE name='<name>'"`.
 
@@ -82,7 +79,7 @@ sc skill grant <skill_name> <shell>...
 ```
 Name one standard shell to update its whole flavor, or name a Bespoke shell to
 update only that shell. Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render`
-and commit the resulting artifacts.
+to refresh the local artifacts.
 
 ## Removing a skill
 
@@ -92,14 +89,14 @@ and commit the resulting artifacts.
    ```
    Refuses engine skills — the seed resurrects those on next update/rebuild.
    Engine skill this fork has superseded -> retire fork-wide:
-   `sc skill retire <name>` (writes the tracked
-   `.sc-state/skills_retired.json`, which rides updates; `sc skill unretire`
+   `sc skill retire <name>` (writes the ignored local
+   `.sc-state/local/skills_retired.json`; `sc skill unretire`
    reverses). Flavor/Bespoke removal -> `sc skill revoke`.
 
 2. **Remove the asset file** (`.super-coder/assets/skills/<name>/`) —
    otherwise the next `sc seed-skills` re-inserts the skill.
 
-3. **Snapshot, render, commit:**
+3. **Snapshot and render locally:**
    ```bash
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
@@ -111,7 +108,7 @@ flavor appears once; Bespoke shells appear individually.
 
 - **Repo skills** — lead section: skills authored in this fork. Membership is
   *derived* — a skill the engine seed doesn't own is repo-local. Same rule
-  snapshot.py uses to decide what serializes into `.sc-state/content.sql`, so
+  snapshot.py uses to decide what serializes into local `content.sql`, so
   the section shows exactly what the snapshot keeps durable. No frontmatter
   flag exists or is needed.
 - **Substrate / Craft / …** — engine skills, sectioned by `category`

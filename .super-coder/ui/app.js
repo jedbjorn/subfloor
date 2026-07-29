@@ -54,7 +54,7 @@ async function api(path, method = "GET", body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  // publish/scripts report failure as {ok:false, output:<step trace>} with no
+  // maintenance scripts report failure as {ok:false, output:<step trace>} with no
   // `error` key — the trace names the refusing guard and the remedy, so it is
   // the message, not statusText.
   if (!r.ok) {
@@ -70,7 +70,7 @@ async function api(path, method = "GET", body) {
 function toast(msg) {
   const t = el("div", { className: "toast" }, msg);
   document.body.append(t);
-  // Multi-line traces (publish refusals) need longer than one-liners.
+  // Multi-line maintenance traces need longer than one-liners.
   setTimeout(() => t.remove(), Math.min(12000, Math.max(4000, String(msg).length * 30)));
 }
 function setStatus(s) { $("#status").textContent = s; }
@@ -83,7 +83,7 @@ function setStatus(s) { $("#status").textContent = s; }
 const SECTION_ORDER = ["repo", "substrate", "craft"];
 const SECTION_LABEL = { repo: "Repo skills", substrate: "Substrate", craft: "Craft", other: "Other" };
 const SECTION_NOTE = {
-  repo: "Authored in this repo — not engine catalogue. Durable via .sc-state/content.sql; see the local_skill_management skill.",
+  repo: "Authored in this repo — not engine catalogue. Durable in the local engine DB and gitignored snapshot; see the local_skill_management skill.",
 };
 const sectionOf = (s) => (s.origin === "repo" ? "repo" : (s.category || "other"));
 const sectionLabel = (k) => SECTION_LABEL[k] || k.charAt(0).toUpperCase() + k.slice(1);
@@ -1455,7 +1455,7 @@ async function renderScripts(root) {
   const { scripts } = await api("/scripts");
   root.replaceChildren();
   root.append(el("div", { className: "muted" },
-    "Run a maintenance script. Output appears below it. Per-instance DB edits → run Snapshot, then Render flat, to persist them to git-tracked text."));
+    "Run a maintenance script. Output appears below it. Per-instance DB edits → Save locally to refresh the ignored snapshot and flat renders."));
 
   // Windows Test VM — opt-in, link-only. Links this fork to an operator-run
   // Windows VM for installer/system-level testing. Config lives in instance.json
@@ -3065,51 +3065,20 @@ document.addEventListener("keydown", (e) => {
     overlays[overlays.length - 1]?.remove();
   }
 });
-let localArtifactMode = false;
-function configureArtifactActions(health) {
-  localArtifactMode = health.artifact_mode === "local" || health.git_publication === false;
-  const snapshot = $("#snapshot");
-  const publish = $("#publish");
-  if (localArtifactMode) {
-    snapshot.textContent = "save locally ⤓";
-    snapshot.title = "snapshot + render into ignored .sc-state/local/";
-    publish.textContent = "publish off";
-    publish.title = "Git publication is disabled in local artifact mode";
-    publish.disabled = true;
-  } else {
-    snapshot.textContent = "snapshot ⤓";
-    publish.textContent = "publish ⤴";
-    publish.disabled = false;
-  }
-}
 $("#snapshot").onclick = async () => {
-  setStatus(localArtifactMode ? "saving locally…" : "snapshotting…");
+  setStatus("saving locally…");
   try {
     const r = await api("/snapshot", "POST");
     toast(r.output || "done");
-    setStatus(localArtifactMode ? "saved locally" : "snapshot done");
+    setStatus("saved locally");
   }
   catch (e) { toast("error: " + e.message); }
-};
-$("#publish").onclick = async (e) => {
-  const btn = e.currentTarget;
-  if (localArtifactMode) return;
-  btn.disabled = true;
-  setStatus("publishing…");
-  try {
-    const r = await api("/publish", "POST");
-    toast(r.output || "published");
-    setStatus(r.pr_url ? "published → PR ready" : "published");
-    if (r.pr_url) window.open(r.pr_url, "_blank", "noopener");
-  } catch (e) { toast("publish error: " + e.message); setStatus("publish failed"); }
-  finally { btn.disabled = false; }
 };
 (async () => {
   try {
     const h = await api("/health");
     $("#repo").textContent = h.repo;
     forkName = h.repo || "";
-    configureArtifactActions(h);
   }
   catch { setStatus("offline"); }
   // The active count is live global navigation state. Start its document-wide

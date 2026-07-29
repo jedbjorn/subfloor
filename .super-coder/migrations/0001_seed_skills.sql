@@ -2,7 +2,7 @@
 -- System content: the engine catalogue propagates to every fork. Idempotent
 -- and ID-STABLE: UPSERTs each authored engine skill by name, but never
 -- retires names absent from assets/skills because those may be project-local
--- skills serialized by .sc-state/content.sql. Do not hand-edit; author
+-- skills serialized by .sc-state/local/content.sql. Do not hand-edit; author
 -- assets/skills/<name>/SKILL.md then `./sc seed-skills`.
 
 BEGIN;
@@ -289,7 +289,7 @@ NEVER save the result by editing this skill: engine skills self-heal on every
 `sc update` — a fork edit to any skill named in `assets/skills/` is detected
 as stale and reverted to the shipped body. A project-local name (one the
 engine doesn''t ship) is never touched and persists through rebuilds via
-`sc snapshot` -> `.sc-state/content.sql`. Leave this scaffold as shipped.
+`sc snapshot` -> `.sc-state/local/content.sql`. Leave this scaffold as shipped.
 
 ## 1. Scaffold the migration dirs
 
@@ -368,8 +368,8 @@ contract in the same catalogue):
 2. Seed it into the catalogue + grant it live: `sc seed-skills` (upserts the
    asset into the DB, grants common skills to every live shell).
 
-3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in
-   `.sc-state/content.sql`; commit per that skill''s steps.
+3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in the
+   ignored local snapshot. There is no generated-content commit.
 
 Details, updates, and removal: the `local_skill_management` skill.
 
@@ -571,13 +571,11 @@ Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
 map. You alone do three things: **configure** how this repo is mapped, **wire**
 the automation that keeps it fresh, **heal** both on drift.
 
-Map db = `.sc-state/map.db` in tracked mode or
-`.sc-state/local/map/map.db` in local mode, separate from the engine memory db
+Map db = `.sc-state/local/map/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
 map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
 map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/map_content.sql` (tracked mode) or
-`.sc-state/local/map/content.sql` (local mode) on snapshot (admin/GUI step — see Standing jobs)
+`.sc-state/local/map/content.sql` on snapshot (admin/GUI step — see Standing jobs)
 and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
@@ -609,8 +607,7 @@ and reload on a fresh map db.
    generated/vendored dir being indexed?
 
 2. **Author the active map config at the canonical live root** —
-   `$SC_ROOT/.sc-state/map.config.json` in tracked mode or
-   `$SC_ROOT/.sc-state/local/map/config.json` in local mode. The mapper
+   `$SC_ROOT/.sc-state/local/map/config.json`. The mapper
    deliberately reads the shared live checkout, not your shell worktree. It is
    per-instance and survives `sc update`. All keys optional; each merges over
    `map_repo.py` defaults:
@@ -648,12 +645,8 @@ and reload on a fresh map db.
 5. **Describe — NULLs and filler** — run the description worklist (Standing
    jobs § 2); leave only when it returns zero rows, NULLs and filler both.
 
-6. **Persist by mode.** Hook wiring is per-clone runtime state, never a commit.
-   In tracked mode, use the `messaging` skill to send admin the exact canonical
-   path (`.sc-state/map.config.json`) and verification result; only admin may
-   commit the main checkout. In local mode, the config is intentionally ignored
-   and needs no commit. Do not branch or commit the main checkout from the
-   cartographer shell. Then `sc mem state "…"` -> `sc mem oriented` (sets
+6. **Persist locally.** Hook wiring and map config are per-clone runtime state,
+   never a commit. Then `sc mem state "…"` -> `sc mem oriented` (sets
    `bootstrapped=1` — the write is live in the shared DB; it does NOT snapshot).
 
 ## Heal — run whenever the map looks wrong
@@ -802,10 +795,10 @@ Adopt one per stack:
    rewrite the match — target the dominant pattern, not 100%.
 3. **Run + verify:** `sc map` -> table populated, rows look right
    (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Hand off persistence** to admin via the `messaging` skill, naming each
-   changed `.sc-state/map_extractors/` path and the verification result. These
-   canonical-root files are normal tracked files; snapshotting the authored DB
-   layer remains the separate admin/GUI step above.
+4. **Hand off authored extractor code** to admin via the `messaging` skill,
+   naming each changed `.sc-state/map_extractors/` path and the verification
+   result. Extractor code is deliberate source; generated map DB/content stays
+   local.
 
 **Contract** (full version: `templates/map_extractors/README.md`): each module
 defines `extract(con, repo_root, cfg) -> str`. `con` = the live map db with
@@ -2156,19 +2149,17 @@ NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
 
 - `/.super-coder/` is gitignored — never force-add anything under it.
 - Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
-- From a worktree, commit only your project''s own files. Do NOT hand-commit `.sc-state/content.sql` (serialized DB memory), `.sc-state/engine.ref` (engine pin), or the tracked `_sc` renders — `sc` writes them to the main checkout root, so they aren''t in your worktree to stage. They enter the repo via Publish (below).
-- If `artifact_mode=local`, snapshot/render outputs live under ignored
-  `.sc-state/local/`; Publish persists them without creating a Git commit or PR.
+- From a worktree, commit only your project''s authored files. Generated
+  snapshots and `_sc` renders live under ignored `.sc-state/local/` and never
+  enter Git. `.sc-state/engine.ref` is the deliberate tracked exception: it is
+  the dependency pin and is updated by `sc update`.
 - Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
 
-## After DB work — `sc mem` is already saved; Publish is separate
+## After DB work
 
-An `sc mem` write lands in the shared engine DB immediately (visible to every shell) and `sc rebuild` restores it from the serialized snapshot — there is no per-shell save step. NEVER run `sc snapshot` from a worktree — it refuses by design (`snapshot: refused — serializing to the shared main tree is an admin/GUI step`).
-
-Getting DB text into the repo = the Publish flow (snapshot -> render -> commit -> push -> PR on `sc_gui_content`): the GUI **Publish** button, or the admin shell on `main` running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills changed). Output lands at the main checkout root, NOT your worktree — don''t try to commit `content.sql` or `_sc` renders onto your branch. Feature-branch PRs carry project files; DB content publishes separately. See the `snapshot` skill.
-
-That paragraph is tracked-mode behavior. In local mode the same snapshot/render
-commands remain the durability step, but no content publication is attempted.
+An `sc mem` write lands in the shared engine DB immediately. The admin/API
+save-local path refreshes the ignored snapshot and renders used by rebuild and
+review. There is no generated-content commit or Publish PR. See `snapshot`.
 
 ## Notes
 
@@ -2408,16 +2399,16 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# local_skill_management — fork-specific skills that survive
 
-Fork-specific skills live in the DB and persist via `.sc-state/content.sql`
+Fork-specific skills live in the DB and persist via `.sc-state/local/content.sql`
 (the snapshot). The asset file under `.super-coder/assets/skills/<name>/` is
 the **authoring source only** — it sits in gitignored engine territory, and
 that is safe: the engine/local boundary is the seed migration (0001,
 upstream-owned in a fork), not asset-file presence. The snapshot serializes
 your skill to content.sql whether or not the asset file is kept, and
-`sc update` neither manifests it nor heals over its DB row. **content.sql =
-the durable form; the asset file = your editor.**
+`sc update` neither manifests it nor heals over its DB row. **The live DB plus
+its local snapshot are durable; the asset file is your editor.**
 
-The path: **file -> seed -> grant -> snapshot -> commit**.
+The path: **file -> seed -> grant -> local snapshot**.
 
 ## Creating a fork-specific skill
 
@@ -2459,20 +2450,17 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn''t
-   own) into the active snapshot (`.sc-state/content.sql` in tracked mode,
-   `.sc-state/local/content.sql` in local mode) — what survives `sc update` and
+   own) into `.sc-state/local/content.sql` — what survives `sc update` and
    `sc rebuild`; the row + flavor/Bespoke grants reconstruct from content.sql.
    Skip this -> the skill is lost on next update.
 
-5. **Finish.** Run `sc render-check` first — hermetic rebuild, fails if the
-   `skills_sc/` mirror drifts from the DB render (the CI guard; see the
-   `snapshot` skill). In tracked mode, stage `.sc-state/content.sql` +
-   `skills_sc/` together. In local mode both stay ignored; only engine-owned
-   assets/migrations are committed.
+5. **Finish.** Run `sc render-check` — it fails if the local `skills_sc/`
+   mirror drifts from the DB render. Snapshot and renders stay ignored; commit
+   only deliberately authored engine assets/migrations in the source repo.
 
 ## Updating a skill
 
-Edit the asset file -> repeat seed -> snapshot -> commit (steps 2, 4, 5).
+Edit the asset file -> repeat seed -> snapshot (steps 2, 4, 5).
 Asset file gone (removed / authored elsewhere) -> recreate it from the DB body
 first: `sc sql "SELECT content FROM skills WHERE name=''<name>''"`.
 
@@ -2483,7 +2471,7 @@ sc skill grant <skill_name> <shell>...
 ```
 Name one standard shell to update its whole flavor, or name a Bespoke shell to
 update only that shell. Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render`
-and commit the resulting artifacts.
+to refresh the local artifacts.
 
 ## Removing a skill
 
@@ -2493,14 +2481,14 @@ and commit the resulting artifacts.
    ```
    Refuses engine skills — the seed resurrects those on next update/rebuild.
    Engine skill this fork has superseded -> retire fork-wide:
-   `sc skill retire <name>` (writes the tracked
-   `.sc-state/skills_retired.json`, which rides updates; `sc skill unretire`
+   `sc skill retire <name>` (writes the ignored local
+   `.sc-state/local/skills_retired.json`; `sc skill unretire`
    reverses). Flavor/Bespoke removal -> `sc skill revoke`.
 
 2. **Remove the asset file** (`.super-coder/assets/skills/<name>/`) —
    otherwise the next `sc seed-skills` re-inserts the skill.
 
-3. **Snapshot, render, commit:**
+3. **Snapshot and render locally:**
    ```bash
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
@@ -2512,7 +2500,7 @@ flavor appears once; Bespoke shells appear individually.
 
 - **Repo skills** — lead section: skills authored in this fork. Membership is
   *derived* — a skill the engine seed doesn''t own is repo-local. Same rule
-  snapshot.py uses to decide what serializes into `.sc-state/content.sql`, so
+  snapshot.py uses to decide what serializes into local `content.sql`, so
   the section shows exactly what the snapshot keeps durable. No frontmatter
   flag exists or is needed.
 - **Substrate / Craft / …** — engine skills, sectioned by `category`
@@ -2775,7 +2763,7 @@ from you.
      `CREATE INDEX IF NOT EXISTS`, `DROP TABLE IF EXISTS` before recreate
    - Comment header: migration number + intent (+ doctrine notes if relevant)
    - Structure + system content only — per-instance data (shell memory,
-     grants, roadmap, flags) lives in `.sc-state/content.sql` via snapshot,
+     grants, roadmap, flags) lives in `.sc-state/local/content.sql` via snapshot,
      never in migrations
 
 3. **Apply locally:**
@@ -2798,12 +2786,12 @@ from you.
    ```bash
    SC_ADMIN=1 sc snapshot
    ```
-   Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
+   Commit only `migrations/NNNN_<slug>.sql`; the snapshot remains local.
    - **Content-seed migration** (seeds system content that renders — skills,
      flavor defaults) also changes the flat `_sc` mirrors, but only once the
      new rows are in the DB: after `sc update --no-fetch`, run
-     `SC_ADMIN=1 sc render && sc render-check` and commit the re-rendered `_sc` files
-     alongside the migration. A render against a DB predating the seed passes
+     `SC_ADMIN=1 sc render && sc render-check`. The `_sc` files remain ignored.
+     A render against a DB predating the seed passes
      locally while CI''s hermetic rebuild goes red — the stale-mirror trap; see
      the `snapshot` skill.
 
@@ -3330,29 +3318,17 @@ you.
    - Then `sc render && sc render-check` before step 5. `sc update` re-renders
      from the live DB, which can skip a change the new engine shipped (e.g. a
      skill body) — only `render-check`''s hermetic rebuild surfaces it. A red
-     render-check here = a mirror to re-render + commit, NOT a stale diff to
-     wave through. Pipeline + guard details: `snapshot` skill.
+     render-check here = a local mirror to regenerate. Pipeline + guard details:
+     `snapshot` skill.
 
 4. **Record the crossing.** Append a narrative entry — identity event for a
    shell that updates its own floor. Note what changed + write the handoff.
 
-5. **Commit the full public set.**
-   Stage every tracked file the update regenerated: `.sc-state/content.sql`
-   (refreshed memory) + `.sc-state/engine.ref` (the pin) + the root `sc`
-   dispatcher if it changed + any `_sc` renders. `sc` is the live tracked
-   entrypoint — a pin-only commit leaves it and the renders stale against the
-   engine just pinned, silently dropping commands the new engine ships.
-   `.super-coder/` and `engine.ref.prev` are gitignored — nothing to commit
-   there.
-   With `artifact_mode=local`, `content.sql` and `_sc` renders stay under
-   ignored `.sc-state/local/`; commit the engine pin/dispatcher and other
-   genuinely public files only.
-   - **Render conflict** (committing via PR while main advances):
-     `content.sql` + `_sc` renders are serialized DB state and collide with a
-     concurrent publisher. NEVER hand-merge serialized SQL — live DB canonical,
-     renders derived. Rebase onto main, then either take main''s renders
-     (re-applying just the pin + `sc`) or re-run `sc update` against the live
-     DB so they regenerate clean.
+5. **Commit only the public update.**
+   Stage `.sc-state/engine.ref` (the pin), the root `sc` dispatcher if it
+   changed, and other deliberately authored public files. Snapshot SQL and
+   `_sc` renders remain ignored beneath `.sc-state/local/`; never force-add
+   them. `.super-coder/` and `engine.ref.prev` are also gitignored in forks.
 
 6. **Reboot** the session -> boot onto the new floor.
 
@@ -3390,7 +3366,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'snapshot',
-  'Serialize DB work via sc snapshot / sc render under the instance artifact policy. Tracked mode publishes through Git; local mode persists under .sc-state/local without creating content commits.',
+  'Refresh the gitignored local DB snapshot and flat renders. Generated instance state never enters Git.',
   'substrate',
   'sc snapshot',
   0,
@@ -3398,16 +3374,15 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Live `shell_db.db` = the single source of truth shared by every shell; a
 `sc mem` write is durable + visible to all shells the instant it commits. The
-`.db` is gitignored and reconstructs from schema, migrations, and the active
-per-instance snapshot on `sc rebuild` —
+`.db` is gitignored and reconstructs from schema, migrations, and
+`.sc-state/local/content.sql` on `sc rebuild` —
 an edit not yet serialized is discarded by a rebuild.
 
 Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
-`.sc-state/` + the flat `_sc` mirror into the shared MAIN worktree, and from a
-shell''s linked worktree it churns and collides with other shells. `sc snapshot`
+the shared instance''s gitignored local cache. `sc snapshot`
 and `sc render flat` refuse unless `SC_ADMIN=1` (GUI/API, `install`, `update`,
 and `render-check` set it for you). A shell does not run them; its writes are
-captured when admin snapshots (GUI **Publish**/Snapshot button, or
+captured when admin saves locally (GUI **Save locally** button, or
 `SC_ADMIN=1 sc snapshot`) before a rebuild. The rest of this skill = the
 admin/GUI path.
 
@@ -3417,74 +3392,63 @@ admin/GUI path.
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `sc seed-skills` |
-| `.sc-state/content.sql` (tracked mode) or `.sc-state/local/content.sql` (local mode) | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only) | `sc snapshot` |
+| `.sc-state/local/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only, gitignored) | `sc snapshot` |
 
 The split: system content propagates via migrations; per-instance content stays
 in the snapshot. Skill *bodies* = system (migration); which shell is *granted*
 a skill = per-instance (snapshot).
 
-`artifact_mode` lives in `.super-coder/instance.json` and accepts `tracked` or
-`local`; downstream forks default to `tracked`. Local mode still snapshots and
-renders, but writes beneath `.sc-state/local/` (ignored) and Publish creates no
-Git branch, commit, or PR.
+Generated artifacts always live beneath `.sc-state/local/`. A legacy
+`artifact_mode: tracked` setting is accepted only as upgrade input and resolves
+to local; mode switching and Git publication are retired.
 
-## When admin serializes (the GUI Publish button does all of this)
+## When admin serializes
 
 All commands require `SC_ADMIN=1`, run from the main checkout.
 
 1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to the active
-   snapshot path. Deterministic DELETE-then-INSERT in PK order ->
-   re-running is byte-identical -> clean diffs.
+   local snapshot path. Deterministic DELETE-then-INSERT in PK order makes
+   re-running byte-identical.
 
 2. `SC_ADMIN=1 sc render` -> regenerates the flat `_sc` files
-   (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run
+   (`renders/specs_sc/`, `renders/docs_sc/`, `renders/skills_sc/`,
+   `renders/roadmap_sc.md`) beneath `.sc-state/local/`. Run
    after changing a document body, the roadmap, or skills. Incremental —
    unchanged files not rewritten. (`.claude/skills/` rebuilds at boot and is
    gitignored — not rendered here.)
 
-3. Verify reproducibility: `sc rebuild && sc verify` -> DB rebuilds from text
+3. Verify reproducibility: `sc rebuild && sc verify` -> DB rebuilds from local text
    alone, byte-for-byte.
-   Before committing any `_sc` render: `sc render-check` — rebuilds the DB
-   hermetically from text and fails if the committed mirror drifts from that
-   render (the CI guard, run locally). A plain `sc render` reads the *live* DB,
+   `sc render-check` rebuilds the DB hermetically from text and fails if the
+   local mirror drifts from that render. A plain `sc render` reads the *live* DB,
    which can lag the source just edited (skill-catalogue trap below);
    `render-check`''s rebuild-first catches the stale mirror the live-DB render
    silently passed.
 
-4. In tracked mode, Publish writes
-   `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
-   main checkout root (where the shared engine + DB live), not your worktree —
-   they are not yours to stage. GUI **Publish** = snapshot -> render -> commit
-   -> push -> PR on `sc_gui_content`; the admin shell on `main` may commit them
-   directly. In local mode it only snapshots/renders and reports that nothing
-   was published. NEVER commit the `.db` or anything under the gitignored
-   `.super-coder/` engine dir. (super-coder SOURCE repo only: `schema.sql` +
-   `migrations/` are tracked and committed here too.)
+4. Do not stage the output. Generated snapshots and renders are gitignored.
+   Only authored engine source and explicit migrations belong in Git.
 
 ## Authoring vs. snapshotting
 
 - **Per-instance content** (your memory, this repo''s roadmap/docs): edit the
-  DB -> `sc snapshot`. The snapshot is the canonical reproducer.
+  DB -> `sc snapshot`. The local DB is primary; the ignored snapshot is its
+  rebuild source.
 - **Skill catalogue** (system, propagates): edit
   `assets/skills/<name>/SKILL.md` -> `sc seed-skills` — upserts the live DB
   *and* (source repo only) regenerates the seed migration. Not the snapshot.
   See `seed_skills.py`.
-  - Sequence: `sc seed-skills && sc render`, then `sc render-check` before
-    committing. In tracked mode commit the regenerated
-    `migrations/0001_seed_skills.sql` + re-rendered `skills_sc/` mirror together.
-    In local mode only the migration is public; the mirror stays ignored.
+  - Sequence: `sc seed-skills && sc render`, then `sc render-check`. Commit the
+    regenerated `migrations/0001_seed_skills.sql`; the mirror stays ignored.
 
-Steps 1–3 = durability (a `sc rebuild` cannot lose serialized work). Step 4 =
-the GUI Publish button; you rarely commit this text by hand.
+Steps 1–3 are the local durability path. There is no generated-artifact
+publication path.
 
 ## Related skills
 
 This skill owns the render/snapshot pipeline + the `render-check` guard:
 
-- `self_update` — `sc update` re-renders the same `_sc` files; its verify step
-  runs `render-check` before committing the engine bump.
-- `local_skill_management` — fork-local skills persist via `sc snapshot`; run
-  `render-check` before committing the `skills_sc/` mirror.
+- `self_update` — `sc update` refreshes the same local `_sc` files.
+- `local_skill_management` — fork-local skills persist via the local snapshot.
 - `migration_management` — a **content-seed** migration (skills, flavor
   defaults) changes what renders; rebuild + render + `render-check` after.
 - `docs` / `spec` — document bodies live in the DB, render to `docs_sc/` /
