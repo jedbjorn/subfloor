@@ -62,6 +62,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import conductor_runtime  # noqa: E402  (Step 8 wake/config/doctor)
+import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
@@ -3712,7 +3713,18 @@ def main(argv):
     import transport  # noqa: E402  (api/ — asyncio one-port multiplex)
 
     async def _serve():
-        await transport.serve(bind, port, dispatch_http, _ws_unavailable)
+        # Browser-native conversations are commit-woken, not interval-polled.
+        # Startup/lease timers inside the broker exist only for bounded crash
+        # reconciliation. Task #94 calls notify_commit() after its transaction.
+        # The callback runs after the TCP bind succeeds, so a losing duplicate
+        # server process cannot dispatch a queued prompt before bind refusal.
+        await transport.serve(
+            bind,
+            port,
+            dispatch_http,
+            _ws_unavailable,
+            on_started=lambda: conversation_broker.start_service(DB_PATH),
+        )
 
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:

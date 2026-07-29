@@ -317,13 +317,24 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
         self.addCleanup(lambda: setattr(server, "_CSP", csp))
 
     def _start(self, bind, *, container=False, port=8800):
-        """Run main([]) to the bind decision. Returns (refusal, served): the
-        SystemExit main() raised or None, and the host transport.serve was
-        actually called with or None if the listener was never reached."""
+        """Run main([]) to the bind decision.
+
+        Returns refusal, served host, and whether the conversation broker
+        started after that successful bind.
+        """
         served = []
 
-        async def _fake_serve(host, port, http_handler, ws_handler, log=print):
+        async def _fake_serve(
+            host,
+            port,
+            http_handler,
+            ws_handler,
+            log=print,
+            on_started=None,
+        ):
             served.append(host)
+            if on_started is not None:
+                on_started()
             return port
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +361,9 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                                         "backfill"))
                 enter(mock.patch.object(server.mem_credentials, "provision"))
                 enter(mock.patch.object(server.pr_poller, "Poller"))
+                broker_start = enter(mock.patch.object(
+                    server.conversation_broker, "start_service"
+                ))
                 enter(mock.patch.object(transport, "serve", _fake_serve))
                 enter(contextlib.redirect_stdout(io.StringIO()))
                 enter(contextlib.redirect_stderr(io.StringIO()))
@@ -358,12 +372,16 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                     server.main([])
                 except SystemExit as exc:
                     refusal = exc
-        return refusal, (served[0] if served else None)
+        return (
+            refusal,
+            served[0] if served else None,
+            broker_start.called,
+        )
 
     def test_startup_refuses_an_unsafe_bind_before_serving(self):
         for bind in ("0.0.0.0", "::", "192.168.1.10", "example.com"):
             with self.subTest(bind=bind):
-                refusal, served = self._start(bind)
+                refusal, served, broker_started = self._start(bind)
                 self.assertIsNotNone(
                     refusal, "main() accepted a non-loopback bind on a host")
                 self.assertIn("loopback", str(refusal))
@@ -372,15 +390,24 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                 # assert that directly rather than inferring it from the exit.
                 self.assertIsNone(
                     served, f"transport served {served!r} despite the refusal")
+                self.assertFalse(
+                    broker_started,
+                    "conversation broker started before bind refusal",
+                )
 
     def test_startup_serves_a_loopback_bind(self):
-        self.assertEqual(self._start("127.0.0.1"), (None, "127.0.0.1"))
+        self.assertEqual(
+            self._start("127.0.0.1"),
+            (None, "127.0.0.1", True),
+        )
 
     def test_startup_serves_the_wide_bind_in_the_sandbox(self):
         # The counterweight: over-refusing here would make `./sc launch`
         # unbootable, so the sandbox exception has to survive the wiring too.
-        self.assertEqual(self._start("0.0.0.0", container=True),
-                         (None, "0.0.0.0"))
+        self.assertEqual(
+            self._start("0.0.0.0", container=True),
+            (None, "0.0.0.0", True),
+        )
 
     def test_startup_binds_the_csp_to_the_served_port(self):
         # The app shell's socket sources are port-exact (SC-152), so main()
