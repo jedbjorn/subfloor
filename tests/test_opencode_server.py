@@ -156,6 +156,7 @@ class OpenCodeServerTest(unittest.TestCase):
         transport.assert_called_once_with(
             opencode.SERVER_ENDPOINT,
             password="managed-secret",
+            timeout=600.0,
         )
 
 

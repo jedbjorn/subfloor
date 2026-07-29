@@ -47,9 +47,15 @@ class FakeOpenCode:
             return {"healthy": True, "version": "1.18.9"}
         if method == "POST" and path == "/session":
             return {"id": self.session_ref, "title": "test"}
-        if path.endswith("/prompt_async"):
+        if path.endswith("/message"):
             self.status = "busy"
-            return None
+            return {
+                "info": {
+                    "role": "assistant",
+                    "sessionID": self.session_ref,
+                },
+                "parts": [{"type": "text", "text": "hello"}],
+            }
         if path.endswith("/abort"):
             self.status = "idle"
             return True
@@ -525,7 +531,7 @@ class ConversationAdapterTest(unittest.TestCase):
         prompt = next(
             request
             for request in native.requests
-            if request[1].endswith("/prompt_async")
+            if request[1].endswith("/message")
         )
         self.assertEqual(prompt[2]["directory"], str(self.root))
         self.assertEqual(
@@ -542,17 +548,9 @@ class ConversationAdapterTest(unittest.TestCase):
         )
 
         fresh = adapter.resume(turn.session_ref, self.context, "again")
-        permission_patch = next(
-            request
-            for request in native.requests
-            if request[:2] == (
-                "PATCH",
-                f"/session/{turn.session_ref}",
-            )
-        )
-        self.assertEqual(
-            permission_patch[3]["permission"][0]["action"],
-            "allow",
+        self.assertFalse(
+            any(request[0] == "PATCH" for request in native.requests),
+            "resume must reuse persisted permissions, not duplicate them",
         )
         native.status = "busy"
         recovered = adapter.reconcile(fresh, self.context)
@@ -581,7 +579,7 @@ class ConversationAdapterTest(unittest.TestCase):
         prompt = next(
             request
             for request in native.requests
-            if request[1].endswith("/prompt_async")
+            if request[1].endswith("/message")
         )
         self.assertEqual(
             create[3]["model"],
