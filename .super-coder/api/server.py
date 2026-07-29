@@ -63,6 +63,7 @@ import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import conductor_runtime  # noqa: E402  (Step 8 wake/config/doctor)
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
+import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
@@ -3726,7 +3727,12 @@ def main(argv):
             port,
             dispatch_http,
             _ws_unavailable,
-            on_started=lambda: conversation_broker.start_service(DB_PATH),
+            on_started=lambda: conversation_broker.start_service(
+                DB_PATH,
+                launch_preparer=conversation_launch.ConversationLaunchPreparer(
+                    DB_PATH
+                ),
+            ),
             stream_handler=conversation_routes.stream_events,
         )
 

@@ -67,6 +67,38 @@ async function api(path, method = "GET", body) {
   return data;
 }
 
+function requestKey() {
+  return globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function chatApi(path, method = "GET", body, idempotencyKey) {
+  const headers = body === undefined ? {} : { "Content-Type": "application/json" };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  let response;
+  try {
+    response = await fetch("/api" + path, {
+      method, headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (cause) {
+    const error = new Error("The conversation service could not be reached.");
+    error.code = "NETWORK_ERROR";
+    error.cause = cause;
+    throw error;
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.error || {};
+    const error = new Error(detail.message || response.statusText);
+    error.code = detail.code || "CONVERSATION_REQUEST_FAILED";
+    error.details = detail.details || {};
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
 function toast(msg) {
   const t = el("div", { className: "toast" }, msg);
   document.body.append(t);
@@ -2986,9 +3018,536 @@ async function renderSprints(root) {
     setInterval(sprintsUpdateDurations, SPRINTS_DURATION_MS);
 }
 
+// ── Interface / browser-native conversations ────────────────────────────────
+// A browser conversation is a second, independent way to use a shell. It uses
+// the normal CLI preparation path server-side, but deliberately has no
+// terminal, tmux controls, or live hand-off between browser and CLI.
+const CHAT_HARNESSES = ["opencode", "claude", "codex"];
+const CHAT_FLAVOR_ORDER = ["cartographer", "admin", "planner", "dev", "reviewer", "devops"];
+let chatRouteShell = "";
+let chatRouteConversation = "";
+let chatSource = null;
+let chatRenderGeneration = 0;
+let chatPendingSend = null;
+
+function chatStopStream() {
+  if (chatSource) chatSource.close();
+  chatSource = null;
+}
+
+function chatHash(shortname, conversationId = "") {
+  return `interface/${encodeURIComponent(shortname)}`
+    + (conversationId ? `/${encodeURIComponent(conversationId)}` : "");
+}
+
+function chatRouteLabel(conversation) {
+  const route = conversation.route || {};
+  return [route.harness, route.model || "harness default", route.effort]
+    .filter(Boolean).join(" · ");
+}
+
+function chatStatePill(state) {
+  const label = {
+    queued: "queued", running: "working", waiting: "waiting",
+    error: "failed", idle: "idle", closed: "closed",
+  }[state] || state;
+  return el("span", { className: `chat-state state-${state || "idle"}` }, label);
+}
+
+function chatConversationName(conversation) {
+  return conversation.title
+    || `Chat · ${conversation.route?.harness || "harness"} · `
+      + new Date(`${conversation.created_at}Z`).toLocaleString();
+}
+
+function chatActivity(events) {
+  const rows = [];
+  const tools = new Map();
+  for (const event of events) {
+    if (event.event_type === "tool.started") {
+      const row = { ...event, done: false };
+      tools.set(`${event.run_id}:${event.payload?.tool_call_id || rows.length}`, row);
+      rows.push(row);
+    } else if (event.event_type === "tool.completed") {
+      const key = `${event.run_id}:${event.payload?.tool_call_id || rows.length}`;
+      const prior = tools.get(key);
+      if (prior) {
+        prior.done = true;
+        prior.payload = { ...prior.payload, ...event.payload };
+      } else {
+        rows.push({ ...event, done: true });
+      }
+    } else if (["permission.requested", "input.requested", "run.failed",
+                "run.interrupted", "run.unknown"].includes(event.event_type)) {
+      rows.push(event);
+    }
+  }
+  return rows;
+}
+
+function chatAssistantRuns(events) {
+  const runs = [];
+  const byId = new Map();
+  for (const event of events) {
+    if (event.event_type !== "assistant.delta") continue;
+    const id = event.run_id || `message-${event.message_id || "unknown"}`;
+    let run = byId.get(id);
+    if (!run) {
+      run = {
+        id,
+        text: "",
+        created_at: event.created_at,
+        message_id: event.message_id,
+        sequence: event.sequence,
+      };
+      byId.set(id, run);
+      runs.push(run);
+    }
+    run.text += event.payload?.text || "";
+  }
+  return runs;
+}
+
+function chatBubble(kind, body, meta = "") {
+  const bubble = el("article", { className: `chat-bubble chat-${kind}` });
+  bubble.append(el("div", { className: "chat-who" },
+    kind === "user" ? "FnB" : kind === "assistant" ? "Shell" : "Activity"));
+  bubble.append(kind === "activity"
+    ? el("div", { className: "chat-activity-text" }, body)
+    : mdBlock(body));
+  if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
+  return bubble;
+}
+
+function chatPaintTranscript(host, messages, events, conversation, retry) {
+  const transcript = el("div", { className: "chat-transcript" });
+  const assistants = chatAssistantRuns(events);
+  const activities = chatActivity(events);
+  const items = [];
+  const addActivity = (activity) => {
+    const payload = activity.payload || {};
+    const type = activity.event_type;
+    const label = type.startsWith("tool.")
+      ? `${activity.done ? "✓" : "…" } ${payload.title || payload.name || "tool"}`
+      : type === "permission.requested" ? "Waiting for permission"
+      : type === "input.requested" ? "Waiting for input"
+      : type === "run.interrupted" ? "Turn interrupted"
+      : type === "run.unknown" ? "Turn outcome could not be proven"
+      : `Turn failed${payload.error ? ` — ${payload.error}` : ""}`;
+    items.push({
+      node: chatBubble("activity", label),
+      failed: false,
+    });
+  };
+  for (const message of [...messages].sort((a, b) => a.message_id - b.message_id)) {
+    if (message.message_kind === "control") continue;
+    items.push({
+      node: chatBubble("user", message.body, message.state),
+      failed: message.state === "failed",
+      text: message.body,
+    });
+    for (const run of assistants.filter((item) => item.message_id === message.message_id))
+      items.push({ node: chatBubble("assistant", run.text), failed: false });
+    for (const activity of activities.filter(
+      (item) => item.message_id === message.message_id))
+      addActivity(activity);
+  }
+  // Conversation-scoped events are uncommon, but keeping them visible is
+  // better than dropping a recovery/error signal whose message link is absent.
+  for (const run of assistants.filter((item) => item.message_id == null))
+    items.push({ node: chatBubble("assistant", run.text), failed: false });
+  for (const activity of activities) {
+    if (activity.message_id == null) addActivity(activity);
+  }
+  for (const item of items) {
+    if (item.failed) {
+      const button = el("button", {
+        className: "chat-retry",
+        type: "button",
+        textContent: "Retry",
+      });
+      button.onclick = () => retry(item.text);
+      item.node.append(button);
+    }
+    transcript.append(item.node);
+  }
+  if (!items.length) {
+    transcript.append(el("div", { className: "chat-empty" },
+      `Start a conversation with ${conversation.shell.display_name}.`));
+  }
+  host.replaceChildren(transcript);
+  requestAnimationFrame(() => { transcript.scrollTop = transcript.scrollHeight; });
+}
+
+async function chatRefreshConversation(conversationId, generation, onUpdate) {
+  try {
+    const next = await chatApi(`/conversations/${conversationId}`);
+    if (generation === chatRenderGeneration) onUpdate(next);
+  } catch { /* SSE remains authoritative enough to keep the open view usable. */ }
+}
+
+function chatOpenStream(conversationId, generation, onEvent, onState) {
+  chatStopStream();
+  const source = new EventSource(`/api/conversations/${conversationId}/events`);
+  chatSource = source;
+  source.onopen = () => onState("connected");
+  source.onerror = () => onState("reconnecting");
+  const types = [
+    "conversation.created", "conversation.updated", "conversation.renamed",
+    "conversation.closed", "message.accepted", "session.started", "run.started",
+    "assistant.delta", "tool.started", "tool.completed", "permission.requested",
+    "input.requested", "usage", "run.completed", "run.failed",
+    "run.interrupted", "run.unknown",
+  ];
+  for (const type of types) {
+    source.addEventListener(type, (raw) => {
+      if (generation !== chatRenderGeneration) return;
+      try { onEvent(JSON.parse(raw.data)); } catch { /* malformed frames reconnect */ }
+    });
+  }
+  return source;
+}
+
+function chatModelOptions(select, catalog, harness, defaultModel) {
+  select.replaceChildren();
+  select.append(el("option", {
+    value: "",
+    textContent: defaultModel
+      ? `Use shell default — ${defaultModel}`
+      : "Use harness default",
+  }));
+  const models = catalog.harnesses?.[harness]?.models || [];
+  for (const model of models) {
+    if (model.availability !== "available") continue;
+    select.append(el("option", { value: model.id, textContent: model.id }));
+  }
+}
+
+async function chatRenderNew(host, shell, defaults, catalog) {
+  const rows = defaults.flavors?.[shell.flavor] || [];
+  const byHarness = Object.fromEntries(rows.map((row) => [row.harness, row]));
+  const defaultHarness = rows.find((row) => row.is_default)?.harness;
+  const availableHarnesses = shell.flavor === "conductor"
+    ? ["opencode"] : CHAT_HARNESSES;
+  let harness = availableHarnesses.includes(defaultHarness)
+    ? defaultHarness : availableHarnesses[0];
+  const form = el("form", { className: "chat-new-form" });
+  const harnessSelect = el("select");
+  for (const value of availableHarnesses) {
+    harnessSelect.append(el("option", {
+      value,
+      selected: value === harness,
+      textContent: value + (value === defaultHarness ? " — shell default" : ""),
+    }));
+  }
+  const modelSelect = el("select");
+  const paintModels = () => {
+    harness = harnessSelect.value;
+    chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
+  };
+  harnessSelect.onchange = paintModels;
+  paintModels();
+  const title = el("input", {
+    type: "text",
+    placeholder: "Optional chat title",
+    maxlength: 200,
+  });
+  const submit = el("button", {
+    className: "act primary",
+    type: "submit",
+    textContent: "Start chat",
+  });
+  form.append(
+    el("div", { className: "chat-new-copy" },
+      el("h2", {}, `Start a chat with ${shell.display_name}`),
+      el("p", { className: "muted" },
+        "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
+    el("label", { className: "k" }, "Harness"), harnessSelect,
+    el("label", { className: "k" }, "Model"), modelSelect,
+    el("div", { className: "chat-route-note" },
+      "Choose an exact installed model, or keep the shell/harness default."),
+    el("label", { className: "k" }, "Title"), title,
+    submit,
+  );
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    submit.textContent = "Starting…";
+    const body = {
+      shell_id: shell.shell_id,
+      harness: harnessSelect.value,
+      title: title.value.trim() || null,
+    };
+    if (modelSelect.value) body.model = modelSelect.value;
+    try {
+      const conversation = await chatApi(
+        "/conversations", "POST", body, requestKey());
+      location.hash = chatHash(shell.shortname, conversation.conversation_id);
+    } catch (error) {
+      toast(`${error.code}: ${error.message}`);
+      submit.disabled = false;
+      submit.textContent = "Start chat";
+    }
+  };
+  host.replaceChildren(form);
+}
+
+async function chatRenderOpen(host, initialConversation, initialMessages) {
+  const generation = chatRenderGeneration;
+  let conversation = initialConversation;
+  let messages = [...initialMessages];
+  const events = [];
+  const seen = new Set();
+  let latestRunId = null;
+
+  const header = el("div", { className: "chat-pane-head" });
+  const title = el("div", { className: "chat-pane-title" });
+  const state = el("div", { className: "chat-pane-state" });
+  const streamState = el("span", { className: "chat-stream-state" }, "connecting");
+  const actions = el("div", { className: "chat-actions" });
+  const transcriptHost = el("div", { className: "chat-transcript-host" });
+  const composer = el("textarea", {
+    className: "chat-composer-input",
+    placeholder: "Message this shell…",
+    rows: 3,
+  });
+  const send = el("button", { className: "act primary", type: "button", textContent: "Send" });
+  const pending = el("div", { className: "chat-pending", hidden: true });
+  const composerRow = el("div", { className: "chat-composer" },
+    composer, el("div", { className: "chat-compose-actions" }, pending, send));
+
+  const retry = async (text) => {
+    composer.value = text;
+    composer.focus();
+    await submit();
+  };
+  const paint = () => {
+    title.replaceChildren(
+      el("h2", {}, chatConversationName(conversation)),
+      el("div", { className: "chat-route" }, chatRouteLabel(conversation)));
+    state.replaceChildren(chatStatePill(conversation.state), streamState);
+    const closed = conversation.state === "closed";
+    composer.disabled = closed;
+    send.disabled = closed;
+    interrupt.disabled = !["queued", "running", "waiting"].includes(conversation.state);
+    close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
+    composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
+    chatPaintTranscript(transcriptHost, messages, events, conversation, retry);
+  };
+  const refresh = () => chatRefreshConversation(
+    conversation.conversation_id,
+    generation,
+    (next) => { conversation = next; paint(); });
+
+  const rename = el("button", { className: "act", type: "button", textContent: "Rename" });
+  rename.onclick = async () => {
+    const value = (prompt("Conversation title", conversation.title || "") || "").trim();
+    if (!value) return;
+    try {
+      conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
+        "PATCH", { version: conversation.version, title: value });
+      paint();
+    } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
+  };
+  const analytics = el("button", { className: "act", type: "button", textContent: "Analytics" });
+  analytics.onclick = () => {
+    anFilters.harness = conversation.route.harness || "";
+    anFilters.model = conversation.route.model || "";
+    location.hash = "analytics";
+  };
+  const interrupt = el("button", { className: "act", type: "button", textContent: "Interrupt" });
+  interrupt.onclick = async () => {
+    interrupt.disabled = true;
+    try {
+      await chatApi(`/conversations/${conversation.conversation_id}/interruptions`,
+        "POST", latestRunId ? { run_id: latestRunId } : {}, requestKey());
+    } catch (error) { toast(`${error.code}: ${error.message}`); }
+    finally { interrupt.disabled = false; }
+  };
+  const close = el("button", { className: "act danger", type: "button", textContent: "Close" });
+  close.onclick = async () => {
+    if (!confirm("Close this conversation? Its transcript will remain available.")) return;
+    try {
+      conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
+        "PATCH", { version: conversation.version, state: "closed" });
+      paint();
+    } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
+  };
+  actions.append(rename, analytics, interrupt, close);
+  header.append(title, state, actions);
+
+  async function submit() {
+    const text = composer.value.trim();
+    if (!text || send.disabled) return;
+    if (!chatPendingSend || chatPendingSend.text !== text
+        || chatPendingSend.conversationId !== conversation.conversation_id) {
+      chatPendingSend = {
+        conversationId: conversation.conversation_id,
+        text,
+        key: requestKey(),
+      };
+    }
+    send.disabled = true;
+    pending.hidden = false;
+    pending.textContent = "sending…";
+    try {
+      const result = await chatApi(
+        `/conversations/${conversation.conversation_id}/messages`,
+        "POST", { text }, chatPendingSend.key);
+      if (!messages.some((item) => item.message_id === result.message.message_id))
+        messages.push(result.message);
+      chatPendingSend = null;
+      composer.value = "";
+      pending.hidden = true;
+      conversation.state = "queued";
+      paint();
+      refresh();
+    } catch (error) {
+      pending.hidden = false;
+      pending.textContent = `${error.code} — retry keeps this exact send`;
+      toast(`${error.code}: ${error.message}`);
+    } finally {
+      send.disabled = conversation.state === "closed";
+    }
+  }
+  send.onclick = submit;
+  composer.onkeydown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submit();
+    }
+  };
+  host.replaceChildren(header, transcriptHost, composerRow);
+  paint();
+  chatOpenStream(
+    conversation.conversation_id,
+    generation,
+    (event) => {
+      if (seen.has(event.sequence)) return;
+      seen.add(event.sequence);
+      events.push(event);
+      if (event.run_id) latestRunId = event.run_id;
+      if (event.event_type === "message.accepted") conversation.state = "queued";
+      if (event.event_type === "run.started") conversation.state = "running";
+      if (["permission.requested", "input.requested"].includes(event.event_type))
+        conversation.state = "waiting";
+      if (["run.completed", "run.interrupted"].includes(event.event_type))
+        conversation.state = "idle";
+      if (["run.failed", "run.unknown"].includes(event.event_type))
+        conversation.state = "error";
+      const message = messages.find((item) => item.message_id === event.message_id);
+      if (message && event.event_type === "run.completed") message.state = "completed";
+      if (message && ["run.failed", "run.unknown"].includes(event.event_type))
+        message.state = "failed";
+      if (message && event.event_type === "run.interrupted")
+        message.state = "cancelled";
+      paint();
+      if (["run.completed", "run.failed", "run.interrupted", "run.unknown",
+           "conversation.renamed", "conversation.closed"].includes(event.event_type))
+        refresh();
+    },
+    (value) => {
+      streamState.textContent = value;
+      streamState.classList.toggle("reconnecting", value === "reconnecting");
+    },
+  );
+}
+
+async function renderInterface(root) {
+  chatStopStream();
+  const generation = ++chatRenderGeneration;
+  root.replaceChildren(el("div", { className: "chat-loading" }, "Loading conversations…"));
+  const [{ shells }, defaults, catalog, allConversations] = await Promise.all([
+    api("/shells"),
+    api("/flavor-defaults"),
+    api("/models").catch(() => ({ harnesses: {}, stale: true })),
+    chatApi("/conversations?limit=100"),
+  ]);
+  if (generation !== chatRenderGeneration) return;
+  if (!shells.length) {
+    root.replaceChildren(el("div", { className: "card muted" }, "No shells."));
+    return;
+  }
+  const shell = shells.find((item) => item.shortname === chatRouteShell) || shells[0];
+  const conversations = allConversations.items.filter(
+    (item) => item.shell.shell_id === shell.shell_id);
+  let selectedId = chatRouteConversation;
+  if (selectedId && !conversations.some((item) => item.conversation_id === selectedId))
+    selectedId = "";
+
+  const layout = el("div", { className: "chat-layout" });
+  const rail = el("aside", { className: "chat-rail" });
+  rail.append(el("div", { className: "chat-rail-title" }, "Shells"));
+  const orderedFlavors = [
+    ...CHAT_FLAVOR_ORDER.filter((flavor) => shells.some((item) => item.flavor === flavor)),
+    ...[...new Set(shells.map((item) => item.flavor || "bespoke"))]
+      .filter((flavor) => !CHAT_FLAVOR_ORDER.includes(flavor)).sort(),
+  ];
+  for (const flavor of orderedFlavors) {
+    rail.append(el("div", { className: "chat-shell-group" }, flavor || "bespoke"));
+    for (const item of shells.filter((candidate) => (candidate.flavor || "bespoke") === flavor)) {
+      const latest = allConversations.items.find(
+        (conversation) => conversation.shell.shell_id === item.shell_id);
+      const button = el("button", {
+        className: "chat-shell" + (item.shell_id === shell.shell_id ? " selected" : ""),
+        type: "button",
+      }, el("span", { className: "chat-shell-name" }, item.display_name));
+      if (latest) button.append(chatStatePill(latest.state));
+      button.onclick = () => { location.hash = chatHash(item.shortname); };
+      rail.append(button);
+    }
+  }
+
+  const side = el("aside", { className: "chat-history" });
+  const newChat = el("button", { className: "act primary", type: "button", textContent: "＋ New chat" });
+  newChat.onclick = () => {
+    chatRouteConversation = "";
+    history.replaceChildren();
+    chatRenderNew(pane, shell, defaults, catalog);
+  };
+  side.append(el("div", { className: "chat-history-head" },
+    el("div", {}, el("b", {}, shell.display_name),
+      el("span", { className: "chat-shortname" }, ` /${shell.shortname}`)),
+    newChat));
+  const history = el("div", { className: "chat-history-list" });
+  for (const conversation of conversations) {
+    const button = el("button", {
+      className: "chat-history-item"
+        + (conversation.conversation_id === selectedId ? " selected" : ""),
+      type: "button",
+    });
+    button.append(el("span", { className: "chat-history-name" },
+      chatConversationName(conversation)),
+      el("span", { className: "chat-history-route" }, chatRouteLabel(conversation)),
+      chatStatePill(conversation.state));
+    button.onclick = () => {
+      location.hash = chatHash(shell.shortname, conversation.conversation_id);
+    };
+    history.append(button);
+  }
+  if (!conversations.length)
+    history.append(el("div", { className: "chat-history-empty" }, "No chats yet."));
+  side.append(history);
+
+  const pane = el("section", { className: "chat-pane" });
+  layout.append(rail, side, pane);
+  root.replaceChildren(layout);
+  if (!selectedId) {
+    await chatRenderNew(pane, shell, defaults, catalog);
+    return;
+  }
+  const [conversation, messagePage] = await Promise.all([
+    chatApi(`/conversations/${selectedId}`),
+    chatApi(`/conversations/${selectedId}/messages?limit=100`),
+  ]);
+  if (generation !== chatRenderGeneration) return;
+  await chatRenderOpen(pane, conversation, messagePage.items);
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
+  interface: ["#view-interface", renderInterface],
   sprints: ["#view-sprints", renderSprints],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
@@ -3019,7 +3578,9 @@ function show(tab) {
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("sprints-view", tab === "sprints");
+  document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "sprints") sprintsStopRender();
+  if (tab !== "interface") chatStopStream();
   setDocumentTitle(tab);
   load(tab);
 }
@@ -3032,6 +3593,13 @@ function show(tab) {
 // #shells-default-models.
 function routeFromHash() {
   const raw = location.hash.slice(1);
+  if (raw === "interface" || raw.startsWith("interface/")) {
+    const [, shell = "", conversation = ""] = raw.split("/");
+    chatRouteShell = decodeURIComponent(shell);
+    chatRouteConversation = decodeURIComponent(conversation);
+    show("interface");
+    return;
+  }
   if (raw === "" || raw === "shells" || raw.startsWith("shells-")) {
     shellTab = Object.entries(SHELL_TAB_HASH).find(([, hash]) => hash === raw)?.[0]
       || "harness";
