@@ -7,6 +7,8 @@ sprint 25 seq 8 task #84; wake ops seq 10 task #86).
     ./sc sprint unit state --sprint <doc-id> --seq U1 <state>
     ./sc sprint unit list  [--sprint <doc-id>]
     ./sc sprint board      --sprint <doc-id>
+    ./sc sprint declare    --spec <doc-id> --title "…" --planner-route H/M
+                           --dev-route H/M --reviewer-route H/M
 
 The BOARD is a record, not a markdown table a planner edits by hand (spec
 doc 58). The planner is its only writer — devs and reviewers work and
@@ -280,11 +282,41 @@ def cmd_board(args) -> int:
     return 0
 
 
+def cmd_declare(args) -> int:
+    sprint = _api(
+        "POST",
+        "/api/sprints",
+        {
+            "spec_doc_id": args.spec,
+            "title": args.title,
+            "planner_route": args.planner_route,
+            "dev_route": args.dev_route,
+            "reviewer_route": args.reviewer_route,
+        },
+        f"sprint-declare|{args.spec}|{uuid.uuid4()}",
+    )
+    print(
+        f"sc sprint: declared #{sprint['sprint_doc_id']} "
+        f"({sprint['title']}) from spec #{args.spec}; "
+        "provision the board, verify it, then emit handoff"
+    )
+    return 0
+
+
 def main(argv: "list[str] | None" = None) -> int:
     _conductor_gap(argv)
     p = argparse.ArgumentParser(prog="sc sprint",
                                 description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
+    declare = sub.add_parser(
+        "declare",
+        help="atomically declare a reviewed spec as a zero-unit sprint",
+    )
+    declare.add_argument("--spec", type=int, required=True)
+    declare.add_argument("--title", required=True)
+    declare.add_argument("--planner-route", required=True)
+    declare.add_argument("--dev-route", required=True)
+    declare.add_argument("--reviewer-route", required=True)
     un = sub.add_parser("unit", help="the sprint board record — declare, "
                                      "reassign, and move units (planner "
                                      "writes; anyone reads)")
@@ -348,6 +380,8 @@ def main(argv: "list[str] | None" = None) -> int:
                     args.unit_cmd](args)
     if args.cmd == "board":
         return cmd_board(args)
+    if args.cmd == "declare":
+        return cmd_declare(args)
     raise AssertionError(f"unhandled sprint command: {args.cmd}")
 
 

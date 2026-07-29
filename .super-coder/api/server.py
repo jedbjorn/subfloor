@@ -65,6 +65,7 @@ import conductor_runtime  # noqa: E402  (Step 8 wake/config/doctor)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
+import sprint_lifecycle  # noqa: E402  (authoritative sprint state/ownership)
 sys.path.insert(0, str(ENGINE / "api"))
 import conductor_routes  # noqa: E402  (Step 4 directive/event contracts)
 import sprint_routes  # noqa: E402  (sprint board API — /api/sprint-units)
@@ -79,7 +80,6 @@ import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 from sprint_units import UNIT_COLUMNS as _SPRINT_UNIT_COLUMNS  # noqa: E402
 from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
-from sprint_units import UNIT_STATES  # noqa: E402
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
@@ -575,97 +575,17 @@ def get_docs(con) -> dict:
 
 
 def get_active_sprints(con) -> dict:
-    """Build the active-sprint board from one consistent read snapshot.
-
-    One SELECT reads open sprint documents, feature and role labels, and units.
-    The document body and retired Interface bindings are deliberately absent
-    from both the projection and predicate.
-
-    The predicate comes from `sprint_state` rather than being inlined here, so
-    it cannot drift from the one the wake path enforces. It is
-    `writable_board_clause`, NOT `live_sprint_clause`: the unit-count operand
-    is deliberately absent, because a sprint declared seconds ago has no units
-    yet and this is the operator's window onto exactly that moment
-    (`test_zero_unit_sprint_still_projects` pins it). Liveness gates what the
-    engine ACTS on; this view shows the operator what exists.
-    """
-    result = rows(con.execute(
-        "SELECT "
-        "d.document_id, d.title AS sprint_title, "
-        # SQLite also parses relative clocks and bare Julian days. The shape
-        # gate keeps those fabricated/non-ISO values out of the response.
-        "CASE WHEN d.created_at LIKE '____-__-__%' "
-        "  THEN strftime('%Y-%m-%dT%H:%M:%SZ', d.created_at) "
-        "  ELSE NULL END AS started_at, "
-        "d.feature_id, feature.title AS feature_title, "
-        "unit.unit_id AS unit_unit_id, "
-        "unit.sprint_doc_id AS unit_sprint_doc_id, "
-        "unit.seq AS unit_seq, unit.unit_title AS unit_unit_title, "
-        "unit.dev_shell_id AS unit_dev_shell_id, "
-        "unit.reviewer_shell_id AS unit_reviewer_shell_id, "
-        "unit.state AS unit_state, unit.depends_on AS unit_depends_on, "
-        "unit.overlap AS unit_overlap, unit.branch AS unit_branch, "
-        "unit.pr_number AS unit_pr_number, "
-        "unit.review_head AS unit_review_head, "
-        "unit.assigned_at AS unit_assigned_at, "
-        "unit.state_changed_at AS unit_state_changed_at, "
-        "unit.updated_at AS unit_updated_at, "
-        "unit.updated_by_shell_id AS unit_updated_by_shell_id, "
-        "dev.shortname AS dev_shortname, "
-        "reviewer.shortname AS reviewer_shortname "
-        "FROM documents d "
-        "LEFT JOIN roadmap feature ON feature.feature_id=d.feature_id "
-        "LEFT JOIN sprint_units unit "
-        "  ON unit.sprint_doc_id=d.document_id "
-        "LEFT JOIN shells dev ON dev.shell_id=unit.dev_shell_id "
-        "LEFT JOIN shells reviewer "
-        "  ON reviewer.shell_id=unit.reviewer_shell_id "
-        f"WHERE {sprint_state.writable_board_clause('d')} "
-        # started_at is the single definition of a valid projected timestamp.
-        # Sorting by its NULL state keeps the shape/parser gate from drifting.
-        "ORDER BY started_at IS NULL, started_at, d.document_id, "
-        "  LENGTH(unit.seq), unit.seq"
-    ))
-
-    sprints = []
-    by_document = {}
-    for row in result:
-        document_id = row["document_id"]
-        sprint = by_document.get(document_id)
-        if sprint is None:
-            feature_id = row["feature_id"]
-            title = row["sprint_title"]
-            # The active-title predicate guarantees a non-NULL matching title;
-            # the only reachable fallback is an empty/whitespace remainder.
-            if not title[len("SPRINT:"):].strip():
-                title = f"Sprint #{document_id}"
-            sprint = {
-                "document_id": document_id,
-                "title": title,
-                "started_at": row["started_at"],
-                # Planner context becomes explicit launch state in Step 7.
-                # Until then no retired binding is presented as live truth.
-                "planner": None,
-                "feature": None if feature_id is None else {
-                    "feature_id": feature_id,
-                    "title": row["feature_title"],
-                },
-                "units": [],
-            }
-            by_document[document_id] = sprint
-            sprints.append(sprint)
-
-        if row["unit_unit_id"] is None:
-            continue
-        unit = {
-            column: row[f"unit_{column}"]
-            for column in _SPRINT_UNIT_COLUMNS
-        }
-        unit["state_recognized"] = unit["state"] in UNIT_STATES
-        unit["dev_shortname"] = row["dev_shortname"]
-        unit["reviewer_shortname"] = row["reviewer_shortname"]
-        sprint["units"].append(unit)
-
+    """Project only authoritative ``state=active`` sprint records."""
+    ids = con.execute(
+        "SELECT sp.sprint_doc_id FROM sprints sp "
+        "JOIN documents d ON d.document_id=sp.sprint_doc_id "
+        "WHERE sp.state='active' AND d.frozen=0 "
+        "ORDER BY sp.handed_off_at,sp.sprint_doc_id"
+    ).fetchall()
+    sprints = [
+        sprint_routes._sprint_projection(con, row[0])  # one shared API shape
+        for row in ids
+    ]
     return {"active_count": len(sprints), "sprints": sprints}
 
 
@@ -2805,6 +2725,17 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute(
                     "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
                     (did,))
+                sprint = sprint_lifecycle.sprint_row(con, did)
+                if sprint is not None:
+                    if sprint["state"] == "active":
+                        sprint_lifecycle.transition(con, did, "closing")
+                        sprint_lifecycle.transition(con, did, "closed")
+                    elif sprint["state"] == "closing":
+                        sprint_lifecycle.transition(con, did, "closed")
+                    elif sprint["state"] == "declared":
+                        sprint_lifecycle.transition(con, did, "aborted")
+                    elif sprint["state"] == "needs_owner":
+                        sprint_lifecycle.transition(con, did, "closed")
                 # Sprint close integration (seq 10): freezing the board
                 # releases its wake bindings + cancels queued wake work, and
                 # retires the sprint's watches + watch-scoped alerts (H-12).
@@ -3601,7 +3532,11 @@ def dispatch_http(method: str, path: str, headers_raw: str,
     if parsed.path.startswith(("/api/directives",
                                "/api/sentinel-events")):
         return conductor_routes.handle(method, path, headers_raw, body)
-    if parsed.path.startswith("/api/sprint-units"):
+    if parsed.path.startswith((
+        "/api/sprint-units",
+        "/api/spec-qaqc-reviews",
+        "/api/sprints",
+    )):
         return sprint_routes.handle(method, path, headers_raw, body)
     handler = _ShimHandler(method, path, headers_raw, body)
     try:

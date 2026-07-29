@@ -17,17 +17,17 @@ sys.path.insert(0, str(ENGINE / "render"))
 import flat  # noqa: E402
 
 SLOT_KINDS = {
-    "dev_sprint": (
+    "sprint_dev": (
         "dev",
         {"ready-for-review", "ask-planner", "merged", "unit-report"},
     ),
-    "rev_sprint": (
+    "sprint_rev": (
         "reviewer",
         {"review-clean", "findings", "ask-planner"},
     ),
-    "plan_sprint": (
+    "sprint_pln": (
         "planner",
-        {"kickoff", "hold", "re-scope", "re-task", "close", "answer"},
+        {"handoff", "kickoff", "hold", "re-scope", "re-task", "close", "answer"},
     ),
 }
 
@@ -111,7 +111,9 @@ class FreshCatalogueTest(unittest.TestCase):
         }
         self.assertTrue(set(SLOT_KINDS) <= active)
         self.assertTrue({
-            "sprint_dev",
+            "plan_sprint",
+            "dev_sprint",
+            "rev_sprint",
             "sprint_review",
             "sprint_orchestration",
             "sprint_orchestration_recover",

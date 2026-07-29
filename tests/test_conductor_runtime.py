@@ -46,6 +46,7 @@ class RuntimeFixture(unittest.TestCase):
             (2, "Planner", "PLN1", "planner", "plan-token"),
             (3, "Developer", "DEV1", "dev", "dev-token"),
             (4, "Reviewer", "REV1", "reviewer", "rev-token"),
+            (5, "Other Planner", "PLN2", "planner", "plan2-token"),
         )
         self.con.executemany(
             "INSERT INTO shells "
@@ -60,6 +61,13 @@ class RuntimeFixture(unittest.TestCase):
             "INSERT INTO documents "
             "(document_id,kind,title,body,frozen) "
             "VALUES (100,'doc','SPRINT: synthetic','status: ACTIVE',0)"
+        )
+        self.con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy,planner_shell_id,"
+            "planner_route,dev_route,reviewer_route) "
+            "VALUES (100,'active',1,2,"
+            "'claude/sonnet','claude/sonnet','codex/gpt-5.3-codex')"
         )
         self.con.execute(
             "INSERT INTO sprint_units "
@@ -91,6 +99,17 @@ class RuntimeFixture(unittest.TestCase):
             (state, review_head),
         )
         self.con.execute("UPDATE documents SET frozen=0 WHERE document_id=100")
+        self.con.commit()
+
+    def set_declared(self) -> None:
+        self.con.execute("DELETE FROM sprints WHERE sprint_doc_id=100")
+        self.con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy,planner_shell_id,"
+            "planner_route,dev_route,reviewer_route) "
+            "VALUES (100,'declared',1,2,"
+            "'claude/sonnet','claude/sonnet','codex/gpt-5.3-codex')"
+        )
         self.con.commit()
 
     def emit(self, issuer: str, kind: str, payload: dict, *, unit: bool = True) -> int:
@@ -127,10 +146,10 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
 
         return probe
 
-    def test_template_migration_and_boot_are_zero_skill_and_exhaustive(self):
+    def test_template_migration_and_boot_have_exact_skill_and_are_exhaustive(self):
         template = json.loads((ENGINE / "templates/shells/conductor.json").read_text())
         self.assertEqual(template["flavor"], "conductor")
-        self.assertEqual(template["skills"], [])
+        self.assertEqual(template["skills"], ["sprint_cond"])
         default = self.con.execute(
             "SELECT harness,model,is_default FROM flavor_defaults "
             "WHERE flavor='conductor'"
@@ -148,6 +167,15 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
             )
         self.assertNotIn("## MEMORY", rendered)
         self.assertNotIn("## SKILLS", rendered)
+        skill = (ENGINE / "assets/skills/sprint_cond/SKILL.md").read_text()
+        for phrase in (
+            "recorded originating Planner",
+            "stored role route",
+            "normal merge",
+            "Never invent",
+        ):
+            self.assertIn(phrase, rendered)
+            self.assertIn(phrase, skill)
         composed = compose.compose_boot(
             self.con,
             shell,
@@ -157,7 +185,7 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
         )
         self.assertEqual(composed, rendered)
 
-    def test_doctor_proves_cli_shell_zero_skills_and_exact_route(self):
+    def test_doctor_proves_cli_shell_exact_skill_and_route(self):
         config = runtime.ConductorConfig(True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL)
         result = runtime.doctor(
             self.con,
@@ -281,6 +309,13 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ),
         (
             "planner",
+            "handoff",
+            "pending",
+            {},
+            False,
+        ),
+        (
+            "planner",
             "kickoff",
             "pending",
             {"to": "DEV1", "instruction": "build", "model": "sonnet"},
@@ -373,6 +408,15 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                         "INSERT INTO documents "
                         "(document_id,kind,title,body,frozen) VALUES "
                         "(100,'doc','SPRINT: case','status: ACTIVE',0)"
+                    )
+                    sprint_state = "declared" if kind == "handoff" else "active"
+                    con.execute(
+                        "INSERT INTO sprints "
+                        "(sprint_doc_id,state,legacy,planner_shell_id,"
+                        "planner_route,dev_route,reviewer_route) "
+                        "VALUES (100,?,1,2,"
+                        "'claude/sonnet','claude/sonnet','codex/gpt-5.3-codex')",
+                        (sprint_state,),
                     )
                     con.execute(
                         "INSERT INTO sprint_units "
@@ -484,6 +528,117 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         with self.assertRaisesRegex(PermissionError, "conductor"):
             runtime.act(self.con, directive_id, 2, launcher=self.launcher)
 
+    def test_declared_zero_unit_and_dependency_cycle_handoffs_are_refused(self):
+        self.set_declared()
+        self.con.execute("DELETE FROM sprint_units WHERE sprint_doc_id=100")
+        empty_id = self.emit("planner", "handoff", {}, unit=False)
+        self.con.commit()
+        empty = runtime.act(self.con, empty_id, 1, launcher=self.launcher)
+        self.assertEqual(empty["status"], "refused")
+        self.assertIn("non-empty", empty["reason"])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprints WHERE sprint_doc_id=100"
+            ).fetchone()[0],
+            "declared",
+        )
+
+        self.con.executemany(
+            "INSERT INTO sprint_units "
+            "(unit_id,sprint_doc_id,seq,unit_title,dev_shell_id,"
+            "reviewer_shell_id,state,depends_on) "
+            "VALUES (?,100,?,?,3,4,'pending',?)",
+            (
+                (20, "U1", "cycle one", "U2"),
+                (21, "U2", "cycle two", "U1"),
+            ),
+        )
+        cycle_id = self.emit("planner", "handoff", {}, unit=False)
+        self.con.commit()
+        cycle = runtime.act(self.con, cycle_id, 1, launcher=self.launcher)
+        self.assertEqual(cycle["status"], "refused")
+        self.assertIn("dependency cycle", cycle["reason"])
+
+    def test_two_planners_route_questions_only_to_recorded_owner(self):
+        self.set_unit("working")
+        directive_id = self.emit(
+            "dev",
+            "ask-planner",
+            {"question": "choose", "alternatives": ["a", "b"]},
+        )
+        self.con.commit()
+        result = runtime.act(
+            self.con, directive_id, 1, launcher=self.launcher
+        )
+        self.assertEqual(result["status"], "executed")
+        self.assertEqual(len(result["launches"]), 1)
+        command = result["launches"][0]
+        self.assertIn("PLN1", command)
+        self.assertNotIn("PLN2", command)
+        self.assertEqual(
+            command[command.index("--model") + 1],
+            "sonnet",
+        )
+
+        nonowner = self.con.execute(
+            "INSERT INTO directives "
+            "(issuer_shell_id,issuer_flavor,kind,payload,target,"
+            "sprint_doc_id,unit_id) "
+            "VALUES (5,'planner','hold',?,'conductor',100,10)",
+            (json.dumps({"reason": "not mine"}),),
+        ).lastrowid
+        self.con.commit()
+        refused = runtime.act(
+            self.con, nonowner, 1, launcher=self.launcher
+        )
+        self.assertEqual(refused["status"], "refused")
+        self.assertIn("originating Planner", refused["reason"])
+
+    def test_merge_releases_ready_dependencies_without_booting_planner(self):
+        self.set_unit("working")
+        self.set_unit("in_review", review_head="abc")
+        self.con.execute(
+            "INSERT INTO sprint_units "
+            "(unit_id,sprint_doc_id,seq,unit_title,dev_shell_id,"
+            "reviewer_shell_id,state,depends_on) "
+            "VALUES (20,100,'U2','downstream',3,4,'pending','U1')"
+        )
+        directive_id = self.emit(
+            "dev",
+            "merged",
+            {"pr_number": 7, "head": "abc", "merge_sha": "def"},
+        )
+        self.con.commit()
+        result = runtime.act(
+            self.con, directive_id, 1, launcher=self.launcher
+        )
+        self.assertEqual(result["status"], "executed")
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprint_units WHERE unit_id=20"
+            ).fetchone()[0],
+            "working",
+        )
+        self.assertEqual(len(result["launches"]), 1)
+        self.assertIn("DEV1", result["launches"][0])
+        self.assertNotIn("PLN1", result["launches"][0])
+
+    def test_unit_report_boots_planner_only_after_all_units_terminal(self):
+        self.set_unit("working")
+        first = self.emit("dev", "unit-report", {"shipped": "partial"})
+        self.con.commit()
+        ordinary = runtime.act(self.con, first, 1, launcher=self.launcher)
+        self.assertEqual(ordinary["launches"], [])
+
+        self.con.execute(
+            "UPDATE sprint_units SET state='merged' WHERE unit_id=10"
+        )
+        last = self.emit("dev", "unit-report", {"shipped": "complete"})
+        self.con.commit()
+        terminal = runtime.act(self.con, last, 1, launcher=self.launcher)
+        self.assertEqual(len(terminal["launches"]), 1)
+        self.assertIn("PLN1", terminal["launches"][0])
+
 
 class ConductorSyntheticSprintTests(RuntimeFixture):
     def act_one(self, issuer, kind, payload, *, unit=True):
@@ -494,15 +649,13 @@ class ConductorSyntheticSprintTests(RuntimeFixture):
         return directive_id
 
     def test_kickoff_to_merge_to_conformance_to_close_without_human_input(self):
+        self.set_declared()
         ids = [
             self.act_one(
                 "planner",
-                "kickoff",
-                {
-                    "to": "DEV1",
-                    "instruction": "build synthetic unit",
-                    "model": "sonnet",
-                },
+                "handoff",
+                {"verified": True},
+                unit=False,
             ),
             self.act_one(
                 "dev",
@@ -552,6 +705,12 @@ class ConductorSyntheticSprintTests(RuntimeFixture):
                 "SELECT frozen FROM documents WHERE document_id=100"
             ).fetchone()[0],
             1,
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprints WHERE sprint_doc_id=100"
+            ).fetchone()[0],
+            "closed",
         )
         self.assertEqual(
             self.con.execute(

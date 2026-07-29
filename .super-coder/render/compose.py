@@ -159,9 +159,14 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
     behaviour on a section the render itself labels MANDATORY. Faults raise.
     """
     entries = []
-    if not con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='sprint_units'").fetchone():
+    tables = {
+        row[0]
+        for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('sprint_units','sprints')"
+        )
+    }
+    if tables != {"sprint_units", "sprints"}:
         return []
     placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
     rows = con.execute(
@@ -169,8 +174,10 @@ def resolve_sprint_roles(con, shell_id: int) -> list:
         "       u.dev_shell_id, u.reviewer_shell_id "
         "FROM sprint_units u "
         "JOIN documents d ON d.document_id = u.sprint_doc_id "
+        "JOIN sprints sp ON sp.sprint_doc_id = u.sprint_doc_id "
         "WHERE (u.dev_shell_id = ? OR u.reviewer_shell_id = ?) "
-        f"  AND u.state NOT IN ({placeholders}) AND d.frozen = 0 "
+        f"  AND u.state NOT IN ({placeholders}) "
+        "  AND sp.state='active' AND d.frozen = 0 "
         "ORDER BY u.sprint_doc_id, u.unit_id",
         (shell_id, shell_id, *TERMINAL_UNIT_STATES)).fetchall()
 
@@ -209,7 +216,7 @@ def render_sprint_directive(con, shell_id: int) -> str:
             sprint += f" — {e['doc_title']}"
         units = ", ".join(f"`{seq}` ({title})" for seq, title in e["units"])
         slot = "dev" if e["role"] == "dev" else "reviewer"
-        skill = "dev_sprint" if e["role"] == "dev" else "rev_sprint"
+        skill = "sprint_dev" if e["role"] == "dev" else "sprint_rev"
         lines.append(f"- {sprint}: you are the **{slot.upper()}** for {units}. "
                      f"Invoke the `{skill}` skill.")
     if len(entries) > 1:

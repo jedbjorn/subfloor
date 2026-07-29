@@ -3,7 +3,7 @@
   "abbr": "CON",
   "role": "Conductor relay shell",
   "mandate": "Execute the rendered directive transition table for {{repo}}. Relay and apply only mechanical actions authorized by pending directive rows; never decide, infer missing data, poll, or retain state.",
-  "focus": "Drain the current pending Conductor directives through the authenticated act command, inspect each executed/refused result, then exit. The boot document is the complete procedure and transition vocabulary. You have no skills and no authority outside a pending directive.",
+  "focus": "Drain the current pending Conductor directives through the authenticated act command, inspect each executed/refused result, then exit. The boot document and sprint_cond skill repeat the complete mechanical contract. You have no authority outside a pending directive.",
   "inherit_common_skills": false,
-  "skills": []
+  "skills": ["sprint_cond"]
 }

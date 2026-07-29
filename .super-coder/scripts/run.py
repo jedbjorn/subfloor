@@ -62,7 +62,7 @@ import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
-import sprint_state  # noqa: E402  — canonical structural sprint liveness
+import sprint_lifecycle  # noqa: E402  — authoritative sprint owner/state/routes
 from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "api"))
@@ -73,9 +73,9 @@ PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
 SLOT_SKILLS = {
-    "plan": ("planner", "plan_sprint"),
-    "dev": ("dev", "dev_sprint"),
-    "rev": ("reviewer", "rev_sprint"),
+    "plan": ("planner", "sprint_pln"),
+    "dev": ("dev", "sprint_dev"),
+    "rev": ("reviewer", "sprint_rev"),
 }
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
 
@@ -721,15 +721,32 @@ def resolve_slot_context(con, shell, slot: str, sprint_ref: int,
             f"'{shell['shortname']}' is {shell['flavor'] or 'bespoke'}")
 
     doc = con.execute(
-        "SELECT document_id,title,frozen FROM documents WHERE document_id=?",
+        "SELECT d.document_id,d.title,d.frozen,sp.state,"
+        "sp.planner_shell_id,sp.planner_route,sp.dev_route,sp.reviewer_route "
+        "FROM documents d LEFT JOIN sprints sp "
+        "ON sp.sprint_doc_id=d.document_id WHERE d.document_id=?",
         (sprint_ref,),
     ).fetchone()
     if doc is None:
         raise SlotRequestError(f"sprint document {sprint_ref} does not exist")
-    if not sprint_state.is_live_sprint(con, sprint_ref):
-        state = "frozen" if doc["frozen"] else "not live"
+    if doc["state"] != "active" or doc["frozen"]:
+        state = "frozen" if doc["frozen"] else (doc["state"] or "undeclared")
         raise SlotRequestError(
-            f"sprint document {sprint_ref} is {state}")
+            f"sprint document {sprint_ref} is {state}, not active")
+    if slot == "plan" and doc["planner_shell_id"] != shell["shell_id"]:
+        raise SlotRequestError(
+            f"shell '{shell['shortname']}' is not sprint {sprint_ref}'s "
+            "originating Planner"
+        )
+    route_column = {
+        "plan": "planner_route",
+        "dev": "dev_route",
+        "rev": "reviewer_route",
+    }[slot]
+    try:
+        harness, model = sprint_lifecycle.split_route(doc[route_column])
+    except sprint_lifecycle.SprintLifecycleError as exc:
+        raise SlotRequestError(str(exc)) from exc
 
     skill = con.execute(
         "SELECT name,content FROM skills "
@@ -779,6 +796,8 @@ def resolve_slot_context(con, shell, slot: str, sprint_ref: int,
         "skill_body": skill["content"],
         "sprint_doc_id": doc["document_id"],
         "sprint_title": doc["title"],
+        "harness": harness,
+        "model": model,
         "units": [dict(row) for row in units],
     }
 

@@ -91,6 +91,11 @@ PER_INSTANCE_TABLES = [
     # rebuilds. Loads after `shells` and `documents`, both its FK targets. No
     # row filter: every unit row is durable planner content, terminal or not.
     "sprint_units",
+    # Reviewed-spec evidence and executable sprint declarations are durable
+    # instance truth. Reviews load after their document/shell parents; sprints
+    # then load after documents, shells, and reviews.
+    "spec_qaqc_reviews",
+    "sprints",
     # Conductor contract rows are durable orchestration truth. Whitelist and
     # expectation defaults are migration-owned system data; the live queue,
     # evidence trail, and one-time legacy-drain audit are instance state.

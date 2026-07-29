@@ -49,6 +49,14 @@ CREATE TABLE sprint_units (
     branch TEXT,
     pr_number INTEGER
 );
+CREATE TABLE sprints (
+    sprint_doc_id INTEGER PRIMARY KEY,
+    state TEXT NOT NULL,
+    planner_shell_id INTEGER,
+    planner_route TEXT,
+    dev_route TEXT,
+    reviewer_route TEXT
+);
 """
 
 
@@ -68,14 +76,18 @@ def slot_connection() -> sqlite3.Connection:
     con.executemany(
         "INSERT INTO skills (name,content) VALUES (?,?)",
         (
-            ("plan_sprint", "PLAN BODY\n\n`./sc directives emit kickoff`"),
-            ("dev_sprint", "DEV BODY\n\n`./sc directives emit ready-for-review`"),
-            ("rev_sprint", "REV BODY\n\n`./sc directives emit review-clean`"),
+            ("sprint_pln", "PLAN BODY\n\n`sc directives emit handoff`"),
+            ("sprint_dev", "DEV BODY\n\n`sc directives emit ready-for-review`"),
+            ("sprint_rev", "REV BODY\n\n`sc directives emit review-clean`"),
         ),
     )
     con.execute(
         "INSERT INTO documents (document_id,title) "
         "VALUES (25,'SPRINT: Conductor trial')")
+    con.execute(
+        "INSERT INTO sprints "
+        "(sprint_doc_id,state,planner_shell_id,planner_route,dev_route,reviewer_route) "
+        "VALUES (25,'active',1,'claude/sonnet','claude/sonnet','codex/gpt-5.3-codex')")
     con.executemany(
         "INSERT INTO sprint_units "
         "(unit_id,sprint_doc_id,seq,unit_title,dev_shell_id,"
@@ -104,20 +116,21 @@ class SlotContextTest(unittest.TestCase):
     def test_dev_slot_loads_only_its_assigned_unit_and_skill(self) -> None:
         ctx = run.resolve_slot_context(
             self.con, self.shell(2), "dev", 25)
-        self.assertEqual(ctx["skill_name"], "dev_sprint")
+        self.assertEqual(ctx["skill_name"], "sprint_dev")
+        self.assertEqual((ctx["harness"], ctx["model"]), ("claude", "sonnet"))
         self.assertEqual([u["seq"] for u in ctx["units"]], ["U1"])
         self.assertEqual(ctx["units"][0]["branch"], "feat/u1")
 
     def test_reviewer_can_focus_one_of_several_assigned_units(self) -> None:
         ctx = run.resolve_slot_context(
             self.con, self.shell(3), "rev", 25, "U2")
-        self.assertEqual(ctx["skill_name"], "rev_sprint")
+        self.assertEqual(ctx["skill_name"], "sprint_rev")
         self.assertEqual([u["seq"] for u in ctx["units"]], ["U2"])
 
     def test_planner_slot_loads_the_live_board_without_a_binding(self) -> None:
         ctx = run.resolve_slot_context(
             self.con, self.shell(1), "plan", 25)
-        self.assertEqual(ctx["skill_name"], "plan_sprint")
+        self.assertEqual(ctx["skill_name"], "sprint_pln")
         self.assertEqual([u["seq"] for u in ctx["units"]], ["U1", "U2"])
 
     def test_reviewer_without_unit_is_the_close_time_conformance_slot(self) -> None:
@@ -125,7 +138,7 @@ class SlotContextTest(unittest.TestCase):
             "UPDATE sprint_units SET state='merged' WHERE sprint_doc_id=25")
         ctx = run.resolve_slot_context(
             self.con, self.shell(3), "rev", 25)
-        self.assertEqual(ctx["skill_name"], "rev_sprint")
+        self.assertEqual(ctx["skill_name"], "sprint_rev")
         self.assertEqual([u["state"] for u in ctx["units"]],
                          ["merged", "merged"])
 
@@ -151,15 +164,14 @@ class SlotContextTest(unittest.TestCase):
         self.con.execute(
             "UPDATE documents SET frozen=0 WHERE document_id=25")
         self.con.execute(
-            "UPDATE skills SET is_deleted=1 WHERE name='dev_sprint'")
+            "UPDATE skills SET is_deleted=1 WHERE name='sprint_dev'")
         with self.assertRaisesRegex(run.SlotRequestError, "is unavailable"):
             run.resolve_slot_context(
                 self.con, self.shell(2), "dev", 25)
 
     def test_non_sprint_document_fails_closed(self) -> None:
-        self.con.execute(
-            "UPDATE documents SET kind='spec' WHERE document_id=25")
-        with self.assertRaisesRegex(run.SlotRequestError, "is not live"):
+        self.con.execute("DELETE FROM sprints WHERE sprint_doc_id=25")
+        with self.assertRaisesRegex(run.SlotRequestError, "undeclared, not active"):
             run.resolve_slot_context(
                 self.con, self.shell(2), "dev", 25)
 
@@ -173,13 +185,13 @@ class SlotContextTest(unittest.TestCase):
         self.assertIn("branch `feat/u1`", rendered)
         self.assertIn("PR #77", rendered)
         self.assertIn("DEV BODY", rendered)
-        self.assertIn("./sc directives emit ready-for-review", rendered)
+        self.assertIn("sc directives emit ready-for-review", rendered)
 
     def test_slot_default_prompt_names_loaded_skill_and_scope(self) -> None:
         ctx = run.resolve_slot_context(
             self.con, self.shell(3), "rev", 25)
         prompt = run.slot_default_prompt(ctx)
-        self.assertIn("rev_sprint", prompt)
+        self.assertIn("sprint_rev", prompt)
         self.assertIn("sprint 25", prompt)
         self.assertIn("U1, U2", prompt)
 

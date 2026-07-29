@@ -123,6 +123,9 @@ class RebuildIntegrityTest(unittest.TestCase):
                 "INSERT INTO sprint_units "
                 "(sprint_doc_id, seq, unit_title, state) "
                 "VALUES (59,'U1','guard proof','working')")
+            con.execute(
+                "INSERT INTO sprints (sprint_doc_id, state, legacy) "
+                "VALUES (59,'active',1)")
             con.commit()
             con.close()
             before = digest(outgoing)

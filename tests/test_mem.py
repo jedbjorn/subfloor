@@ -772,6 +772,8 @@ class ApiMemTest(unittest.TestCase):
             if surface == "tasks":
                 self.assertEqual(self.run_mem("get", "tasks", "--feature", "0"), 0, surface)
                 continue
+            if surface == "qaqc":
+                continue
             self.assertEqual(self.run_mem("get", surface), 0, surface)
 
     def test_get_tasks_requires_scope(self):

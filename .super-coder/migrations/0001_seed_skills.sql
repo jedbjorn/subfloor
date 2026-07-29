@@ -1251,127 +1251,6 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'dev_sprint',
-  'Execute one ephemeral Conductor developer slot. Build the launcher-assigned sprint unit, resolve ambiguity through `ask-planner`, send `ready-for-review`, merge only at an approved green head, and emit the structured unit report. Load only from `sc run <dev> --slot dev --sprint <id> [--unit U]`.',
-  'craft',
-  NULL,
-  0,
-  '# dev_sprint
-
-Execute only the unit or units in the mandatory slot section. Emit one
-transition directive for the turn, then exit. After a merge, also emit the
-required `unit-report`.
-
-## Establish the assignment
-
-Read the slot context, relayed prompt, sprint board, and governing document:
-
-```sh
-sc sprint board --sprint <doc-id>
-sc directives list --status pending --sprint <doc-id>
-sc mem get documents --doc <doc-id>
-```
-
-Use the boot section''s numeric unit ID for `--unit`; `U1` is display sequence.
-Load `git` before branch work and `spec` when the governing feature tracks
-tasks.
-
-**Pass:** the assignment names one bounded code outcome, its dependencies,
-branch/PR state, and its observable verification gate.
-
-## Ask before guessing
-
-Stop when the request has materially different readings, its premise is false,
-a credential/human action is required, or the work crosses the recorded scope.
-Emit:
-
-```sh
-sc directives emit ask-planner \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"question":"<decision required>","alternatives":["<A>","<B>"],"evidence":["<fact>"],"downstream":["<effect>"]}''
-```
-
-Do not send a message, boot the planner, or continue on an assumed answer.
-
-**Pass:** the question contains alternatives, evidence, and downstream effect,
-and the returned directive ID inspects as pending.
-
-## Build
-
-Sync the recorded base, create or resume the recorded unit branch, and implement
-the smallest complete change. Preserve unrelated work. Run focused checks, then
-the unit''s full gate. Use `sc job` for work that must outlive the harness
-turn.
-
-Do not write the sprint board or schedule polling. The Conductor applies
-mechanical transitions from directives; the sentinel observes liveness.
-
-When implementation and required checks are green, push/open the PR and emit:
-
-```sh
-sc directives emit ready-for-review \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"pr_number":123,"head":"<sha>","branch":"feat/example","checks":"green","verification":["<gate>"]}''
-```
-
-**Pass:** the directive names the exact PR head and the checks that ran.
-
-## Respond to review
-
-Apply relayed Major/Medium findings, preserve Low findings as follow-ups, rerun
-the affected gate, and emit a new `ready-for-review` at the new exact head.
-
-If a finding or rebase changes the recorded scope, emit `ask-planner` instead.
-Never treat a clean verdict for an old head as approval for a changed
-contribution.
-
-## Merge and report
-
-Merge only when all conditions hold:
-
-- the sprint document is active and unfrozen;
-- the board still assigns the unit to this shell;
-- required checks are green on the exact head;
-- a `review-clean` directive names that head;
-- the planner''s order releases the unit.
-
-After the merge, emit the transition:
-
-```sh
-sc directives emit merged \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"pr_number":123,"head":"<approved-head>","merge_sha":"<sha>"}''
-```
-
-Then emit the report:
-
-```sh
-sc directives emit unit-report \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"shipped":"<observable behavior>","judgements":[],"issues":[],"deviations":[],"follow_ups":[]}''
-```
-
-Read both IDs back with `sc directives inspect <id>`, then clean the local
-branch according to `git`.
-
-**Developer completion:** the approved green head is merged, `merged` and
-`unit-report` are pending for the Conductor, and the worktree is clean.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'docs',
   'Author or review docs & specs in super-coder. The DB owns the body (documents table); roadmap tracks specs (the dev cycle), the Docs tab holds docs. Use whenever asked for a doc, spec, report, design, RFC, ADR, runbook, or to edit existing ones.',
   'substrate',
@@ -3014,153 +2893,6 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'plan_sprint',
-  'Decide and direct one ephemeral Conductor planner slot. Decompose a declared sprint, assign models and units, rule on questions or sentinel evidence, re-scope or re-task work, launch close-time conformance, and close only after the integrated result passes. Load only from `sc run <planner> --slot plan --sprint <id>`.',
-  'craft',
-  NULL,
-  0,
-  '# plan_sprint
-
-Make the sprint decision requested by the slot prompt, emit the corresponding
-planner directive, then exit. The Conductor relays and writes mechanics; never
-boot another shell, write the sprint board, poll, or wait.
-
-## Establish the record
-
-Read the mandatory slot section and the relayed prompt. Confirm the sprint,
-unit IDs, dependencies, assignments, and current states:
-
-```sh
-sc sprint board --sprint <doc-id>
-sc directives list --status pending --sprint <doc-id>
-sc mem get documents --doc <doc-id>
-```
-
-Treat the boot section''s numeric unit ID as the `--unit` value. Treat `U1` as
-the display sequence only.
-
-**Pass:** one requested planner decision is grounded in the current board,
-governing document, and supplied evidence.
-
-## Select one procedure
-
-| Prompt / state | Decide | Emit |
-|---|---|---|
-| New declaration | decomposition, order, assignments, model routes | one `kickoff` per released unit |
-| Worker question | answer from spec + evidence | `answer` |
-| False or unresolved sentinel verdict | whether work continues | `answer`, `hold`, `re-task`, or `re-scope` |
-| Scope or dependency changed | new bounded assignment/order | `re-scope` or `re-task` |
-| Units terminal, conformance absent | reviewer + integrated SHA/scope | `kickoff` for conformance |
-| Conformance clean | final disposition | `close` |
-| Required evidence missing | what must be supplied | `hold` |
-
-Do not infer a human choice. A declaration prompt must carry the FnB-approved
-planner/dev/reviewer model routes. Missing approval -> emit `hold` naming the
-missing choice.
-
-## Declare
-
-Decompose into independently verifiable units. Name dependencies, overlap,
-developer, reviewer, model route, scope, and completion evidence. Release only
-units whose dependencies are satisfied.
-
-Emit each released assignment to the Conductor:
-
-```sh
-sc directives emit kickoff \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"to":"DEV1","unit_seq":"U1","instruction":"<bounded task + gate>","model":"<approved route>","depends_on":[],"overlap":[]}''
-```
-
-**Pass:** every kickoff identifies one recipient, one numeric unit, one bounded
-instruction, one approved model route, and observable completion evidence.
-
-## Rule
-
-Use the spec and supplied evidence; do not replace missing evidence with a
-guess.
-
-Answer a worker:
-
-```sh
-sc directives emit answer \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"to":"DEV1","question_directive_id":42,"answer":"<ruling>","evidence":["<fact>"]}''
-```
-
-Hold unsafe progress:
-
-```sh
-sc directives emit hold \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"reason":"<missing or conflicting evidence>","next":"<required proof>"}''
-```
-
-Re-task the same outcome or re-scope the outcome itself:
-
-```sh
-sc directives emit re-task \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"to":"DEV1","instruction":"<replacement execution path>","reason":"<evidence>"}''
-
-sc directives emit re-scope \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"to":"DEV1","scope":"<new boundary>","reason":"<ruling>","downstream":["U2"]}''
-```
-
-**Pass:** the directive states the decision, evidence, recipient, and downstream
-effect; it contains no mechanical board mutation.
-
-## Close
-
-When all units are terminal, emit a conformance kickoff to a reviewer. Name the
-integrated SHA, full requirement scope, and complete ratified-deviation list.
-Conformance uses `rev_sprint` without a unit focus.
-
-```sh
-sc directives emit kickoff \
-  --target conductor \
-  --sprint <doc-id> \
-  --payload ''{"to":"REV1","mode":"conformance","main_sha":"<sha>","scope":"all requirements","ratified_deviations":[],"model":"<approved route>"}''
-```
-
-After a clean conformance directive, emit:
-
-```sh
-sc directives emit close \
-  --target conductor \
-  --sprint <doc-id> \
-  --payload ''{"main_sha":"<sha>","conformance_directive_id":84,"summary":"<shipped outcome>"}''
-```
-
-Never close with a nonterminal unit, an unresolved Major/Medium finding, red
-required checks, or missing conformance.
-
-## Exit gate
-
-Read back the emitted directive ID with `sc directives inspect <id>`.
-
-**Planner completion:** every requested decision is represented by a valid
-planner directive addressed to `conductor`; no shell was booted, no board row
-was written, and no scheduled poll was started.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'pm2',
   'Observe + manage the host''s pm2-supervised app stack through the host-side pm2-broker — status, app health, log tails, and scoped restarts, holding no host access yourself. The admin shell''s deploy-confirmation companion. Use when verifying a deploy, checking the live app, or bouncing a declared process.',
   'substrate',
@@ -3414,139 +3146,6 @@ Trigger: the FnB says "redlines" (with or without specific context).
 5. **After resolution** — FnB confirms the redline resolved -> delete the
    source `.png` from `shared/redlines/`. Delete only on explicit
    confirmation, never on assumed completion.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'rev_sprint',
-  'Execute one ephemeral Conductor reviewer slot. Review an assigned unit at an exact head and emit `findings` or `review-clean`, or run the folded-in close-time conformance pass when launched without `--unit`. Load only from `sc run <reviewer> --slot rev --sprint <id> [--unit U]`.',
-  'craft',
-  NULL,
-  0,
-  '# rev_sprint
-
-Use the base adversarial review discipline inside the mandatory slot scope.
-Emit one reviewer directive for the turn, then exit. Never merge, write the
-board, boot another shell, poll, or wait.
-
-## Select the mode
-
-Read the slot context, relayed prompt, board, and governing document:
-
-```sh
-sc sprint board --sprint <doc-id>
-sc directives list --status pending --sprint <doc-id>
-sc mem get documents --doc <doc-id>
-```
-
-- Focused numeric unit in the slot -> unit review.
-- No unit focus + conformance prompt -> close-time conformance over the
-  integrated sprint.
-- Any other ambiguity -> emit `ask-planner`.
-
-Use the boot section''s numeric unit ID for `--unit`; `U1` is display sequence.
-
-**Pass:** the mode, exact code target, governing requirements, and completion
-verdict are unambiguous.
-
-## Ask before reviewing the wrong target
-
-For a missing/superseded head, unclear scope, missing ratified deviations, or
-overlap requiring a rebase, emit:
-
-```sh
-sc directives emit ask-planner \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"question":"<decision or evidence required>","alternatives":["<A>","<B>"],"evidence":["<fact>"]}''
-```
-
-Omit `--unit` for conformance. Do not continue on an assumed target.
-
-## Review a unit
-
-Pin the PR and exact head from the prompt. Confirm required checks belong to
-that head. Trace correctness, error handling, boundary/empty/concurrent/partial
-failure states, authorization, scope, and test strength.
-
-For a high-value property, mutate the implementation or condition, prove the
-relevant test fails, restore it, and prove the test passes.
-
-Emit blocking and nonblocking findings together:
-
-```sh
-sc directives emit findings \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"head":"<sha>","findings":[{"severity":"Major","location":"path:line","consequence":"<observable failure>","required":"<behavior>"}],"mutation":"<property/result>"}''
-```
-
-When no finding remains, emit:
-
-```sh
-sc directives emit review-clean \
-  --target conductor \
-  --sprint <doc-id> \
-  --unit <numeric-unit-id> \
-  --payload ''{"head":"<sha>","findings":[],"mutation":"<property/result>"}''
-```
-
-A clean verdict applies only to the named head and a later head whose
-contribution is proven unchanged across disjoint interference.
-
-**Pass:** exactly one `findings` or `review-clean` directive names the reviewed
-head and mutation evidence.
-
-## Run conformance
-
-Use this mode only when the prompt supplies the integrated main SHA, complete
-requirement scope, and ratified-deviation list. Judge shipped code, not PR
-narratives.
-
-Give every requirement exactly one verdict:
-
-- `as-specced`
-- `deviated-intentionally`
-- `deviated-silently`
-- `unimplemented`
-
-Attach location, observable consequence, and Major/Medium/Low severity to every
-silent deviation or unimplemented requirement.
-
-Emit gaps:
-
-```sh
-sc directives emit findings \
-  --target conductor \
-  --sprint <doc-id> \
-  --payload ''{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"<id>","verdict":"unimplemented","severity":"Major","evidence":"path:line"}]}''
-```
-
-Emit clean conformance:
-
-```sh
-sc directives emit review-clean \
-  --target conductor \
-  --sprint <doc-id> \
-  --payload ''{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"<id>","verdict":"as-specced"}],"findings":[]}''
-```
-
-**Conformance pass:** every requirement has one verdict and the directive names
-the integrated SHA.
-
-## Exit gate
-
-Read the emitted ID with `sc directives inspect <id>`.
-
-**Reviewer completion:** one valid reviewer directive addressed to `conductor`
-contains the exact target, evidence, and verdict; the worktree contains no
-unrestored mutation.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4141,6 +3740,350 @@ Mid-build, the work grows past the spec''s stated what/why:
   churn. Work with no spec (quick UI tweaks, minor migrations) is exempt
   entirely: no promotion, no handoff, no creep check. Stage discipline never
   blocks small things.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_cond',
+  'Execute the complete mechanical Conductor transition contract: stored-owner routing, stored role routes, refusal, dependency release, and stop-on-empty with zero discretionary decisions.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_cond — complete mechanical contract
+
+Conductor is a relay, never a decision-maker. Execute only pending directive
+rows with `sc directives act <id>`. Never invent missing data, choose a shell,
+select a model, alter scope, judge findings, poll, wait, or write the board
+directly. The stored sprint row is the only owner/state/route authority.
+
+| Issuer | Kind | Mechanical action | Pass |
+|---|---|---|---|
+| planner | handoff | validate non-empty fully assigned board; `declared → active`; boot every dependency-ready developer | state is active; released units are working |
+| dev | ready-for-review | record PR/head/branch; move in_review; boot assigned reviewer | exact stored reviewer route starts |
+| dev/reviewer | ask-planner | block when legal; boot the recorded originating Planner | no fleet-wide Planner selection |
+| dev | merged | verify recorded PR/review head; move merged; release every newly ready dependency | normal merge does not boot Planner |
+| dev | unit-report | record evidence; only if all units are terminal boot originating Planner for conformance decision | ordinary reports do not boot Planner |
+| reviewer | review-clean | record exact head and return to assigned developer; unitless conformance returns to Planner | exact-head gate preserved |
+| reviewer | findings | unit findings return to developer; conformance findings return to Planner | decision route is explicit |
+| planner | answer/hold/re-task/re-scope | apply only the named mechanical consequence | issuer is the stored owner |
+| planner | kickoff | boot named assigned worker or conformance reviewer using the stored role route | no payload-selected model |
+| planner | close | require terminal board + clean integrated conformance; `active → closing → closed`; freeze doc in the same transaction | state and document agree |
+| system | pr-green/pr-red/pr-merged | apply recorded PR transition and assigned-role wake | no discretionary interpretation |
+| system | stall/dead-shell | block when legal; boot originating Planner with evidence | Planner decides |
+
+## Refusal
+
+Refuse malformed payloads, wrong issuer flavor, non-owner Planner directives,
+unassigned issuers, missing stored routes, legacy `needs_owner`, wrong sprint
+state, illegal unit transitions, stale review heads, incomplete handoff boards,
+and close without exact clean conformance. Record the refusal and route it only
+to that sprint''s originating Planner. If no owner exists, record the refusal
+without guessing one.
+
+## Loop and stop
+
+1. Run `sc directives list --status pending`.
+2. Act each ID in ascending order with `sc directives act <id>`.
+3. Inspect every executed/refused result.
+4. Continue only through the current pending set.
+5. Exit when the pending list is empty.
+
+No scheduled polling, no retained private state, no direct shell control, and
+no decisions.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_dev',
+  'Execute one Conductor-assigned sprint unit, ask the originating Planner for decisions, deliver an exact reviewed head, report the merge, and exit.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_dev
+
+Own only the unit in the mandatory slot context. Conductor owns the board,
+worker boots, relays, and dependency release. The originating Planner owns
+decisions. You build, prove, report, and exit.
+
+## Establish the boundary
+
+```sh
+sc sprint board --sprint <id>
+sc directives list --status pending --sprint <id>
+sc mem get documents --doc <governing-spec-id>
+```
+
+Confirm assignment, dependencies, branch, overlap, and observable completion
+gate. Never widen scope from neighboring units.
+
+When meaning, scope, authority, or evidence is ambiguous, stop and emit:
+
+```sh
+sc directives emit ask-planner \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"question":"<decision>","alternatives":["A","B"],"evidence":["<fact>"],"downstream":["<effect>"]}''
+```
+
+Do not guess, message Planner directly, or boot another shell.
+
+## Build and review gate
+
+Use the recorded branch, preserve unrelated work, implement the smallest
+complete change, and run the unit''s focused and full gates. When green:
+
+```sh
+sc directives emit ready-for-review \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"pr_number":123,"head":"<sha>","branch":"feat/example","checks":"green","verification":["<gate>"]}''
+```
+
+Review approval is exact-head-bound. Any relevant change after `review-clean`
+requires a new review. Merge only when the board still assigns this unit, all
+required checks are green, dependencies are satisfied, and `review-clean`
+names the exact head.
+
+After merge emit both records:
+
+```sh
+sc directives emit merged \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"pr_number":123,"head":"<approved-head>","merge_sha":"<sha>"}''
+sc directives emit unit-report \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"shipped":"<observable behavior>","judgements":[],"issues":[],"deviations":[],"follow_ups":[]}''
+```
+
+## Forbidden
+
+Never write the sprint board, boot or kill shells, schedule polling, issue
+Planner directives, approve your own head, merge without exact-head approval,
+or continue after an unresolved decision request.
+
+## Stop
+
+Exit after the inspected transition directive for the turn. Completion means
+the approved head is merged, both merge/report directives exist, and the
+worktree is clean.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_pln',
+  'Declare a reviewed spec for the FnB, provision its complete board, hand it to Conductor, then return only for bounded sprint decisions and close-time disposition.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_pln
+
+You are the sprint''s originating Planner. There are exactly two modes:
+
+1. a normal FnB-facing boot with no slot declares and provisions a sprint;
+2. `--slot plan --sprint <id>` answers one Conductor decision request.
+
+Declaration ends at handoff. After handoff Conductor owns mechanics and you
+re-enter only for decisions. In either mode, finish the bounded job and exit.
+
+## Declaration: onboard the FnB
+
+Explain the lifecycle before asking for routes:
+
+```text
+reviewed spec → Planner declaration + complete board → explicit handoff →
+Conductor runs workers mechanically → Planner re-enters only for decisions →
+independent conformance → close
+```
+
+Ask the FnB for one exact `harness/model` route for Planner, developer, and
+reviewer. Resolve each offered route by splitting it at the slash and running
+`sc models resolve <harness> <model>`; never silently substitute a default.
+Persist the original `harness/model` string. Confirm the governing spec and
+current QAQC:
+
+```sh
+sc mem get documents --doc <spec-id>
+sc mem get qaqc --doc <spec-id>
+```
+
+Missing, rejected, or stale approval is a hard stop. Declaration itself
+rechecks the canonical body hash:
+
+```sh
+sc sprint declare \
+  --spec <spec-id> \
+  --title "<title without SPRINT:>" \
+  --planner-route <harness/model> \
+  --dev-route <harness/model> \
+  --reviewer-route <harness/model>
+```
+
+The command returns the sprint document ID in `state=declared`; zero units are
+valid only during this provisioning window.
+
+## Provision and verify
+
+Decompose the reviewed spec into independently verifiable units. For every unit
+record its developer, reviewer, dependencies, overlap, and bounded outcome:
+
+```sh
+sc sprint unit add \
+  --sprint <id> --seq U1 --title "<bounded outcome>" \
+  --dev DEV1 --reviewer REV1 \
+  --depends-on none --overlap "<merge-surface note>"
+```
+
+Use `unit set` for corrections. Do not hand-edit a markdown board. Before
+handoff, verify:
+
+- at least one unit exists;
+- every unit has an active developer and reviewer;
+- every dependency names a real unit, with no self-edge or cycle;
+- every unit''s scope and verification gate are present in its title/context;
+- the three stored routes are exactly what the FnB approved.
+
+```sh
+sc sprint board --sprint <id>
+```
+
+Emit the single authority transfer:
+
+```sh
+sc directives emit handoff \
+  --target conductor \
+  --sprint <id> \
+  --payload ''{}''
+```
+
+Inspect the directive, then exit. Never boot a worker yourself and never remain
+resident after handoff.
+
+## Decision re-entry
+
+Read the mandatory slot context, relayed evidence, governing spec, and board.
+Make only the decision requested. You may correct the board when the decision
+changes scope, assignment, or dependencies; Conductor remains the mechanical
+executor.
+
+Allowed directives:
+
+```sh
+sc directives emit answer --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"to":"DEV1","question_directive_id":42,"answer":"<ruling>"}''
+sc directives emit hold --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"reason":"<missing evidence>"}''
+sc directives emit re-task --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"to":"DEV1","instruction":"<new path>","reason":"<evidence>"}''
+sc directives emit re-scope --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"to":"DEV1","scope":"<new boundary>","reason":"<ruling>"}''
+sc directives emit kickoff --target conductor --sprint <id> \
+  --payload ''{"to":"REV1","mode":"conformance","main_sha":"<sha>","scope":"all requirements","ratified_deviations":[]}''
+sc directives emit close --target conductor --sprint <id> \
+  --payload ''{"main_sha":"<sha>","conformance_directive_id":84,"summary":"<outcome>"}''
+```
+
+Do not issue routine kickoff directives after handoff: Conductor releases
+dependency-ready developers itself. Do not boot shells, relay messages, poll,
+merge, or make mechanical state moves.
+
+## Stop
+
+Declaration stops after an inspected `handoff`. Re-entry stops after the
+requested directive is inspected. The originating Planner never becomes the
+active sprint runner.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_rev',
+  'Independently review one sprint unit at an exact head or run close-time conformance, route decisions to the originating Planner, emit one evidence-bound verdict, and exit.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_rev
+
+Review adversarially inside the mandatory slot boundary. You never plan,
+implement the feature, merge, write the board, boot shells, poll, or wait.
+
+## Select the mode
+
+- a focused unit means exact-head code review;
+- no unit plus a conformance prompt means integrated close-time conformance;
+- anything ambiguous means `ask-planner`.
+
+```sh
+sc sprint board --sprint <id>
+sc directives list --status pending --sprint <id>
+sc mem get documents --doc <governing-spec-id>
+```
+
+For a missing/superseded head, unclear scope, unresolved overlap, or missing
+ratified deviation:
+
+```sh
+sc directives emit ask-planner \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"question":"<decision or evidence>","alternatives":["A","B"],"evidence":["<fact>"]}''
+```
+
+Omit `--unit` for conformance.
+
+## Unit review
+
+Pin the exact PR head and its checks. Trace correctness, authorization,
+empty/boundary/concurrent/partial-failure behavior, scope, and test strength.
+Mutate one high-value property, prove its test fails, restore, and prove green.
+
+Emit all findings together:
+
+```sh
+sc directives emit findings \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"head":"<sha>","findings":[{"severity":"Major","location":"path:line","consequence":"<failure>","required":"<behavior>"}],"mutation":"<proof>"}''
+```
+
+Or exact-head approval:
+
+```sh
+sc directives emit review-clean \
+  --target conductor --sprint <id> --unit <unit-id> \
+  --payload ''{"head":"<sha>","findings":[],"mutation":"<proof>"}''
+```
+
+## Conformance
+
+Require the integrated main SHA, full requirement scope, and complete
+ratified-deviation list. Give every requirement exactly one verdict:
+`as-specced`, `deviated-intentionally`, `deviated-silently`, or
+`unimplemented`.
+
+```sh
+sc directives emit findings \
+  --target conductor --sprint <id> \
+  --payload ''{"mode":"conformance","main_sha":"<sha>","findings":[{"severity":"Major","requirement":"R1","evidence":"path:line"}]}''
+sc directives emit review-clean \
+  --target conductor --sprint <id> \
+  --payload ''{"mode":"conformance","main_sha":"<sha>","verdicts":[{"requirement":"R1","verdict":"as-specced"}],"findings":[]}''
+```
+
+## Stop
+
+Inspect the one emitted verdict and exit with no unrestored mutation. A clean
+verdict never floats to another head.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
