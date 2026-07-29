@@ -69,6 +69,19 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "mdBlock(body)" in interface
 
 
+def test_connection_status_is_encoded_in_the_idle_pill_without_visible_copy():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert 'let streamStatus = "connecting"' in interface
+    assert 'source.onopen = () => onState("connected")' in interface
+    assert 'source.onerror = () => onState("reconnecting")' in interface
+    assert "pill.title = `Connection: ${connectionLabel}`" in interface
+    assert '"stream-disconnected"' in interface
+    assert 'className: "chat-stream-state"' not in interface
+    assert ".chat-stream-state" not in STYLE
+    assert ".chat-state.state-idle.stream-disconnected" in STYLE
+
+
 def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
@@ -115,7 +128,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'queueState.textContent = `${queued} queued`' in interface
     assert 'conversation.state !== "running"' in interface
     assert 'event.event_type === "run.started") message.state = "running"' in interface
-    assert 'textContent: "Interrupt"' in interface
+    assert 'textContent: "Interrupt"' not in interface
     assert 'textContent: "Retry"' in interface
     assert 'textContent: "Close"' in interface
     assert 'textContent: "Analytics"' in interface
@@ -129,7 +142,8 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'className: "chat-title-button"' in interface
     assert 'title: "Rename conversation"' in interface
     assert 'textContent: "Rename"' not in interface
-    assert "actions.append(analytics, interrupt, close)" in interface
+    assert "actions.append(analytics, close)" in interface
+    assert "/interruptions" not in interface
     assert "chatCloseForSwitch(selectedConversation)" in interface
     assert "Finish the current turn and queued messages before switching chats." in interface
     assert 'item.state !== "closed"' in interface
@@ -167,13 +181,47 @@ def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
     assert "height: 100%; overflow-y: auto;" in STYLE
 
 
-def test_shell_rail_is_flat_but_retains_flavor_order():
+def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
+    assert (
+        '"cartographer", "admin", "conductor", "planner", "dev", '
+        '"reviewer", "devops"'
+    ) in APP
     assert "const orderedShells = orderedFlavors.flatMap" in interface
     assert "for (const item of orderedShells)" in interface
+    assert 'const flavor = item.flavor || "bespoke"' in interface
+    assert "previousFlavor && flavor !== previousFlavor" in interface
+    assert 'className: "chat-shell-divider", role: "separator"' in interface
     assert 'className: "chat-shell-group"' not in interface
     assert ".chat-shell-group" not in STYLE
+    assert ".chat-shell-divider" in STYLE
+
+
+def test_history_badges_poll_without_repainting_the_interface():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert "const CHAT_HISTORY_POLL_MS = 2000" in interface
+    assert "if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer)" in interface
+    assert "const historyItems = new Map()" in interface
+    assert "historyItems.set(conversation.conversation_id, button)" in interface
+    assert 'await chatApi("/conversations?limit=100")' in interface
+    assert "generation !== chatRenderGeneration || !chatHistoryPollTimer" in interface
+    assert "historyItems.get(conversation.conversation_id)" in interface
+    assert "pill.replaceWith(chatStatePill(nextState))" in interface
+    assert "if (document.hidden || historyPollInFlight) return" in interface
+    assert "finally { historyPollInFlight = false; }" in interface
+    assert "setInterval(pollHistory, CHAT_HISTORY_POLL_MS)" in interface
+    poll = interface[interface.index("const pollHistory = async"):
+                     interface.index("chatHistoryPollTimer = setInterval")]
+    assert "renderInterface(" not in poll
+
+
+def test_redline_chat_text_is_one_pixel_larger():
+    assert "font-size: 15px;" in STYLE[STYLE.index(".chat-shell {"):
+                                      STYLE.index(".chat-shell:hover")]
+    assert "background: var(--panel); font-size: 15px;" in STYLE
+    assert "font-size: calc(.62rem + 1px)" in STYLE
 
 
 def test_history_header_places_configure_under_identity_and_centers_chat_action():

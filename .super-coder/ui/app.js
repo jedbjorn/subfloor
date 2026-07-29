@@ -3022,17 +3022,26 @@ async function renderSprints(root) {
 // uses the normal CLI preparation path server-side, but deliberately has no
 // terminal, tmux controls, or live hand-off between browser and CLI.
 const CHAT_HARNESSES = ["opencode", "claude", "codex"];
-const CHAT_FLAVOR_ORDER = ["cartographer", "admin", "planner", "dev", "reviewer", "devops"];
+const CHAT_FLAVOR_ORDER = [
+  "cartographer", "admin", "conductor", "planner", "dev", "reviewer", "devops",
+];
 const CHAT_CONFIGURE_ROUTE = "configure";
+const CHAT_HISTORY_POLL_MS = 2000;
 let chatRouteShell = "";
 let chatRouteConversation = "";
 let chatSource = null;
+let chatHistoryPollTimer = null;
 let chatRenderGeneration = 0;
 let chatPendingSend = null;
 
 function chatStopStream() {
   if (chatSource) chatSource.close();
   chatSource = null;
+}
+
+function chatStopHistoryPoll() {
+  if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer);
+  chatHistoryPollTimer = null;
 }
 
 function chatHash(shortname, conversationId = "") {
@@ -3392,13 +3401,12 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   let messages = [...initialMessages];
   const events = [];
   const seen = new Set();
-  let latestRunId = null;
+  let streamStatus = "connecting";
 
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
   const state = el("div", { className: "chat-pane-state" });
   const queueState = el("span", { className: "chat-queue-state", hidden: true });
-  const streamState = el("span", { className: "chat-stream-state" }, "connecting");
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
   const transcript = el("div", { className: "chat-transcript" });
@@ -3437,6 +3445,23 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const pending = el("div", { className: "chat-pending", hidden: true });
   const composerRow = el("div", { className: "chat-composer" },
     composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
+  const updateStreamStatus = () => {
+    const pill = state.querySelector(".chat-state");
+    if (!pill) return;
+    const connected = streamStatus === "connected";
+    const connectionLabel = connected
+      ? "Connected"
+      : streamStatus === "reconnecting" ? "Reconnecting" : "Connecting";
+    pill.title = `Connection: ${connectionLabel}`;
+    pill.setAttribute(
+      "aria-label",
+      `${pill.textContent}; connection ${connectionLabel.toLowerCase()}`,
+    );
+    pill.classList.toggle(
+      "stream-disconnected",
+      conversation.state === "idle" && !connected,
+    );
+  };
 
   const retry = async (text) => {
     composer.value = text;
@@ -3469,12 +3494,11 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     const queued = chatQueuedCount(messages);
     queueState.hidden = queued === 0;
     queueState.textContent = `${queued} queued`;
-    state.replaceChildren(
-      chatStatePill(conversation.state), queueState, streamState);
+    state.replaceChildren(chatStatePill(conversation.state), queueState);
+    updateStreamStatus();
     const closed = conversation.state === "closed";
     composer.disabled = closed;
     send.disabled = closed;
-    interrupt.disabled = !["queued", "running", "waiting"].includes(conversation.state);
     close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
     composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
     chatPaintTranscript(
@@ -3502,15 +3526,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     anFilters.model = conversation.route.model || "";
     location.hash = "analytics";
   };
-  const interrupt = el("button", { className: "act", type: "button", textContent: "Interrupt" });
-  interrupt.onclick = async () => {
-    interrupt.disabled = true;
-    try {
-      await chatApi(`/conversations/${conversation.conversation_id}/interruptions`,
-        "POST", latestRunId ? { run_id: latestRunId } : {}, requestKey());
-    } catch (error) { toast(`${error.code}: ${error.message}`); }
-    finally { interrupt.disabled = false; }
-  };
   const close = el("button", {
     className: "act danger",
     type: "button",
@@ -3526,7 +3541,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
-  actions.append(analytics, interrupt, close);
+  actions.append(analytics, close);
   header.append(title, state, actions);
 
   async function submit() {
@@ -3579,7 +3594,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       if (seen.has(event.sequence)) return;
       seen.add(event.sequence);
       events.push(event);
-      if (event.run_id) latestRunId = event.run_id;
       const message = messages.find((item) => item.message_id === event.message_id);
       if (message && event.event_type === "run.started") message.state = "running";
       if (message && event.event_type === "run.completed") message.state = "completed";
@@ -3604,14 +3618,15 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
         refresh();
     },
     (value) => {
-      streamState.textContent = value;
-      streamState.classList.toggle("reconnecting", value === "reconnecting");
+      streamStatus = value;
+      updateStreamStatus();
     },
   );
 }
 
 async function renderInterface(root) {
   chatStopStream();
+  chatStopHistoryPoll();
   const generation = ++chatRenderGeneration;
   root.replaceChildren(el("div", { className: "chat-loading" }, "Loading conversations…"));
   const [{ shells }, defaults, catalog, allConversations] = await Promise.all([
@@ -3655,7 +3670,12 @@ async function renderInterface(root) {
   ];
   const orderedShells = orderedFlavors.flatMap((flavor) =>
     shells.filter((item) => (item.flavor || "bespoke") === flavor));
+  let previousFlavor = "";
   for (const item of orderedShells) {
+    const flavor = item.flavor || "bespoke";
+    if (previousFlavor && flavor !== previousFlavor)
+      rail.append(el("div", { className: "chat-shell-divider", role: "separator" }));
+    previousFlavor = flavor;
     const active = allConversations.items.find(
       (conversation) => conversation.shell.shell_id === item.shell_id
         && conversation.state !== "closed");
@@ -3715,6 +3735,7 @@ async function renderInterface(root) {
       configure),
     newChat));
   const history = el("div", { className: "chat-history-list" });
+  const historyItems = new Map();
   for (const conversation of conversations) {
     const button = el("button", {
       className: "chat-history-item"
@@ -3726,6 +3747,7 @@ async function renderInterface(root) {
       el("span", { className: "chat-history-name" },
       chatConversationName(conversation)),
       chatStatePill(conversation.state));
+    historyItems.set(conversation.conversation_id, button);
     button.onclick = async () => {
       if (conversation.conversation_id === selectedId) return;
       if (await chatCloseForSwitch(selectedConversation))
@@ -3736,6 +3758,25 @@ async function renderInterface(root) {
   if (!conversations.length)
     history.append(el("div", { className: "chat-history-empty" }, "No chats yet."));
   side.append(history);
+  let historyPollInFlight = false;
+  const pollHistory = async () => {
+    if (document.hidden || historyPollInFlight) return;
+    historyPollInFlight = true;
+    try {
+      const page = await chatApi("/conversations?limit=100");
+      if (generation !== chatRenderGeneration || !chatHistoryPollTimer) return;
+      for (const conversation of page.items) {
+        if (conversation.shell.shell_id !== shell.shell_id) continue;
+        const button = historyItems.get(conversation.conversation_id);
+        const pill = button?.querySelector(".chat-state");
+        const nextState = conversation.state || "idle";
+        if (!pill || pill.classList.contains(`state-${nextState}`)) continue;
+        pill.replaceWith(chatStatePill(nextState));
+      }
+    } catch { /* The next poll retries without disrupting the open chat. */ }
+    finally { historyPollInFlight = false; }
+  };
+  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);
 
   const pane = el("section", { className: "chat-pane" });
   layout.append(rail, side, pane);
@@ -3793,7 +3834,10 @@ function show(tab) {
   document.body.classList.toggle("sprints-view", tab === "sprints");
   document.body.classList.toggle("interface-view", tab === "interface");
   if (tab !== "sprints") sprintsStopRender();
-  if (tab !== "interface") chatStopStream();
+  if (tab !== "interface") {
+    chatStopStream();
+    chatStopHistoryPoll();
+  }
   setDocumentTitle(tab);
   load(tab);
 }

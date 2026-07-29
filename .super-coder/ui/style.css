@@ -95,10 +95,14 @@ body.interface-view main {
   letter-spacing: .14em; padding: .35rem .55rem;
 }
 .chat-rail-title { color: var(--ink); font-size: .74rem; margin-bottom: .45rem; }
+.chat-shell-divider {
+  height: 1px; margin: .65rem .55rem; background: var(--line-soft);
+}
 .chat-shell {
   position: relative; width: 100%; display: flex; align-items: center; gap: .45rem;
   background: transparent; border: 1px solid transparent; color: var(--dim);
   border-radius: 8px; padding: .48rem .55rem; cursor: pointer; text-align: left;
+  font-size: 15px;
 }
 .chat-shell:hover { color: var(--ink); background: var(--panel); }
 .chat-shell.selected { color: var(--ink); border-color: var(--line); background: var(--panel); }
@@ -169,6 +173,9 @@ body.interface-view main {
 .chat-state.state-waiting { color: var(--warn); border-color: rgba(212,145,74,.45); }
 .chat-state.state-error { color: #ef7d86; border-color: rgba(239,125,134,.45); }
 .chat-state.state-idle { color: var(--ok); border-color: rgba(76,175,125,.4); }
+.chat-state.state-idle.stream-disconnected {
+  color: var(--warn); border-color: rgba(212,145,74,.45);
+}
 .chat-state.state-closed { opacity: .6; }
 .chat-pane {
   min-width: 0; min-height: 0; display: grid;
@@ -193,8 +200,6 @@ body.interface-view main {
 .chat-title-button:hover { color: var(--accent); text-decoration: underline; }
 .chat-pane-state { display: flex; align-items: center; gap: .5rem; }
 .chat-queue-state { color: var(--accent); font-size: .68rem; white-space: nowrap; }
-.chat-stream-state { color: var(--dim); font-size: .68rem; }
-.chat-stream-state.reconnecting { color: var(--warn); }
 .chat-actions { display: flex; align-items: center; gap: .35rem; }
 .chat-actions .act { margin: 0; padding: .3rem .65rem; font-size: .72rem; }
 .chat-actions .danger { color: #ef7d86; }
@@ -215,7 +220,7 @@ body.interface-view main {
 .chat-bubble {
   width: fit-content; max-width: min(720px, 82%);
   border: 1px solid var(--line); border-radius: 12px; padding: .65rem .8rem;
-  background: var(--panel);
+  background: var(--panel); font-size: 15px;
 }
 .chat-bubble.chat-user { align-self: flex-end; background: #202936; border-color: #2c3b50; }
 .chat-bubble.chat-assistant { align-self: flex-start; }
@@ -224,7 +229,7 @@ body.interface-view main {
   color: var(--dim); font-size: .78rem; padding: .4rem .65rem;
 }
 .chat-who {
-  color: var(--dim); font-size: .62rem; text-transform: uppercase;
+  color: var(--dim); font-size: calc(.62rem + 1px); text-transform: uppercase;
   letter-spacing: .12em; margin-bottom: .22rem;
 }
 .chat-bubble .md > :first-child { margin-top: 0; }
