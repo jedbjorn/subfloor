@@ -158,14 +158,21 @@ class Transport:
 
 
 async def serve(host: str, port: int, http_handler, ws_handler,
-                log=print) -> int:
+                log=print, on_started=None) -> int:
     """Start the multiplex and block forever (until cancelled). Returns the
     bound port after start for callers that passed port=0 — via `log` line and
-    the Transport object; this coroutine simply runs until shutdown."""
+    the Transport object; this coroutine simply runs until shutdown.
+
+    ``on_started`` runs only after the socket bind succeeds. Background workers
+    that can cause external side effects belong behind that boundary: a second
+    process must lose the bind race before it can dispatch work.
+    """
     transport = Transport(host, port, http_handler, ws_handler, log=log)
     await transport.start()
-    log(f"transport: listening on {host}:{transport.port}")
     try:
+        log(f"transport: listening on {host}:{transport.port}")
+        if on_started is not None:
+            on_started()
         await asyncio.Event().wait()
     finally:
         await transport.stop()
