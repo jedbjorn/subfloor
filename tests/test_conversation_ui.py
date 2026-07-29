@@ -66,6 +66,11 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert "chatCloseForSwitch(selectedConversation)" in interface
     assert "Finish or interrupt the current turn before switching chats." in interface
     assert 'item.state !== "closed"' in interface
+    shell_switch = interface[
+        interface.index('button.onclick = () => {', interface.index("chat-shell-name")):
+        interface.index("rail.append(button);", interface.index("chat-shell-name"))
+    ]
+    assert "chatCloseForSwitch" not in shell_switch
 
 
 def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():

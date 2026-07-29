@@ -1529,7 +1529,7 @@ def main() -> None:
         con.close()
         sys.exit(
             f"shell '{chosen['shortname']}': Browser chat is open. "
-            "End it in Interface before starting a CLI session."
+            "Close it in Interface before starting a CLI session."
         )
     slot_context = None
     if slot is not None:

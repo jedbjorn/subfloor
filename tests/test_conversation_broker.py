@@ -153,6 +153,13 @@ class ConversationBrokerCase(unittest.TestCase):
         con.execute("PRAGMA foreign_keys=ON")
         return con
 
+    def allow_legacy_duplicate_open_chats(self) -> None:
+        """Exercise the broker's independent lock against pre-migration data."""
+        con = self.connect()
+        con.execute("DROP INDEX idx_conversations_live_normal_shell")
+        con.commit()
+        con.close()
+
     def add_conversation(
         self,
         *,
@@ -361,6 +368,7 @@ class StoreContractTest(ConversationBrokerCase):
         self.assertEqual(sequences, [1, 2])
 
     def test_shell_mutation_lock_blocks_other_conversation(self) -> None:
+        self.allow_legacy_duplicate_open_chats()
         first_conversation = self.add_conversation(shell_id=1)
         second_conversation = self.add_conversation(shell_id=1)
         self.add_message(first_conversation)
@@ -395,6 +403,7 @@ class StoreContractTest(ConversationBrokerCase):
         )
 
     def test_concurrent_claims_cannot_bypass_shell_lock(self) -> None:
+        self.allow_legacy_duplicate_open_chats()
         first_conversation = self.add_conversation(shell_id=1)
         second_conversation = self.add_conversation(shell_id=1)
         self.add_message(first_conversation)

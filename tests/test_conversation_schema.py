@@ -539,6 +539,37 @@ class TransitionMatrixTest(ConversationDbCase):
 
 
 class FenceAndEventTest(ConversationDbCase):
+    def test_open_chat_migration_closes_older_legacy_rows(self) -> None:
+        self.con.execute("DROP INDEX idx_conversations_live_normal_shell")
+        older = self.add_conversation(shell_id=1)
+        self.con.execute(
+            "UPDATE conversations SET last_activity_at='2026-01-01 00:00:00' "
+            "WHERE conversation_id=?",
+            (older,),
+        )
+        newer = self.add_conversation(shell_id=1)
+        self.con.execute(
+            "UPDATE conversations SET last_activity_at='2026-07-29 00:00:00' "
+            "WHERE conversation_id=?",
+            (newer,),
+        )
+
+        self.con.executescript(
+            (ENGINE / "migrations"
+             / "0133_one_open_normal_conversation_per_shell.sql").read_text()
+        )
+
+        states = dict(
+            self.con.execute(
+                "SELECT conversation_id,state FROM conversations "
+                "WHERE shell_id=1"
+            ).fetchall()
+        )
+        self.assertEqual(states[older], "closed")
+        self.assertEqual(states[newer], "idle")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_conversation(shell_id=1)
+
     def test_one_live_run_per_conversation_and_shell(self) -> None:
         first = self.add_conversation()
         first_message = self.add_message(first)
@@ -548,7 +579,10 @@ class FenceAndEventTest(ConversationDbCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.add_run(first, second_message)
 
-        second = self.add_conversation()
+        # The run fence remains independent of the newer open-chat fence. A
+        # closed historical row supplies a second same-shell conversation
+        # without violating the one-open-normal-conversation invariant.
+        second = self.add_conversation(state="closed")
         second_message = self.add_message(second)
         with self.assertRaises(sqlite3.IntegrityError):
             self.add_run(second, second_message)
@@ -559,6 +593,13 @@ class FenceAndEventTest(ConversationDbCase):
             (first_run,),
         )
         self.add_run(second, second_message)
+
+    def test_one_open_normal_conversation_per_shell(self) -> None:
+        self.add_conversation(shell_id=1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_conversation(shell_id=1)
+        self.add_conversation(shell_id=1, state="closed")
+        self.add_conversation(shell_id=2)
 
     def test_different_shells_may_run_concurrently(self) -> None:
         first = self.add_conversation(shell_id=1)

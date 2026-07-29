@@ -3547,10 +3547,9 @@ async function renderInterface(root) {
         type: "button",
       }, el("span", { className: "chat-shell-name" }, item.display_name));
       if (latest) button.append(chatStatePill(latest.state));
-      button.onclick = async () => {
+      button.onclick = () => {
         if (item.shell_id === shell.shell_id) return;
-        if (await chatCloseForSwitch(selectedConversation))
-          location.hash = chatHash(item.shortname);
+        location.hash = chatHash(item.shortname);
       };
       rail.append(button);
     }
