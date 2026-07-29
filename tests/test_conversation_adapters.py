@@ -8,9 +8,9 @@ import signal
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Iterable, Mapping
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
@@ -553,6 +553,35 @@ class ConversationAdapterTest(unittest.TestCase):
         recovered = adapter.reconcile(fresh, self.context)
         self.assertEqual(recovered.outcome, "unknown")
         self.assertFalse(recovered.proven)
+
+    def test_opencode_strips_the_selected_provider_prefix_from_model_id(
+        self,
+    ) -> None:
+        adapter, native = self.build("opencode")
+        context = ConversationContext(
+            worktree=self.root,
+            provider="openai",
+            model="openai/gpt-5.6-terra-fast",
+        )
+        adapter.start(context, "hello")
+        create = next(
+            request
+            for request in native.requests
+            if request[:2] == ("POST", "/session")
+        )
+        prompt = next(
+            request
+            for request in native.requests
+            if request[1].endswith("/prompt_async")
+        )
+        self.assertEqual(
+            create[3]["model"],
+            {"providerID": "openai", "id": "gpt-5.6-terra-fast"},
+        )
+        self.assertEqual(
+            prompt[3]["model"],
+            {"providerID": "openai", "modelID": "gpt-5.6-terra-fast"},
+        )
 
     def test_claude_uses_exact_start_and_resume_flags_and_sigint(
         self,

@@ -260,7 +260,14 @@ class OpenCodeAdapter(ConversationAdapter):
         if not context.model:
             return None
         if context.provider:
-            return context.provider, context.model
+            prefix = f"{context.provider}/"
+            model = (
+                context.model.removeprefix(prefix)
+                if context.model.startswith(prefix)
+                else context.model
+            )
+            if model:
+                return context.provider, model
         if "/" in context.model:
             provider, model = context.model.split("/", 1)
             if provider and model:
