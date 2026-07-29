@@ -20,6 +20,19 @@ CAPABILITIES = {
     "server_backed",
     "session_inspection",
 }
+NORMALIZED_EVENTS = {
+    "session.started",
+    "run.started",
+    "assistant.delta",
+    "tool.started",
+    "tool.completed",
+    "permission.requested",
+    "input.requested",
+    "usage",
+    "run.completed",
+    "run.failed",
+    "run.interrupted",
+}
 VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 
 
@@ -42,6 +55,17 @@ class ConversationCapabilityContractTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 conversation = self.adapter(harness)["conversation"]
                 probe = self.probes["required_harnesses"][harness]
+                self.assertEqual(conversation["contract_version"], 1)
+                self.assertEqual(
+                    set(conversation["normalized_events"]),
+                    NORMALIZED_EVENTS,
+                )
+                execution = conversation["execution_permissions"]
+                self.assertEqual(
+                    execution["requirement"],
+                    "worktree-command-access",
+                )
+                self.assertFalse(execution["sandbox_flag_required"])
                 self.assertRegex(conversation["minimum_cli_version"], VERSION)
                 self.assertEqual(
                     conversation["verified_cli_version"],

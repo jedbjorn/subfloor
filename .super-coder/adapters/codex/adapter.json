@@ -11,6 +11,7 @@
     "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" }
   },
   "conversation": {
+    "contract_version": 1,
     "minimum_cli_version": "0.145.0",
     "verified_cli_version": "0.145.0",
     "driver": "codex-app-server",
@@ -25,6 +26,24 @@
       "approval": "never",
       "unrestricted": "danger-full-access"
     },
+    "execution_permissions": {
+      "requirement": "worktree-command-access",
+      "unrestricted_mechanism": "thread-policy",
+      "sandbox_flag_required": false
+    },
+    "normalized_events": [
+      "session.started",
+      "run.started",
+      "assistant.delta",
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+      "usage",
+      "run.completed",
+      "run.failed",
+      "run.interrupted"
+    ],
     "capabilities": {
       "exact_session_resume": true,
       "structured_streaming": true,

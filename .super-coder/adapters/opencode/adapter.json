@@ -8,6 +8,7 @@
   "model": { "file": "opencode.json", "key": "model" },
   "headless": { "launch": ["opencode", "run"], "model_flag": "-m" },
   "conversation": {
+    "contract_version": 1,
     "minimum_cli_version": "1.18.9",
     "verified_cli_version": "1.18.9",
     "driver": "opencode-server",
@@ -16,6 +17,24 @@
     "interrupt": { "method": "POST", "path": "/session/{session_ref}/abort" },
     "inspect": { "method": "GET", "path": "/session/{session_ref}" },
     "permission_policy": "opencode-config-and-permission-events",
+    "execution_permissions": {
+      "requirement": "worktree-command-access",
+      "unrestricted_mechanism": "session-permission-rules",
+      "sandbox_flag_required": false
+    },
+    "normalized_events": [
+      "session.started",
+      "run.started",
+      "assistant.delta",
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+      "usage",
+      "run.completed",
+      "run.failed",
+      "run.interrupted"
+    ],
     "capabilities": {
       "exact_session_resume": true,
       "structured_streaming": true,
