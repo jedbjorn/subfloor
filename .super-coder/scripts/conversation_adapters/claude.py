@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import uuid
 from pathlib import Path
@@ -363,7 +364,12 @@ class ClaudeAdapter(ConversationAdapter):
             self.config_dir
             or Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
         )
-        project = str(worktree).replace(os.sep, "-")
+        # Claude maps the absolute cwd to a project directory by replacing
+        # every non-alphanumeric character independently. In particular,
+        # ``/.sc-worktrees`` becomes ``--sc-worktrees``; replacing separators
+        # alone points at a plausible but nonexistent ``-.sc-worktrees`` path
+        # and makes every exact resume look like a lost session.
+        project = re.sub(r"[^A-Za-z0-9]", "-", str(worktree))
         return root / "projects" / project / f"{session_ref}.jsonl"
 
     def inspect(

@@ -436,6 +436,20 @@ class ConversationAdapterTest(unittest.TestCase):
         if harness == "claude":
             self.write_claude_session(adapter, session_ref)
 
+    def test_claude_session_path_matches_native_project_encoding(self) -> None:
+        adapter = ClaudeAdapter(config_dir=self.claude_config)
+        worktree = Path("/home/j3d1/Repos/dos_app/.sc-worktrees/pln1")
+        self.assertEqual(
+            adapter._session_path(
+                "b6321ad5-9363-4529-980d-93a959000968",
+                worktree,
+            ),
+            self.claude_config
+            / "projects"
+            / "-home-j3d1-Repos-dos-app--sc-worktrees-pln1"
+            / "b6321ad5-9363-4529-980d-93a959000968.jsonl",
+        )
+
     def test_identical_contract_start_stream_interrupt_resume_reconcile(
         self,
     ) -> None:
