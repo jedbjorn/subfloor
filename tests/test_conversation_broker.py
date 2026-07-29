@@ -285,6 +285,29 @@ class ConversationBrokerCase(unittest.TestCase):
 
 
 class StoreContractTest(ConversationBrokerCase):
+    def test_prepared_shell_archive_is_bound_while_the_run_is_leased(self) -> None:
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        con = self.connect()
+        con.execute(
+            "INSERT INTO shell_memory_archives "
+            "(archive_id,shell_id,session_id,date) VALUES (42,1,'session-42','2026-07-29')"
+        )
+        con.commit()
+        con.close()
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+
+        store.bind_archive(run.run_id, "broker", 42)
+
+        con = self.connect()
+        row = con.execute(
+            "SELECT archive_id,state FROM conversation_runs WHERE run_id=?",
+            (run.run_id,),
+        ).fetchone()
+        con.close()
+        self.assertEqual(tuple(row), (42, "leased"))
+
     def test_turns_are_ordered_and_terminal_commit_queues_the_next(self) -> None:
         conversation_id = self.add_conversation()
         first = self.add_message(conversation_id)

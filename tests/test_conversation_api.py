@@ -125,6 +125,28 @@ class ConversationApiCase(unittest.TestCase):
         self.assertEqual(status, 201, obj)
         return obj
 
+    def test_create_prepares_never_booted_worktree_on_first_turn(self):
+        worktree = self.root / ".sc-worktrees" / "dev"
+        worktree.rmdir()
+        created = self.create()
+        self.assertEqual(
+            created["route"]["effort"],
+            "high",
+            "headless effort must be resolved and immutable at creation",
+        )
+        self.assertFalse(worktree.exists())
+        con = self.connect()
+        try:
+            row = con.execute(
+                "SELECT worktree,effort FROM conversations "
+                "WHERE conversation_id=?",
+                (created["conversation_id"],),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(Path(row["worktree"]), worktree)
+        self.assertEqual(row["effort"], "high")
+
 
 class ConversationResourceTest(ConversationApiCase):
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:

@@ -596,6 +596,27 @@ def open_db():
     return con
 
 
+def browser_conversation_active(con, shell_id: int) -> bool:
+    """Does a durable browser turn currently own this shell's mutation slot?"""
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM conversation_runs WHERE shell_id=? "
+            "AND state IN ('leased','starting','running')",
+            (shell_id,),
+        ).fetchone()
+        return row is not None and int(row[0]) > 0
+    except db_driver.OperationalError as exc:
+        # An older, not-yet-migrated fork has no conversation tables. Its
+        # existing CLI launch path must remain usable. Other DB failures must
+        # stay fail-closed instead of silently permitting a second surface.
+        if "no such table: conversation_runs" in str(exc):
+            return False
+        raise
+    except (IndexError, KeyError, TypeError, ValueError):
+        # Mock/partial databases used by launcher tests do not assert a lease.
+        return False
+
+
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
 def authenticate(con, interactive: bool = True):
@@ -1504,6 +1525,13 @@ def main() -> None:
             if not headless and sys.stdin.isatty() else None)
     chosen = pick_shell(list_shells(con, user["user_id"]), requested, first,
                         fdefaults, snap)
+    if browser_conversation_active(con, chosen["shell_id"]):
+        con.close()
+        sys.exit(
+            f"shell '{chosen['shortname']}' has an active browser turn — "
+            "wait for it to finish or interrupt it in Interface before "
+            "starting a CLI session"
+        )
     slot_context = None
     if slot is not None:
         try:

@@ -452,24 +452,23 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         model = defaults["models"].get(harness)
     model = _nonblank(model, "model", maximum=255, optional=True)
     effort = _nonblank(body.get("effort"), "effort", maximum=64, optional=True)
+    adapter = run_mod.load_adapter(harness)
+    if effort is None:
+        effort = run_mod.default_headless_effort(adapter)
+    try:
+        run_mod.validate_headless_request(adapter, model, effort)
+    except ValueError as exc:
+        con.rollback()
+        raise ApiError(422, "HARNESS_ROUTE_INVALID", str(exc)) from exc
     title = _nonblank(body.get("title"), "title", maximum=200, optional=True)
     worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
-    try:
-        worktree = worktree.resolve(strict=True)
-    except OSError as exc:
+    worktree = worktree.resolve(strict=False)
+    if worktree.exists() and not worktree.is_dir():
         con.rollback()
         raise ApiError(
             422,
             "HARNESS_WORKTREE_MISSING",
-            "the shell worktree must be booted before starting a conversation",
-            {"shell_id": shell_id},
-        ) from exc
-    if not worktree.is_dir():
-        con.rollback()
-        raise ApiError(
-            422,
-            "HARNESS_WORKTREE_MISSING",
-            "the shell worktree is not a directory",
+            "the shell worktree path exists but is not a directory",
             {"shell_id": shell_id},
         )
 

@@ -451,6 +451,25 @@ class BrokerStore:
         finally:
             con.close()
 
+    def bind_archive(self, run_id: int, owner: str, archive_id: int) -> None:
+        """Attach the canonical shell session archive before native dispatch."""
+        con = self.connect()
+        try:
+            changed = con.execute(
+                "UPDATE conversation_runs SET archive_id=? "
+                "WHERE run_id=? AND lease_owner=? AND state='leased' "
+                "AND archive_id IS NULL",
+                (archive_id, run_id, owner),
+            ).rowcount
+            if changed != 1:
+                raise BrokerError(
+                    "CONVERSATION_RUN_LEASE_LOST",
+                    f"run {run_id} is not an unbound lease owned by this broker",
+                )
+            con.commit()
+        finally:
+            con.close()
+
     def mark_native_started(
         self,
         run_id: int,
@@ -802,6 +821,9 @@ class ConversationBroker(threading.Thread):
         *,
         store: BrokerStore | None = None,
         adapter_factory: Callable[[str], ConversationAdapter] = adapter_for,
+        launch_preparer: (
+            Callable[[BrokerRun], tuple[ConversationContext, int]] | None
+        ) = None,
         owner: str | None = None,
         max_workers: int = DEFAULT_MAX_WORKERS,
         heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
@@ -811,6 +833,7 @@ class ConversationBroker(threading.Thread):
         super().__init__(name="conversation-broker", daemon=True)
         self.store = store or BrokerStore(db_path)
         self.adapter_factory = adapter_factory
+        self.launch_preparer = launch_preparer
         self.owner = owner or (
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
         )
@@ -1055,6 +1078,13 @@ class ConversationBroker(threading.Thread):
             if run.state == "leased":
                 try:
                     # Validate failures here are proven pre-dispatch.
+                    if self.launch_preparer is not None:
+                        context, archive_id = self.launch_preparer(run)
+                        self.store.bind_archive(
+                            run.run_id,
+                            self.owner,
+                            archive_id,
+                        )
                     context.checked_worktree()
                     adapter = self.adapter_factory(run.harness)
                     active.adapter = adapter
