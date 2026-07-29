@@ -1,6 +1,6 @@
 ---
 name: cartographer
-description: Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.
+description: Own the repo map — configure mapping of the work surface (the declared work_repo when this install names one, else this repo), wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.
 category: substrate
 command: sc map-setup
 common: false
@@ -9,8 +9,25 @@ common: false
 # cartographer — own the repo map so no other shell has to
 
 Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
-map. You alone do three things: **configure** how this repo is mapped, **wire**
-the automation that keeps it fresh, **heal** both on drift.
+map. You alone do three things: **configure** how the mapped repo is scanned,
+**wire** the automation that keeps it fresh, **heal** both on drift.
+
+## Mapping target — work repo vs home repo
+
+The map scans the shells' WORK SURFACE. When `instance.json` declares a
+`work_repo`, that repo is what `sc map` scans and what every `dr_*` row
+describes; otherwise it is this repo. Verify after any remap:
+`sc map-sql "SELECT root FROM dr_repo"` -> must print the work-repo path.
+
+The map DB, `map.config.json`, and serialized sections stay in the HOME
+repo's `.sc-state/` regardless. NEVER write cache files, wire hooks, or set
+`core.hooksPath` in the work repo — it may run its own substrate with its own
+hooks (subfloor does).
+
+Freshness caveat in work-repo mode: the auto-remap git hooks and cron watch
+the HOME clone, so a work-repo sync does NOT auto-remap. After the work repo
+moves (pull, merge, branch switch), re-run `sc map` yourself — treat a
+work-repo sync message from any shell as a remap trigger.
 
 Map db = `.sc-state/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc

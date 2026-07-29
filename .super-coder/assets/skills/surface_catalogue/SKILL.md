@@ -1,14 +1,17 @@
 ---
 name: surface_catalogue
-description: Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.
+description: Read the mapped work surface via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree — it covers the declared work repo when this install names one, else the host repo. Query first, lazy-load the few files it points at. Use to orient fast.
 category: substrate
 common: true
 ---
 
 # surface_catalogue — read the repo from the map, not by grepping
 
-super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
-— query them first to orient, not the tree. They live in the **map db**,
+The `dr_*` tables = a scan of your WORK SURFACE — the declared work repo when
+this install names one (boot doc PROJECT vs ENGINE; confirm with
+`sc map-sql "SELECT root FROM dr_repo"`), else the host repo super-coder lives
+in. Query them first to orient, not the tree. Paths in `dr_filepath` are
+relative to that mapped root — open them from there, not from your cwd. They live in the **map db**,
 `.sc-state/map.db` — a separate file from your memory db
 (`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
 

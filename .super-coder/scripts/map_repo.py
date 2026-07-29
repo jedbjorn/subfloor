@@ -33,6 +33,22 @@ import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for scri
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
+
+
+def _resolve_map_root() -> Path:
+    """The tree the map SCANS. Normally the home repo; when instance.json
+    declares a work_repo (this install's shells maintain a different repo),
+    the map covers THAT tree — the shells' 'query the map before grepping'
+    doctrine must point where they actually work. The map DB, config, and
+    serialized sections stay in the HOME repo's .sc-state/ regardless: the
+    work repo is not ours to drop cache files into (it may carry its own
+    substrate with its own .sc-state)."""
+    import install
+    wr = install.work_repo()
+    return Path(wr) if wr and Path(wr).is_dir() else REPO_ROOT
+
+
+MAP_ROOT = _resolve_map_root()
 # Per-fork map tuning, authored by the cartographer (see the `cartographer`
 # skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
 # so a wholesale engine refresh never touches it. Absent → built-in defaults
@@ -126,19 +142,24 @@ def count_lines(p: Path) -> int | None:
 
 
 def git(*args: str) -> str | None:
-    r = subprocess.run(["git", "-C", str(REPO_ROOT), *args],
+    r = subprocess.run(["git", "-C", str(MAP_ROOT), *args],
                        capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
 def is_source_repo() -> bool:
-    """In a fork, .super-coder is infrastructure (skip it). In the SOURCE repo
-    the engine IS the project, so map it too. Names canonical in
-    install.SOURCE_REPO_NAMES (super-coder → subfloor rename: both valid).
-    Delegates to install.is_source_repo() — one detection (origin basename OR
-    tracked engine, so a remote-less source repo still reads as source)."""
+    """Answers for the MAPPED repo: is its engine the project (map .super-coder
+    too) or infrastructure (skip it)? Home-mapped -> delegate to
+    install.is_source_repo() (one detection: origin basename OR tracked
+    engine). Work-repo-mapped -> decide by the same ground truth applied to
+    that tree: a tracked engine source file means the engine IS its project."""
     import install
-    return install.is_source_repo()
+    if MAP_ROOT == REPO_ROOT:
+        return install.is_source_repo()
+    r = subprocess.run(
+        ["git", "-C", str(MAP_ROOT), "ls-files", "--", ".super-coder/schema.sql"],
+        capture_output=True, text=True)
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 
 # ── Dependency parsers (best-effort; each guarded) ───────────────────────────
@@ -298,8 +319,8 @@ def main() -> int:
 
         files = deps = envs = 0
         truncated = False
-        for p in sorted(REPO_ROOT.rglob("*")):
-            rel_parts = p.relative_to(REPO_ROOT).parts
+        for p in sorted(MAP_ROOT.rglob("*")):
+            rel_parts = p.relative_to(MAP_ROOT).parts
             if any(part in skip for part in rel_parts):
                 continue
             if not p.is_file() or p.name in skip_files:
@@ -350,14 +371,14 @@ def main() -> int:
         con.execute(
             "INSERT INTO dr_repo (repo_id, name, root, remote, vcs, default_branch, "
             "file_count, mapped_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
-            (REPO_ROOT.name, str(REPO_ROOT), git("remote", "get-url", "origin"),
-             "git" if (REPO_ROOT / ".git").exists() else None,
+            (MAP_ROOT.name, str(MAP_ROOT), git("remote", "get-url", "origin"),
+             "git" if (MAP_ROOT / ".git").exists() else None,
              git("rev-parse", "--abbrev-ref", "HEAD"), files,
              datetime.now().isoformat(timespec="seconds")))
         con.commit()
         # Fork-owned semantic extractors (endpoints / db schema / routes), if any.
-        ext_summaries = run_extractors(con, REPO_ROOT, cfg)
-        msg = f"map_repo: {files} files, {deps} deps, {envs} env vars → dr_* ({REPO_ROOT.name})"
+        ext_summaries = run_extractors(con, MAP_ROOT, cfg)
+        msg = f"map_repo: {files} files, {deps} deps, {envs} env vars → dr_* ({MAP_ROOT.name})"
         if truncated:
             msg += f"  ⚠ stopped at MAX_FILES={MAX_FILES}"
         print(msg)

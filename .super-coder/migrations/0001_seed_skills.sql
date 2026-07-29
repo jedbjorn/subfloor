@@ -563,15 +563,32 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'cartographer',
-  'Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
+  'Own the repo map — configure mapping of the work surface (the declared work_repo when this install names one, else this repo), wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
   'substrate',
   'sc map-setup',
   0,
   '# cartographer — own the repo map so no other shell has to
 
 Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
-map. You alone do three things: **configure** how this repo is mapped, **wire**
-the automation that keeps it fresh, **heal** both on drift.
+map. You alone do three things: **configure** how the mapped repo is scanned,
+**wire** the automation that keeps it fresh, **heal** both on drift.
+
+## Mapping target — work repo vs home repo
+
+The map scans the shells'' WORK SURFACE. When `instance.json` declares a
+`work_repo`, that repo is what `sc map` scans and what every `dr_*` row
+describes; otherwise it is this repo. Verify after any remap:
+`sc map-sql "SELECT root FROM dr_repo"` -> must print the work-repo path.
+
+The map DB, `map.config.json`, and serialized sections stay in the HOME
+repo''s `.sc-state/` regardless. NEVER write cache files, wire hooks, or set
+`core.hooksPath` in the work repo — it may run its own substrate with its own
+hooks (subfloor does).
+
+Freshness caveat in work-repo mode: the auto-remap git hooks and cron watch
+the HOME clone, so a work-repo sync does NOT auto-remap. After the work repo
+moves (pull, merge, branch switch), re-run `sc map` yourself — treat a
+work-repo sync message from any shell as a remap trigger.
 
 Map db = `.sc-state/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
@@ -4062,14 +4079,17 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'surface_catalogue',
-  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.',
+  'Read the mapped work surface via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree — it covers the declared work repo when this install names one, else the host repo. Query first, lazy-load the few files it points at. Use to orient fast.',
   'substrate',
   NULL,
   1,
   '# surface_catalogue — read the repo from the map, not by grepping
 
-super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
-— query them first to orient, not the tree. They live in the **map db**,
+The `dr_*` tables = a scan of your WORK SURFACE — the declared work repo when
+this install names one (boot doc PROJECT vs ENGINE; confirm with
+`sc map-sql "SELECT root FROM dr_repo"`), else the host repo super-coder lives
+in. Query them first to orient, not the tree. Paths in `dr_filepath` are
+relative to that mapped root — open them from there, not from your cwd. They live in the **map db**,
 `.sc-state/map.db` — a separate file from your memory db
 (`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
 

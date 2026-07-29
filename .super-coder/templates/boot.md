@@ -75,8 +75,9 @@ any per-shell prompt loads, before any query runs.
 ## ORIENTATION
 
 Find things by querying the repo map — not by reading or grepping the tree. The
-`dr_*` tables are a scan of this repo, kept fresh for you (a cartographer shell
-owns and heals them; you read, you don't map). They live in `.sc-state/map.db`
+`dr_*` tables are a scan of your work surface — the declared work repo when
+this install names one (see PROJECT vs ENGINE), else this repo — kept fresh
+for you (a cartographer shell owns and heals them; you read, you don't map). They live in `.sc-state/map.db`
 (SQLite) — your **repo map**, a *separate database* from your memory
 (`.super-coder/shell_db.db`). Query the map db for `dr_*`; never look for `dr_*`
 in the memory db:
@@ -110,9 +111,9 @@ cartographer has wired an extractor for this stack — live in the
 `surface_catalogue` skill. Before writing SQL against your memory DB, check the
 `db_map` skill — don't read `schema.sql` raw.
 
-`dr_*` is the engine DB's read-only **map of your repo** — it indexes the
-product's files, including the schema + migrations that define the app's own
-database. It describes that schema; it is **not** the app DB itself (see
+`dr_*` is the engine DB's read-only **map of your work surface** — it indexes
+the mapped repo's files, including the schema + migrations that define the
+app's own database. It describes that schema; it is **not** the app DB itself (see
 DATABASES). Querying `dr_*` is how you *find* the app DB, never how you change it.
 
 {{map_discrepancy}}

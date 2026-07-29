@@ -78,9 +78,13 @@ class SourceRepoGuardTest(unittest.TestCase):
             install._engine_tracked = orig_tracked
 
     def test_map_repo_accepts_source_names(self):
-        # map_repo.is_source_repo delegates to install's — one detection.
+        # Home-mapped mode delegates to install's detection — one detection.
+        # Pin MAP_ROOT to the home repo: in work-repo mode is_source_repo asks
+        # the MAPPED tree (tracked engine) and ignores origin entirely.
         orig, orig_tracked = install.origin_basename, install._engine_tracked
+        orig_root = map_repo.MAP_ROOT
         install._engine_tracked = lambda: False
+        map_repo.MAP_ROOT = map_repo.REPO_ROOT
         try:
             for base, want in [("subfloor", True), ("super-coder", True),
                                ("subfloor-cli", True), ("sc-cachy", True),
@@ -90,6 +94,19 @@ class SourceRepoGuardTest(unittest.TestCase):
         finally:
             install.origin_basename = orig
             install._engine_tracked = orig_tracked
+            map_repo.MAP_ROOT = orig_root
+
+    def test_map_repo_workrepo_mode_asks_the_mapped_tree(self):
+        # Work-repo mode: the mapped tree's tracked engine decides; origin
+        # spoofing must have no effect. A non-repo dir -> not source.
+        orig, orig_root = install.origin_basename, map_repo.MAP_ROOT
+        install.origin_basename = lambda: "sc-cachy"   # would say source
+        map_repo.MAP_ROOT = Path("/nonexistent-mapped-repo")
+        try:
+            self.assertFalse(map_repo.is_source_repo())
+        finally:
+            install.origin_basename = orig
+            map_repo.MAP_ROOT = orig_root
 
     def test_update_remote_matcher_accepts_renamed_url(self):
         orig = update.git
