@@ -19,6 +19,10 @@ Contract:
       async callable taking full ownership of an upgraded connection.
       `head_raw` is the verbatim request head (ending CRLFCRLF) plus any
       already-read leftover bytes, ready to feed a sans-io protocol.
+  stream_handler(method, path, headers_raw, writer) -> bool
+      optional async callable checked before buffered HTTP dispatch. Returning
+      true takes ownership of the response connection (used by replay/live
+      conversation SSE); false continues through `http_handler`.
 
 Limits: 64 KiB request head, 8 MiB body. Every HTTP response is
 `Connection: close` (the multiplex reads exactly one request per connection;
@@ -65,11 +69,12 @@ async def _read_head(reader: asyncio.StreamReader):
 
 class Transport:
     def __init__(self, host: str, port: int, http_handler, ws_handler,
-                 log=print):
+                 log=print, stream_handler=None):
         self.host = host
         self.port = port
         self.http_handler = http_handler
         self.ws_handler = ws_handler
+        self.stream_handler = stream_handler
         self._log = log
         self._tcp: asyncio.AbstractServer | None = None
 
@@ -98,8 +103,18 @@ class Transport:
             if "upgrade" in headers.get("connection", "").lower():
                 await self.ws_handler(reader, writer, raw)
             else:
-                await self._handle_http(reader, writer, request_line,
-                                        headers, headers_raw, raw)
+                parts = (request_line.split(" ", 2) + ["", ""])[:3]
+                method, path = parts[0].upper(), parts[1]
+                streamed = (
+                    await self.stream_handler(
+                        method, path, headers_raw, writer
+                    )
+                    if self.stream_handler is not None
+                    else False
+                )
+                if not streamed:
+                    await self._handle_http(reader, writer, request_line,
+                                            headers, headers_raw, raw)
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception as exc:  # noqa: BLE001 — one bad connection must not kill the server
@@ -114,10 +129,34 @@ class Transport:
                            raw: bytes) -> None:
         parts = (request_line.split(" ", 2) + ["", ""])[:3]
         method, path = parts[0].upper(), parts[1]
-        length = int(headers.get("content-length") or 0)
+        try:
+            length = int(headers.get("content-length") or 0)
+        except ValueError:
+            await self._respond(
+                writer,
+                400,
+                [("Content-Type", "application/json")],
+                b'{"error":{"code":"BAD_CONTENT_LENGTH",'
+                b'"message":"Content-Length must be an integer","details":{}}}',
+            )
+            return
+        if length < 0:
+            await self._respond(
+                writer,
+                400,
+                [("Content-Type", "application/json")],
+                b'{"error":{"code":"BAD_CONTENT_LENGTH",'
+                b'"message":"Content-Length cannot be negative","details":{}}}',
+            )
+            return
         if length > MAX_BODY:
-            await self._respond(writer, 413, [],
-                                b'{"error":"request body too large"}')
+            await self._respond(
+                writer,
+                413,
+                [("Content-Type", "application/json")],
+                b'{"error":{"code":"REQUEST_BODY_TOO_LARGE",'
+                b'"message":"request body exceeds 8 MiB","details":{}}}',
+            )
             return
         head_len = raw.find(b"\r\n\r\n") + 4
         body = raw[head_len:head_len + length]
@@ -132,7 +171,12 @@ class Transport:
                 None, self.http_handler, method, path, headers_raw, body)
         except Exception as exc:  # noqa: BLE001 — defense in depth; handlers catch their own
             self._log(f"transport: handler error {method} {path}: {exc!r}")
-            status, resp_headers, resp_body = 500, [], b'{"error":"internal"}'
+            status = 500
+            resp_headers = [("Content-Type", "application/json")]
+            resp_body = (
+                b'{"error":{"code":"INTERNAL_ERROR",'
+                b'"message":"request handler failed","details":{}}}'
+            )
         await self._respond(writer, status, resp_headers, resp_body)
 
     async def _respond(self, writer, status: int,
@@ -158,7 +202,7 @@ class Transport:
 
 
 async def serve(host: str, port: int, http_handler, ws_handler,
-                log=print, on_started=None) -> int:
+                log=print, on_started=None, stream_handler=None) -> int:
     """Start the multiplex and block forever (until cancelled). Returns the
     bound port after start for callers that passed port=0 — via `log` line and
     the Transport object; this coroutine simply runs until shutdown.
@@ -167,7 +211,14 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     that can cause external side effects belong behind that boundary: a second
     process must lose the bind race before it can dispatch work.
     """
-    transport = Transport(host, port, http_handler, ws_handler, log=log)
+    transport = Transport(
+        host,
+        port,
+        http_handler,
+        ws_handler,
+        log=log,
+        stream_handler=stream_handler,
+    )
     await transport.start()
     try:
         log(f"transport: listening on {host}:{transport.port}")

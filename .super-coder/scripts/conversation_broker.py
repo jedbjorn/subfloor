@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import conversation_events
 import db_driver
 from conversation_adapters import (
     ConversationAdapter,
@@ -572,12 +573,14 @@ class BrokerStore:
                 (now, row["conversation_id"]),
             )
             con.commit()
-            return sequence
+            conversation_id = row["conversation_id"]
         except Exception:
             self._rollback(con)
             raise
         finally:
             con.close()
+        conversation_events.notify(conversation_id)
+        return sequence
 
     def finish_run(
         self,
@@ -678,12 +681,14 @@ class BrokerStore:
                 run_id=run_id,
             )
             con.commit()
-            return True
+            conversation_id = row["conversation_id"]
         except Exception:
             self._rollback(con)
             raise
         finally:
             con.close()
+        conversation_events.notify(conversation_id)
+        return True
 
     def renew_runs(self, owner: str, run_ids: list[int]) -> int:
         if not run_ids:
@@ -762,12 +767,16 @@ class BrokerStore:
                     (now, row["conversation_id"]),
                 )
             con.commit()
-            return exists is None
+            conversation_id = row["conversation_id"]
+            created = exists is None
         except Exception:
             self._rollback(con)
             raise
         finally:
             con.close()
+        if created:
+            conversation_events.notify(conversation_id)
+        return created
 
     def heartbeat_service(self, interval_seconds: int) -> None:
         con = self.connect()
