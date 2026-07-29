@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
@@ -32,10 +31,17 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
     )
 
 
-def test_start_chat_exposes_shell_harness_and_model_without_terminal_controls():
+def test_start_chat_has_default_and_configured_paths_without_terminal_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert 'const CHAT_HARNESSES = ["opencode", "claude", "codex"]' in interface
+    assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
+    assert 'textContent: "＋ New chat"' in interface
+    assert 'textContent: "Configure"' in interface
+    assert "const conversation = await chatCreateConversation(shell);" in interface
+    assert "{ shell_id: shell.shell_id, ...fields }" in interface
+    assert "chatRouteConversation === CHAT_CONFIGURE_ROUTE" in interface
+    assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
     assert "Use shell default" in interface
     assert "Use harness default" in interface
     assert 'harness !== "opencode" || connectedDefault' in interface
@@ -43,7 +49,6 @@ def test_start_chat_exposes_shell_harness_and_model_without_terminal_controls():
     assert "providers connected in OpenCode" in interface
     assert "submit.disabled = !ready" in interface
     assert '"Start chat"' in interface
-    assert "shell_id: shell.shell_id" in interface
     assert "harness: harnessSelect.value" in interface
     assert "if (modelSelect.value) body.model = modelSelect.value" in interface
     assert "xterm" not in interface.lower()
@@ -64,6 +69,41 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "mdBlock(body)" in interface
 
 
+def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    activity = interface[
+        interface.index("function chatActivity"):
+        interface.index("function chatAssistantRuns")
+    ]
+    assert '"tool.started"' not in activity
+    assert '"tool.completed"' not in activity
+    assert '"permission.requested"' in activity
+    assert '"input.requested"' in activity
+    assert '"run.failed"' in activity
+    assert '"run.interrupted"' in activity
+    assert '"run.unknown"' in activity
+
+
+def test_transcript_follow_pauses_for_reading_and_offers_jump_to_latest():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert (
+        "transcript.scrollHeight - transcript.scrollTop "
+        "- transcript.clientHeight <= 32"
+    ) in interface
+    assert "const previousTop = transcript.scrollTop" in interface
+    assert (
+        "transcript.scrollTop = shouldFollow() "
+        "? transcript.scrollHeight : previousTop"
+    ) in interface
+    assert 'className: "chat-jump-latest"' in interface
+    assert 'ariaLabel: "Jump to latest message"' in interface
+    assert "transcript.onscroll = updateTranscriptFollow" in interface
+    assert "jumpToLatest.hidden = followTranscriptTail" in interface
+    assert "transcript.scrollTop = transcript.scrollHeight" in interface
+
+
 def test_composer_is_retry_safe_and_has_turn_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
@@ -72,9 +112,19 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'event.key === "Enter" && !event.shiftKey' in interface
     assert 'textContent: "Interrupt"' in interface
     assert 'textContent: "Retry"' in interface
-    assert 'textContent: "Rename"' in interface
     assert 'textContent: "Close"' in interface
     assert 'textContent: "Analytics"' in interface
+    assert 'textContent: "Stop"' in interface
+    stop_control = interface[
+        interface.index("const stop ="):
+        interface.index("const pending =", interface.index("const stop ="))
+    ]
+    assert "disabled: true" in stop_control
+    assert ".onclick" not in stop_control
+    assert 'className: "chat-title-button"' in interface
+    assert 'title: "Rename conversation"' in interface
+    assert 'textContent: "Rename"' not in interface
+    assert "actions.append(analytics, interrupt, close)" in interface
     assert "chatCloseForSwitch(selectedConversation)" in interface
     assert "Finish or interrupt the current turn before switching chats." in interface
     assert 'item.state !== "closed"' in interface
@@ -83,6 +133,19 @@ def test_composer_is_retry_safe_and_has_turn_controls():
         interface.index("rail.append(button);", interface.index("chat-shell-name"))
     ]
     assert "chatCloseForSwitch" not in shell_switch
+
+
+def test_conversation_identity_uses_shell_context_and_neutral_user_label():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert 'kind === "user" ? "You"' in interface
+    assert "chatShellLabel(conversation)" in interface
+    assert "chatHeaderLabel(conversation)" in interface
+    assert "chatStartedLabel(conversation)" in interface
+    assert '"Untitled chat"' in interface
+    assert 'className: "chat-history-context"' in interface
+    assert 'className: "chat-shell-shortname"' in interface
+    assert '(active ? " active-chat" : "")' in interface
 
 
 def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
@@ -94,6 +157,13 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-bubble.chat-user",
         ".chat-bubble.chat-assistant",
         ".chat-composer",
+        ".chat-jump-latest",
+        ".chat-jump-latest[hidden]",
+        ".chat-compose-actions .chat-stop:disabled",
+        ".chat-title-button",
+        ".chat-shell.active-chat::before",
     ):
         assert selector in STYLE
-    assert "grid-template-columns: 180px 260px minmax(0, 1fr)" in STYLE
+    assert "grid-template-columns: 198px 260px minmax(0, 1fr)" in STYLE
+    assert "grid-template-columns: 145px 210px minmax(0, 1fr)" in STYLE
+    assert "grid-template-columns: 101px minmax(0, 1fr)" in STYLE

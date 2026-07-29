@@ -254,8 +254,7 @@ async function openSkillContentModal(skill) {
   } catch (e) { toast("error: " + e.message); }
 }
 
-// New-shell form in a 600×300 modal — Create bottom-left, Cancel bottom-right,
-// same dialog pattern as the new-flag modal.
+// New-shell form in a 600×300 modal — Cancel bottom-left, Create bottom-right.
 function openNewShellModal(templates, root) {
   const fl = el("select", {});
   for (const t of templates)
@@ -271,7 +270,7 @@ function openNewShellModal(templates, root) {
     el("span", { className: "k" }, "shell type"), fl,
     el("span", { className: "k" }, "name"), nm);
   const close = openModal({ title: "New shell", bodyNode: form,
-    footNodes: [create, cancel], width: 600, height: 300 });
+    footNodes: [cancel, create], width: 600, height: 300 });
   create.onclick = async () => {
     if (!nm.value.trim()) return toast("name required");
     create.disabled = true; create.textContent = "Creating…";
@@ -3024,6 +3023,7 @@ async function renderSprints(root) {
 // terminal, tmux controls, or live hand-off between browser and CLI.
 const CHAT_HARNESSES = ["opencode", "claude", "codex"];
 const CHAT_FLAVOR_ORDER = ["cartographer", "admin", "planner", "dev", "reviewer", "devops"];
+const CHAT_CONFIGURE_ROUTE = "configure";
 let chatRouteShell = "";
 let chatRouteConversation = "";
 let chatSource = null;
@@ -3040,10 +3040,35 @@ function chatHash(shortname, conversationId = "") {
     + (conversationId ? `/${encodeURIComponent(conversationId)}` : "");
 }
 
-function chatRouteLabel(conversation) {
-  const route = conversation.route || {};
-  return [route.harness, route.model || "harness default", route.effort]
-    .filter(Boolean).join(" · ");
+function chatModelLabel(conversation) {
+  return conversation.route?.model || "harness default";
+}
+
+function chatStartedLabel(conversation) {
+  if (!conversation.created_at) return "Start time unavailable";
+  const raw = String(conversation.created_at);
+  const timestamp = /(?:Z|[+-]\d\d:\d\d)$/.test(raw) ? raw : `${raw}Z`;
+  const started = new Date(timestamp);
+  if (Number.isNaN(started.getTime())) return raw;
+  return new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(started);
+}
+
+function chatShellLabel(conversation) {
+  const shell = conversation?.shell || {};
+  return [shell.display_name, shell.shortname].filter(Boolean).join(" | ") || "Shell";
+}
+
+function chatHeaderLabel(conversation) {
+  return [
+    conversation.shell?.shortname,
+    chatModelLabel(conversation),
+    conversation.route?.harness,
+  ].filter(Boolean).join(" | ");
 }
 
 function chatStatePill(state) {
@@ -3055,9 +3080,7 @@ function chatStatePill(state) {
 }
 
 function chatConversationName(conversation) {
-  return conversation.title
-    || `Chat · ${conversation.route?.harness || "harness"} · `
-      + new Date(`${conversation.created_at}Z`).toLocaleString();
+  return conversation.title || "Untitled chat";
 }
 
 async function chatCloseForSwitch(conversation) {
@@ -3081,28 +3104,13 @@ async function chatCloseForSwitch(conversation) {
 }
 
 function chatActivity(events) {
-  const rows = [];
-  const tools = new Map();
-  for (const event of events) {
-    if (event.event_type === "tool.started") {
-      const row = { ...event, done: false };
-      tools.set(`${event.run_id}:${event.payload?.tool_call_id || rows.length}`, row);
-      rows.push(row);
-    } else if (event.event_type === "tool.completed") {
-      const key = `${event.run_id}:${event.payload?.tool_call_id || rows.length}`;
-      const prior = tools.get(key);
-      if (prior) {
-        prior.done = true;
-        prior.payload = { ...prior.payload, ...event.payload };
-      } else {
-        rows.push({ ...event, done: true });
-      }
-    } else if (["permission.requested", "input.requested", "run.failed",
-                "run.interrupted", "run.unknown"].includes(event.event_type)) {
-      rows.push(event);
-    }
-  }
-  return rows;
+  return events.filter((event) => [
+    "permission.requested",
+    "input.requested",
+    "run.failed",
+    "run.interrupted",
+    "run.unknown",
+  ].includes(event.event_type));
 }
 
 function chatAssistantRuns(events) {
@@ -3128,10 +3136,12 @@ function chatAssistantRuns(events) {
   return runs;
 }
 
-function chatBubble(kind, body, meta = "") {
+function chatBubble(kind, body, meta = "", conversation = null) {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
   bubble.append(el("div", { className: "chat-who" },
-    kind === "user" ? "FnB" : kind === "assistant" ? "Shell" : "Activity"));
+    kind === "user" ? "You"
+      : kind === "assistant" ? chatShellLabel(conversation)
+      : "Activity"));
   bubble.append(kind === "activity"
     ? el("div", { className: "chat-activity-text" }, body)
     : mdBlock(body));
@@ -3139,17 +3149,21 @@ function chatBubble(kind, body, meta = "") {
   return bubble;
 }
 
-function chatPaintTranscript(host, messages, events, conversation, retry) {
-  const transcript = el("div", { className: "chat-transcript" });
+function chatTranscriptAtBottom(transcript) {
+  return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight <= 32;
+}
+
+function chatPaintTranscript(
+  transcript, messages, events, conversation, retry, shouldFollow, onPosition,
+) {
+  const previousTop = transcript.scrollTop;
   const assistants = chatAssistantRuns(events);
   const activities = chatActivity(events);
   const items = [];
   const addActivity = (activity) => {
     const payload = activity.payload || {};
     const type = activity.event_type;
-    const label = type.startsWith("tool.")
-      ? `${activity.done ? "✓" : "…" } ${payload.title || payload.name || "tool"}`
-      : type === "permission.requested" ? "Waiting for permission"
+    const label = type === "permission.requested" ? "Waiting for permission"
       : type === "input.requested" ? "Waiting for input"
       : type === "run.interrupted" ? "Turn interrupted"
       : type === "run.unknown" ? "Turn outcome could not be proven"
@@ -3167,7 +3181,10 @@ function chatPaintTranscript(host, messages, events, conversation, retry) {
       text: message.body,
     });
     for (const run of assistants.filter((item) => item.message_id === message.message_id))
-      items.push({ node: chatBubble("assistant", run.text), failed: false });
+      items.push({
+        node: chatBubble("assistant", run.text, "", conversation),
+        failed: false,
+      });
     for (const activity of activities.filter(
       (item) => item.message_id === message.message_id))
       addActivity(activity);
@@ -3175,7 +3192,10 @@ function chatPaintTranscript(host, messages, events, conversation, retry) {
   // Conversation-scoped events are uncommon, but keeping them visible is
   // better than dropping a recovery/error signal whose message link is absent.
   for (const run of assistants.filter((item) => item.message_id == null))
-    items.push({ node: chatBubble("assistant", run.text), failed: false });
+    items.push({
+      node: chatBubble("assistant", run.text, "", conversation),
+      failed: false,
+    });
   for (const activity of activities) {
     if (activity.message_id == null) addActivity(activity);
   }
@@ -3189,14 +3209,19 @@ function chatPaintTranscript(host, messages, events, conversation, retry) {
       button.onclick = () => retry(item.text);
       item.node.append(button);
     }
-    transcript.append(item.node);
   }
   if (!items.length) {
-    transcript.append(el("div", { className: "chat-empty" },
-      `Start a conversation with ${conversation.shell.display_name}.`));
+    items.push({
+      node: el("div", { className: "chat-empty" },
+        `Start a conversation with ${conversation.shell.display_name}.`),
+      failed: false,
+    });
   }
-  host.replaceChildren(transcript);
-  requestAnimationFrame(() => { transcript.scrollTop = transcript.scrollHeight; });
+  transcript.replaceChildren(...items.map((item) => item.node));
+  requestAnimationFrame(() => {
+    transcript.scrollTop = shouldFollow() ? transcript.scrollHeight : previousTop;
+    onPosition();
+  });
 }
 
 async function chatRefreshConversation(conversationId, generation, onUpdate) {
@@ -3256,6 +3281,15 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
   return harness !== "opencode" || available.length > 0;
 }
 
+function chatCreateConversation(shell, fields = {}) {
+  return chatApi(
+    "/conversations",
+    "POST",
+    { shell_id: shell.shell_id, ...fields },
+    requestKey(),
+  );
+}
+
 async function chatRenderNew(host, shell, defaults, catalog) {
   const rows = defaults.flavors?.[shell.flavor] || [];
   const byHarness = Object.fromEntries(rows.map((row) => [row.harness, row]));
@@ -3312,14 +3346,12 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     submit.disabled = true;
     submit.textContent = "Starting…";
     const body = {
-      shell_id: shell.shell_id,
       harness: harnessSelect.value,
       title: title.value.trim() || null,
     };
     if (modelSelect.value) body.model = modelSelect.value;
     try {
-      const conversation = await chatApi(
-        "/conversations", "POST", body, requestKey());
+      const conversation = await chatCreateConversation(shell, body);
       location.hash = chatHash(shell.shortname, conversation.conversation_id);
     } catch (error) {
       toast(`${error.code}: ${error.message}`);
@@ -3344,41 +3376,49 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const streamState = el("span", { className: "chat-stream-state" }, "connecting");
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
+  const transcript = el("div", { className: "chat-transcript" });
+  const jumpToLatest = el("button", {
+    className: "chat-jump-latest",
+    type: "button",
+    title: "Jump to latest",
+    ariaLabel: "Jump to latest message",
+    textContent: "↓",
+    hidden: true,
+  });
+  transcriptHost.append(transcript, jumpToLatest);
+  let followTranscriptTail = true;
+  const updateTranscriptFollow = () => {
+    followTranscriptTail = chatTranscriptAtBottom(transcript);
+    jumpToLatest.hidden = followTranscriptTail;
+  };
+  transcript.onscroll = updateTranscriptFollow;
+  jumpToLatest.onclick = () => {
+    transcript.scrollTop = transcript.scrollHeight;
+    updateTranscriptFollow();
+  };
   const composer = el("textarea", {
     className: "chat-composer-input",
     placeholder: "Message this shell…",
     rows: 3,
   });
   const send = el("button", { className: "act primary", type: "button", textContent: "Send" });
+  const stop = el("button", {
+    className: "act danger chat-stop",
+    type: "button",
+    textContent: "Stop",
+    title: "Reserved for future stream control",
+    disabled: true,
+  });
   const pending = el("div", { className: "chat-pending", hidden: true });
   const composerRow = el("div", { className: "chat-composer" },
-    composer, el("div", { className: "chat-compose-actions" }, pending, send));
+    composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
 
   const retry = async (text) => {
     composer.value = text;
     composer.focus();
     await submit();
   };
-  const paint = () => {
-    title.replaceChildren(
-      el("h2", {}, chatConversationName(conversation)),
-      el("div", { className: "chat-route" }, chatRouteLabel(conversation)));
-    state.replaceChildren(chatStatePill(conversation.state), streamState);
-    const closed = conversation.state === "closed";
-    composer.disabled = closed;
-    send.disabled = closed;
-    interrupt.disabled = !["queued", "running", "waiting"].includes(conversation.state);
-    close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
-    composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
-    chatPaintTranscript(transcriptHost, messages, events, conversation, retry);
-  };
-  const refresh = () => chatRefreshConversation(
-    conversation.conversation_id,
-    generation,
-    (next) => { conversation = next; paint(); });
-
-  const rename = el("button", { className: "act", type: "button", textContent: "Rename" });
-  rename.onclick = async () => {
+  const renameConversation = async () => {
     const value = (prompt("Conversation title", conversation.title || "") || "").trim();
     if (!value) return;
     try {
@@ -3387,6 +3427,42 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
+  const paint = () => {
+    const rename = el("button", {
+      className: "chat-title-button",
+      type: "button",
+      title: "Rename conversation",
+      textContent: chatConversationName(conversation),
+    });
+    rename.onclick = renameConversation;
+    title.replaceChildren(
+      el("h2", {}, chatHeaderLabel(conversation)),
+      el("div", { className: "chat-conversation-line" },
+        el("span", {}, chatStartedLabel(conversation)),
+        el("span", { className: "chat-context-separator" }, " | "),
+        rename));
+    state.replaceChildren(chatStatePill(conversation.state), streamState);
+    const closed = conversation.state === "closed";
+    composer.disabled = closed;
+    send.disabled = closed;
+    interrupt.disabled = !["queued", "running", "waiting"].includes(conversation.state);
+    close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
+    composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
+    chatPaintTranscript(
+      transcript,
+      messages,
+      events,
+      conversation,
+      retry,
+      () => followTranscriptTail,
+      updateTranscriptFollow,
+    );
+  };
+  const refresh = () => chatRefreshConversation(
+    conversation.conversation_id,
+    generation,
+    (next) => { conversation = next; paint(); });
+
   const analytics = el("button", { className: "act", type: "button", textContent: "Analytics" });
   analytics.onclick = () => {
     anFilters.harness = conversation.route.harness || "";
@@ -3417,7 +3493,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
-  actions.append(rename, analytics, interrupt, close);
+  actions.append(analytics, interrupt, close);
   header.append(title, state, actions);
 
   async function submit() {
@@ -3521,9 +3597,12 @@ async function renderInterface(root) {
     || shells[0];
   const conversations = allConversations.items.filter(
     (item) => item.shell.shell_id === shell.shell_id);
-  let selectedId = chatRouteConversation
-    || conversations.find((item) => item.state !== "closed")?.conversation_id
-    || "";
+  const configuring = chatRouteConversation === CHAT_CONFIGURE_ROUTE;
+  let selectedId = configuring
+    ? ""
+    : chatRouteConversation
+      || conversations.find((item) => item.state !== "closed")?.conversation_id
+      || "";
   if (selectedId && !conversations.some((item) => item.conversation_id === selectedId))
     selectedId = "";
   const selectedConversation = allConversations.items.find(
@@ -3540,13 +3619,17 @@ async function renderInterface(root) {
   for (const flavor of orderedFlavors) {
     rail.append(el("div", { className: "chat-shell-group" }, flavor || "bespoke"));
     for (const item of shells.filter((candidate) => (candidate.flavor || "bespoke") === flavor)) {
-      const latest = allConversations.items.find(
-        (conversation) => conversation.shell.shell_id === item.shell_id);
+      const active = allConversations.items.find(
+        (conversation) => conversation.shell.shell_id === item.shell_id
+          && conversation.state !== "closed");
       const button = el("button", {
-        className: "chat-shell" + (item.shell_id === shell.shell_id ? " selected" : ""),
+        className: "chat-shell"
+          + (item.shell_id === shell.shell_id ? " selected" : "")
+          + (active ? " active-chat" : ""),
         type: "button",
-      }, el("span", { className: "chat-shell-name" }, item.display_name));
-      if (latest) button.append(chatStatePill(latest.state));
+      },
+      el("span", { className: "chat-shell-name" }, item.display_name),
+      el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
       button.onclick = () => {
         if (item.shell_id === shell.shell_id) return;
         location.hash = chatHash(item.shortname);
@@ -3557,14 +3640,38 @@ async function renderInterface(root) {
 
   const side = el("aside", { className: "chat-history" });
   const newChat = el("button", { className: "act primary", type: "button", textContent: "＋ New chat" });
+  const configure = el("button", {
+    className: "chat-configure",
+    type: "button",
+    textContent: "Configure",
+  });
   newChat.onclick = async () => {
-    if (await chatCloseForSwitch(selectedConversation))
-      location.hash = chatHash(shell.shortname);
+    if (!await chatCloseForSwitch(selectedConversation)) return;
+    newChat.disabled = true;
+    configure.disabled = true;
+    newChat.textContent = "Starting…";
+    try {
+      const conversation = await chatCreateConversation(shell);
+      location.hash = chatHash(shell.shortname, conversation.conversation_id);
+    } catch (error) {
+      toast(`${error.code}: ${error.message}`);
+      newChat.disabled = false;
+      configure.disabled = false;
+      newChat.textContent = "＋ New chat";
+    }
+  };
+  configure.onclick = async () => {
+    configure.disabled = true;
+    if (!await chatCloseForSwitch(selectedConversation)) {
+      configure.disabled = false;
+      return;
+    }
+    location.hash = chatHash(shell.shortname, CHAT_CONFIGURE_ROUTE);
   };
   side.append(el("div", { className: "chat-history-head" },
-    el("div", {}, el("b", {}, shell.display_name),
+    el("div", { className: "chat-history-shell" }, el("b", {}, shell.display_name),
       el("span", { className: "chat-shortname" }, ` /${shell.shortname}`)),
-    newChat));
+    el("div", { className: "chat-history-actions" }, newChat, configure)));
   const history = el("div", { className: "chat-history-list" });
   for (const conversation of conversations) {
     const button = el("button", {
@@ -3572,9 +3679,10 @@ async function renderInterface(root) {
         + (conversation.conversation_id === selectedId ? " selected" : ""),
       type: "button",
     });
-    button.append(el("span", { className: "chat-history-name" },
+    button.append(el("span", { className: "chat-history-context" },
+      `${chatStartedLabel(conversation)} | ${chatModelLabel(conversation)}`),
+      el("span", { className: "chat-history-name" },
       chatConversationName(conversation)),
-      el("span", { className: "chat-history-route" }, chatRouteLabel(conversation)),
       chatStatePill(conversation.state));
     button.onclick = async () => {
       if (conversation.conversation_id === selectedId) return;
@@ -3591,7 +3699,12 @@ async function renderInterface(root) {
   layout.append(rail, side, pane);
   root.replaceChildren(layout);
   if (!selectedId) {
-    await chatRenderNew(pane, shell, defaults, catalog);
+    if (configuring) {
+      await chatRenderNew(pane, shell, defaults, catalog);
+    } else {
+      pane.append(el("div", { className: "chat-empty chat-no-selection" },
+        "No chat selected."));
+    }
     return;
   }
   const [conversation, messagePage] = await Promise.all([
