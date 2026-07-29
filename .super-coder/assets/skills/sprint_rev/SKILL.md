@@ -35,9 +35,12 @@ Omit `--unit` for conformance.
 
 ## Unit review
 
-Pin the exact PR head and its checks. Trace correctness, authorization,
-empty/boundary/concurrent/partial-failure behavior, scope, and test strength.
-Mutate one high-value property, prove its test fails, restore, and prove green.
+Pin the exact PR head and its checks. For an explicit report-only unit, pin the
+integrated main head named by the developer and independently re-execute the
+claimed verification; a missing PR is expected only in that mode. Trace
+correctness, authorization, empty/boundary/concurrent/partial-failure behavior,
+scope, and test strength. Mutate one high-value property, prove its test fails,
+restore, and prove green.
 
 Emit all findings together:
 

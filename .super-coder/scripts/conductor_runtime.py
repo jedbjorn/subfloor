@@ -63,7 +63,7 @@ TRANSITIONS = (
     (
         "dev",
         "ready-for-review",
-        "record PR + move in_review; boot reviewer",
+        "record PR/report-only head + move in_review; boot reviewer",
         "reviewer slot starts at the exact head",
     ),
     (
@@ -87,8 +87,8 @@ TRANSITIONS = (
     (
         "reviewer",
         "review-clean",
-        "record review head; boot dev",
-        "developer receives approval for the exact head",
+        "record review head; boot dev or terminalize report-only unit",
+        "developer receives exact-head approval or report-only completion",
     ),
     (
         "reviewer",
@@ -668,11 +668,36 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
         unit = _unit(con, row)
         _assert_issuer_assignment(row, unit)
         if kind == "ready-for-review":
-            pr = _integer(payload, "pr_number")
-            head = _text(payload, "head")
-            branch = _text(payload, "branch")
-            if payload.get("checks") != "green":
-                raise DirectiveRefused("payload.checks must be 'green'")
+            report_only = payload.get("report_only") is True
+            if report_only:
+                if payload.get("pr_number") is not None:
+                    raise DirectiveRefused(
+                        "report-only ready-for-review requires null pr_number"
+                    )
+                if payload.get("branch") is not None:
+                    raise DirectiveRefused(
+                        "report-only ready-for-review requires null branch"
+                    )
+                if payload.get("checks") != "report-only":
+                    raise DirectiveRefused(
+                        "report-only ready-for-review requires "
+                        "payload.checks='report-only'"
+                    )
+                verification = payload.get("verification")
+                if not isinstance(verification, list) or not verification:
+                    raise DirectiveRefused(
+                        "report-only ready-for-review requires nonempty "
+                        "payload.verification"
+                    )
+                head = _text(payload, "head")
+                pr = None
+                branch = None
+            else:
+                pr = _integer(payload, "pr_number")
+                head = _text(payload, "head")
+                branch = _text(payload, "branch")
+                if payload.get("checks") != "green":
+                    raise DirectiveRefused("payload.checks must be 'green'")
             con.execute(
                 "UPDATE sprint_units SET pr_number=?,branch=?,"
                 "updated_at=datetime('now'),updated_by_shell_id=? "
@@ -754,7 +779,22 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     "SELECT shell_id,shortname,flavor FROM shells WHERE shell_id=?",
                     (unit["dev_shell_id"],),
                 ).fetchone()
-                _spawn(con, launches, dev, "dev", row, payload, unit=unit)
+                if unit["pr_number"] is None and unit["branch"] is None:
+                    _move(con, unit, "merged", actor_shell_id)
+                    _release_ready_units(
+                        con, launches, row, payload, actor_shell_id
+                    )
+                    _spawn(
+                        con,
+                        launches,
+                        dev,
+                        "dev",
+                        row,
+                        {**payload, "report_only": True},
+                        unit=unit,
+                    )
+                else:
+                    _spawn(con, launches, dev, "dev", row, payload, unit=unit)
         elif kind == "findings":
             findings = payload.get("findings")
             if not isinstance(findings, list) or not findings:

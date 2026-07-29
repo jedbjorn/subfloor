@@ -586,6 +586,110 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             "refused",
         )
 
+    def test_report_only_unit_is_reviewed_then_terminal_and_reported(self):
+        self.set_unit("working")
+        ready_id = self.emit(
+            "dev",
+            "ready-for-review",
+            {
+                "report_only": True,
+                "pr_number": None,
+                "head": "main-abc",
+                "branch": None,
+                "checks": "report-only",
+                "verification": ["re-executed documented command"],
+            },
+        )
+        self.con.commit()
+
+        ready = runtime.act(self.con, ready_id, 1, launcher=self.launcher)
+
+        self.assertEqual(ready["status"], "executed")
+        self.assertEqual(len(ready["launches"]), 1)
+        unit = self.con.execute(
+            "SELECT state,pr_number,branch FROM sprint_units WHERE unit_id=10"
+        ).fetchone()
+        self.assertEqual(tuple(unit), ("in_review", None, None))
+
+        clean_id = self.emit(
+            "reviewer",
+            "review-clean",
+            {"head": "main-abc", "findings": [], "mutation": "failed then passed"},
+        )
+        self.con.commit()
+
+        clean = runtime.act(self.con, clean_id, 1, launcher=self.launcher)
+
+        self.assertEqual(clean["status"], "executed")
+        self.assertEqual(len(clean["launches"]), 1)
+        self.assertIn('"report_only": true', clean["launches"][0][-1])
+        unit = self.con.execute(
+            "SELECT state,review_head FROM sprint_units WHERE unit_id=10"
+        ).fetchone()
+        self.assertEqual(tuple(unit), ("merged", "main-abc"))
+
+        report_id = self.emit(
+            "dev",
+            "unit-report",
+            {"shipped": "verified requested state already present"},
+        )
+        self.con.commit()
+        report = runtime.act(self.con, report_id, 1, launcher=self.launcher)
+        self.assertEqual(report["status"], "executed")
+        self.assertEqual(len(report["launches"]), 1)
+        self.assertIn("PLN1", report["launches"][0])
+
+    def test_report_only_requires_explicit_null_contract_and_evidence(self):
+        cases = (
+            {
+                "report_only": True,
+                "pr_number": 7,
+                "head": "abc",
+                "branch": None,
+                "checks": "report-only",
+                "verification": ["gate"],
+            },
+            {
+                "report_only": True,
+                "pr_number": None,
+                "head": "abc",
+                "branch": "feat/not-report-only",
+                "checks": "report-only",
+                "verification": ["gate"],
+            },
+            {
+                "report_only": True,
+                "pr_number": None,
+                "head": "abc",
+                "branch": None,
+                "checks": "green",
+                "verification": ["gate"],
+            },
+            {
+                "report_only": True,
+                "pr_number": None,
+                "head": "abc",
+                "branch": None,
+                "checks": "report-only",
+                "verification": [],
+            },
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.set_unit("working")
+                directive_id = self.emit("dev", "ready-for-review", payload)
+                self.con.commit()
+                result = runtime.act(
+                    self.con, directive_id, 1, launcher=self.launcher
+                )
+                self.assertEqual(result["status"], "refused")
+                self.assertEqual(
+                    self.con.execute(
+                        "SELECT state FROM sprint_units WHERE unit_id=10"
+                    ).fetchone()[0],
+                    "working",
+                )
+
     def test_retask_returns_reviewed_unit_to_working_and_clears_review_head(self):
         self.set_unit("working")
         self.set_unit("in_review", review_head="approved-old-head")
