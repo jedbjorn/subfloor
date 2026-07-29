@@ -13,6 +13,7 @@
     "effort": { "flag": "--effort" }
   },
   "conversation": {
+    "contract_version": 1,
     "minimum_cli_version": "2.1.220",
     "verified_cli_version": "2.1.220",
     "driver": "claude-print",
@@ -26,6 +27,24 @@
     "interrupt": { "mechanism": "signal", "signal": "SIGINT" },
     "inspect": { "mechanism": "native-session-store" },
     "permission_policy": "claude-permission-mode-and-prompt-tool",
+    "execution_permissions": {
+      "requirement": "worktree-command-access",
+      "unrestricted_mechanism": "bypassPermissions",
+      "sandbox_flag_required": false
+    },
+    "normalized_events": [
+      "session.started",
+      "run.started",
+      "assistant.delta",
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+      "usage",
+      "run.completed",
+      "run.failed",
+      "run.interrupted"
+    ],
     "capabilities": {
       "exact_session_resume": true,
       "structured_streaming": true,
