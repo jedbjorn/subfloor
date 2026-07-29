@@ -24,7 +24,12 @@ from conductor_policy import CONDUCTOR_HARNESS, DEFAULT_CONDUCTOR_MODEL
 import shell_liveness
 import sprint_lifecycle
 import sprint_state
-from sprint_units import SPRINT_UNIT_EDGES, SprintTransitionError, check_transition
+from sprint_units import (
+    SPRINT_UNIT_EDGES,
+    TERMINAL_UNIT_STATES,
+    SprintTransitionError,
+    check_transition,
+)
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -113,13 +118,13 @@ TRANSITIONS = (
     (
         "planner",
         "re-scope",
-        "move working; reboot target dev",
+        "move non-terminal unit working; reboot target dev",
         "developer receives the new boundary",
     ),
     (
         "planner",
         "re-task",
-        "move working; reboot target dev",
+        "move non-terminal unit working; reboot target dev",
         "developer receives the replacement path",
     ),
     (
@@ -813,8 +818,19 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             _text(payload, "reason")
             if unit["dev_shell_id"] != target["shell_id"]:
                 raise DirectiveRefused(f"{kind} target is not the assigned developer")
-            if unit["state"] == "blocked":
+            if unit["state"] in TERMINAL_UNIT_STATES:
+                raise DirectiveRefused(
+                    f"{kind} requires a non-terminal unit; add a follow-up "
+                    "unit for post-merge work"
+                )
+            if unit["state"] != "working":
                 _move(con, unit, "working", actor_shell_id)
+            con.execute(
+                "UPDATE sprint_units SET review_head=NULL,"
+                "updated_at=datetime('now'),updated_by_shell_id=? "
+                "WHERE unit_id=?",
+                (actor_shell_id, unit["unit_id"]),
+            )
             _spawn(con, launches, target, "dev", row, payload, unit=unit)
         elif kind == "answer":
             if unit is None:
