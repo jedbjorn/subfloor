@@ -1006,7 +1006,7 @@ def _act_locked(
             "launches": launches,
             "pids": pids,
         }
-    except DirectiveRefused as exc:
+    except (DirectiveRefused, ConductorLaunchError) as exc:
         con.execute("ROLLBACK TO conductor_act")
         con.execute("RELEASE conductor_act")
         reason = str(exc)
@@ -1043,7 +1043,7 @@ def _act_locked(
                 model=model,
             )
             escalation = {"command": command, "pid": launcher(command)}
-        except DirectiveRefused as escalation_error:
+        except (DirectiveRefused, ConductorLaunchError) as escalation_error:
             escalation = {"error": str(escalation_error)}
         _trail(
             con,
