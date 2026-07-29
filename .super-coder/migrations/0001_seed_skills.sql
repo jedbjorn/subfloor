@@ -15,6 +15,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# agents — delegated waves under your discipline
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 FnB invokes this as `--agents [model]`. It is an **overlay** on `spec` (dev
 mode) and `review` (review mode): it changes only what is written here.
 Everything upstream and downstream of the named steps — loading the spec,
@@ -1702,90 +1704,89 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'git',
-  'Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
+  'Git conventions for this install — ALL version control happens in the work repo (~/Repos/subfloor), addressed explicitly with git -C / gh --repo. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK). Use before any git work.',
   'substrate',
   NULL,
   0,
-  '# git — version control, the super-coder way
+  '# git — version control, the work-repo way
 
-One repo at its root -> plain `git` (cwd = repo root) is safe.
+Two repos are in reach; only one takes commits from you:
 
-Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
+| Repo | Path | Git role |
+|---|---|---|
+| **work repo** | `~/Repos/subfloor` (GitHub `jedbjorn/subfloor`) | ALL of it: sync, branch, commit, push, PR |
+| **home repo** | the repo your cwd sits in | NONE. Local-only (no remotes); commits refused by a pre-commit guard |
+
+Your cwd is a home worktree -> a bare `git`/`gh` command targets the WRONG repo.
+Address the work repo explicitly, every time:
+
+- `git -C ~/Repos/subfloor <cmd>` — never rely on cwd, even right after a `cd`.
+- `gh --repo jedbjorn/subfloor <cmd>` for PR operations.
+- Success condition: `git -C ~/Repos/subfloor rev-parse --show-toplevel` prints
+  the subfloor path before your first write of a session.
+
+NEVER commit, branch, or open a PR in the home repo. The guard blocks the
+commit and prints this redirect; `SC_HOME_MAINTENANCE=1` is for FnB-approved
+home maintenance only — never a way around a mistake. Home and work repo are
+different products with divergent histories: NEVER retarget a commit, branch,
+or diff from one onto the other. Built against the wrong repo -> rebuild from
+scratch in the right one.
 
 ## Sync before you start — hard pre-code gate
 
-Run the gate every session + before each new unit of work. `shell/<shortname>` = a moving base pinned to `origin/main`, not a content branch — cut feature branches from it. A stale base -> you read code that no longer exists + your PRs conflict on arrival.
+Run before each new unit of work. A stale base -> you read code that no longer
+exists + your PRs conflict on arrival.
 
-The launcher auto-syncs at boot when provably nothing can be lost (on base branch + clean tree + no local-only commits). Read the `sync:` line in ACTIVE SESSION: auto-synced + nothing done since -> current, carry on. Says **NOT auto-synced** / you''re mid-session about to start new work -> run:
+1. `git -C ~/Repos/subfloor fetch origin main && git -C ~/Repos/subfloor rev-list --count HEAD..origin/main` -> 0 = carry on.
+2. Behind -> take stock BEFORE touching anything: `git -C ~/Repos/subfloor status` (uncommitted) + `git -C ~/Repos/subfloor rev-list origin/main..HEAD` (unmerged commits) + `git -C ~/Repos/subfloor branch --no-merged origin/main` (unlanded branches).
+3. Local state that is NOT yours -> another shell''s in-flight work: leave it untouched, take a worktree seat (below). Yours -> land or stash before syncing.
+4. Clean (or FnB said go) -> `git -C ~/Repos/subfloor checkout main && git -C ~/Repos/subfloor pull --ff-only`. Stale feature branch -> `git -C ~/Repos/subfloor rebase origin/main`.
 
-1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> 0 = carry on.
-2. Behind -> take stock BEFORE touching anything: `git status` (uncommitted) + `git rev-list origin/main..HEAD` (unmerged commits) + `git branch --no-merged origin/main` (unlanded branches).
-3. Anything local -> surface to the FnB first: list the commits/files, ask land / stash / discard. No sync without their call (soft gate).
-4. Clean (or FnB said go) -> `git checkout shell/<shortname> && git reset --hard origin/main`. NEVER `git pull`/merge on the base — merge bubbles accumulate + your squash-merged work replays as conflicts.
-5. Reset only the base, never a feature branch. Stale feature branch -> `git rebase origin/main`.
+## Shared checkout — one clone, many shells
+
+`~/Repos/subfloor` is ONE checkout shared by every shell. Before switching
+branches: `git -C ~/Repos/subfloor status` — a dirty tree or a sibling''s
+checked-out branch = someone is mid-work. NEVER reset, stash, or branch-switch
+under them; take a worktree seat instead:
+
+    git -C ~/Repos/subfloor worktree add ~/Repos/subfloor-wt/<shortname> -b <type>/<short-desc> origin/main
+
+Work in it with `git -C ~/Repos/subfloor-wt/<shortname> …`; remove the seat
+(`git -C ~/Repos/subfloor worktree remove ~/Repos/subfloor-wt/<shortname>`)
+once its PR is open.
 
 ## Branch -> commit -> push -> PR -> stop
 
-1. NEVER commit to the default branch. Branch first: `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). *Admin-shell exception:* it boots at the repo root on `main`, exempt from the branch-guard; committing to main is its mandate (engine updates, migrations, approved patches) and it starts each session with `git pull --ff-only`. Every other shell branches, always.
+1. NEVER commit to `main`. Branch first: `git -C ~/Repos/subfloor checkout -b <type>/<short-desc>` (feat/fix/chore/docs).
 2. Commit in logical units. End every message with your shell''s trailer:
    ```
    Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
    ```
-3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
+3. Push -> open the PR (`gh --repo jedbjorn/subfloor pr create`) -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
 
 ## Merging a stack (only when the FnB hands you one)
 
 Merge bottom-up, retargeting before each merge — never rely on GitHub''s auto-retarget:
 
-1. `gh pr view <n> --json mergeable,mergeStateStatus` -> clean.
-2. `gh pr merge <low> --squash --delete-branch`.
-3. BEFORE the next merge: `gh pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
+1. `gh --repo jedbjorn/subfloor pr view <n> --json mergeable,mergeStateStatus` -> clean.
+2. `gh --repo jedbjorn/subfloor pr merge <low> --squash --delete-branch`.
+3. BEFORE the next merge: `gh --repo jedbjorn/subfloor pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
 4. Re-check `MERGEABLE` -> merge. Repeat up the stack.
 
 PR already orphaned (base deleted under it) -> the head branch still holds the commits; reopen the SAME PR, don''t rebuild:
 
-1. `git push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh pr view <merged-pr> --json headRefOid`.
-2. `gh pr reopen <closed-pr>` -> `gh pr edit <closed-pr> --base main`.
-3. Verify `MERGEABLE` -> delete the recreated branch again.
+1. `git -C ~/Repos/subfloor push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh --repo jedbjorn/subfloor pr view <merged-pr> --json headRefOid`.
+2. `gh --repo jedbjorn/subfloor pr reopen <closed-pr>` -> `gh --repo jedbjorn/subfloor pr edit <closed-pr> --base main`.
+3. Verify `MERGEABLE` -> merge/close as directed; delete the recreated branch again.
 
 ## Finish before you stop
 
-Bookend to the sync gate. At end of session: `git status` (uncommitted) + `git rev-list origin/<base>..HEAD` (unpushed) -> resolve every hit:
+Bookend to the sync gate. At end of session: `git -C ~/Repos/subfloor status` (uncommitted) + `git -C ~/Repos/subfloor rev-list origin/main..HEAD` (unpushed) -> resolve every hit:
 
 1. Real work -> commit (attributed, trailer above) + push + open the PR. Don''t skip because the session is ending.
-2. Throwaway / experiment -> discard deliberately: `git restore` / `git stash`.
+2. Throwaway / experiment -> discard deliberately: `git -C ~/Repos/subfloor restore` / `stash`.
 3. Genuinely unsure -> surface to the FnB + leave it committed-and-pushed on a branch — never sitting uncommitted.
-
-Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces the admin''s `git_cleanup` to map attribution, check liveness, and commit on your behalf.
-
-## After a merge — clean up local
-
-Only after the PR is merged:
-
-1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
-2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren''t ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
-3. `git fetch --prune`.
-
-NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
-
-## Never commit the engine or derived files
-
-- `/.super-coder/` is gitignored — never force-add anything under it.
-- Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
-- From a worktree, commit only your project''s own files. Do NOT hand-commit `.sc-state/content.sql` (serialized DB memory), `.sc-state/engine.ref` (engine pin), or the tracked `_sc` renders — `sc` writes them to the main checkout root, so they aren''t in your worktree to stage. They enter the repo via Publish (below).
-- Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
-
-## After DB work — `sc mem` is already saved; Publish is separate
-
-An `sc mem` write lands in the shared engine DB immediately (visible to every shell) and `sc rebuild` restores it from the serialized snapshot — there is no per-shell save step. NEVER run `sc snapshot` from a worktree — it refuses by design (`snapshot: refused — serializing to the shared main tree is an admin/GUI step`).
-
-Getting DB text into the repo = the Publish flow (snapshot -> render -> commit -> push -> PR on `sc_gui_content`): the GUI **Publish** button, or the admin shell on `main` running `SC_ADMIN=1 sc snapshot` (+ `SC_ADMIN=1 sc render` if docs/roadmap/skills changed). Output lands at the main checkout root, NOT your worktree — don''t try to commit `content.sql` or `_sc` renders onto your branch. Feature-branch PRs carry project files; DB content publishes separately. See the `snapshot` skill.
-
-## Notes
-
-- Before destructive ops, confirm the repo — `git -C <abs-path>` if ever in doubt.
-- Multi-shell: each shell boots into its own worktree at `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`; the launcher keeps the base pinned to `origin/main` (see the sync gate). Worktree isolation is automatic — no shared cwd. Admin shell = the one exception: repo root on `main`.
-- UI preview: worktree edits do NOT show on the fork''s main dev server. `sc preview` (start once from the main checkout if not running) serves every shell''s worktree UI live (HMR) on the fork''s `dev_port`, one subdomain each: `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your URL after each commit — surface that line to the FnB.',
+4. Took a worktree seat -> remove it once its PR is open.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1906,104 +1907,81 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'issue_reporting',
-  'Report engine defects upstream — the moment a ./sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
+  'Route engine defects the maintainer way — a subfloor defect is yours to triage and fix in ~/Repos/subfloor (or file on its tracker as backlog); a HOME-substrate defect becomes a flag for the FnB, never an in-place fix. Fires the moment a command fails or lies, a skill contradicts reality, or you work around anything to proceed.',
   'substrate',
   NULL,
   1,
-  '# issue_reporting — the backwards flow
+  '# issue_reporting — defects land where they''re fixed
 
-An engine defect fixed upstream reaches every fork via `./sc update`; worked
-around silently, every fork re-derives the workaround. File the issue while
-the failure is on screen — NEVER batch to session end.
+You maintain subfloor: there is no upstream above you to report engine defects
+to. A defect either lands in **your backlog** (subfloor) or in **the FnB''s
+hands** (home substrate). Route it while the failure is on screen — NEVER
+batch to session end.
 
-A workaround IS a report: deviating from a skill''s steps, wrapping a command,
-or hand-patching state to proceed -> you hold the exact repro; file it now.
+A workaround IS a signal: deviating from a skill''s steps, wrapping a command,
+or hand-patching state to proceed -> you hold the exact repro; route it now.
 
-## Boundary — engine vs fork
+## Boundary — whose defect is it
 
-| Where | What |
+| Where it lives | What you do |
 |---|---|
-| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `./sc update` + migrations, the `_sc` API + `sc mem` |
-| **Fork — don''t** | the repo''s app code, fork-local skills (see `local_skill_management`), operator-owned host config |
+| **subfloor engine** (`~/Repos/subfloor`: its `sc` + subcommands, `.super-coder/` code, migrations, adapters, boot render, engine skills, `sc mem` API) | You are the maintainer. In current scope -> fix it in subfloor (`git` skill flow). Out of scope -> file it on the tracker (below) so it survives your session. |
+| **HOME substrate** (the engine your cwd runs on: its boot doc, its `sc mem`, its launcher) | NOT your work surface. Open a flag (`sc mem flag open "[Engine] <symptom> | Blocker for: <x>"`) + surface to the FnB. NEVER fix in place — home-engine edits are FnB-gated. |
+| **Fork reports** (issues filed on subfloor by installed forks: dos-arch, md-converter, ami, rst-c) | Your intake queue — triage like your own findings. |
 
-Unsure -> "would the same problem hit any other fork?" yes = upstream.
+Unsure which install misbehaved -> check where the failing command ran:
+your cwd = home substrate; `~/Repos/subfloor` or a fork = subfloor engine.
 
 ## Triggers
 
-Each row = a real engine defect filed by a fork shell doing ordinary work.
-Match the left column -> file.
+Each row = a real engine-defect shape (filed by fork shells doing ordinary
+work). Match the left column -> route it.
 
 | You hit | Real case |
 |---|---|
 | A `./sc` command fails out of the box | `./sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
 | A command exits green without doing the work | `./sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
 | The documented remedy is a closed loop | `./sc lint` said "run `./sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
-| A skill instructs tools/paths your seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
+| A skill instructs tools/paths the seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400''d standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404''d advancing its status (#224) |
 | Every write suddenly 401s | rebuild didn''t re-mint api_keys — all live shells locked out until an API bounce (#214) |
-| `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
-| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `./sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
-| The sandbox can reach something it shouldn''t | `do_push` src/dest weren''t contained — sandbox→host escape (#228) |
+| `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229) |
+| A structural foot-gun keeps re-biting | the cwd trap — bare git resolving to the wrong tree, "my edits vanished" (#225) |
 
-Stale guidance (skill says X, engine does Y) files the same as a crash.
+Stale guidance (skill says X, engine does Y) routes the same as a crash.
 
 ## Capture — while the failure is on screen
 
-- **engine ref** = `cat .sc-state/engine.ref` — first line of every report
-- **staleness** = compare that ref to upstream head:
-  `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
-  `current` or `behind head <sha7>`. Behind + the symptom is a missing
-  command or a skill/engine mismatch -> the fix may already be shipped:
-  ask your FnB for `./sc update` first, and file only if the defect
-  survives the update (or updating isn''t an option — then the staleness
-  note carries that caveat). Triage reads this line to tell a live
-  engine defect from a stale fork build.
-- **fork + seat**: repo name, shell flavor, sandbox/host
+- **where**: which install (subfloor / fork name / home), shell, host seat
 - **ran / followed**: the exact command, or skill name + step
 - **expected vs actual**: exact output, trimmed to the failing lines
 - **workaround**: what unblocked you, or "blocked, none found"
 
-The issue is public: NEVER paste api keys, tokens, secrets, or private paths.
+The tracker is public: NEVER paste api keys, tokens, secrets, or private paths.
 
-## File it
+## Backlog it (subfloor defects out of current scope)
 
 ```bash
-# 1. dedup — someone may have hit it first
-gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
+# 1. dedup — a fork may have hit it first
+gh --repo jedbjorn/subfloor issue list --search "<symptom keywords>" --state all
 
-# 2. file — title: [<fork>] <area>: <one-line symptom>
-gh issue create --repo jedbjorn/subfloor \
-  --title "[<fork>] <area>: <symptom>" \
-  --body "$(cat <<''EOF''
-- engine ref: <sha from .sc-state/engine.ref> · <current | behind head <sha7>>
-- fork/seat: <repo> · <shell flavor> · <sandbox|host>
-
-**Ran / followed:** <command or skill+step>
-**Expected:** <what the docs/skill promise>
-**Actual:** <exact trimmed output>
-**Workaround:** <what unblocked you, or "blocked">
-EOF
-)"
+# 2. file — title: <area>: <one-line symptom>
+gh --repo jedbjorn/subfloor issue create \
+  --title "<area>: <symptom>" \
+  --body "<capture block above>"
 ```
 
-`jedbjorn/subfloor` = engine upstream; confirm: `git remote get-url super-coder`.
-
-Dedup hit -> comment your engine ref + repro on the existing issue; do NOT
-file a duplicate.
-
-No `gh` / no network from your seat -> save the identical body as a fork flag:
-`sc mem flag open "[Engine] <symptom> | Blocker for: <x>" --name UP-###`, then
-message the **admin** shell to relay it upstream (see `messaging`).
+Dedup hit -> comment your repro on the existing issue; do NOT file a duplicate.
 
 ## Rules
 
-- One defect per issue. Batch nothing.
+- One defect per issue/flag. Batch nothing.
 - Observed failure = the bar for filing unasked; enhancement ideas ("the
-  engine should…") go to your FnB first.
-- Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
-  issue URL.',
+  engine should…") go to the FnB first.
+- Filing ≠ unblocked: defect blocks current work -> also open a flag linking
+  the issue URL.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2746,6 +2724,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# review — gate a diff against its spec
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 The reviewer''s job end to end. You are a **different lineage than the code**
 — reviewer shells are deliberately booted on a different model family than
 the authoring dev, so the review doesn''t share the author''s blind spots ->
@@ -3064,28 +3044,36 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'source-maintenance',
-  'Maintain the super-coder/subfloor engine source itself on bare metal. Use for changes to sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or the source repository''s tracked dogfood state.',
+  'Maintain the subfloor engine source at ~/Repos/subfloor — you are its upstream. Use for changes to its sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or its tracked dogfood state. NEVER for the home repo''s engine.',
   'substrate',
   NULL,
   0,
-  '# Source maintenance
+  '# Source maintenance — the subfloor engine
 
-Treat this repository as upstream: `.super-coder/` and `sc` are the product,
-not an installed dependency. Fix engine defects here; do not run the fork
-report-upstream or never-edit-engine procedures.
+The engine source you maintain lives at **`~/Repos/subfloor`** (GitHub
+`jedbjorn/subfloor`). THERE, `.super-coder/` and `sc` are the product and you
+are upstream: fix engine defects in that repo directly; the fork
+report-upstream / never-edit-engine procedures do not apply to it.
+
+The engine under your OWN cwd (the home repo''s `.super-coder/`) is a different
+install: your memory substrate, NOT your work surface. NEVER apply this skill
+to it — home-engine changes are FnB-gated maintenance (see the boot doc''s
+PROJECT vs ENGINE).
+
+Every command below runs against the work repo: `git -C ~/Repos/subfloor …`,
+or scripts from that root — never from your cwd (the `git` skill has the full
+addressing contract).
 
 ## Orient
 
-1. Confirm source mode:
-   `python3 -c "import sys; sys.path.insert(0,''.super-coder/scripts''); import install; print(install.is_source_repo())"`
-   must print `True`. If not, fix `SOURCE_REPO_NAMES` before other work.
-2. Query the repo map, but verify it includes `.super-coder/`. A source map that
-   hides the engine is invalid.
-3. Read active decisions before choosing an architecture.
-4. Work from a branch/worktree. Preserve tracked `.sc-state/content.sql`; it is
-   this source repo''s dogfood memory, not a disposable fork seed.
+1. Confirm the target: `git -C ~/Repos/subfloor remote get-url origin` ->
+   `…jedbjorn/subfloor…`. Anything else = wrong repo; stop.
+2. Read subfloor''s active decisions/specs before choosing an architecture.
+3. Work from a branch (or a worktree seat — `git` skill). Preserve subfloor''s
+   tracked `.sc-state/content.sql`; it is that repo''s dogfood memory, not a
+   disposable fork seed.
 
-## Change the right source
+## Change the right source (paths within ~/Repos/subfloor)
 
 | Concern | Authoritative source |
 |---|---|
@@ -3095,38 +3083,31 @@ report-upstream or never-edit-engine procedures.
 | Shell flavor defaults | `.super-coder/templates/shells/*.json` |
 | Engine skill | `.super-coder/assets/skills/<name>/SKILL.md`, then `./sc seed-skills` |
 | Schema/system content | a new ordered migration; never rewrite an applied migration except the generated skill seed |
-| This team''s mandate, grants, memory, roadmap | live DB, then `SC_ADMIN=1 ./sc snapshot` |
+| Subfloor''s own team state | its live DB, then `SC_ADMIN=1 ./sc snapshot` (run in subfloor) |
 
 Flat `_sc` markdown and `AGENTS.md`/`CLAUDE.md` are renders. Never author a
 behavioral change in them.
 
-## Bare-metal contract
+## Downstream contract
 
-- `./sc launch`, `enter`, `run`, `down`, `restart`, and `logs` are the primary
-  host-native lifecycle.
-- `enter` and `run` intentionally set trusted harness mode. Do not silently
-  restore a harness sandbox or approval loop.
-- Docker compatibility is explicit under `sandbox-*`; do not let its
-  assumptions leak into host prompts or primary help.
-- Bind the engine API and ordinary dev servers to loopback by default.
-- Direct host authority is not task authority: keep actions scoped to the
-  operator''s request and preserve unrelated host state.
+A subfloor change reaches installed forks (dos-arch, md-converter, ami, rst-c)
+only after it merges and they `./sc update` — keep migrations ordered and
+non-destructive, and never assume a running shell inherits a changed prompt or
+skill before its next boot.
 
 ## Finish
 
-Run focused tests, then:
+Run focused tests, then from `~/Repos/subfloor`:
 
 ```bash
 ./sc map
 ./sc render-check
 ./sc verify
-git diff --check
+git -C ~/Repos/subfloor diff --check
 ```
 
-If skill assets changed, run `./sc seed-skills` first. If dogfood DB content or
-grants changed, snapshot it. A source change reaches downstream forks only
-after it is merged and they update; never expect the currently running shell to
-inherit a changed prompt or skill until its next boot.',
+If skill assets changed, run `./sc seed-skills` first (in subfloor). Then the
+`git` skill''s finish gate: branch -> commit -> push -> PR -> stop.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3141,6 +3122,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   NULL,
   0,
   '# spec — analyze and execute a spec
+
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
 
 Load at the start of any session that builds or implements a feature, whether
 or not the work is framed as a "spec". A spec governs the work -> this skill
@@ -3392,6 +3375,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   NULL,
   0,
   '# sprint — your slot in a coordinated multi-shell push
+
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
 
 A sprint = a declared, planner-governed push where shells build dependent
 units (B on A, C on B); loop = planner → devs → reviewers → devs → planner,
@@ -3720,6 +3705,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   NULL,
   0,
   '# sprint_orchestration — governing a coordinated multi-shell push
+
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
 
 The FnB declares *that* a sprint happens; you make it run: decompose the
 push into units, sequence who builds on whom, assign a reviewer to every

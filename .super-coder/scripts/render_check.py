@@ -56,6 +56,14 @@ def _build_tracked_db(path: Path) -> None:
         con.executescript(content.read_text())
         con.commit()
         con.close()
+    # Converge to the fork retire list, exactly as rebuild.py does — the seed
+    # migrations resurrect retired engine skills with is_deleted=0, and a
+    # hermetic DB that skips this renders a mirror (skills README) no real
+    # rebuild would produce.
+    import seed_skills
+    con = sqlite3.connect(path)
+    seed_skills.apply_retired(con)
+    con.close()
 
 
 def _rel_files(base: Path) -> set[str]:

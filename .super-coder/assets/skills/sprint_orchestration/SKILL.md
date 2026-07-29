@@ -7,6 +7,8 @@ common: false
 
 # sprint_orchestration — governing a coordinated multi-shell push
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 The FnB declares *that* a sprint happens; you make it run: decompose the
 push into units, sequence who builds on whom, assign a reviewer to every
 unit, interview the FnB for the sprint's models, boot each worker when its

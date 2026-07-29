@@ -7,6 +7,8 @@ common: false
 
 # review — gate a diff against its spec
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 The reviewer's job end to end. You are a **different lineage than the code**
 — reviewer shells are deliberately booted on a different model family than
 the authoring dev, so the review doesn't share the author's blind spots ->

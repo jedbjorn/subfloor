@@ -1,29 +1,37 @@
 ---
 name: source-maintenance
-description: Maintain the super-coder/subfloor engine source itself on bare metal. Use for changes to sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or the source repository's tracked dogfood state.
+description: Maintain the subfloor engine source at ~/Repos/subfloor — you are its upstream. Use for changes to its sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or its tracked dogfood state. NEVER for the home repo's engine.
 metadata:
   category: substrate
   common: false
 ---
 
-# Source maintenance
+# Source maintenance — the subfloor engine
 
-Treat this repository as upstream: `.super-coder/` and `sc` are the product,
-not an installed dependency. Fix engine defects here; do not run the fork
-report-upstream or never-edit-engine procedures.
+The engine source you maintain lives at **`~/Repos/subfloor`** (GitHub
+`jedbjorn/subfloor`). THERE, `.super-coder/` and `sc` are the product and you
+are upstream: fix engine defects in that repo directly; the fork
+report-upstream / never-edit-engine procedures do not apply to it.
+
+The engine under your OWN cwd (the home repo's `.super-coder/`) is a different
+install: your memory substrate, NOT your work surface. NEVER apply this skill
+to it — home-engine changes are FnB-gated maintenance (see the boot doc's
+PROJECT vs ENGINE).
+
+Every command below runs against the work repo: `git -C ~/Repos/subfloor …`,
+or scripts from that root — never from your cwd (the `git` skill has the full
+addressing contract).
 
 ## Orient
 
-1. Confirm source mode:
-   `python3 -c "import sys; sys.path.insert(0,'.super-coder/scripts'); import install; print(install.is_source_repo())"`
-   must print `True`. If not, fix `SOURCE_REPO_NAMES` before other work.
-2. Query the repo map, but verify it includes `.super-coder/`. A source map that
-   hides the engine is invalid.
-3. Read active decisions before choosing an architecture.
-4. Work from a branch/worktree. Preserve tracked `.sc-state/content.sql`; it is
-   this source repo's dogfood memory, not a disposable fork seed.
+1. Confirm the target: `git -C ~/Repos/subfloor remote get-url origin` ->
+   `…jedbjorn/subfloor…`. Anything else = wrong repo; stop.
+2. Read subfloor's active decisions/specs before choosing an architecture.
+3. Work from a branch (or a worktree seat — `git` skill). Preserve subfloor's
+   tracked `.sc-state/content.sql`; it is that repo's dogfood memory, not a
+   disposable fork seed.
 
-## Change the right source
+## Change the right source (paths within ~/Repos/subfloor)
 
 | Concern | Authoritative source |
 |---|---|
@@ -33,35 +41,28 @@ report-upstream or never-edit-engine procedures.
 | Shell flavor defaults | `.super-coder/templates/shells/*.json` |
 | Engine skill | `.super-coder/assets/skills/<name>/SKILL.md`, then `./sc seed-skills` |
 | Schema/system content | a new ordered migration; never rewrite an applied migration except the generated skill seed |
-| This team's mandate, grants, memory, roadmap | live DB, then `SC_ADMIN=1 ./sc snapshot` |
+| Subfloor's own team state | its live DB, then `SC_ADMIN=1 ./sc snapshot` (run in subfloor) |
 
 Flat `_sc` markdown and `AGENTS.md`/`CLAUDE.md` are renders. Never author a
 behavioral change in them.
 
-## Bare-metal contract
+## Downstream contract
 
-- `./sc launch`, `enter`, `run`, `down`, `restart`, and `logs` are the primary
-  host-native lifecycle.
-- `enter` and `run` intentionally set trusted harness mode. Do not silently
-  restore a harness sandbox or approval loop.
-- Docker compatibility is explicit under `sandbox-*`; do not let its
-  assumptions leak into host prompts or primary help.
-- Bind the engine API and ordinary dev servers to loopback by default.
-- Direct host authority is not task authority: keep actions scoped to the
-  operator's request and preserve unrelated host state.
+A subfloor change reaches installed forks (dos-arch, md-converter, ami, rst-c)
+only after it merges and they `./sc update` — keep migrations ordered and
+non-destructive, and never assume a running shell inherits a changed prompt or
+skill before its next boot.
 
 ## Finish
 
-Run focused tests, then:
+Run focused tests, then from `~/Repos/subfloor`:
 
 ```bash
 ./sc map
 ./sc render-check
 ./sc verify
-git diff --check
+git -C ~/Repos/subfloor diff --check
 ```
 
-If skill assets changed, run `./sc seed-skills` first. If dogfood DB content or
-grants changed, snapshot it. A source change reaches downstream forks only
-after it is merged and they update; never expect the currently running shell to
-inherit a changed prompt or skill until its next boot.
+If skill assets changed, run `./sc seed-skills` first (in subfloor). Then the
+`git` skill's finish gate: branch -> commit -> push -> PR -> stop.

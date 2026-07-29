@@ -7,6 +7,8 @@ common: false
 
 # sprint — your slot in a coordinated multi-shell push
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 A sprint = a declared, planner-governed push where shells build dependent
 units (B on A, C on B); loop = planner → devs → reviewers → devs → planner,
 the shells running the handoffs themselves. This skill is the participant

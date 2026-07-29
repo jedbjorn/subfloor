@@ -7,6 +7,8 @@ common: false
 
 # agents — delegated waves under your discipline
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 FnB invokes this as `--agents [model]`. It is an **overlay** on `spec` (dev
 mode) and `review` (review mode): it changes only what is written here.
 Everything upstream and downstream of the named steps — loading the spec,

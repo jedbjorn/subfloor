@@ -1,0 +1,10 @@
+[
+  "app_deploy_setup",
+  "configure_winbox",
+  "query_authoring_pg",
+  "self_update",
+  "tailscale",
+  "test_authoring_pg",
+  "windows_devkit",
+  "windows_vm_gui"
+]

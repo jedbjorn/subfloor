@@ -7,6 +7,8 @@ common: false
 
 # spec — analyze and execute a spec
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 Load at the start of any session that builds or implements a feature, whether
 or not the work is framed as a "spec". A spec governs the work -> this skill
 executes it; one should exist but doesn't -> the `docs` skill authors it first.
