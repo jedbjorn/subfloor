@@ -530,7 +530,22 @@ def _spawn(
             "not satisfy the typed result."
         ),
     }
-    if role == "planner" and row["kind"] == "unit-report":
+    if role == "developer" and unit["state"] in ("pending", "blocked", "working"):
+        packet["instruction"] = (
+            "This is a first-pass or retry execution assignment. Perform the "
+            "bounded unit verification, then emit ready-for-review as the one "
+            "workflow directive with exact head/check evidence. Do not emit "
+            "unit-report as the workflow directive: unit-report is the "
+            "separate typed result required by completion_contract."
+        )
+    elif role == "developer":
+        packet["instruction"] = (
+            "This is the post-review completion assignment. Follow the "
+            "sprint_dev terminal reporting contract for the reviewed unit, "
+            "then send the separate typed unit-report result required by "
+            "completion_contract."
+        )
+    elif role == "planner" and row["kind"] == "unit-report":
         packet["instruction"] = (
             "All declared units are terminal. This is a conformance handoff, "
             "not a question: do not emit answer. Read the governing spec, "

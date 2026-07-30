@@ -618,6 +618,17 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                             "immediately send exactly one correlated",
                             packet["completion_contract"],
                         )
+                        if kind == "sprint-armed":
+                            self.assertIn(
+                                "emit ready-for-review as the one workflow "
+                                "directive",
+                                packet["instruction"],
+                            )
+                            self.assertIn(
+                                "Do not emit unit-report as the workflow "
+                                "directive",
+                                packet["instruction"],
+                            )
                     row = con.execute(
                         "SELECT status,refusal_reason FROM directives "
                         "WHERE directive_id=?",
@@ -1112,6 +1123,14 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.assertEqual(len(result["assignments"]), 1)
         self.assertEqual(result["assignments"][0]["slot"], "DEV1")
+        prompt = self.con.execute(
+            "SELECT body FROM conversation_messages WHERE conversation_id=?",
+            (result["assignments"][0]["conversation_id"],),
+        ).fetchone()[0]
+        self.assertIn(
+            "emit ready-for-review as the one workflow directive",
+            json.loads(prompt)["instruction"],
+        )
 
     def test_unit_report_boots_planner_only_after_all_units_terminal(self):
         self.set_unit("working")
