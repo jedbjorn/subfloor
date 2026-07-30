@@ -167,6 +167,36 @@ class LocalReviewProjectionTest(unittest.TestCase):
         self.assertTrue(pushed.pushed)
         self.assertEqual(pushed.remote_branch_sha, pushed.head_sha)
 
+    def test_public_commit_resolution_and_ancestry_are_exact(self) -> None:
+        base_sha = self.fixture.git("rev-parse", "HEAD")
+        self.fixture.branch("feature/identity")
+        self.fixture.write("identity.txt", "identity\n")
+        head_sha = self.fixture.commit("identity")
+
+        self.assertEqual(
+            git_review.resolve_commit(self.fixture.repo, "feature/identity"),
+            head_sha,
+        )
+        self.assertTrue(
+            git_review.commit_is_ancestor(
+                self.fixture.repo,
+                base_sha,
+                head_sha,
+            )
+        )
+        self.assertFalse(
+            git_review.commit_is_ancestor(
+                self.fixture.repo,
+                head_sha,
+                base_sha,
+            )
+        )
+        with self.assertRaisesRegex(
+            git_review.GitReadError,
+            "Git ref is invalid",
+        ):
+            git_review.resolve_commit(self.fixture.repo, "--help")
+
     def test_conflict_and_local_only_overlay_are_explicit(self) -> None:
         self.fixture.build_conflict_case()
         conflict = git_review.collect_workspace(self.fixture.repo)

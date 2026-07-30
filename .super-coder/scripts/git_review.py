@@ -664,6 +664,14 @@ def _sha(
     *,
     runner: Callable[..., Any],
 ) -> str:
+    if (
+        not isinstance(ref, str)
+        or not ref
+        or len(ref.encode("utf-8", errors="surrogateescape")) > 1024
+        or ref.startswith("-")
+        or any(ord(char) < 32 or ord(char) == 127 for char in ref)
+    ):
+        raise GitReadError("REVIEW_REF_MISSING", "Git ref is invalid")
     payload, _ = _run_git(
         worktree,
         ("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"),
@@ -686,6 +694,37 @@ def _optional_sha(
         return _sha(worktree, ref, runner=runner)
     except GitReadError:
         return None
+
+
+def resolve_commit(
+    worktree: str | Path,
+    ref: str,
+    *,
+    runner: Callable[..., Any] = _run_read_process,
+) -> str:
+    """Resolve one server-selected ref to an exact commit SHA."""
+    resolved = _resolve_worktree(worktree)
+    return _sha(resolved, ref, runner=runner)
+
+
+def commit_is_ancestor(
+    worktree: str | Path,
+    ancestor_ref: str,
+    descendant_ref: str,
+    *,
+    runner: Callable[..., Any] = _run_read_process,
+) -> bool:
+    """Return whether ``ancestor_ref`` reaches ``descendant_ref``."""
+    resolved = _resolve_worktree(worktree)
+    ancestor_sha = _sha(resolved, ancestor_ref, runner=runner)
+    descendant_sha = _sha(resolved, descendant_ref, runner=runner)
+    merge_raw, _ = _run_git(
+        resolved,
+        ("merge-base", ancestor_sha, descendant_sha),
+        runner=runner,
+        output_limit=128,
+    )
+    return merge_raw.decode("ascii", errors="replace").strip().lower() == ancestor_sha
 
 
 def collect_workspace(

@@ -71,6 +71,7 @@ import sprint_lifecycle  # noqa: E402  (authoritative sprint state/ownership)
 sys.path.insert(0, str(ENGINE / "api"))
 import conductor_routes  # noqa: E402  (Step 4 directive/event contracts)
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
+import review_routes  # noqa: E402  (Feature #26 browser Diff review)
 import sprint_routes  # noqa: E402  (sprint board API — /api/sprint-units)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
@@ -3702,6 +3703,14 @@ def dispatch_http(method: str, path: str, headers_raw: str,
     if parsed.path.startswith(("/api/directives",
                                "/api/sentinel-events")):
         return conductor_routes.handle(method, path, headers_raw, body)
+    if (
+        parsed.path.startswith("/api/review-targets/")
+        or (
+            parsed.path.startswith("/api/conversations/")
+            and parsed.path.endswith("/review-targets")
+        )
+    ):
+        return review_routes.handle(method, path, headers_raw, body)
     if parsed.path.startswith("/api/conversations"):
         return conversation_routes.handle(method, path, headers_raw, body)
     if parsed.path.startswith((
