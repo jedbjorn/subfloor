@@ -1148,6 +1148,48 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         self.assertEqual(len(terminal["assignments"]), 1)
         self.assertEqual(terminal["assignments"][0]["slot"], "PLN1")
 
+    def test_conformance_kickoff_is_unitless_and_typed_conformance(self):
+        self.set_unit("working")
+        self.set_unit("in_review")
+        self.set_unit("merged")
+        linked = self.emit(
+            "planner",
+            "kickoff",
+            {
+                "to": "REV1",
+                "mode": "conformance",
+                "main_sha": "abc",
+                "scope": "all requirements",
+                "ratified_deviations": [],
+            },
+        )
+        self.con.commit()
+        refused = runtime.act(self.con, linked, 1)
+        self.assertEqual(refused["status"], "refused")
+        self.assertIn("must be unitless", refused["reason"])
+
+        unitless = self.emit(
+            "planner",
+            "kickoff",
+            {
+                "to": "REV1",
+                "mode": "conformance",
+                "main_sha": "abc",
+                "scope": "all requirements",
+                "ratified_deviations": [],
+            },
+            unit=False,
+        )
+        self.con.commit()
+        result = runtime.act(self.con, unitless, 1)
+        self.assertEqual(result["status"], "executed")
+        binding = self.con.execute(
+            "SELECT role,required_result_kind FROM "
+            "sprint_conversation_bindings WHERE conversation_id=?",
+            (result["assignments"][0]["conversation_id"],),
+        ).fetchone()
+        self.assertEqual(tuple(binding), ("conformance", "conformance-verdict"))
+
 
 class ConductorSyntheticSprintTests(RuntimeFixture):
     def act_one(self, issuer, kind, payload, *, unit=True):

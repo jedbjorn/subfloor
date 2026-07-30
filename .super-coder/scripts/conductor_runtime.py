@@ -550,8 +550,9 @@ def _spawn(
             "All declared units are terminal. This is a conformance handoff, "
             "not a question: do not emit answer. Read the governing spec, "
             "board, and unit evidence; resolve the integrated main SHA; emit "
-            "one kickoff directive to an assigned reviewer with "
-            "mode=conformance and the complete requirement scope; then return "
+            "one unitless kickoff directive to an assigned reviewer with "
+            "mode=conformance and the complete requirement scope. Omit "
+            "--unit even when the triggering unit is injected; then return "
             "the required planner-directive result."
         )
     prompt = json.dumps(packet, sort_keys=True)
@@ -991,7 +992,11 @@ def _execute(
                     unit=unit,
                 )
             elif target["flavor"] == "reviewer":
-                if unit is None and payload.get("mode") != "conformance":
+                if unit is not None:
+                    raise DirectiveRefused(
+                        "reviewer kickoff must be unitless conformance"
+                    )
+                if payload.get("mode") != "conformance":
                     raise DirectiveRefused(
                         "unitless reviewer kickoff requires mode=conformance"
                     )
