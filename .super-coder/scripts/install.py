@@ -819,7 +819,7 @@ def main(argv: list[str]) -> int:
     # Record harness + installed marker in instance.json ---------------------
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
-    cfg["installed_at"] = date.today().isoformat()
+    cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
     cfg["conductor"] = {
         "enabled": True,
         "shell": "CON1",
