@@ -26,6 +26,7 @@ from conversation_adapters import (  # noqa: E402
     KimiAdapter,
     NativeTurn,
     NormalizedEvent,
+    OpenCodeAdapter,
     ReconcileResult,
 )
 from conversation_broker import (  # noqa: E402
@@ -120,6 +121,80 @@ class FakeAdapter:
 
     def close(self) -> None:
         self.closed += 1
+
+
+class BlockingOpenCodeTransport:
+    """Hold synchronous message delivery until the broker calls abort."""
+
+    def __init__(self) -> None:
+        self.session_ref = "ses_interruptible"
+        self.message_started = threading.Event()
+        self.aborted = threading.Event()
+        self.requests: list[tuple[str, str]] = []
+        self.message_count = 0
+        self.stream_count = 0
+
+    def request(self, method: str, path: str, *, query=None, body=None):
+        self.requests.append((method, path))
+        if method == "POST" and path == "/session":
+            return {"id": self.session_ref}
+        if method == "POST" and path.endswith("/message"):
+            self.message_count += 1
+            self.message_started.set()
+            if self.message_count == 1 and not self.aborted.wait(2):
+                raise AssertionError("OpenCode message remained uninterruptible")
+            return {"id": f"message-{self.message_count}"}
+        if method == "POST" and path.endswith("/abort"):
+            self.aborted.set()
+            # Let the blocked message response and native idle race ahead of
+            # the abort acknowledgement. The adapter must wait for this
+            # result before choosing completed versus interrupted.
+            time.sleep(0.05)
+            return True
+        if method == "GET" and path == f"/session/{self.session_ref}":
+            return {"id": self.session_ref}
+        if method == "GET" and path == "/session/status":
+            return {
+                self.session_ref: {
+                    "type": "idle" if self.aborted.is_set() else "busy"
+                }
+            }
+        raise AssertionError(f"unexpected OpenCode request: {method} {path}")
+
+    def stream(self, path: str, *, query=None):
+        self.stream_count += 1
+        stream_number = self.stream_count
+
+        def events():
+            yield {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "status": {"type": "busy"},
+                },
+            }
+            if stream_number == 1:
+                if not self.aborted.wait(2):
+                    raise AssertionError("OpenCode event stream saw no abort")
+                yield {
+                    "type": "session.idle",
+                    "properties": {"sessionID": self.session_ref},
+                }
+                return
+            yield {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": self.session_ref,
+                    "field": "text",
+                    "delta": f"resumed-{stream_number}",
+                },
+            }
+            yield {
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_ref},
+            }
+
+        return events()
 
 
 class ConversationBrokerCase(unittest.TestCase):
@@ -963,6 +1038,105 @@ class ServiceContractTest(ConversationBrokerCase):
             events.index("run.interrupt.requested"),
             events.index("run.interrupted"),
         )
+
+    def test_opencode_blocking_message_is_interruptible_after_identity(
+        self,
+    ) -> None:
+        transport = BlockingOpenCodeTransport()
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "opencode" else None
+        )
+        conversation_id = self.add_conversation(harness="opencode")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+        self.assertTrue(
+            transport.message_started.wait(1),
+            "OpenCode synchronous message dispatch never started",
+        )
+
+        con = self.connect()
+        run = con.execute(
+            "SELECT run_id,state,harness_session_after,runner_ref "
+            "FROM conversation_runs WHERE trigger_message_id=?",
+            (message_id,),
+        ).fetchone()
+        con.close()
+        self.assertIsNotNone(run)
+        self.assertEqual(run["state"], "running")
+        self.assertEqual(
+            run["harness_session_after"],
+            transport.session_ref,
+        )
+        self.assertTrue(run["runner_ref"])
+
+        second_message_id = self.add_message(conversation_id)
+        third_message_id = self.add_message(conversation_id)
+        self.assertTrue(broker.interrupt(int(run["run_id"])))
+        self.wait_run_state(int(run["run_id"]), "cancelled")
+        self.assertTrue(transport.aborted.is_set())
+        self.assertIn(
+            ("POST", f"/session/{transport.session_ref}/abort"),
+            transport.requests,
+        )
+
+        con = self.connect()
+        events = [
+            row[0]
+            for row in con.execute(
+                "SELECT event_type FROM conversation_events "
+                "WHERE run_id=? ORDER BY sequence",
+                (run["run_id"],),
+            )
+        ]
+        con.close()
+        self.assertLess(
+            events.index("run.interrupt.requested"),
+            events.index("run.interrupted"),
+        )
+
+        deadline = time.monotonic() + 3
+        resumed_runs = []
+        while time.monotonic() < deadline:
+            con = self.connect()
+            resumed_runs = con.execute(
+                "SELECT trigger_message_id,state,harness_session_before,"
+                "harness_session_after FROM conversation_runs "
+                "WHERE conversation_id=? ORDER BY run_id",
+                (conversation_id,),
+            ).fetchall()
+            con.close()
+            if (
+                len(resumed_runs) == 3
+                and resumed_runs[-1]["state"] == "succeeded"
+            ):
+                break
+            time.sleep(0.01)
+        self.assertEqual(
+            [row["trigger_message_id"] for row in resumed_runs],
+            [message_id, second_message_id, third_message_id],
+        )
+        self.assertEqual(
+            [row["state"] for row in resumed_runs],
+            ["cancelled", "succeeded", "succeeded"],
+        )
+        self.assertEqual(
+            [
+                (
+                    row["harness_session_before"],
+                    row["harness_session_after"],
+                )
+                for row in resumed_runs[1:]
+            ],
+            [
+                (transport.session_ref, transport.session_ref),
+                (transport.session_ref, transport.session_ref),
+            ],
+        )
+        self.assertEqual(transport.message_count, 3)
 
     def test_starting_crash_without_exact_identity_becomes_unknown(self) -> None:
         _conversation, _message, run_id = self.add_live_run(state="starting")

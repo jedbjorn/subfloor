@@ -843,6 +843,11 @@ class ConversationAdapterTest(unittest.TestCase):
             [("/event", {"directory": str(self.root)})],
             "the SSE subscription must open before prompt dispatch",
         )
+        self.assertFalse(
+            any(request[1].endswith("/message") for request in native.requests),
+            "message dispatch must wait until NativeTurn can be persisted",
+        )
+        events = list(adapter.stream(turn))
         prompt = next(
             request
             for request in native.requests
@@ -858,7 +863,6 @@ class ConversationAdapterTest(unittest.TestCase):
             prompt[3]["model"],
             {"providerID": "openrouter", "modelID": "test-model"},
         )
-        events = list(adapter.stream(turn))
         self.assertNotIn("wrong", repr(events))
         self.assertIn("permission.requested", [event.type for event in events])
         self.assertEqual(
@@ -947,12 +951,13 @@ class ConversationAdapterTest(unittest.TestCase):
             provider="openai",
             model="openai/gpt-5.6-terra-fast",
         )
-        adapter.start(context, "hello")
+        turn = adapter.start(context, "hello")
         create = next(
             request
             for request in native.requests
             if request[:2] == ("POST", "/session")
         )
+        list(adapter.stream(turn))
         prompt = next(
             request
             for request in native.requests
@@ -965,6 +970,30 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(
             prompt[3]["model"],
             {"providerID": "openai", "modelID": "gpt-5.6-terra-fast"},
+        )
+
+    def test_opencode_default_transport_uses_decided_turn_ceiling(
+        self,
+    ) -> None:
+        with mock.patch(
+            "conversation_adapters.opencode.ensure_server",
+            return_value="test-password",
+        ):
+            adapter = OpenCodeAdapter(endpoint="http://127.0.0.1:1")
+        self.assertEqual(adapter.transport.timeout, 5400.0)
+
+    def test_opencode_stop_before_dispatch_never_sends_the_prompt(
+        self,
+    ) -> None:
+        adapter, native = self.build("opencode")
+        turn = adapter.start(self.context, "must not dispatch")
+        self.assertTrue(adapter.interrupt(turn).acknowledged)
+
+        events = list(adapter.stream(turn))
+
+        self.assertEqual(events[-1].type, "run.interrupted")
+        self.assertFalse(
+            any(request[1].endswith("/message") for request in native.requests)
         )
 
     def test_claude_uses_exact_start_and_resume_flags_and_sigint(
