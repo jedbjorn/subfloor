@@ -1170,13 +1170,22 @@ def act(
         )
 
 
-def render_boot(con, shell) -> str:
+def render_boot(con, shell, *, slot_context: dict | None = None) -> str:
     """Render the Conductor's complete transition-table boot doc."""
-    pending = con.execute(
+    sprint_id = (
+        int(slot_context["sprint_doc_id"])
+        if slot_context is not None
+        else None
+    )
+    sql = (
         "SELECT directive_id,issuer_flavor,kind,sprint_doc_id,unit_id "
         "FROM directives WHERE status='pending' AND target='conductor' "
-        "ORDER BY directive_id"
-    ).fetchall()
+    )
+    params: tuple = ()
+    if sprint_id is not None:
+        sql += "AND sprint_doc_id=? "
+        params = (sprint_id,)
+    pending = con.execute(sql + "ORDER BY directive_id", params).fetchall()
     lines = [
         "# CONDUCTOR — MECHANICAL RELAY",
         "",
@@ -1188,6 +1197,29 @@ def render_boot(con, shell) -> str:
         "| Never write directly | Board/session changes occur only inside the authenticated act command |",
         "| Never select an owner or route | Use the recorded originating Planner and each stored role route |",
         "",
+    ]
+    if slot_context is not None:
+        lines += [
+            "## Browser Sprint binding",
+            "",
+            f"- **Sprint:** document `{sprint_id}` — "
+            f"{slot_context.get('sprint_title') or '(untitled sprint)'}",
+            f"- **Slot:** `{slot_context['slot']}`",
+            f"- **Lifecycle:** `{slot_context['lifecycle']}`",
+            f"- **Assignment:** `{slot_context['binding_id']}`",
+            "",
+            "Act only on pending directives for this Sprint. Other Sprints "
+            "belong to their own persistent Conductor conversations.",
+            "",
+        ]
+        if slot_context.get("spec_doc_id") is not None:
+            lines.insert(
+                -2,
+                f"- **Governing spec:** document "
+                f"`{slot_context['spec_doc_id']}` — "
+                f"{slot_context.get('spec_title') or '(untitled spec)'}",
+            )
+    lines += [
         "| Issuer | Kind | Mechanical action | Pass |",
         "|---|---|---|---|",
     ]
@@ -1207,13 +1239,23 @@ def render_boot(con, shell) -> str:
             )
     else:
         lines.append("| — | — | — | — | — |")
+    list_command = "sc directives list --status pending"
+    if sprint_id is not None:
+        list_command += f" --sprint {sprint_id}"
     lines += [
         "",
-        "1. Run `sc directives list --status pending`.",
+        f"1. Run `{list_command}`.",
         "2. For each id in ascending order run `sc directives act <id>`.",
         "3. Inspect every result; continue after executed or refused.",
-        "4. Exit when the pending list is empty.",
+        "4. Exit when this Sprint's pending list is empty.",
         "",
         f"Shell: `{shell['shortname']}` · flavor: `conductor` · skill: `sprint_cond`",
     ]
+    if slot_context is not None:
+        lines += [
+            "",
+            "## Loaded skill — sprint_cond",
+            "",
+            slot_context["skill_body"].strip(),
+        ]
     return "\n".join(lines) + "\n"

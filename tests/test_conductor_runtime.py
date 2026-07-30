@@ -256,6 +256,45 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
         )
         self.assertEqual(composed, rendered)
 
+    def test_browser_binding_limits_conductor_boot_to_its_exact_sprint(self):
+        sprint_directive = self.emit(
+            "system",
+            "stall",
+            {"evidence": "bounded"},
+        )
+        other_directive = self.con.execute(
+            "INSERT INTO directives "
+            "(issuer_flavor,kind,payload,target) "
+            "VALUES ('system','stall','{}','conductor')"
+        ).lastrowid
+        self.con.commit()
+        shell = self.con.execute(
+            "SELECT * FROM shells WHERE shell_id=1"
+        ).fetchone()
+        context = {
+            "binding_id": 901,
+            "role": "conductor",
+            "lifecycle": "persistent",
+            "slot": "CON1",
+            "sprint_doc_id": 100,
+            "sprint_title": "SPRINT: synthetic",
+            "spec_doc_id": 99,
+            "spec_title": "Synthetic spec",
+            "skill_body": "SPRINT CONDUCTOR SKILL BODY",
+        }
+
+        rendered = runtime.render_boot(
+            self.con,
+            shell,
+            slot_context=context,
+        )
+
+        self.assertIn("## Browser Sprint binding", rendered)
+        self.assertIn("`sc directives list --status pending --sprint 100`", rendered)
+        self.assertIn(f"| {sprint_directive} |", rendered)
+        self.assertNotIn(f"| {other_directive} |", rendered)
+        self.assertIn("SPRINT CONDUCTOR SKILL BODY", rendered)
+
     def test_conductor_harness_policy_rejects_every_non_opencode_route(self):
         conductor_policy.require_harness("conductor", "opencode")
         conductor_policy.require_harness("dev", "codex")
