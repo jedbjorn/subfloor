@@ -1527,6 +1527,21 @@ def _arm_sprint(
                 ),
             )
             sprint_lifecycle.transition(con, sprint_doc_id, "active")
+            directive_id = con.execute(
+                "INSERT INTO directives "
+                "(issuer_shell_id,issuer_flavor,kind,payload,target,"
+                " sprint_doc_id,unit_id) "
+                "VALUES (NULL,'system','sprint-armed','{}','conductor',?,NULL)",
+                (sprint_doc_id,),
+            ).lastrowid
+            sprint_conversations.enqueue_conductor_directive(
+                con,
+                sprint_doc_id=sprint_doc_id,
+                directive_id=directive_id,
+                source_kind="sprint-armed",
+                evidence={"armed_by_shell_id": actor.shell_id},
+                idempotency_key=f"sprint-arm-release:{sprint_doc_id}",
+            )
             con.execute(
                 "INSERT INTO sentinel_events "
                 "(event_kind,shell_id,sprint_doc_id,evidence) "

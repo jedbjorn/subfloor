@@ -25,6 +25,7 @@ board directly. The stored sprint row is the only owner/state/route authority.
 | planner | answer/hold/re-task/re-scope | apply only the named mechanical consequence | issuer is the stored owner |
 | planner | kickoff | boot named assigned worker or conformance reviewer using the stored role route | no payload-selected model |
 | planner | close | require terminal board + clean integrated conformance; `active → closing → closed`; freeze doc in the same transaction | state and document agree |
+| system | sprint-armed | release every dependency-ready unit through its assigned developer route | every initially ready developer starts |
 | system | pr-green/pr-red/pr-merged | apply recorded PR transition and assigned-role wake | no discretionary interpretation |
 | system | stall/dead-shell | block when legal; boot originating Planner with evidence | Planner decides |
 

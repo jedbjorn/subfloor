@@ -582,7 +582,36 @@ class SprintDeclarationContractTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM conversation_outbox "
                 "WHERE state='pending'"
             ).fetchone()[0],
-            1,
+            2,
+        )
+        release = self.con.execute(
+            "SELECT directive_id,issuer_shell_id,issuer_flavor,kind,target,"
+            "sprint_doc_id,unit_id,status FROM directives "
+            "WHERE sprint_doc_id=? AND kind='sprint-armed'",
+            (sprint_id,),
+        ).fetchone()
+        self.assertIsNotNone(release)
+        self.assertEqual(
+            tuple(release)[1:],
+            (
+                None,
+                "system",
+                "sprint-armed",
+                "conductor",
+                sprint_id,
+                None,
+                "pending",
+            ),
+        )
+        queued = list(self.con.execute(
+            "SELECT body FROM conversation_messages "
+            "WHERE conversation_id=? ORDER BY message_id",
+            (armed["conductor"]["conversation_id"],),
+        ))
+        self.assertEqual(len(queued), 2)
+        self.assertIn(
+            f'"directive_id":{release["directive_id"]}',
+            queued[1]["body"],
         )
 
         with mock.patch.object(
@@ -606,6 +635,54 @@ class SprintDeclarationContractTest(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM directives "
+                "WHERE sprint_doc_id=? AND kind='sprint-armed'",
+                (sprint_id,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_arm_release_enqueue_failure_rolls_back_every_activation_row(self):
+        sprint = self.staged_sprint(key="arm-release-failure")
+        sprint_id = sprint["sprint_doc_id"]
+
+        with mock.patch.object(
+            sprint_routes.sprint_conversations,
+            "enqueue_conductor_directive",
+            side_effect=sqlite3.OperationalError("injected release enqueue failure"),
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "injected release enqueue failure",
+            ):
+                self.call(
+                    "PATCH",
+                    f"/api/sprints/{sprint_id}",
+                    {"state": "active"},
+                    key="arm-release-failure",
+                )
+
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprints WHERE sprint_doc_id=?",
+                (sprint_id,),
+            ).fetchone()[0],
+            "declared",
+        )
+        for table in (
+            "conversations",
+            "sprint_conversation_bindings",
+            "directives",
+            "conversation_messages",
+            "conversation_outbox",
+        ):
+            self.assertEqual(
+                self.con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                0,
+                f"{table} escaped a failed arm transaction",
+            )
 
     def test_parallel_arm_retry_creates_exactly_one_conductor(self):
         sprint = self.staged_sprint(key="parallel-arm")
@@ -759,6 +836,31 @@ class SprintDeclarationContractTest(unittest.TestCase):
                 (sprint_id,),
             ).fetchone()[0],
             1,
+        )
+
+        restored = self.con.execute(
+            "SELECT * FROM sprint_cancellations WHERE sprint_doc_id=?",
+            (sprint_id,),
+        ).fetchone()
+        self.con.execute(
+            "DROP TRIGGER trg_sprint_cancellation_delete"
+        )
+        self.con.execute(
+            "DELETE FROM sprint_cancellations WHERE sprint_doc_id=?",
+            (sprint_id,),
+        )
+        columns = tuple(restored.keys())
+        self.con.execute(
+            f"INSERT INTO sprint_cancellations ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            tuple(restored),
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprint_cancellations WHERE sprint_doc_id=?",
+                (sprint_id,),
+            ).fetchone()[0],
+            "completed",
         )
 
     def test_cancel_records_interrupt_for_a_run_that_crossed_dispatch(self):

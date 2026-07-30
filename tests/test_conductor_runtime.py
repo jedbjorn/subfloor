@@ -462,6 +462,13 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ),
         (
             "system",
+            "sprint-armed",
+            "pending",
+            {},
+            False,
+        ),
+        (
+            "system",
             "pr-green",
             "in_review",
             {"head_sha": "abc", "transition": "checks:SUCCESS"},

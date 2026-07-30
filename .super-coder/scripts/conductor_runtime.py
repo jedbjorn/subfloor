@@ -167,6 +167,12 @@ TRANSITIONS = (
     ),
     (
         "system",
+        "sprint-armed",
+        "release every dependency-ready unit",
+        "every initially ready developer starts from committed board state",
+    ),
+    (
+        "system",
         "pr-green",
         "boot assigned reviewer",
         "reviewer receives the green-head evidence",
@@ -1100,7 +1106,18 @@ def _execute(
         return assignments
 
     unit = _unit(con, row) if row["unit_id"] is not None else None
-    if kind == "pr-green":
+    if kind == "sprint-armed":
+        if unit is not None:
+            raise DirectiveRefused("sprint-armed must not name a unit")
+        _release_ready_units(
+            con,
+            assignments,
+            row,
+            payload,
+            actor_shell_id,
+            prepared_routes,
+        )
+    elif kind == "pr-green":
         if unit is None:
             raise DirectiveRefused("pr-green requires unit_id")
         if unit["state"] != "in_review":
