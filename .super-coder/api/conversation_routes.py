@@ -319,7 +319,13 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
-        "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname "
+        "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
+        "CASE WHEN c.state!='closed' THEN ("
+        " SELECT requested.created_at FROM conversation_events requested "
+        " WHERE requested.conversation_id=c.conversation_id "
+        " AND requested.event_type='conversation.close.requested' "
+        " ORDER BY requested.sequence DESC LIMIT 1"
+        ") END AS close_requested_at "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         "WHERE c.conversation_id=? AND c.mode='normal' AND c.owner_user_id=?",
         (conversation_id, owner_user_id),
@@ -347,6 +353,7 @@ def _conversation_projection(row) -> dict:
         "created_at": row["created_at"],
         "last_activity_at": row["last_activity_at"],
         "closed_at": row["closed_at"],
+        "close_requested_at": row["close_requested_at"],
         "version": int(row["version"]),
     }
 
@@ -380,6 +387,128 @@ def _require_conversation(con, conversation_id: str, owner_user_id: int):
     if row is None:
         raise ApiError(404, "CONVERSATION_NOT_FOUND", "conversation does not exist")
     return row
+
+
+def _close_requested(con, conversation_id: str) -> bool:
+    return (
+        con.execute(
+            "SELECT 1 FROM conversation_events WHERE conversation_id=? "
+            "AND event_type='conversation.close.requested' LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _cancel_queued_turns(con, conversation_id: str) -> int:
+    message_ids = [
+        int(row["message_id"])
+        for row in con.execute(
+            "SELECT DISTINCT message_id FROM conversation_outbox "
+            "WHERE conversation_id=? AND state IN ('pending','claimed')",
+            (conversation_id,),
+        ).fetchall()
+    ]
+    if not message_ids:
+        return 0
+    marks = ",".join("?" for _ in message_ids)
+    cancelled = con.execute(
+        "UPDATE conversation_messages SET state='cancelled',"
+        "completed_at=datetime('now') "
+        f"WHERE message_id IN ({marks}) "
+        "AND state IN ('accepted','queued','running')",
+        message_ids,
+    ).rowcount
+    con.execute(
+        "UPDATE conversation_outbox SET state='cancelled',"
+        "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL "
+        f"WHERE message_id IN ({marks}) AND state IN ('pending','claimed')",
+        message_ids,
+    )
+    return int(cancelled)
+
+
+def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+    active = con.execute(
+        "SELECT run_id,trigger_message_id FROM conversation_runs "
+        "WHERE conversation_id=? AND state IN ('leased','starting','running') "
+        "ORDER BY run_id DESC LIMIT 1",
+        (conversation_id,),
+    ).fetchone()
+    cancelled = _cancel_queued_turns(con, conversation_id)
+    if active is not None:
+        run_id = int(active["run_id"])
+        if not _close_requested(con, conversation_id):
+            _append_event(
+                con,
+                conversation_id,
+                "conversation.close.requested",
+                {"cancelled_queued_turns": cancelled},
+                run_id=run_id,
+            )
+        interrupt_exists = con.execute(
+            "SELECT 1 FROM conversation_events WHERE run_id=? "
+            "AND event_type='run.interrupt.requested' LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if interrupt_exists is None:
+            _append_event(
+                con,
+                conversation_id,
+                "run.interrupt.requested",
+                {"reason": "conversation.close"},
+                message_id=int(active["trigger_message_id"]),
+                run_id=run_id,
+            )
+        con.execute(
+            "UPDATE conversations SET last_activity_at=datetime('now'),"
+            "version=version+1 WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        return run_id
+
+    recovered_state = None
+    if current_state == "queued":
+        con.execute(
+            "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+    elif current_state == "running":
+        recovered_state = current_state
+        con.execute(
+            "UPDATE conversations SET state='error' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+    con.execute(
+        "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
+        "last_activity_at=datetime('now'),version=version+1 "
+        "WHERE conversation_id=?",
+        (conversation_id,),
+    )
+    _append_event(
+        con,
+        conversation_id,
+        "conversation.closed",
+        {
+            "state": "closed",
+            "cancelled_queued_turns": cancelled,
+            **(
+                {"recovered_orphaned_state": recovered_state}
+                if recovered_state
+                else {}
+            ),
+        },
+    )
+    return None
+
+
+def _deliver_close_interrupt(run_id: int) -> None:
+    try:
+        conversation_broker.interrupt_run(run_id)
+    except conversation_broker.BrokerError:
+        # The close transaction already persisted interrupt intent. A live
+        # broker is nudged now; startup/lease recovery delivers it otherwise.
+        conversation_broker.notify_commit()
 
 
 def _live_shell_session(shell) -> str | None:
@@ -686,7 +815,13 @@ def _list_conversations(con, operator: dict, query):
     rows = con.execute(
         "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
-        "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname "
+        "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
+        "CASE WHEN c.state!='closed' THEN ("
+        " SELECT requested.created_at FROM conversation_events requested "
+        " WHERE requested.conversation_id=c.conversation_id "
+        " AND requested.event_type='conversation.close.requested' "
+        " ORDER BY requested.sequence DESC LIMIT 1"
+        ") END AS close_requested_at "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE "
         + " AND ".join(clauses)
         + " ORDER BY c.last_activity_at DESC,c.conversation_id DESC LIMIT ?",
@@ -729,6 +864,7 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
     if "state" in body and body["state"] != "closed":
         raise ApiError(422, "VALIDATION_ERROR", "state may only be changed to closed")
 
+    active_run_id = None
     with db_driver.write_transaction(con, "conversation.patch"):
         row = _require_conversation(con, conversation_id, operator["user_id"])
         if int(row["version"]) != version:
@@ -745,16 +881,7 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                 "CONVERSATION_CLOSED",
                 "conversation is already closed",
             )
-        if closing and row["state"] not in ("idle", "waiting", "error"):
-            raise ApiError(
-                409,
-                "BROWSER_CHAT_BUSY",
-                "a queued or running conversation cannot be closed",
-                {"state": row["state"]},
-            )
-        sets = ["version=version+1"]
-        if "title" in body or closing:
-            sets.append("last_activity_at=datetime('now')")
+        sets = []
         params: list = []
         if "title" in body:
             sets.append("title=?")
@@ -763,35 +890,61 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
             sets.append("starred=?")
             params.append(int(body["starred"]))
         if closing:
-            sets.extend(("state='closed'", "closed_at=datetime('now')"))
-        changed = con.execute(
-            f"UPDATE conversations SET {','.join(sets)} "
-            "WHERE conversation_id=? AND owner_user_id=? AND version=?",
-            (*params, conversation_id, operator["user_id"], version),
-        ).rowcount
-        if changed != 1:
-            raise ApiError(
-                409,
-                "CONVERSATION_VERSION_CONFLICT",
-                "conversation changed concurrently",
+            if sets:
+                con.execute(
+                    f"UPDATE conversations SET {','.join(sets)} "
+                    "WHERE conversation_id=?",
+                    (*params, conversation_id),
+                )
+                _append_event(
+                    con,
+                    conversation_id,
+                    "conversation.updated",
+                    {
+                        **({"title": title} if "title" in body else {}),
+                        **(
+                            {"starred": body["starred"]}
+                            if "starred" in body
+                            else {}
+                        ),
+                    },
+                )
+            active_run_id = _begin_close(con, conversation_id, row["state"])
+        else:
+            sets.insert(0, "version=version+1")
+            if "title" in body:
+                sets.append("last_activity_at=datetime('now')")
+            changed = con.execute(
+                f"UPDATE conversations SET {','.join(sets)} "
+                "WHERE conversation_id=? AND owner_user_id=? AND version=?",
+                (*params, conversation_id, operator["user_id"], version),
+            ).rowcount
+            if changed != 1:
+                raise ApiError(
+                    409,
+                    "CONVERSATION_VERSION_CONFLICT",
+                    "conversation changed concurrently",
+                )
+            _append_event(
+                con,
+                conversation_id,
+                (
+                    "conversation.renamed"
+                    if set(body) == {"version", "title"}
+                    else "conversation.updated"
+                ),
+                {
+                    **({"title": title} if "title" in body else {}),
+                    **(
+                        {"starred": body["starred"]}
+                        if "starred" in body
+                        else {}
+                    ),
+                },
             )
-        _append_event(
-            con,
-            conversation_id,
-            (
-                "conversation.closed"
-                if closing and set(body) == {"version", "state"}
-                else "conversation.renamed"
-                if set(body) == {"version", "title"}
-                else "conversation.updated"
-            ),
-            {
-                **({"title": title} if "title" in body else {}),
-                **({"starred": body["starred"]} if "starred" in body else {}),
-                **({"state": "closed"} if closing else {}),
-            },
-        )
     conversation_events.notify(conversation_id)
+    if active_run_id is not None:
+        _deliver_close_interrupt(active_run_id)
     return _json(
         200,
         _conversation_projection(
@@ -844,6 +997,12 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
                 409,
                 "CONVERSATION_CLOSED",
                 "closed conversations reject messages",
+            )
+        if _close_requested(con, conversation_id):
+            raise ApiError(
+                409,
+                "CONVERSATION_CLOSING",
+                "the conversation is stopping active work before it closes",
             )
         target_state = (
             conversation["state"]

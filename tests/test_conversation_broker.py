@@ -382,6 +382,42 @@ class StoreContractTest(ConversationBrokerCase):
         self.assertEqual(first_state, "completed")
         self.assertEqual(sequences, [1, 2])
 
+    def test_close_requested_conversation_cannot_dispatch_queued_work(self) -> None:
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        con = self.connect()
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload) "
+            "VALUES (?,1,'conversation.close.requested','{}')",
+            (conversation_id,),
+        )
+        con.commit()
+        con.close()
+
+        self.assertIsNone(BrokerStore(self.db_path).claim_next("broker"))
+
+        con = self.connect()
+        try:
+            message = con.execute(
+                "SELECT state FROM conversation_messages WHERE message_id=?",
+                (message_id,),
+            ).fetchone()[0]
+            outbox = con.execute(
+                "SELECT state,run_id FROM conversation_outbox WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+            run_count = con.execute(
+                "SELECT COUNT(*) FROM conversation_runs "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(message, "queued")
+        self.assertEqual(tuple(outbox), ("pending", None))
+        self.assertEqual(run_count, 0)
+
     def test_shell_mutation_lock_blocks_other_conversation(self) -> None:
         self.allow_legacy_duplicate_open_chats()
         first_conversation = self.add_conversation(shell_id=1)
