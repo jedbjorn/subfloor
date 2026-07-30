@@ -3285,6 +3285,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, get_roadmap(con))
             if path == "/api/sprints":
                 q = parse_qs(urlparse(self.path).query)
+                if q.get("view") == ["board"] and "status" not in q:
+                    try:
+                        recent = int(q.get("recent", ["5"])[0])
+                    except (TypeError, ValueError):
+                        return self._send(
+                            422,
+                            {"error": {
+                                "code": "validation",
+                                "message": (
+                                    "recent must be an integer from 0 through 20"
+                                ),
+                            }},
+                        )
+                    if recent < 0 or recent > 20:
+                        return self._send(
+                            422,
+                            {"error": {
+                                "code": "validation",
+                                "message": (
+                                    "recent must be an integer from 0 through 20"
+                                ),
+                            }},
+                        )
+                    return self._send(
+                        200, sprint_routes._sprint_overview(con, recent)
+                    )
                 if q.get("status") != ["active"]:
                     return self._send(
                         400, {"error": "status=active is required"})

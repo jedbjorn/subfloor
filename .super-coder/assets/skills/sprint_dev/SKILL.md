@@ -9,7 +9,9 @@ common: false
 
 Own only the unit in the mandatory slot context. Conductor owns the board,
 worker boots, relays, and dependency release. The originating Planner owns
-decisions. You build, prove, report, and exit.
+decisions. This is one fresh headless assignment, not a resumable shell:
+`SC_SPRINT_*` names the Sprint, unit, assignment, required result, and
+Conductor recipient. You build, prove, return one typed result, and exit.
 
 ## Establish the boundary
 
@@ -74,6 +76,21 @@ sc directives emit unit-report \
   --payload '{"shipped":"<observable behavior>","judgements":[],"issues":[],"deviations":[],"follow_ups":[]}'
 ```
 
+Record the directive ID printed by the final `sc directives emit` command for
+this assignment. Before exiting, correlate that exact directive with this
+one-shot:
+
+```sh
+sc mem message send "$SC_SPRINT_RESULT_TARGET" \
+  "<bounded result evidence>" \
+  --kind result --sprint "$SC_SPRINT_REF" --directive <directive-id>
+```
+
+The assignment ID and required `unit-report` result kind come from the injected
+environment automatically. A result message without the exact directive is
+refused. Final assistant text is supporting evidence only; it does not return
+the assignment to Conductor.
+
 ## Forbidden
 
 Never write the sprint board, boot or kill shells, schedule polling, issue
@@ -82,6 +99,6 @@ or continue after an unresolved decision request.
 
 ## Stop
 
-Exit after the inspected transition directive for the turn. Completion means
-the approved head is merged, both merge/report directives exist, and the
-worktree is clean.
+Exit after the transition directive and its typed result message are both
+accepted. Completion means the approved head is merged when applicable, both
+merge/report directives exist at closeout, and the worktree is clean.

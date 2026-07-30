@@ -293,11 +293,11 @@ out({
     assert result["boards"] == result["flows"] == 2
     assert result["titles"][0].startswith("sprint: rendered verbatim")
     assert result["titles"][1].startswith("SPRINT: second board")
-    assert result["controls"] == 2
+    assert result["controls"] == 1
     assert result["utc"] == "2026-07-26T20:00:00Z"
 
 
-def test_cancel_is_the_only_lifecycle_control_and_clears_board_immediately():
+def test_cancel_is_the_only_lifecycle_control_and_moves_board_to_closing():
     result = run_js(
         """
 apiQueue = [DATA, { cleared: true, cancellation: { cancellation_id: 9 } }];
@@ -321,7 +321,7 @@ out({
             "function toast(message) { notices.push(message); }\n"
         ),
     )
-    assert result["boards"] == 0
+    assert result["boards"] == 1
     assert result["nav"] == "Sprints"
     assert result["request"] == {
         "path": "/sprints/77/cancellations",
@@ -330,7 +330,7 @@ out({
         "headers": {"Idempotency-Key": "ui-request-key"},
     }
     assert result["notices"] == [
-        "Sprint #77 cancelled; Planner abort report queued."
+        "Sprint #77 cancelling; Planner abort report queued."
     ]
 
 
@@ -376,6 +376,142 @@ out({
     assert "Oversee Sprint 77." in result["text"]
     assert "Board observed." in result["text"]
     assert result["lines"] == 2
+
+
+def test_assignment_evidence_and_conductor_message_stop_controls():
+    running = payload()
+    running["open_count"] = 1
+    running["sprints"][0]["assignments"] = [
+        {
+            "binding_id": 41,
+            "role": "developer",
+            "slot": "DEV1",
+            "unit_seq": "U3",
+            "display_state": "closed",
+            "shell": {"shortname": "DEV1"},
+            "result": {
+                "message_id": 88,
+                "result_kind": "unit-report",
+                "directive_id": 73,
+            },
+            "run": None,
+            "error_evidence": None,
+        },
+        {
+            "binding_id": 42,
+            "role": "reviewer",
+            "slot": "REV1",
+            "unit_seq": "U3",
+            "display_state": "unknown",
+            "shell": {"shortname": "REV1"},
+            "result": None,
+            "run": {"error_code": "RUN_UNPROVEN", "error_detail": "lease expired"},
+            "error_evidence": None,
+        },
+    ]
+    running["sprints"][0]["conductor"] = {
+        "conversation_id": "cv_" + ("b" * 32),
+        "state": "running",
+        "shell": {"shortname": "CON1"},
+        "run": {"run_id": 19, "state": "running"},
+        "messages": [],
+        "assistant": [],
+        "events": [],
+    }
+    stopped = json.loads(json.dumps(running))
+    stopped["sprints"][0]["conductor"]["state"] = "idle"
+    stopped["sprints"][0]["conductor"]["run"]["state"] = "cancelled"
+    result = run_js(
+        """
+apiQueue = [
+  RUNNING,
+  { message: { message_id: 90 }, queue_position: 1 },
+  RUNNING,
+  { interruption: { message_id: 91 }, run_id: 19 },
+  STOPPED,
+];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const before = root.textContent;
+const composer = byClass(root, "sprint-conductor-composer")[0];
+composer.value = "Inspect directive 73";
+await byClass(root, "sprint-conductor-send")[0].onclick();
+await byClass(root, "sprint-conductor-stop")[0].onclick();
+out({
+  before,
+  requests: apiRequests.filter(
+    (request) => request.path.includes("/conversations/")),
+  stop: byClass(root, "sprint-conductor-stop")[0].textContent,
+  stopDisabled: byClass(root, "sprint-conductor-stop")[0].disabled,
+});
+""",
+        prelude=(
+            "const RUNNING = " + json.dumps(running) + ";\n"
+            "const STOPPED = " + json.dumps(stopped) + ";\n"
+            "function toast() {}\n"
+        ),
+    )
+    assert "Developer · U3closedDEV1 · assignment #41" in result["before"]
+    assert "Result: unit-report message #88 · directive #73" in result["before"]
+    assert "Reviewer · U3unknownREV1 · assignment #42" in result["before"]
+    assert "RUN_UNPROVEN · lease expired" in result["before"]
+    assert result["requests"] == [
+        {
+            "path": f"/conversations/{running['sprints'][0]['conductor']['conversation_id']}/messages",
+            "method": "POST",
+            "body": {"text": "Inspect directive 73"},
+            "headers": {"Idempotency-Key": "ui-request-key"},
+        },
+        {
+            "path": f"/conversations/{running['sprints'][0]['conductor']['conversation_id']}/interruptions",
+            "method": "POST",
+            "body": {"run_id": 19},
+            "headers": {"Idempotency-Key": "ui-request-key"},
+        },
+    ]
+    assert result["stop"] == "Stop"
+    assert result["stopDisabled"] is True
+
+
+def test_conductor_stream_reports_reconnect_and_closes_on_tab_exit():
+    data = payload()
+    data["sprints"][0]["conductor"] = {
+        "conversation_id": "cv_" + ("c" * 32),
+        "state": "idle",
+        "shell": {"shortname": "CON1"},
+        "run": None,
+        "messages": [],
+        "assistant": [],
+        "events": [],
+    }
+    result = run_js(
+        """
+apiQueue = [DATA];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+sources[0].onopen();
+const connected = root.textContent;
+sources[0].onerror();
+const reconnecting = root.textContent;
+sprintsStopRender();
+out({ connected, reconnecting, closed: sources[0].closed });
+""",
+        prelude=(
+            "const DATA = " + json.dumps(data) + ";\n"
+            "const sources = [];\n"
+            "globalThis.EventSource = class {\n"
+            "  constructor(url) { this.url = url; this.closed = false;"
+            " this.listeners = {}; sources.push(this); }\n"
+            "  addEventListener(name, fn) { this.listeners[name] = fn; }\n"
+            "  close() { this.closed = true; }\n"
+            "};\n"
+        ),
+    )
+    assert "Conductor · CON1 · idle · connected" in result["connected"]
+    assert "Conductor · CON1 · idle · reconnecting" in result["reconnecting"]
+    assert result["closed"] is True
 
 
 def test_flow_columns_cards_and_active_role_emphasis():
@@ -1057,7 +1193,7 @@ out({
             "warn": False,
             "title": "",
             "boardCount": 0,
-            "text": "No active sprints.",
+            "text": "No Sprints yet.",
         },
     }
 
@@ -1109,7 +1245,7 @@ out({
 
 
 def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
-    sprint_css = STYLE[STYLE.index("/* Active Sprint flow boards"):
+    sprint_css = STYLE[STYLE.index("/* Sprint observation"):
                        STYLE.index("/* Roadmap Flow view")]
     assert "#view-sprints, .sprint-board { min-width: 0; }" in sprint_css
     assert "#view-sprints { max-width: 1350px; }" in sprint_css
@@ -1137,7 +1273,7 @@ out({ text: root.textContent, nav: navButton.textContent,
         prelude="const DATA = " + json.dumps(payload(count=0)) + ";\n",
     )
     assert zero == {
-        "text": "No active sprints.", "nav": "Sprints", "warn": False,
+        "text": "No Sprints yet.", "nav": "Sprints", "warn": False,
         "hidden": False,
     }
 

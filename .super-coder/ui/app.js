@@ -2474,6 +2474,10 @@ const sprintsState = {
   renderedRoot: null,
   renderedSignature: null,
   selectedByDocument: new Map(),
+  pendingMessages: new Map(),
+  pendingStops: new Map(),
+  streamStates: new Map(),
+  eventSources: new Map(),
 };
 
 function sprintsDuration(startedAt, now = Date.now()) {
@@ -2492,7 +2496,7 @@ function sprintsDuration(startedAt, now = Date.now()) {
 function sprintsUpdateNav(payload) {
   const button = document.querySelector('nav button[data-tab="sprints"]');
   if (!button) return;
-  const count = payload.active_count;
+  const count = Number(payload.open_count ?? payload.active_count ?? 0);
   button.textContent = count > 0 ? `Sprints ${count}` : "Sprints";
   button.classList.toggle("warn", count > 0);
   button.title = "";
@@ -2500,10 +2504,15 @@ function sprintsUpdateNav(payload) {
 }
 
 function sprintsHeader(sprint) {
+  const displayState = sprint.display_state || sprint.state || "unknown";
   const header = el("div", { className: "sprint-header" },
     el("h2", {}, sprint.title),
     el("span", { className: "pill" }, `Doc #${sprint.document_id}`),
-    el("span", { className: "pill" }, sprint.state || "unknown"));
+    el("span", {
+      className: `pill sprint-state state-${displayState}`,
+    }, displayState));
+  const cancellable = ["declared", "active"].includes(sprint.state)
+    && !sprint.cancellation;
   const cancel = el("button", {
     className: "act danger sprint-cancel",
     type: "button",
@@ -2522,29 +2531,28 @@ function sprintsHeader(sprint) {
     cancel.disabled = true;
     cancel.textContent = "Cancelling…";
     try {
-      await api(
+      const result = await api(
         `/sprints/${sprint.document_id}/cancellations`,
         "POST",
         { reason },
         { "Idempotency-Key": requestKey() },
       );
-      sprintsState.payload.sprints = (
-        sprintsState.payload.sprints || []
-      ).filter((item) => item.document_id !== sprint.document_id);
+      sprint.cancellation = result.cancellation;
+      sprint.display_state = "cancelling";
       sprintsState.payload.active_count = Math.max(
         0, Number(sprintsState.payload.active_count || 0) - 1);
       sprintsState.renderedSignature = null;
       sprintsUpdateNav(sprintsState.payload);
       sprintsPaint();
       toast(
-        `Sprint #${sprint.document_id} cancelled; Planner abort report queued.`);
+        `Sprint #${sprint.document_id} cancelling; Planner abort report queued.`);
     } catch (error) {
       cancel.disabled = false;
       cancel.textContent = "Cancel Sprint";
       toast("error: " + error.message);
     }
   };
-  header.append(cancel);
+  if (cancellable) header.append(cancel);
   const planner = sprint.planner
     ? sprint.planner.shortname : "Unbound";
   const feature = sprint.feature
@@ -2576,7 +2584,48 @@ function sprintsHeader(sprint) {
         `Started: ${started.toLocaleString()}`),
       durationNode);
   }
+  if (sprint.cancellation) {
+    const progress = sprint.cancellation.state === "completed"
+      ? "Abort report complete"
+      : "Waiting for Planner abort report";
+    meta.append(el(
+      "span",
+      { className: "sprint-cancellation-progress" },
+      `Cancellation: ${progress} · ${sprint.cancellation.reason}`,
+    ));
+  }
   return [header, meta];
+}
+
+function sprintsRefreshSoon() {
+  sprintsState.renderedSignature = null;
+  sprintsPaint();
+  return sprintsRefresh();
+}
+
+function sprintsSetStreamState(conversationId, state) {
+  if (sprintsState.streamStates.get(conversationId) === state) return;
+  sprintsState.streamStates.set(conversationId, state);
+  sprintsState.renderedSignature = null;
+  sprintsPaint();
+}
+
+function sprintsEnsureStream(conversationId) {
+  if (typeof EventSource === "undefined"
+      || sprintsState.eventSources.has(conversationId)) return;
+  const source = new EventSource(
+    `/api/conversations/${conversationId}/events`);
+  sprintsState.eventSources.set(conversationId, source);
+  source.onopen = () => sprintsSetStreamState(conversationId, "connected");
+  source.onerror = () => sprintsSetStreamState(conversationId, "reconnecting");
+  const refresh = () => {
+    if (sprintsState.active) sprintsRefresh();
+  };
+  for (const type of [
+    "message.accepted", "run.started", "assistant.delta",
+    "permission.requested", "input.requested", "run.completed", "run.failed",
+    "run.interrupted", "run.unknown", "conversation.closed",
+  ]) source.addEventListener(type, refresh);
 }
 
 function sprintsConductor(sprint) {
@@ -2584,6 +2633,9 @@ function sprintsConductor(sprint) {
   if (!conductor) return el(
     "div", { className: "sprint-conductor muted" },
     "Conductor has not started.");
+  const terminal = ["closed", "aborted"].includes(sprint.state)
+    || conductor.state === "closed";
+  if (!terminal) sprintsEnsureStream(conductor.conversation_id);
   const transcript = el("div", { className: "sprint-conductor-transcript" });
   for (const message of conductor.messages || []) {
     transcript.append(el(
@@ -2604,19 +2656,177 @@ function sprintsConductor(sprint) {
     " ",
     assistantText,
   ));
+  for (const event of conductor.events || []) {
+    if (![
+      "permission.requested", "input.requested", "run.failed",
+      "run.interrupted", "run.unknown", "sprint.assignment.completed",
+    ].includes(event.event_type)) continue;
+    const detail = event.payload?.error_detail || event.payload?.error
+      || event.payload?.outcome || "";
+    transcript.append(el(
+      "div",
+      { className: `sprint-conductor-line activity ${event.event_type}` },
+      el("span", { className: "k" }, "Activity"),
+      " ",
+      `${event.event_type}${detail ? ` · ${detail}` : ""}`,
+    ));
+  }
   if (!transcript.children.length)
     transcript.append(el("div", { className: "muted" }, "No transcript yet."));
+  const pendingMessage = sprintsState.pendingMessages.get(
+    conductor.conversation_id);
+  if (!["running", "waiting"].includes(conductor.state))
+    sprintsState.pendingStops.delete(conductor.conversation_id);
+  const pendingStop = sprintsState.pendingStops.get(conductor.conversation_id);
+  const cancelling = sprint.display_state === "cancelling";
+  const composer = el("textarea", {
+    className: "sprint-conductor-composer",
+    rows: 2,
+    placeholder: terminal
+      ? "This Sprint conversation is closed."
+      : cancelling
+        ? "Cancellation is in progress."
+        : "Message Conductor…",
+    disabled: terminal || cancelling,
+    value: pendingMessage?.text || "",
+  });
+  const send = el("button", {
+    className: "act sprint-conductor-send",
+    type: "button",
+    textContent: pendingMessage ? "Retry send" : "Send",
+    disabled: terminal || cancelling,
+  });
+  const stop = el("button", {
+    className: "act danger sprint-conductor-stop",
+    type: "button",
+    textContent: pendingStop ? "Stopping…" : "Stop",
+    disabled: !["running", "waiting"].includes(conductor.state)
+      || Boolean(pendingStop),
+    title: "Interrupt only the active Conductor turn",
+  });
+  const submit = async () => {
+    const text = composer.value.trim();
+    if (!text || send.disabled) return;
+    let pending = sprintsState.pendingMessages.get(conductor.conversation_id);
+    if (!pending || pending.text !== text) {
+      pending = { text, key: requestKey() };
+      sprintsState.pendingMessages.set(conductor.conversation_id, pending);
+    }
+    send.disabled = true;
+    send.textContent = "Sending…";
+    try {
+      await api(
+        `/conversations/${conductor.conversation_id}/messages`,
+        "POST",
+        { text },
+        { "Idempotency-Key": pending.key },
+      );
+      sprintsState.pendingMessages.delete(conductor.conversation_id);
+      composer.value = "";
+      await sprintsRefreshSoon();
+    } catch (error) {
+      send.disabled = false;
+      send.textContent = "Retry send";
+      toast("error: " + error.message);
+    }
+  };
+  send.onclick = submit;
+  composer.onkeydown = (event) => {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    submit();
+  };
+  stop.onclick = async () => {
+    if (stop.disabled) return;
+    const pending = { key: requestKey() };
+    sprintsState.pendingStops.set(conductor.conversation_id, pending);
+    stop.disabled = true;
+    stop.textContent = "Stopping…";
+    try {
+      await api(
+        `/conversations/${conductor.conversation_id}/interruptions`,
+        "POST",
+        conductor.run?.run_id == null
+          ? {} : { run_id: conductor.run.run_id },
+        { "Idempotency-Key": pending.key },
+      );
+      await sprintsRefreshSoon();
+    } catch (error) {
+      sprintsState.pendingStops.delete(conductor.conversation_id);
+      stop.disabled = !["running", "waiting"].includes(conductor.state);
+      stop.textContent = "Stop";
+      toast("error: " + error.message);
+    }
+  };
+  const connection = sprintsState.streamStates.get(conductor.conversation_id)
+    || (typeof EventSource === "undefined" ? "polling" : "connecting");
+  const controls = el(
+    "div",
+    { className: "sprint-conductor-controls" },
+    composer,
+    el("div", { className: "sprint-conductor-actions" }, send, stop),
+  );
   return el(
     "details",
-    { className: "sprint-conductor" },
+    { className: "sprint-conductor", open: !terminal },
     el(
       "summary",
       {},
       `Conductor · ${conductor.shell?.shortname || "unknown"} · `
-      + `${conductor.state || "unknown"}`,
+      + `${conductor.state || "unknown"} · ${connection}`,
     ),
     transcript,
+    controls,
   );
+}
+
+function sprintsAssignments(sprint) {
+  const assignments = sprint.assignments || [];
+  const wrap = el("section", { className: "sprint-assignments" },
+    el("h3", {}, "Assignments"));
+  if (!assignments.length) {
+    wrap.append(el("div", { className: "muted" }, "No worker assignments yet."));
+    return wrap;
+  }
+  const list = el("div", { className: "sprint-assignment-list" });
+  for (const assignment of assignments) {
+    const role = assignment.role === "conformance"
+      ? "Conformance" : assignment.role[0].toUpperCase() + assignment.role.slice(1);
+    const unit = assignment.unit_seq ? ` · ${assignment.unit_seq}` : "";
+    const card = el(
+      "article",
+      { className: `sprint-assignment state-${assignment.display_state}` },
+      el("div", { className: "sprint-assignment-head" },
+        el("strong", {}, `${role}${unit}`),
+        el("span", {
+          className: `pill state-${assignment.display_state}`,
+        }, assignment.display_state)),
+      el("div", { className: "muted" },
+        `${assignment.shell?.shortname || assignment.slot} · `
+        + `assignment #${assignment.binding_id}`),
+    );
+    if (assignment.result) {
+      card.append(el(
+        "div",
+        { className: "sprint-assignment-result" },
+        `Result: ${assignment.result.result_kind} message `
+        + `#${assignment.result.message_id}`
+        + (assignment.result.directive_id == null
+          ? "" : ` · directive #${assignment.result.directive_id}`),
+      ));
+    }
+    const evidence = assignment.error_evidence || assignment.run;
+    if (evidence?.error_code || evidence?.error_detail) {
+      card.append(el(
+        "div",
+        { className: "sprint-assignment-error" },
+        [evidence.error_code, evidence.error_detail].filter(Boolean).join(" · "),
+      ));
+    }
+    list.append(card);
+  }
+  wrap.append(list);
+  return wrap;
 }
 
 // Most-advanced state first: dependency wires run prerequisite → dependent,
@@ -2942,41 +3152,48 @@ function sprintsBuildFlow(sprint) {
 }
 
 function sprintsRenderedProjection(payload) {
-  return (payload?.sprints || []).map((sprint) => ({
-    document_id: sprint.document_id,
-    title: sprint.title,
-    state: sprint.state,
-    started_at: sprint.started_at,
-    planner_route: sprint.planner_route,
-    dev_route: sprint.dev_route,
-    reviewer_route: sprint.reviewer_route,
-    conductor: sprint.conductor,
-    qaqc: sprint.qaqc ? {
-      review_id: sprint.qaqc.review_id,
-      verdict: sprint.qaqc.verdict,
-      body_sha256: sprint.qaqc.body_sha256,
-    } : null,
-    planner: sprint.planner
-      ? { shortname: sprint.planner.shortname } : null,
-    feature: sprint.feature ? {
-      feature_id: sprint.feature.feature_id,
-      title: sprint.feature.title,
-    } : null,
-    units: (sprint.units || []).map((unit) => ({
-      seq: unit.seq,
-      unit_title: unit.unit_title,
-      state: unit.state,
-      state_recognized: unit.state_recognized,
-      dev_shell_id: unit.dev_shell_id,
-      dev_shortname: unit.dev_shortname,
-      reviewer_shell_id: unit.reviewer_shell_id,
-      reviewer_shortname: unit.reviewer_shortname,
-      depends_on: unit.depends_on,
-      overlap: unit.overlap,
-      branch: unit.branch,
-      pr_number: unit.pr_number,
+  return {
+    active_count: payload?.active_count,
+    open_count: payload?.open_count,
+    sprints: (payload?.sprints || []).map((sprint) => ({
+      document_id: sprint.document_id,
+      title: sprint.title,
+      state: sprint.state,
+      display_state: sprint.display_state,
+      started_at: sprint.started_at,
+      planner_route: sprint.planner_route,
+      dev_route: sprint.dev_route,
+      reviewer_route: sprint.reviewer_route,
+      conductor: sprint.conductor,
+      cancellation: sprint.cancellation,
+      assignments: sprint.assignments,
+      qaqc: sprint.qaqc ? {
+        review_id: sprint.qaqc.review_id,
+        verdict: sprint.qaqc.verdict,
+        body_sha256: sprint.qaqc.body_sha256,
+      } : null,
+      planner: sprint.planner
+        ? { shortname: sprint.planner.shortname } : null,
+      feature: sprint.feature ? {
+        feature_id: sprint.feature.feature_id,
+        title: sprint.feature.title,
+      } : null,
+      units: (sprint.units || []).map((unit) => ({
+        seq: unit.seq,
+        unit_title: unit.unit_title,
+        state: unit.state,
+        state_recognized: unit.state_recognized,
+        dev_shell_id: unit.dev_shell_id,
+        dev_shortname: unit.dev_shortname,
+        reviewer_shell_id: unit.reviewer_shell_id,
+        reviewer_shortname: unit.reviewer_shortname,
+        depends_on: unit.depends_on,
+        overlap: unit.overlap,
+        branch: unit.branch,
+        pr_number: unit.pr_number,
+      })),
     })),
-  }));
+  };
 }
 
 function sprintsPaint() {
@@ -2995,7 +3212,7 @@ function sprintsPaint() {
   if (!sprintsState.payload) {
     const message = sprintsState.lastFetchAt
       ? "error: " + (sprintsState.error || "request failed")
-      : "Loading active sprints…";
+      : "Loading Sprints…";
     root.replaceChildren(el("div", { className: "card" }, message));
     sprintsState.renderedRoot = root;
     sprintsState.renderedSignature = signature;
@@ -3008,12 +3225,54 @@ function sprintsPaint() {
       "Stale — refresh failed: " + sprintsState.error));
   }
   const sprints = sprintsState.payload.sprints || [];
+  const streamed = new Set(
+    sprints
+      .filter((sprint) => !["closed", "aborted"].includes(sprint.state))
+      .map((sprint) => sprint.conductor?.conversation_id)
+      .filter(Boolean),
+  );
+  for (const [conversationId, source] of sprintsState.eventSources) {
+    if (streamed.has(conversationId)) continue;
+    source.close();
+    sprintsState.eventSources.delete(conversationId);
+    sprintsState.streamStates.delete(conversationId);
+  }
   if (!sprints.length)
-    nodes.push(el("div", { className: "card" }, "No active sprints."));
-  for (const sprint of sprints) {
-    nodes.push(el("section", { className: "card sprint-board" },
-      ...sprintsHeader(sprint), sprintsBuildFlow(sprint),
-      sprintsConductor(sprint)));
+    nodes.push(el("div", { className: "card" }, "No Sprints yet."));
+  const renderedSprints = new Set();
+  for (const group of [
+    { title: "Live", states: ["declared", "active"], className: "sprint-live" },
+    {
+      title: "Closing",
+      states: ["cancelling", "closing"],
+      className: "sprint-closing",
+    },
+    {
+      title: "Recent",
+      states: ["closed", "aborted"],
+      className: "sprint-history",
+    },
+    { title: "Other", states: null, className: "sprint-history" },
+  ]) {
+    const members = sprints.filter((sprint) =>
+      !renderedSprints.has(sprint.document_id)
+      && (
+        group.states === null
+        || group.states.includes(sprint.display_state || sprint.state)
+      ));
+    if (!members.length) continue;
+    for (const sprint of members) renderedSprints.add(sprint.document_id);
+    nodes.push(el("h2", { className: "sprint-group-title" }, group.title));
+    for (const sprint of members) {
+      nodes.push(el(
+        "section",
+        { className: `card sprint-board ${group.className}` },
+        ...sprintsHeader(sprint),
+        sprintsBuildFlow(sprint),
+        sprintsAssignments(sprint),
+        sprintsConductor(sprint),
+      ));
+    }
   }
   root.replaceChildren(...nodes);
   sprintsState.renderedRoot = root;
@@ -3033,7 +3292,7 @@ async function sprintsRefresh({ render = true } = {}) {
   if (sprintsState.inFlight) return sprintsState.inFlight;
   const request = (async () => {
     try {
-      const payload = await api("/sprints?status=active");
+      const payload = await api("/sprints?view=board&recent=5");
       if (!Number.isFinite(payload?.active_count))
         throw new Error("invalid active sprint projection");
       sprintsState.payload = payload;
@@ -3085,7 +3344,10 @@ function sprintsStopRender() {
   if (sprintsState.durationTimer !== null)
     clearInterval(sprintsState.durationTimer);
   for (const cleanup of sprintsState.flowCleanups) cleanup();
+  for (const source of sprintsState.eventSources.values()) source.close();
   sprintsState.flowCleanups = [];
+  sprintsState.eventSources.clear();
+  sprintsState.streamStates.clear();
   sprintsState.active = false;
   sprintsState.root = null;
   sprintsState.durationTimer = null;

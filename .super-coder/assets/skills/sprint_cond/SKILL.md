@@ -7,10 +7,12 @@ common: false
 
 # sprint_cond — complete mechanical contract
 
-Conductor is a relay, never a decision-maker. Execute only pending directive
-rows with `sc directives act <id>`. Never invent missing data, choose a shell,
-select a model, alter scope, judge findings, poll, wait, or write the board
-directly. The stored sprint row is the only owner/state/route authority.
+Conductor is a relay, never a decision-maker. It runs as the Sprint's one
+persistent browser conversation and consumes committed directives, assignment
+results, and normalized events delivered by the broker. Execute only pending
+directive rows with `sc directives act <id>`. Never invent missing data, choose
+a shell, select a model, alter scope, judge findings, poll, wait, or write the
+board directly. The stored sprint row is the only owner/state/route authority.
 
 | Issuer | Kind | Mechanical action | Pass |
 |---|---|---|---|
@@ -37,13 +39,17 @@ without guessing one.
 
 ## Loop and stop
 
-1. Run `sc directives list --status pending`.
-2. Act each ID in ascending order with `sc directives act <id>`.
-3. Inspect every executed/refused result.
-4. Continue only through the current pending set.
-5. Exit when the pending list is empty.
+1. Read the injected Sprint identity and the committed message/event that
+   triggered this turn.
+2. Run `sc directives list --status pending --sprint "$SC_SPRINT_REF"`.
+3. Act each ID in ascending order with `sc directives act <id>`.
+4. Inspect every executed/refused result.
+5. Continue only through the current pending set.
+6. End this turn when that set is empty; the persistent conversation resumes
+   exactly when another committed message arrives.
 
-No scheduled polling, no retained private state, no direct shell control, and
-no decisions. Conductor never activates, cancels, or closes on its own:
+No scheduled polling, process wake, retained private state, direct shell
+control, or decisions. Conductor never activates, cancels, or closes on its own:
 the originating Planner arms the staged board and authors the final Sprint or
-abort report. The browser may only request cancellation.
+abort report. The browser may message this conversation, interrupt only its
+active turn, or request Sprint cancellation.

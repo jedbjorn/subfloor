@@ -137,7 +137,13 @@ class SchemaTest(unittest.TestCase):
                          "high_effort_supported", "stale"}.issubset(cols))
 
     def test_slot_skill_seed_matches_each_source_asset(self):
-        for name in ("sprint_pln", "sprint_dev", "sprint_rev", "sprint_cond"):
+        for name in (
+            "sprint_pln",
+            "sprint_dev",
+            "sprint_rev",
+            "sprint_cond",
+            "sprint_onboarding",
+        ):
             with self.subTest(name=name):
                 asset = (
                     ENGINE / "assets" / "skills" / name / "SKILL.md"
@@ -178,6 +184,7 @@ class SchemaTest(unittest.TestCase):
         conductor = json.loads((templates / "conductor.json").read_text())["skills"]
 
         self.assertIn("sprint_pln", planner)
+        self.assertIn("sprint_onboarding", planner)
         self.assertIn("sprint_dev", dev)
         self.assertIn("sprint_rev", reviewer)
         self.assertEqual(conductor, ["sprint_cond"])
@@ -192,6 +199,24 @@ class SchemaTest(unittest.TestCase):
         }
         self.assertTrue(legacy.isdisjoint(planner + dev + reviewer))
 
+    def test_sprint_onboarding_is_seeded_and_granted_only_to_planner(self):
+        rows = self.con.execute(
+            "SELECT fs.flavor FROM flavor_skills fs "
+            "JOIN skills s ON s.skill_id=fs.skill_id "
+            "WHERE s.name='sprint_onboarding' ORDER BY fs.flavor"
+        ).fetchall()
+        self.assertEqual([row["flavor"] for row in rows], ["planner"])
+        text = (
+            ENGINE / "assets/skills/sprint_onboarding/SKILL.md"
+        ).read_text()
+        for phrase in (
+            "explanatory skill",
+            "browser never performs a second activation step",
+            "Cancel Sprint",
+            "Do not declare, arm, cancel",
+        ):
+            self.assertIn(phrase, text)
+
     def test_role_skills_route_only_through_the_conductor(self):
         def body(name):
             return (ENGINE / "assets" / "skills" / name / "SKILL.md"
@@ -201,7 +226,9 @@ class SchemaTest(unittest.TestCase):
             with self.subTest(name=name):
                 text = body(name)
                 self.assertIn("--target conductor", text)
-                self.assertNotIn("mem message send", text)
+                self.assertIn("mem message send", text)
+                self.assertIn('"$SC_SPRINT_RESULT_TARGET"', text)
+                self.assertIn("--kind result", text)
                 self.assertNotIn("watch inbox", text)
 
 

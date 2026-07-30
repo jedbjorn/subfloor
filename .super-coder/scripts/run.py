@@ -920,6 +920,7 @@ def sprint_launch_env(context: "dict | None") -> dict[str, str]:
         "SC_SPRINT_SLOT": str(context["slot"]),
         "SC_SPRINT_ASSIGNMENT_ID": str(context["binding_id"]),
         "SC_SPRINT_LIFECYCLE": str(context["lifecycle"]),
+        "SC_SPRINT_RESULT_TARGET": str(context["result_target_slot"]),
     }
     optional = {
         "SC_SPRINT_SPEC_DOC_ID": context.get("spec_doc_id"),

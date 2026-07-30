@@ -800,15 +800,24 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
 
-/* Active Sprint flow boards — Planner-armed, with one operator cancel control. */
+/* Sprint observation — Planner-armed, with operator messaging/Stop/Cancel. */
 #view-sprints, .sprint-board { min-width: 0; }
 #view-sprints { max-width: 1350px; }
 .sprint-board { overflow: hidden; }
+.sprint-group-title { margin: 1.2rem 0 .45rem; color: var(--dim);
+  font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
+.sprint-board.sprint-closing { border-color: var(--warn); }
+.sprint-board.sprint-history { opacity: .82; }
 .sprint-header { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
 .sprint-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
 .sprint-cancel { margin: 0 0 0 auto; color: #ef7d86; white-space: nowrap; }
 .sprint-meta { color: var(--dim); font-size: .78rem; margin-bottom: .7rem; }
+.sprint-state.state-cancelling, .sprint-state.state-closing {
+  color: var(--warn); }
+.sprint-state.state-closed { color: var(--ok); }
+.sprint-state.state-aborted { color: #ef7d86; }
+.sprint-cancellation-progress { flex-basis: 100%; color: var(--warn); }
 .sprint-flow { width: 100%; min-width: 0; overflow-x: auto; padding: .2rem 0 .35rem; }
 .sprint-flow-inner { position: relative; min-width: 850px; }
 .sprint-wires { position: absolute; inset: 0 auto auto 0; z-index: 0;
@@ -875,6 +884,34 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .sprint-conductor-line { white-space: pre-wrap; overflow-wrap: anywhere;
   color: var(--dim); }
 .sprint-conductor-line.assistant { color: var(--ink); }
+.sprint-conductor-line.activity { color: var(--warn); }
+.sprint-conductor-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: .45rem; align-items: stretch; }
+.sprint-conductor-composer { min-width: 0; resize: vertical; }
+.sprint-conductor-actions { display: flex; flex-direction: column; gap: .35rem; }
+.sprint-conductor-actions .act { min-width: 5rem; }
+.sprint-assignments { margin-top: .8rem; border-top: 1px solid var(--line);
+  padding-top: .6rem; }
+.sprint-assignments h3 { margin: 0 0 .45rem; color: var(--dim);
+  font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }
+.sprint-assignment-list { display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .45rem; }
+.sprint-assignment { min-width: 0; padding: .5rem .55rem;
+  border: 1px solid var(--line); border-left: 3px solid var(--line);
+  border-radius: 8px; background: var(--panel2); font-size: .72rem; }
+.sprint-assignment.state-working, .sprint-assignment.state-queued {
+  border-left-color: var(--task-open); }
+.sprint-assignment.state-waiting { border-left-color: var(--warn); }
+.sprint-assignment.state-failed, .sprint-assignment.state-unknown {
+  border-left-color: #ef7d86; }
+.sprint-assignment.state-cancelled { border-left-color: var(--dim); }
+.sprint-assignment.state-closed { border-left-color: var(--ok); }
+.sprint-assignment-head { display: flex; justify-content: space-between;
+  gap: .5rem; align-items: baseline; }
+.sprint-assignment-result { margin-top: .3rem; color: var(--ok);
+  overflow-wrap: anywhere; }
+.sprint-assignment-error { margin-top: .3rem; color: #ef7d86;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* Roadmap Flow view — feature dependency graph: cards in stage columns with an
    SVG wire overlay (blocker → blocked). Replaces the old mermaid flowchart. */

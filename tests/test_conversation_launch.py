@@ -253,6 +253,7 @@ def test_sprint_worker_launch_injects_validated_assignment_context(launch_case):
     assert sprint["spec_doc_id"] == 25
     assert sprint["source_directive_id"]
     assert sprint["required_result_kind"] == "unit-report"
+    assert sprint["result_target_slot"] == "dev"
     assert sprint["units"] == [{
         "unit_id": sprint["units"][0]["unit_id"],
         "seq": "U1",
@@ -268,6 +269,7 @@ def test_sprint_worker_launch_injects_validated_assignment_context(launch_case):
     assert context.env["SC_SPRINT_SLOT"] == "dev"
     assert context.env["SC_SPRINT_UNIT"] == "U1"
     assert context.env["SC_SPRINT_REQUIRED_RESULT_KIND"] == "unit-report"
+    assert context.env["SC_SPRINT_RESULT_TARGET"] == "dev"
 
 
 def test_persistent_conductor_preserves_exact_session_resume(launch_case):

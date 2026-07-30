@@ -37,6 +37,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (server.py adds scripts/ to the path on import)
 import sprint_routes  # noqa: E402
 import sprint_units  # noqa: E402
+import sprint_conversations  # noqa: E402
 
 
 def build_db() -> sqlite3.Connection:
@@ -264,6 +265,143 @@ class ActiveSprintsProjectionTest(unittest.TestCase):
             sprint["document_id"]
             for sprint in server.get_active_sprints(self.con)["sprints"]
         ]
+
+    def _state_doc(self, title: str, state: str, *, closed_at=None) -> int:
+        doc_id = self._doc("Ordinary staging title")
+        self.con.execute(
+            "UPDATE documents SET title=? WHERE document_id=?",
+            (title, doc_id),
+        )
+        self.con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy,closed_at) VALUES (?,?,1,?)",
+            (doc_id, state, closed_at),
+        )
+        return doc_id
+
+    def test_board_overview_lists_live_closing_and_bounded_recent_history(self):
+        declared = self._state_doc("SPRINT: Declared", "declared")
+        active = self._state_doc("SPRINT: Active", "active")
+        closing = self._state_doc("SPRINT: Closing", "closing")
+        terminal = [
+            self._state_doc(
+                f"SPRINT: Closed {index}",
+                "closed" if index % 2 else "aborted",
+                closed_at=f"2026-07-{20 + index:02d} 12:00:00",
+            )
+            for index in range(1, 7)
+        ]
+        self.con.commit()
+
+        out = sprint_routes._sprint_overview(self.con, recent=3)
+
+        self.assertEqual(out["active_count"], 1)
+        self.assertEqual(out["open_count"], 3)
+        self.assertEqual(
+            [item["document_id"] for item in out["sprints"][:3]],
+            [declared, active, closing],
+        )
+        self.assertEqual(
+            [item["document_id"] for item in out["sprints"][3:]],
+            list(reversed(terminal[-3:])),
+        )
+        proxy = mock.Mock(wraps=self.con)
+        proxy.close.return_value = None
+        with mock.patch.object(sprint_routes, "_db", return_value=proxy):
+            status, _headers, body = server.dispatch_http(
+                "GET",
+                "/api/sprints?view=board&recent=3",
+                "Host: 127.0.0.1:8800\r\n",
+                b"",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["open_count"], 3)
+
+    def test_projection_carries_assignment_result_and_failure_evidence(self):
+        sprint_doc_id = self._state_doc("SPRINT: Evidence", "active")
+        unit_id = self._unit(sprint_doc_id, "U1", state="working")
+        conductor_id = self._shell("CON1", "conductor")
+        route = {
+            "harness": "opencode",
+            "provider": "openai",
+            "model": "gpt-test",
+            "effort": "high",
+            "worktree": "/tmp/subfloor-test",
+        }
+        conductor = self.con.execute(
+            "SELECT * FROM shells WHERE shell_id=?", (conductor_id,)
+        ).fetchone()
+        sprint_conversations.create_sprint_conversation(
+            self.con,
+            sprint_doc_id=sprint_doc_id,
+            shell=conductor,
+            role="conductor",
+            lifecycle="persistent",
+            route=route,
+            title="Conductor",
+            creation_key="test-conductor",
+            prompt="Oversee.",
+        )
+        source_directive = self.con.execute(
+            "INSERT INTO directives "
+            "(issuer_shell_id,issuer_flavor,kind,payload,target,"
+            "sprint_doc_id,unit_id) VALUES (?,?, 'kickoff','{}','conductor',?,?)",
+            (self.planner_new, "planner", sprint_doc_id, unit_id),
+        ).lastrowid
+        developer = self.con.execute(
+            "SELECT * FROM shells WHERE shell_id=?", (self.dev,)
+        ).fetchone()
+        conversation_id = sprint_conversations.create_sprint_conversation(
+            self.con,
+            sprint_doc_id=sprint_doc_id,
+            shell=developer,
+            role="developer",
+            lifecycle="one_shot",
+            route=route,
+            title="Developer assignment",
+            creation_key="test-developer",
+            prompt="Build U1.",
+            unit_id=unit_id,
+            required_result_kind="unit-report",
+            source_directive_id=source_directive,
+        )
+        binding_id = self.con.execute(
+            "SELECT binding_id FROM sprint_conversation_bindings "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings SET state='active',"
+            "started_at=datetime('now') WHERE binding_id=?",
+            (binding_id,),
+        )
+        self.con.execute(
+            "INSERT INTO sentinel_events "
+            "(event_kind,shell_id,sprint_doc_id,unit_id,evidence) "
+            "VALUES ('worker-failed',?,?,?,?)",
+            (
+                self.dev,
+                sprint_doc_id,
+                unit_id,
+                json.dumps({
+                    "binding_id": binding_id,
+                    "error_code": "RUN_UNPROVEN",
+                    "error_detail": "lease expired",
+                }),
+            ),
+        )
+        self.con.commit()
+
+        sprint = sprint_routes._sprint_projection(self.con, sprint_doc_id)
+
+        self.assertEqual(len(sprint["assignments"]), 1)
+        assignment = sprint["assignments"][0]
+        self.assertEqual(assignment["binding_id"], binding_id)
+        self.assertEqual(assignment["display_state"], "queued")
+        self.assertEqual(
+            assignment["error_evidence"]["error_code"], "RUN_UNPROVEN"
+        )
+        self.assertTrue(sprint["conductor"]["events"])
 
     def test_unfrozen_closed_body_still_projects(self) -> None:
         doc_id = self._doc(

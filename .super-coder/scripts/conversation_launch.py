@@ -278,6 +278,7 @@ class ConversationLaunchPreparer:
             "source_message_id": row["source_message_id"],
             "required_result_kind": row["required_result_kind"],
             "conductor_slot": row["conductor_slot"],
+            "result_target_slot": row["conductor_slot"] or row["slot"],
             "units": [unit] if unit is not None else [],
         }
 
