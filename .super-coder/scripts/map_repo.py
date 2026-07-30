@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Map the host repo into the dr_* catalogue — how the shell reads its repo.
+"""Map the shell work surface into the dr_* catalogue.
 
-super-coder lives INSIDE a host repo. This walks that repo and records what's
-there — files (with language + role), dependencies (from the common manifests),
-and env-var names — into the dr_* tables, so the shell queries the catalogue
-instead of grepping blind (see the `surface_catalogue` skill).
+Normally super-coder lives inside the project it maps. An external-work install
+instead declares ``work_repo`` in ``instance.json``: this maps that project
+while retaining the map database and generated state in the home repo.
 
 The catalogue is a DERIVED CACHE of the repo, not authored content: it is NOT
 snapshotted. Re-run any time the repo changes:
@@ -33,6 +32,18 @@ import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for scri
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
+
+
+def _resolve_map_root() -> Path:
+    """Return the project tree to scan, never the home-state location."""
+    import install
+
+    work_repo = install.work_repo()
+    candidate = Path(work_repo) if work_repo else None
+    return candidate if candidate and candidate.is_dir() else REPO_ROOT
+
+
+MAP_ROOT = _resolve_map_root()
 # Per-fork map tuning, authored by the cartographer (see the `cartographer`
 # skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
 # so a wholesale engine refresh never touches it. Absent → built-in defaults
@@ -142,7 +153,7 @@ def count_lines(p: Path) -> int | None:
 
 
 def git(*args: str) -> str | None:
-    r = subprocess.run(["git", "-C", str(REPO_ROOT), *args],
+    r = subprocess.run(["git", "-C", str(MAP_ROOT), *args],
                        capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
 
@@ -314,8 +325,8 @@ def main() -> int:
 
         files = deps = envs = 0
         truncated = False
-        for p in sorted(REPO_ROOT.rglob("*")):
-            rel_parts = p.relative_to(REPO_ROOT).parts
+        for p in sorted(MAP_ROOT.rglob("*")):
+            rel_parts = p.relative_to(MAP_ROOT).parts
             if path_is_skipped(rel_parts, skip, skip_files) or not p.is_file():
                 continue
             if files >= MAX_FILES:
@@ -364,14 +375,14 @@ def main() -> int:
         con.execute(
             "INSERT INTO dr_repo (repo_id, name, root, remote, vcs, default_branch, "
             "file_count, mapped_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
-            (REPO_ROOT.name, str(REPO_ROOT), git("remote", "get-url", "origin"),
-             "git" if (REPO_ROOT / ".git").exists() else None,
+            (MAP_ROOT.name, str(MAP_ROOT), git("remote", "get-url", "origin"),
+             "git" if (MAP_ROOT / ".git").exists() else None,
              git("rev-parse", "--abbrev-ref", "HEAD"), files,
              datetime.now().isoformat(timespec="seconds")))
         con.commit()
         # Fork-owned semantic extractors (endpoints / db schema / routes), if any.
-        ext_summaries = run_extractors(con, REPO_ROOT, cfg)
-        msg = f"map_repo: {files} files, {deps} deps, {envs} env vars → dr_* ({REPO_ROOT.name})"
+        ext_summaries = run_extractors(con, MAP_ROOT, cfg)
+        msg = f"map_repo: {files} files, {deps} deps, {envs} env vars → dr_* ({MAP_ROOT.name})"
         if truncated:
             msg += f"  ⚠ stopped at MAX_FILES={MAX_FILES}"
         print(msg)

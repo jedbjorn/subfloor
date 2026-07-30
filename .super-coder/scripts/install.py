@@ -142,6 +142,20 @@ def is_source_repo() -> bool:
     return origin_basename() in SOURCE_REPO_NAMES
 
 
+def work_repo() -> str | None:
+    """Return this install's declared work project, if it has one.
+
+    An external-work install keeps its engine, local map database, and hooks in
+    the home repo but directs shells to maintain a different project.
+    """
+    cfg = ENGINE / "instance.json"
+    try:
+        raw = (json.loads(cfg.read_text()).get("work_repo") or "").strip()
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(Path(raw).expanduser()) if raw else None
+
+
 def seed_visual_qa_files(
     repo_root: Path = REPO_ROOT,
     template_root: Path | None = None,

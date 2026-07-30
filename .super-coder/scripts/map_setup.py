@@ -4,7 +4,9 @@
 The repo map (dr_* catalogue) is kept fresh by tracked git hooks that re-run
 `./sc map` on pull / branch-switch / rebase. The hooks live in
 `.super-coder/hooks/` and fire via `core.hooksPath` — a *per-clone* git setting,
-so a fresh clone needs this run once to point git at them. This:
+so a fresh clone needs this run once to point git at them. In an external-work
+install, the hooks always remain on this HOME clone; only the map scan moves to
+the declared project. This:
 
     1. points `core.hooksPath` at .super-coder/hooks/   (idempotent)
     2. ensures the hook scripts are executable
@@ -25,7 +27,7 @@ import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
-REPO_ROOT = ENGINE.parent
+HOME_ROOT = ENGINE.parent
 HOOKS_DIR = ENGINE / "hooks"
 # core.hooksPath must be ABSOLUTE. Git interprets a relative hooksPath against
 # the *current working directory* — which in a linked worktree is the worktree
@@ -43,7 +45,7 @@ import map_repo  # noqa: E402
 
 def _is_git_repo() -> bool:
     return subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+        ["git", "-C", str(HOME_ROOT), "rev-parse", "--is-inside-work-tree"],
         capture_output=True, text=True).returncode == 0
 
 
@@ -62,7 +64,7 @@ def wire_hooks() -> bool:
               "(auto-remap needs git; `./sc map` / rebuild still refresh)")
         return False
     subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "config", "core.hooksPath", HOOKS_ABS],
+        ["git", "-C", str(HOME_ROOT), "config", "core.hooksPath", HOOKS_ABS],
         check=True)
     print(f"map-setup: core.hooksPath -> {HOOKS_ABS} "
           f"({len(hooks)} hook(s): {', '.join(h.name for h in hooks)})")
