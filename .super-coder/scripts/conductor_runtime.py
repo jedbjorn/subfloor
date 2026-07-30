@@ -167,6 +167,12 @@ TRANSITIONS = (
     ),
     (
         "system",
+        "sprint-armed",
+        "release every dependency-ready unit",
+        "every initially ready developer starts from committed board state",
+    ),
+    (
+        "system",
         "pr-green",
         "boot assigned reviewer",
         "reviewer receives the green-head evidence",
@@ -511,15 +517,45 @@ def _spawn(
             f"{prepared['error']}"
         )
     role = _assignment_role(slot, unit)
-    prompt = json.dumps(
-        {
-            "directive_id": row["directive_id"],
-            "issuer": row["issuer_flavor"],
-            "kind": row["kind"],
-            "payload": payload,
-        },
-        sort_keys=True,
-    )
+    packet = {
+        "directive_id": row["directive_id"],
+        "issuer": row["issuer_flavor"],
+        "kind": row["kind"],
+        "payload": payload,
+        "completion_contract": (
+            f"Complete this one-shot {role} assignment by emitting exactly "
+            "one appropriate directive, then immediately send exactly one "
+            f"correlated {_required_result_kind(role)} result to the injected "
+            "SC_SPRINT_RESULT_TARGET before exit. Final assistant prose does "
+            "not satisfy the typed result."
+        ),
+    }
+    if role == "developer" and unit["state"] in ("pending", "blocked", "working"):
+        packet["instruction"] = (
+            "This is a first-pass or retry execution assignment. Perform the "
+            "bounded unit verification, then emit ready-for-review as the one "
+            "workflow directive with exact head/check evidence. Do not emit "
+            "unit-report as the workflow directive: unit-report is the "
+            "separate typed result required by completion_contract."
+        )
+    elif role == "developer":
+        packet["instruction"] = (
+            "This is the post-review completion assignment. Follow the "
+            "sprint_dev terminal reporting contract for the reviewed unit, "
+            "then send the separate typed unit-report result required by "
+            "completion_contract."
+        )
+    elif role == "planner" and row["kind"] == "unit-report":
+        packet["instruction"] = (
+            "All declared units are terminal. This is a conformance handoff, "
+            "not a question: do not emit answer. Read the governing spec, "
+            "board, and unit evidence; resolve the integrated main SHA; emit "
+            "one unitless kickoff directive to an assigned reviewer with "
+            "mode=conformance and the complete requirement scope. Omit "
+            "--unit even when the triggering unit is injected; then return "
+            "the required planner-directive result."
+        )
+    prompt = json.dumps(packet, sort_keys=True)
     creation_key = (
         f"sprint:{row['sprint_doc_id']}:assignment:{row['directive_id']}:"
         f"{role}:{shell['shortname']}"
@@ -956,9 +992,22 @@ def _execute(
                     unit=unit,
                 )
             elif target["flavor"] == "reviewer":
-                if unit is None and payload.get("mode") != "conformance":
+                if unit is not None:
+                    raise DirectiveRefused(
+                        "reviewer kickoff must be unitless conformance"
+                    )
+                if payload.get("mode") != "conformance":
                     raise DirectiveRefused(
                         "unitless reviewer kickoff requires mode=conformance"
+                    )
+                if con.execute(
+                    "SELECT 1 FROM sprint_conversation_bindings "
+                    "WHERE sprint_doc_id=? AND role='conformance' "
+                    "AND state<>'terminal' LIMIT 1",
+                    (sprint_id,),
+                ).fetchone() is not None:
+                    raise DirectiveRefused(
+                        "Sprint already has a nonterminal conformance assignment"
                     )
                 _spawn(
                     con,
@@ -1100,7 +1149,18 @@ def _execute(
         return assignments
 
     unit = _unit(con, row) if row["unit_id"] is not None else None
-    if kind == "pr-green":
+    if kind == "sprint-armed":
+        if unit is not None:
+            raise DirectiveRefused("sprint-armed must not name a unit")
+        _release_ready_units(
+            con,
+            assignments,
+            row,
+            payload,
+            actor_shell_id,
+            prepared_routes,
+        )
+    elif kind == "pr-green":
         if unit is None:
             raise DirectiveRefused("pr-green requires unit_id")
         if unit["state"] != "in_review":

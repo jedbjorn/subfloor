@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -661,7 +663,13 @@ class ConversationAdapterTest(unittest.TestCase):
     def build(self, harness: str):
         if harness == "opencode":
             native = FakeOpenCode()
-            return OpenCodeAdapter(transport=native), native
+            return (
+                OpenCodeAdapter(
+                    transport=native,
+                    shell_runtime_dir=self.root / "opencode-shells",
+                ),
+                native,
+            )
         if harness == "claude":
             native = FakeClaudeRunner()
             return (
@@ -872,6 +880,63 @@ class ConversationAdapterTest(unittest.TestCase):
         recovered = adapter.reconcile(fresh, self.context)
         self.assertEqual(recovered.outcome, "unknown")
         self.assertFalse(recovered.proven)
+
+    def test_opencode_shell_tools_use_the_conversation_launch_identity(
+        self,
+    ) -> None:
+        native = FakeOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        config = self.root / "opencode.json"
+        config.write_text('{"permission":{"*":"allow"}}\n')
+        context = ConversationContext(
+            worktree=self.root,
+            provider="openai",
+            model="gpt-test",
+            env={
+                "PATH": os.environ["PATH"],
+                "SC_API_BASE": "http://127.0.0.1:9911",
+                "SC_API_TOKEN": "reviewer-token",
+                "SC_ROOT": "/target/fork",
+                "SC_SHELL_FLAVOR": "reviewer",
+                "UNRELATED_SECRET": "must-not-persist",
+            },
+        )
+
+        adapter.start(context, "review")
+
+        configured = json.loads(config.read_text())
+        self.assertEqual(configured["permission"], {"*": "allow"})
+        wrapper = Path(configured["shell"])
+        self.assertEqual(wrapper.stat().st_mode & 0o777, 0o700)
+        self.assertNotIn("reviewer-token", config.read_text())
+        self.assertNotIn("UNRELATED_SECRET", wrapper.read_text())
+        result = subprocess.run(
+            [
+                str(wrapper),
+                "-lc",
+                "printf '%s\\n%s\\n%s' \"$SC_API_BASE\" \"$SC_API_TOKEN\" \"$SC_SHELL_FLAVOR\"",
+            ],
+            env={
+                **os.environ,
+                "SC_API_BASE": "http://127.0.0.1:8837",
+                "SC_API_TOKEN": "wrong-parent-token",
+                "SC_SHELL_FLAVOR": "dev",
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "http://127.0.0.1:9911",
+                "reviewer-token",
+                "reviewer",
+            ],
+        )
 
     def test_opencode_strips_the_selected_provider_prefix_from_model_id(
         self,

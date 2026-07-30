@@ -462,6 +462,13 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ),
         (
             "system",
+            "sprint-armed",
+            "pending",
+            {},
+            False,
+        ),
+        (
+            "system",
             "pr-green",
             "in_review",
             {"head_sha": "abc", "transition": "checks:SUCCESS"},
@@ -596,6 +603,32 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                             ).fetchone()[0],
                             1,
                         )
+                        message = con.execute(
+                            "SELECT body FROM conversation_messages "
+                            "WHERE conversation_id=? "
+                            "ORDER BY message_id LIMIT 1",
+                            (assignment["conversation_id"],),
+                        ).fetchone()
+                        packet = json.loads(message["body"])
+                        self.assertIn(
+                            "emitting exactly one appropriate directive",
+                            packet["completion_contract"],
+                        )
+                        self.assertIn(
+                            "immediately send exactly one correlated",
+                            packet["completion_contract"],
+                        )
+                        if kind == "sprint-armed":
+                            self.assertIn(
+                                "emit ready-for-review as the one workflow "
+                                "directive",
+                                packet["instruction"],
+                            )
+                            self.assertIn(
+                                "Do not emit unit-report as the workflow "
+                                "directive",
+                                packet["instruction"],
+                            )
                     row = con.execute(
                         "SELECT status,refusal_reason FROM directives "
                         "WHERE directive_id=?",
@@ -683,6 +716,17 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         self.assertEqual(report["status"], "executed")
         self.assertEqual(len(report["assignments"]), 1)
         self.assertEqual(report["assignments"][0]["slot"], "PLN1")
+        planner_prompt = self.con.execute(
+            "SELECT body FROM conversation_messages "
+            "WHERE conversation_id=? ORDER BY message_id LIMIT 1",
+            (report["assignments"][0]["conversation_id"],),
+        ).fetchone()
+        packet = json.loads(planner_prompt["body"])
+        self.assertIn(
+            "This is a conformance handoff, not a question",
+            packet["instruction"],
+        )
+        self.assertIn("do not emit answer", packet["instruction"])
 
     def test_report_only_requires_explicit_null_contract_and_evidence(self):
         cases = (
@@ -1079,6 +1123,14 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.assertEqual(len(result["assignments"]), 1)
         self.assertEqual(result["assignments"][0]["slot"], "DEV1")
+        prompt = self.con.execute(
+            "SELECT body FROM conversation_messages WHERE conversation_id=?",
+            (result["assignments"][0]["conversation_id"],),
+        ).fetchone()[0]
+        self.assertIn(
+            "emit ready-for-review as the one workflow directive",
+            json.loads(prompt)["instruction"],
+        )
 
     def test_unit_report_boots_planner_only_after_all_units_terminal(self):
         self.set_unit("working")
@@ -1095,6 +1147,68 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         terminal = runtime.act(self.con, last, 1)
         self.assertEqual(len(terminal["assignments"]), 1)
         self.assertEqual(terminal["assignments"][0]["slot"], "PLN1")
+
+    def test_conformance_kickoff_is_unitless_and_typed_conformance(self):
+        self.set_unit("working")
+        self.set_unit("in_review")
+        self.set_unit("merged")
+        linked = self.emit(
+            "planner",
+            "kickoff",
+            {
+                "to": "REV1",
+                "mode": "conformance",
+                "main_sha": "abc",
+                "scope": "all requirements",
+                "ratified_deviations": [],
+            },
+        )
+        self.con.commit()
+        refused = runtime.act(self.con, linked, 1)
+        self.assertEqual(refused["status"], "refused")
+        self.assertIn("must be unitless", refused["reason"])
+
+        unitless = self.emit(
+            "planner",
+            "kickoff",
+            {
+                "to": "REV1",
+                "mode": "conformance",
+                "main_sha": "abc",
+                "scope": "all requirements",
+                "ratified_deviations": [],
+            },
+            unit=False,
+        )
+        self.con.commit()
+        result = runtime.act(self.con, unitless, 1)
+        self.assertEqual(result["status"], "executed")
+        binding = self.con.execute(
+            "SELECT role,required_result_kind FROM "
+            "sprint_conversation_bindings WHERE conversation_id=?",
+            (result["assignments"][0]["conversation_id"],),
+        ).fetchone()
+        self.assertEqual(tuple(binding), ("conformance", "conformance-verdict"))
+
+        duplicate = self.emit(
+            "planner",
+            "kickoff",
+            {
+                "to": "REV1",
+                "mode": "conformance",
+                "main_sha": "abc",
+                "scope": "all requirements",
+                "ratified_deviations": [],
+            },
+            unit=False,
+        )
+        self.con.commit()
+        refused_duplicate = runtime.act(self.con, duplicate, 1)
+        self.assertEqual(refused_duplicate["status"], "refused")
+        self.assertIn(
+            "already has a nonterminal conformance assignment",
+            refused_duplicate["reason"],
+        )
 
 
 class ConductorSyntheticSprintTests(RuntimeFixture):

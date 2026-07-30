@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
+import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 import threading
@@ -36,6 +39,7 @@ from .base import (
 ENGINE = Path(__file__).resolve().parents[2]
 SERVER_ENDPOINT = "http://127.0.0.1:4096"
 SERVER_LOG = ENGINE / "logs" / "opencode-server.log"
+SHELL_RUNTIME_DIR = ENGINE / "run" / "opencode-shells"
 _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
 _SERVER_PASSWORD: str | None = None
@@ -229,8 +233,10 @@ class OpenCodeAdapter(ConversationAdapter):
         password: str | None = None,
         transport: HttpTransport | None = None,
         manifest: Mapping[str, Any] | None = None,
+        shell_runtime_dir: Path = SHELL_RUNTIME_DIR,
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
+        self.shell_runtime_dir = shell_runtime_dir
         if transport is not None:
             self.transport = transport
         else:
@@ -296,6 +302,65 @@ class OpenCodeAdapter(ConversationAdapter):
             }
         ]
 
+    def _prepare_shell_environment(
+        self,
+        context: ConversationContext,
+    ) -> Path:
+        """Bind OpenCode shell tools to this conversation's launch identity.
+
+        ``opencode serve`` is one long-lived process, so every shell tool it
+        starts otherwise inherits the server's environment rather than the
+        target shell's canonical ``LaunchPlan.env``. A server started from an
+        already-wired shell could therefore route ``sc mem`` to that unrelated
+        install and identity.
+
+        OpenCode's project config supports an exact shell executable. Point it
+        at an owner-only runtime wrapper which restores the canonical SC_*
+        contract and PATH before delegating to bash. The project config stores
+        only the wrapper path; the API key remains under the gitignored engine
+        runtime directory.
+        """
+        worktree = context.checked_worktree()
+        identity = hashlib.sha256(str(worktree).encode()).hexdigest()[:20]
+        self.shell_runtime_dir.mkdir(parents=True, exist_ok=True)
+        wrapper = self.shell_runtime_dir / f"{identity}.sh"
+        exported = {
+            key: str(value)
+            for key, value in context.env.items()
+            if key == "PATH" or key.startswith("SC_")
+        }
+        lines = ["#!/bin/sh"]
+        lines.extend(
+            f"export {key}={shlex.quote(value)}"
+            for key, value in sorted(exported.items())
+        )
+        lines.append('exec /bin/bash "$@"')
+        temporary = wrapper.with_name(
+            f".{wrapper.name}.{secrets.token_hex(6)}.tmp"
+        )
+        temporary.write_text("\n".join(lines) + "\n")
+        temporary.chmod(0o700)
+        os.replace(temporary, wrapper)
+
+        config_path = worktree / "opencode.json"
+        try:
+            config = json.loads(config_path.read_text())
+        except FileNotFoundError:
+            config = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AdapterError(
+                "HARNESS_CONFIG_INVALID",
+                f"cannot prepare OpenCode shell config: {exc}",
+            ) from exc
+        if not isinstance(config, dict):
+            raise AdapterError(
+                "HARNESS_CONFIG_INVALID",
+                "OpenCode project config must be a JSON object",
+            )
+        config["shell"] = str(wrapper)
+        config_path.write_text(json.dumps(config, indent=2) + "\n")
+        return wrapper
+
     def _prompt(
         self,
         session_ref: str,
@@ -357,6 +422,7 @@ class OpenCodeAdapter(ConversationAdapter):
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         worktree = context.checked_worktree()
         message = ensure_nonempty_message(message)
+        self._prepare_shell_environment(context)
         body: dict[str, Any] = {}
         if context.title:
             body["title"] = context.title
@@ -390,6 +456,7 @@ class OpenCodeAdapter(ConversationAdapter):
         message: str,
     ) -> NativeTurn:
         message = ensure_nonempty_message(message)
+        self._prepare_shell_environment(context)
         inspected = self.inspect(session_ref, context)
         if not inspected.exists:
             raise AdapterError(
