@@ -910,6 +910,35 @@ def slot_default_prompt(context: dict) -> str:
     )
 
 
+def sprint_launch_env(context: "dict | None") -> dict[str, str]:
+    """Serialize one validated Sprint binding into the launched process env."""
+    if context is None:
+        return {}
+    env = {
+        "SC_SPRINT_REF": str(context["sprint_doc_id"]),
+        "SC_SPRINT_ROLE": str(context["role"]),
+        "SC_SPRINT_SLOT": str(context["slot"]),
+        "SC_SPRINT_ASSIGNMENT_ID": str(context["binding_id"]),
+        "SC_SPRINT_LIFECYCLE": str(context["lifecycle"]),
+    }
+    optional = {
+        "SC_SPRINT_SPEC_DOC_ID": context.get("spec_doc_id"),
+        "SC_SPRINT_SOURCE_DIRECTIVE_ID": context.get("source_directive_id"),
+        "SC_SPRINT_SOURCE_MESSAGE_ID": context.get("source_message_id"),
+        "SC_SPRINT_REQUIRED_RESULT_KIND": context.get("required_result_kind"),
+    }
+    env.update(
+        {name: str(value) for name, value in optional.items() if value is not None}
+    )
+    units = context.get("units") or []
+    if units:
+        env["SC_SPRINT_UNITS"] = ",".join(str(row["seq"]) for row in units)
+        if len(units) == 1:
+            env["SC_SPRINT_UNIT_ID"] = str(units[0]["unit_id"])
+            env["SC_SPRINT_UNIT"] = str(units[0]["seq"])
+    return env
+
+
 def _shell_status(shell, snap: "dict | None") -> str:
     """Styled picker status derived from liveness plus sprint reservation."""
     if shell["flavor"] == "admin":
@@ -1184,7 +1213,8 @@ def _cli_version(binary: str) -> "str | None":
 
 def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    model: "str | None" = None, effort: "str | None" = None,
-                   headless_prompt: "str | None" = None) -> LaunchPlan:
+                   headless_prompt: "str | None" = None,
+                   slot_context: "dict | None" = None) -> LaunchPlan:
     """Prepare a launch exactly as main() would, without any TTY.
 
     Spec #20 (sprint 25 seq 5): starting an Interface chat uses the NORMAL
@@ -1204,6 +1234,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     this seam (open_db, authenticate, ensure_worktree) still sys.exit, so
     callers must also treat SystemExit as a refusal."""
     headless = headless_prompt is not None
+    if slot_context is not None and not headless:
+        raise LaunchError("Sprint launch context requires a headless prompt")
     con = open_db()
     # Same best-effort skill heal as main() — compose's SKILLS block reads
     # what this repairs. RENDER_ONLY never mutates, here as there.
@@ -1280,7 +1312,11 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             "harness": harness,
             "provider": session_provider(harness, session_model),
             "model": session_model,
-            "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
+            "sprint_ref": (
+                str(slot_context["sprint_doc_id"])
+                if slot_context is not None
+                else (os.environ.get("SC_SPRINT_REF") or None)
+            ),
         })
     except SessionOpenError as exc:
         con.close()
@@ -1313,7 +1349,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                            floor_note=floor_note,
                            source_mode=install.is_source_repo(),
                            api_key=full["api_key"],
-                           api_port=api_port)
+                           api_port=api_port,
+                           slot_context=slot_context)
     render_harness_skills(
         con, full["shell_id"], work_dir, adapter
     )
@@ -1382,6 +1419,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
+    env.update(sprint_launch_env(slot_context))
 
     return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
                       session_id=session_id, archive_id=archive_id,

@@ -230,19 +230,47 @@ def render_slot_directive(context: "dict | None") -> str:
     if context is None:
         return ""
     title = context.get("sprint_title") or "(untitled sprint)"
+    browser_binding = context.get("binding_id") is not None
     lines = [
-        "This ephemeral session has one launcher-validated role. Execute only "
-        "this slot and finish by emitting the directive required by its loaded "
-        "skill.",
+        (
+            "This browser-launched session has one validated Sprint binding. "
+            "Execute only this assignment and return the required typed result."
+            if browser_binding
+            else
+            "This ephemeral session has one launcher-validated role. Execute "
+            "only this slot and finish by emitting the directive required by "
+            "its loaded skill."
+        ),
         "",
         f"- **Slot:** `{context['slot']}`",
         f"- **Sprint:** document `{context['sprint_doc_id']}` — {title}",
         f"- **Loaded skill:** `{context['skill_name']}`",
-        "",
-        "### Kickoff context",
-        "",
     ]
-    for unit in context["units"]:
+    if context.get("role"):
+        lines.append(f"- **Role:** `{context['role']}`")
+    if context.get("lifecycle"):
+        lines.append(f"- **Lifecycle:** `{context['lifecycle']}`")
+    if context.get("binding_id") is not None:
+        lines.append(f"- **Assignment:** `{context['binding_id']}`")
+    if context.get("spec_doc_id") is not None:
+        spec_title = context.get("spec_title") or "(untitled spec)"
+        lines.append(
+            f"- **Governing spec:** document `{context['spec_doc_id']}` — "
+            f"{spec_title}"
+        )
+    if context.get("source_directive_id") is not None:
+        lines.append(
+            f"- **Source directive:** `{context['source_directive_id']}`"
+        )
+    if context.get("source_message_id") is not None:
+        lines.append(f"- **Source message:** `{context['source_message_id']}`")
+    if context.get("required_result_kind"):
+        lines.append(
+            f"- **Required result:** `{context['required_result_kind']}`"
+        )
+    lines.extend(["", "### Kickoff context", ""])
+    units = context.get("units") or []
+    for unit in units:
         detail = (
             f"`{unit['seq']}` (unit id `{unit['unit_id']}`) — "
             f"{unit['unit_title']} · state `{unit['state']}`"
@@ -256,6 +284,8 @@ def render_slot_directive(context: "dict | None") -> str:
         lines.append(f"- {detail}")
         if unit.get("overlap"):
             lines.append(f"  - overlap: {unit['overlap']}")
+    if not units:
+        lines.append("- Sprint-wide assignment; no unit is bound.")
     lines.extend([
         "",
         f"### Loaded skill — {context['skill_name']}",
@@ -509,7 +539,11 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     stays a pure render, no git).
     """
     if shell["flavor"] == "conductor":
-        return conductor_runtime.render_boot(con, shell)
+        return conductor_runtime.render_boot(
+            con,
+            shell,
+            slot_context=slot_context,
+        )
 
     template = TEMPLATE_PATH.read_text().rstrip()
     template = template.replace(

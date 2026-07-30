@@ -232,6 +232,62 @@ class SlotContextTest(unittest.TestCase):
         self.assertIn("sprint 25", prompt)
         self.assertIn("U1, U2", prompt)
 
+    def test_browser_binding_context_renders_result_contract(self) -> None:
+        ctx = {
+            **run.resolve_slot_context(
+                self.con, self.shell(2), "dev", 25, "U1"
+            ),
+            "binding_id": 91,
+            "role": "developer",
+            "lifecycle": "one_shot",
+            "slot": "DEV1",
+            "spec_doc_id": 24,
+            "spec_title": "Governing spec",
+            "source_directive_id": 73,
+            "source_message_id": 88,
+            "required_result_kind": "unit-report",
+        }
+        rendered = compose.render_slot_directive(ctx)
+        self.assertIn("validated Sprint binding", rendered)
+        self.assertIn("**Role:** `developer`", rendered)
+        self.assertIn("**Lifecycle:** `one_shot`", rendered)
+        self.assertIn("**Assignment:** `91`", rendered)
+        self.assertIn("**Governing spec:** document `24`", rendered)
+        self.assertIn("**Source directive:** `73`", rendered)
+        self.assertIn("**Source message:** `88`", rendered)
+        self.assertIn("**Required result:** `unit-report`", rendered)
+
+    def test_browser_binding_environment_is_explicit_and_bounded(self) -> None:
+        context = {
+            "binding_id": 91,
+            "role": "developer",
+            "lifecycle": "one_shot",
+            "slot": "DEV1",
+            "sprint_doc_id": 25,
+            "spec_doc_id": 24,
+            "source_directive_id": 73,
+            "source_message_id": None,
+            "required_result_kind": "unit-report",
+            "units": [{"unit_id": 10, "seq": "U1"}],
+        }
+        self.assertEqual(
+            run.sprint_launch_env(context),
+            {
+                "SC_SPRINT_REF": "25",
+                "SC_SPRINT_ROLE": "developer",
+                "SC_SPRINT_SLOT": "DEV1",
+                "SC_SPRINT_ASSIGNMENT_ID": "91",
+                "SC_SPRINT_LIFECYCLE": "one_shot",
+                "SC_SPRINT_SPEC_DOC_ID": "24",
+                "SC_SPRINT_SOURCE_DIRECTIVE_ID": "73",
+                "SC_SPRINT_REQUIRED_RESULT_KIND": "unit-report",
+                "SC_SPRINT_UNITS": "U1",
+                "SC_SPRINT_UNIT_ID": "10",
+                "SC_SPRINT_UNIT": "U1",
+            },
+        )
+        self.assertEqual(run.sprint_launch_env(None), {})
+
 
 class SlotArgumentTest(unittest.TestCase):
     def test_slot_and_sprint_are_required_together_before_db_open(self) -> None:
