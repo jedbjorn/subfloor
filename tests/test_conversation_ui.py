@@ -76,17 +76,20 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "mdBlock(body)" in interface
 
 
-def test_connection_status_is_encoded_in_the_idle_pill_without_visible_copy():
+def test_connection_status_is_attached_to_transcript_without_visible_copy():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert 'let streamStatus = "connecting"' in interface
     assert 'source.onopen = () => onState("connected")' in interface
     assert 'source.onerror = () => onState("reconnecting")' in interface
-    assert "pill.title = `Connection: ${connectionLabel}`" in interface
+    assert "transcriptHost.title = `Connection: ${connectionLabel}`" in interface
+    assert "`Conversation transcript; connection ${connectionLabel.toLowerCase()}`" in interface
     assert '"stream-disconnected"' in interface
+    assert 'const state = el("div", { className: "chat-pane-state" })' not in interface
+    assert "state.replaceChildren(chatStatePill" not in interface
     assert 'className: "chat-stream-state"' not in interface
     assert ".chat-stream-state" not in STYLE
-    assert ".chat-state.state-idle.stream-disconnected" in STYLE
+    assert ".chat-state.state-idle.stream-disconnected" not in STYLE
 
 
 def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
@@ -171,7 +174,7 @@ def test_conversation_identity_uses_shell_context_and_neutral_user_label():
     assert '"Untitled chat"' in interface
     assert 'className: "chat-history-context"' in interface
     assert 'className: "chat-shell-shortname"' in interface
-    assert '(active ? " active-chat" : "")' in interface
+    assert "chatPaintShellState(button, active?.state)" in interface
 
 
 def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
@@ -205,23 +208,88 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     assert ".chat-shell-divider" in STYLE
 
 
-def test_history_badges_poll_without_repainting_the_interface():
+def test_history_metadata_and_all_shell_accents_poll_without_repainting_interface():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert "const CHAT_HISTORY_POLL_MS = 2000" in interface
     assert "if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer)" in interface
     assert "const historyItems = new Map()" in interface
-    assert "historyItems.set(conversation.conversation_id, button)" in interface
+    assert "const shellItems = new Map()" in interface
+    assert "historyItems.set(conversation.conversation_id, item)" in interface
+    assert "shellItems.set(item.shell_id, button)" in interface
     assert 'await chatApi("/conversations?limit=100")' in interface
     assert "generation !== chatRenderGeneration || !chatHistoryPollTimer" in interface
     assert "historyItems.get(conversation.conversation_id)" in interface
-    assert "pill.replaceWith(chatStatePill(nextState))" in interface
+    assert "chatPaintHistoryItem(item, conversation)" in interface
+    assert "item.name.textContent = chatConversationName(conversation)" in interface
+    assert "chatPaintStar(item.star, Boolean(conversation.starred))" in interface
+    assert "selectedConversation = conversation" in interface
+    assert "const openByShell = new Map()" in interface
+    assert 'if (conversation.state !== "closed")' in interface
+    assert "openByShell.set(conversation.shell.shell_id" in interface
+    assert "for (const [shellId, button] of shellItems)" in interface
+    assert "chatPaintShellState(button, openByShell.get(shellId))" in interface
     assert "if (document.hidden || historyPollInFlight) return" in interface
     assert "finally { historyPollInFlight = false; }" in interface
     assert "setInterval(pollHistory, CHAT_HISTORY_POLL_MS)" in interface
     poll = interface[interface.index("const pollHistory = async"):
                      interface.index("chatHistoryPollTimer = setInterval")]
     assert "renderInterface(" not in poll
+
+
+def test_history_card_has_independent_durable_star_button():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    history = interface[interface.index('const history = el("div"'):
+                        interface.index("if (!conversations.length)")]
+
+    assert 'const card = el("div", {' in history
+    assert 'className: "chat-history-open"' in history
+    assert 'className: "chat-history-star"' in history
+    assert "open.append(context, name, state)" in history
+    assert "card.append(open, star)" in history
+    assert "event.stopPropagation()" in history
+    assert '{ version: current.version, starred: !current.starred }' in history
+    assert "chatPaintHistoryItem(item, updated)" in history
+    assert 'button.textContent = starred ? "★" : "☆"' in interface
+    assert 'button.setAttribute("aria-pressed", String(starred))' in interface
+    assert ".chat-history-star:hover, .chat-history-star.starred" in STYLE
+    assert "color: #f4cf4a; opacity: 1;" in STYLE
+
+
+def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    transcript = interface[interface.index("function chatPaintTranscript"):
+                           interface.index("async function chatRefreshConversation")]
+    header = interface[interface.index("async function chatRenderOpen"):
+                       interface.index("async function submit()")]
+    indicator_style = STYLE[STYLE.index(".chat-working-indicator {"):
+                            STYLE.index("}", STYLE.index(".chat-working-indicator {"))]
+
+    assert 'indicator.append("<Working>", chatWorkingDots())' in interface
+    assert 'className: "chat-working-indicator"' in interface
+    assert 'role: "status"' in interface
+    assert 'if (conversation.state === "running")' in transcript
+    assert "node: chatWorkingIndicator()" in transcript
+    assert "chatStatePill(conversation.state)" not in transcript
+    assert "header.append(title, queueState, actions)" in header
+    assert "chatStatePill(conversation.state)" not in header
+    assert "border" not in indicator_style
+    assert "background" not in indicator_style
+
+
+def test_shell_accent_colors_cover_idle_working_waiting_and_error_states():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert '"state-idle", "state-queued", "state-running"' in interface
+    assert '"state-waiting", "state-error"' in interface
+    assert 'button.classList.add("active-chat", `state-${state}`)' in interface
+    assert ".chat-shell.state-idle { --shell-state-color: var(--ok); }" in STYLE
+    assert ".chat-shell.state-queued," in STYLE
+    assert ".chat-shell.state-running," in STYLE
+    assert ".chat-shell.state-waiting { --shell-state-color: var(--accent); }" in STYLE
+    assert ".chat-shell.state-error { --shell-state-color: #ef7d86; }" in STYLE
 
 
 def test_redline_chat_text_is_one_pixel_larger():
@@ -257,6 +325,9 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-compose-actions .chat-stop:disabled",
         ".chat-title-button",
         ".chat-shell.active-chat::before",
+        ".chat-working-indicator",
+        ".chat-history-open",
+        ".chat-history-star",
     ):
         assert selector in STYLE
     assert "grid-template-columns: 260px 260px minmax(0, 1fr)" in STYLE

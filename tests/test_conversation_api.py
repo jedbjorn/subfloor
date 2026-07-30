@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -634,6 +635,92 @@ class ConversationResourceTest(ConversationApiCase):
         )
         self.assertEqual(status, 409)
         self.assertEqual(conflict["error"]["code"], "CONVERSATION_VERSION_CONFLICT")
+
+    def test_star_round_trip_is_durable_versioned_and_preserves_activity(self) -> None:
+        created = self.create(title="Keep my place")
+        self.assertFalse(created["starred"])
+        conversation_id = created["conversation_id"]
+        original_version = created["version"]
+        original_activity = created["last_activity_at"]
+
+        status, _, starred = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": original_version, "starred": True},
+        )
+
+        self.assertEqual(status, 200, starred)
+        self.assertTrue(starred["starred"])
+        self.assertEqual(starred["version"], original_version + 1)
+        self.assertEqual(starred["title"], "Keep my place")
+        self.assertEqual(starred["state"], "idle")
+        self.assertEqual(starred["last_activity_at"], original_activity)
+        with closing(self.connect()) as con:
+            row = con.execute(
+                "SELECT starred,title,state,last_activity_at,version "
+                "FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(row),
+                (1, "Keep my place", "idle", original_activity, original_version + 1),
+            )
+
+        conflict_status, _, conflict = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": original_version, "starred": False},
+        )
+        self.assertEqual(conflict_status, 409, conflict)
+        self.assertEqual(
+            conflict["error"]["code"],
+            "CONVERSATION_VERSION_CONFLICT",
+        )
+        with closing(self.connect()) as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT starred FROM conversations WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_star_requires_boolean_and_closed_history_remains_starrable(self) -> None:
+        created = self.create()
+        conversation_id = created["conversation_id"]
+
+        status, _, invalid = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": created["version"], "starred": 1},
+        )
+        self.assertEqual(status, 422, invalid)
+        self.assertEqual(invalid["error"]["code"], "VALIDATION_ERROR")
+        with closing(self.connect()) as con:
+            self.assertEqual(
+                tuple(con.execute(
+                    "SELECT starred,version FROM conversations "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()),
+                (0, created["version"]),
+            )
+
+        close_status, _, closed = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": created["version"], "state": "closed"},
+        )
+        self.assertEqual(close_status, 200, closed)
+        star_status, _, starred = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": closed["version"], "starred": True},
+        )
+        self.assertEqual(star_status, 200, starred)
+        self.assertEqual(starred["state"], "closed")
+        self.assertTrue(starred["starred"])
+        self.assertEqual(starred["version"], closed["version"] + 1)
 
     def test_closed_conversation_rejects_messages(self) -> None:
         conversation = self.create()
