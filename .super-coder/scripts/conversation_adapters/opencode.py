@@ -40,6 +40,7 @@ ENGINE = Path(__file__).resolve().parents[2]
 SERVER_ENDPOINT = "http://127.0.0.1:4096"
 SERVER_LOG = ENGINE / "logs" / "opencode-server.log"
 SHELL_RUNTIME_DIR = ENGINE / "run" / "opencode-shells"
+TURN_TIMEOUT_SECONDS = 5400.0
 _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
 _SERVER_PASSWORD: str | None = None
@@ -243,7 +244,7 @@ class OpenCodeAdapter(ConversationAdapter):
             self.transport = UrlHttpTransport(
                 endpoint,
                 password=password if password is not None else ensure_server(),
-                timeout=600.0,
+                timeout=TURN_TIMEOUT_SECONDS,
             )
 
     def probe(self) -> ProbeResult:
@@ -412,12 +413,23 @@ class OpenCodeAdapter(ConversationAdapter):
             run_ref=run_ref,
             worktree=worktree,
             metadata={
+                "context": context,
                 "event_stream": event_stream,
+                "message": message,
+                "dispatch_pending": True,
+                "interrupt_lock": threading.Lock(),
                 "resumed": resumed,
             },
         )
-        self._prompt(session_ref, context, message)
         return turn
+
+    @staticmethod
+    def _interrupt_lock(turn: NativeTurn):
+        lock = turn.metadata.get("interrupt_lock")
+        if lock is None:
+            lock = threading.Lock()
+            turn.metadata["interrupt_lock"] = lock
+        return lock
 
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         worktree = context.checked_worktree()
@@ -647,6 +659,31 @@ class OpenCodeAdapter(ConversationAdapter):
             },
             "session.create-or-resume",
         )
+        context = turn.metadata.pop("context", None)
+        message = turn.metadata.pop("message", None)
+        if not isinstance(context, ConversationContext) or not isinstance(
+            message, str
+        ):
+            raise AdapterError(
+                "HARNESS_PROTOCOL_ERROR",
+                "OpenCode turn has no pending synchronous message dispatch",
+            )
+        interrupted_before_dispatch = False
+        with self._interrupt_lock(turn):
+            if turn.metadata.get("interrupt_requested"):
+                turn.metadata["dispatch_pending"] = False
+                turn.metadata["terminal"] = "run.interrupted"
+                interrupted_before_dispatch = True
+            else:
+                turn.metadata["dispatch_pending"] = False
+        if interrupted_before_dispatch:
+            yield NormalizedEvent(
+                "run.interrupted",
+                {"status": "cancelled"},
+                "operator.interrupt",
+            )
+            return
+        self._prompt(turn.session_ref, context, message)
         observed_activity = False
         for raw in native_stream:
             event_session = self._session_of(raw)
@@ -659,6 +696,14 @@ class OpenCodeAdapter(ConversationAdapter):
                 # the new message complete without ever generating a reply.
                 if event.type == "run.completed" and not observed_activity:
                     continue
+                if event.type == "run.completed":
+                    with self._interrupt_lock(turn):
+                        if turn.metadata.get("interrupt_acknowledged"):
+                            event = NormalizedEvent(
+                                "run.interrupted",
+                                {"status": "cancelled"},
+                                event.native_type,
+                            )
                 if event.type in {
                     "run.started",
                     "assistant.delta",
@@ -675,12 +720,18 @@ class OpenCodeAdapter(ConversationAdapter):
                     return
 
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
-        result = self.transport.request(
-            "POST",
-            f"/session/{turn.session_ref}/abort",
-            query=self._query(turn.worktree),
-        )
-        return InterruptResult(bool(result))
+        with self._interrupt_lock(turn):
+            turn.metadata["interrupt_requested"] = True
+            result = self.transport.request(
+                "POST",
+                f"/session/{turn.session_ref}/abort",
+                query=self._query(turn.worktree),
+            )
+            acknowledged = bool(result) or bool(
+                turn.metadata.get("dispatch_pending")
+            )
+            turn.metadata["interrupt_acknowledged"] = acknowledged
+        return InterruptResult(acknowledged)
 
     def inspect(
         self,
