@@ -1578,8 +1578,24 @@ def main() -> None:
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
             if not headless and sys.stdin.isatty() else None)
-    chosen = pick_shell(list_shells(con, user["user_id"]), requested, first,
-                        fdefaults, snap)
+    launchable = list_shells(con, user["user_id"])
+    if not os.environ.get("SC_CONDUCTOR_INTERNAL"):
+        if requested and any(
+            shell["shortname"].lower() == requested.lower()
+            and shell["flavor"] == "conductor"
+            for shell in launchable
+        ):
+            con.close()
+            sys.exit(
+                "sc run: Conductor is Sprint-owned and cannot be launched "
+                "as an ordinary shell; the originating Planner starts it "
+                "with `sc sprint arm --sprint <id>`"
+            )
+        launchable = [
+            shell for shell in launchable
+            if shell["flavor"] != "conductor"
+        ]
+    chosen = pick_shell(launchable, requested, first, fdefaults, snap)
     if browser_conversation_active(con, chosen["shell_id"]):
         con.close()
         sys.exit(

@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -45,6 +46,10 @@ class SprintDeclarationContractTest(unittest.TestCase):
         self.db_path = Path(self.tmp.name) / "engine.db"
         self.con = build_db(self.db_path)
         self.addCleanup(self.con.close)
+        self.con.execute(
+            "INSERT INTO users (user_id,username,is_active) "
+            "VALUES (1,'operator',1)"
+        )
         self.con.executemany(
             "INSERT INTO shells "
             "(shell_id,display_name,shortname,flavor,system_prompt,api_key) "
@@ -54,6 +59,7 @@ class SprintDeclarationContractTest(unittest.TestCase):
                 (2, "Planner Two", "PLN2", "planner", "x", "plan2-token"),
                 (3, "Reviewer", "REV1", "reviewer", "x", "rev-token"),
                 (4, "Developer", "DEV1", "dev", "x", "dev-token"),
+                (5, "Conductor", "CON1", "conductor", "x", "cond-token"),
             ),
         )
         self.con.execute(
@@ -84,6 +90,17 @@ class SprintDeclarationContractTest(unittest.TestCase):
         )
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
+        self.config_patch = mock.patch.object(
+            sprint_routes.conductor_runtime,
+            "load_config",
+            return_value=sprint_routes.conductor_runtime.ConductorConfig(
+                enabled=True,
+                shell="CON1",
+                model="openai/gpt-5.6-luna",
+            ),
+        )
+        self.config_patch.start()
+        self.addCleanup(self.config_patch.stop)
 
     @staticmethod
     def headers(token: str | None, key: str | None = None) -> str:
@@ -121,6 +138,20 @@ class SprintDeclarationContractTest(unittest.TestCase):
             "dev_route": "codex/gpt-5",
             "reviewer_route": "claude/sonnet",
         }
+
+    def staged_sprint(self, *, key="declare-staged"):
+        self.qaqc(key=f"{key}-qaqc")
+        sprint = self.call(
+            "POST", "/api/sprints", self.declaration(), key=key
+        )[2]
+        self.con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id,seq,unit_title,dev_shell_id,reviewer_shell_id) "
+            "VALUES (?,'U1','Build the contract',4,3)",
+            (sprint["sprint_doc_id"],),
+        )
+        self.con.commit()
+        return sprint
 
     def test_qaqc_is_server_hashed_append_only_and_idempotent(self):
         status, _headers, first = self.qaqc()
@@ -450,6 +481,36 @@ class SprintDeclarationContractTest(unittest.TestCase):
         self.assertTrue(calls[0][3].startswith("sprint-declare|20|"))
 
         calls.clear()
+        with mock.patch.object(sprint_cli, "_api", side_effect=sprint_api):
+            self.assertEqual(
+                sprint_cli.main(["arm", "--sprint", "44"]),
+                0,
+            )
+        self.assertEqual(
+            calls[0][0:3],
+            ("PATCH", "/api/sprints/44", {"state": "active"}),
+        )
+        self.assertTrue(calls[0][3].startswith("sprint-arm|44|"))
+
+        calls.clear()
+        with mock.patch.object(sprint_cli, "_api", side_effect=sprint_api):
+            self.assertEqual(
+                sprint_cli.main(
+                    ["abort", "--sprint", "44", "--report", "Stopped safely"]
+                ),
+                0,
+            )
+        self.assertEqual(
+            calls[0][0:3],
+            (
+                "PATCH",
+                "/api/sprints/44",
+                {"state": "aborted", "report": "Stopped safely"},
+            ),
+        )
+        self.assertTrue(calls[0][3].startswith("sprint-abort|44|"))
+
+        calls.clear()
 
         def mem_api(method, path, body=None, **kwargs):
             calls.append((method, path, body, kwargs))
@@ -468,6 +529,274 @@ class SprintDeclarationContractTest(unittest.TestCase):
             )
         self.assertEqual(calls[0][0:2], ("POST", "/api/spec-qaqc-reviews"))
         self.assertTrue(calls[0][3]["idempotent"])
+
+    def test_originating_planner_arms_and_browser_has_no_arm_authority(self):
+        sprint = self.staged_sprint()
+        sprint_id = sprint["sprint_doc_id"]
+        status, _headers, error = self.call(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            {"state": "active"},
+            token=None,
+            key="operator-arm",
+        )
+        self.assertEqual(
+            (status, error["error"]["code"]),
+            (403, "planner_required"),
+        )
+        status, _headers, error = self.call(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            {"state": "active"},
+            token="plan2-token",
+            key="other-arm",
+        )
+        self.assertEqual(
+            (status, error["error"]["code"]),
+            (403, "not_sprint_owner"),
+        )
+
+        with mock.patch.object(
+            sprint_routes.conversation_broker, "notify_commit"
+        ) as notify:
+            status, _headers, armed = self.call(
+                "PATCH",
+                f"/api/sprints/{sprint_id}",
+                {"state": "active"},
+                key="planner-arm",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(armed["state"], "active")
+        self.assertEqual(armed["conductor"]["shell"]["shortname"], "CON1")
+        self.assertEqual(armed["conductor"]["state"], "queued")
+        notify.assert_called_once_with()
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT role,lifecycle,state FROM "
+                "sprint_conversation_bindings"
+            ).fetchone()),
+            ("conductor", "persistent", "active"),
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_outbox "
+                "WHERE state='pending'"
+            ).fetchone()[0],
+            1,
+        )
+
+        with mock.patch.object(
+            sprint_routes.conductor_runtime,
+            "load_config",
+            return_value=sprint_routes.conductor_runtime.ConductorConfig(),
+        ):
+            replay = self.call(
+                "PATCH",
+                f"/api/sprints/{sprint_id}",
+                {"state": "active"},
+                key="planner-arm",
+            )[2]
+        self.assertEqual(
+            replay["conductor"]["conversation_id"],
+            armed["conductor"]["conversation_id"],
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversations WHERE mode='sprint'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_parallel_arm_retry_creates_exactly_one_conductor(self):
+        sprint = self.staged_sprint(key="parallel-arm")
+        sprint_id = sprint["sprint_doc_id"]
+
+        def arm():
+            return self.call(
+                "PATCH",
+                f"/api/sprints/{sprint_id}",
+                {"state": "active"},
+                key="same-parallel-arm",
+            )
+
+        with (
+            mock.patch.object(
+                sprint_routes.conversation_broker, "notify_commit"
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            results = list(pool.map(lambda _index: arm(), range(2)))
+        self.assertEqual([result[0] for result in results], [200, 200])
+        self.assertEqual(
+            {
+                result[2]["conductor"]["conversation_id"]
+                for result in results
+            },
+            {
+                self.con.execute(
+                    "SELECT conversation_id FROM sprint_conversation_bindings "
+                    "WHERE role='conductor'"
+                ).fetchone()[0]
+            },
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_conversation_bindings "
+                "WHERE role='conductor'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_operator_cancel_stops_work_clears_projection_and_planner_aborts(self):
+        sprint = self.staged_sprint(key="cancel-flow")
+        sprint_id = sprint["sprint_doc_id"]
+        self.call(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            {"state": "active"},
+            key="arm-cancel-flow",
+        )
+        conductor_id = self.con.execute(
+            "SELECT conversation_id FROM sprint_conversation_bindings "
+            "WHERE role='conductor'"
+        ).fetchone()[0]
+
+        status, _headers, error = self.call(
+            "POST",
+            f"/api/sprints/{sprint_id}/cancellations",
+            {"reason": "wrong actor"},
+            token="plan-token",
+            key="shell-cancel",
+        )
+        self.assertEqual(
+            (status, error["error"]["code"]),
+            (403, "operator_required"),
+        )
+        with mock.patch.object(
+            sprint_routes.conversation_broker, "notify_commit"
+        ):
+            status, headers, cancelled = self.call(
+                "POST",
+                f"/api/sprints/{sprint_id}/cancellations",
+                {"reason": "FnB stopped the Sprint"},
+                token=None,
+                key="operator-cancel",
+            )
+        self.assertEqual(status, 202)
+        self.assertTrue(cancelled["cleared"])
+        self.assertIn("/cancellations/", headers["Location"])
+        cancellation = cancelled["cancellation"]
+        self.assertEqual(cancellation["state"], "requested")
+        self.assertEqual(cancellation["reason"], "FnB stopped the Sprint")
+        self.assertEqual(
+            self.call(
+                "GET", headers["Location"], token=None
+            )[2],
+            cancellation,
+        )
+        self.assertNotEqual(
+            cancellation["planner_conversation_id"], conductor_id
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprint_units WHERE sprint_doc_id=?",
+                (sprint_id,),
+            ).fetchone()[0],
+            "cancelled",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM conversation_outbox "
+                "WHERE conversation_id=?",
+                (conductor_id,),
+            ).fetchone()[0],
+            "cancelled",
+        )
+        self.assertEqual(
+            self.call(
+                "GET", "/api/sprints?status=active", token=None
+            )[2],
+            {"active_count": 0, "sprints": []},
+        )
+        planner_binding = self.con.execute(
+            "SELECT role,lifecycle,required_result_kind,state "
+            "FROM sprint_conversation_bindings "
+            "WHERE conversation_id=?",
+            (cancellation["planner_conversation_id"],),
+        ).fetchone()
+        self.assertEqual(
+            tuple(planner_binding),
+            ("planner", "one_shot", "abort-report", "pending"),
+        )
+
+        status, _headers, error = self.call(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            {"state": "aborted", "report": "# Abort report\n\nStopped safely."},
+            token="plan2-token",
+            key="wrong-planner-abort",
+        )
+        self.assertEqual(
+            (status, error["error"]["code"]),
+            (403, "not_sprint_owner"),
+        )
+        status, _headers, aborted = self.call(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            {"state": "aborted", "report": "# Abort report\n\nStopped safely."},
+            key="planner-abort",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(aborted["state"], "aborted")
+        self.assertEqual(aborted["cancellation"]["state"], "completed")
+        self.assertEqual(
+            aborted["cancellation"]["abort_report"],
+            "# Abort report\n\nStopped safely.",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT frozen FROM documents WHERE document_id=?",
+                (sprint_id,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_cancel_records_interrupt_for_a_run_that_crossed_dispatch(self):
+        sprint = self.staged_sprint(key="cancel-running")
+        sprint_id = sprint["sprint_doc_id"]
+        self.call(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            {"state": "active"},
+            key="arm-running",
+        )
+        store = sprint_routes.conversation_broker.BrokerStore(self.db_path)
+        run = store.claim_next("test-broker")
+        self.assertIsNotNone(run)
+
+        with mock.patch.object(
+            sprint_routes.conversation_broker,
+            "interrupt_run",
+            side_effect=sprint_routes.conversation_broker.BrokerError(
+                "CONVERSATION_BROKER_UNAVAILABLE", "offline"
+            ),
+        ) as interrupt:
+            self.call(
+                "POST",
+                f"/api/sprints/{sprint_id}/cancellations",
+                {"reason": "stop running work"},
+                token=None,
+                key="cancel-running",
+            )
+        interrupt.assert_called_once_with(run.run_id)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE run_id=? AND event_type='run.interrupt.requested'",
+                (run.run_id,),
+            ).fetchone()[0],
+            1,
+        )
 
 
 if __name__ == "__main__":

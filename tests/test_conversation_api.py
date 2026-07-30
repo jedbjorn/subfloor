@@ -394,7 +394,7 @@ class ConversationResourceTest(ConversationApiCase):
             ("kimi", "kimi", None, "high"),
         )
 
-    def test_conductor_shell_rejects_kimi_without_creating_a_chat(self) -> None:
+    def test_conductor_shell_rejects_ordinary_browser_chat(self) -> None:
         con = self.connect()
         try:
             con.execute("UPDATE shells SET flavor='conductor' WHERE shell_id=1")
@@ -408,8 +408,8 @@ class ConversationResourceTest(ConversationApiCase):
             key="conductor-kimi",
         )
         self.assertEqual(status, 422)
-        self.assertEqual(error["error"]["code"], "HARNESS_ROUTE_INVALID")
-        self.assertIn("opencode", error["error"]["message"].lower())
+        self.assertEqual(error["error"]["code"], "SPRINT_OWNED_SHELL")
+        self.assertIn("armed sprints", error["error"]["message"].lower())
         con = self.connect()
         try:
             count = con.execute(

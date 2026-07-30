@@ -1295,7 +1295,9 @@ class RemovedWakeVerbsTest(unittest.TestCase):
         with redirect_stdout(out), self.assertRaises(SystemExit):
             sprint_cli.main(["--help"])
         help_text = out.getvalue()
-        for verb in ("action", "arm", "disarm", "status", "alerts", "retry"):
+        self.assertIn("arm", help_text)
+        self.assertIn("abort", help_text)
+        for verb in ("action", "disarm", "status", "alerts", "retry"):
             self.assertNotIn(f"{{{verb}", help_text)
             with self.subTest(verb=verb):
                 with self.assertRaises(SystemExit) as raised:

@@ -445,6 +445,13 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "SHELL_NOT_LAUNCHABLE",
             "shell is unknown, deleted, or unavailable to this operator",
         )
+    if shell["flavor"] == "conductor":
+        raise ApiError(
+            422,
+            "SPRINT_OWNED_SHELL",
+            "Conductor is owned by armed Sprints and cannot open an ordinary "
+            "browser conversation",
+        )
 
     open_conversations = con.execute(
         "SELECT conversation_id,state FROM conversations "

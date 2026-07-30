@@ -63,7 +63,9 @@ def sprint_row(con, sprint_doc_id: int):
 
 def is_active_sprint(con, sprint_doc_id: int) -> bool:
     return con.execute(
-        "SELECT 1 FROM sprints WHERE sprint_doc_id=? AND state='active'",
+        "SELECT 1 FROM sprints sp WHERE sprint_doc_id=? AND state='active' "
+        "AND NOT EXISTS (SELECT 1 FROM sprint_cancellations sc "
+        "WHERE sc.sprint_doc_id=sp.sprint_doc_id)",
         (sprint_doc_id,),
     ).fetchone() is not None
 
@@ -72,7 +74,9 @@ def active_sprint_doc_ids(con) -> set[int]:
     return {
         row[0]
         for row in con.execute(
-            "SELECT sprint_doc_id FROM sprints WHERE state='active'"
+            "SELECT sprint_doc_id FROM sprints sp WHERE state='active' "
+            "AND NOT EXISTS (SELECT 1 FROM sprint_cancellations sc "
+            "WHERE sc.sprint_doc_id=sp.sprint_doc_id)"
         )
     }
 

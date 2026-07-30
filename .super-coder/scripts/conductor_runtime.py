@@ -141,12 +141,6 @@ TRANSITIONS = (
     ),
     (
         "planner",
-        "handoff",
-        "validate board; activate sprint; boot every dependency-ready developer",
-        "authoritative state is active and each released unit is working",
-    ),
-    (
-        "planner",
         "kickoff",
         "move released unit; boot target slot",
         "the declared target starts with bounded context",
@@ -330,6 +324,8 @@ def _pending_ids(con) -> list[int]:
             "JOIN sprints sp ON sp.sprint_doc_id=d.sprint_doc_id "
             "WHERE d.status='pending' AND d.target='conductor' "
             "AND sp.state='active' "
+            "AND NOT EXISTS (SELECT 1 FROM sprint_cancellations sc "
+            "WHERE sc.sprint_doc_id=sp.sprint_doc_id) "
             "ORDER BY d.directive_id"
         )
     ]
@@ -345,7 +341,11 @@ def _default_launcher(command: list[str]) -> int:
             stdout=log,
             stderr=log,
             start_new_session=True,
-            env={**os.environ, "SC_NO_AUTOPRUNE": "1"},
+            env={
+                **os.environ,
+                "SC_NO_AUTOPRUNE": "1",
+                "SC_CONDUCTOR_INTERNAL": "1",
+            },
         )
         time.sleep(0.2)
         returncode = proc.poll()
@@ -626,14 +626,14 @@ def _release_ready_units(con, launches, row, payload, actor_shell_id: int):
     return released
 
 
-def _validate_handoff_board(con, sprint_id: int) -> None:
+def validate_arm_board(con, sprint_id: int) -> None:
     units = con.execute(
         "SELECT seq,state,dev_shell_id,reviewer_shell_id,depends_on "
         "FROM sprint_units WHERE sprint_doc_id=? ORDER BY unit_id",
         (sprint_id,),
     ).fetchall()
     if not units:
-        raise DirectiveRefused("handoff requires a non-empty sprint board")
+        raise DirectiveRefused("arming requires a non-empty sprint board")
     seqs = {unit["seq"] for unit in units}
     gaps = []
     dependencies = {}
@@ -665,14 +665,14 @@ def _validate_handoff_board(con, sprint_id: int) -> None:
             elif dep not in seqs:
                 gaps.append(f"{unit['seq']} names unknown dependency {dep}")
     if gaps:
-        raise DirectiveRefused("handoff board invalid: " + "; ".join(gaps))
+        raise DirectiveRefused("arming board invalid: " + "; ".join(gaps))
     remaining = {seq: set(deps) for seq, deps in dependencies.items()}
     while remaining:
         roots = {seq for seq, deps in remaining.items() if not deps}
         if not roots:
             cycle = ", ".join(sorted(remaining))
             raise DirectiveRefused(
-                f"handoff board has a dependency cycle among: {cycle}"
+                f"arming board has a dependency cycle among: {cycle}"
             )
         remaining = {
             seq: deps - roots
@@ -681,7 +681,7 @@ def _validate_handoff_board(con, sprint_id: int) -> None:
         }
     if not _ready_pending_units(con, sprint_id):
         raise DirectiveRefused(
-            "handoff board has no dependency-ready unit (dependency cycle)"
+            "arming board has no dependency-ready unit (dependency cycle)"
         )
 
 
@@ -696,11 +696,17 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
         sprint_lifecycle.sprint_row(con, sprint_id)
         if sprint_id is not None else None
     )
-    required_state = "declared" if (issuer, kind) == ("planner", "handoff") \
-        else "active"
+    required_state = "active"
     if sprint is None or sprint["state"] != required_state:
         raise DirectiveRefused(
             f"directive requires a {required_state} authoritative sprint"
+        )
+    if con.execute(
+        "SELECT 1 FROM sprint_cancellations WHERE sprint_doc_id=?",
+        (sprint_id,),
+    ).fetchone() is not None:
+        raise DirectiveRefused(
+            f"sprint {sprint_id} has an operator cancellation request"
         )
     if issuer == "planner":
         planner = _planner_for_sprint(con, sprint_id)
@@ -863,17 +869,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
         if sprint_id is None:
             raise DirectiveRefused("planner directive requires sprint_doc_id")
         unit = _unit(con, row) if row["unit_id"] is not None else None
-        if kind == "handoff":
-            if unit is not None:
-                raise DirectiveRefused("handoff is sprint-scoped, not unit-scoped")
-            if payload not in ({}, {"verified": True}):
-                raise DirectiveRefused(
-                    "handoff payload must be empty or {'verified': true}"
-                )
-            _validate_handoff_board(con, sprint_id)
-            sprint_lifecycle.transition(con, sprint_id, "active")
-            _release_ready_units(con, launches, row, payload, actor_shell_id)
-        elif kind == "kickoff":
+        if kind == "kickoff":
             target = _shell(con, _text(payload, "to"))
             if target["flavor"] == "dev":
                 if unit is None:

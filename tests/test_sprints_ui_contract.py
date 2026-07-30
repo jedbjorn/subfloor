@@ -122,12 +122,15 @@ globalThis.setInterval = (fn, ms) => {
 globalThis.clearInterval = (id) => cleared.push(id);
 let apiQueue = [];
 let apiCalls = [];
-async function api(path) {
+let apiRequests = [];
+async function api(path, method = "GET", body, headers = {}) {
   apiCalls.push(path);
+  apiRequests.push({ path, method, body, headers });
   const next = apiQueue.shift();
   if (next instanceof Error) throw next;
   return next;
 }
+function requestKey() { return "ui-request-key"; }
 function all(root, predicate, found = []) {
   if (predicate(root)) found.push(root);
   for (const child of root.children || [])
@@ -238,7 +241,7 @@ console.log(JSON.stringify({ tab: shown.at(-1) }));
     assert json.loads(proc.stdout)["tab"] == "sprints"
 
 
-def test_authoritative_count_and_headers_render_without_controls():
+def test_authoritative_count_headers_and_cancel_controls_render():
     data = payload(count=3)
     data["sprints"][0]["title"] = "sprint: rendered verbatim"
     data["sprints"].append({
@@ -290,8 +293,89 @@ out({
     assert result["boards"] == result["flows"] == 2
     assert result["titles"][0].startswith("sprint: rendered verbatim")
     assert result["titles"][1].startswith("SPRINT: second board")
-    assert result["controls"] == 0
+    assert result["controls"] == 2
     assert result["utc"] == "2026-07-26T20:00:00Z"
+
+
+def test_cancel_is_the_only_lifecycle_control_and_clears_board_immediately():
+    result = run_js(
+        """
+apiQueue = [DATA, { cleared: true, cancellation: { cancellation_id: 9 } }];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const button = byClass(root, "sprint-cancel")[0];
+await button.onclick();
+out({
+  boards: byClass(root, "sprint-board").length,
+  nav: navButton.textContent,
+  request: apiRequests.at(-1),
+  notices,
+});
+""",
+        prelude=(
+            "const DATA = " + json.dumps(payload()) + ";\n"
+            "const notices = [];\n"
+            "function confirm() { return true; }\n"
+            "function prompt() { return 'Stop requested by FnB'; }\n"
+            "function toast(message) { notices.push(message); }\n"
+        ),
+    )
+    assert result["boards"] == 0
+    assert result["nav"] == "Sprints"
+    assert result["request"] == {
+        "path": "/sprints/77/cancellations",
+        "method": "POST",
+        "body": {"reason": "Stop requested by FnB"},
+        "headers": {"Idempotency-Key": "ui-request-key"},
+    }
+    assert result["notices"] == [
+        "Sprint #77 cancelled; Planner abort report queued."
+    ]
+
+
+def test_conductor_transcript_is_embedded_in_sprint_board():
+    data = payload()
+    data["sprints"][0]["conductor"] = {
+        "conversation_id": "cv_" + ("a" * 32),
+        "state": "idle",
+        "shell": {
+            "shell_id": 12,
+            "shortname": "CON1",
+            "display_name": "Conductor",
+        },
+        "messages": [{
+            "message_id": 1,
+            "sender_kind": "engine",
+            "message_kind": "prompt",
+            "body": "Oversee Sprint 77.",
+            "state": "completed",
+            "created_at": "2026-07-26T20:00:00Z",
+        }],
+        "assistant": [{
+            "sequence": 4,
+            "text": "Board observed.",
+            "created_at": "2026-07-26T20:00:01Z",
+        }],
+    }
+    result = run_js(
+        """
+apiQueue = [DATA];
+await sprintsRefresh({ render: false });
+const root = makeRoot();
+await renderSprints(root);
+const conductor = byClass(root, "sprint-conductor")[0];
+out({
+  text: conductor.textContent,
+  lines: byClass(conductor, "sprint-conductor-line").length,
+});
+""",
+        prelude="const DATA = " + json.dumps(data) + ";\n",
+    )
+    assert "Conductor · CON1 · idle" in result["text"]
+    assert "Oversee Sprint 77." in result["text"]
+    assert "Board observed." in result["text"]
+    assert result["lines"] == 2
 
 
 def test_flow_columns_cards_and_active_role_emphasis():
@@ -1025,7 +1109,7 @@ out({
 
 
 def test_flow_styles_clamp_text_and_contain_narrow_viewport_scrolling():
-    sprint_css = STYLE[STYLE.index("/* Active sprint flow boards"):
+    sprint_css = STYLE[STYLE.index("/* Active Sprint flow boards"):
                        STYLE.index("/* Roadmap Flow view")]
     assert "#view-sprints, .sprint-board { min-width: 0; }" in sprint_css
     assert "#view-sprints { max-width: 1350px; }" in sprint_css

@@ -800,13 +800,14 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
 
-/* Active sprint flow boards — one self-contained, read-only graph per sprint. */
+/* Active Sprint flow boards — Planner-armed, with one operator cancel control. */
 #view-sprints, .sprint-board { min-width: 0; }
 #view-sprints { max-width: 1350px; }
 .sprint-board { overflow: hidden; }
 .sprint-header { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
 .sprint-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
+.sprint-cancel { margin: 0 0 0 auto; color: #ef7d86; white-space: nowrap; }
 .sprint-meta { color: var(--dim); font-size: .78rem; margin-bottom: .7rem; }
 .sprint-flow { width: 100%; min-width: 0; overflow-x: auto; padding: .2rem 0 .35rem; }
 .sprint-flow-inner { position: relative; min-width: 850px; }
@@ -866,6 +867,14 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   box-shadow: 0 0 0 2px rgba(110,168,254,.58); }
 .sprint-flow.sprint-spotlight .sprint-wire { stroke: rgba(110,168,254,.1); }
 .sprint-flow.sprint-spotlight .sprint-wire.lit { stroke: var(--accent); stroke-width: 2px; }
+.sprint-conductor { margin-top: .7rem; border-top: 1px solid var(--line);
+  padding-top: .55rem; color: var(--dim); font-size: .75rem; }
+.sprint-conductor summary { cursor: pointer; color: var(--ink); }
+.sprint-conductor-transcript { display: flex; flex-direction: column; gap: .35rem;
+  max-height: 18rem; overflow-y: auto; padding: .55rem 0; }
+.sprint-conductor-line { white-space: pre-wrap; overflow-wrap: anywhere;
+  color: var(--dim); }
+.sprint-conductor-line.assistant { color: var(--ink); }
 
 /* Roadmap Flow view — feature dependency graph: cards in stage columns with an
    SVG wire overlay (blocker → blocked). Replaces the old mermaid flowchart. */

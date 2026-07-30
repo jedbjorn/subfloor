@@ -27,7 +27,7 @@ SLOT_KINDS = {
     ),
     "sprint_pln": (
         "planner",
-        {"handoff", "kickoff", "hold", "re-scope", "re-task", "close", "answer"},
+        {"kickoff", "hold", "re-scope", "re-task", "close", "answer"},
     ),
 }
 

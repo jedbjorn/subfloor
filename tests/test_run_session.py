@@ -310,7 +310,7 @@ class OpenSessionContentionTest(unittest.TestCase):
 
 
 class HeadlessSessionFailureTest(unittest.TestCase):
-    def test_conductor_rejects_cli_harness_override_before_launch_side_effects(
+    def test_conductor_rejects_ordinary_cli_launch_before_side_effects(
             self) -> None:
         con = mock.Mock()
         chosen = {"shell_id": 11, "shortname": "CON1", "flavor": "conductor"}
@@ -347,7 +347,7 @@ class HeadlessSessionFailureTest(unittest.TestCase):
             run.main()
 
         self.assertIn(
-            "conductor requires harness 'opencode'",
+            "Conductor is Sprint-owned",
             str(raised.exception),
         )
         con.close.assert_called_once_with()

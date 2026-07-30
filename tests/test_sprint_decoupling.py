@@ -70,7 +70,7 @@ class SprintDecouplingTest(unittest.TestCase):
             "truth; use documents/sprint_units/messages or wait for directives",
         )
 
-    def test_cli_exposes_only_record_and_render_verbs(self):
+    def test_cli_exposes_records_plus_planner_owned_lifecycle_verbs(self):
         source = (ENGINE / "scripts" / "sprint.py").read_text()
         tree = ast.parse(source)
         parser_verbs = set()
@@ -85,7 +85,10 @@ class SprintDecouplingTest(unittest.TestCase):
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
                 parser_verbs.add(value.value)
         self.assertEqual(
-            {"declare", "unit", "board", "add", "set", "state", "list"},
+            {
+                "declare", "arm", "abort", "unit", "board",
+                "add", "set", "state", "list",
+            },
             parser_verbs,
         )
 

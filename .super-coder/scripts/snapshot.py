@@ -108,6 +108,7 @@ PER_INSTANCE_TABLES = [
     # children so a snapshot stays readable and foreign-key-valid when loaded.
     "conversations",
     "sprint_conversation_bindings",
+    "sprint_cancellations",
     "conversation_messages",
     "conversation_runs",
     "conversation_events",

@@ -210,9 +210,12 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
     assert (
-        '"cartographer", "admin", "conductor", "planner", "dev", '
-        '"reviewer", "devops"'
+        '"cartographer", "admin", "planner", "dev", "reviewer", "devops"'
     ) in APP
+    assert (
+        'const shells = allShells.filter((item) => '
+        'item.flavor !== "conductor")'
+    ) in interface
     assert "const orderedShells = orderedFlavors.flatMap" in interface
     assert "for (const item of orderedShells)" in interface
     assert 'const flavor = item.flavor || "bespoke"' in interface
