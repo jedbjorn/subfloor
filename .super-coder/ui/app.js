@@ -3080,6 +3080,13 @@ function chatHeaderLabel(conversation) {
   ].filter(Boolean).join(" | ");
 }
 
+function chatWorkingDots() {
+  return el("span", { className: "chat-working-dots", ariaHidden: "true" },
+    el("span", {}, "."),
+    el("span", {}, "."),
+    el("span", {}, "."));
+}
+
 function chatStatePill(state) {
   const label = {
     queued: "queued", running: "working", waiting: "waiting",
@@ -3092,14 +3099,29 @@ function chatStatePill(state) {
     pill.textContent = label;
     return pill;
   }
-  pill.append(
-    label,
-    el("span", { className: "chat-working-dots", ariaHidden: "true" },
-      el("span", {}, "."),
-      el("span", {}, "."),
-      el("span", {}, ".")),
-  );
+  pill.append(label, chatWorkingDots());
   return pill;
+}
+
+function chatWorkingIndicator() {
+  const indicator = el("div", {
+    className: "chat-working-indicator",
+    role: "status",
+    ariaLabel: "Working",
+  });
+  indicator.append("<Working>", chatWorkingDots());
+  return indicator;
+}
+
+const CHAT_SHELL_STATE_CLASSES = [
+  "active-chat", "state-idle", "state-queued", "state-running",
+  "state-waiting", "state-error",
+];
+
+function chatPaintShellState(button, state) {
+  button.classList.remove(...CHAT_SHELL_STATE_CLASSES);
+  if (!["idle", "queued", "running", "waiting", "error"].includes(state)) return;
+  button.classList.add("active-chat", `state-${state}`);
 }
 
 function chatQueuedCount(messages) {
@@ -3228,6 +3250,12 @@ function chatPaintTranscript(
     });
   for (const activity of activities) {
     if (activity.message_id == null) addActivity(activity);
+  }
+  if (conversation.state === "running") {
+    items.push({
+      node: chatWorkingIndicator(),
+      failed: false,
+    });
   }
   for (const item of items) {
     if (item.failed) {
@@ -3405,7 +3433,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
 
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
-  const state = el("div", { className: "chat-pane-state" });
   const queueState = el("span", { className: "chat-queue-state", hidden: true });
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
@@ -3446,21 +3473,16 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const composerRow = el("div", { className: "chat-composer" },
     composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
   const updateStreamStatus = () => {
-    const pill = state.querySelector(".chat-state");
-    if (!pill) return;
     const connected = streamStatus === "connected";
     const connectionLabel = connected
       ? "Connected"
       : streamStatus === "reconnecting" ? "Reconnecting" : "Connecting";
-    pill.title = `Connection: ${connectionLabel}`;
-    pill.setAttribute(
+    transcriptHost.title = `Connection: ${connectionLabel}`;
+    transcriptHost.setAttribute(
       "aria-label",
-      `${pill.textContent}; connection ${connectionLabel.toLowerCase()}`,
+      `Conversation transcript; connection ${connectionLabel.toLowerCase()}`,
     );
-    pill.classList.toggle(
-      "stream-disconnected",
-      conversation.state === "idle" && !connected,
-    );
+    transcriptHost.classList.toggle("stream-disconnected", !connected);
   };
 
   const retry = async (text) => {
@@ -3494,7 +3516,6 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     const queued = chatQueuedCount(messages);
     queueState.hidden = queued === 0;
     queueState.textContent = `${queued} queued`;
-    state.replaceChildren(chatStatePill(conversation.state), queueState);
     updateStreamStatus();
     const closed = conversation.state === "closed";
     composer.disabled = closed;
@@ -3542,7 +3563,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
   actions.append(analytics, close);
-  header.append(title, state, actions);
+  header.append(title, queueState, actions);
 
   async function submit() {
     const text = composer.value.trim();
@@ -3670,6 +3691,7 @@ async function renderInterface(root) {
   ];
   const orderedShells = orderedFlavors.flatMap((flavor) =>
     shells.filter((item) => (item.flavor || "bespoke") === flavor));
+  const shellItems = new Map();
   let previousFlavor = "";
   for (const item of orderedShells) {
     const flavor = item.flavor || "bespoke";
@@ -3681,12 +3703,13 @@ async function renderInterface(root) {
         && conversation.state !== "closed");
     const button = el("button", {
       className: "chat-shell"
-        + (item.shell_id === shell.shell_id ? " selected" : "")
-        + (active ? " active-chat" : ""),
+        + (item.shell_id === shell.shell_id ? " selected" : ""),
       type: "button",
     },
     el("span", { className: "chat-shell-name" }, item.display_name),
     el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
+    chatPaintShellState(button, active?.state);
+    shellItems.set(item.shell_id, button);
     button.onclick = () => {
       if (item.shell_id === shell.shell_id) return;
       location.hash = chatHash(item.shortname);
@@ -3765,7 +3788,10 @@ async function renderInterface(root) {
     try {
       const page = await chatApi("/conversations?limit=100");
       if (generation !== chatRenderGeneration || !chatHistoryPollTimer) return;
+      const openByShell = new Map();
       for (const conversation of page.items) {
+        if (conversation.state !== "closed")
+          openByShell.set(conversation.shell.shell_id, conversation.state || "idle");
         if (conversation.shell.shell_id !== shell.shell_id) continue;
         const button = historyItems.get(conversation.conversation_id);
         const pill = button?.querySelector(".chat-state");
@@ -3773,6 +3799,8 @@ async function renderInterface(root) {
         if (!pill || pill.classList.contains(`state-${nextState}`)) continue;
         pill.replaceWith(chatStatePill(nextState));
       }
+      for (const [shellId, button] of shellItems)
+        chatPaintShellState(button, openByShell.get(shellId));
     } catch { /* The next poll retries without disrupting the open chat. */ }
     finally { historyPollInFlight = false; }
   };
