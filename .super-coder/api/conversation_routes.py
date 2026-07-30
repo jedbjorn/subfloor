@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import conversation_broker
 import conversation_events
+import conversation_git_targets
 import db_driver
 import run as run_mod
 from conversation_adapters import ADAPTER_TYPES
@@ -772,6 +773,10 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     for closed_id in auto_closed:
         conversation_events.notify(closed_id)
     conversation_events.notify(conversation_id)
+    conversation_git_targets.safely_observe_and_persist(
+        DB_PATH,
+        conversation_id,
+    )
     row = _require_conversation(con, conversation_id, operator["user_id"])
     return _json(
         201,

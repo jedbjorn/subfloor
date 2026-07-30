@@ -18,6 +18,7 @@ ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
+GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -358,6 +359,91 @@ class MigrationAndShapeTest(ConversationDbCase):
                     "UPDATE conversations SET starred=2 "
                     "WHERE creation_idempotency_key='legacy'"
                 )
+
+    def test_git_target_migration_upgrades_existing_conversations(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            apply_schema(
+                con,
+                through="0141_rebuild_completed_sprint_cancellations.sql",
+            )
+            con.execute(
+                "INSERT INTO users (user_id,username) VALUES (9,'legacy')"
+            )
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,mode,owner_user_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES ('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',9,'normal',9,"
+                "'codex','/tmp/legacy','legacy','hash')"
+            )
+
+            con.executescript(GIT_TARGETS.read_text())
+
+            indexes = {
+                row[1]
+                for row in con.execute(
+                    "PRAGMA index_list('conversation_git_targets')"
+                )
+            }
+            self.assertTrue(
+                {
+                    "idx_conversation_git_targets_pr",
+                    "idx_conversation_git_targets_local",
+                    "idx_conversation_git_targets_recent",
+                    "idx_conversation_git_targets_head",
+                    "idx_conversation_git_targets_pr_lookup",
+                }.issubset(indexes)
+            )
+            first = "1" * 40
+            target_id = con.execute(
+                "INSERT INTO conversation_git_targets "
+                "(conversation_id,branch_name,base_ref,first_head_sha,"
+                "latest_head_sha) VALUES "
+                "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','feature/reused',"
+                "'origin/main',?,?) RETURNING target_id",
+                (first, first),
+            ).fetchone()[0]
+            con.execute(
+                "UPDATE conversation_git_targets SET latest_head_sha=? "
+                "WHERE target_id=?",
+                ("2" * 40, target_id),
+            )
+            con.execute(
+                "UPDATE conversation_git_targets SET pr_number=821,"
+                "pr_head_sha=?,pr_state='OPEN',"
+                "remote_refreshed_at=datetime('now') WHERE target_id=?",
+                ("2" * 40, target_id),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "PR identity is immutable",
+            ):
+                con.execute(
+                    "UPDATE conversation_git_targets SET pr_number=822 "
+                    "WHERE target_id=?",
+                    (target_id,),
+                )
+            second = "3" * 40
+            con.execute(
+                "INSERT INTO conversation_git_targets "
+                "(conversation_id,branch_name,base_ref,first_head_sha,"
+                "latest_head_sha,pr_number) VALUES "
+                "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','feature/reused',"
+                "'origin/main',?,?,822)",
+                (second, second),
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_git_targets "
+                    "WHERE branch_name='feature/reused'"
+                ).fetchone()[0],
+                2,
+            )
 
     def test_binding_migration_preserves_reserved_sprint_conversation(
         self,
@@ -1278,6 +1364,7 @@ class SprintBindingConcurrencyTest(unittest.TestCase):
 class SnapshotPolicyTest(ConversationDbCase):
     TABLES = (
         "conversations",
+        "conversation_git_targets",
         "sprint_conversation_bindings",
         "sprint_cancellations",
         "conversation_messages",

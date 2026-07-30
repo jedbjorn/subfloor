@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import conversation_events
+import conversation_git_targets
 import db_driver
 import sprint_conversations
 from conversation_adapters import (
@@ -961,6 +962,10 @@ class BrokerStore:
             con.close()
         for notify_id in notify_ids or {str(conversation_id)}:
             conversation_events.notify(notify_id)
+        conversation_git_targets.safely_observe_and_persist(
+            self.db_path,
+            str(conversation_id),
+        )
         return True
 
     def renew_runs(self, owner: str, run_ids: list[int]) -> int:
