@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
@@ -21,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS))
 from conversation_adapters import (  # noqa: E402
     ConversationContext,
     InterruptResult,
+    KimiAdapter,
     NativeTurn,
     NormalizedEvent,
     ReconcileResult,
@@ -227,8 +229,12 @@ class ConversationBrokerCase(unittest.TestCase):
         session_after: str | None = None,
         runner_ref: str | None = None,
         expired: bool = True,
+        harness: str = "codex",
     ) -> tuple[str, int, int]:
-        conversation_id = self.add_conversation(state="running")
+        conversation_id = self.add_conversation(
+            state="running",
+            harness=harness,
+        )
         message_id = self.add_message(conversation_id, state="running")
         con = self.connect()
         started_at = None if state == "leased" else "2026-07-29 00:00:00"
@@ -681,6 +687,75 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(adapter.resumed, 0)
         self.assertEqual(adapter.reconciled, 1)
         self.assertTrue(broker.wait_idle())
+
+    def test_kimi_running_crash_rebuilds_exact_run_slice(self) -> None:
+        sessions_root = self.root / "kimi-sessions"
+        session_ref = "session_dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        session_dir = sessions_root / "wd_recovered" / session_ref
+        wire = session_dir / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True)
+        (session_dir / "state.json").write_text(
+            json.dumps({"workDir": str(self.worktree)}),
+            encoding="utf-8",
+        )
+        with wire.open("w", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "turn.prompt",
+                        "input": [{"type": "text", "text": "hello"}],
+                        "time": 8200,
+                    }
+                )
+                + "\n"
+            )
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "usage.record",
+                        "usageScope": "turn",
+                        "usage": {"inputOther": 4, "output": 2},
+                    }
+                )
+                + "\n"
+            )
+        _conversation, _message, run_id = self.add_live_run(
+            state="running",
+            session_after=session_ref,
+            runner_ref="kimi-8200-0",
+            harness="kimi",
+        )
+        adapter = KimiAdapter(sessions_root=sessions_root)
+
+        broker = self.start_broker(
+            lambda harness: adapter if harness == "kimi" else None
+        )
+
+        self.wait_run_state(run_id, "succeeded")
+        self.assertTrue(broker.wait_idle())
+        con = self.connect()
+        run = con.execute(
+            "SELECT state,error_code,error_detail FROM conversation_runs "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        events = con.execute(
+            "SELECT event_type,payload FROM conversation_events "
+            "WHERE run_id=? ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual(tuple(run), ("succeeded", None, None))
+        self.assertEqual([row["event_type"] for row in events], ["run.completed"])
+        self.assertEqual(
+            json.loads(events[0]["payload"]),
+            {
+                "detail": "Kimi exact run slice contains turn-scoped usage",
+                "outcome": "succeeded",
+                "proven": True,
+                "reconciled": True,
+            },
+        )
 
     def test_leased_crash_is_safe_to_start_once(self) -> None:
         _conversation, _message, run_id = self.add_live_run(state="leased")
