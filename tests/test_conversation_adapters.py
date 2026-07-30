@@ -7,10 +7,12 @@ import json
 import signal
 import sys
 import tempfile
+import threading
 import unittest
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
@@ -254,12 +256,23 @@ class FakeKimiProcess:
         exit_before_identity: bool = False,
         stderr: str = "",
         cancel_wire: Path | None = None,
+        block_after_stdout: bool = False,
     ) -> None:
         encoded = [
             line if isinstance(line, str) else json.dumps(line)
             for line in stdout_lines
         ]
-        self.stdout = io.StringIO("".join(line + "\n" for line in encoded))
+        self.stdout_released = threading.Event()
+        self.stdout_blocked = threading.Event()
+        self.stdout = (
+            BlockingKimiStdout(
+                encoded,
+                self.stdout_blocked,
+                self.stdout_released,
+            )
+            if block_after_stdout
+            else io.StringIO("".join(line + "\n" for line in encoded))
+        )
         self.stderr = io.StringIO(stderr)
         self.pid = 9876
         self.returncode: int | None = (
@@ -284,10 +297,12 @@ class FakeKimiProcess:
     def terminate(self) -> None:
         self.terminated = True
         self.returncode = -signal.SIGTERM
+        self.stdout_released.set()
 
     def kill(self) -> None:
         self.killed = True
         self.returncode = -signal.SIGKILL
+        self.stdout_released.set()
 
     def send_signal(self, value: int) -> None:
         self.signals.append(value)
@@ -297,6 +312,25 @@ class FakeKimiProcess:
                     json.dumps({"type": "turn.cancel", "time": 9000}) + "\n"
                 )
             self.returncode = -signal.SIGINT
+            self.stdout_released.set()
+
+
+class BlockingKimiStdout:
+    def __init__(
+        self,
+        lines: list[str],
+        blocked: threading.Event,
+        released: threading.Event,
+    ) -> None:
+        self.lines = lines
+        self.blocked = blocked
+        self.released = released
+
+    def __iter__(self) -> Iterator[str]:
+        yield from (line + "\n" for line in self.lines)
+        self.blocked.set()
+        if not self.released.wait(2.0):
+            raise AssertionError("Kimi stdout remained blocked")
 
 
 class FakeKimiRunner:
@@ -440,6 +474,7 @@ class FakeKimiRunner:
             exit_before_identity=plan.get("exit_before_identity", False),
             stderr=plan.get("stderr", ""),
             cancel_wire=wire,
+            block_after_stdout=plan.get("block_after_stdout", False),
         )
         self.calls.append((list(argv), cwd, dict(env)))
         self.processes.append(process)
@@ -1200,6 +1235,61 @@ class ConversationAdapterTest(unittest.TestCase):
             failed_events[-1].payload["error"].startswith(
                 "native failure detail"
             )
+        )
+
+    def test_kimi_durable_usage_completes_when_child_holds_stdout_open(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        runner.queue(
+            stdout_lines=[
+                {"role": "assistant", "content": "server started"},
+            ],
+            after_prompt=[
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 10, "output": 2},
+                },
+            ],
+            block_after_stdout=True,
+        )
+
+        turn = adapter.start(self.context, "start server")
+        events = list(adapter.stream(turn))
+
+        self.assertTrue(turn.opaque.stdout_blocked.is_set())
+        self.assertTrue(turn.opaque.terminated)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "usage",
+                "run.completed",
+            ],
+        )
+        self.assertEqual(events[-1].native_type, "usage.record")
+
+    def test_kimi_default_runner_owns_and_cleans_up_process_group(self) -> None:
+        adapter = KimiAdapter()
+        self.assertTrue(adapter.runner.start_new_session)
+        process = FakeKimiProcess([])
+        process._sc_conversation_process_group = 4321
+
+        with mock.patch(
+            "conversation_adapters.kimi.os.killpg"
+        ) as kill_process_group:
+            adapter._cleanup_process(process, 0.1)
+
+        self.assertEqual(
+            kill_process_group.call_args_list,
+            [
+                mock.call(4321, signal.SIGTERM),
+                mock.call(4321, 0),
+                mock.call(4321, signal.SIGKILL),
+            ],
         )
 
     def test_kimi_identity_mismatch_blocks_usage_reconciliation(self) -> None:
