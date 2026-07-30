@@ -20,10 +20,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from conductor_policy import CONDUCTOR_HARNESS, DEFAULT_CONDUCTOR_MODEL
+import db_driver
 import shell_liveness
+import sprint_conversations
 import sprint_lifecycle
-import sprint_state
+from conductor_policy import CONDUCTOR_HARNESS, DEFAULT_CONDUCTOR_MODEL
 from sprint_units import (
     SPRINT_UNIT_EDGES,
     TERMINAL_UNIT_STATES,
@@ -55,6 +56,10 @@ class DirectiveRefused(ValueError):
 
 class ConductorLaunchError(RuntimeError):
     """A role or Conductor process that refused before it could start."""
+
+
+class _RoutePreparationStale(RuntimeError):
+    """The durable route/roster changed after external route preparation."""
 
 
 def _operational_config() -> ConductorConfig:
@@ -485,6 +490,62 @@ def _route_for_slot(con, sprint_id: int, slot: str) -> tuple[str, str]:
         raise DirectiveRefused(str(exc)) from exc
 
 
+def _prepare_assignment_routes(con, sprint_id: int) -> dict[tuple[int, str], dict]:
+    """Prepare every eligible role route before the write transaction.
+
+    Adapter loading and worktree inspection touch the filesystem, so they stay
+    outside the action's short DB-only transaction.  ``_spawn`` revalidates the
+    selected shell and stored route after ``BEGIN IMMEDIATE``.
+    """
+    import run as run_mod
+
+    prepared: dict[tuple[int, str], dict] = {}
+    shells = con.execute(
+        "SELECT shell_id,shortname,flavor FROM shells "
+        "WHERE flavor IN ('planner','dev','reviewer') "
+        "AND COALESCE(is_deleted,0)=0 ORDER BY shell_id"
+    ).fetchall()
+    for shell in shells:
+        harness = model = None
+        slot = {
+            "planner": "plan",
+            "dev": "dev",
+            "reviewer": "rev",
+        }[shell["flavor"]]
+        key = (int(shell["shell_id"]), slot)
+        try:
+            harness, model = _route_for_slot(con, sprint_id, slot)
+            adapter = run_mod.load_adapter(harness)
+            effort = run_mod.default_headless_effort(adapter)
+            run_mod.validate_headless_request(adapter, model, effort)
+            worktree = run_mod.shell_work_dir(
+                shell["shortname"], shell["flavor"]
+            ).resolve(strict=False)
+            if worktree.exists() and not worktree.is_dir():
+                raise ValueError(
+                    f"shell {shell['shortname']!r} worktree is not a directory"
+                )
+            prepared[key] = {
+                "shell_id": int(shell["shell_id"]),
+                "shortname": shell["shortname"],
+                "harness": harness,
+                "provider": run_mod.session_provider(harness, model),
+                "model": model,
+                "effort": effort,
+                "worktree": str(worktree),
+                "error": None,
+            }
+        except (DirectiveRefused, OSError, ValueError) as exc:
+            prepared[key] = {
+                "shell_id": int(shell["shell_id"]),
+                "shortname": shell["shortname"],
+                "harness": harness,
+                "model": model,
+                "error": str(exc),
+            }
+    return prepared
+
+
 def _assert_issuer_assignment(row, unit) -> None:
     if row["issuer_flavor"] == "dev" and row["issuer_shell_id"] != unit["dev_shell_id"]:
         raise DirectiveRefused("dev issuer is not the unit's assigned developer")
@@ -514,46 +575,51 @@ def _block_when_legal(con, unit, actor_shell_id: int) -> None:
         _move(con, unit, "blocked", actor_shell_id)
 
 
-def _slot_command(
-    shell,
-    slot: str,
-    sprint_id: int,
-    *,
-    unit_seq: str | None,
-    prompt: str,
-    harness: str,
-    model: str,
-) -> list[str]:
-    command = [
-        str(REPO_ROOT / "sc"),
-        "run",
-        shell["shortname"],
-        "--slot",
-        slot,
-        "--sprint",
-        str(sprint_id),
-        "--await-sprint-active",
-        "--harness",
-        harness,
-        "--model",
-        model,
-    ]
-    if unit_seq is not None:
-        command += ["--unit", unit_seq]
-    command += ["--prompt", prompt]
-    return command
+def _assignment_role(slot: str, unit) -> str:
+    if slot == "plan":
+        return "planner"
+    if slot == "dev":
+        return "developer"
+    return "reviewer" if unit is not None else "conformance"
+
+
+def _required_result_kind(role: str) -> str:
+    return {
+        "planner": "planner-directive",
+        "developer": "unit-report",
+        "reviewer": "review-verdict",
+        "conformance": "conformance-verdict",
+    }[role]
 
 
 def _spawn(
     con,
-    launches: list[list[str]],
+    assignments: list[dict],
     shell,
     slot: str,
     row,
     payload: dict,
     *,
+    prepared_routes: dict[tuple[int, str], dict],
     unit=None,
 ) -> None:
+    key = (int(shell["shell_id"]), slot)
+    prepared = prepared_routes.get(key)
+    if prepared is None or prepared["shortname"] != shell["shortname"]:
+        raise _RoutePreparationStale(
+            f"assignment route changed for shell {shell['shortname']}"
+        )
+    harness, model = _route_for_slot(con, row["sprint_doc_id"], slot)
+    if (harness, model) != (prepared.get("harness"), prepared.get("model")):
+        raise _RoutePreparationStale(
+            f"Sprint {row['sprint_doc_id']} {slot} route changed"
+        )
+    if prepared["error"] is not None:
+        raise DirectiveRefused(
+            f"target shell {shell['shortname']!r} route is not runnable: "
+            f"{prepared['error']}"
+        )
+    role = _assignment_role(slot, unit)
     prompt = json.dumps(
         {
             "directive_id": row["directive_id"],
@@ -563,17 +629,34 @@ def _spawn(
         },
         sort_keys=True,
     )
-    harness, model = _route_for_slot(con, row["sprint_doc_id"], slot)
-    launches.append(
-        _slot_command(
-            shell,
-            slot,
-            row["sprint_doc_id"],
-            unit_seq=unit["seq"] if unit is not None else None,
-            prompt=prompt,
-            harness=harness,
-            model=model,
-        )
+    creation_key = (
+        f"sprint:{row['sprint_doc_id']}:assignment:{row['directive_id']}:"
+        f"{role}:{shell['shortname']}"
+    )
+    conversation_id = sprint_conversations.create_sprint_conversation(
+        con,
+        sprint_doc_id=int(row["sprint_doc_id"]),
+        shell=shell,
+        role=role,
+        lifecycle="one_shot",
+        route=prepared,
+        title=(
+            f"Sprint #{row['sprint_doc_id']} {role} "
+            f"{shell['shortname']}"
+        ),
+        creation_key=creation_key,
+        prompt=prompt,
+        unit_id=int(unit["unit_id"]) if unit is not None else None,
+        source_directive_id=int(row["directive_id"]),
+        required_result_kind=_required_result_kind(role),
+    )
+    assignments.append(
+        {
+            "conversation_id": conversation_id,
+            "role": role,
+            "slot": shell["shortname"],
+            "unit_id": int(unit["unit_id"]) if unit is not None else None,
+        }
     )
 
 
@@ -608,7 +691,14 @@ def _ready_pending_units(con, sprint_id: int):
     return ready
 
 
-def _release_ready_units(con, launches, row, payload, actor_shell_id: int):
+def _release_ready_units(
+    con,
+    assignments,
+    row,
+    payload,
+    actor_shell_id: int,
+    prepared_routes,
+):
     released = []
     for unit in _ready_pending_units(con, row["sprint_doc_id"]):
         dev = con.execute(
@@ -621,7 +711,16 @@ def _release_ready_units(con, launches, row, payload, actor_shell_id: int):
                 f"unit {unit['seq']} has no active assigned developer"
             )
         _move(con, unit, "working", actor_shell_id)
-        _spawn(con, launches, dev, "dev", row, payload, unit=unit)
+        _spawn(
+            con,
+            assignments,
+            dev,
+            "dev",
+            row,
+            payload,
+            prepared_routes=prepared_routes,
+            unit=unit,
+        )
         released.append(unit["seq"])
     return released
 
@@ -685,7 +784,13 @@ def validate_arm_board(con, sprint_id: int) -> None:
         )
 
 
-def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
+def _execute(
+    con,
+    row,
+    payload: dict,
+    actor_shell_id: int,
+    prepared_routes,
+) -> list[dict]:
     issuer, kind = row["issuer_flavor"], row["kind"]
     if (issuer, kind) not in _TRANSITION_SET:
         raise DirectiveRefused(f"no transition for {issuer}:{kind}")
@@ -714,7 +819,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             raise DirectiveRefused(
                 f"planner issuer is not sprint {sprint_id}'s originating Planner"
             )
-    launches: list[list[str]] = []
+    assignments: list[dict] = []
 
     if issuer == "dev":
         unit = _unit(con, row)
@@ -765,13 +870,28 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             ).fetchone()
             if reviewer is None:
                 raise DirectiveRefused("unit has no assigned reviewer")
-            _spawn(con, launches, reviewer, "rev", row, payload, unit=unit)
+            _spawn(
+                con,
+                assignments,
+                reviewer,
+                "rev",
+                row,
+                payload,
+                prepared_routes=prepared_routes,
+                unit=unit,
+            )
         elif kind == "ask-planner":
             _text(payload, "question")
             _block_when_legal(con, unit, actor_shell_id)
             _spawn(
-                con, launches, _planner_for_sprint(con, sprint_id),
-                "plan", row, payload,
+                con,
+                assignments,
+                _planner_for_sprint(con, sprint_id),
+                "plan",
+                row,
+                payload,
+                prepared_routes=prepared_routes,
+                unit=unit,
             )
         elif kind == "merged":
             pr_number = _integer(payload, "pr_number")
@@ -784,15 +904,28 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     "merged head does not match the recorded review head"
                 )
             _move(con, unit, "merged", actor_shell_id)
-            _release_ready_units(con, launches, row, payload, actor_shell_id)
+            _release_ready_units(
+                con,
+                assignments,
+                row,
+                payload,
+                actor_shell_id,
+                prepared_routes,
+            )
         elif kind == "unit-report":
             _text(payload, "shipped")
             if _all_units_terminal(con, sprint_id):
                 _spawn(
-                    con, launches, _planner_for_sprint(con, sprint_id),
-                    "plan", row, payload,
+                    con,
+                    assignments,
+                    _planner_for_sprint(con, sprint_id),
+                    "plan",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
+                    unit=unit,
                 )
-        return launches
+        return assignments
 
     if issuer == "reviewer":
         unit = _unit(con, row) if row["unit_id"] is not None else None
@@ -803,8 +936,14 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             if unit is not None:
                 _block_when_legal(con, unit, actor_shell_id)
             _spawn(
-                con, launches, _planner_for_sprint(con, sprint_id),
-                "plan", row, payload,
+                con,
+                assignments,
+                _planner_for_sprint(con, sprint_id),
+                "plan",
+                row,
+                payload,
+                prepared_routes=prepared_routes,
+                unit=unit,
             )
         elif kind == "review-clean":
             if unit is None:
@@ -814,8 +953,13 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     )
                 _text(payload, "main_sha")
                 _spawn(
-                    con, launches, _planner_for_sprint(con, sprint_id),
-                    "plan", row, payload,
+                    con,
+                    assignments,
+                    _planner_for_sprint(con, sprint_id),
+                    "plan",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
                 )
             else:
                 if unit["state"] != "in_review":
@@ -834,35 +978,64 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                 if unit["pr_number"] is None and unit["branch"] is None:
                     _move(con, unit, "merged", actor_shell_id)
                     _release_ready_units(
-                        con, launches, row, payload, actor_shell_id
+                        con,
+                        assignments,
+                        row,
+                        payload,
+                        actor_shell_id,
+                        prepared_routes,
                     )
                     _spawn(
                         con,
-                        launches,
+                        assignments,
                         dev,
                         "dev",
                         row,
                         {**payload, "report_only": True},
+                        prepared_routes=prepared_routes,
                         unit=unit,
                     )
                 else:
-                    _spawn(con, launches, dev, "dev", row, payload, unit=unit)
+                    _spawn(
+                        con,
+                        assignments,
+                        dev,
+                        "dev",
+                        row,
+                        payload,
+                        prepared_routes=prepared_routes,
+                        unit=unit,
+                    )
         elif kind == "findings":
             findings = payload.get("findings")
             if not isinstance(findings, list) or not findings:
                 raise DirectiveRefused("payload.findings must be a nonempty array")
             if unit is None:
                 _spawn(
-                    con, launches, _planner_for_sprint(con, sprint_id),
-                    "plan", row, payload,
+                    con,
+                    assignments,
+                    _planner_for_sprint(con, sprint_id),
+                    "plan",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
                 )
             else:
                 dev = con.execute(
                     "SELECT shell_id,shortname,flavor FROM shells WHERE shell_id=?",
                     (unit["dev_shell_id"],),
                 ).fetchone()
-                _spawn(con, launches, dev, "dev", row, payload, unit=unit)
-        return launches
+                _spawn(
+                    con,
+                    assignments,
+                    dev,
+                    "dev",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
+                    unit=unit,
+                )
+        return assignments
 
     if issuer == "planner":
         sprint_id = row["sprint_doc_id"]
@@ -881,13 +1054,31 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                     )
                 if unit["state"] in ("pending", "blocked"):
                     _move(con, unit, "working", actor_shell_id)
-                _spawn(con, launches, target, "dev", row, payload, unit=unit)
+                _spawn(
+                    con,
+                    assignments,
+                    target,
+                    "dev",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
+                    unit=unit,
+                )
             elif target["flavor"] == "reviewer":
                 if unit is None and payload.get("mode") != "conformance":
                     raise DirectiveRefused(
                         "unitless reviewer kickoff requires mode=conformance"
                     )
-                _spawn(con, launches, target, "rev", row, payload, unit=unit)
+                _spawn(
+                    con,
+                    assignments,
+                    target,
+                    "rev",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
+                    unit=unit,
+                )
             else:
                 raise DirectiveRefused("kickoff target must be dev or reviewer")
         elif kind == "hold":
@@ -915,7 +1106,16 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                 "WHERE unit_id=?",
                 (actor_shell_id, unit["unit_id"]),
             )
-            _spawn(con, launches, target, "dev", row, payload, unit=unit)
+            _spawn(
+                con,
+                assignments,
+                target,
+                "dev",
+                row,
+                payload,
+                prepared_routes=prepared_routes,
+                unit=unit,
+            )
         elif kind == "answer":
             if unit is None:
                 raise DirectiveRefused("answer requires unit_id")
@@ -925,7 +1125,16 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             if target["flavor"] == "dev":
                 if unit["state"] == "blocked":
                     _move(con, unit, "working", actor_shell_id)
-                _spawn(con, launches, target, "dev", row, payload, unit=unit)
+                _spawn(
+                    con,
+                    assignments,
+                    target,
+                    "dev",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
+                    unit=unit,
+                )
             elif target["flavor"] == "reviewer":
                 if unit["state"] == "blocked":
                     _move(con, unit, "working", actor_shell_id)
@@ -934,7 +1143,16 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
                         (unit["unit_id"],),
                     ).fetchone()
                     _move(con, unit, "in_review", actor_shell_id)
-                _spawn(con, launches, target, "rev", row, payload, unit=unit)
+                _spawn(
+                    con,
+                    assignments,
+                    target,
+                    "rev",
+                    row,
+                    payload,
+                    prepared_routes=prepared_routes,
+                    unit=unit,
+                )
             else:
                 raise DirectiveRefused("answer target must be dev or reviewer")
         elif kind == "close":
@@ -983,7 +1201,7 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             )
             sprint_lifecycle.transition(con, sprint_id, "closing")
             sprint_lifecycle.transition(con, sprint_id, "closed")
-        return launches
+        return assignments
 
     unit = _unit(con, row)
     if kind == "pr-green":
@@ -995,7 +1213,16 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
         ).fetchone()
         if reviewer is None:
             raise DirectiveRefused("unit has no assigned reviewer")
-        _spawn(con, launches, reviewer, "rev", row, payload, unit=unit)
+        _spawn(
+            con,
+            assignments,
+            reviewer,
+            "rev",
+            row,
+            payload,
+            prepared_routes=prepared_routes,
+            unit=unit,
+        )
     elif kind == "pr-red":
         if unit["state"] != "working":
             _move(con, unit, "working", actor_shell_id)
@@ -1003,22 +1230,50 @@ def _execute(con, row, payload: dict, actor_shell_id: int) -> list[list[str]]:
             "SELECT shell_id,shortname,flavor FROM shells WHERE shell_id=?",
             (unit["dev_shell_id"],),
         ).fetchone()
-        _spawn(con, launches, dev, "dev", row, payload, unit=unit)
+        _spawn(
+            con,
+            assignments,
+            dev,
+            "dev",
+            row,
+            payload,
+            prepared_routes=prepared_routes,
+            unit=unit,
+        )
     elif kind == "pr-merged":
         _move(con, unit, "merged", actor_shell_id)
-        _release_ready_units(con, launches, row, payload, actor_shell_id)
+        _release_ready_units(
+            con,
+            assignments,
+            row,
+            payload,
+            actor_shell_id,
+            prepared_routes,
+        )
         if _all_units_terminal(con, sprint_id):
             _spawn(
-                con, launches, _planner_for_sprint(con, sprint_id),
-                "plan", row, payload,
+                con,
+                assignments,
+                _planner_for_sprint(con, sprint_id),
+                "plan",
+                row,
+                payload,
+                prepared_routes=prepared_routes,
+                unit=unit,
             )
     elif kind in ("stall", "dead-shell"):
         _block_when_legal(con, unit, actor_shell_id)
         _spawn(
-            con, launches, _planner_for_sprint(con, sprint_id),
-            "plan", row, payload,
+            con,
+            assignments,
+            _planner_for_sprint(con, sprint_id),
+            "plan",
+            row,
+            payload,
+            prepared_routes=prepared_routes,
+            unit=unit,
         )
-    return launches
+    return assignments
 
 
 def _trail(con, row, actor_shell_id: int, event_kind: str, evidence: dict) -> None:
@@ -1037,14 +1292,54 @@ def _trail(con, row, actor_shell_id: int, event_kind: str, evidence: dict) -> No
     )
 
 
+def _source_unit(con, row):
+    if row["unit_id"] is None:
+        return None
+    return con.execute(
+        "SELECT * FROM sprint_units "
+        "WHERE unit_id=? AND sprint_doc_id=?",
+        (row["unit_id"], row["sprint_doc_id"]),
+    ).fetchone()
+
+
+def _queue_refusal_assignment(
+    con,
+    row,
+    reason: str,
+    prepared_routes,
+) -> dict:
+    """Atomically queue the originating Planner after a mechanical refusal."""
+    if row["sprint_doc_id"] is None:
+        return {"error": "cannot escalate without sprint_doc_id"}
+    con.execute("SAVEPOINT conductor_refusal_assignment")
+    try:
+        assignments: list[dict] = []
+        _spawn(
+            con,
+            assignments,
+            _planner_for_sprint(con, row["sprint_doc_id"]),
+            "plan",
+            row,
+            {
+                "refusal": reason,
+                "source_payload": row["payload"],
+            },
+            prepared_routes=prepared_routes,
+            unit=_source_unit(con, row),
+        )
+        con.execute("RELEASE conductor_refusal_assignment")
+        return assignments[0]
+    except DirectiveRefused as exc:
+        con.execute("ROLLBACK TO conductor_refusal_assignment")
+        con.execute("RELEASE conductor_refusal_assignment")
+        return {"error": str(exc)}
+
+
 def _act_locked(
     con,
     directive_id: int,
     actor_shell_id: int,
-    *,
-    launcher: Callable[[list[str]], int] | None = None,
 ) -> dict:
-    launcher = launcher or _default_launcher
     actor = con.execute(
         "SELECT shell_id,flavor FROM shells "
         "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
@@ -1065,104 +1360,139 @@ def _act_locked(
             "replayed": True,
         }
 
-    con.execute("SAVEPOINT conductor_act")
-    try:
-        payload = _payload(row)
-        launches = _execute(con, row, payload, actor_shell_id)
-        pids = [launcher(command) for command in launches]
-        con.execute("RELEASE conductor_act")
-        con.execute(
-            "UPDATE directives SET status='executed',"
-            "executed_at=datetime('now') WHERE directive_id=?",
-            (directive_id,),
-        )
-        evidence = {
-            "issuer": row["issuer_flavor"],
-            "kind": row["kind"],
-            "launches": launches,
-            "pids": pids,
-        }
-        _trail(con, row, actor_shell_id, "conductor-executed", evidence)
-        con.commit()
-        return {
-            "directive_id": directive_id,
-            "status": "executed",
-            "launches": launches,
-            "pids": pids,
-        }
-    except (DirectiveRefused, ConductorLaunchError) as exc:
-        con.execute("ROLLBACK TO conductor_act")
-        con.execute("RELEASE conductor_act")
-        reason = str(exc)
-        con.execute(
-            "UPDATE directives SET status='refused',refusal_reason=?,"
-            "executed_at=datetime('now') WHERE directive_id=?",
-            (reason, directive_id),
-        )
-        escalation = None
+    for attempt in range(3):
+        prepared_routes = _prepare_assignment_routes(
+            con, int(row["sprint_doc_id"])
+        ) if row["sprint_doc_id"] is not None else {}
         try:
-            if row["sprint_doc_id"] is None:
-                raise DirectiveRefused("cannot escalate without sprint_doc_id")
-            planner = _planner_for_sprint(con, row["sprint_doc_id"])
-            harness, model = _route_for_slot(
-                con, row["sprint_doc_id"], "plan"
-            )
-            prompt = json.dumps(
-                {
-                    "directive_id": directive_id,
-                    "refusal": reason,
-                    "issuer": row["issuer_flavor"],
-                    "kind": row["kind"],
-                    "payload": row["payload"],
-                },
-                sort_keys=True,
-            )
-            command = _slot_command(
-                planner,
-                "plan",
-                row["sprint_doc_id"],
-                unit_seq=None,
-                prompt=prompt,
-                harness=harness,
-                model=model,
-            )
-            escalation = {"command": command, "pid": launcher(command)}
-        except (DirectiveRefused, ConductorLaunchError) as escalation_error:
-            escalation = {"error": str(escalation_error)}
-        _trail(
-            con,
-            row,
-            actor_shell_id,
-            "conductor-refused",
-            {"reason": reason, "escalation": escalation},
-        )
-        con.commit()
-        return {
-            "directive_id": directive_id,
-            "status": "refused",
-            "reason": reason,
-            "escalation": escalation,
-        }
-    except Exception:
-        con.execute("ROLLBACK TO conductor_act")
-        con.execute("RELEASE conductor_act")
-        raise
+            with db_driver.write_transaction(
+                con,
+                "conductor.directive_act",
+            ):
+                actor = con.execute(
+                    "SELECT shell_id,flavor FROM shells "
+                    "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+                    (actor_shell_id,),
+                ).fetchone()
+                if actor is None or actor["flavor"] != "conductor":
+                    raise PermissionError(
+                        "directive act requires a conductor shell"
+                    )
+                row = con.execute(
+                    "SELECT * FROM directives WHERE directive_id=?",
+                    (directive_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"no directive {directive_id}")
+                if row["status"] != "pending":
+                    return {
+                        "directive_id": directive_id,
+                        "status": row["status"],
+                        "replayed": True,
+                    }
+
+                con.execute("SAVEPOINT conductor_act")
+                try:
+                    payload = _payload(row)
+                    assignments = _execute(
+                        con,
+                        row,
+                        payload,
+                        actor_shell_id,
+                        prepared_routes,
+                    )
+                except DirectiveRefused as exc:
+                    con.execute("ROLLBACK TO conductor_act")
+                    con.execute("RELEASE conductor_act")
+                    reason = str(exc)
+                    escalation = _queue_refusal_assignment(
+                        con,
+                        row,
+                        reason,
+                        prepared_routes,
+                    )
+                    con.execute(
+                        "UPDATE directives SET status='refused',"
+                        "refusal_reason=?,executed_at=datetime('now') "
+                        "WHERE directive_id=?",
+                        (reason, directive_id),
+                    )
+                    evidence = {
+                        "reason": reason,
+                        "escalation": escalation,
+                    }
+                    _trail(
+                        con,
+                        row,
+                        actor_shell_id,
+                        "conductor-refused",
+                        evidence,
+                    )
+                    conversation_ids = (
+                        [escalation["conversation_id"]]
+                        if "conversation_id" in escalation
+                        else []
+                    )
+                    result = {
+                        "directive_id": directive_id,
+                        "status": "refused",
+                        "reason": reason,
+                        "escalation": escalation,
+                        "conversation_ids": conversation_ids,
+                    }
+                else:
+                    con.execute(
+                        "UPDATE directives SET status='executed',"
+                        "executed_at=datetime('now') WHERE directive_id=?",
+                        (directive_id,),
+                    )
+                    evidence = {
+                        "issuer": row["issuer_flavor"],
+                        "kind": row["kind"],
+                        "assignments": assignments,
+                    }
+                    _trail(
+                        con,
+                        row,
+                        actor_shell_id,
+                        "conductor-executed",
+                        evidence,
+                    )
+                    con.execute("RELEASE conductor_act")
+                    result = {
+                        "directive_id": directive_id,
+                        "status": "executed",
+                        "assignments": assignments,
+                        # Retained response fields for old API/CLI consumers.
+                        # Browser-native actions never populate process evidence.
+                        "launches": [],
+                        "pids": [],
+                        "conversation_ids": [
+                            item["conversation_id"] for item in assignments
+                        ],
+                    }
+            return result
+        except _RoutePreparationStale:
+            if attempt == 2:
+                raise
+            row = con.execute(
+                "SELECT * FROM directives WHERE directive_id=?",
+                (directive_id,),
+            ).fetchone()
+    raise RuntimeError("directive route preparation did not converge")
 
 
 def act(
     con,
     directive_id: int,
     actor_shell_id: int,
-    *,
-    launcher: Callable[[list[str]], int] | None = None,
 ) -> dict:
-    """Execute or refuse one pending directive as a Conductor shell."""
+    """Commit one directive transition and every worker handoff atomically."""
     with _act_lock:
         return _act_locked(
             con,
             directive_id,
             actor_shell_id,
-            launcher=launcher,
         )
 
 

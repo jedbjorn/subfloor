@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sqlite3
 import subprocess
@@ -105,7 +106,8 @@ class RuntimeFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="sc_conductor8_")
         self.addCleanup(self.tmp.cleanup)
-        self.con = build_db(Path(self.tmp.name) / "runtime.db")
+        self.db_path = Path(self.tmp.name) / "runtime.db"
+        self.con = build_db(self.db_path)
         self.addCleanup(self.con.close)
         shells = (
             (1, "Conductor", "CON1", "conductor", "con-token"),
@@ -650,8 +652,18 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                         ),
                     ).lastrowid
                     con.commit()
-                    result = runtime.act(con, directive_id, 1, launcher=self.launcher)
+                    result = runtime.act(con, directive_id, 1)
                     self.assertEqual(result["status"], "executed")
+                    for assignment in result["assignments"]:
+                        self.assertEqual(
+                            con.execute(
+                                "SELECT COUNT(*) FROM "
+                                "sprint_conversation_bindings "
+                                "WHERE conversation_id=?",
+                                (assignment["conversation_id"],),
+                            ).fetchone()[0],
+                            1,
+                        )
                     row = con.execute(
                         "SELECT status,refusal_reason FROM directives "
                         "WHERE directive_id=?",
@@ -669,11 +681,11 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
     def test_malformed_payload_is_refused_and_escalated(self):
         directive_id = self.emit("dev", "ready-for-review", {"pr_number": "not-int"})
         self.con.commit()
-        result = runtime.act(self.con, directive_id, 1, launcher=self.launcher)
+        result = runtime.act(self.con, directive_id, 1)
         self.assertEqual(result["status"], "refused")
         self.assertIn("payload.pr_number", result["reason"])
-        self.assertIn("command", result["escalation"])
-        self.assertIn("PLN1", result["escalation"]["command"])
+        self.assertEqual(result["escalation"]["role"], "planner")
+        self.assertEqual(result["escalation"]["slot"], "PLN1")
         self.assertEqual(
             self.con.execute(
                 "SELECT status FROM directives WHERE directive_id=?",
@@ -698,10 +710,11 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.con.commit()
 
-        ready = runtime.act(self.con, ready_id, 1, launcher=self.launcher)
+        ready = runtime.act(self.con, ready_id, 1)
 
         self.assertEqual(ready["status"], "executed")
-        self.assertEqual(len(ready["launches"]), 1)
+        self.assertEqual(len(ready["assignments"]), 1)
+        self.assertEqual(ready["assignments"][0]["role"], "reviewer")
         unit = self.con.execute(
             "SELECT state,pr_number,branch FROM sprint_units WHERE unit_id=10"
         ).fetchone()
@@ -714,11 +727,15 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.con.commit()
 
-        clean = runtime.act(self.con, clean_id, 1, launcher=self.launcher)
+        clean = runtime.act(self.con, clean_id, 1)
 
         self.assertEqual(clean["status"], "executed")
-        self.assertEqual(len(clean["launches"]), 1)
-        self.assertIn('"report_only": true', clean["launches"][0][-1])
+        self.assertEqual(len(clean["assignments"]), 1)
+        prompt = self.con.execute(
+            "SELECT body FROM conversation_messages WHERE conversation_id=?",
+            (clean["assignments"][0]["conversation_id"],),
+        ).fetchone()[0]
+        self.assertIn('"report_only": true', prompt)
         unit = self.con.execute(
             "SELECT state,review_head FROM sprint_units WHERE unit_id=10"
         ).fetchone()
@@ -730,10 +747,10 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             {"shipped": "verified requested state already present"},
         )
         self.con.commit()
-        report = runtime.act(self.con, report_id, 1, launcher=self.launcher)
+        report = runtime.act(self.con, report_id, 1)
         self.assertEqual(report["status"], "executed")
-        self.assertEqual(len(report["launches"]), 1)
-        self.assertIn("PLN1", report["launches"][0])
+        self.assertEqual(len(report["assignments"]), 1)
+        self.assertEqual(report["assignments"][0]["slot"], "PLN1")
 
     def test_report_only_requires_explicit_null_contract_and_evidence(self):
         cases = (
@@ -775,9 +792,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                 self.set_unit("working")
                 directive_id = self.emit("dev", "ready-for-review", payload)
                 self.con.commit()
-                result = runtime.act(
-                    self.con, directive_id, 1, launcher=self.launcher
-                )
+                result = runtime.act(self.con, directive_id, 1)
                 self.assertEqual(result["status"], "refused")
                 self.assertEqual(
                     self.con.execute(
@@ -800,16 +815,14 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.con.commit()
 
-        result = runtime.act(
-            self.con, directive_id, 1, launcher=self.launcher
-        )
+        result = runtime.act(self.con, directive_id, 1)
 
         self.assertEqual(result["status"], "executed")
         unit = self.con.execute(
             "SELECT state,review_head FROM sprint_units WHERE unit_id=10"
         ).fetchone()
         self.assertEqual(tuple(unit), ("working", None))
-        self.assertIn("DEV1", result["launches"][0])
+        self.assertEqual(result["assignments"][0]["slot"], "DEV1")
 
     def test_retask_refuses_merged_unit_before_worker_launch(self):
         self.set_unit("working")
@@ -825,9 +838,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.con.commit()
 
-        result = runtime.act(
-            self.con, directive_id, 1, launcher=self.launcher
-        )
+        result = runtime.act(self.con, directive_id, 1)
 
         self.assertEqual(result["status"], "refused")
         self.assertIn("add a follow-up unit", result["reason"])
@@ -837,10 +848,9 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             ).fetchone()[0],
             "merged",
         )
-        self.assertIn("PLN1", result["escalation"]["command"])
-        self.assertNotIn("DEV1", result["escalation"]["command"])
+        self.assertEqual(result["escalation"]["slot"], "PLN1")
 
-    def test_refusal_persists_when_planner_escalation_launch_fails(self):
+    def test_refusal_persists_when_planner_route_is_unavailable(self):
         self.set_unit("working")
         self.set_unit("merged", review_head="approved-head")
         directive_id = self.emit(
@@ -854,20 +864,19 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.con.commit()
 
-        def failing_launcher(_command):
-            raise runtime.ConductorLaunchError(
-                "planner slot cannot launch on a closed sprint"
-            )
-
-        result = runtime.act(
-            self.con, directive_id, 1, launcher=failing_launcher
-        )
+        with mock.patch.object(
+            run,
+            "load_adapter",
+            side_effect=ValueError("route temporarily unavailable"),
+        ):
+            result = runtime.act(self.con, directive_id, 1)
 
         self.assertEqual(result["status"], "refused")
         self.assertIn("add a follow-up unit", result["reason"])
         self.assertEqual(
             result["escalation"],
-            {"error": "planner slot cannot launch on a closed sprint"},
+            {"error": "target shell 'PLN1' route is not runnable: "
+             "route temporarily unavailable"},
         )
         row = self.con.execute(
             "SELECT status,refusal_reason FROM directives "
@@ -877,7 +886,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         self.assertEqual(row["status"], "refused")
         self.assertIn("add a follow-up unit", row["refusal_reason"])
 
-    def test_worker_launch_failure_rolls_back_and_is_durably_refused(self):
+    def test_assignment_persistence_failure_rolls_back_the_whole_action(self):
         self.set_unit("working")
         self.set_unit("blocked")
         directive_id = self.emit(
@@ -890,27 +899,16 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             },
         )
         self.con.commit()
-        calls = []
+        with (
+            mock.patch.object(
+                runtime.sprint_conversations,
+                "create_sprint_conversation",
+                side_effect=RuntimeError("forced persistence failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "forced persistence failure"),
+        ):
+            runtime.act(self.con, directive_id, 1)
 
-        def fail_worker_then_launch_planner(command):
-            calls.append(command)
-            if len(calls) == 1:
-                raise runtime.ConductorLaunchError(
-                    "worker slot is no longer live"
-                )
-            return 31337
-
-        result = runtime.act(
-            self.con,
-            directive_id,
-            1,
-            launcher=fail_worker_then_launch_planner,
-        )
-
-        self.assertEqual(result["status"], "refused")
-        self.assertEqual(result["reason"], "worker slot is no longer live")
-        self.assertEqual(result["escalation"]["pid"], 31337)
-        self.assertIn("PLN1", result["escalation"]["command"])
         self.assertEqual(
             self.con.execute(
                 "SELECT state FROM sprint_units WHERE unit_id=10"
@@ -922,16 +920,115 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             "WHERE directive_id=?",
             (directive_id,),
         ).fetchone()
-        self.assertEqual(tuple(row), ("refused", "worker slot is no longer live"))
+        self.assertEqual(tuple(row), ("pending", None))
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversations WHERE mode='sprint'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_action_does_no_external_work_inside_the_transaction(self):
+        directive_id = self.emit(
+            "planner",
+            "kickoff",
+            {"to": "DEV1", "instruction": "build the bounded unit"},
+        )
+        self.con.commit()
+        load_adapter = run.load_adapter
+        transaction_states = []
+
+        def checked_adapter(harness):
+            transaction_states.append(self.con.in_transaction)
+            return load_adapter(harness)
+
+        with (
+            mock.patch.object(run, "load_adapter", side_effect=checked_adapter),
+            mock.patch.object(
+                runtime.subprocess,
+                "Popen",
+                side_effect=AssertionError("action attempted process launch"),
+            ),
+        ):
+            result = runtime.act(self.con, directive_id, 1)
+
+        self.assertEqual(result["status"], "executed")
+        self.assertTrue(transaction_states)
+        self.assertEqual(set(transaction_states), {False})
+        prompt = self.con.execute(
+            "SELECT body FROM conversation_messages WHERE conversation_id=?",
+            (result["conversation_ids"][0],),
+        ).fetchone()[0]
+        self.assertNotIn("await-sprint-active", prompt)
+
+    def test_parallel_duplicate_action_commits_one_complete_assignment(self):
+        directive_id = self.emit(
+            "planner",
+            "kickoff",
+            {"to": "DEV1", "instruction": "build the bounded unit"},
+        )
+        self.con.commit()
+
+        def act_once():
+            con = runtime.db_driver.connect(self.db_path)
+            try:
+                return runtime._act_locked(con, directive_id, 1)
+            finally:
+                con.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = [
+                future.result(timeout=10)
+                for future in (pool.submit(act_once), pool.submit(act_once))
+            ]
+
+        self.assertEqual([item["status"] for item in results], [
+            "executed",
+            "executed",
+        ])
+        self.assertEqual(
+            sum(bool(item.get("replayed")) for item in results),
+            1,
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT state FROM sprint_units WHERE unit_id=10"
+            ).fetchone()[0],
+            "working",
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_conversation_bindings "
+                "WHERE source_directive_id=?",
+                (directive_id,),
+            ).fetchone()[0],
+            1,
+        )
+        conversation_id = self.con.execute(
+            "SELECT conversation_id FROM sprint_conversation_bindings "
+            "WHERE source_directive_id=?",
+            (directive_id,),
+        ).fetchone()[0]
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM conversation_messages "
+                " WHERE conversation_id=?),"
+                "(SELECT COUNT(*) FROM conversation_outbox "
+                " WHERE conversation_id=?),"
+                "(SELECT COUNT(*) FROM conversation_events "
+                " WHERE conversation_id=?)",
+                (conversation_id, conversation_id, conversation_id),
+            ).fetchone()),
+            (1, 1, 2),
+        )
 
     def test_runtime_backstop_refuses_retired_handoff(self):
         self.set_declared()
         directive_id = self.emit("planner", "handoff", {}, unit=False)
         self.con.commit()
 
-        result = runtime.act(
-            self.con, directive_id, 1, launcher=self.launcher
-        )
+        result = runtime.act(self.con, directive_id, 1)
 
         self.assertEqual(result["status"], "refused")
         self.assertEqual(result["reason"], "no transition for planner:handoff")
@@ -952,7 +1049,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         )
         self.con.commit()
 
-        result = runtime.act(self.con, directive_id, 1, launcher=self.launcher)
+        result = runtime.act(self.con, directive_id, 1)
 
         self.assertEqual(result["status"], "refused")
         unit = self.con.execute(
@@ -964,7 +1061,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         directive_id = self.emit("dev", "unit-report", {"shipped": "x"})
         self.con.commit()
         with self.assertRaisesRegex(PermissionError, "conductor"):
-            runtime.act(self.con, directive_id, 2, launcher=self.launcher)
+            runtime.act(self.con, directive_id, 2)
 
     def test_declared_zero_unit_and_dependency_cycle_arming_is_refused(self):
         self.set_declared()
@@ -1001,16 +1098,15 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             {"question": "choose", "alternatives": ["a", "b"]},
         )
         self.con.commit()
-        result = runtime.act(
-            self.con, directive_id, 1, launcher=self.launcher
-        )
+        result = runtime.act(self.con, directive_id, 1)
         self.assertEqual(result["status"], "executed")
-        self.assertEqual(len(result["launches"]), 1)
-        command = result["launches"][0]
-        self.assertIn("PLN1", command)
-        self.assertNotIn("PLN2", command)
+        self.assertEqual(len(result["assignments"]), 1)
+        self.assertEqual(result["assignments"][0]["slot"], "PLN1")
         self.assertEqual(
-            command[command.index("--model") + 1],
+            self.con.execute(
+                "SELECT model FROM conversations WHERE conversation_id=?",
+                (result["assignments"][0]["conversation_id"],),
+            ).fetchone()[0],
             "sonnet",
         )
 
@@ -1022,9 +1118,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             (json.dumps({"reason": "not mine"}),),
         ).lastrowid
         self.con.commit()
-        refused = runtime.act(
-            self.con, nonowner, 1, launcher=self.launcher
-        )
+        refused = runtime.act(self.con, nonowner, 1)
         self.assertEqual(refused["status"], "refused")
         self.assertIn("originating Planner", refused["reason"])
 
@@ -1043,9 +1137,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             {"pr_number": 7, "head": "abc", "merge_sha": "def"},
         )
         self.con.commit()
-        result = runtime.act(
-            self.con, directive_id, 1, launcher=self.launcher
-        )
+        result = runtime.act(self.con, directive_id, 1)
         self.assertEqual(result["status"], "executed")
         self.assertEqual(
             self.con.execute(
@@ -1053,32 +1145,31 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             ).fetchone()[0],
             "working",
         )
-        self.assertEqual(len(result["launches"]), 1)
-        self.assertIn("DEV1", result["launches"][0])
-        self.assertNotIn("PLN1", result["launches"][0])
+        self.assertEqual(len(result["assignments"]), 1)
+        self.assertEqual(result["assignments"][0]["slot"], "DEV1")
 
     def test_unit_report_boots_planner_only_after_all_units_terminal(self):
         self.set_unit("working")
         first = self.emit("dev", "unit-report", {"shipped": "partial"})
         self.con.commit()
-        ordinary = runtime.act(self.con, first, 1, launcher=self.launcher)
-        self.assertEqual(ordinary["launches"], [])
+        ordinary = runtime.act(self.con, first, 1)
+        self.assertEqual(ordinary["assignments"], [])
 
         self.con.execute(
             "UPDATE sprint_units SET state='merged' WHERE unit_id=10"
         )
         last = self.emit("dev", "unit-report", {"shipped": "complete"})
         self.con.commit()
-        terminal = runtime.act(self.con, last, 1, launcher=self.launcher)
-        self.assertEqual(len(terminal["launches"]), 1)
-        self.assertIn("PLN1", terminal["launches"][0])
+        terminal = runtime.act(self.con, last, 1)
+        self.assertEqual(len(terminal["assignments"]), 1)
+        self.assertEqual(terminal["assignments"][0]["slot"], "PLN1")
 
 
 class ConductorSyntheticSprintTests(RuntimeFixture):
     def act_one(self, issuer, kind, payload, *, unit=True):
         directive_id = self.emit(issuer, kind, payload, unit=unit)
         self.con.commit()
-        result = runtime.act(self.con, directive_id, 1, launcher=self.launcher)
+        result = runtime.act(self.con, directive_id, 1)
         self.assertEqual(result["status"], "executed")
         return directive_id
 

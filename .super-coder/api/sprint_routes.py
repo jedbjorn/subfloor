@@ -27,7 +27,6 @@ import io
 import json
 import sys
 import time
-import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -41,6 +40,7 @@ import conductor_runtime  # noqa: E402
 import conversation_broker  # noqa: E402
 import conversation_events  # noqa: E402
 import run as run_mod  # noqa: E402
+import sprint_conversations  # noqa: E402
 import sprint_lifecycle  # noqa: E402
 import sprint_state  # noqa: E402
 from sprint_units import SPRINT_UNIT_EDGES  # noqa: E402
@@ -889,27 +889,14 @@ def _append_conversation_event(
     message_id: int | None = None,
     run_id: int | None = None,
 ) -> int:
-    sequence = int(
-        con.execute(
-            "SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_events "
-            "WHERE conversation_id=?",
-            (conversation_id,),
-        ).fetchone()[0]
+    return sprint_conversations.append_event(
+        con,
+        conversation_id,
+        event_type,
+        payload,
+        message_id=message_id,
+        run_id=run_id,
     )
-    con.execute(
-        "INSERT INTO conversation_events "
-        "(conversation_id,sequence,event_type,payload,message_id,run_id) "
-        "VALUES (?,?,?,?,?,?)",
-        (
-            conversation_id,
-            sequence,
-            event_type,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            message_id,
-            run_id,
-        ),
-    )
-    return sequence
 
 
 def _conversation_route(con, shell, harness: str, model: str | None):
@@ -947,97 +934,24 @@ def _create_sprint_conversation(
     title: str,
     creation_key: str,
     prompt: str,
+    unit_id: int | None = None,
     required_result_kind: str | None = None,
     source_directive_id: int | None = None,
 ) -> str:
-    conversation_id = "cv_" + uuid.uuid4().hex
-    creation_body = {
-        "sprint_doc_id": sprint_doc_id,
-        "shell_id": int(shell["shell_id"]),
-        "role": role,
-        "route": route,
-        "title": title,
-    }
-    creation_hash = hashlib.sha256(
-        json.dumps(creation_body, sort_keys=True).encode()
-    ).hexdigest()
-    con.execute(
-        "INSERT INTO conversations "
-        "(conversation_id,shell_id,mode,owner_user_id,sprint_doc_id,harness,"
-        "provider,model,effort,worktree,state,title,"
-        "creation_idempotency_key,creation_request_hash) "
-        "VALUES (?,?, 'sprint',NULL,?,?,?,?,?,?,'queued',?,?,?)",
-        (
-            conversation_id,
-            shell["shell_id"],
-            sprint_doc_id,
-            route["harness"],
-            route["provider"],
-            route["model"],
-            route["effort"],
-            route["worktree"],
-            title,
-            creation_key,
-            creation_hash,
-        ),
-    )
-    binding_state = "active" if lifecycle == "persistent" else "pending"
-    con.execute(
-        "INSERT INTO sprint_conversation_bindings "
-        "(conversation_id,sprint_doc_id,role,lifecycle,slot,"
-        "source_directive_id,required_result_kind,state,started_at) "
-        "VALUES (?,?,?,?,?,?,?,?,"
-        "CASE WHEN ?='active' THEN datetime('now') ELSE NULL END)",
-        (
-            conversation_id,
-            sprint_doc_id,
-            role,
-            lifecycle,
-            shell["shortname"],
-            source_directive_id,
-            required_result_kind,
-            binding_state,
-            binding_state,
-        ),
-    )
-    prompt_key = f"{creation_key}:prompt"
-    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-    message_id = int(
-        con.execute(
-            "INSERT INTO conversation_messages "
-            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
-            "idempotency_key,request_hash,state) "
-            "VALUES (?,'engine','sprint','prompt',?,?,?,'queued')",
-            (conversation_id, prompt, prompt_key, prompt_hash),
-        ).lastrowid
-    )
-    con.execute(
-        "INSERT INTO conversation_outbox (conversation_id,message_id) "
-        "VALUES (?,?)",
-        (conversation_id, message_id),
-    )
-    _append_conversation_event(
+    return sprint_conversations.create_sprint_conversation(
         con,
-        conversation_id,
-        "conversation.created",
-        {
-            "shell_id": int(shell["shell_id"]),
-            "mode": "sprint",
-            "sprint_doc_id": sprint_doc_id,
-            "role": role,
-            "harness": route["harness"],
-            "model": route["model"],
-            "effort": route["effort"],
-        },
+        sprint_doc_id=sprint_doc_id,
+        shell=shell,
+        role=role,
+        lifecycle=lifecycle,
+        route=route,
+        title=title,
+        creation_key=creation_key,
+        prompt=prompt,
+        unit_id=unit_id,
+        required_result_kind=required_result_kind,
+        source_directive_id=source_directive_id,
     )
-    _append_conversation_event(
-        con,
-        conversation_id,
-        "message.accepted",
-        {"message_id": message_id, "queue_state": "queued", "queue_position": 1},
-        message_id=message_id,
-    )
-    return conversation_id
 
 
 def _conductor_projection(con, sprint_doc_id: int):

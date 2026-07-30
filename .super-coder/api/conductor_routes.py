@@ -24,6 +24,8 @@ ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conductor_runtime  # noqa: E402
+import conversation_broker  # noqa: E402
+import conversation_events  # noqa: E402
 import db_driver  # noqa: E402
 import sprint_lifecycle  # noqa: E402
 
@@ -292,7 +294,6 @@ def _create_directive(con, headers, body):
         con.rollback()
         return _err(422, "directive_invalid", str(exc))
     item = _directive(con, cur.lastrowid)
-    conductor_runtime.maybe_wake(con)
     return _json(201, item)
 
 
@@ -315,6 +316,10 @@ def _act_directive(con, headers, directive_id: int):
         return _err(404, "not_found", "no such directive")
     except PermissionError as exc:
         return _err(403, "conductor_required", str(exc))
+    for conversation_id in result.get("conversation_ids", ()):
+        conversation_events.notify(conversation_id)
+    if result.get("conversation_ids"):
+        conversation_broker.notify_commit()
     return _json(200, result)
 
 

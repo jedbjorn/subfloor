@@ -158,11 +158,10 @@ class ConductorContractTests(unittest.TestCase):
         })
         self.assertEqual((status, obj["error"]["code"]), (422, "validation"))
 
-    def test_valid_creation_requests_config_gated_conductor_wake(self):
+    def test_valid_creation_never_launches_a_conductor_process(self):
         with mock.patch.object(
                 conductor_routes.conductor_runtime,
                 "maybe_wake",
-                return_value={"launched": True},
         ) as wake:
             status, _item = self.post({
                 "kind": "ready-for-review",
@@ -170,7 +169,7 @@ class ConductorContractTests(unittest.TestCase):
                 "payload": {"head": "abc"},
             })
         self.assertEqual(status, 201)
-        wake.assert_called_once()
+        wake.assert_not_called()
 
     def test_planner_handoff_is_retired_in_favor_of_planner_arm(self):
         planner_id = self.con.execute(
@@ -241,20 +240,37 @@ class ConductorContractTests(unittest.TestCase):
         expected = {
             "directive_id": directive_id,
             "status": "executed",
-            "launches": [],
-            "pids": [],
+            "assignments": [{
+                "conversation_id": "cv_worker",
+                "role": "developer",
+                "slot": "dev",
+                "unit_id": 10,
+            }],
+            "conversation_ids": ["cv_worker"],
         }
-        with mock.patch.object(
+        with (
+            mock.patch.object(
                 conductor_routes.conductor_runtime,
                 "act",
                 return_value=expected,
-        ) as act:
+            ) as act,
+            mock.patch.object(
+                conductor_routes.conversation_events,
+                "notify",
+            ) as event_notify,
+            mock.patch.object(
+                conductor_routes.conversation_broker,
+                "notify_commit",
+            ) as broker_notify,
+        ):
             status, obj = response(conductor_routes.handle(
                 "POST", f"/api/directives/{directive_id}/act",
                 self.headers("con-token"), b"{}"))
         self.assertEqual((status, obj), (200, expected))
         act.assert_called_once()
         self.assertEqual(act.call_args.args[2], conductor_id)
+        event_notify.assert_called_once_with("cv_worker")
+        broker_notify.assert_called_once_with()
 
     def test_sentinel_events_are_readable_and_append_only(self):
         event_id = conductor_routes.append_sentinel_event(
