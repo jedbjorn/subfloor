@@ -85,6 +85,11 @@ def retired_skills_path() -> Path:
     return LOCAL_DIR / "skills_retired.json"
 
 
+def review_patch_root() -> Path:
+    """Ignored, per-instance cache for canonical merged-PR patches."""
+    return LOCAL_DIR / "review-patches"
+
+
 def _copy_file_once(source: Path, destination: Path) -> bool:
     if destination.exists() or not source.exists() or source == destination:
         return False
