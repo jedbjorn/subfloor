@@ -6,9 +6,9 @@ catalogue, the render chain) but **no per-instance content** — a fork inherits
 the system, never super-coder's memory or roadmap. So a just-installed fork has
 no users and no shells, and `./sc launch` has nothing to authenticate or boot.
 This provisions the local user, then seeds the starting team via the shared
-shell factory: two `planner`, four `dev`, two `reviewer` shells, an `admin`, and the
-singleton `cartographer` — a ten-shell roster out of the box. One planner is
-your primary by default.
+shell factory: two `planner`, four `dev`, two `reviewer` shells, an `admin`, the
+singleton `cartographer`, and the operational `conductor` — an eleven-shell
+roster out of the box. One planner is your primary by default.
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
 exists. After it runs: `SC_ADMIN=1 ./sc snapshot`, then `./sc launch`. More shells (or
@@ -39,17 +39,17 @@ import install as install_mod  # noqa: E402
 
 # The starting team seeded at install, besides the singleton cartographer (added
 # separately below). Your interviewed primary shell — default planner — fills one
-# of these slots; the rest are auto-named team members.
+# of these slots; the rest use the canonical out-of-the-box identities.
 TEAM_ROSTER = [
-    "admin",
-    "planner",
-    "planner",
-    "dev",
-    "dev",
-    "dev",
-    "dev",
-    "reviewer",
-    "reviewer",
+    ("admin", "Admin", "ADM1"),
+    ("planner", "Planner-01", "PLN1"),
+    ("planner", "Planner-02", "PLN2"),
+    ("dev", "Dev-01", "DEV1"),
+    ("dev", "Dev-02", "DEV2"),
+    ("dev", "Dev-03", "DEV3"),
+    ("dev", "Dev-04", "DEV4"),
+    ("reviewer", "Rev-01", "REV1"),
+    ("reviewer", "Rev-02", "REV2"),
 ]
 
 from shell_factory import create_shell, flavors, reconcile_conductor  # noqa: E402
@@ -120,11 +120,17 @@ def main(argv: list[str]) -> int:
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
         # Pre-named out of the box — no naming interview. The primary takes the
-        # flavor's default display name (e.g. "Planner"), exactly like the rest of
-        # the roster; create_shell auto-names the shortname <ABBR><n> (e.g. PLN1).
-        # --name/--shortname remain optional scripted overrides, never prompted.
-        name = a.name or flavor.capitalize()
-        shortname = a.shortname or None
+        # first canonical slot for its flavor. --name/--shortname remain optional
+        # scripted overrides, never prompted.
+        primary_slot = next(
+            (slot for slot in TEAM_ROSTER if slot[0] == flavor), None
+        )
+        name = a.name or (
+            primary_slot[1] if primary_slot else flavor.capitalize()
+        )
+        shortname = a.shortname or (
+            primary_slot[2] if primary_slot else None
+        )
 
         con.execute(
             "INSERT INTO users (user_id, username, is_active) VALUES (1, ?, 1)",
@@ -137,12 +143,18 @@ def main(argv: list[str]) -> int:
         # The rest of the starting team — the full roster minus the slot your
         # primary already fills — auto-named by the factory.
         rest = list(TEAM_ROSTER)
-        if flavor in rest:
-            rest.remove(flavor)
+        if primary_slot:
+            rest.remove(primary_slot)
         team = []
-        for fl in rest:
-            sid = create_shell(con, flavor=fl, name=fl.capitalize(),
-                               partner=a.partner or username, repo=repo)
+        for fl, default_name, default_shortname in rest:
+            sid = create_shell(
+                con,
+                flavor=fl,
+                name=default_name,
+                shortname=default_shortname if a.shortname is None else None,
+                partner=a.partner or username,
+                repo=repo,
+            )
             team.append((fl, sid))
         # The singleton Cartographer owns the repo map so no working shell ever
         # maps; configured + wired by `./sc map-setup` (install runs it). Skip if
@@ -151,6 +163,7 @@ def main(argv: list[str]) -> int:
         if flavor != "cartographer":
             cart_id = create_shell(
                 con, flavor="cartographer", name="Cartographer",
+                shortname="CART1" if a.shortname is None else None,
                 partner=a.partner or username, repo=repo)
         conductor_id, _ = reconcile_conductor(
             con, partner=a.partner or username, repo=repo

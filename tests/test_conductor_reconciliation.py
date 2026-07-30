@@ -210,6 +210,28 @@ class FreshInstallConductorTest(unittest.TestCase):
         con.row_factory = sqlite3.Row
         self.addCleanup(con.close)
         assert_conductor_contract(self, con)
+        self.assertCountEqual(
+            [
+                tuple(row)
+                for row in con.execute(
+                    "SELECT display_name,shortname,flavor FROM shells "
+                    "WHERE is_deleted=0"
+                )
+            ],
+            [
+                ("Cartographer", "CART1", "cartographer"),
+                ("Admin", "ADM1", "admin"),
+                ("Maestro-01", "CON1", "conductor"),
+                ("Planner-01", "PLN1", "planner"),
+                ("Planner-02", "PLN2", "planner"),
+                ("Dev-01", "DEV1", "dev"),
+                ("Dev-02", "DEV2", "dev"),
+                ("Dev-03", "DEV3", "dev"),
+                ("Dev-04", "DEV4", "dev"),
+                ("Rev-01", "REV1", "reviewer"),
+                ("Rev-02", "REV2", "reviewer"),
+            ],
+        )
 
 
 if __name__ == "__main__":
