@@ -1190,6 +1190,26 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ).fetchone()
         self.assertEqual(tuple(binding), ("conformance", "conformance-verdict"))
 
+        duplicate = self.emit(
+            "planner",
+            "kickoff",
+            {
+                "to": "REV1",
+                "mode": "conformance",
+                "main_sha": "abc",
+                "scope": "all requirements",
+                "ratified_deviations": [],
+            },
+            unit=False,
+        )
+        self.con.commit()
+        refused_duplicate = runtime.act(self.con, duplicate, 1)
+        self.assertEqual(refused_duplicate["status"], "refused")
+        self.assertIn(
+            "already has a nonterminal conformance assignment",
+            refused_duplicate["reason"],
+        )
+
 
 class ConductorSyntheticSprintTests(RuntimeFixture):
     def act_one(self, issuer, kind, payload, *, unit=True):

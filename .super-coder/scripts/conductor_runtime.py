@@ -1000,6 +1000,15 @@ def _execute(
                     raise DirectiveRefused(
                         "unitless reviewer kickoff requires mode=conformance"
                     )
+                if con.execute(
+                    "SELECT 1 FROM sprint_conversation_bindings "
+                    "WHERE sprint_doc_id=? AND role='conformance' "
+                    "AND state<>'terminal' LIMIT 1",
+                    (sprint_id,),
+                ).fetchone() is not None:
+                    raise DirectiveRefused(
+                        "Sprint already has a nonterminal conformance assignment"
+                    )
                 _spawn(
                     con,
                     assignments,
