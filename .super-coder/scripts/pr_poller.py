@@ -49,6 +49,7 @@ from pathlib import Path
 
 import activity_readers
 import conductor_runtime
+import conversation_broker
 import sentinel
 import sprint_state
 from quota_probes import dispatch as quota_dispatch
@@ -997,7 +998,7 @@ class Poller(threading.Thread):
                  sentinel_cycle=None, sentinel_liveness=None,
                  sentinel_git_probe=None,
                  conductor_config: conductor_runtime.ConductorConfig | None = None,
-                 conductor_wake=None):
+                 conductor_wake=None, broker_notify=None):
         super().__init__(name="pr-poller", daemon=True)
         self._db_path = str(db_path)
         self._interval = interval
@@ -1017,7 +1018,6 @@ class Poller(threading.Thread):
             else sentinel.SentinelConfig()
         )
         self._sentinel_cycle = sentinel_cycle or sentinel.cycle
-        self._sentinel_liveness = sentinel_liveness
         self._sentinel_git_probe = sentinel_git_probe
         self._sentinel_due = 0.0
         # The API startup also owns Conductor config loading and doctor
@@ -1028,7 +1028,10 @@ class Poller(threading.Thread):
             if conductor_config is not None
             else conductor_runtime.ConductorConfig()
         )
-        self._conductor_wake = conductor_wake or conductor_runtime.maybe_wake
+        # Retain the old constructor arguments for one update window, but PID
+        # launch/wake is no longer a delivery path. The conversation broker is
+        # notified after committed PR/sentinel bridge messages instead.
+        self._broker_notify = broker_notify or conversation_broker.notify_commit
         self._github_enabled = fetch is not None or shutil.which("gh") is not None
         self._stop_event = threading.Event()
         self.state = PollerState()
@@ -1089,8 +1092,6 @@ class Poller(threading.Thread):
                             "config": self._sentinel_config,
                             "activity_reader": self._activity_reader,
                         }
-                        if self._sentinel_liveness is not None:
-                            kwargs["liveness"] = self._sentinel_liveness
                         if self._sentinel_git_probe is not None:
                             kwargs["git_probe"] = self._sentinel_git_probe
                         self.last_sentinel = self._sentinel_cycle(
@@ -1138,18 +1139,9 @@ class Poller(threading.Thread):
                             monotonic_now + self._reconcile_interval
                         )
                     if self._conductor_config.enabled:
-                        try:
-                            self.last_conductor = self._conductor_wake(
-                                con, config=self._conductor_config)
-                        except Exception as e:
-                            # Wake is a notification edge, never the scheduler
-                            # mission. Startup doctor catches static config;
-                            # transient launch failures remain visible without
-                            # suppressing poll/sentinel/reconciliation work.
-                            print(
-                                f"pr-poller: conductor wake error ({e})",
-                                flush=True,
-                            )
+                        self.last_conductor = {
+                            "broker_notified": bool(self._broker_notify())
+                        }
                 finally:
                     con.close()
             except Exception as e:

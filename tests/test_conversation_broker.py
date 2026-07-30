@@ -307,6 +307,88 @@ class ConversationBrokerCase(unittest.TestCase):
 
 
 class StoreContractTest(ConversationBrokerCase):
+    def add_sprint_assignment_floor(self) -> dict:
+        con = self.connect()
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (3,'Conductor','CON1','conductor','prompt',1)"
+        )
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Planner','PLN1','planner','prompt',1)"
+        )
+        con.execute(
+            "INSERT INTO documents "
+            "(document_id,kind,title,body) "
+            "VALUES (24,'doc','SPRINT: broker role loop','x')"
+        )
+        con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy,planner_shell_id) "
+            "VALUES (24,'active',1,4)"
+        )
+        unit_id = int(
+            con.execute(
+                "INSERT INTO sprint_units "
+                "(sprint_doc_id,seq,unit_title,dev_shell_id,state) "
+                "VALUES (24,'U1','Broker bridge',1,'working')"
+            ).lastrowid
+        )
+        source_directive_id = int(
+            con.execute(
+                "INSERT INTO directives "
+                "(issuer_flavor,kind,target,sprint_doc_id,unit_id) "
+                "VALUES ('system','stall','conductor',24,?)",
+                (unit_id,),
+            ).lastrowid
+        )
+        conductor_id = "cv_sprint_conductor"
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+            "state,creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,3,'sprint',24,'opencode',?,'idle','cond','cond-hash')",
+            (conductor_id, str(self.worktree)),
+        )
+        con.execute(
+            "INSERT INTO sprint_conversation_bindings "
+            "(conversation_id,sprint_doc_id,role,lifecycle,slot,state,"
+            "started_at) "
+            "VALUES (?,24,'conductor','persistent','CON1','active',"
+            "datetime('now'))",
+            (conductor_id,),
+        )
+        worker_id = "cv_sprint_worker"
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+            "state,creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,1,'sprint',24,'codex',?,'queued','worker','worker-hash')",
+            (worker_id, str(self.worktree)),
+        )
+        binding_id = int(
+            con.execute(
+                "INSERT INTO sprint_conversation_bindings "
+                "(conversation_id,sprint_doc_id,role,lifecycle,slot,unit_id,"
+                "source_directive_id,required_result_kind) "
+                "VALUES (?,24,'developer','one_shot','sh1',?,?,"
+                "'unit-report')",
+                (worker_id, unit_id, source_directive_id),
+            ).lastrowid
+        )
+        con.commit()
+        con.close()
+        message_id = self.add_message(worker_id)
+        return {
+            "worker_id": worker_id,
+            "conductor_id": conductor_id,
+            "binding_id": binding_id,
+            "unit_id": unit_id,
+            "message_id": message_id,
+        }
+
     def test_prepared_shell_archive_is_bound_while_the_run_is_leased(self) -> None:
         conversation_id = self.add_conversation()
         self.add_message(conversation_id)
@@ -381,6 +463,195 @@ class StoreContractTest(ConversationBrokerCase):
         con.close()
         self.assertEqual(first_state, "completed")
         self.assertEqual(sequences, [1, 2])
+
+    def test_one_shot_result_closes_and_returns_exact_directive_to_conductor(
+        self,
+    ) -> None:
+        floor = self.add_sprint_assignment_floor()
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        self.assertEqual(run.conversation_id, floor["worker_id"])
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn("codex", "worker-session", "worker-run", self.worktree),
+        )
+
+        con = self.connect()
+        directive_id = int(
+            con.execute(
+                "INSERT INTO directives "
+                "(issuer_shell_id,issuer_flavor,kind,payload,target,"
+                "sprint_doc_id,unit_id) "
+                "VALUES (1,'dev','unit-report','{\"shipped\":\"yes\"}',"
+                "'conductor',24,?)",
+                (floor["unit_id"],),
+            ).lastrowid
+        )
+        result_message_id = int(
+            con.execute(
+                "INSERT INTO shell_messages "
+                "(from_shell_id,to_shell_id,body,kind,sprint_doc_id) "
+                "VALUES (1,3,'unit report evidence','result',24)"
+            ).lastrowid
+        )
+        con.execute(
+            "INSERT INTO sprint_assignment_results "
+            "(binding_id,message_id,result_kind,directive_id) "
+            "VALUES (?,?,'unit-report',?)",
+            (floor["binding_id"], result_message_id, directive_id),
+        )
+        con.commit()
+        con.close()
+
+        store.finish_run(
+            run.run_id,
+            "succeeded",
+            event_type="run.completed",
+        )
+
+        con = self.connect()
+        binding = con.execute(
+            "SELECT state,outcome,result_message_id "
+            "FROM sprint_conversation_bindings WHERE binding_id=?",
+            (floor["binding_id"],),
+        ).fetchone()
+        worker_state = con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (floor["worker_id"],),
+        ).fetchone()[0]
+        conductor_message = con.execute(
+            "SELECT body,state FROM conversation_messages "
+            "WHERE conversation_id=? ORDER BY message_id DESC LIMIT 1",
+            (floor["conductor_id"],),
+        ).fetchone()
+        con.close()
+        self.assertEqual(
+            tuple(binding),
+            ("terminal", "succeeded", result_message_id),
+        )
+        self.assertEqual(worker_state, "closed")
+        self.assertEqual(conductor_message["state"], "queued")
+        self.assertEqual(
+            json.loads(conductor_message["body"])["directive_id"],
+            directive_id,
+        )
+
+        conductor_run = store.claim_next("broker")
+        self.assertEqual(conductor_run.conversation_id, floor["conductor_id"])
+        store.mark_starting(conductor_run.run_id, "broker")
+        store.mark_native_started(
+            conductor_run.run_id,
+            "broker",
+            NativeTurn(
+                "opencode",
+                "conductor-session",
+                "conductor-run",
+                self.worktree,
+            ),
+        )
+        con = self.connect()
+        con.execute("UPDATE sprints SET state='closing' WHERE sprint_doc_id=24")
+        con.execute("UPDATE sprints SET state='closed' WHERE sprint_doc_id=24")
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload) "
+            "VALUES (?,(SELECT COALESCE(MAX(sequence),0)+1 "
+            "FROM conversation_events WHERE conversation_id=?),"
+            "'conversation.close.requested','{}')",
+            (floor["conductor_id"], floor["conductor_id"]),
+        )
+        con.commit()
+        con.close()
+
+        # A restarted broker can finish the already-identified exact run; the
+        # close request and Sprint state, not a process identity, are truth.
+        BrokerStore(self.db_path).finish_run(
+            conductor_run.run_id,
+            "succeeded",
+            event_type="run.completed",
+        )
+        con = self.connect()
+        conductor_terminal = con.execute(
+            "SELECT c.state,b.state,b.outcome "
+            "FROM conversations c JOIN sprint_conversation_bindings b "
+            "ON b.conversation_id=c.conversation_id "
+            "WHERE c.conversation_id=?",
+            (floor["conductor_id"],),
+        ).fetchone()
+        con.close()
+        self.assertEqual(
+            tuple(conductor_terminal),
+            ("closed", "terminal", "closed"),
+        )
+
+    def assert_assignment_failure(
+        self,
+        run_outcome: str,
+        expected_outcome: str,
+    ) -> None:
+        floor = self.add_sprint_assignment_floor()
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        if run_outcome == "succeeded":
+            store.mark_starting(run.run_id, "broker")
+            store.mark_native_started(
+                run.run_id,
+                "broker",
+                NativeTurn(
+                    "codex",
+                    "worker-session",
+                    "worker-run",
+                    self.worktree,
+                ),
+            )
+        store.finish_run(
+            run.run_id,
+            run_outcome,
+            event_type=(
+                "run.completed"
+                if run_outcome == "succeeded"
+                else "run.unknown"
+            ),
+            error_code=(
+                None
+                if run_outcome == "succeeded"
+                else "HARNESS_OUTCOME_UNKNOWN"
+            ),
+        )
+
+        con = self.connect()
+        binding = con.execute(
+            "SELECT state,outcome FROM sprint_conversation_bindings "
+            "WHERE binding_id=?",
+            (floor["binding_id"],),
+        ).fetchone()
+        failure = con.execute(
+            "SELECT d.payload,e.evidence FROM directives d "
+            "JOIN sentinel_events e ON e.directive_id=d.directive_id "
+            "WHERE d.kind='worker-failed'"
+        ).fetchone()
+        worker_outbox = con.execute(
+            "SELECT COUNT(*) FROM conversation_outbox "
+            "WHERE conversation_id=?",
+            (floor["worker_id"],),
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(tuple(binding), ("terminal", expected_outcome))
+        self.assertEqual(
+            json.loads(failure["payload"])["run_outcome"],
+            run_outcome,
+        )
+        self.assertEqual(worker_outbox, 1)
+        next_run = store.claim_next("second-broker")
+        self.assertEqual(next_run.conversation_id, floor["conductor_id"])
+
+    def test_missing_one_shot_result_is_typed_and_not_replayed(self) -> None:
+        self.assert_assignment_failure("succeeded", "failed")
+
+    def test_unknown_one_shot_result_is_typed_and_not_replayed(self) -> None:
+        self.assert_assignment_failure("unknown", "unknown")
 
     def test_close_requested_conversation_cannot_dispatch_queued_work(self) -> None:
         conversation_id = self.add_conversation()

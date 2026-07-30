@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import activity_readers
-import shell_liveness
+import sprint_conversations
 import sprint_state
 from sprint_units import TERMINAL_UNIT_STATES
 
@@ -187,6 +187,15 @@ def emit_system_signal(
             _json(body),
         ),
     )
+    if sprint_doc_id is not None:
+        sprint_conversations.enqueue_conductor_directive(
+            con,
+            sprint_doc_id=int(sprint_doc_id),
+            directive_id=int(directive_id),
+            source_kind=f"sentinel:{kind}",
+            evidence=body,
+            idempotency_key=f"sprint:{sprint_doc_id}:sentinel:{dedupe_key}",
+        )
     return directive_id
 
 
@@ -245,9 +254,8 @@ def _assigned_shell(unit) -> tuple[int | None, str]:
     if unit["state"] == "blocked":
         # Blocked has no active worker role in the board schema: it is reachable
         # from both working and in_review, and the transition does not retain
-        # which side blocked. Its expectation is deliberately planner-shaped
-        # (message/directive), so attaching either worker's pid would invent an
-        # owner and can turn the inactive peer into a false dead-shell verdict.
+        # which side blocked. Its expectation is deliberately Planner-shaped;
+        # the latest bound Planner conversation supplies execution evidence.
         return None, "planner"
     return unit["dev_shell_id"], "dev"
 
@@ -271,24 +279,56 @@ def active_units(con) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def _shell_and_launch(con, shell_id) -> tuple[dict | None, dict | None]:
-    if shell_id is None:
-        return None, None
-    shell = con.execute(
-        "SELECT shell_id,shortname,flavor FROM shells "
-        "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
-        (shell_id,),
+def _shell_and_assignment(
+    con,
+    unit,
+    shell_id,
+    role: str,
+) -> tuple[dict | None, dict | None]:
+    binding_role = {
+        "dev": "developer",
+        "reviewer": "reviewer",
+        "planner": "planner",
+    }[role]
+    shell_clause = "AND c.shell_id=? " if shell_id is not None else ""
+    params = [unit["sprint_doc_id"], unit["unit_id"], binding_role]
+    if shell_id is not None:
+        params.append(shell_id)
+    assignment = con.execute(
+        "SELECT b.binding_id,b.conversation_id,b.role,b.state AS binding_state,"
+        "b.outcome,b.started_at,b.completed_at,c.state AS conversation_state,"
+        "c.shell_id,c.worktree,r.run_id,r.state AS run_state,"
+        "r.started_at AS run_started_at,"
+        "r.heartbeat_at,r.ended_at,r.error_code,r.error_detail,"
+        "(SELECT MAX(e.created_at) FROM conversation_events e "
+        " WHERE e.conversation_id=c.conversation_id) AS last_event_at "
+        "FROM sprint_conversation_bindings b "
+        "JOIN conversations c ON c.conversation_id=b.conversation_id "
+        "LEFT JOIN conversation_runs r ON r.run_id=("
+        " SELECT r2.run_id FROM conversation_runs r2 "
+        " WHERE r2.conversation_id=b.conversation_id "
+        " ORDER BY r2.run_id DESC LIMIT 1"
+        ") WHERE b.sprint_doc_id=? AND b.unit_id=? AND b.role=? "
+        f"{shell_clause}ORDER BY b.binding_id DESC LIMIT 1",
+        params,
     ).fetchone()
-    launch = con.execute(
-        "SELECT shell_id,pid,start_ticks,worktree,harness,launched_at "
-        "FROM shell_launch_records WHERE shell_id=?",
-        (shell_id,),
-    ).fetchone()
+    resolved_shell_id = (
+        assignment["shell_id"] if assignment is not None else shell_id
+    )
+    shell = (
+        con.execute(
+            "SELECT shell_id,shortname,flavor FROM shells "
+            "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+            (resolved_shell_id,),
+        ).fetchone()
+        if resolved_shell_id is not None
+        else None
+    )
     shell_dict = dict(shell) if shell is not None else None
-    launch_dict = dict(launch) if launch is not None else None
-    if shell_dict is not None and launch_dict is not None:
-        shell_dict["worktree"] = launch_dict["worktree"]
-    return shell_dict, launch_dict
+    assignment_dict = dict(assignment) if assignment is not None else None
+    if shell_dict is not None and assignment_dict is not None:
+        shell_dict["worktree"] = assignment_dict["worktree"]
+    return shell_dict, assignment_dict
 
 
 def _message_snapshot(con, unit, shell_id) -> dict | None:
@@ -440,6 +480,7 @@ def _signal_times(
     pr,
     planner,
     kickoff,
+    assignment,
 ) -> dict[str, datetime | None]:
     latest_activity = _latest(
         activity.newest_mtime,
@@ -461,6 +502,13 @@ def _signal_times(
         "review": review_at,
         "planner-directive": _utc(_row(planner, "created_at")),
         "kickoff": _utc(_row(kickoff, "created_at")),
+        "conversation": _latest(
+            _row(assignment, "started_at"),
+            _row(assignment, "run_started_at"),
+            _row(assignment, "heartbeat_at"),
+            _row(assignment, "ended_at"),
+            _row(assignment, "last_event_at"),
+        ),
     }
 
 
@@ -512,13 +560,13 @@ def cycle(
     config: SentinelConfig | None = None,
     now=None,
     activity_reader=None,
-    liveness: Callable[[dict], bool] = shell_liveness.claim_live,
+    liveness=None,
     git_probe: Callable[[Path], dict] = git_snapshot,
 ) -> dict:
     """Run one complete sentinel pass.
 
-    Every external seam is injectable so fake clocks, worktrees, launch claims,
-    and git state can exercise the production transaction.
+    Every external seam is injectable so fake clocks, worktrees, conversation
+    evidence, and git state can exercise the production transaction.
     """
     config = config or load_config()
     summary = {
@@ -542,7 +590,9 @@ def cycle(
 
     for unit in units:
         shell_id, role = _assigned_shell(unit)
-        shell, launch = _shell_and_launch(con, shell_id)
+        shell, assignment = _shell_and_assignment(
+            con, unit, shell_id, role
+        )
         state_clock = _utc(unit["state_changed_at"])
         if state_clock is None:
             summary["indeterminate"] += 1
@@ -555,7 +605,7 @@ def cycle(
         if shell is not None:
             activity = read_one(shell, unit, current, role=role)
         worktree = Path(
-            _row(launch, "worktree")
+            _row(assignment, "worktree")
             or (REPO_ROOT / ".sc-worktrees" / str(_row(shell, "shortname", "")))
         )
         try:
@@ -577,8 +627,13 @@ def cycle(
             pr=pr,
             planner=planner,
             kickoff=kickoff,
+            assignment=assignment,
         )
-        latest_activity = signals["activity"]
+        latest_activity = _latest(
+            signals["activity"],
+            signals["conversation"],
+        )
+        signals["activity"] = latest_activity
         evidence = {
             "unit_state": unit["state"],
             "unit_seq": unit["seq"],
@@ -593,43 +648,22 @@ def cycle(
             "last_message_at": _stamp(_row(message, "created_at")),
             "last_message": message,
             "pr": pr,
-            "process": {
-                "pid": _row(launch, "pid"),
-                "start_ticks": _row(launch, "start_ticks"),
-                "launched_at": _stamp(_row(launch, "launched_at")),
+            "conversation": {
+                "binding_id": _row(assignment, "binding_id"),
+                "conversation_id": _row(assignment, "conversation_id"),
+                "binding_state": _row(assignment, "binding_state"),
+                "conversation_state": _row(assignment, "conversation_state"),
+                "run_id": _row(assignment, "run_id"),
+                "run_state": _row(assignment, "run_state"),
+                "run_started_at": _stamp(_row(assignment, "run_started_at")),
+                "heartbeat_at": _stamp(_row(assignment, "heartbeat_at")),
+                "ended_at": _stamp(_row(assignment, "ended_at")),
+                "last_event_at": _stamp(_row(assignment, "last_event_at")),
+                "error_code": _row(assignment, "error_code"),
+                "error_detail": _row(assignment, "error_detail"),
             },
             "expected_signals": json.loads(unit["expected_signals"]),
         }
-
-        launch_floor = _utc(unit.get("assigned_at")) or state_clock
-        launch_at = _utc(_row(launch, "launched_at"))
-        launch_applies = launch is not None and (
-            launch_at is None or launch_at >= launch_floor
-        )
-        live = None
-        if launch_applies:
-            try:
-                verdict = liveness(launch)
-                live = verdict if isinstance(verdict, bool) else None
-            except (OSError, ValueError):
-                live = None
-        evidence["process"]["live"] = live
-        if launch_applies and live is False:
-            dedupe_key = (
-                f"dead-shell|{unit['unit_id']}|{unit['state_changed_at']}|"
-                f"{launch['pid']}|{launch['start_ticks']}"
-            )
-            if emit_system_signal(
-                con,
-                kind="dead-shell",
-                evidence=evidence,
-                dedupe_key=dedupe_key,
-                shell_id=shell_id,
-                sprint_doc_id=unit["sprint_doc_id"],
-                unit_id=unit["unit_id"],
-            ) is not None:
-                summary["dead_shells"] += 1
-            continue
 
         if _activity_beat(
             con,

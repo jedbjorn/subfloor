@@ -11,17 +11,14 @@ are code, not model judgement.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import db_driver
-import shell_liveness
 import sprint_conversations
 import sprint_lifecycle
 from conductor_policy import CONDUCTOR_HARNESS, DEFAULT_CONDUCTOR_MODEL
@@ -33,10 +30,7 @@ from sprint_units import (
 )
 
 ENGINE = Path(__file__).resolve().parents[1]
-REPO_ROOT = ENGINE.parent
 INSTANCE_CONFIG = ENGINE / "instance.json"
-_LAUNCH_GUARD_SECONDS = 20
-LAUNCH_LOG = ENGINE / "logs" / "conductor-launches.log"
 
 
 @dataclass(frozen=True)
@@ -52,10 +46,6 @@ class ConductorConfigError(ValueError):
 
 class DirectiveRefused(ValueError):
     """A pending directive that cannot be mechanically executed."""
-
-
-class ConductorLaunchError(RuntimeError):
-    """A role or Conductor process that refused before it could start."""
 
 
 class _RoutePreparationStale(RuntimeError):
@@ -205,12 +195,16 @@ TRANSITIONS = (
         "move blocked when legal; boot originating Planner",
         "originating Planner receives the liveness snapshot",
     ),
+    (
+        "system",
+        "worker-failed",
+        "block the affected unit; boot originating Planner",
+        "originating Planner receives typed run/result evidence",
+    ),
 )
 _TRANSITION_SET = {(issuer, kind) for issuer, kind, _action, _pass in TRANSITIONS}
 
-_wake_lock = threading.Lock()
 _act_lock = threading.Lock()
-_launching_until = 0.0
 
 
 def load_config(path: Path = INSTANCE_CONFIG) -> ConductorConfig:
@@ -318,109 +312,6 @@ def doctor(
         "shell": shell["shortname"],
         "harness": CONDUCTOR_HARNESS,
         "model": config.model,
-    }
-
-
-def _pending_ids(con) -> list[int]:
-    return [
-        row[0]
-        for row in con.execute(
-            "SELECT d.directive_id FROM directives d "
-            "JOIN sprints sp ON sp.sprint_doc_id=d.sprint_doc_id "
-            "WHERE d.status='pending' AND d.target='conductor' "
-            "AND sp.state='active' "
-            "AND NOT EXISTS (SELECT 1 FROM sprint_cancellations sc "
-            "WHERE sc.sprint_doc_id=sp.sprint_doc_id) "
-            "ORDER BY d.directive_id"
-        )
-    ]
-
-
-def _default_launcher(command: list[str]) -> int:
-    LAUNCH_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with LAUNCH_LOG.open("a") as log:
-        proc = subprocess.Popen(
-            command,
-            cwd=REPO_ROOT,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
-            env={
-                **os.environ,
-                "SC_NO_AUTOPRUNE": "1",
-                "SC_CONDUCTOR_INTERNAL": "1",
-            },
-        )
-        time.sleep(0.2)
-        returncode = proc.poll()
-    if returncode not in (None, 0):
-        raise ConductorLaunchError(
-            f"launch pid {proc.pid} exited {returncode}; see {LAUNCH_LOG}"
-        )
-    return proc.pid
-
-
-def _launch_is_live(con, shell_id: int) -> bool:
-    row = con.execute(
-        "SELECT shell_id,pid,start_ticks,worktree,harness,launched_at "
-        "FROM shell_launch_records WHERE shell_id=?",
-        (shell_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    try:
-        return shell_liveness.claim_live(dict(row)) is True
-    except (OSError, ValueError):
-        return False
-
-
-def maybe_wake(
-    con,
-    *,
-    config: ConductorConfig | None = None,
-    launcher: Callable[[list[str]], int] | None = None,
-    now: Callable[[], float] = time.monotonic,
-) -> dict:
-    """Boot one ephemeral Conductor when a pending row arrives."""
-    global _launching_until
-    config = config or load_config()
-    launcher = launcher or _default_launcher
-    if not config.enabled:
-        return {"enabled": False, "launched": False}
-    checked = doctor(con, config)
-    pending = _pending_ids(con)
-    if not pending:
-        return {**checked, "launched": False, "reason": "no-pending"}
-    with _wake_lock:
-        current = now()
-        if current < _launching_until:
-            return {**checked, "launched": False, "reason": "launching"}
-        if _launch_is_live(con, checked["shell_id"]):
-            return {**checked, "launched": False, "reason": "already-live"}
-        prompt = (
-            "Process pending Conductor directives in ascending id order. "
-            "For each id run `sc directives act <id>`, inspect the result, "
-            "and continue until `sc directives list --status pending` is empty."
-        )
-        command = [
-            str(REPO_ROOT / "sc"),
-            "run",
-            checked["shell"],
-            "--harness",
-            CONDUCTOR_HARNESS,
-            "--model",
-            config.model,
-            "--prompt",
-            prompt,
-        ]
-        pid = launcher(command)
-        _launching_until = current + _LAUNCH_GUARD_SECONDS
-    return {
-        **checked,
-        "launched": True,
-        "pid": pid,
-        "pending": pending,
     }
 
 
@@ -1201,10 +1092,17 @@ def _execute(
             )
             sprint_lifecycle.transition(con, sprint_id, "closing")
             sprint_lifecycle.transition(con, sprint_id, "closed")
+            sprint_conversations.request_conductor_close(
+                con,
+                sprint_id,
+                reason="originating Planner closed the Sprint",
+            )
         return assignments
 
-    unit = _unit(con, row)
+    unit = _unit(con, row) if row["unit_id"] is not None else None
     if kind == "pr-green":
+        if unit is None:
+            raise DirectiveRefused("pr-green requires unit_id")
         if unit["state"] != "in_review":
             raise DirectiveRefused("pr-green requires an in_review unit")
         reviewer = con.execute(
@@ -1224,6 +1122,8 @@ def _execute(
             unit=unit,
         )
     elif kind == "pr-red":
+        if unit is None:
+            raise DirectiveRefused("pr-red requires unit_id")
         if unit["state"] != "working":
             _move(con, unit, "working", actor_shell_id)
         dev = con.execute(
@@ -1241,6 +1141,8 @@ def _execute(
             unit=unit,
         )
     elif kind == "pr-merged":
+        if unit is None:
+            raise DirectiveRefused("pr-merged requires unit_id")
         _move(con, unit, "merged", actor_shell_id)
         _release_ready_units(
             con,
@@ -1262,7 +1164,27 @@ def _execute(
                 unit=unit,
             )
     elif kind in ("stall", "dead-shell"):
+        if unit is None:
+            raise DirectiveRefused(f"{kind} requires unit_id")
         _block_when_legal(con, unit, actor_shell_id)
+        _spawn(
+            con,
+            assignments,
+            _planner_for_sprint(con, sprint_id),
+            "plan",
+            row,
+            payload,
+            prepared_routes=prepared_routes,
+            unit=unit,
+        )
+    elif kind == "worker-failed":
+        _integer(payload, "binding_id")
+        _text(payload, "role")
+        _text(payload, "run_outcome")
+        _text(payload, "assignment_outcome")
+        _text(payload, "error_code")
+        if unit is not None:
+            _block_when_legal(con, unit, actor_shell_id)
         _spawn(
             con,
             assignments,

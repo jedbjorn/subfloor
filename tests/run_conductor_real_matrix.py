@@ -183,12 +183,6 @@ def main() -> int:
         )
         (temp / "sc").chmod(0o755)
 
-        launches: list[list[str]] = []
-
-        def record(command):
-            launches.append(command)
-            return 7000 + len(launches)
-
         server = ThreadingHTTPServer(("127.0.0.1", 0), ContractHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -206,11 +200,7 @@ def main() -> int:
             "list is empty, then reply MATRIX_COMPLETE."
         )
         try:
-            with (
-                mock.patch.object(conductor_routes, "DB_PATH", db_path),
-                mock.patch.object(runtime, "_default_launcher", record),
-                mock.patch.object(runtime, "REPO_ROOT", temp),
-            ):
+            with mock.patch.object(conductor_routes, "DB_PATH", db_path):
                 result = subprocess.run(
                     [
                         "opencode",
@@ -255,7 +245,7 @@ def main() -> int:
                     "refused": refused,
                     "pending": pending,
                     "trail": trail,
-                    "recorded_role_launches": len(launches),
+                    "recorded_role_launches": 0,
                 },
                 sort_keys=True,
             )

@@ -2516,6 +2516,103 @@ class Handler(BaseHTTPRequestHandler):
                     to_sid = r[0]
                 if to_sid is None or not msg:
                     return self._send(400, {"error": "to (shortname) or to_shell_id, and body, required"})
+                assignment_id = body.get("sprint_assignment_id")
+                result_kind = body.get("sprint_result_kind")
+                directive_id = body.get("sprint_directive_id")
+                assignment_result = assignment_id is not None
+                # Resolve the idempotency key before assignment liveness. An
+                # accepted result can terminalize its one-shot while the HTTP
+                # response is in flight; the exact retry must still return the
+                # committed row instead of failing the now-terminal binding.
+                dk = (body.get("dedupe_key") or "").strip() or None
+                if assignment_result:
+                    if kind != "result":
+                        return self._send(400, {"error":
+                            "sprint_assignment_id requires kind='result'"})
+                    if (
+                        isinstance(assignment_id, bool)
+                        or not isinstance(assignment_id, int)
+                    ):
+                        return self._send(400, {"error":
+                            "sprint_assignment_id must be an int"})
+                    if not isinstance(result_kind, str) or not result_kind.strip():
+                        return self._send(400, {"error":
+                            "sprint_result_kind must be a nonblank string"})
+                    result_kind = result_kind.strip()
+                    if result_kind == "abort-report":
+                        if directive_id is not None:
+                            return self._send(422, {"error":
+                                "abort-report results do not name a directive"})
+                    elif (
+                        isinstance(directive_id, bool)
+                        or not isinstance(directive_id, int)
+                    ):
+                        return self._send(400, {"error":
+                            "Sprint assignment result requires an integer "
+                            "sprint_directive_id"})
+                    if dk is not None:
+                        prior = con.execute(
+                            "SELECT m.message_id,m.to_shell_id,m.body,m.kind,"
+                            "m.sprint_doc_id,ar.binding_id,ar.result_kind,"
+                            "ar.directive_id FROM shell_messages m "
+                            "LEFT JOIN sprint_assignment_results ar "
+                            "ON ar.message_id=m.message_id "
+                            "WHERE m.from_shell_id=? AND m.dedupe_key=?",
+                            (sid, dk),
+                        ).fetchone()
+                        if prior is not None:
+                            exact = (
+                                prior["to_shell_id"] == int(to_sid)
+                                and prior["body"] == msg
+                                and prior["kind"] == kind
+                                and prior["sprint_doc_id"] == sprint_doc_id
+                                and prior["binding_id"] == assignment_id
+                                and prior["result_kind"] == result_kind
+                                and prior["directive_id"] == directive_id
+                            )
+                            if exact:
+                                return self._send(
+                                    200,
+                                    {
+                                        "message_id": prior["message_id"],
+                                        "duplicate": True,
+                                    },
+                                )
+                            return self._send(409, {"error":
+                                "Sprint result dedupe_key was reused with "
+                                "different assignment evidence"})
+                    binding = con.execute(
+                        "SELECT b.binding_id,b.sprint_doc_id,b.role,b.unit_id,"
+                        "b.required_result_kind,b.state,c.shell_id "
+                        "FROM sprint_conversation_bindings b "
+                        "JOIN conversations c "
+                        "ON c.conversation_id=b.conversation_id "
+                        "WHERE b.binding_id=? AND b.lifecycle='one_shot'",
+                        (assignment_id,),
+                    ).fetchone()
+                    if binding is None:
+                        return self._send(404, {"error":
+                            f"no one-shot Sprint assignment {assignment_id}"})
+                    if binding["state"] != "active":
+                        return self._send(409, {"error":
+                            f"Sprint assignment {assignment_id} is "
+                            f"{binding['state']}, not active"})
+                    if binding["shell_id"] != sid:
+                        return self._send(403, {"error":
+                            f"Sprint assignment {assignment_id} belongs to "
+                            "another shell"})
+                    if sprint_doc_id != binding["sprint_doc_id"]:
+                        return self._send(422, {"error":
+                            "Sprint assignment result has the wrong "
+                            "sprint_doc_id"})
+                    if result_kind != binding["required_result_kind"]:
+                        return self._send(422, {"error":
+                            f"Sprint assignment {assignment_id} requires "
+                            f"result kind {binding['required_result_kind']!r}"})
+                elif result_kind is not None or directive_id is not None:
+                    return self._send(400, {"error":
+                        "Sprint result metadata requires "
+                        "sprint_assignment_id"})
                 # Idempotent send (#333): a client timeout after the server-side
                 # write left the sender unable to tell delivered from lost, and
                 # blind resends duplicated fleet-wide. The client stamps each
@@ -2523,7 +2620,6 @@ class Handler(BaseHTTPRequestHandler):
                 # returns the original row instead of inserting a twin. The
                 # unique index (from_shell_id, dedupe_key) backstops the
                 # check-then-insert race.
-                dk = (body.get("dedupe_key") or "").strip() or None
                 if dk is not None:
                     r = con.execute(
                         "SELECT message_id FROM shell_messages "
@@ -2536,8 +2632,51 @@ class Handler(BaseHTTPRequestHandler):
                         "VALUES (?, ?, ?, ?, ?, ?)",
                         (sid, int(to_sid), msg, kind, sprint_doc_id, dk))
                     message_id = cur.lastrowid
+                    if assignment_result:
+                        con.execute(
+                            "INSERT INTO sprint_assignment_results "
+                            "(binding_id,message_id,result_kind,directive_id) "
+                            "VALUES (?,?,?,?)",
+                            (
+                                assignment_id,
+                                message_id,
+                                result_kind,
+                                directive_id,
+                            ),
+                        )
                     con.commit()
-                except db_driver.IntegrityError:
+                except db_driver.IntegrityError as exc:
+                    con.rollback()
+                    if assignment_result:
+                        r = con.execute(
+                            "SELECT m.message_id,m.to_shell_id,m.body,m.kind,"
+                            "m.sprint_doc_id,ar.binding_id,ar.result_kind,"
+                            "ar.directive_id FROM shell_messages m "
+                            "LEFT JOIN sprint_assignment_results ar "
+                            "ON ar.message_id=m.message_id "
+                            "WHERE m.from_shell_id=? AND m.dedupe_key=?",
+                            (sid, dk),
+                        ).fetchone()
+                        exact = r is not None and (
+                            r["to_shell_id"] == int(to_sid)
+                            and r["body"] == msg
+                            and r["kind"] == kind
+                            and r["sprint_doc_id"] == sprint_doc_id
+                            and r["binding_id"] == assignment_id
+                            and r["result_kind"] == result_kind
+                            and r["directive_id"] == directive_id
+                        )
+                        if exact:
+                            return self._send(
+                                200,
+                                {
+                                    "message_id": r["message_id"],
+                                    "duplicate": True,
+                                },
+                            )
+                        return self._send(409, {"error":
+                            "Sprint assignment result conflicts with durable "
+                            f"assignment evidence: {exc}"})
                     r = con.execute(
                         "SELECT message_id FROM shell_messages "
                         "WHERE from_shell_id=? AND dedupe_key=?", (sid, dk)).fetchone()

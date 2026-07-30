@@ -159,17 +159,15 @@ class ConductorContractTests(unittest.TestCase):
         self.assertEqual((status, obj["error"]["code"]), (422, "validation"))
 
     def test_valid_creation_never_launches_a_conductor_process(self):
-        with mock.patch.object(
-                conductor_routes.conductor_runtime,
-                "maybe_wake",
-        ) as wake:
-            status, _item = self.post({
-                "kind": "ready-for-review",
-                "target": "conductor",
-                "payload": {"head": "abc"},
-            })
+        self.assertFalse(
+            hasattr(conductor_routes.conductor_runtime, "maybe_wake")
+        )
+        status, _item = self.post({
+            "kind": "ready-for-review",
+            "target": "conductor",
+            "payload": {"head": "abc"},
+        })
         self.assertEqual(status, 201)
-        wake.assert_not_called()
 
     def test_planner_handoff_is_retired_in_favor_of_planner_arm(self):
         planner_id = self.con.execute(
@@ -190,25 +188,20 @@ class ConductorContractTests(unittest.TestCase):
         )
         self.con.commit()
 
-        with mock.patch.object(
-                conductor_routes.conductor_runtime,
-                "maybe_wake",
-        ) as wake:
-            status, item = self.post(
-                {
-                    "kind": "handoff",
-                    "target": "conductor",
-                    "sprint_doc_id": 100,
-                    "payload": {},
-                },
-                token="planner-token",
-            )
+        status, item = self.post(
+            {
+                "kind": "handoff",
+                "target": "conductor",
+                "sprint_doc_id": 100,
+                "payload": {},
+            },
+            token="planner-token",
+        )
 
         self.assertEqual(
             (status, item["error"]["code"]),
             (409, "handoff_retired"),
         )
-        wake.assert_not_called()
         self.assertEqual(
             self.con.execute(
                 "SELECT COUNT(*) FROM directives WHERE kind='handoff'"
