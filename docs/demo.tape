@@ -1,4 +1,6 @@
-# Records docs/demo.gif — the README demo of `./sc enter`.
+# Automated fallback for recording docs/demo.gif — the README demo of
+# `./sc enter`. A live screen capture from the dos-app test repo may replace
+# the generated GIF when the demo needs to show concurrent browser/CLI state.
 #
 # Re-record from the repo root:  vhs docs/demo.tape
 # Needs: vhs + ttyd + ffmpeg on PATH, the fork's sandbox container up on an
