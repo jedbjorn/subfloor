@@ -78,14 +78,62 @@ def _report_timing(
     )
 
 
+def _enable_wal(
+    con: sqlite3.Connection,
+    *,
+    max_wait_seconds: float = DEFAULT_WRITE_WAIT_SECONDS,
+    attempt_timeout_ms: int = DEFAULT_BEGIN_ATTEMPT_TIMEOUT_MS,
+    retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    random_fraction: Callable[[], float] = random.random,
+) -> None:
+    """Enable WAL within the shared bounded SQLite acquisition policy."""
+    deadline = monotonic() + max_wait_seconds
+    attempts = 0
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise sqlite3.OperationalError(
+                "timed out configuring SQLite journal_mode=WAL"
+            )
+        attempts += 1
+        per_attempt_ms = max(
+            1,
+            min(attempt_timeout_ms, int(remaining * 1000)),
+        )
+        con.execute(f"PRAGMA busy_timeout={per_attempt_ms}")
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if not is_busy_error(exc):
+                raise
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise
+            ceiling = min(
+                retry_max_seconds,
+                retry_base_seconds * (2 ** min(attempts - 1, 8)),
+                remaining,
+            )
+            if ceiling > 0:
+                sleep(ceiling * (0.75 + 0.5 * random_fraction()))
+
+
 def connect(path):
     """Open the engine SQLite DB at `path` with the standard PRAGMAs."""
     con = sqlite3.connect(str(path), timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        _enable_wal(con)
+        con.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+        return con
+    except BaseException:
+        con.close()
+        raise
 
 
 @contextmanager
