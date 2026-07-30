@@ -262,7 +262,7 @@ def reconcile_conductor(
         shell_id = create_shell(
             con,
             flavor="conductor",
-            name="Conductor",
+            name="Maestro-01",
             shortname="CON1",
             partner=partner,
             repo=repo,
