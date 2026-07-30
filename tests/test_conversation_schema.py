@@ -565,6 +565,32 @@ class MigrationAndShapeTest(ConversationDbCase):
                 required_result_kind="answer",
             )
 
+    def test_sprint_binding_allows_source_to_release_another_sprint_unit(
+        self,
+    ) -> None:
+        source_unit_id = self.add_unit(seq="U1")
+        assignment_unit_id = self.add_unit(seq="U2")
+        directive_id = self.add_directive(unit_id=source_unit_id)
+        conversation = self.add_conversation(shell_id=1, mode="sprint")
+
+        binding_id = self.add_binding(
+            conversation,
+            role="developer",
+            slot="dev1",
+            unit_id=assignment_unit_id,
+            source_directive_id=directive_id,
+            required_result_kind="unit-report",
+        )
+
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT sprint_doc_id,unit_id,source_directive_id "
+                "FROM sprint_conversation_bindings WHERE binding_id=?",
+                (binding_id,),
+            ).fetchone()),
+            (24, assignment_unit_id, directive_id),
+        )
+
     def test_succeeded_assignment_requires_scoped_result_and_is_immutable(
         self,
     ) -> None:
