@@ -436,16 +436,17 @@ ergonomics degrade, correctness doesn't.
 ### Keeping harnesses (and therefore models) current
 
 A new model arrives in a new harness **CLI release** — so a shell can only reach
-the models its CLI knows about. The CLIs are baked into the sandbox image (creds
-are mounted, binaries never are: a darwin binary is fatal in a linux container,
-and vibe's entry point carries an absolute shebang into a host interpreter), and
-docker caches those layers indefinitely. `SC_HARNESS_EPOCH` is their expiry:
-`./sc update` and `./sc update-harnesses` roll it, and the next image build
-reinstalls every harness at latest.
+the models its CLI knows about. The CLIs are image-owned (harness state homes
+are mounted, but their executables must never resolve from the host: a darwin
+binary is fatal in a linux container, and vibe's entry point carries an absolute
+shebang into a host interpreter), and docker caches those layers indefinitely.
+`SC_HARNESS_EPOCH` is their cache key. A normal restart gives it a unique value
+and reinstalls every harness at latest before replacing the running sandbox.
 
 ```
 ./sc harness-status      # what the sandbox actually runs + is a rebuild owed
-./sc update-harnesses    # roll the epoch + rebuild (then ./sc restart to run it)
+./sc restart             # refresh harnesses, build safely, then bounce
+./sc restart --no-build  # deliberately reuse the current image
 ```
 
 If a model that exists is not offered to a shell, start there — it is nearly
@@ -979,7 +980,8 @@ launch, enter, snapshot, render, and the GUI work unchanged.
                          #   flag · roadmap · doc · narrative) — identity is the shell's token
 sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` for the repo-map dr_*
 ./sc down                # stop + remove the sandbox container
-./sc restart             # confirm-gated (YES) + DB backup, then down + launch — recreate fresh
+./sc restart             # confirm + refresh harnesses + build + DB backup, then down + launch
+./sc restart --no-build  # confirm + DB backup, then bounce on the existing image
 ./sc persist             # reboot-proof the host daemons: install every applicable systemd --user unit
 ./sc logs                # tail the sandbox server logs
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot

@@ -9,7 +9,8 @@ could see the version that decided it.
 
 Run inside the sandbox (`./sc harness-status` docker-execs it there) so the
 answer is the version SHELLS run, not the host's own copy. The host's CLIs are
-irrelevant on the docker path: the container mounts creds, never binaries.
+irrelevant on the docker path: state homes are mounted, but launchers must
+resolve image-owned executables.
 
 Each probe is capped by a timeout — a harness that hangs on `--version` must not
 be able to hang a launch banner — and a missing harness is reported, not fatal.

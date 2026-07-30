@@ -25,6 +25,7 @@ class SupervisionFixture:
         self.fakebin = Path(self._tmp.name) / "bin"
         self.home = Path(self._tmp.name) / "home"
         self.log = Path(self._tmp.name) / "calls.log"
+        self.epoch_file = Path(self._tmp.name) / "harness-epoch"
         self.docker_state = Path(self._tmp.name) / "docker-state"
         self.root.mkdir()
         self.scripts.mkdir(parents=True)
@@ -34,7 +35,13 @@ class SupervisionFixture:
         shutil.copy2(ROOT / "sc", self.root / "sc")
         # cli_entry.py rides along with every script copied here: each one
         # imports it from its __main__ block (SIGPIPE hygiene, #384).
-        for script in ("artifact_policy.py", "db_backup.py", "cli_entry.py"):
+        for script in (
+            "artifact_policy.py",
+            "db_backup.py",
+            "cli_entry.py",
+            "engine_manifest.py",
+            "install.py",
+        ):
             shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / script,
                 self.scripts / script,
@@ -62,6 +69,7 @@ class SupervisionFixture:
                 "HOME": str(self.home),
                 "PATH": f"{self.fakebin}:{self.env['PATH']}",
                 "SC_PYTHON": sys.executable,
+                "SC_HARNESS_EPOCH_FILE": str(self.epoch_file),
                 "SC_TEST_LOG": str(self.log),
                 "SC_TEST_IMAGE": "present",
                 "SC_TEST_DOCKER_STATE": str(self.docker_state),
@@ -125,7 +133,10 @@ class SupervisionFixture:
             fi
             if [ "$1" = network ] && [ "$2" = inspect ]; then exit 0; fi
             if [ "$1" = network ] && [ "$2" = create ]; then exit 0; fi
-            if [ "$1" = build ]; then exit 0; fi
+            if [ "$1" = build ]; then
+              [ "${SC_TEST_BUILD_FAIL:-}" != 1 ]
+              exit
+            fi
             if [ "$1" = rm ]; then
               name="$3"
               if [ "$name" = "$SC_TEST_PG_NAME" ] &&
@@ -293,6 +304,56 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertFalse((self.fx.home / "db_backups").exists())
         calls = self.fx.calls()
         self.assertFalse(any(line.startswith("docker rm ") for line in calls))
+
+    def test_restart_refreshes_harnesses_before_build_and_teardown(self):
+        result = self.fx.run("restart", "--yes")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        epoch = self.fx.epoch_file.read_text().strip()
+        self.assertRegex(epoch, r"\A\d{8}T\d{6}\.\d{6}Z\Z")
+        calls = self.fx.calls()
+        build_at = next(
+            i for i, line in enumerate(calls)
+            if line.startswith("docker build ")
+        )
+        down_at = next(
+            i for i, line in enumerate(calls)
+            if line.startswith("docker rm -f ")
+        )
+        self.assertLess(build_at, down_at)
+        self.assertIn(f"SC_HARNESS_EPOCH={epoch}", calls[build_at])
+        self.assertIn("refresh harnesses for restart", result.stdout)
+
+    def test_restart_refresh_failure_keeps_running_sandbox_intact(self):
+        self.fx.env["SC_TEST_BUILD_FAIL"] = "1"
+
+        result = self.fx.run("restart", "--yes")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.fx.epoch_file.exists())
+        self.assertFalse((self.fx.home / "db_backups").exists())
+        self.assertFalse(
+            any(line.startswith("docker rm ") for line in self.fx.calls())
+        )
+
+    def test_restart_epoch_write_failure_prevents_build_and_teardown(self):
+        self.fx.epoch_file.mkdir()
+
+        result = self.fx.run("restart", "--yes")
+
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.fx.calls()
+        self.assertFalse(any(line.startswith("docker build ") for line in calls))
+        self.assertFalse(any(line.startswith("docker rm ") for line in calls))
+
+    def test_restart_no_build_neither_rolls_nor_builds(self):
+        result = self.fx.run("restart", "--yes", "--no-build")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.fx.epoch_file.exists())
+        self.assertFalse(
+            any(line.startswith("docker build ") for line in self.fx.calls())
+        )
 
     def test_restart_no_writable_backup_destination_refuses_before_down(self):
         bad_home = Path(self.fx._tmp.name) / "home-file"
