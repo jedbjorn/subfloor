@@ -690,6 +690,17 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         self.assertEqual(report["status"], "executed")
         self.assertEqual(len(report["assignments"]), 1)
         self.assertEqual(report["assignments"][0]["slot"], "PLN1")
+        planner_prompt = self.con.execute(
+            "SELECT body FROM conversation_messages "
+            "WHERE conversation_id=? ORDER BY message_id LIMIT 1",
+            (report["assignments"][0]["conversation_id"],),
+        ).fetchone()
+        packet = json.loads(planner_prompt["body"])
+        self.assertIn(
+            "This is a conformance handoff, not a question",
+            packet["instruction"],
+        )
+        self.assertIn("do not emit answer", packet["instruction"])
 
     def test_report_only_requires_explicit_null_contract_and_evidence(self):
         cases = (

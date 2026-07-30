@@ -517,15 +517,22 @@ def _spawn(
             f"{prepared['error']}"
         )
     role = _assignment_role(slot, unit)
-    prompt = json.dumps(
-        {
-            "directive_id": row["directive_id"],
-            "issuer": row["issuer_flavor"],
-            "kind": row["kind"],
-            "payload": payload,
-        },
-        sort_keys=True,
-    )
+    packet = {
+        "directive_id": row["directive_id"],
+        "issuer": row["issuer_flavor"],
+        "kind": row["kind"],
+        "payload": payload,
+    }
+    if role == "planner" and row["kind"] == "unit-report":
+        packet["instruction"] = (
+            "All declared units are terminal. This is a conformance handoff, "
+            "not a question: do not emit answer. Read the governing spec, "
+            "board, and unit evidence; resolve the integrated main SHA; emit "
+            "one kickoff directive to an assigned reviewer with "
+            "mode=conformance and the complete requirement scope; then return "
+            "the required planner-directive result."
+        )
+    prompt = json.dumps(packet, sort_keys=True)
     creation_key = (
         f"sprint:{row['sprint_doc_id']}:assignment:{row['directive_id']}:"
         f"{role}:{shell['shortname']}"
