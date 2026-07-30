@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,64 @@ class WriteTransactionTest(unittest.TestCase):
         self.assertTrue(timings[0].acquired)
         self.assertTrue(timings[0].committed)
         self.assertEqual(timings[0].operation, "test.commit")
+
+    def test_connect_retries_busy_wal_configuration_and_restores_timeout(
+        self,
+    ) -> None:
+        con = mock.Mock()
+        attempts = 0
+
+        def execute(statement: str):
+            nonlocal attempts
+            if statement == "PRAGMA journal_mode=WAL":
+                attempts += 1
+                if attempts < 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return mock.Mock()
+
+        con.execute.side_effect = execute
+        sleep = mock.Mock()
+        enable_wal = db_driver._enable_wal
+        with (
+            mock.patch.object(db_driver.sqlite3, "connect", return_value=con),
+            mock.patch.object(
+                db_driver,
+                "_enable_wal",
+                side_effect=lambda connection: enable_wal(
+                    connection,
+                    sleep=sleep,
+                ),
+            ),
+        ):
+            connected = db_driver.connect(self.path)
+
+        self.assertIs(connected, con)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+        con.execute.assert_any_call(
+            f"PRAGMA busy_timeout={db_driver.DEFAULT_BEGIN_ATTEMPT_TIMEOUT_MS}"
+        )
+        con.execute.assert_called_with(
+            f"PRAGMA busy_timeout={db_driver.DEFAULT_BUSY_TIMEOUT_MS}"
+        )
+        con.close.assert_not_called()
+
+    def test_connect_closes_connection_after_non_busy_wal_failure(self) -> None:
+        con = mock.Mock()
+
+        def execute(statement: str):
+            if statement == "PRAGMA journal_mode=WAL":
+                raise sqlite3.OperationalError("disk I/O error")
+            return mock.Mock()
+
+        con.execute.side_effect = execute
+        with (
+            mock.patch.object(db_driver.sqlite3, "connect", return_value=con),
+            self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O"),
+        ):
+            db_driver.connect(self.path)
+
+        con.close.assert_called_once_with()
 
     def test_rolls_back_the_whole_body_on_failure(self) -> None:
         timings: list[db_driver.WriteTransactionTiming] = []

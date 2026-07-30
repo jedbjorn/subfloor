@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sqlite3
 import sys
@@ -423,22 +424,20 @@ class StoreContractTest(ConversationBrokerCase):
         self.add_message(first_conversation)
         self.add_message(second_conversation)
         barrier = threading.Barrier(3)
-        claimed: list[BrokerRun | None] = []
 
-        def claim(owner: str) -> None:
+        def claim(owner: str) -> BrokerRun | None:
             barrier.wait()
-            claimed.append(BrokerStore(self.db_path).claim_next(owner))
+            return BrokerStore(self.db_path).claim_next(owner)
 
-        workers = [
-            threading.Thread(target=claim, args=(f"broker-{index}",))
-            for index in (1, 2)
-        ]
-        for worker in workers:
-            worker.start()
-        barrier.wait()
-        for worker in workers:
-            worker.join()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            workers = [
+                pool.submit(claim, f"broker-{index}")
+                for index in (1, 2)
+            ]
+            barrier.wait()
+            claimed = [worker.result(timeout=5) for worker in workers]
 
+        self.assertEqual(len(claimed), 2)
         self.assertEqual(sum(run is not None for run in claimed), 1)
         con = self.connect()
         self.assertEqual(
