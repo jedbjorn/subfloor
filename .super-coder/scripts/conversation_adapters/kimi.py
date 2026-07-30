@@ -621,14 +621,18 @@ class KimiAdapter(ConversationAdapter):
         return []
 
     @staticmethod
-    def _run_coordinates(turn: NativeTurn) -> tuple[int, int]:
-        match = RUN_REF.fullmatch(turn.run_ref)
+    def _parse_run_ref(run_ref: str) -> tuple[int, int]:
+        match = RUN_REF.fullmatch(run_ref)
         if not match:
             raise AdapterError(
                 "HARNESS_SESSION_INSPECTION_FAILED",
-                f"Kimi run ref is malformed: {turn.run_ref}",
+                f"Kimi run ref is malformed: {run_ref}",
             )
-        prompt_time, prompt_offset = (int(value) for value in match.groups())
+        return int(match.group(1)), int(match.group(2))
+
+    @classmethod
+    def _run_coordinates(cls, turn: NativeTurn) -> tuple[int, int]:
+        prompt_time, prompt_offset = cls._parse_run_ref(turn.run_ref)
         if (
             turn.metadata.get("prompt_time") != prompt_time
             or turn.metadata.get("prompt_offset") != prompt_offset
@@ -638,6 +642,43 @@ class KimiAdapter(ConversationAdapter):
                 "Kimi run metadata does not match its persisted run ref",
             )
         return prompt_time, prompt_offset
+
+    def _restore_recovered_run_metadata(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> None:
+        if turn.metadata.get("recovered") is not True:
+            return
+        session_ref = self._validate_session_ref(turn.session_ref)
+        prompt_time, prompt_offset = self._parse_run_ref(turn.run_ref)
+        worktree = context.checked_worktree()
+        _env, root = self._environment(context)
+        session_dir = self._matching_session_dir(root, session_ref)
+        if session_dir is None:
+            raise AdapterError(
+                "HARNESS_SESSION_LOST",
+                f"Kimi session does not exist: {session_ref}",
+            )
+        if self._state_worktree(session_dir) != worktree:
+            raise AdapterError(
+                "HARNESS_WORKTREE_MISMATCH",
+                "Kimi session belongs to a different worktree",
+            )
+        restored = {
+            "session_path": str(session_dir),
+            "wire_path": str(self._wire_path(session_dir)),
+            "prompt_time": prompt_time,
+            "prompt_offset": prompt_offset,
+        }
+        for key, value in restored.items():
+            existing = turn.metadata.get(key, value)
+            if existing != value:
+                raise AdapterError(
+                    "HARNESS_SESSION_INSPECTION_FAILED",
+                    f"Kimi recovered {key} conflicts with persisted identity",
+                )
+        turn.metadata.update(restored)
 
     def _run_slice(self, turn: NativeTurn) -> list[Mapping[str, Any]]:
         prompt_time, prompt_offset = self._run_coordinates(turn)
@@ -902,6 +943,7 @@ class KimiAdapter(ConversationAdapter):
                 "Kimi process is still running",
             )
         try:
+            self._restore_recovered_run_metadata(turn, context)
             records = self._run_slice(turn)
         except AdapterError:
             return ReconcileResult(

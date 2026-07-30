@@ -1225,6 +1225,98 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertFalse(result.proven)
         self.assertTrue(turn.metadata["identity_mismatch"])
 
+    def test_kimi_recovered_turn_rebuilds_exact_usage_slice(self) -> None:
+        adapter, runner = self.build("kimi")
+        session_ref = "session_dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        session, wire = runner.write_session(
+            runner.sessions_root,
+            session_ref,
+            self.root,
+            "recovered",
+            prompt_time=8000,
+            after_prompt=[
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 4, "output": 2},
+                },
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "later"}],
+                    "time": 8001,
+                },
+                {"type": "turn.cancel", "time": 8002},
+            ],
+            directory="wd_recovered_usage",
+        )
+        recovered = NativeTurn(
+            "kimi",
+            session_ref,
+            "kimi-8000-0",
+            self.root,
+            metadata={"recovered": True},
+        )
+
+        result = adapter.reconcile(recovered, self.context)
+
+        self.assertEqual(result.outcome, "succeeded")
+        self.assertTrue(result.proven)
+        self.assertEqual(recovered.metadata["session_path"], str(session))
+        self.assertEqual(recovered.metadata["wire_path"], str(wire))
+        self.assertEqual(recovered.metadata["prompt_time"], 8000)
+        self.assertEqual(recovered.metadata["prompt_offset"], 0)
+        self.assertNotEqual(
+            result.outcome,
+            "cancelled",
+            "a later turn.cancel must not terminate the recovered run",
+        )
+
+    def test_kimi_recovered_turn_rebuilds_exact_cancel_slice(self) -> None:
+        adapter, runner = self.build("kimi")
+        session_ref = "session_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        session, wire = runner.write_session(
+            runner.sessions_root,
+            session_ref,
+            self.root,
+            "interrupted",
+            prompt_time=8100,
+            after_prompt=[
+                {"type": "turn.cancel", "time": 8101},
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "later"}],
+                    "time": 8102,
+                },
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 99},
+                },
+            ],
+            directory="wd_recovered_cancel",
+        )
+        recovered = NativeTurn(
+            "kimi",
+            session_ref,
+            "kimi-8100-0",
+            self.root,
+            metadata={"recovered": True},
+        )
+
+        result = adapter.reconcile(recovered, self.context)
+
+        self.assertEqual(result.outcome, "cancelled")
+        self.assertTrue(result.proven)
+        self.assertEqual(recovered.metadata["session_path"], str(session))
+        self.assertEqual(recovered.metadata["wire_path"], str(wire))
+        self.assertEqual(recovered.metadata["prompt_time"], 8100)
+        self.assertEqual(recovered.metadata["prompt_offset"], 0)
+        self.assertNotEqual(
+            result.outcome,
+            "succeeded",
+            "a later usage record must not complete the recovered run",
+        )
+
     def test_kimi_inspect_and_reconcile_use_only_main_exact_run_slice(
         self,
     ) -> None:
