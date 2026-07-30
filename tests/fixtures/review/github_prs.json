@@ -1,0 +1,102 @@
+{
+  "pull_requests": [
+    {
+      "number": 821,
+      "headRefName": "feature/open",
+      "baseRefName": "main",
+      "headRefOid": "1111111111111111111111111111111111111111",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "title": "Open review fixture",
+      "url": "https://example.test/pulls/821",
+      "reviewDecision": "",
+      "statusCheckRollup": [
+        {
+          "name": "tests",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 822,
+      "headRefName": "feature/failing",
+      "baseRefName": "main",
+      "headRefOid": "2222222222222222222222222222222222222222",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "title": "Failing-check fixture",
+      "url": "https://example.test/pulls/822",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "statusCheckRollup": [
+        {
+          "name": "tests",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE"
+        }
+      ]
+    },
+    {
+      "number": 823,
+      "headRefName": "feature/squash",
+      "baseRefName": "main",
+      "headRefOid": "3333333333333333333333333333333333333333",
+      "state": "MERGED",
+      "mergedAt": "2026-07-30T12:00:00Z",
+      "mergeCommit": {
+        "oid": "4444444444444444444444444444444444444444"
+      },
+      "title": "Squash-merged fixture",
+      "url": "https://example.test/pulls/823",
+      "reviewDecision": "APPROVED",
+      "statusCheckRollup": []
+    },
+    {
+      "number": 826,
+      "headRefName": "feature/closed",
+      "baseRefName": "main",
+      "headRefOid": "8888888888888888888888888888888888888888",
+      "state": "CLOSED",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "title": "Closed-without-merge fixture",
+      "url": "https://example.test/pulls/826",
+      "reviewDecision": "",
+      "statusCheckRollup": []
+    },
+    {
+      "number": 824,
+      "headRefName": "feature/reused",
+      "baseRefName": "main",
+      "headRefOid": "5555555555555555555555555555555555555555",
+      "state": "MERGED",
+      "mergedAt": "2026-07-30T13:00:00Z",
+      "mergeCommit": {
+        "oid": "6666666666666666666666666666666666666666"
+      },
+      "title": "First reused-branch fixture",
+      "url": "https://example.test/pulls/824",
+      "reviewDecision": "APPROVED",
+      "statusCheckRollup": []
+    },
+    {
+      "number": 825,
+      "headRefName": "feature/reused",
+      "baseRefName": "main",
+      "headRefOid": "7777777777777777777777777777777777777777",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "title": "Second reused-branch fixture",
+      "url": "https://example.test/pulls/825",
+      "reviewDecision": "",
+      "statusCheckRollup": []
+    }
+  ],
+  "patches": {
+    "821": "diff --git a/open.txt b/open.txt\nnew file mode 100644\n--- /dev/null\n+++ b/open.txt\n@@ -0,0 +1 @@\n+open\n",
+    "823": "diff --git a/squash.txt b/squash.txt\nnew file mode 100644\n--- /dev/null\n+++ b/squash.txt\n@@ -0,0 +1 @@\n+squash\n"
+  }
+}
