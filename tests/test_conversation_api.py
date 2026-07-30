@@ -290,7 +290,7 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 409)
         self.assertEqual(error["error"]["code"], "BROWSER_CHAT_BUSY")
 
-    def test_close_refuses_while_the_open_turn_is_running(self) -> None:
+    def test_close_repairs_running_state_without_a_live_run(self) -> None:
         first = self.create(key="running-close")
         con = self.connect()
         try:
@@ -308,13 +308,215 @@ class ConversationResourceTest(ConversationApiCase):
         finally:
             con.close()
 
-        status, _, error = self.request(
+        status, _, closed = self.request(
             "PATCH",
             f"/api/conversations/{first['conversation_id']}",
             body={"version": first["version"], "state": "closed"},
         )
-        self.assertEqual(status, 409)
-        self.assertEqual(error["error"]["code"], "BROWSER_CHAT_BUSY")
+        self.assertEqual(status, 200, closed)
+        self.assertEqual(closed["state"], "closed")
+        self.assertIsNone(closed["close_requested_at"])
+        con = self.connect()
+        try:
+            row = con.execute(
+                "SELECT state,closed_at FROM conversations "
+                "WHERE conversation_id=?",
+                (first["conversation_id"],),
+            ).fetchone()
+            events = con.execute(
+                "SELECT event_type,payload FROM conversation_events "
+                "WHERE conversation_id=? ORDER BY sequence",
+                (first["conversation_id"],),
+            ).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(row["state"], "closed")
+        self.assertIsNotNone(row["closed_at"])
+        self.assertEqual(events[-1]["event_type"], "conversation.closed")
+        self.assertEqual(
+            json.loads(events[-1]["payload"])["recovered_orphaned_state"],
+            "running",
+        )
+
+    def test_close_cancels_every_queued_turn_before_releasing_ownership(self) -> None:
+        conversation = self.create(key="queued-close")
+        message_ids = []
+        for number in range(2):
+            status, _, accepted = self.request(
+                "POST",
+                f"/api/conversations/{conversation['conversation_id']}/messages",
+                body={"text": f"queued {number}"},
+                key=f"queued-close-{number}",
+            )
+            self.assertEqual(status, 202, accepted)
+            message_ids.append(accepted["message"]["message_id"])
+        _, _, latest = self.request(
+            "GET",
+            f"/api/conversations/{conversation['conversation_id']}",
+        )
+
+        status, _, closed = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation['conversation_id']}",
+            body={"version": latest["version"], "state": "closed"},
+        )
+
+        self.assertEqual(status, 200, closed)
+        self.assertEqual(closed["state"], "closed")
+        con = self.connect()
+        try:
+            messages = con.execute(
+                "SELECT message_id,state,completed_at "
+                "FROM conversation_messages WHERE conversation_id=? "
+                "ORDER BY message_id",
+                (conversation["conversation_id"],),
+            ).fetchall()
+            outbox = con.execute(
+                "SELECT message_id,state,run_id FROM conversation_outbox "
+                "WHERE conversation_id=? ORDER BY message_id",
+                (conversation["conversation_id"],),
+            ).fetchall()
+            live_runs = con.execute(
+                "SELECT COUNT(*) FROM conversation_runs "
+                "WHERE conversation_id=? "
+                "AND state IN ('leased','starting','running')",
+                (conversation["conversation_id"],),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual([row["message_id"] for row in messages], message_ids)
+        self.assertEqual([row["state"] for row in messages], ["cancelled", "cancelled"])
+        self.assertTrue(all(row["completed_at"] for row in messages))
+        self.assertEqual(
+            [(row["message_id"], row["state"], row["run_id"]) for row in outbox],
+            [(message_ids[0], "cancelled", None), (message_ids[1], "cancelled", None)],
+        )
+        self.assertEqual(live_runs, 0)
+
+    def test_close_interrupts_active_run_and_closes_after_terminal_proof(self) -> None:
+        conversation = self.create(key="active-close")
+        message_ids = []
+        for number in range(2):
+            status, _, accepted = self.request(
+                "POST",
+                f"/api/conversations/{conversation['conversation_id']}/messages",
+                body={"text": f"turn {number}"},
+                key=f"active-close-{number}",
+            )
+            self.assertEqual(status, 202, accepted)
+            message_ids.append(accepted["message"]["message_id"])
+        store = conversation_broker.BrokerStore(self.db_path)
+        run = store.claim_next("test-close")
+        self.assertIsNotNone(run)
+        _, _, latest = self.request(
+            "GET",
+            f"/api/conversations/{conversation['conversation_id']}",
+        )
+
+        with mock.patch.object(
+            conversation_routes.conversation_broker,
+            "interrupt_run",
+            return_value=True,
+        ) as interrupt:
+            status, _, closing = self.request(
+                "PATCH",
+                f"/api/conversations/{conversation['conversation_id']}",
+                body={"version": latest["version"], "state": "closed"},
+            )
+
+        self.assertEqual(status, 200, closing)
+        self.assertEqual(closing["state"], "running")
+        self.assertIsNotNone(closing["close_requested_at"])
+        interrupt.assert_called_once_with(run.run_id)
+        rejected_status, _, rejected = self.request(
+            "POST",
+            f"/api/conversations/{conversation['conversation_id']}/messages",
+            body={"text": "must not queue"},
+            key="active-close-rejected",
+        )
+        self.assertEqual(rejected_status, 409)
+        self.assertEqual(rejected["error"]["code"], "CONVERSATION_CLOSING")
+
+        con = self.connect()
+        try:
+            before_messages = con.execute(
+                "SELECT message_id,state FROM conversation_messages "
+                "WHERE conversation_id=? AND message_kind='prompt' "
+                "ORDER BY message_id",
+                (conversation["conversation_id"],),
+            ).fetchall()
+            before_outbox = con.execute(
+                "SELECT message_id,state FROM conversation_outbox "
+                "WHERE conversation_id=? ORDER BY message_id",
+                (conversation["conversation_id"],),
+            ).fetchall()
+            request_events = con.execute(
+                "SELECT event_type,run_id FROM conversation_events "
+                "WHERE conversation_id=? AND event_type IN "
+                "('conversation.close.requested','run.interrupt.requested') "
+                "ORDER BY sequence",
+                (conversation["conversation_id"],),
+            ).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(
+            [(row["message_id"], row["state"]) for row in before_messages],
+            [(message_ids[0], "running"), (message_ids[1], "cancelled")],
+        )
+        self.assertEqual(
+            [(row["message_id"], row["state"]) for row in before_outbox],
+            [(message_ids[0], "dispatched"), (message_ids[1], "cancelled")],
+        )
+        self.assertEqual(
+            [(row["event_type"], row["run_id"]) for row in request_events],
+            [
+                ("conversation.close.requested", run.run_id),
+                ("run.interrupt.requested", run.run_id),
+            ],
+        )
+
+        self.assertTrue(
+            store.finish_run(
+                run.run_id,
+                "cancelled",
+                event_type="run.interrupted",
+                payload={"outcome": "cancelled"},
+            )
+        )
+        _, _, closed = self.request(
+            "GET",
+            f"/api/conversations/{conversation['conversation_id']}",
+        )
+        self.assertEqual(closed["state"], "closed")
+        self.assertIsNone(closed["close_requested_at"])
+        con = self.connect()
+        try:
+            final_messages = con.execute(
+                "SELECT message_id,state FROM conversation_messages "
+                "WHERE conversation_id=? AND message_kind='prompt' "
+                "ORDER BY message_id",
+                (conversation["conversation_id"],),
+            ).fetchall()
+            final_events = con.execute(
+                "SELECT event_type FROM conversation_events "
+                "WHERE conversation_id=? ORDER BY sequence",
+                (conversation["conversation_id"],),
+            ).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(
+            [(row["message_id"], row["state"]) for row in final_messages],
+            [(message_ids[0], "cancelled"), (message_ids[1], "cancelled")],
+        )
+        self.assertEqual(
+            [row["event_type"] for row in final_events][-4:],
+            [
+                "conversation.close.requested",
+                "run.interrupt.requested",
+                "run.interrupted",
+                "conversation.closed",
+            ],
+        )
 
     def test_opencode_requires_an_exact_resolved_model(self) -> None:
         with mock.patch.object(

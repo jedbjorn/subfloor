@@ -3411,7 +3411,8 @@ function chatOpenStream(conversationId, generation, onEvent, onState) {
   source.onerror = () => onState("reconnecting");
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
-    "conversation.closed", "message.accepted", "session.started", "run.started",
+    "conversation.close.requested", "conversation.closed",
+    "message.accepted", "session.started", "run.started",
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
     "input.requested", "usage", "run.completed", "run.failed",
     "run.interrupted", "run.unknown",
@@ -3541,6 +3542,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const events = [];
   const seen = new Set();
   let streamStatus = "connecting";
+  let stopRequest = null;
 
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
@@ -3577,8 +3579,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     className: "act danger chat-stop",
     type: "button",
     textContent: "Stop",
-    title: "Reserved for future stream control",
-    disabled: true,
+    title: "Interrupt the active turn",
   });
   const pending = el("div", { className: "chat-pending", hidden: true });
   const composerRow = el("div", { className: "chat-composer" },
@@ -3629,10 +3630,16 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     queueState.textContent = `${queued} queued`;
     updateStreamStatus();
     const closed = conversation.state === "closed";
-    composer.disabled = closed;
-    send.disabled = closed;
-    close.disabled = !["idle", "waiting", "error"].includes(conversation.state);
-    composer.placeholder = closed ? "This conversation is closed." : "Message this shell…";
+    const closing = !closed && Boolean(conversation.close_requested_at);
+    composer.disabled = closed || closing;
+    send.disabled = closed || closing;
+    stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
+    stop.textContent = stopRequest ? "Stopping…" : "Stop";
+    close.disabled = closed || closing;
+    close.textContent = closing ? "Closing…" : "Close";
+    composer.placeholder = closed
+      ? "This conversation is closed."
+      : closing ? "Stopping work and closing…" : "Message this shell…";
     chatPaintTranscript(
       transcript,
       messages,
@@ -3664,12 +3671,19 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     textContent: "Close",
   });
   close.onclick = async () => {
-    if (!confirm(
-      "Close this conversation? Its transcript will remain available."
-    )) return;
+    if (close.disabled) return;
+    close.disabled = true;
+    close.textContent = "Closing…";
     try {
+      const latest = await chatApi(
+        `/conversations/${conversation.conversation_id}`);
+      if (latest.state === "closed") {
+        conversation = latest;
+        paint();
+        return;
+      }
       conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
-        "PATCH", { version: conversation.version, state: "closed" });
+        "PATCH", { version: latest.version, state: "closed" });
       paint();
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
@@ -3707,10 +3721,26 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       pending.textContent = `${error.code} — retry keeps this exact send`;
       toast(`${error.code}: ${error.message}`);
     } finally {
-      send.disabled = conversation.state === "closed";
+      send.disabled = conversation.state === "closed"
+        || Boolean(conversation.close_requested_at);
     }
   }
   send.onclick = submit;
+  stop.onclick = async () => {
+    if (conversation.state !== "running") return;
+    if (!stopRequest) stopRequest = { key: requestKey() };
+    paint();
+    try {
+      await chatApi(
+        `/conversations/${conversation.conversation_id}/interruptions`,
+        "POST", {}, stopRequest.key);
+    } catch (error) {
+      stopRequest = null;
+      toast(`${error.code}: ${error.message}`);
+      refresh();
+      paint();
+    }
+  };
   composer.onkeydown = (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -3737,16 +3767,22 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
           && conversation.state !== "running")
         conversation.state = "queued";
       if (event.event_type === "run.started") conversation.state = "running";
+      if (event.event_type === "conversation.close.requested")
+        conversation.close_requested_at = event.created_at || true;
       if (["permission.requested", "input.requested"].includes(event.event_type))
         conversation.state = "waiting";
       if (["run.completed", "run.interrupted"].includes(event.event_type))
         conversation.state = chatQueuedCount(messages) ? "queued" : "idle";
       if (["run.failed", "run.unknown"].includes(event.event_type))
         conversation.state = "error";
+      if (["run.completed", "run.failed", "run.interrupted", "run.unknown"]
+        .includes(event.event_type))
+        stopRequest = null;
       paint();
       if (["message.accepted", "run.completed", "run.failed",
            "run.interrupted", "run.unknown",
            "conversation.updated", "conversation.renamed",
+           "conversation.close.requested",
            "conversation.closed"].includes(event.event_type))
         refresh();
     },

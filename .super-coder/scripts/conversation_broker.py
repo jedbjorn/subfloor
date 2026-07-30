@@ -239,6 +239,11 @@ class BrokerStore:
                     " ON c.conversation_id=o.conversation_id "
                     "JOIN conversation_messages m ON m.message_id=o.message_id "
                     "WHERE o.state='pending' AND c.state='queued' "
+                    "AND NOT EXISTS ("
+                    " SELECT 1 FROM conversation_events closing "
+                    " WHERE closing.conversation_id=c.conversation_id "
+                    " AND closing.event_type='conversation.close.requested'"
+                    ") "
                     "AND m.state IN ('accepted','queued') "
                     "AND (c.mode='normal' OR NOT EXISTS ("
                     " SELECT 1 FROM sprint_cancellations cancelled "
@@ -618,7 +623,11 @@ class BrokerStore:
             ):
                 row = con.execute(
                     "SELECT r.state,r.conversation_id,r.trigger_message_id,"
-                    "c.state AS conversation_state "
+                    "c.state AS conversation_state,"
+                    "EXISTS(SELECT 1 FROM conversation_events closing "
+                    " WHERE closing.conversation_id=r.conversation_id "
+                    " AND closing.event_type='conversation.close.requested') "
+                    "AS close_requested "
                     "FROM conversation_runs r JOIN conversations c "
                     "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
                     (run_id,),
@@ -639,6 +648,33 @@ class BrokerStore:
                     (row["trigger_message_id"],),
                 ).fetchone()[0]
                 require_transition("message", message_current, message_state)
+                if row["close_requested"]:
+                    queued_ids = [
+                        int(item["message_id"])
+                        for item in con.execute(
+                            "SELECT DISTINCT message_id FROM conversation_outbox "
+                            "WHERE conversation_id=? "
+                            "AND state IN ('pending','claimed')",
+                            (row["conversation_id"],),
+                        ).fetchall()
+                    ]
+                    if queued_ids:
+                        marks = ",".join("?" for _ in queued_ids)
+                        con.execute(
+                            "UPDATE conversation_messages SET state='cancelled',"
+                            "completed_at=? "
+                            f"WHERE message_id IN ({marks}) "
+                            "AND state IN ('accepted','queued','running')",
+                            (now, *queued_ids),
+                        )
+                        con.execute(
+                            "UPDATE conversation_outbox SET state='cancelled',"
+                            "claim_owner=NULL,claimed_at=NULL,"
+                            "lease_expires_at=NULL "
+                            f"WHERE message_id IN ({marks}) "
+                            "AND state IN ('pending','claimed')",
+                            queued_ids,
+                        )
                 pending = (
                     con.execute(
                         "SELECT 1 FROM conversation_outbox "
@@ -692,6 +728,26 @@ class BrokerStore:
                     message_id=row["trigger_message_id"],
                     run_id=run_id,
                 )
+                if row["close_requested"]:
+                    require_transition(
+                        "conversation",
+                        conversation_target,
+                        "closed",
+                    )
+                    con.execute(
+                        "UPDATE conversations SET state='closed',closed_at=?,"
+                        "last_activity_at=?,version=version+1 "
+                        "WHERE conversation_id=?",
+                        (now, now, row["conversation_id"]),
+                    )
+                    self._append_event(
+                        con,
+                        conversation_id=row["conversation_id"],
+                        event_type="conversation.closed",
+                        payload={"state": "closed", "recovered": True},
+                        message_id=None,
+                        run_id=run_id,
+                    )
                 conversation_id = row["conversation_id"]
         finally:
             con.close()

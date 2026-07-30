@@ -147,13 +147,44 @@ def test_composer_is_retry_safe_and_has_turn_controls():
         interface.index("const stop ="):
         interface.index("const pending =", interface.index("const stop ="))
     ]
-    assert "disabled: true" in stop_control
-    assert ".onclick" not in stop_control
+    assert 'title: "Interrupt the active turn"' in stop_control
+    assert "disabled: true" not in stop_control
+    stop_handler = interface[
+        interface.index("stop.onclick ="):
+        interface.index("composer.onkeydown", interface.index("stop.onclick ="))
+    ]
+    assert 'conversation.state !== "running"' in stop_handler
+    assert "if (!stopRequest) stopRequest = { key: requestKey() }" in stop_handler
+    assert "/interruptions`" in stop_handler
+    assert '"POST", {}, stopRequest.key' in stop_handler
+    assert "stopRequest = null" in stop_handler
+    assert (
+        'stop.disabled = conversation.state !== "running" || closing '
+        "|| Boolean(stopRequest)"
+        in interface
+    )
+    assert 'stop.textContent = stopRequest ? "Stopping…" : "Stop"' in interface
+    assert (
+        '["run.completed", "run.failed", "run.interrupted", "run.unknown"]'
+        in interface
+    )
     assert 'className: "chat-title-button"' in interface
     assert 'title: "Rename conversation"' in interface
     assert 'textContent: "Rename"' not in interface
     assert "actions.append(analytics, close)" in interface
-    assert "/interruptions" not in interface
+    assert "/interruptions" in interface
+    close_handler = interface[
+        interface.index("close.onclick ="):
+        interface.index("actions.append", interface.index("close.onclick ="))
+    ]
+    assert "confirm(" not in close_handler
+    assert "const latest = await chatApi(" in close_handler
+    assert "{ version: latest.version, state: \"closed\" }" in close_handler
+    assert 'close.textContent = "Closing…"' in close_handler
+    assert "const closing = !closed && Boolean(conversation.close_requested_at)" in interface
+    assert "close.disabled = closed || closing" in interface
+    assert 'close.textContent = closing ? "Closing…" : "Close"' in interface
+    assert '"conversation.close.requested"' in interface
     assert "chatCloseForSwitch(selectedConversation)" in interface
     assert "Finish the current turn and queued messages before switching chats." in interface
     assert 'item.state !== "closed"' in interface
