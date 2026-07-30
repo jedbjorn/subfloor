@@ -12,6 +12,7 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 import map_repo  # noqa: E402
+import install  # noqa: E402
 
 
 SCHEMA = """
@@ -78,6 +79,7 @@ class WorktreeSkipTest(unittest.TestCase):
                 return sqlite3.connect(db_path)
 
             with mock.patch.object(map_repo, "REPO_ROOT", root), \
+                    mock.patch.object(map_repo, "MAP_ROOT", root), \
                     mock.patch.object(map_repo, "ENGINE", root / ".super-coder"), \
                     mock.patch.object(map_repo, "CONFIG_PATH",
                                       root / ".sc-state" / "map.config.json"), \
@@ -105,6 +107,59 @@ class WorktreeSkipTest(unittest.TestCase):
         self.assertEqual(["ROOT_ONLY"], env_names)
         self.assertEqual(len(paths), file_count)
         self.assertFalse(any(path.startswith(".sc-worktrees/") for path in paths))
+
+
+class ExternalWorkProjectTest(unittest.TestCase):
+    def test_declared_work_repo_is_the_map_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            home = temp_root / "home"
+            project = temp_root / "project"
+            home.mkdir()
+            project.mkdir()
+            (project / "app.py").write_text("print('project')\n")
+            (home / "home_only.py").write_text("print('home')\n")
+            with mock.patch.object(install, "work_repo", return_value=str(project)):
+                self.assertEqual(project, map_repo._resolve_map_root())
+            db_path = temp_root / "map.db"
+            con = sqlite3.connect(db_path)
+            con.executescript(SCHEMA)
+            con.close()
+
+            def connect() -> sqlite3.Connection:
+                return sqlite3.connect(db_path)
+
+            with mock.patch.object(map_repo, "REPO_ROOT", home), \
+                    mock.patch.object(map_repo, "MAP_ROOT", project), \
+                    mock.patch.object(map_repo, "CONFIG_PATH", home / "config.json"), \
+                    mock.patch.object(map_repo, "CONFIG_PATH_LEGACY", home / "legacy.json"), \
+                    mock.patch.object(map_repo, "is_source_repo", return_value=False), \
+                    mock.patch.object(map_repo, "git", return_value=""), \
+                    mock.patch.object(map_repo.artifact_policy, "prepare_local_state"), \
+                    mock.patch.object(map_repo.map_db, "connect", side_effect=connect):
+                self.assertEqual(0, map_repo.main())
+
+            con = sqlite3.connect(db_path)
+            paths = [row[0] for row in con.execute(
+                "SELECT path FROM dr_filepath ORDER BY path")]
+            mapped_root = con.execute(
+                "SELECT root FROM dr_repo WHERE repo_id=1").fetchone()[0]
+            con.close()
+
+        self.assertEqual(["app.py"], paths)
+        self.assertEqual(str(project), mapped_root)
+
+    def test_work_repo_expands_home_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            config_dir = Path(td) / ".super-coder"
+            config_dir.mkdir()
+            (config_dir / "instance.json").write_text(
+                '{"work_repo": "~/Repos/super-coder"}')
+            with mock.patch.object(install, "ENGINE", config_dir):
+                self.assertEqual(
+                    str(Path("~/Repos/super-coder").expanduser()),
+                    install.work_repo(),
+                )
 
 
 if __name__ == "__main__":
