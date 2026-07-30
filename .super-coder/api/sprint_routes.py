@@ -996,6 +996,33 @@ def _conductor_projection(con, sprint_doc_id: int):
             (row["conversation_id"],),
         ).fetchall()[::-1]
     ]
+    events = []
+    for item in con.execute(
+        "SELECT sequence,event_type,payload,message_id,run_id,created_at "
+        "FROM conversation_events WHERE conversation_id=? "
+        "ORDER BY sequence DESC LIMIT 200",
+        (row["conversation_id"],),
+    ).fetchall()[::-1]:
+        try:
+            payload = json.loads(item["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        events.append(
+            {
+                "sequence": int(item["sequence"]),
+                "event_type": item["event_type"],
+                "payload": payload,
+                "message_id": item["message_id"],
+                "run_id": item["run_id"],
+                "created_at": item["created_at"],
+            }
+        )
+    latest_run = con.execute(
+        "SELECT run_id,state,error_code,error_detail,started_at,ended_at "
+        "FROM conversation_runs WHERE conversation_id=? "
+        "ORDER BY run_id DESC LIMIT 1",
+        (row["conversation_id"],),
+    ).fetchone()
     return {
         "conversation_id": row["conversation_id"],
         "state": row["state"],
@@ -1008,6 +1035,8 @@ def _conductor_projection(con, sprint_doc_id: int):
         },
         "messages": messages,
         "assistant": assistant,
+        "events": events,
+        "run": dict(latest_run) if latest_run is not None else None,
     }
 
 
@@ -1020,6 +1049,128 @@ def _cancellation_projection(con, sprint_doc_id: int):
         (sprint_doc_id,),
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _assignment_projections(con, sprint_doc_id: int):
+    rows = con.execute(
+        "SELECT b.binding_id,b.conversation_id,b.role,b.lifecycle,b.slot,"
+        "b.unit_id,u.seq AS unit_seq,b.source_directive_id,"
+        "b.required_result_kind,b.state,b.outcome,b.result_message_id,"
+        "b.created_at,b.started_at,b.completed_at,"
+        "c.state AS conversation_state,s.shell_id,s.shortname,s.display_name,"
+        "ar.result_kind,ar.directive_id,m.body AS result_body,"
+        "r.run_id,r.state AS run_state,r.error_code,r.error_detail,"
+        "r.started_at AS run_started_at,r.ended_at AS run_ended_at "
+        "FROM sprint_conversation_bindings b "
+        "JOIN conversations c ON c.conversation_id=b.conversation_id "
+        "JOIN shells s ON s.shell_id=c.shell_id "
+        "LEFT JOIN sprint_units u ON u.unit_id=b.unit_id "
+        "LEFT JOIN sprint_assignment_results ar ON ar.binding_id=b.binding_id "
+        "LEFT JOIN shell_messages m ON m.message_id=ar.message_id "
+        "LEFT JOIN conversation_runs r ON r.run_id=("
+        " SELECT latest.run_id FROM conversation_runs latest "
+        " WHERE latest.conversation_id=b.conversation_id "
+        " ORDER BY latest.run_id DESC LIMIT 1"
+        ") "
+        "WHERE b.sprint_doc_id=? AND b.role<>'conductor' "
+        "ORDER BY b.binding_id",
+        (sprint_doc_id,),
+    ).fetchall()
+    assignments = []
+    for row in rows:
+        failure = con.execute(
+            "SELECT evidence,observed_at FROM sentinel_events "
+            "WHERE sprint_doc_id=? AND event_kind='worker-failed' "
+            "AND json_extract(evidence,'$.binding_id')=? "
+            "ORDER BY event_id DESC LIMIT 1",
+            (sprint_doc_id, row["binding_id"]),
+        ).fetchone()
+        failure_evidence = None
+        if failure is not None:
+            try:
+                parsed_evidence = json.loads(failure["evidence"])
+            except (TypeError, ValueError):
+                parsed_evidence = {}
+            failure_evidence = (
+                parsed_evidence
+                if isinstance(parsed_evidence, dict)
+                else {"evidence": parsed_evidence}
+            )
+            failure_evidence["observed_at"] = failure["observed_at"]
+        if row["outcome"] is not None:
+            display_state = {
+                "succeeded": "closed",
+                "failed": "failed",
+                "unknown": "unknown",
+                "cancelled": "cancelled",
+                "closed": "closed",
+            }.get(row["outcome"], row["outcome"])
+        elif row["run_state"] in ("leased", "starting", "running"):
+            display_state = "working"
+        elif row["conversation_state"] in ("queued", "running"):
+            display_state = (
+                "working"
+                if row["conversation_state"] == "running"
+                else "queued"
+            )
+        elif row["conversation_state"] in ("waiting", "error"):
+            display_state = (
+                "waiting"
+                if row["conversation_state"] == "waiting"
+                else "failed"
+            )
+        else:
+            display_state = "idle"
+        assignments.append(
+            {
+                "binding_id": int(row["binding_id"]),
+                "conversation_id": row["conversation_id"],
+                "role": row["role"],
+                "lifecycle": row["lifecycle"],
+                "slot": row["slot"],
+                "unit_id": row["unit_id"],
+                "unit_seq": row["unit_seq"],
+                "source_directive_id": row["source_directive_id"],
+                "required_result_kind": row["required_result_kind"],
+                "state": row["state"],
+                "outcome": row["outcome"],
+                "display_state": display_state,
+                "result_message_id": row["result_message_id"],
+                "created_at": row["created_at"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "conversation_state": row["conversation_state"],
+                "shell": {
+                    "shell_id": int(row["shell_id"]),
+                    "shortname": row["shortname"],
+                    "display_name": row["display_name"],
+                },
+                "run": (
+                    None
+                    if row["run_id"] is None
+                    else {
+                        "run_id": int(row["run_id"]),
+                        "state": row["run_state"],
+                        "error_code": row["error_code"],
+                        "error_detail": row["error_detail"],
+                        "started_at": row["run_started_at"],
+                        "ended_at": row["run_ended_at"],
+                    }
+                ),
+                "result": (
+                    None
+                    if row["result_message_id"] is None
+                    else {
+                        "message_id": int(row["result_message_id"]),
+                        "result_kind": row["result_kind"],
+                        "directive_id": row["directive_id"],
+                        "body": row["result_body"],
+                    }
+                ),
+                "error_evidence": failure_evidence,
+            }
+        )
+    return assignments
 
 
 def _sprint_projection(con, sprint_doc_id: int):
@@ -1047,11 +1198,20 @@ def _sprint_projection(con, sprint_doc_id: int):
     if title is not None and title.upper().startswith("SPRINT:") \
             and not title[len("SPRINT:"):].strip():
         title = f"Sprint #{row['sprint_doc_id']}"
+    cancellation = _cancellation_projection(con, sprint_doc_id)
+    display_state = (
+        "cancelling"
+        if cancellation is not None
+        and cancellation["state"] == "requested"
+        and row["state"] not in ("closed", "aborted")
+        else row["state"]
+    )
     out = {
         "document_id": row["sprint_doc_id"],
         "sprint_doc_id": row["sprint_doc_id"],
         "title": title,
         "state": row["state"],
+        "display_state": display_state,
         "legacy": bool(row["legacy"]),
         "declared_at": row["declared_at"],
         "handed_off_at": row["handed_off_at"],
@@ -1095,7 +1255,8 @@ def _sprint_projection(con, sprint_doc_id: int):
             }
         ),
         "conductor": _conductor_projection(con, sprint_doc_id),
-        "cancellation": _cancellation_projection(con, sprint_doc_id),
+        "cancellation": cancellation,
+        "assignments": _assignment_projections(con, sprint_doc_id),
         "units": [],
     }
     unit_ids = con.execute(
@@ -1108,6 +1269,43 @@ def _sprint_projection(con, sprint_doc_id: int):
         unit["state_recognized"] = unit["state"] in _UNIT_STATES
         out["units"].append(unit)
     return out
+
+
+def _sprint_overview(con, recent: int = 5) -> dict:
+    live_ids = [
+        int(row[0])
+        for row in con.execute(
+            "SELECT sprint_doc_id FROM sprints "
+            "WHERE state IN ('declared','active','closing') "
+            "ORDER BY sprint_doc_id"
+        ).fetchall()
+    ]
+    recent_ids = [
+        int(row[0])
+        for row in con.execute(
+            "SELECT sprint_doc_id FROM sprints "
+            "WHERE state IN ('closed','aborted') "
+            "ORDER BY COALESCE(closed_at,declared_at) DESC,sprint_doc_id DESC "
+            "LIMIT ?",
+            (recent,),
+        ).fetchall()
+    ]
+    sprints = [
+        _sprint_projection(con, sprint_doc_id)
+        for sprint_doc_id in (*live_ids, *recent_ids)
+    ]
+    return {
+        "active_count": sum(
+            sprint["state"] == "active"
+            and sprint["display_state"] == "active"
+            for sprint in sprints
+        ),
+        "open_count": sum(
+            sprint["state"] in ("declared", "active", "closing")
+            for sprint in sprints
+        ),
+        "sprints": sprints,
+    }
 
 
 def _create_sprint(actor: _Actor, headers, body: dict):
@@ -1947,6 +2145,30 @@ def _adopt_sprint(actor: _Actor, headers, sprint_doc_id: int, body: dict):
 
 def _list_sprints(query: dict):
     state = query.get("status", [None])[0]
+    view = query.get("view", [None])[0]
+    if view is not None:
+        if view != "board" or state is not None:
+            return _err(
+                422,
+                "validation",
+                "view must be board and cannot be combined with status",
+            )
+        raw_recent = query.get("recent", ["5"])[0]
+        try:
+            recent = int(raw_recent)
+        except (TypeError, ValueError):
+            recent = -1
+        if recent < 0 or recent > 20:
+            return _err(
+                422,
+                "validation",
+                "recent must be an integer from 0 through 20",
+            )
+        con = _db()
+        try:
+            return _json(200, _sprint_overview(con, recent))
+        finally:
+            con.close()
     if state is not None and state not in sprint_lifecycle.SPRINT_STATES:
         return _err(
             422,

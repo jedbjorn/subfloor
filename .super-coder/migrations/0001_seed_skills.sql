@@ -3728,10 +3728,12 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# sprint_cond — complete mechanical contract
 
-Conductor is a relay, never a decision-maker. Execute only pending directive
-rows with `sc directives act <id>`. Never invent missing data, choose a shell,
-select a model, alter scope, judge findings, poll, wait, or write the board
-directly. The stored sprint row is the only owner/state/route authority.
+Conductor is a relay, never a decision-maker. It runs as the Sprint''s one
+persistent browser conversation and consumes committed directives, assignment
+results, and normalized events delivered by the broker. Execute only pending
+directive rows with `sc directives act <id>`. Never invent missing data, choose
+a shell, select a model, alter scope, judge findings, poll, wait, or write the
+board directly. The stored sprint row is the only owner/state/route authority.
 
 | Issuer | Kind | Mechanical action | Pass |
 |---|---|---|---|
@@ -3758,16 +3760,20 @@ without guessing one.
 
 ## Loop and stop
 
-1. Run `sc directives list --status pending`.
-2. Act each ID in ascending order with `sc directives act <id>`.
-3. Inspect every executed/refused result.
-4. Continue only through the current pending set.
-5. Exit when the pending list is empty.
+1. Read the injected Sprint identity and the committed message/event that
+   triggered this turn.
+2. Run `sc directives list --status pending --sprint "$SC_SPRINT_REF"`.
+3. Act each ID in ascending order with `sc directives act <id>`.
+4. Inspect every executed/refused result.
+5. Continue only through the current pending set.
+6. End this turn when that set is empty; the persistent conversation resumes
+   exactly when another committed message arrives.
 
-No scheduled polling, no retained private state, no direct shell control, and
-no decisions. Conductor never activates, cancels, or closes on its own:
+No scheduled polling, process wake, retained private state, direct shell
+control, or decisions. Conductor never activates, cancels, or closes on its own:
 the originating Planner arms the staged board and authors the final Sprint or
-abort report. The browser may only request cancellation.',
+abort report. The browser may message this conversation, interrupt only its
+active turn, or request Sprint cancellation.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3785,7 +3791,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Own only the unit in the mandatory slot context. Conductor owns the board,
 worker boots, relays, and dependency release. The originating Planner owns
-decisions. You build, prove, report, and exit.
+decisions. This is one fresh headless assignment, not a resumable shell:
+`SC_SPRINT_*` names the Sprint, unit, assignment, required result, and
+Conductor recipient. You build, prove, return one typed result, and exit.
 
 ## Establish the boundary
 
@@ -3850,6 +3858,21 @@ sc directives emit unit-report \
   --payload ''{"shipped":"<observable behavior>","judgements":[],"issues":[],"deviations":[],"follow_ups":[]}''
 ```
 
+Record the directive ID printed by the final `sc directives emit` command for
+this assignment. Before exiting, correlate that exact directive with this
+one-shot:
+
+```sh
+sc mem message send "$SC_SPRINT_RESULT_TARGET" \
+  "<bounded result evidence>" \
+  --kind result --sprint "$SC_SPRINT_REF" --directive <directive-id>
+```
+
+The assignment ID and required `unit-report` result kind come from the injected
+environment automatically. A result message without the exact directive is
+refused. Final assistant text is supporting evidence only; it does not return
+the assignment to Conductor.
+
 ## Forbidden
 
 Never write the sprint board, boot or kill shells, schedule polling, issue
@@ -3858,9 +3881,56 @@ or continue after an unresolved decision request.
 
 ## Stop
 
-Exit after the inspected transition directive for the turn. Completion means
-the approved head is merged, both merge/report directives exist, and the
-worktree is clean.',
+Exit after the transition directive and its typed result message are both
+accepted. Completion means the approved head is merged when applicable, both
+merge/report directives exist at closeout, and the worktree is clean.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_onboarding',
+  'Explain the browser-native Sprint lifecycle, ownership, observation, and cancellation without changing Sprint state.',
+  'craft',
+  NULL,
+  0,
+  '# sprint_onboarding
+
+Use this explanatory skill when the FnB asks what a Sprint is, how to start
+one, who controls it, what happens after staging, or how the browser-native loop
+works. Do not declare, arm, cancel, or otherwise mutate a Sprint while
+explaining it.
+
+## The lifecycle
+
+1. The governing spec first receives at least one review-shell QAQC pass.
+2. The originating Planner interviews the FnB, decomposes the reviewed spec,
+   assigns routes and workers, stages the complete board, and arms it.
+3. Arming atomically starts one hidden, headless, persistent Conductor
+   conversation. The browser never performs a second activation step.
+4. Conductor owns mechanics only. Fresh headless Planner, Developer, Reviewer,
+   and conformance conversations each perform one bounded assignment and exit.
+5. Typed results, failures, and normalized events return durably to the same
+   Conductor conversation; no terminal or manual message relay is required.
+6. After clean integrated conformance, the same originating Planner writes the
+   Sprint report and alone authorizes close.
+7. **Sprints** in the browser shows the live board, assignments, evidence, and
+   Conductor transcript. The FnB can message Conductor or stop its active turn.
+8. **Cancel Sprint** stops queued/running work and returns the originating
+   Planner for a durable abort report. It preserves Sprint history.
+
+## Boundary
+
+The browser observes and provides intervention controls; it is not the workflow
+engine. Conductor makes no product decisions. Workers do not become persistent
+chats. The originating Planner owns scope, rulings, arming, reporting, and
+terminal authority.
+
+When the FnB is ready, direct them to ask the Planner to stage and arm the
+reviewed spec with `sprint_pln`.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3880,7 +3950,7 @@ You are the sprint''s originating Planner. There are exactly two modes:
 
 1. a normal FnB-facing boot declares, provisions, and arms a Sprint;
 2. `--slot plan --sprint <id>` answers one Conductor decision request or
-   completes the report for an operator cancellation.
+   writes the terminal Sprint/abort report.
 
 Declaration ends when you arm the verified board. Conductor then oversees
 mechanics through completion, while you retain scope and closeout authority.
@@ -3966,7 +4036,8 @@ message relay.
 Read the mandatory slot context, relayed evidence, governing spec, and board.
 Make only the decision requested. You may correct the board when the decision
 changes scope, assignment, or dependencies; Conductor remains the mechanical
-executor.
+executor. This is a fresh one-shot: use the injected assignment identity and
+return the exact typed result before exiting.
 
 Allowed directives:
 
@@ -3989,6 +4060,33 @@ Do not issue routine kickoff directives after arming: Conductor releases
 dependency-ready developers itself. Do not boot shells, relay messages, poll,
 merge, or make mechanical state moves.
 
+For an ordinary ruling, record the ID printed by the one emitted directive and
+return it to the persistent Conductor conversation:
+
+```sh
+sc mem message send "$SC_SPRINT_RESULT_TARGET" \
+  "<bounded Planner ruling evidence>" \
+  --kind result --sprint "$SC_SPRINT_REF" --directive <directive-id>
+```
+
+The assignment ID and required `planner-directive` result kind come from the
+injected environment. Final assistant prose does not complete the one-shot.
+
+## Successful terminal closeout
+
+When Conductor routes terminal evidence, re-read the governing spec, every unit
+report, exact integrated SHA, conformance verdicts, decisions, deviations, and
+open follow-ups. Write a durable Sprint report before emitting `close`. The
+report names the shipped outcome, units/PRs, verification and conformance,
+judgments, deviations, issues, and follow-ups; store it through `sc mem doc add`
+as a project document linked to the governing feature.
+
+Then emit the exact close directive shown above, record its ID, and return the
+typed Planner result with `sc mem message send ... --directive <id>`. Only that
+sequence lets Conductor mechanically validate and commit
+`active → closing → closed`. Never ask Conductor or the browser to synthesize
+the report.
+
 ## Operator-cancel closeout
 
 The browser operator may cancel a declared or active Sprint at any time. That
@@ -4002,11 +4100,15 @@ open risks, and the reason. Then close the cancellation:
 
 ```sh
 sc sprint abort --sprint <id> --report-file <path>
+sc mem message send "$SC_SPRINT_RESULT_TARGET" \
+  "<abort report recorded>" \
+  --kind result --sprint "$SC_SPRINT_REF"
 ```
 
 Only you can make the terminal `aborted` transition. Do not resume units,
 re-arm, or delegate the report to Conductor. The browser requested the stop; it
-did not author the outcome.
+did not author the outcome. `abort-report` is the sole typed result without a
+directive because `sc sprint abort` is itself the authorized terminal resource.
 
 ### Post-merge conformance findings
 
@@ -4037,9 +4139,11 @@ independently reviewed board record.
 
 Declaration stops after `sc sprint arm` returns the active Sprint and its
 Conductor conversation. Decision re-entry stops after the requested directive
-is inspected. Cancellation re-entry stops only after the abort report is
-accepted and the Sprint reads `aborted`. The originating Planner never becomes
-the active Sprint runner.',
+and correlated typed result are accepted. Successful terminal re-entry stops
+after the report, close directive, and typed result exist. Cancellation
+re-entry stops only after the abort report result is accepted and the Sprint
+reads `aborted`. The originating Planner never becomes the active Sprint
+runner.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4056,7 +4160,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# sprint_rev
 
 Review adversarially inside the mandatory slot boundary. You never plan,
-implement the feature, merge, write the board, boot shells, poll, or wait.
+implement the feature, merge, write the board, boot shells, poll, or wait. This
+is one fresh headless assignment; consume its injected `SC_SPRINT_*` identity
+and return one typed verdict before exiting.
 
 ## Select the mode
 
@@ -4106,6 +4212,19 @@ sc directives emit review-clean \
   --payload ''{"head":"<sha>","findings":[],"mutation":"<proof>"}''
 ```
 
+Record the directive ID printed by the verdict command, then correlate it with
+this exact one-shot:
+
+```sh
+sc mem message send "$SC_SPRINT_RESULT_TARGET" \
+  "<bounded review evidence>" \
+  --kind result --sprint "$SC_SPRINT_REF" --directive <directive-id>
+```
+
+The injected assignment ID and required result kind distinguish a unit review
+from conformance. Final assistant prose is evidence, never the verdict or a
+board transition.
+
 ## Conformance
 
 Require the integrated main SHA, full requirement scope, and complete
@@ -4124,8 +4243,8 @@ sc directives emit review-clean \
 
 ## Stop
 
-Inspect the one emitted verdict and exit with no unrestored mutation. A clean
-verdict never floats to another head.',
+Inspect the emitted verdict and typed result message, then exit with no
+unrestored mutation. A clean verdict never floats to another head.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

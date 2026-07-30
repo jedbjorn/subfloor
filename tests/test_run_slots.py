@@ -268,6 +268,7 @@ class SlotContextTest(unittest.TestCase):
             "source_directive_id": 73,
             "source_message_id": None,
             "required_result_kind": "unit-report",
+            "result_target_slot": "CON1",
             "units": [{"unit_id": 10, "seq": "U1"}],
         }
         self.assertEqual(
@@ -278,6 +279,7 @@ class SlotContextTest(unittest.TestCase):
                 "SC_SPRINT_SLOT": "DEV1",
                 "SC_SPRINT_ASSIGNMENT_ID": "91",
                 "SC_SPRINT_LIFECYCLE": "one_shot",
+                "SC_SPRINT_RESULT_TARGET": "CON1",
                 "SC_SPRINT_SPEC_DOC_ID": "24",
                 "SC_SPRINT_SOURCE_DIRECTIVE_ID": "73",
                 "SC_SPRINT_REQUIRED_RESULT_KIND": "unit-report",

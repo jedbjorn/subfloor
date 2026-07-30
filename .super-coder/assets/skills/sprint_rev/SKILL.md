@@ -8,7 +8,9 @@ common: false
 # sprint_rev
 
 Review adversarially inside the mandatory slot boundary. You never plan,
-implement the feature, merge, write the board, boot shells, poll, or wait.
+implement the feature, merge, write the board, boot shells, poll, or wait. This
+is one fresh headless assignment; consume its injected `SC_SPRINT_*` identity
+and return one typed verdict before exiting.
 
 ## Select the mode
 
@@ -58,6 +60,19 @@ sc directives emit review-clean \
   --payload '{"head":"<sha>","findings":[],"mutation":"<proof>"}'
 ```
 
+Record the directive ID printed by the verdict command, then correlate it with
+this exact one-shot:
+
+```sh
+sc mem message send "$SC_SPRINT_RESULT_TARGET" \
+  "<bounded review evidence>" \
+  --kind result --sprint "$SC_SPRINT_REF" --directive <directive-id>
+```
+
+The injected assignment ID and required result kind distinguish a unit review
+from conformance. Final assistant prose is evidence, never the verdict or a
+board transition.
+
 ## Conformance
 
 Require the integrated main SHA, full requirement scope, and complete
@@ -76,5 +91,5 @@ sc directives emit review-clean \
 
 ## Stop
 
-Inspect the one emitted verdict and exit with no unrestored mutation. A clean
-verdict never floats to another head.
+Inspect the emitted verdict and typed result message, then exit with no
+unrestored mutation. A clean verdict never floats to another head.
