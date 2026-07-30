@@ -521,25 +521,36 @@ def _target_summary(
 
 def _selected_target(items: list[dict[str, Any]]) -> str | None:
     priority = {
-        "pr_open": 0,
-        "checks_failed": 0,
-        "workspace": 1,
-        "pushed": 2,
-        "local": 3,
-        "pr_merged": 4,
-        "pr_closed": 5,
+        "pr_open": 1,
+        "checks_failed": 1,
+        "workspace": 2,
+        "pushed": 3,
+        "local": 4,
+        "pr_merged": 5,
+        "pr_closed": 6,
     }
     if not items:
         return None
+
+    def target_priority(item: dict[str, Any]) -> int:
+        facts = item["facts"]
+        if item["kind"] == "workspace" and (
+            facts["dirty"]
+            or (facts["ahead"] or 0) > 0
+            or facts["pushed"] is False
+        ):
+            return 0
+        return priority.get(
+            item["kind"]
+            if item["kind"] == "workspace"
+            else item["lifecycle"],
+            10,
+        )
+
     return min(
         enumerate(items),
         key=lambda pair: (
-            priority.get(
-                pair[1]["kind"]
-                if pair[1]["kind"] == "workspace"
-                else pair[1]["lifecycle"],
-                10,
-            ),
+            target_priority(pair[1]),
             pair[0],
         ),
     )[1]["target_id"]

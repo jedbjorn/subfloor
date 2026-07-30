@@ -190,6 +190,43 @@ class ConversationReviewApiTest(unittest.TestCase):
         self.assertEqual(response_headers["Cache-Control"], "no-store")
         self.assertIsNone(response_body)
 
+    def test_dirty_current_workspace_is_recommended_before_its_open_pr(self) -> None:
+        workspace_target = self.target_id()
+        self.fixture.write("dirty.txt", "not committed\n")
+        FakeReader.pull_requests = [
+            PullRequest(
+                number=816,
+                head_ref="feature/review-api",
+                base_ref="main",
+                head_sha=self.head_sha,
+                state="OPEN",
+                merged_at=None,
+                merge_sha=None,
+                title="Review API",
+                url="https://example.test/pull/816",
+                review_decision=None,
+                checks="PENDING",
+                checks_failed=False,
+            )
+        ]
+        review_routes._REMOTE_ATTEMPTS.clear()
+
+        status, _headers, body = self.request(
+            f"/api/conversations/{self.conversation_id}/review-targets"
+            "?refresh=remote"
+        )
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["selected_target_id"], workspace_target)
+        self.assertEqual(
+            next(
+                item["kind"]
+                for item in body["items"]
+                if item["target_id"] == body["selected_target_id"]
+            ),
+            "workspace",
+        )
+
     def test_files_diff_and_commits_are_server_selected_and_bounded(self) -> None:
         target_id = self.target_id()
         status, headers, files = self.request(

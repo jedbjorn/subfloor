@@ -3374,12 +3374,18 @@ const CHAT_FLAVOR_ORDER = [
 ];
 const CHAT_CONFIGURE_ROUTE = "configure";
 const CHAT_HISTORY_POLL_MS = 2000;
+const CHAT_REVIEW_POLL_MS = 2000;
+const CHAT_MODES = ["chat", "diff"];
 let chatRouteShell = "";
 let chatRouteConversation = "";
+let chatRouteMode = "chat";
 let chatSource = null;
 let chatHistoryPollTimer = null;
 let chatRenderGeneration = 0;
 let chatPendingSend = null;
+let chatModeController = null;
+let chatReviewCleanup = null;
+const chatReviewViewed = new Map();
 
 function chatStopStream() {
   if (chatSource) chatSource.close();
@@ -3391,9 +3397,20 @@ function chatStopHistoryPoll() {
   chatHistoryPollTimer = null;
 }
 
+function chatStopReview() {
+  if (chatReviewCleanup) chatReviewCleanup();
+  chatReviewCleanup = null;
+  document.body.classList.remove("chat-diff-view");
+}
+
 function chatHash(shortname, conversationId = "") {
   return `interface/${encodeURIComponent(shortname)}`
     + (conversationId ? `/${encodeURIComponent(conversationId)}` : "");
+}
+
+function chatModeHash(shortname, conversationId, mode = "chat") {
+  return chatHash(shortname, conversationId)
+    + (mode === "diff" ? "/diff" : "");
 }
 
 function chatModelLabel(conversation) {
@@ -3582,6 +3599,7 @@ function chatPaintTranscript(
   transcript, messages, events, conversation, retry, shouldFollow, onPosition,
 ) {
   const previousTop = transcript.scrollTop;
+  const followTail = shouldFollow();
   const assistants = chatAssistantRuns(events);
   const activities = chatActivity(events);
   const items = [];
@@ -3650,7 +3668,7 @@ function chatPaintTranscript(
   }
   transcript.replaceChildren(...items.map((item) => item.node));
   requestAnimationFrame(() => {
-    transcript.scrollTop = shouldFollow() ? transcript.scrollHeight : previousTop;
+    transcript.scrollTop = followTail ? transcript.scrollHeight : previousTop;
     onPosition();
   });
 }
@@ -3723,6 +3741,762 @@ function chatCreateConversation(shell, fields = {}) {
     { shell_id: shell.shell_id, ...fields },
     requestKey(),
   );
+}
+
+async function reviewApi(path, etagValue = "") {
+  const headers = etagValue ? { "If-None-Match": etagValue } : {};
+  let response;
+  try {
+    response = await fetch("/api" + path, { method: "GET", headers });
+  } catch (cause) {
+    const error = new Error("Review data could not be reached.");
+    error.code = "REVIEW_REMOTE_UNAVAILABLE";
+    error.cause = cause;
+    throw error;
+  }
+  if (response.status === 304) {
+    return {
+      notModified: true,
+      etag: response.headers.get("ETag") || etagValue,
+      data: null,
+    };
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.error || {};
+    const error = new Error(detail.message || response.statusText);
+    error.code = detail.code || "REVIEW_TARGET_UNAVAILABLE";
+    error.details = detail.details || {};
+    error.status = response.status;
+    throw error;
+  }
+  return {
+    notModified: false,
+    etag: response.headers.get("ETag") || "",
+    data,
+  };
+}
+
+function reviewLifecycleLabel(lifecycle) {
+  return {
+    local: "LOCAL BRANCH",
+    local_branch: "LOCAL BRANCH",
+    pushed: "PUSHED",
+    pr_open: "PR OPEN",
+    checks_failed: "CHECKS FAILED",
+    pr_merged: "PR MERGED",
+    pr_closed: "PR CLOSED",
+    remote_unknown: "REMOTE UNKNOWN",
+  }[lifecycle] || String(lifecycle || "LOCAL BRANCH").replaceAll("_", " ").toUpperCase();
+}
+
+function reviewTargetLabel(target) {
+  if (target.pr_number)
+    return `PR #${target.pr_number} · ${target.branch || "branch unavailable"} · `
+      + reviewLifecycleLabel(target.lifecycle).toLowerCase();
+  if (target.kind === "workspace")
+    return `Live workspace · ${target.branch || "detached HEAD"}`;
+  return `Branch ${target.branch || "detached HEAD"} · `
+    + reviewLifecycleLabel(target.lifecycle).toLowerCase();
+}
+
+function reviewObservedLabel(value) {
+  if (!value) return "observed just now";
+  const parsed = new Date(/(?:Z|[+-]\d\d:\d\d)$/.test(value) ? value : `${value}Z`);
+  return Number.isNaN(parsed.getTime())
+    ? `observed ${value}`
+    : `observed ${parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function reviewViewedKey(targetId, fingerprint) {
+  return `${targetId}:${fingerprint || "unknown"}`;
+}
+
+function reviewTypedState(title, detail = "", tone = "") {
+  const state = el("div", {
+    className: `review-typed-state${tone ? ` ${tone}` : ""}`,
+  }, el("strong", {}, title));
+  if (detail) state.append(el("span", {}, detail));
+  return state;
+}
+
+function reviewPatchRows(text) {
+  const patch = el("div", { className: "review-patch" });
+  let oldLine = null;
+  let newLine = null;
+  for (const line of String(text || "").split("\n")) {
+    let kind = "context";
+    let oldNumber = "";
+    let newNumber = "";
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      kind = "hunk";
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+    } else if (line.startsWith("diff --git ") || line.startsWith("index ")
+        || line.startsWith("--- ") || line.startsWith("+++ ")) {
+      kind = "header";
+    } else if (line.startsWith("+")) {
+      kind = "add";
+      newNumber = newLine ?? "";
+      if (newLine !== null) newLine += 1;
+    } else if (line.startsWith("-")) {
+      kind = "delete";
+      oldNumber = oldLine ?? "";
+      if (oldLine !== null) oldLine += 1;
+    } else if (line.startsWith("\\")) {
+      kind = "notice";
+    } else {
+      oldNumber = oldLine ?? "";
+      newNumber = newLine ?? "";
+      if (oldLine !== null) oldLine += 1;
+      if (newLine !== null) newLine += 1;
+    }
+    const row = el("div", { className: `review-line review-line-${kind}` });
+    row.append(
+      el("span", { className: "review-line-number" }, oldNumber),
+      el("span", { className: "review-line-number" }, newNumber),
+      el("span", { className: "review-line-code" }, line),
+    );
+    patch.append(row);
+  }
+  return patch;
+}
+
+function reviewFileTree(files, selectedPath, viewed, onSelect) {
+  const tree = { directories: new Map(), files: [] };
+  for (const file of files) {
+    const parts = file.path.split("/");
+    let node = tree;
+    for (const part of parts.slice(0, -1)) {
+      if (!node.directories.has(part))
+        node.directories.set(part, { directories: new Map(), files: [] });
+      node = node.directories.get(part);
+    }
+    node.files.push(file);
+  }
+  const renderNode = (node, depth = 0) => {
+    const fragment = document.createDocumentFragment();
+    for (const [name, child] of [...node.directories].sort(([a], [b]) => a.localeCompare(b))) {
+      fragment.append(el("div", {
+        className: "review-tree-directory",
+        style: `--review-depth:${depth}`,
+      }, el("span", { ariaHidden: "true" }, "▾"), name));
+      fragment.append(renderNode(child, depth + 1));
+    }
+    for (const file of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
+      const status = file.conflict ? "!" : file.status === "untracked" ? "?"
+        : file.status?.slice(0, 1).toUpperCase() || "M";
+      const button = el("button", {
+        className: "review-file-row"
+          + (file.path === selectedPath ? " selected" : "")
+          + (viewed.has(file.path) ? " viewed" : ""),
+        type: "button",
+        style: `--review-depth:${depth}`,
+        title: file.old_path ? `${file.old_path} → ${file.path}` : file.path,
+      });
+      const fileFacts = [
+        file.binary ? "binary" : "",
+        file.submodule ? "submodule" : "",
+        file.oversized ? "large" : "",
+        file.generated ? "generated" : "",
+      ].filter(Boolean);
+      button.append(
+        el("span", { className: `review-file-status status-${file.status}` }, status),
+        el("span", { className: "review-file-path" }, file.path.split("/").at(-1)),
+        el("span", { className: "review-file-counts" },
+          fileFacts.length ? fileFacts.join(" · ")
+            : [file.additions != null ? `+${file.additions}` : "",
+              file.deletions != null ? `−${file.deletions}` : ""]
+              .filter(Boolean).join(" ")),
+      );
+      button.onclick = () => onSelect(file);
+      fragment.append(button);
+    }
+    return fragment;
+  };
+  const host = el("div", { className: "review-file-tree" });
+  host.append(renderNode(tree));
+  return host;
+}
+
+function chatReviewWorkspace(host, conversation) {
+  const state = {
+    mode: "chat",
+    loaded: false,
+    loadingTargets: false,
+    loadingContent: false,
+    pollInFlight: false,
+    pollTimer: null,
+    requestGeneration: 0,
+    responseCache: new Map(),
+    targetsEtag: "",
+    gitFingerprint: "",
+    targets: [],
+    targetId: "",
+    targetFingerprint: "",
+    freshness: null,
+    scope: "review",
+    files: [],
+    fileFingerprint: "",
+    filesTruncated: false,
+    selectedPath: "",
+    patch: null,
+    patchError: null,
+    patchLoading: false,
+    commits: [],
+    commitsTruncated: false,
+    pathFilter: "",
+    statusFilter: "",
+    hideViewed: false,
+    hideGenerated: false,
+    hideBinary: false,
+    hideDeleted: false,
+    error: null,
+  };
+
+  const selectedTarget = () =>
+    state.targets.find((target) => target.target_id === state.targetId) || null;
+  const selectedFile = () =>
+    state.files.find((file) => file.path === state.selectedPath) || null;
+  const viewedFiles = () => {
+    const key = reviewViewedKey(state.targetId, state.fileFingerprint);
+    if (!chatReviewViewed.has(key)) chatReviewViewed.set(key, new Set());
+    return chatReviewViewed.get(key);
+  };
+
+  const targetFacts = (target) => {
+    if (!target) return [];
+    const facts = [];
+    if (target.facts?.dirty) facts.push("dirty workspace");
+    if (target.facts?.ahead) facts.push(`${target.facts.ahead} unpushed commit${target.facts.ahead === 1 ? "" : "s"}`);
+    if (target.facts?.behind) facts.push(`${target.facts.behind} behind base`);
+    if (target.facts?.cleanup_pending) facts.push("cleanup pending");
+    if (target.facts?.pushed === false && target.kind !== "pull_request")
+      facts.push("not pushed");
+    if (target.freshness?.remote === "cached") facts.push("cached remote");
+    return facts;
+  };
+
+  const patchBody = () => {
+    const file = selectedFile();
+    if (!file) return reviewTypedState(
+      "Select a file",
+      "Choose a path from the navigator to read its bounded patch.",
+    );
+    if (state.patchLoading) return reviewTypedState("Loading patch…", file.path);
+    if (state.patchError) {
+      const code = state.patchError.code || "REVIEW_TARGET_UNAVAILABLE";
+      return reviewTypedState(code, state.patchError.message, "error");
+    }
+    if (!state.patch) return reviewTypedState("Patch unavailable", file.path);
+    if (state.patch.binary || file.binary)
+      return reviewTypedState("Binary file", "Raw binary bytes are never transported.");
+    if (!state.patch.patch) {
+      const reason = state.patch.unavailable_reason || "unavailable";
+      return reviewTypedState(
+        reason === "oversized" ? "Patch too large" : "Patch unavailable",
+        reason === "oversized"
+          ? "The file remains listed, but its patch exceeds the review limit."
+          : `No textual patch is available (${reason}).`,
+      );
+    }
+    const wrapper = el("div", { className: "review-patch-wrap" });
+    if (state.patch.truncated)
+      wrapper.append(reviewTypedState(
+        "Patch truncated",
+        "Showing the bounded portion returned by the server.",
+        "warning",
+      ));
+    wrapper.append(reviewPatchRows(state.patch.patch));
+    return wrapper;
+  };
+
+  const commitBody = () => {
+    if (state.error)
+      return reviewTypedState(
+        state.error.code || "REVIEW_TARGET_UNAVAILABLE",
+        state.error.message,
+        "error",
+      );
+    if (state.loadingContent)
+      return reviewTypedState("Loading commits…", "Reading the bounded change history.");
+    if (!state.commits.length)
+      return reviewTypedState("No commits in this change set.");
+    const list = el("div", { className: "review-commit-list" });
+    for (const commit of state.commits) {
+      list.append(el("article", { className: "review-commit" },
+        el("code", {}, commit.short_sha),
+        el("div", { className: "review-commit-main" },
+          el("strong", {}, commit.subject),
+          el("span", {}, `${commit.author} · ${commit.authored_at}`))));
+    }
+    if (state.commitsTruncated)
+      list.append(reviewTypedState(
+        "Commit list truncated",
+        "The server returned its bounded commit projection.",
+        "warning",
+      ));
+    return list;
+  };
+
+  const filteredFiles = () => {
+    const needle = state.pathFilter.trim().toLowerCase();
+    const viewed = viewedFiles();
+    return state.files.filter((file) =>
+      (!needle || file.path.toLowerCase().includes(needle))
+      && (!state.statusFilter || file.status === state.statusFilter)
+      && (!state.hideViewed || !viewed.has(file.path))
+      && (!state.hideGenerated || !file.generated)
+      && (!state.hideBinary || !file.binary)
+      && (!state.hideDeleted || file.status !== "deleted"));
+  };
+
+  const toggleFilter = (label, key) => {
+    const button = el("button", {
+      className: `review-filter-toggle${state[key] ? " active" : ""}`,
+      type: "button",
+      textContent: label,
+      ariaPressed: String(state[key]),
+    });
+    button.onclick = () => {
+      state[key] = !state[key];
+      paint();
+    };
+    return button;
+  };
+
+  const selectReviewFile = (file) => {
+    if (!file) return;
+    state.selectedPath = file.path;
+    viewedFiles().add(file.path);
+    loadPatch(file);
+    paint();
+  };
+
+  const paint = () => {
+    if (state.mode !== "diff") return;
+    if (state.loadingTargets && !state.loaded) {
+      host.replaceChildren(reviewTypedState(
+        "Loading review workspace…",
+        "Reading local Git state and cached pull-request evidence.",
+      ));
+      return;
+    }
+    if (state.error && !state.targets.length) {
+      const retry = el("button", {
+        className: "act",
+        type: "button",
+        textContent: "Retry",
+      });
+      retry.onclick = () => loadTargets();
+      host.replaceChildren(reviewTypedState(
+        state.error.code || "REVIEW_TARGET_UNAVAILABLE",
+        state.error.message,
+        "error",
+      ), retry);
+      return;
+    }
+    if (!state.targets.length) {
+      const refresh = el("button", {
+        className: "act",
+        type: "button",
+        textContent: "Refresh remote",
+      });
+      refresh.onclick = () => loadTargets({ remote: true });
+      host.replaceChildren(reviewTypedState(
+        "No review targets yet.",
+        "The selected conversation has no observed branch, workspace change, or pull request.",
+      ), refresh);
+      return;
+    }
+
+    const target = selectedTarget();
+    const targetSelect = el("select", {
+      className: "review-target-select",
+      ariaLabel: "Review target",
+    });
+    for (const item of state.targets)
+      targetSelect.append(el("option", {
+        value: item.target_id,
+        selected: item.target_id === state.targetId,
+        textContent: reviewTargetLabel(item),
+      }));
+    targetSelect.onchange = () => {
+      state.targetId = targetSelect.value;
+      state.targetFingerprint = selectedTarget()?.fingerprint || "";
+      state.scope = "review";
+      state.selectedPath = "";
+      state.patch = null;
+      state.commits = [];
+      loadContent();
+    };
+    const status = el("span", {
+      className: `review-lifecycle lifecycle-${target?.lifecycle || "local"}`,
+    }, reviewLifecycleLabel(target?.lifecycle));
+    const refresh = el("button", {
+      className: "act review-refresh",
+      type: "button",
+      textContent: state.loadingTargets ? "Refreshing…" : "Refresh remote",
+      disabled: state.loadingTargets,
+    });
+    refresh.onclick = () => loadTargets({ remote: true });
+    const facts = targetFacts(target);
+    if (state.scope !== "commits" && !state.loadingContent) {
+      const additions = state.files.reduce(
+        (total, file) => total + (file.additions || 0), 0);
+      const deletions = state.files.reduce(
+        (total, file) => total + (file.deletions || 0), 0);
+      facts.push(`${state.files.length} file${state.files.length === 1 ? "" : "s"}`);
+      if (additions || deletions) facts.push(`+${additions} −${deletions}`);
+    }
+    const remoteWarning = state.freshness?.remote === "unavailable"
+      ? `Remote unavailable${state.freshness.remote_error
+        ? ` — ${state.freshness.remote_error}` : ""}. Local and cached evidence remain readable.`
+      : "";
+    const summary = el("div", { className: "review-summary" },
+      el("div", { className: "review-target-control" },
+        el("label", { className: "k" }, "Change set"),
+        targetSelect),
+      el("div", { className: "review-lifecycle-block" },
+        status,
+        el("span", { className: "review-facts" }, facts.join(" · ") || "clean local state")),
+      el("div", { className: "review-freshness" },
+        el("span", {}, reviewObservedLabel(target?.last_seen_at)),
+        remoteWarning ? el("span", { className: "warning" }, remoteWarning) : null),
+      refresh);
+
+    const scopeSwitch = el("div", {
+      className: "review-scope-switch",
+      role: "tablist",
+      ariaLabel: "Comparison scope",
+    });
+    for (const [value, label] of [
+      ["review", "Review changes"],
+      ["local", "Local only"],
+      ["commits", "Commits"],
+    ]) {
+      const button = el("button", {
+        className: value === state.scope ? "active" : "",
+        type: "button",
+        role: "tab",
+        ariaSelected: String(value === state.scope),
+        textContent: label,
+      });
+      button.onclick = () => {
+        if (state.scope === value) return;
+        state.scope = value;
+        state.selectedPath = "";
+        state.patch = null;
+        state.error = null;
+        loadContent();
+      };
+      scopeSwitch.append(button);
+    }
+
+    const workspace = el("div", { className: "review-workspace" }, summary, scopeSwitch);
+    if (state.scope === "commits") {
+      workspace.append(el("div", { className: "review-commits-pane" }, commitBody()));
+      host.replaceChildren(workspace);
+      return;
+    }
+
+    const pathInput = el("input", {
+      type: "search",
+      className: "review-path-filter",
+      placeholder: "Filter paths",
+      value: state.pathFilter,
+    });
+    pathInput.oninput = () => {
+      const start = pathInput.selectionStart;
+      state.pathFilter = pathInput.value;
+      paint();
+      const next = $(".review-path-filter", host);
+      next?.focus();
+      next?.setSelectionRange(start, start);
+    };
+    const statuses = [...new Set(state.files.map((file) => file.status))].sort();
+    const statusSelect = el("select", {
+      className: "review-status-filter",
+      ariaLabel: "File status",
+    }, el("option", { value: "", textContent: "All statuses" }));
+    for (const value of statuses)
+      statusSelect.append(el("option", {
+        value,
+        selected: value === state.statusFilter,
+        textContent: value,
+      }));
+    statusSelect.onchange = () => {
+      state.statusFilter = statusSelect.value;
+      paint();
+    };
+    const filters = el("div", { className: "review-filters" },
+      pathInput,
+      statusSelect,
+      toggleFilter("Hide viewed", "hideViewed"),
+      toggleFilter("Hide generated", "hideGenerated"),
+      toggleFilter("Hide binary", "hideBinary"),
+      toggleFilter("Hide deleted", "hideDeleted"));
+    const visibleFiles = filteredFiles();
+    const viewed = viewedFiles();
+    const navigator = el("aside", { className: "review-navigator" }, filters);
+    if (state.error) {
+      navigator.append(reviewTypedState(
+        state.error.code || "REVIEW_TARGET_UNAVAILABLE",
+        state.error.message,
+        "error",
+      ));
+    } else if (state.loadingContent) {
+      navigator.append(reviewTypedState("Loading files…"));
+    } else if (!visibleFiles.length) {
+      navigator.append(reviewTypedState("No files match this scope and filter."));
+    } else {
+      navigator.append(reviewFileTree(
+        visibleFiles,
+        state.selectedPath,
+        viewed,
+        selectReviewFile,
+      ));
+    }
+    if (state.filesTruncated)
+      navigator.append(reviewTypedState(
+        "File list truncated",
+        "The server returned its bounded file projection.",
+        "warning",
+      ));
+    const selected = selectedFile();
+    const selectedIndex = visibleFiles.findIndex(
+      (file) => file.path === state.selectedPath);
+    const previousFile = selectedIndex > 0 ? visibleFiles[selectedIndex - 1] : null;
+    const nextFile = selectedIndex >= 0 && selectedIndex < visibleFiles.length - 1
+      ? visibleFiles[selectedIndex + 1] : null;
+    const previous = el("button", {
+      type: "button",
+      className: "review-file-step",
+      textContent: "↑",
+      title: "Previous file",
+      ariaLabel: "Previous file",
+      disabled: !previousFile,
+    });
+    previous.onclick = () => selectReviewFile(previousFile);
+    const next = el("button", {
+      type: "button",
+      className: "review-file-step",
+      textContent: "↓",
+      title: "Next file",
+      ariaLabel: "Next file",
+      disabled: !nextFile,
+    });
+    next.onclick = () => selectReviewFile(nextFile);
+    const patchHead = el("div", { className: "review-patch-head" },
+      el("strong", {}, selected?.path || "Patch"),
+      selected?.old_path
+        ? el("span", {}, `renamed from ${selected.old_path}`)
+        : el("span", {}, state.scope === "local"
+          ? "local changes absent from selected head"
+          : "merge-base / canonical review patch"),
+      el("div", { className: "review-file-steps" }, previous, next));
+    const patchPane = el("section", { className: "review-patch-pane" },
+      patchHead, patchBody());
+    workspace.append(el("div", { className: "review-body" }, navigator, patchPane));
+    host.replaceChildren(workspace);
+  };
+
+  const readReviewResource = async (path) => {
+    const cached = state.responseCache.get(path);
+    const result = await reviewApi(path, cached?.etag || "");
+    if (result.notModified) {
+      if (!cached) {
+        const error = new Error("Review cache entry is unavailable.");
+        error.code = "REVIEW_TARGET_UNAVAILABLE";
+        throw error;
+      }
+      return cached.data;
+    }
+    state.responseCache.set(path, { etag: result.etag, data: result.data });
+    return result.data;
+  };
+
+  const loadPatch = async (file) => {
+    if (!file || state.scope === "commits") return;
+    const request = ++state.requestGeneration;
+    state.patchLoading = true;
+    state.patchError = null;
+    paint();
+    try {
+      const data = await readReviewResource(
+        `/review-targets/${encodeURIComponent(state.targetId)}/diff`
+        + `?scope=${encodeURIComponent(state.scope)}`
+        + `&path=${encodeURIComponent(file.path)}`,
+      );
+      if (request !== state.requestGeneration) return;
+      state.patch = data;
+    } catch (error) {
+      if (request !== state.requestGeneration) return;
+      state.patchError = error;
+      if (error.code === "REVIEW_TARGET_CHANGED") loadTargets();
+    } finally {
+      if (request === state.requestGeneration) {
+        state.patchLoading = false;
+        paint();
+      }
+    }
+  };
+
+  const loadFiles = async () => {
+    const request = ++state.requestGeneration;
+    state.loadingContent = true;
+    state.error = null;
+    paint();
+    try {
+      const items = [];
+      let cursor = "";
+      let page;
+      do {
+        const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+        page = await readReviewResource(
+          `/review-targets/${encodeURIComponent(state.targetId)}/files`
+          + `?scope=${encodeURIComponent(state.scope)}&limit=200${suffix}`,
+        );
+        items.push(...page.items);
+        cursor = page.next_cursor || "";
+      } while (cursor && items.length < 2000);
+      if (request !== state.requestGeneration) return;
+      const fingerprintChanged = state.fileFingerprint
+        && state.fileFingerprint !== page.fingerprint;
+      state.files = items;
+      state.fileFingerprint = page.fingerprint;
+      state.filesTruncated = Boolean(page.files_truncated || cursor);
+      if (fingerprintChanged || !items.some((file) => file.path === state.selectedPath))
+        state.selectedPath = items[0]?.path || "";
+      state.patch = null;
+      state.patchError = null;
+      state.loadingContent = false;
+      paint();
+      const file = selectedFile();
+      if (file) {
+        viewedFiles().add(file.path);
+        await loadPatch(file);
+      }
+    } catch (error) {
+      if (request !== state.requestGeneration) return;
+      state.loadingContent = false;
+      state.error = error;
+      state.files = [];
+      state.patch = null;
+      paint();
+    }
+  };
+
+  const loadCommits = async () => {
+    const request = ++state.requestGeneration;
+    state.loadingContent = true;
+    state.error = null;
+    paint();
+    try {
+      const items = [];
+      let cursor = "";
+      let page;
+      do {
+        const suffix = cursor ? `?limit=200&cursor=${encodeURIComponent(cursor)}` : "?limit=200";
+        page = await readReviewResource(
+          `/review-targets/${encodeURIComponent(state.targetId)}/commits${suffix}`,
+        );
+        items.push(...page.items);
+        cursor = page.next_cursor || "";
+      } while (cursor && items.length < 500);
+      if (request !== state.requestGeneration) return;
+      state.commits = items;
+      state.commitsTruncated = Boolean(page.commits_truncated || cursor);
+    } catch (error) {
+      if (request !== state.requestGeneration) return;
+      state.error = error;
+      state.commits = [];
+    } finally {
+      if (request === state.requestGeneration) {
+        state.loadingContent = false;
+        paint();
+      }
+    }
+  };
+
+  const loadContent = () =>
+    state.scope === "commits" ? loadCommits() : loadFiles();
+
+  const loadTargets = async ({ remote = false, polling = false } = {}) => {
+    if (state.loadingTargets) return;
+    state.loadingTargets = true;
+    if (!polling) paint();
+    const oldTargetId = state.targetId;
+    const oldTargetFingerprint = selectedTarget()?.fingerprint || "";
+    try {
+      const query = remote ? "?refresh=remote" : "";
+      const result = await reviewApi(
+        `/conversations/${conversation.conversation_id}/review-targets${query}`,
+        polling && !remote ? state.targetsEtag : "",
+      );
+      if (result.notModified) return;
+      const page = result.data;
+      state.targetsEtag = result.etag;
+      state.gitFingerprint = page.git_fingerprint;
+      state.targets = page.items;
+      state.freshness = page.freshness;
+      state.loaded = true;
+      state.error = null;
+      if (!state.targets.some((target) => target.target_id === state.targetId))
+        state.targetId = page.selected_target_id || state.targets[0]?.target_id || "";
+      const nextTargetFingerprint = selectedTarget()?.fingerprint || "";
+      state.targetFingerprint = nextTargetFingerprint;
+      if (state.targetId && (
+        state.targetId !== oldTargetId
+        || nextTargetFingerprint !== oldTargetFingerprint
+        || (!state.files.length && !state.commits.length)
+      )) {
+        await loadContent();
+      } else {
+        paint();
+      }
+    } catch (error) {
+      state.error = error;
+      state.loaded = true;
+      paint();
+    } finally {
+      state.loadingTargets = false;
+      paint();
+    }
+  };
+
+  const pollReview = async () => {
+    if (document.hidden || state.mode !== "diff" || state.pollInFlight) return;
+    state.pollInFlight = true;
+    try { await loadTargets({ polling: true }); }
+    finally { state.pollInFlight = false; }
+  };
+  const visibilityRefresh = () => {
+    if (!document.hidden && state.mode === "diff") pollReview();
+  };
+  document.addEventListener("visibilitychange", visibilityRefresh);
+
+  const setMode = (mode) => {
+    state.mode = mode;
+    if (mode === "diff") {
+      if (!state.loaded) loadTargets();
+      if (state.pollTimer === null)
+        state.pollTimer = setInterval(pollReview, CHAT_REVIEW_POLL_MS);
+      paint();
+    } else if (state.pollTimer !== null) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  };
+  const cleanup = () => {
+    state.requestGeneration += 1;
+    if (state.pollTimer !== null) clearInterval(state.pollTimer);
+    state.pollTimer = null;
+    document.removeEventListener("visibilitychange", visibilityRefresh);
+  };
+  chatReviewCleanup = cleanup;
+  return { setMode, cleanup };
 }
 
 async function chatRenderNew(host, shell, defaults, catalog) {
@@ -3805,12 +4579,30 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   const seen = new Set();
   let streamStatus = "connecting";
   let stopRequest = null;
+  let currentMode = CHAT_MODES.includes(chatRouteMode) ? chatRouteMode : "chat";
 
   const header = el("div", { className: "chat-pane-head" });
   const title = el("div", { className: "chat-pane-title" });
+  const modeSwitch = el("div", {
+    className: "chat-mode-switch",
+    role: "tablist",
+    ariaLabel: "Conversation mode",
+  });
+  const chatModeButton = el("button", {
+    type: "button",
+    role: "tab",
+    textContent: "Chat",
+  });
+  const diffModeButton = el("button", {
+    type: "button",
+    role: "tab",
+    textContent: "Diff",
+  });
+  modeSwitch.append(chatModeButton, diffModeButton);
   const queueState = el("span", { className: "chat-queue-state", hidden: true });
   const actions = el("div", { className: "chat-actions" });
   const transcriptHost = el("div", { className: "chat-transcript-host" });
+  const reviewHost = el("div", { className: "chat-review-host", hidden: true });
   const transcript = el("div", { className: "chat-transcript" });
   const jumpToLatest = el("button", {
     className: "chat-jump-latest",
@@ -3823,6 +4615,7 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
   transcriptHost.append(transcript, jumpToLatest);
   let followTranscriptTail = true;
   const updateTranscriptFollow = () => {
+    if (currentMode !== "chat") return;
     followTranscriptTail = chatTranscriptAtBottom(transcript);
     jumpToLatest.hidden = followTranscriptTail;
   };
@@ -3843,9 +4636,17 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     textContent: "Stop",
     title: "Interrupt the active turn",
   });
+  const headerStop = el("button", {
+    className: "act danger chat-stop-header",
+    type: "button",
+    textContent: "Stop",
+    title: "Interrupt the active turn",
+    hidden: true,
+  });
   const pending = el("div", { className: "chat-pending", hidden: true });
   const composerRow = el("div", { className: "chat-composer" },
     composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
+  const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
   const updateStreamStatus = () => {
     const connected = streamStatus === "connected";
     const connectionLabel = connected
@@ -3864,6 +4665,35 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     composer.focus();
     await submit();
   };
+  const setMode = (mode) => {
+    currentMode = CHAT_MODES.includes(mode) ? mode : "chat";
+    chatRouteMode = currentMode;
+    document.body.classList.toggle("chat-diff-view", currentMode === "diff");
+    transcriptHost.hidden = currentMode !== "chat";
+    composerRow.hidden = currentMode !== "chat";
+    reviewHost.hidden = currentMode !== "diff";
+    chatModeButton.classList.toggle("active", currentMode === "chat");
+    diffModeButton.classList.toggle("active", currentMode === "diff");
+    chatModeButton.setAttribute("aria-selected", String(currentMode === "chat"));
+    diffModeButton.setAttribute("aria-selected", String(currentMode === "diff"));
+    reviewWorkspace.setMode(currentMode);
+  };
+  const selectMode = (mode) => {
+    if (mode === currentMode) return;
+    history.pushState(
+      null,
+      "",
+      `#${chatModeHash(
+        conversation.shell.shortname,
+        conversation.conversation_id,
+        mode,
+      )}`,
+    );
+    setMode(mode);
+    paint();
+  };
+  chatModeButton.onclick = () => selectMode("chat");
+  diffModeButton.onclick = () => selectMode("diff");
   const renameConversation = async () => {
     const value = (prompt("Conversation title", conversation.title || "") || "").trim();
     if (!value) return;
@@ -3897,6 +4727,9 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     send.disabled = closed || closing;
     stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
     stop.textContent = stopRequest ? "Stopping…" : "Stop";
+    headerStop.disabled = stop.disabled;
+    headerStop.textContent = stop.textContent;
+    headerStop.hidden = currentMode !== "diff";
     close.disabled = closed || closing;
     close.textContent = closing ? "Closing…" : "Close";
     composer.placeholder = closed
@@ -3950,7 +4783,9 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
     } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
   };
   actions.append(analytics, close);
+  actions.insertBefore(headerStop, close);
   header.append(title, queueState, actions);
+  header.insertBefore(modeSwitch, queueState);
 
   async function submit() {
     const text = composer.value.trim();
@@ -4003,13 +4838,23 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       paint();
     }
   };
+  headerStop.onclick = () => stop.click();
   composer.onkeydown = (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       submit();
     }
   };
-  host.replaceChildren(header, transcriptHost, composerRow);
+  host.replaceChildren(header, transcriptHost, reviewHost, composerRow);
+  chatModeController = {
+    shell: conversation.shell.shortname,
+    conversationId: conversation.conversation_id,
+    setMode: (mode) => {
+      setMode(mode);
+      paint();
+    },
+  };
+  setMode(currentMode);
   paint();
   chatOpenStream(
     conversation.conversation_id,
@@ -4058,6 +4903,8 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
 async function renderInterface(root) {
   chatStopStream();
   chatStopHistoryPoll();
+  chatStopReview();
+  chatModeController = null;
   const generation = ++chatRenderGeneration;
   root.replaceChildren(el("div", { className: "chat-loading" }, "Loading conversations…"));
   const [{ shells: allShells }, defaults, catalog, allConversations] = await Promise.all([
@@ -4303,6 +5150,8 @@ function show(tab) {
   if (tab !== "interface") {
     chatStopStream();
     chatStopHistoryPoll();
+    chatStopReview();
+    chatModeController = null;
   }
   setDocumentTitle(tab);
   load(tab);
@@ -4317,9 +5166,20 @@ function show(tab) {
 function routeFromHash() {
   const raw = location.hash.slice(1);
   if (raw === "interface" || raw.startsWith("interface/")) {
-    const [, shell = "", conversation = ""] = raw.split("/");
+    const [, shell = "", conversation = "", requestedMode = ""] = raw.split("/");
+    const nextMode = requestedMode === "diff" ? "diff" : "chat";
     chatRouteShell = decodeURIComponent(shell);
     chatRouteConversation = decodeURIComponent(conversation);
+    const sameOpenConversation = Boolean(
+      chatModeController
+      && chatModeController.shell === chatRouteShell
+      && chatModeController.conversationId === chatRouteConversation
+    );
+    chatRouteMode = nextMode;
+    if (sameOpenConversation) {
+      chatModeController.setMode(nextMode);
+      return;
+    }
     show("interface");
     return;
   }
@@ -4344,6 +5204,7 @@ function routeFromHash() {
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
 window.addEventListener("hashchange", routeFromHash);
+window.addEventListener("popstate", routeFromHash);
 // Close any open popover menu on an outside click (one handler for all .gmenu).
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))

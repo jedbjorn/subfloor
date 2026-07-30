@@ -117,9 +117,10 @@ def test_transcript_follow_pauses_for_reading_and_offers_jump_to_latest():
     ) in interface
     assert "const previousTop = transcript.scrollTop" in interface
     assert (
-        "transcript.scrollTop = shouldFollow() "
+        "transcript.scrollTop = followTail "
         "? transcript.scrollHeight : previousTop"
     ) in interface
+    assert "const followTail = shouldFollow()" in interface
     assert 'className: "chat-jump-latest"' in interface
     assert 'ariaLabel: "Jump to latest message"' in interface
     assert "transcript.onscroll = updateTranscriptFollow" in interface
