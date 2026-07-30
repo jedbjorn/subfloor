@@ -161,6 +161,21 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert "chatCloseForSwitch" not in shell_switch
 
 
+def test_chat_switch_refetches_authoritative_version_before_close():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    close_for_switch = interface[
+        interface.index("async function chatCloseForSwitch"):
+        interface.index("function chatActivity")
+    ]
+    assert "const latest = await chatApi(" in close_for_switch
+    assert 'if (latest.state === "closed") return true' in close_for_switch
+    assert '["idle", "waiting", "error"].includes(latest.state)' in close_for_switch
+    assert "{ version: latest.version, state: \"closed\" }" in close_for_switch
+    assert "Object.assign(conversation, closed)" in close_for_switch
+    assert "{ version: conversation.version" not in close_for_switch
+
+
 def test_conversation_identity_uses_shell_context_and_neutral_user_label():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]

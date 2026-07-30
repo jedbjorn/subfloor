@@ -3114,18 +3114,22 @@ function chatConversationName(conversation) {
 }
 
 async function chatCloseForSwitch(conversation) {
-  if (!conversation || conversation.state === "closed") return true;
-  if (!["idle", "waiting", "error"].includes(conversation.state)) {
-    toast("Finish the current turn and queued messages before switching chats.");
-    return false;
-  }
+  if (!conversation) return true;
   try {
-    await chatApi(
+    const latest = await chatApi(
+      `/conversations/${conversation.conversation_id}`,
+    );
+    if (latest.state === "closed") return true;
+    if (!["idle", "waiting", "error"].includes(latest.state)) {
+      toast("Finish the current turn and queued messages before switching chats.");
+      return false;
+    }
+    const closed = await chatApi(
       `/conversations/${conversation.conversation_id}`,
       "PATCH",
-      { version: conversation.version, state: "closed" },
+      { version: latest.version, state: "closed" },
     );
-    conversation.state = "closed";
+    Object.assign(conversation, closed);
     return true;
   } catch (error) {
     toast(`${error.code}: ${error.message}`);
