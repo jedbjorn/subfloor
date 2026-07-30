@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -41,6 +42,9 @@ _CONVERSATION_STATES = frozenset(
 _ID = re.compile(r"^cv_[0-9a-f]{32}$")
 _DETAIL_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})$")
 _MESSAGES_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/messages$")
+_TRANSCRIPT_PATH = re.compile(
+    r"^/api/conversations/(cv_[0-9a-f]{32})/transcript$"
+)
 _EVENTS_PATH = re.compile(r"^/api/conversations/(cv_[0-9a-f]{32})/events$")
 _INTERRUPTIONS_PATH = re.compile(
     r"^/api/conversations/(cv_[0-9a-f]{32})/interruptions$"
@@ -69,6 +73,33 @@ _SENSITIVE_EVENT_KEYS = frozenset(
 )
 SSE_HEARTBEAT_SECONDS = 15.0
 SSE_BATCH = 200
+TRANSCRIPT_MAX_TURNS = 200
+TRANSCRIPT_MAX_SOURCE_EVENTS = 20_000
+TRANSCRIPT_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+TRANSCRIPT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+TRANSCRIPT_PROJECTION_VERSION = 1
+TRANSCRIPT_MAX_WARNINGS = 20
+TRANSCRIPT_MAX_ACTIVITY_LABEL_BYTES = 1024
+
+
+@dataclass(frozen=True)
+class TranscriptLimits:
+    max_turns: int = TRANSCRIPT_MAX_TURNS
+    max_source_events: int = TRANSCRIPT_MAX_SOURCE_EVENTS
+    max_source_bytes: int = TRANSCRIPT_MAX_SOURCE_BYTES
+    max_response_bytes: int = TRANSCRIPT_MAX_RESPONSE_BYTES
+
+    def __post_init__(self) -> None:
+        if min(
+            self.max_turns,
+            self.max_source_events,
+            self.max_source_bytes,
+            self.max_response_bytes,
+        ) <= 0:
+            raise ValueError("transcript limits must be positive")
+
+
+DEFAULT_TRANSCRIPT_LIMITS = TranscriptLimits()
 
 
 class ApiError(RuntimeError):
@@ -284,6 +315,19 @@ def _limit(query, *, default: int = 50, maximum: int = 200) -> int:
     return value
 
 
+def _strict_boolean(query, name: str) -> bool | None:
+    values = query.get(name)
+    if values is None:
+        return None
+    if len(values) != 1 or values[0] not in ("true", "false"):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"{name} must be exactly one lowercase true or false value",
+        )
+    return values[0] == "true"
+
+
 def _append_event(
     con,
     conversation_id: str,
@@ -320,13 +364,22 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
-        "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
+        "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
+        "s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
         " SELECT requested.created_at FROM conversation_events requested "
         " WHERE requested.conversation_id=c.conversation_id "
         " AND requested.event_type='conversation.close.requested' "
         " ORDER BY requested.sequence DESC LIMIT 1"
-        ") END AS close_requested_at "
+        ") END AS close_requested_at,"
+        "(SELECT COUNT(*) FROM conversation_messages queued "
+        " WHERE queued.conversation_id=c.conversation_id "
+        " AND queued.message_kind!='control' "
+        " AND queued.state IN ('accepted','queued')) AS queued_count,"
+        "(SELECT active.run_id FROM conversation_runs active "
+        " WHERE active.conversation_id=c.conversation_id "
+        " AND active.state IN ('leased','starting','running') "
+        " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         "WHERE c.conversation_id=? AND c.mode='normal' AND c.owner_user_id=?",
         (conversation_id, owner_user_id),
@@ -790,15 +843,31 @@ def _list_conversations(con, operator: dict, query):
     clauses = ["c.mode='normal'", "c.owner_user_id=?"]
     params: list = [operator["user_id"]]
     shell = query.get("shell_id", [None])[0]
+    shell_id = None
     if shell not in (None, ""):
+        shell_id = _integer(shell, "shell_id")
         clauses.append("c.shell_id=?")
-        params.append(_integer(shell, "shell_id"))
+        params.append(shell_id)
     state = query.get("state", [None])[0]
     if state:
         if state not in _CONVERSATION_STATES:
             raise ApiError(422, "VALIDATION_ERROR", "invalid conversation state")
         clauses.append("c.state=?")
         params.append(state)
+    starred = _strict_boolean(query, "starred")
+    if starred is not None:
+        clauses.append("c.starred=?")
+        params.append(int(starred))
+    open_only = _strict_boolean(query, "open")
+    if open_only is not None:
+        compatible = state != "closed" if open_only else state in (None, "closed")
+        if state is not None and not compatible:
+            raise ApiError(
+                422,
+                "VALIDATION_ERROR",
+                "open and state filters cannot both be true",
+            )
+        clauses.append("c.state!='closed'" if open_only else "c.state='closed'")
     mode = query.get("mode", [None])[0]
     if mode and mode != "normal":
         raise ApiError(
@@ -806,6 +875,14 @@ def _list_conversations(con, operator: dict, query):
             "VALIDATION_ERROR",
             "this endpoint exposes normal conversations only",
         )
+    scope = {
+        "owner_user_id": int(operator["user_id"]),
+        "shell_id": shell_id,
+        "starred": starred,
+        "open": open_only,
+        "state": state or None,
+        "mode": "normal",
+    }
     cursor = query.get("cursor", [None])[0]
     if cursor:
         decoded = _cursor_decode(cursor, "conversation")
@@ -813,6 +890,12 @@ def _list_conversations(con, operator: dict, query):
             str(decoded.get("id", ""))
         ):
             raise ApiError(422, "CURSOR_INVALID", "invalid conversation cursor")
+        if decoded.get("scope") != scope:
+            raise ApiError(
+                422,
+                "CURSOR_INVALID",
+                "conversation cursor does not match the requested filter scope",
+            )
         clauses.append(
             "(c.last_activity_at<? OR (c.last_activity_at=? AND c.conversation_id<?))"
         )
@@ -837,7 +920,12 @@ def _list_conversations(con, operator: dict, query):
     if len(rows) > limit:
         last = page[-1]
         next_cursor = _cursor_encode(
-            {"v": 1, "a": last["last_activity_at"], "id": last["conversation_id"]}
+            {
+                "v": 1,
+                "a": last["last_activity_at"],
+                "id": last["conversation_id"],
+                "scope": scope,
+            }
         )
     return _json(
         200,
@@ -1238,6 +1326,502 @@ def _interrupt(con, operator: dict, conversation_id: str, headers, body: dict):
     )
 
 
+def _utf8_prefix(value: str, maximum: int) -> str:
+    raw = value.encode()
+    if len(raw) <= maximum:
+        return value
+    return raw[:maximum].decode("utf-8", errors="ignore")
+
+
+def _transcript_activity_label(event_type: str, payload: dict) -> str:
+    if event_type == "permission.requested":
+        label = "Waiting for permission"
+    elif event_type == "input.requested":
+        label = "Waiting for input"
+    elif event_type == "run.interrupted":
+        label = "Turn interrupted"
+    elif event_type == "run.unknown":
+        label = "Turn outcome could not be proven"
+    else:
+        detail = payload.get("error") or payload.get("detail")
+        label = f"Turn failed — {detail}" if detail else "Turn failed"
+    return _utf8_prefix(label, TRANSCRIPT_MAX_ACTIVITY_LABEL_BYTES)
+
+
+def _transcript_size(projection: dict) -> int:
+    return len(
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    )
+
+
+def _transcript_truncation(
+    *,
+    reason: str,
+    omitted_message_count: int,
+    omitted_source_event_count: int,
+    omitted_through_sequence: int,
+    retained_from_sequence: int,
+) -> dict:
+    return {
+        "reason": reason,
+        "omitted_message_count": max(0, int(omitted_message_count)),
+        "omitted_source_event_count": max(
+            0, int(omitted_source_event_count)
+        ),
+        "omitted_through_sequence": max(0, int(omitted_through_sequence)),
+        "retained_from_sequence": max(0, int(retained_from_sequence)),
+    }
+
+
+def _bound_transcript_response(
+    projection: dict,
+    *,
+    limits: TranscriptLimits,
+    total_messages: int,
+    total_events: int,
+) -> None:
+    if _transcript_size(projection) <= limits.max_response_bytes:
+        return
+
+    items = projection["items"]
+    projection["truncation"] = _transcript_truncation(
+        reason="response_byte_limit",
+        omitted_message_count=max(
+            0,
+            total_messages
+            - len({item["message_id"] for item in items if item["kind"] == "user"}),
+        ),
+        omitted_source_event_count=0,
+        omitted_through_sequence=0,
+        retained_from_sequence=min(
+            (int(item["order_sequence"]) for item in items),
+            default=projection["through_sequence"],
+        ),
+    )
+
+    def group_key(item: dict) -> tuple[str, int | str]:
+        message_id = item.get("message_id")
+        return (
+            ("message", int(message_id))
+            if message_id is not None
+            else ("item", item["item_id"])
+        )
+
+    while _transcript_size(projection) > limits.max_response_bytes:
+        keys = []
+        for item in items:
+            key = group_key(item)
+            if key not in keys:
+                keys.append(key)
+        if len(keys) <= 1:
+            break
+        removed = keys[0]
+        items[:] = [item for item in items if group_key(item) != removed]
+
+    retained_from = min(
+        (int(item["order_sequence"]) for item in items),
+        default=projection["through_sequence"],
+    )
+    omitted_events = min(
+        total_events,
+        max(0, retained_from - 1),
+    )
+    retained_users = {
+        item["message_id"] for item in items if item["kind"] == "user"
+    }
+    projection["truncation"] = _transcript_truncation(
+        reason="response_byte_limit",
+        omitted_message_count=max(0, total_messages - len(retained_users)),
+        omitted_source_event_count=min(total_events, omitted_events),
+        omitted_through_sequence=max(0, retained_from - 1),
+        retained_from_sequence=retained_from,
+    )
+
+    for item in sorted(
+        items,
+        key=lambda candidate: len(str(candidate.get("text", "")).encode()),
+        reverse=True,
+    ):
+        if _transcript_size(projection) <= limits.max_response_bytes:
+            break
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        low = 0
+        high = len(text.encode())
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = _utf8_prefix(text, middle)
+            item["text"] = candidate
+            item["text_truncated"] = True
+            if _transcript_size(projection) <= limits.max_response_bytes:
+                low = middle
+            else:
+                high = middle - 1
+        item["text"] = _utf8_prefix(text, low)
+        item["text_truncated"] = True
+
+    if _transcript_size(projection) > limits.max_response_bytes:
+        raise ApiError(
+            503,
+            "TRANSCRIPT_PROJECTION_UNAVAILABLE",
+            "the transcript control envelope exceeds its response limit",
+        )
+
+
+def _transcript_projection(
+    con,
+    conversation_id: str,
+    *,
+    owner_user_id: int,
+    limits: TranscriptLimits = DEFAULT_TRANSCRIPT_LIMITS,
+) -> dict:
+    if con.in_transaction:
+        raise RuntimeError("transcript projection requires a fresh read view")
+
+    con.execute("BEGIN")
+    try:
+        conversation = _require_conversation(
+            con,
+            conversation_id,
+            owner_user_id,
+        )
+        through_sequence = int(
+            con.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM conversation_events "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        )
+        message_rows = con.execute(
+            "WITH ranked AS ("
+            " SELECT message_id,body,state,created_at,completed_at,"
+            "ROW_NUMBER() OVER (ORDER BY message_id DESC) AS source_rank,"
+            "COUNT(*) OVER() AS total_messages,"
+            "SUM(length(CAST(body AS BLOB))) OVER ("
+            " ORDER BY message_id DESC ROWS UNBOUNDED PRECEDING"
+            ") AS message_source_bytes "
+            " FROM conversation_messages "
+            " WHERE conversation_id=? AND message_kind='prompt'"
+            ") SELECT * FROM ranked WHERE source_rank<=? "
+            "AND (message_source_bytes<=? OR source_rank=1) "
+            "ORDER BY message_id",
+            (
+                conversation_id,
+                limits.max_turns,
+                limits.max_source_bytes,
+            ),
+        ).fetchall()
+        total_messages = (
+            int(message_rows[0]["total_messages"]) if message_rows else 0
+        )
+        message_source_bytes = max(
+            (int(row["message_source_bytes"]) for row in message_rows),
+            default=0,
+        )
+        remaining_source_bytes = max(
+            1,
+            limits.max_source_bytes - message_source_bytes,
+        )
+        message_ids = [int(row["message_id"]) for row in message_rows]
+        marks = ",".join("?" for _ in message_ids)
+        run_where = (
+            f"r.trigger_message_id IN ({marks})"
+            if marks
+            else "0"
+        )
+        active_run_id = conversation["active_run_id"]
+        run_rows = con.execute(
+            "SELECT r.run_id,r.trigger_message_id,r.state,"
+            "r.started_at,r.ended_at,r.error_code,r.error_detail,"
+            "r.harness_session_before,r.harness_session_after,r.runner_ref,"
+            "(SELECT COUNT(*) FROM conversation_events delta_count "
+            " WHERE delta_count.run_id=r.run_id "
+            " AND delta_count.event_type='assistant.delta' "
+            " AND delta_count.sequence<=?) AS assistant_delta_count "
+            "FROM conversation_runs r WHERE r.conversation_id=? AND ("
+            + run_where
+            + (" OR r.run_id=?" if active_run_id is not None else "")
+            + ") ORDER BY r.run_id",
+            (
+                through_sequence,
+                conversation_id,
+                *message_ids,
+                *((int(active_run_id),) if active_run_id is not None else ()),
+            ),
+        ).fetchall()
+        event_rows = con.execute(
+            "WITH ranked AS ("
+            " SELECT sequence,event_type,payload_version,payload,message_id,"
+            "run_id,created_at,"
+            "ROW_NUMBER() OVER (ORDER BY sequence DESC) AS source_rank,"
+            "COUNT(*) OVER () AS total_events,"
+            "SUM(length(CAST(payload AS BLOB))) OVER ("
+            " ORDER BY sequence DESC ROWS UNBOUNDED PRECEDING"
+            ") AS source_bytes,"
+            "COUNT(*) OVER ("
+            " ORDER BY sequence ROWS BETWEEN UNBOUNDED PRECEDING "
+            " AND 1 PRECEDING"
+            ") AS older_count,"
+            "LAG(sequence) OVER (ORDER BY sequence) AS prior_sequence "
+            " FROM conversation_events "
+            " WHERE conversation_id=? AND sequence<=?"
+            ") SELECT * FROM ranked "
+            "WHERE source_rank<=? "
+            "AND (source_bytes<=? OR source_rank=1) "
+            "ORDER BY sequence",
+            (
+                conversation_id,
+                through_sequence,
+                limits.max_source_events,
+                remaining_source_bytes,
+            ),
+        ).fetchall()
+
+        total_events = (
+            int(event_rows[0]["total_events"]) if event_rows else 0
+        )
+        secrets = tuple(sorted({
+            value
+            for value in (
+                conversation["harness_session_ref"],
+                *(
+                    candidate
+                    for row in run_rows
+                    for candidate in (
+                        row["harness_session_before"],
+                        row["harness_session_after"],
+                        row["runner_ref"],
+                    )
+                ),
+            )
+            if isinstance(value, str) and value
+        }, key=len, reverse=True))
+
+        warnings = []
+        events = []
+        for row in event_rows:
+            sequence = int(row["sequence"])
+            if int(row["payload_version"]) != 1:
+                if len(warnings) < TRANSCRIPT_MAX_WARNINGS:
+                    warnings.append({
+                        "sequence": sequence,
+                        "code": "UNSUPPORTED_PAYLOAD_VERSION",
+                    })
+                continue
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                payload = None
+            if not isinstance(payload, dict):
+                if len(warnings) < TRANSCRIPT_MAX_WARNINGS:
+                    warnings.append({
+                        "sequence": sequence,
+                        "code": "MALFORMED_EVENT_PAYLOAD",
+                    })
+                continue
+            if (
+                row["event_type"] == "assistant.delta"
+                and not isinstance(payload.get("text"), str)
+            ):
+                if len(warnings) < TRANSCRIPT_MAX_WARNINGS:
+                    warnings.append({
+                        "sequence": sequence,
+                        "code": "MALFORMED_EVENT_PAYLOAD",
+                    })
+                continue
+            events.append({
+                "sequence": sequence,
+                "event_type": row["event_type"],
+                "payload": _redact_event_value(payload, secrets),
+                "message_id": row["message_id"],
+                "run_id": row["run_id"],
+                "created_at": row["created_at"],
+            })
+
+        accepted_sequence = {
+            int(event["message_id"]): event["sequence"]
+            for event in events
+            if event["event_type"] == "message.accepted"
+            and event["message_id"] is not None
+        }
+        deltas_by_run: dict[int, list[dict]] = {}
+        activities = []
+        activity_types = {
+            "permission.requested",
+            "input.requested",
+            "run.failed",
+            "run.interrupted",
+            "run.unknown",
+        }
+        for event in events:
+            if event["event_type"] == "assistant.delta" and event["run_id"] is not None:
+                deltas_by_run.setdefault(int(event["run_id"]), []).append(event)
+            elif event["event_type"] in activity_types:
+                activities.append(event)
+
+        run_by_message: dict[int, list] = {}
+        for row in run_rows:
+            run_by_message.setdefault(
+                int(row["trigger_message_id"]),
+                [],
+            ).append(row)
+
+        items = []
+        retained_messages = set()
+        for message in message_rows:
+            message_id = int(message["message_id"])
+            order_sequence = accepted_sequence.get(message_id)
+            message_runs = run_by_message.get(message_id, [])
+            loaded_complete = all(
+                len(deltas_by_run.get(int(run["run_id"]), []))
+                == int(run["assistant_delta_count"])
+                for run in message_runs
+            )
+            non_terminal = any(
+                run["state"] in ("leased", "starting", "running")
+                for run in message_runs
+            )
+            if order_sequence is None or (not loaded_complete and not non_terminal):
+                continue
+            retained_messages.add(message_id)
+            items.append({
+                "item_id": f"message:{message_id}",
+                "kind": "user",
+                "order_sequence": order_sequence,
+                "message_id": message_id,
+                "run_id": None,
+                "created_at": message["created_at"],
+                "text": message["body"],
+                "state": message["state"],
+                "completed_at": message["completed_at"],
+                "text_truncated": False,
+            })
+            for run in message_runs:
+                run_id = int(run["run_id"])
+                deltas = deltas_by_run.get(run_id, [])
+                if not deltas:
+                    continue
+                items.append({
+                    "item_id": f"run:{run_id}:assistant",
+                    "kind": "assistant",
+                    "order_sequence": deltas[0]["sequence"],
+                    "message_id": message_id,
+                    "run_id": run_id,
+                    "created_at": deltas[0]["created_at"],
+                    "text": "".join(delta["payload"]["text"] for delta in deltas),
+                    "outcome": run["state"],
+                    "first_sequence": deltas[0]["sequence"],
+                    "last_sequence": deltas[-1]["sequence"],
+                    "text_truncated": False,
+                })
+
+        for event in activities:
+            message_id = (
+                int(event["message_id"])
+                if event["message_id"] is not None
+                else None
+            )
+            if message_id is not None and message_id not in retained_messages:
+                continue
+            items.append({
+                "item_id": f"event:{event['sequence']}",
+                "kind": "activity",
+                "order_sequence": event["sequence"],
+                "message_id": message_id,
+                "run_id": (
+                    int(event["run_id"])
+                    if event["run_id"] is not None
+                    else None
+                ),
+                "created_at": event["created_at"],
+                "activity_type": event["event_type"],
+                "label": _transcript_activity_label(
+                    event["event_type"],
+                    event["payload"],
+                ),
+                "sequence": event["sequence"],
+            })
+        items.sort(key=lambda item: (item["order_sequence"], item["item_id"]))
+
+        message_source_limited = (
+            len(message_rows) < min(total_messages, limits.max_turns)
+        )
+        source_reason = "source_byte_limit" if message_source_limited else None
+        if len(event_rows) < total_events:
+            if len(event_rows) < min(total_events, limits.max_source_events):
+                source_reason = "source_byte_limit"
+            elif source_reason is None:
+                source_reason = "source_event_limit"
+        turn_limited = total_messages > len(message_rows)
+        reason = source_reason or ("turn_limit" if turn_limited else None)
+        retained_from = min(
+            (int(item["order_sequence"]) for item in items),
+            default=through_sequence,
+        )
+        earliest_source = event_rows[0] if event_rows else None
+        omitted_rows = [
+            row for row in event_rows
+            if int(row["sequence"]) < retained_from
+        ]
+        source_omitted = 0
+        omitted_through = 0
+        if earliest_source is not None and reason:
+            source_omitted = (
+                int(earliest_source["older_count"]) + len(omitted_rows)
+            )
+            omitted_through = max(
+                int(earliest_source["prior_sequence"] or 0),
+                max(
+                    (int(row["sequence"]) for row in omitted_rows),
+                    default=0,
+                ),
+            )
+        projection = {
+            "conversation_id": conversation_id,
+            "projection_version": TRANSCRIPT_PROJECTION_VERSION,
+            "through_sequence": through_sequence,
+            "controls": {
+                "conversation_version": int(conversation["version"]),
+                "conversation_state": conversation["state"],
+                "queued_count": int(conversation["queued_count"]),
+                "active_run_id": (
+                    int(active_run_id) if active_run_id is not None else None
+                ),
+                "close_requested_at": conversation["close_requested_at"],
+            },
+            "items": items,
+            "truncation": (
+                _transcript_truncation(
+                    reason=reason,
+                    omitted_message_count=max(
+                        0, total_messages - len(retained_messages)
+                    ),
+                    omitted_source_event_count=source_omitted,
+                    omitted_through_sequence=omitted_through,
+                    retained_from_sequence=retained_from,
+                )
+                if reason
+                else None
+            ),
+        }
+        if warnings:
+            projection["warnings"] = warnings
+        _bound_transcript_response(
+            projection,
+            limits=limits,
+            total_messages=total_messages,
+            total_events=total_events,
+        )
+        return projection
+    finally:
+        con.rollback()
+
+
 def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
     headers = _parse_headers(headers_raw)
     if not _host_ok(headers):
@@ -1247,7 +1831,7 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
             "conversation API serves 127.0.0.1/localhost only",
         )
     parsed = urlparse(path)
-    query = parse_qs(parsed.query)
+    query = parse_qs(parsed.query, keep_blank_values=True)
     con = _db()
     try:
         try:
@@ -1287,6 +1871,16 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                     return _create_message(
                         con, operator, conversation_id, headers, body
                     )
+            transcript = _TRANSCRIPT_PATH.fullmatch(parsed.path)
+            if transcript and method == "GET":
+                return _json(
+                    200,
+                    _transcript_projection(
+                        con,
+                        transcript.group(1),
+                        owner_user_id=operator["user_id"],
+                    ),
+                )
             interruptions = _INTERRUPTIONS_PATH.fullmatch(parsed.path)
             if interruptions and method == "POST":
                 return _interrupt(con, operator, interruptions.group(1), headers, body)
@@ -1390,22 +1984,21 @@ def _after_sequence(query, headers) -> int:
     cursor = query.get("cursor", [None])[0]
     last_event = headers.get("Last-Event-ID")
     raw_after = query.get("after", [None])[0]
-    supplied = sum(value not in (None, "") for value in (cursor, last_event, raw_after))
-    if supplied > 1:
+    if cursor not in (None, "") and raw_after not in (None, ""):
         raise ApiError(
             422,
             "CURSOR_INVALID",
-            "supply only one of cursor, after, or Last-Event-ID",
+            "cursor and after are mutually exclusive",
         )
     if cursor:
         decoded = _cursor_decode(cursor, "event")
         after = _integer(decoded.get("sequence"), "event sequence")
-    elif last_event:
-        after = _integer(last_event, "Last-Event-ID")
     elif raw_after:
         after = _integer(raw_after, "after")
     else:
         after = 0
+    if last_event not in (None, ""):
+        after = max(after, _integer(last_event, "Last-Event-ID"))
     if after < 0:
         raise ApiError(422, "CURSOR_INVALID", "event sequence cannot be negative")
     return after
@@ -1414,6 +2007,7 @@ def _after_sequence(query, headers) -> int:
 def _event_batch(conversation_id: str, after: int) -> list[dict]:
     con = _db()
     try:
+        con.execute("BEGIN")
         secret_values = [
             row[0]
             for row in con.execute(
@@ -1439,6 +2033,8 @@ def _event_batch(conversation_id: str, after: int) -> list[dict]:
         ).fetchall()
         return [_event_projection(row, secrets) for row in rows]
     finally:
+        if con.in_transaction:
+            con.rollback()
         con.close()
 
 

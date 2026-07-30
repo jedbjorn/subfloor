@@ -139,6 +139,117 @@ class ConversationApiCase(unittest.TestCase):
         self.assertEqual(status, 201, obj)
         return obj
 
+    def seed_conversation(
+        self,
+        con: sqlite3.Connection,
+        *,
+        number: int,
+        shell_id: int = 1,
+        owner_user_id: int = 1,
+        state: str = "closed",
+        starred: bool = False,
+        activity: str | None = None,
+    ) -> str:
+        conversation_id = f"cv_{number:032x}"
+        timestamp = activity or f"2026-07-30 12:{number % 60:02d}:00"
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,owner_user_id,harness,effort,"
+            "worktree,state,title,starred,creation_idempotency_key,"
+            "creation_request_hash,created_at,last_activity_at,closed_at) "
+            "VALUES (?,?,'normal',?,'codex','high',?,?,?,?,?,?,?, ?,?)",
+            (
+                conversation_id,
+                shell_id,
+                owner_user_id,
+                str(self.root / ".sc-worktrees" / "dev"),
+                state,
+                f"Fixture {number}",
+                int(starred),
+                f"fixture-{number}",
+                f"hash-{number}",
+                timestamp,
+                timestamp,
+                timestamp if state == "closed" else None,
+            ),
+        )
+        return conversation_id
+
+    def seed_transcript(
+        self,
+        con: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        turns: int = 1,
+        deltas_per_turn: int = 4000,
+        delta_text: str = "x",
+    ) -> tuple[list[int], int]:
+        sequence = 0
+        message_ids: list[int] = []
+        for turn in range(turns):
+            body = f"prompt {turn}"
+            cursor = con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state,completed_at) "
+                "VALUES (?,'user','operator','prompt',?,?,?,'completed',datetime('now'))",
+                (conversation_id, body, f"prompt-{turn}", f"hash-{turn}"),
+            )
+            message_id = int(cursor.lastrowid)
+            message_ids.append(message_id)
+            run = con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,lease_owner,"
+                "lease_expires_at,state,started_at,ended_at) "
+                "VALUES (?,1,?,'fixture','2026-07-30 13:00:00','succeeded',"
+                "'2026-07-30 12:00:00','2026-07-30 12:01:00')",
+                (conversation_id, message_id),
+            )
+            run_id = int(run.lastrowid)
+            sequence += 1
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'message.accepted',?, ?,NULL)",
+                (
+                    conversation_id,
+                    sequence,
+                    json.dumps({"text": body}),
+                    message_id,
+                ),
+            )
+            sequence += 1
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'run.started','{}',?,?)",
+                (conversation_id, sequence, message_id, run_id),
+            )
+            con.executemany(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'assistant.delta',?,?,?)",
+                (
+                    (
+                        conversation_id,
+                        sequence + offset,
+                        json.dumps({"text": delta_text}),
+                        message_id,
+                        run_id,
+                    )
+                    for offset in range(1, deltas_per_turn + 1)
+                ),
+            )
+            sequence += deltas_per_turn
+            sequence += 1
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'run.completed','{}',?,?)",
+                (conversation_id, sequence, message_id, run_id),
+            )
+        return message_ids, sequence
+
     def test_creation_observation_is_post_commit_and_cannot_fail_create(self):
         def observer(db_path, conversation_id):
             probe = sqlite3.connect(db_path, timeout=0.1)
@@ -1082,6 +1193,477 @@ class ConversationResourceTest(ConversationApiCase):
         ).fetchone()
         con.close()
         self.assertEqual(event["event_type"], "run.interrupt.requested")
+
+
+class ConversationPerformanceFixtureTest(ConversationApiCase):
+    def test_filtered_history_pages_bind_scope_and_exclude_other_owners(self) -> None:
+        with closing(self.connect()) as con:
+            recent = [
+                self.seed_conversation(
+                    con,
+                    number=number,
+                    activity=f"2026-07-30 14:{number:02d}:00",
+                )
+                for number in range(25)
+            ]
+            starred = [
+                self.seed_conversation(
+                    con,
+                    number=100 + number,
+                    starred=True,
+                    activity=f"2026-07-29 09:{number:02d}:00",
+                )
+                for number in range(3)
+            ]
+            other_owner = self.seed_conversation(
+                con,
+                number=999,
+                owner_user_id=2,
+                starred=True,
+                activity="2026-07-31 23:59:00",
+            )
+            con.commit()
+
+        status, _, first = self.request(
+            "GET",
+            "/api/conversations?shell_id=1&starred=false&limit=20",
+        )
+        self.assertEqual(status, 200, first)
+        self.assertEqual(len(first["items"]), 20)
+        self.assertEqual(
+            [item["conversation_id"] for item in first["items"]],
+            list(reversed(recent[5:])),
+        )
+        self.assertTrue(all(not item["starred"] for item in first["items"]))
+        self.assertIsInstance(first["next_cursor"], str)
+        self.assertGreater(len(first["next_cursor"]), 10)
+        self.assertNotIn(other_owner, {
+            item["conversation_id"] for item in first["items"]
+        })
+
+        with closing(self.connect()) as con:
+            con.execute(
+                "UPDATE conversations SET starred=1 WHERE conversation_id=?",
+                (recent[4],),
+            )
+            con.commit()
+        status, _, second = self.request(
+            "GET",
+            "/api/conversations?shell_id=1&starred=false&limit=20"
+            f"&cursor={first['next_cursor']}",
+        )
+        self.assertEqual(status, 200, second)
+        self.assertEqual(
+            [item["conversation_id"] for item in second["items"]],
+            list(reversed(recent[:4])),
+        )
+        self.assertIsNone(second["next_cursor"])
+
+        status, _, pinned = self.request(
+            "GET",
+            "/api/conversations?shell_id=1&starred=true&limit=2",
+        )
+        self.assertEqual(status, 200, pinned)
+        self.assertEqual(
+            [item["conversation_id"] for item in pinned["items"]],
+            [recent[4], starred[2]],
+        )
+        self.assertEqual(len(pinned["items"]), 2)
+        self.assertTrue(all(item["starred"] for item in pinned["items"]))
+        self.assertIsInstance(pinned["next_cursor"], str)
+        self.assertGreater(len(pinned["next_cursor"]), 10)
+
+        status, _, wrong_scope = self.request(
+            "GET",
+            "/api/conversations?shell_id=1&starred=true&limit=20"
+            f"&cursor={first['next_cursor']}",
+        )
+        self.assertEqual(status, 422, wrong_scope)
+        self.assertEqual(wrong_scope["error"]["code"], "CURSOR_INVALID")
+
+    def test_history_boolean_validation_and_open_state_compatibility(self) -> None:
+        with closing(self.connect()) as con:
+            idle_id = self.seed_conversation(
+                con,
+                number=1,
+                state="idle",
+                activity="2026-07-30 12:02:00",
+            )
+            closed_id = self.seed_conversation(
+                con,
+                number=2,
+                state="closed",
+                activity="2026-07-30 12:01:00",
+            )
+            con.commit()
+
+        for query in (
+            "starred=TRUE",
+            "starred=1",
+            "starred=",
+            "starred=true&starred=false",
+            "open=yes",
+            "open=true&open=true",
+        ):
+            with self.subTest(query=query):
+                status, _, error = self.request(
+                    "GET", f"/api/conversations?{query}"
+                )
+                self.assertEqual(status, 422, error)
+                self.assertEqual(error["error"]["code"], "VALIDATION_ERROR")
+
+        status, _, open_page = self.request(
+            "GET", "/api/conversations?open=true&state=idle"
+        )
+        self.assertEqual(status, 200, open_page)
+        self.assertEqual(
+            [item["conversation_id"] for item in open_page["items"]],
+            [idle_id],
+        )
+        status, _, closed_page = self.request(
+            "GET", "/api/conversations?open=false&state=closed"
+        )
+        self.assertEqual(status, 200, closed_page)
+        self.assertEqual(
+            [item["conversation_id"] for item in closed_page["items"]],
+            [closed_id],
+        )
+        for query in ("open=true&state=closed", "open=false&state=running"):
+            with self.subTest(query=query):
+                status, _, error = self.request(
+                    "GET", f"/api/conversations?{query}"
+                )
+                self.assertEqual(status, 422, error)
+                self.assertEqual(error["error"]["code"], "VALIDATION_ERROR")
+
+    def test_filtered_history_uses_the_existing_shell_activity_index(self) -> None:
+        with closing(self.connect()) as con:
+            for number in range(60):
+                self.seed_conversation(
+                    con,
+                    number=number,
+                    starred=number % 9 == 0,
+                    activity=f"2026-07-{1 + number % 28:02d} 12:00:00",
+                )
+            con.commit()
+            details = [
+                str(row["detail"])
+                for row in con.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT c.conversation_id FROM conversations c "
+                    "WHERE c.mode='normal' AND c.owner_user_id=? "
+                    "AND c.shell_id=? AND c.starred=? "
+                    "ORDER BY c.last_activity_at DESC,c.conversation_id DESC "
+                    "LIMIT ?",
+                    (1, 1, 0, 21),
+                ).fetchall()
+            ]
+
+        self.assertTrue(any(
+            "idx_conversations_shell_activity" in detail
+            for detail in details
+        ), details)
+        self.assertFalse(any(
+            "USE TEMP B-TREE" in detail or detail.startswith("SCAN c")
+            for detail in details
+        ), details)
+
+    def test_large_transcript_fixture_materializes_deltas_at_one_watermark(
+        self,
+    ) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=700,
+                state="closed",
+            )
+            message_ids, through_sequence = self.seed_transcript(
+                con,
+                conversation_id=conversation_id,
+            )
+            source_rows = con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+            con.commit()
+
+        status, headers, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(status, 200, transcript)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(transcript["conversation_id"], conversation_id)
+        self.assertEqual(transcript["projection_version"], 1)
+        self.assertEqual(transcript["through_sequence"], through_sequence)
+        self.assertEqual(transcript["truncation"], None)
+        self.assertEqual(
+            [
+                (
+                    item["item_id"],
+                    item["kind"],
+                    item["message_id"],
+                    item["run_id"],
+                )
+                for item in transcript["items"]
+            ],
+            [
+                (f"message:{message_ids[0]}", "user", message_ids[0], None),
+                (
+                    f"run:{transcript['items'][1]['run_id']}:assistant",
+                    "assistant",
+                    message_ids[0],
+                    transcript["items"][1]["run_id"],
+                ),
+            ],
+        )
+        self.assertEqual(transcript["items"][1]["text"], "x" * 4000)
+        self.assertEqual(source_rows, 4003)
+        self.assertNotIn("assistant.delta", json.dumps(transcript))
+
+        with closing(self.connect()) as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_events "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                source_rows,
+            )
+
+    def test_transcript_caps_are_injected_explicit_and_never_mutate_sources(
+        self,
+    ) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=701,
+                state="closed",
+            )
+            self.seed_transcript(
+                con,
+                conversation_id=conversation_id,
+                turns=3,
+                deltas_per_turn=12,
+                delta_text="é" * 20,
+            )
+            source_rows = con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+            con.commit()
+
+            cases = (
+                (
+                    "turn_limit",
+                    conversation_routes.TranscriptLimits(
+                        max_turns=1,
+                        max_source_events=1000,
+                        max_source_bytes=1_000_000,
+                        max_response_bytes=1_000_000,
+                    ),
+                ),
+                (
+                    "source_event_limit",
+                    conversation_routes.TranscriptLimits(
+                        max_turns=200,
+                        max_source_events=10,
+                        max_source_bytes=1_000_000,
+                        max_response_bytes=1_000_000,
+                    ),
+                ),
+                (
+                    "source_byte_limit",
+                    conversation_routes.TranscriptLimits(
+                        max_turns=200,
+                        max_source_events=1000,
+                        max_source_bytes=400,
+                        max_response_bytes=1_000_000,
+                    ),
+                ),
+                (
+                    "response_byte_limit",
+                    conversation_routes.TranscriptLimits(
+                        max_turns=200,
+                        max_source_events=1000,
+                        max_source_bytes=1_000_000,
+                        max_response_bytes=1400,
+                    ),
+                ),
+            )
+            for reason, limits in cases:
+                with self.subTest(reason=reason):
+                    projected = conversation_routes._transcript_projection(
+                        con,
+                        conversation_id,
+                        owner_user_id=1,
+                        limits=limits,
+                    )
+                    encoded = json.dumps(
+                        projected,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode()
+                    self.assertLessEqual(len(encoded), limits.max_response_bytes)
+                    self.assertEqual(projected["truncation"]["reason"], reason)
+                    self.assertGreaterEqual(
+                        projected["truncation"]["omitted_source_event_count"],
+                        0,
+                    )
+                    self.assertNotIn("assistant.delta", encoded.decode())
+
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_events "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                source_rows,
+            )
+
+    def test_snapshot_race_replays_the_post_watermark_event_exactly_once(
+        self,
+    ) -> None:
+        with closing(self.connect()) as setup:
+            conversation_id = self.seed_conversation(
+                setup,
+                number=702,
+                state="closed",
+            )
+            _message_ids, through_sequence = self.seed_transcript(
+                setup,
+                conversation_id=conversation_id,
+                deltas_per_turn=3,
+            )
+            setup.commit()
+
+        reader = conversation_routes.db_driver.connect(str(self.db_path))
+        self.addCleanup(reader.close)
+        writer = sqlite3.connect(self.db_path)
+        writer.execute("PRAGMA foreign_keys=ON")
+        self.addCleanup(writer.close)
+        inserted = False
+
+        def insert_after_watermark(statement: str) -> None:
+            nonlocal inserted
+            if (
+                inserted
+                or not statement.startswith("WITH ranked AS")
+                or "FROM conversation_messages" not in statement
+            ):
+                return
+            inserted = True
+            writer.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload) "
+                "VALUES (?,?,'run.unknown',?)",
+                (
+                    conversation_id,
+                    through_sequence + 1,
+                    json.dumps({"detail": "committed after snapshot"}),
+                ),
+            )
+            writer.commit()
+
+        reader.set_trace_callback(insert_after_watermark)
+        projection = conversation_routes._transcript_projection(
+            reader,
+            conversation_id,
+            owner_user_id=1,
+        )
+        reader.set_trace_callback(None)
+        self.assertTrue(inserted)
+        self.assertEqual(projection["through_sequence"], through_sequence)
+        self.assertNotIn(
+            "committed after snapshot",
+            json.dumps(projection),
+        )
+
+        replay = conversation_routes._event_batch(
+            conversation_id,
+            projection["through_sequence"],
+        )
+        self.assertEqual(
+            [
+                (
+                    event["sequence"],
+                    event["event_type"],
+                    event["payload"]["detail"],
+                )
+                for event in replay
+            ],
+            [
+                (
+                    through_sequence + 1,
+                    "run.unknown",
+                    "committed after snapshot",
+                )
+            ],
+        )
+
+    def test_snapshot_projection_uses_one_fixed_five_read_view(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=703,
+                state="closed",
+            )
+            self.seed_transcript(
+                con,
+                conversation_id=conversation_id,
+                turns=2,
+                deltas_per_turn=10,
+            )
+            con.commit()
+            statements: list[str] = []
+            con.set_trace_callback(statements.append)
+            projection = conversation_routes._transcript_projection(
+                con,
+                conversation_id,
+                owner_user_id=1,
+            )
+            con.set_trace_callback(None)
+
+        reads = [
+            statement
+            for statement in statements
+            if statement.startswith(("SELECT", "WITH"))
+        ]
+        self.assertEqual(len(reads), 5, reads)
+        self.assertEqual(
+            sum(statement == "BEGIN" for statement in statements),
+            1,
+        )
+        self.assertEqual(
+            sum(statement == "ROLLBACK" for statement in statements),
+            1,
+        )
+        self.assertEqual(len(projection["items"]), 4)
+
+    def test_sse_reconnect_advances_past_the_snapshot_bootstrap(self) -> None:
+        query = {"after": ["4003"]}
+        self.assertEqual(
+            conversation_routes._after_sequence(
+                query,
+                {"Last-Event-ID": "4010"},
+            ),
+            4010,
+        )
+        self.assertEqual(
+            conversation_routes._after_sequence(
+                {"after": ["4010"]},
+                {"Last-Event-ID": "4003"},
+            ),
+            4010,
+        )
+        with self.assertRaises(conversation_routes.ApiError) as invalid:
+            conversation_routes._after_sequence(
+                {"cursor": ["opaque"], "after": ["4003"]},
+                {"Last-Event-ID": "4010"},
+            )
+        self.assertEqual(invalid.exception.code, "CURSOR_INVALID")
 
 
 class ConversationEventStreamTest(ConversationApiCase):

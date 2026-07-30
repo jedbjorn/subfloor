@@ -172,6 +172,28 @@ body.interface-view main {
 }
 .chat-history-star:disabled { cursor: default; opacity: .4; }
 .chat-history-empty { color: var(--dim); padding: 1rem .65rem; font-size: .8rem; }
+.chat-history-status {
+  color: var(--dim); padding: .7rem .65rem; font-size: .72rem;
+}
+.chat-history-status.error { color: #ef9aa1; }
+.chat-history-retry {
+  border: 0; background: transparent; color: var(--accent); cursor: pointer;
+  font: inherit; padding: 0;
+}
+.chat-history-more {
+  width: 100%; margin-top: .35rem; padding: .45rem;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: transparent; color: var(--accent); cursor: pointer;
+}
+.chat-history-more:disabled { color: var(--dim); cursor: default; }
+.chat-config-error { display: grid; gap: .7rem; justify-items: start; }
+.chat-transcript-omission, .chat-transcript-reconcile {
+  margin: .35rem 0 .75rem; padding: .55rem .7rem;
+  border: 1px solid var(--line); border-radius: 7px;
+  color: var(--dim); font-size: .75rem;
+}
+.chat-transcript-reconcile.error { color: #ef9aa1; }
+.chat-transcript-error { display: grid; gap: .7rem; align-content: start; }
 .chat-state {
   display: inline-flex; align-items: center; width: fit-content; flex: none;
   border: 1px solid var(--line); border-radius: 99px; padding: .06rem .4rem;

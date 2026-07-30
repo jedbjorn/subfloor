@@ -20,10 +20,7 @@ def test_interface_is_a_first_class_reload_safe_view():
 
 
 def test_open_chat_restore_matches_the_flat_shell_projection():
-    assert (
-        "shells.find((item) => item.shell_id === openConversation.shell.shell_id)"
-        in APP
-    )
+    assert "item.shell_id === openConversation.shell.shell_id" in APP
     assert (
         "shells.find((item) => item.shell.shell_id "
         "=== openConversation.shell.shell_id)"
@@ -76,6 +73,37 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "mdBlock(body)" in interface
 
 
+def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    keyed = interface[interface.index("function chatCreateTranscriptState"):
+                      interface.index("async function renderInterface")]
+
+    assert "snapshot.projection_version !== 1" in keyed
+    assert "items.has(item.item_id)" in keyed
+    assert "nodes: new Map()" in keyed
+    assert "dirty: new Set(items.keys())" in keyed
+    assert "transcript.replaceChildren(...nodes)" in keyed
+    assert "chatUpdateTranscriptNode(node, item, retry)" in keyed
+    assert 'node.querySelector(".chat-assistant-body")' in keyed
+    assert "body.replaceChildren(...rendered.childNodes)" in keyed
+    assert "if (transcriptState.frame !== null) return" in keyed
+    assert "transcriptState.frame = requestAnimationFrame" in keyed
+    assert 'if (currentMode !== "chat")' in keyed
+    assert "transcriptState.hiddenDirty = true" in keyed
+    assert "sequence !== transcriptState.lastSequence + 1" in keyed
+    assert "if (reconcilePromise" in keyed
+    assert "`run:${runId}:assistant`" in keyed
+    assert "assistant.text += event.payload?.text || \"\"" in keyed
+    assert "transcriptState.throughSequence" in keyed
+    assert "/events?after=${afterSequence}" in interface
+    assert "/transcript`" in keyed
+    assert "/messages?limit=100" not in interface[
+      interface.index("const loadTranscript = async"):
+      interface.index("await loadTranscript()")
+    ]
+
+
 def test_connection_status_is_attached_to_transcript_without_visible_copy():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
@@ -96,8 +124,9 @@ def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     activity = interface[
-        interface.index("function chatActivity"):
-        interface.index("function chatAssistantRuns")
+        interface.index("const activityLabel = (event) =>"):
+        interface.index("chatOpenStream(", interface.index(
+          "const activityLabel = (event) =>"))
     ]
     assert '"tool.started"' not in activity
     assert '"tool.completed"' not in activity
@@ -138,7 +167,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'className: "chat-queue-state"' in interface
     assert 'queueState.textContent = `${queued} queued`' in interface
     assert 'conversation.state !== "running"' in interface
-    assert 'event.event_type === "run.started") message.state = "running"' in interface
+    assert 'type === "run.started") message.state = "running"' in interface
     assert 'textContent: "Interrupt"' not in interface
     assert 'textContent: "Retry"' in interface
     assert 'textContent: "Close"' in interface
@@ -201,7 +230,7 @@ def test_chat_switch_refetches_authoritative_version_before_close():
                     APP.index("// ── Tabs + boot")]
     close_for_switch = interface[
         interface.index("async function chatCloseForSwitch"):
-        interface.index("function chatActivity")
+        interface.index("function chatBubble")
     ]
     assert "const latest = await chatApi(" in close_for_switch
     assert 'if (latest.state === "closed") return true' in close_for_switch
@@ -221,7 +250,7 @@ def test_conversation_identity_uses_shell_context_and_neutral_user_label():
     assert '"Untitled chat"' in interface
     assert 'className: "chat-history-context"' in interface
     assert 'className: "chat-shell-shortname"' in interface
-    assert "chatPaintShellState(button, active?.state)" in interface
+    assert "chatPaintShellState(button, openByShell.get(item.shell_id))" in interface
 
 
 def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
@@ -267,18 +296,17 @@ def test_history_metadata_and_all_shell_accents_poll_without_repainting_interfac
     assert "const shellItems = new Map()" in interface
     assert "historyItems.set(conversation.conversation_id, item)" in interface
     assert "shellItems.set(item.shell_id, button)" in interface
-    assert 'await chatApi("/conversations?limit=100")' in interface
+    assert "`/conversations?open=true&limit=100${suffix}`" in interface
     assert "generation !== chatRenderGeneration || !chatHistoryPollTimer" in interface
     assert "historyItems.get(conversation.conversation_id)" in interface
     assert "chatPaintHistoryItem(item, conversation)" in interface
     assert "item.name.textContent = chatConversationName(conversation)" in interface
     assert "chatPaintStar(item.star, Boolean(conversation.starred))" in interface
-    assert "selectedConversation = conversation" in interface
-    assert "const openByShell = new Map()" in interface
-    assert 'if (conversation.state !== "closed")' in interface
-    assert "openByShell.set(conversation.shell.shell_id" in interface
+    assert "selectedConversation = acceptSummary(conversation)" in interface
+    assert "const nextOpenByShell = new Map()" in interface
+    assert "nextOpenByShell.set(" in interface
     assert "for (const [shellId, button] of shellItems)" in interface
-    assert "chatPaintShellState(button, openByShell.get(shellId))" in interface
+    assert "chatPaintShellState(button, nextOpenByShell.get(shellId))" in interface
     assert "if (document.hidden || historyPollInFlight) return" in interface
     assert "finally { historyPollInFlight = false; }" in interface
     assert "setInterval(pollHistory, CHAT_HISTORY_POLL_MS)" in interface
@@ -287,11 +315,74 @@ def test_history_metadata_and_all_shell_accents_poll_without_repainting_interfac
     assert "renderInterface(" not in poll
 
 
+def test_interface_arrival_defers_configuration_and_phases_history_requests():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    loader = APP[APP.index("function chatLoadConfiguration"):
+                 APP.index("function chatStopStream")]
+
+    assert 'api("/models")' not in interface
+    assert 'api("/flavor-defaults")' not in interface
+    assert 'api("/flavor-defaults")' in loader
+    assert 'api("/models")' in loader
+    assert "if (chatConfiguration) return Promise.resolve(chatConfiguration)" in loader
+    assert "if (chatConfigurationPromise) return chatConfigurationPromise" in loader
+    assert "chatConfigurationPromise = null" in loader
+    assert 'chatApi("/conversations?open=true&limit=100")' in interface
+    assert "starred=false&limit=20" in interface
+    assert "starred=true&limit=100" in interface
+    assert "const recentPage = await recentRequest" in interface
+    assert "loadStars();" in interface
+    assert "await loadStars()" not in interface
+    assert 'textContent: "Retry"' in interface
+    assert "chatRenderNew(pane, shell, defaults, catalog)" in interface
+
+
+def test_history_more_and_deep_links_are_keyed_and_failure_isolated():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+
+    assert "const detailRequest = deepLinked" in interface
+    assert "chatApi(`/conversations/${chatRouteConversation}`)" in interface
+    assert "selectedConversation.shell.shortname !== chatRouteShell" in interface
+    assert "history.replaceState(" in interface
+    assert "const summaries = new Map()" in interface
+    assert "const historyItems = new Map()" in interface
+    assert "const starredIds = new Set()" in interface
+    assert "if (moreInFlight || !moreCursor) return" in interface
+    assert "const requestedCursor = moreCursor" in interface
+    assert "moreCursor = requestedCursor" in interface
+    assert 'more.textContent = "Retry"' in interface
+    assert "if (!recentIds.includes(conversation.conversation_id))" in interface
+    assert "selected ? [selected] : []" in interface
+    assert "if (starsInFlight) return" in interface
+    assert "Starred chats unavailable" in interface
+
+
+def test_history_poll_only_reconciles_open_pages_without_advancing_history():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    poll = interface[interface.index("const pollHistory = async"):
+                     interface.index(
+                       "chatHistoryPollTimer = setInterval",
+                       interface.index("const pollHistory = async"),
+                     )]
+
+    assert "`/conversations?open=true&limit=100${suffix}`" in poll
+    assert "cursor = page.next_cursor" in poll
+    assert "starred=true" not in poll
+    assert "starred=false" not in poll
+    assert "moreCursor" not in poll
+    assert "renderInterface(" not in poll
+    assert "historyItems.get(conversation.conversation_id)" in poll
+    assert "chatPaintShellState(button, nextOpenByShell.get(shellId))" in poll
+
+
 def test_history_card_has_independent_durable_star_button():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     history = interface[interface.index('const history = el("div"'):
-                        interface.index("if (!conversations.length)")]
+                        interface.index("const renderHistory =")]
 
     assert 'const card = el("div", {' in history
     assert 'className: "chat-history-open"' in history
@@ -300,7 +391,8 @@ def test_history_card_has_independent_durable_star_button():
     assert "card.append(open, star)" in history
     assert "event.stopPropagation()" in history
     assert '{ version: current.version, starred: !current.starred }' in history
-    assert "chatPaintHistoryItem(item, updated)" in history
+    assert "acceptSummary(updated)" in history
+    assert "renderHistory()" in history
     assert 'button.textContent = starred ? "★" : "☆"' in interface
     assert 'button.setAttribute("aria-pressed", String(starred))' in interface
     assert ".chat-history-star:hover, .chat-history-star.starred" in STYLE
@@ -310,8 +402,8 @@ def test_history_card_has_independent_durable_star_button():
 def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    transcript = interface[interface.index("function chatPaintTranscript"):
-                           interface.index("async function chatRefreshConversation")]
+    transcript = interface[interface.index("function chatFlushTranscript"):
+                           interface.index("async function chatRenderOpen")]
     header = interface[interface.index("async function chatRenderOpen"):
                        interface.index("async function submit()")]
     indicator_style = STYLE[STYLE.index(".chat-working-indicator {"):
@@ -320,8 +412,8 @@ def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
     assert 'indicator.append("<Working>", chatWorkingDots())' in interface
     assert 'className: "chat-working-indicator"' in interface
     assert 'role: "status"' in interface
-    assert 'if (conversation.state === "running")' in transcript
-    assert "node: chatWorkingIndicator()" in transcript
+    assert 'if (conversation.state === "running" && !working)' in transcript
+    assert "transcript.append(chatWorkingIndicator())" in transcript
     assert "chatStatePill(conversation.state)" not in transcript
     assert "header.append(title, queueState, actions)" in header
     assert "chatStatePill(conversation.state)" not in header
