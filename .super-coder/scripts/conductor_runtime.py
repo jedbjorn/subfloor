@@ -522,6 +522,13 @@ def _spawn(
         "issuer": row["issuer_flavor"],
         "kind": row["kind"],
         "payload": payload,
+        "completion_contract": (
+            f"Complete this one-shot {role} assignment by emitting exactly "
+            "one appropriate directive, then immediately send exactly one "
+            f"correlated {_required_result_kind(role)} result to the injected "
+            "SC_SPRINT_RESULT_TARGET before exit. Final assistant prose does "
+            "not satisfy the typed result."
+        ),
     }
     if role == "planner" and row["kind"] == "unit-report":
         packet["instruction"] = (

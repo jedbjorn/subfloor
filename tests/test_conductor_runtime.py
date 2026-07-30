@@ -603,6 +603,21 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                             ).fetchone()[0],
                             1,
                         )
+                        message = con.execute(
+                            "SELECT body FROM conversation_messages "
+                            "WHERE conversation_id=? "
+                            "ORDER BY message_id LIMIT 1",
+                            (assignment["conversation_id"],),
+                        ).fetchone()
+                        packet = json.loads(message["body"])
+                        self.assertIn(
+                            "emitting exactly one appropriate directive",
+                            packet["completion_contract"],
+                        )
+                        self.assertIn(
+                            "immediately send exactly one correlated",
+                            packet["completion_contract"],
+                        )
                     row = con.execute(
                         "SELECT status,refusal_reason FROM directives "
                         "WHERE directive_id=?",
