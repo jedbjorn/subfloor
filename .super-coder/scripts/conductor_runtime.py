@@ -57,6 +57,43 @@ class ConductorLaunchError(RuntimeError):
     """A role or Conductor process that refused before it could start."""
 
 
+def _operational_config() -> ConductorConfig:
+    return ConductorConfig(True, "CON1", DEFAULT_CONDUCTOR_MODEL)
+
+
+def reconcile_config(path: Path = INSTANCE_CONFIG) -> bool:
+    """Persist the default Conductor block when an instance has none.
+
+    Existing blocks are operator-owned, including an explicit opt-out.  The
+    compatibility fallback in :func:`load_config` covers the first restart
+    after an old updater materializes this code; fresh installs and subsequent
+    updates call this function so the effective default becomes explicit.
+    """
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise ConductorConfigError(
+            f"cannot enable conductor without instance config at {path}"
+        ) from exc
+    except OSError as exc:
+        raise ConductorConfigError(f"cannot read conductor config: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConductorConfigError(f"instance.json is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConductorConfigError("instance.json must contain a JSON object")
+    if "conductor" in raw:
+        return False
+    config = _operational_config()
+    raw["conductor"] = {
+        "enabled": config.enabled,
+        "shell": config.shell,
+        "model": config.model,
+    }
+    path.write_text(json.dumps(raw, indent=2) + "\n")
+    return True
+
+
 # issuer, kind, mechanical action, success condition.  The renderer and runtime
 # tests consume the same rows so the boot table cannot drift from the executor.
 TRANSITIONS = (
@@ -178,7 +215,12 @@ _launching_until = 0.0
 
 
 def load_config(path: Path = INSTANCE_CONFIG) -> ConductorConfig:
-    """Read the top-level ``conductor`` block; absent means disabled."""
+    """Read the top-level ``conductor`` block.
+
+    Installed instances that predate the block use the operational default.
+    Missing instance configuration still fails closed, while an explicit block
+    remains authoritative and can disable automatic wakes.
+    """
     try:
         raw = json.loads(Path(path).read_text())
     except FileNotFoundError:
@@ -187,6 +229,10 @@ def load_config(path: Path = INSTANCE_CONFIG) -> ConductorConfig:
         raise ConductorConfigError(f"cannot read conductor config: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ConductorConfigError(f"instance.json is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConductorConfigError("instance.json must contain a JSON object")
+    if "conductor" not in raw:
+        return _operational_config()
     block = raw.get("conductor")
     if not isinstance(block, dict):
         return ConductorConfig()

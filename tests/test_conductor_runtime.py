@@ -37,6 +37,70 @@ def build_db(path: Path) -> sqlite3.Connection:
     return con
 
 
+class ConductorConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="sc_conductor_config_")
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "instance.json"
+
+    def test_existing_instance_without_block_uses_operational_default(self):
+        self.path.write_text('{"repo":"legacy-fork","port":8800}\n')
+
+        self.assertEqual(
+            runtime.load_config(self.path),
+            runtime.ConductorConfig(
+                True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL
+            ),
+        )
+
+    def test_missing_instance_config_still_fails_closed(self):
+        self.assertEqual(
+            runtime.load_config(self.path),
+            runtime.ConductorConfig(),
+        )
+
+    def test_explicit_disabled_block_remains_disabled(self):
+        self.path.write_text(json.dumps({
+            "conductor": {
+                "enabled": False,
+                "shell": "CON2",
+                "model": "openai/custom",
+            }
+        }))
+
+        self.assertEqual(
+            runtime.load_config(self.path),
+            runtime.ConductorConfig(False, "CON2", "openai/custom"),
+        )
+
+    def test_reconcile_config_persists_default_without_clobbering(self):
+        original = {"repo": "legacy-fork", "port": 8800}
+        self.path.write_text(json.dumps(original))
+
+        self.assertTrue(runtime.reconcile_config(self.path))
+        configured = json.loads(self.path.read_text())
+        self.assertEqual(
+            configured["conductor"],
+            {
+                "enabled": True,
+                "shell": "CON1",
+                "model": runtime.DEFAULT_CONDUCTOR_MODEL,
+            },
+        )
+        self.assertEqual(
+            {key: configured[key] for key in original},
+            original,
+        )
+
+        configured["conductor"] = {"enabled": False}
+        self.path.write_text(json.dumps(configured))
+        self.assertFalse(runtime.reconcile_config(self.path))
+        self.assertEqual(
+            json.loads(self.path.read_text())["conductor"],
+            {"enabled": False},
+        )
+
+
 class RuntimeFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="sc_conductor8_")

@@ -69,6 +69,7 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import conductor_runtime  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
@@ -906,6 +907,12 @@ def main(argv: list[str]) -> int:
     print(f"  {regrant()} grant change(s)")
     print("→ reconcile singleton Conductor")
     print("  created CON1" if reconcile_conductor() else "  CON1 current")
+    print("→ reconcile Conductor config")
+    print(
+        "  enabled CON1 automatic wakes"
+        if conductor_runtime.reconcile_config()
+        else "  Conductor config current"
+    )
     print("→ wire map automation + map the repo")
     run_script("map_setup.py")
     print("→ snapshot the live state")
