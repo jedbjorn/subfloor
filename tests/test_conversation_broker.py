@@ -14,6 +14,7 @@ import unittest
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -538,6 +539,71 @@ class StoreContractTest(ConversationBrokerCase):
         con.close()
         self.assertEqual(first_state, "completed")
         self.assertEqual(sequences, [1, 2])
+
+    def test_terminal_observation_is_post_commit_and_cannot_fail_run(self) -> None:
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn(
+                "codex",
+                "native-session",
+                "native-run-observation",
+                self.worktree,
+            ),
+        )
+
+        def observer(db_path, observed_conversation_id):
+            probe = sqlite3.connect(db_path, timeout=0.1)
+            try:
+                probe.execute("BEGIN IMMEDIATE")
+                probe.rollback()
+            finally:
+                probe.close()
+            raise RuntimeError("Git unavailable")
+
+        with mock.patch(
+            "conversation_broker.conversation_git_targets.observe_and_persist",
+            side_effect=observer,
+        ) as observe:
+            self.assertTrue(
+                store.finish_run(
+                    run.run_id,
+                    "succeeded",
+                    event_type="run.completed",
+                )
+            )
+
+        observe.assert_called_once_with(
+            str(self.db_path),
+            conversation_id,
+            runner=mock.ANY,
+            connect=mock.ANY,
+            now=None,
+        )
+        con = self.connect()
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT state FROM conversation_runs WHERE run_id=?",
+                    (run.run_id,),
+                ).fetchone()[0],
+                "succeeded",
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT state FROM conversations "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0],
+                "idle",
+            )
+        finally:
+            con.close()
 
     def test_one_shot_result_closes_and_returns_exact_directive_to_conductor(
         self,

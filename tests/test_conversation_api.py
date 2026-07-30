@@ -139,6 +139,42 @@ class ConversationApiCase(unittest.TestCase):
         self.assertEqual(status, 201, obj)
         return obj
 
+    def test_creation_observation_is_post_commit_and_cannot_fail_create(self):
+        def observer(db_path, conversation_id):
+            probe = sqlite3.connect(db_path, timeout=0.1)
+            try:
+                probe.execute("BEGIN IMMEDIATE")
+                probe.rollback()
+            finally:
+                probe.close()
+            raise RuntimeError("Git unavailable")
+
+        with mock.patch.object(
+            conversation_routes.conversation_git_targets,
+            "observe_and_persist",
+            side_effect=observer,
+        ) as observe:
+            created = self.create()
+
+        observe.assert_called_once_with(
+            self.db_path,
+            created["conversation_id"],
+            runner=mock.ANY,
+            connect=mock.ANY,
+            now=None,
+        )
+        con = self.connect()
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT state FROM conversations WHERE conversation_id=?",
+                    (created["conversation_id"],),
+                ).fetchone()[0],
+                "idle",
+            )
+        finally:
+            con.close()
+
     def test_create_prepares_never_booted_worktree_on_first_turn(self):
         worktree = self.root / ".sc-worktrees" / "dev"
         worktree.rmdir()
