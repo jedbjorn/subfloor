@@ -268,6 +268,26 @@ def render_slot_directive(context: "dict | None") -> str:
         lines.append(
             f"- **Required result:** `{context['required_result_kind']}`"
         )
+        result_target = context.get("conductor_slot") or context["slot"]
+        directive_arg = (
+            ""
+            if context["required_result_kind"] == "abort-report"
+            else " --directive <directive-id>"
+        )
+        lines.extend([
+            "",
+            "Return the durable result before this one-shot exits:",
+            "",
+            "```bash",
+            (
+                f"sc mem message send {result_target} \"<bounded evidence>\" "
+                f"--kind result --sprint {context['sprint_doc_id']} "
+                f"--assignment {context['binding_id']} "
+                f"--result-kind {context['required_result_kind']}"
+                f"{directive_arg}"
+            ),
+            "```",
+        ])
     lines.extend(["", "### Kickoff context", ""])
     units = context.get("units") or []
     for unit in units:

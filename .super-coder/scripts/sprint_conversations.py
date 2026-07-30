@@ -43,6 +43,186 @@ def append_event(
     return sequence
 
 
+def enqueue_message(
+    con,
+    conversation_id: str,
+    *,
+    body: str,
+    idempotency_key: str,
+    sender_ref: str,
+    message_kind: str = "prompt",
+) -> int:
+    """Atomically append one broker-dispatched message to a live conversation."""
+    request_hash = hashlib.sha256(body.encode()).hexdigest()
+    prior = con.execute(
+        "SELECT message_id,request_hash FROM conversation_messages "
+        "WHERE conversation_id=? AND idempotency_key=?",
+        (conversation_id, idempotency_key),
+    ).fetchone()
+    if prior is not None:
+        if prior["request_hash"] != request_hash:
+            raise ValueError(
+                f"conversation message key {idempotency_key!r} was reused "
+                "with different content"
+            )
+        return int(prior["message_id"])
+    conversation = con.execute(
+        "SELECT state FROM conversations WHERE conversation_id=?",
+        (conversation_id,),
+    ).fetchone()
+    if conversation is None:
+        raise ValueError(f"conversation {conversation_id!r} does not exist")
+    if conversation["state"] == "closed":
+        raise ValueError(f"conversation {conversation_id!r} is closed")
+    message_id = int(
+        con.execute(
+            "INSERT INTO conversation_messages "
+            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+            "idempotency_key,request_hash,state) "
+            "VALUES (?,'engine',?,?,?,?,?,'queued')",
+            (
+                conversation_id,
+                sender_ref,
+                message_kind,
+                body,
+                idempotency_key,
+                request_hash,
+            ),
+        ).lastrowid
+    )
+    con.execute(
+        "INSERT INTO conversation_outbox (conversation_id,message_id) "
+        "VALUES (?,?)",
+        (conversation_id, message_id),
+    )
+    if conversation["state"] in ("idle", "waiting", "error"):
+        con.execute(
+            "UPDATE conversations SET state='queued',"
+            "last_activity_at=datetime('now'),version=version+1 "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        )
+    else:
+        con.execute(
+            "UPDATE conversations SET last_activity_at=datetime('now'),"
+            "version=version+1 WHERE conversation_id=?",
+            (conversation_id,),
+        )
+    queue_position = int(
+        con.execute(
+            "SELECT COUNT(*) FROM conversation_messages "
+            "WHERE conversation_id=? AND message_id<=? "
+            "AND state IN ('accepted','queued','running')",
+            (conversation_id, message_id),
+        ).fetchone()[0]
+    )
+    append_event(
+        con,
+        conversation_id,
+        "message.accepted",
+        {
+            "message_id": message_id,
+            "queue_state": "queued",
+            "queue_position": queue_position,
+        },
+        message_id=message_id,
+    )
+    return message_id
+
+
+def conductor_conversation(con, sprint_doc_id: int):
+    return con.execute(
+        "SELECT c.conversation_id,c.state,b.binding_id "
+        "FROM sprint_conversation_bindings b "
+        "JOIN conversations c ON c.conversation_id=b.conversation_id "
+        "WHERE b.sprint_doc_id=? AND b.role='conductor' "
+        "AND b.state<>'terminal' AND c.state<>'closed' "
+        "ORDER BY b.binding_id DESC LIMIT 1",
+        (sprint_doc_id,),
+    ).fetchone()
+
+
+def enqueue_conductor_directive(
+    con,
+    *,
+    sprint_doc_id: int,
+    directive_id: int,
+    source_kind: str,
+    evidence: dict,
+    idempotency_key: str,
+) -> str | None:
+    """Queue one committed directive/evidence packet to persistent Conductor."""
+    conductor = conductor_conversation(con, sprint_doc_id)
+    if conductor is None:
+        return None
+    body = json.dumps(
+        {
+            "sprint_doc_id": sprint_doc_id,
+            "source_kind": source_kind,
+            "directive_id": directive_id,
+            "evidence": evidence,
+            "instruction": f"Run `sc directives act {directive_id}`.",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    enqueue_message(
+        con,
+        conductor["conversation_id"],
+        body=body,
+        idempotency_key=idempotency_key,
+        sender_ref="sprint-bridge",
+    )
+    return str(conductor["conversation_id"])
+
+
+def request_conductor_close(
+    con,
+    sprint_doc_id: int,
+    *,
+    reason: str,
+) -> str | None:
+    """Request terminal close, closing an already-idle Conductor immediately."""
+    conductor = conductor_conversation(con, sprint_doc_id)
+    if conductor is None:
+        return None
+    conversation_id = str(conductor["conversation_id"])
+    exists = con.execute(
+        "SELECT 1 FROM conversation_events WHERE conversation_id=? "
+        "AND event_type='conversation.close.requested'",
+        (conversation_id,),
+    ).fetchone()
+    if exists is None:
+        append_event(
+            con,
+            conversation_id,
+            "conversation.close.requested",
+            {"reason": reason, "sprint_doc_id": sprint_doc_id},
+        )
+    state = conductor["state"]
+    if state in ("idle", "waiting", "error"):
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
+            "last_activity_at=datetime('now'),version=version+1 "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        append_event(
+            con,
+            conversation_id,
+            "conversation.closed",
+            {"state": "closed", "reason": reason},
+        )
+        con.execute(
+            "UPDATE sprint_conversation_bindings SET state='terminal',"
+            "outcome='closed',completed_at=datetime('now') "
+            "WHERE binding_id=?",
+            (conductor["binding_id"],),
+        )
+    return conversation_id
+
+
 def create_sprint_conversation(
     con,
     *,

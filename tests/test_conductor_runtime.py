@@ -154,12 +154,6 @@ class RuntimeFixture(unittest.TestCase):
             (runtime.DEFAULT_CONDUCTOR_MODEL,),
         )
         self.con.commit()
-        runtime._launching_until = 0.0
-        self.commands: list[list[str]] = []
-
-    def launcher(self, command: list[str]) -> int:
-        self.commands.append(command)
-        return 9000 + len(self.commands)
 
     def set_unit(self, state: str, *, review_head=None) -> None:
         self.con.execute(
@@ -357,84 +351,9 @@ class ConductorFlavorAndDoctorTests(RuntimeFixture):
                 run=self.model_probe("ollama-cloud/another-model"),
             )
 
-    def test_wake_is_config_gated_and_single_flight(self):
-        self.emit("dev", "unit-report", {"shipped": "x"})
-        disabled = runtime.maybe_wake(
-            self.con,
-            config=runtime.ConductorConfig(),
-            launcher=self.launcher,
-        )
-        self.assertFalse(disabled["launched"])
-
-        config = runtime.ConductorConfig(True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL)
-        with (
-            mock.patch.object(runtime, "_launch_is_live", return_value=False),
-            mock.patch.object(
-                runtime,
-                "doctor",
-                return_value={
-                    "enabled": True,
-                    "ok": True,
-                    "shell_id": 1,
-                    "shell": "CON1",
-                    "harness": "opencode",
-                    "model": runtime.DEFAULT_CONDUCTOR_MODEL,
-                },
-            ),
-        ):
-            first = runtime.maybe_wake(
-                self.con, config=config, launcher=self.launcher, now=lambda: 100.0
-            )
-            second = runtime.maybe_wake(
-                self.con, config=config, launcher=self.launcher, now=lambda: 101.0
-            )
-        self.assertTrue(first["launched"])
-        self.assertEqual(second["reason"], "launching")
-        self.assertEqual(len(self.commands), 1)
-        self.assertIn("--harness", self.commands[0])
-        self.assertIn("opencode", self.commands[0])
-        self.assertIn(runtime.DEFAULT_CONDUCTOR_MODEL, self.commands[0])
-
-    def test_declared_handoff_is_not_eligible_for_automatic_wake(self):
-        self.set_declared()
-        directive_id = self.emit("planner", "handoff", {}, unit=False)
-        self.con.commit()
-
-        config = runtime.ConductorConfig(
-            True, "CON1", runtime.DEFAULT_CONDUCTOR_MODEL
-        )
-        with mock.patch.object(
-            runtime,
-            "doctor",
-            return_value={
-                "enabled": True,
-                "ok": True,
-                "shell_id": 1,
-                "shell": "CON1",
-                "harness": "opencode",
-                "model": runtime.DEFAULT_CONDUCTOR_MODEL,
-            },
-        ):
-            result = runtime.maybe_wake(
-                self.con, config=config, launcher=self.launcher
-            )
-
-        self.assertFalse(result["launched"])
-        self.assertEqual(result["reason"], "no-pending")
-        self.assertEqual(self.commands, [])
-        self.assertEqual(
-            self.con.execute(
-                "SELECT status FROM directives WHERE directive_id=?",
-                (directive_id,),
-            ).fetchone()[0],
-            "pending",
-        )
-        self.assertEqual(
-            self.con.execute(
-                "SELECT state FROM sprints WHERE sprint_doc_id=100"
-            ).fetchone()[0],
-            "declared",
-        )
+    def test_process_wake_path_is_retired(self):
+        self.assertFalse(hasattr(runtime, "maybe_wake"))
+        self.assertFalse(hasattr(runtime, "_launch_is_live"))
 
     def test_opencode_headless_route_does_not_invent_effort(self):
         adapter = run.load_adapter("opencode")
@@ -564,6 +483,19 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ),
         ("system", "stall", "working", {"dwell_seconds": 99}, True),
         ("system", "dead-shell", "working", {"process": {"live": False}}, True),
+        (
+            "system",
+            "worker-failed",
+            "working",
+            {
+                "binding_id": 42,
+                "role": "developer",
+                "run_outcome": "unknown",
+                "assignment_outcome": "unknown",
+                "error_code": "HARNESS_OUTCOME_UNKNOWN",
+            },
+            True,
+        ),
     )
 
     def test_every_kind_and_issuer_has_one_executable_action(self):
@@ -1180,6 +1112,21 @@ class ConductorSyntheticSprintTests(RuntimeFixture):
         self.con.execute(
             "UPDATE sprint_units SET state='working' WHERE unit_id=10"
         )
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+            "state,creation_idempotency_key,creation_request_hash) "
+            "VALUES ('cv_synthetic_conductor',1,'sprint',100,'opencode',"
+            "'/tmp/conductor','idle','synthetic-conductor',"
+            "'synthetic-conductor-hash')"
+        )
+        self.con.execute(
+            "INSERT INTO sprint_conversation_bindings "
+            "(conversation_id,sprint_doc_id,role,lifecycle,slot,state,"
+            "started_at) VALUES "
+            "('cv_synthetic_conductor',100,'conductor','persistent','CON1',"
+            "'active',datetime('now'))"
+        )
         self.con.commit()
         ids = [
             self.act_one(
@@ -1236,6 +1183,15 @@ class ConductorSyntheticSprintTests(RuntimeFixture):
                 "SELECT state FROM sprints WHERE sprint_doc_id=100"
             ).fetchone()[0],
             "closed",
+        )
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT c.state,b.state,b.outcome "
+                "FROM conversations c JOIN sprint_conversation_bindings b "
+                "ON b.conversation_id=c.conversation_id "
+                "WHERE c.conversation_id='cv_synthetic_conductor'"
+            ).fetchone()),
+            ("closed", "terminal", "closed"),
         )
         self.assertEqual(
             self.con.execute(

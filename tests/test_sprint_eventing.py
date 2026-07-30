@@ -973,6 +973,126 @@ class ApiTest(unittest.TestCase):
                            "WHERE message_id=?", out["message_id"])[0]["s"],
                     scope)
 
+    def test_typed_assignment_result_records_exact_binding_and_directive(self):
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("UPDATE shells SET flavor='planner' WHERE shell_id=1")
+            con.execute(
+                "INSERT OR IGNORE INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (3,'Conductor','CON1','conductor','x',1)"
+            )
+            seed_sprint_doc(con, 180, units=0)
+            con.execute("UPDATE sprints SET state='active' WHERE sprint_doc_id=180")
+            source_id = con.execute(
+                "INSERT INTO directives "
+                "(issuer_flavor,kind,target,sprint_doc_id) "
+                "VALUES ('system','stall','conductor',180)"
+            ).lastrowid
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+                "state,creation_idempotency_key,creation_request_hash) "
+                "VALUES ('cv_result_planner',1,'sprint',180,'claude','/tmp',"
+                "'running','result-planner','result-planner-hash')"
+            )
+            binding_id = con.execute(
+                "INSERT INTO sprint_conversation_bindings "
+                "(conversation_id,sprint_doc_id,role,lifecycle,slot,"
+                "source_directive_id,required_result_kind,state,started_at) "
+                "VALUES ('cv_result_planner',180,'planner','one_shot','plan1',"
+                "?,'planner-directive','active',datetime('now'))",
+                (source_id,),
+            ).lastrowid
+            directive_id = con.execute(
+                "INSERT INTO directives "
+                "(issuer_shell_id,issuer_flavor,kind,payload,target,"
+                "sprint_doc_id) "
+                "VALUES (1,'planner','hold','{\"reason\":\"gate\"}',"
+                "'conductor',180)"
+            ).lastrowid
+            con.commit()
+        finally:
+            con.close()
+
+        result = mem._api(
+            "POST",
+            "/_sc/mem/messages",
+            {
+                "to": "CON1",
+                "body": "Planner ruling evidence",
+                "kind": "result",
+                "sprint_doc_id": 180,
+                "sprint_assignment_id": binding_id,
+                "sprint_result_kind": "planner-directive",
+                "sprint_directive_id": directive_id,
+                "dedupe_key": "typed-result-180",
+            },
+        )
+
+        row = self.q(
+            "SELECT binding_id,message_id,result_kind,directive_id "
+            "FROM sprint_assignment_results WHERE binding_id=?",
+            binding_id,
+        )[0]
+        self.assertEqual(
+            tuple(row),
+            (binding_id, result["message_id"], "planner-directive", directive_id),
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE conversations SET state='idle' "
+                "WHERE conversation_id='cv_result_planner'"
+            )
+            con.execute(
+                "UPDATE conversations SET state='closed',"
+                "closed_at=datetime('now') "
+                "WHERE conversation_id='cv_result_planner'"
+            )
+            con.execute(
+                "UPDATE sprint_conversation_bindings SET state='terminal',"
+                "outcome='succeeded',result_message_id=?,"
+                "completed_at=datetime('now') "
+                "WHERE binding_id=?",
+                (result["message_id"], binding_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+        replay = mem._api(
+            "POST",
+            "/_sc/mem/messages",
+            {
+                "to": "CON1",
+                "body": "Planner ruling evidence",
+                "kind": "result",
+                "sprint_doc_id": 180,
+                "sprint_assignment_id": binding_id,
+                "sprint_result_kind": "planner-directive",
+                "sprint_directive_id": directive_id,
+                "dedupe_key": "typed-result-180",
+            },
+        )
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(replay["message_id"], result["message_id"])
+        with self.assertRaises(SystemExit):
+            mem._api(
+                "POST",
+                "/_sc/mem/messages",
+                {
+                    "to": "CON1",
+                    "body": "different evidence",
+                    "kind": "result",
+                    "sprint_doc_id": 180,
+                    "sprint_assignment_id": binding_id,
+                    "sprint_result_kind": "planner-directive",
+                    "sprint_directive_id": directive_id,
+                    "dedupe_key": "typed-result-180",
+                },
+            )
+
     def test_messages_read_returns_kind(self):
         mem.main(["message", "send", "plan1", "report done", "--kind", "result"])
         data = mem._api("GET", "/_sc/mem/messages")

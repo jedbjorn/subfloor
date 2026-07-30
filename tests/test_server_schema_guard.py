@@ -367,6 +367,11 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                                         "backfill"))
                 enter(mock.patch.object(server.mem_credentials, "provision"))
                 enter(mock.patch.object(server.pr_poller, "Poller"))
+                enter(mock.patch.object(
+                    server.conductor_runtime,
+                    "load_config",
+                    return_value=server.conductor_runtime.ConductorConfig(),
+                ))
                 broker_start = enter(mock.patch.object(
                     server.conversation_broker, "start_service"
                 ))

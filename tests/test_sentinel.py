@@ -143,8 +143,8 @@ class SentinelCycleTests(unittest.TestCase):
             0,
         )
 
-    def test_dead_launch_is_immediate_and_deduped_before_dwell(self):
-        unit_id = seed_floor(self.con)
+    def test_launch_record_and_pid_verdict_are_not_sprint_liveness(self):
+        seed_floor(self.con)
         self.con.execute(
             "INSERT INTO shell_launch_records "
             "(shell_id,pid,start_ticks,worktree,harness,launched_at) "
@@ -152,28 +152,17 @@ class SentinelCycleTests(unittest.TestCase):
         )
         self.con.commit()
 
-        first = self.run_cycle(
+        result = self.run_cycle(
             now="2026-01-01T00:02:00Z", liveness=lambda claim: False
         )
-        second = self.run_cycle(
-            now="2026-01-01T00:03:00Z", liveness=lambda claim: False
-        )
 
-        self.assertEqual(first["dead_shells"], 1)
-        self.assertEqual(first["stalls"], 0)
-        self.assertEqual(second["dead_shells"], 0)
-        directive = self.con.execute(
-            "SELECT * FROM directives WHERE kind='dead-shell'"
-        ).fetchone()
-        self.assertEqual(directive["issuer_flavor"], "system")
-        self.assertEqual(directive["target"], "conductor")
-        self.assertEqual(directive["unit_id"], unit_id)
-        event = self.con.execute(
-            "SELECT directive_id,evidence FROM sentinel_events "
-            "WHERE event_kind='dead-shell'"
-        ).fetchone()
-        self.assertEqual(event["directive_id"], directive["directive_id"])
-        self.assertEqual(json.loads(event["evidence"])["process"]["pid"], 4242)
+        self.assertEqual(result["dead_shells"], 0)
+        self.assertEqual(result["stalls"], 0)
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM directives WHERE kind='dead-shell'"
+            ).fetchone()
+        )
 
     def test_indeterminate_launch_verdict_never_becomes_dead(self):
         seed_floor(self.con)
@@ -193,6 +182,94 @@ class SentinelCycleTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    def test_run_events_drive_dwell_and_stall_wakes_persistent_conductor(self):
+        unit_id = seed_floor(self.con)
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Conductor','CON1','conductor','x',1)"
+        )
+        self.con.execute(
+            "INSERT INTO directives "
+            "(issuer_flavor,kind,target,sprint_doc_id,unit_id) "
+            "VALUES ('system','stall','conductor',100,?)",
+            (unit_id,),
+        )
+        source_id = int(self.con.execute(
+            "SELECT MAX(directive_id) FROM directives"
+        ).fetchone()[0])
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+            "state,creation_idempotency_key,creation_request_hash) "
+            "VALUES ('cv_sentinel_cond',4,'sprint',100,'opencode','/tmp/cond',"
+            "'idle','sentinel-cond','sentinel-cond-hash')"
+        )
+        self.con.execute(
+            "INSERT INTO sprint_conversation_bindings "
+            "(conversation_id,sprint_doc_id,role,lifecycle,slot,state,"
+            "started_at) VALUES "
+            "('cv_sentinel_cond',100,'conductor','persistent','CON1','active',"
+            "'2026-01-01T00:00:00Z')"
+        )
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+            "state,creation_idempotency_key,creation_request_hash) "
+            "VALUES ('cv_sentinel_dev',2,'sprint',100,'codex','/tmp/dev1',"
+            "'running','sentinel-dev','sentinel-dev-hash')"
+        )
+        binding_id = self.con.execute(
+            "INSERT INTO sprint_conversation_bindings "
+            "(conversation_id,sprint_doc_id,role,lifecycle,slot,unit_id,"
+            "source_directive_id,required_result_kind,state,started_at) "
+            "VALUES ('cv_sentinel_dev',100,'developer','one_shot','dev1',?,"
+            "?,'unit-report','active','2026-01-01T00:00:00Z')",
+            (unit_id, source_id),
+        ).lastrowid
+        message_id = self.con.execute(
+            "INSERT INTO conversation_messages "
+            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+            "idempotency_key,request_hash,state) "
+            "VALUES ('cv_sentinel_dev','engine','sprint','prompt','work',"
+            "'sentinel-work','sentinel-work-hash','running')"
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO conversation_runs "
+            "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+            "lease_expires_at,started_at,heartbeat_at) "
+            "VALUES ('cv_sentinel_dev',2,?,'running','broker',"
+            "'2026-01-01T03:10:00Z','2026-01-01T00:00:00Z',"
+            "'2026-01-01T02:59:00Z')",
+            (message_id,),
+        )
+        self.con.commit()
+
+        recent = self.run_cycle(now="2026-01-01T03:00:00Z")
+        self.assertEqual(recent["stalls"], 0)
+        beat = self.con.execute(
+            "SELECT evidence FROM sentinel_events "
+            "WHERE event_kind='activity-beat' ORDER BY event_id DESC LIMIT 1"
+        ).fetchone()
+        conversation = json.loads(beat["evidence"])["conversation"]
+        self.assertEqual(conversation["binding_id"], binding_id)
+        self.assertEqual(conversation["run_state"], "running")
+        self.assertNotIn("process", json.loads(beat["evidence"]))
+
+        self.con.execute(
+            "UPDATE conversation_runs SET heartbeat_at='2026-01-01T00:00:00Z'"
+        )
+        self.con.commit()
+        stalled = self.run_cycle(now="2026-01-01T03:00:01Z")
+
+        self.assertEqual(stalled["stalls"], 1)
+        queued = self.con.execute(
+            "SELECT body FROM conversation_messages "
+            "WHERE conversation_id='cv_sentinel_cond' "
+            "ORDER BY message_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(json.loads(queued["body"])["source_kind"], "sentinel:stall")
 
     def test_disk_activity_emits_a_beat_and_resets_dwell(self):
         seed_floor(self.con)

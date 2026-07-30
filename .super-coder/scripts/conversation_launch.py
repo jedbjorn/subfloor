@@ -103,6 +103,10 @@ class ConversationLaunchPreparer:
                 "b.binding_id,b.sprint_doc_id,b.role,b.lifecycle,b.slot,"
                 "b.unit_id,b.source_directive_id,b.source_message_id,"
                 "b.required_result_kind,b.state AS binding_state,"
+                "(SELECT cb.slot FROM sprint_conversation_bindings cb "
+                " WHERE cb.sprint_doc_id=b.sprint_doc_id "
+                " AND cb.role='conductor' AND cb.state<>'terminal' "
+                " ORDER BY cb.binding_id DESC LIMIT 1) AS conductor_slot,"
                 "sp.state AS sprint_state,sp.spec_doc_id,sp.planner_shell_id,"
                 "sp.planner_route,"
                 "sp.dev_route,sp.reviewer_route,"
@@ -273,6 +277,7 @@ class ConversationLaunchPreparer:
             "source_directive_id": row["source_directive_id"],
             "source_message_id": row["source_message_id"],
             "required_result_kind": row["required_result_kind"],
+            "conductor_slot": row["conductor_slot"],
             "units": [unit] if unit is not None else [],
         }
 

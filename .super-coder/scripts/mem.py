@@ -62,6 +62,7 @@ Run from the repo root, like every engine command:
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--sprint DOC_ID]
+                            [--assignment ID --result-kind KIND --directive ID]
     ./sc mem message sent                              # outbound view — verify delivery
     ./sc mem message mark-read <message_id>            # (pr_event rows are daemon-emitted)
 
@@ -892,12 +893,46 @@ def cmd_message(args) -> int:
     if args.message_cmd == "send":
         if not args.body.strip():
             die("body is empty")
+        sprint_doc_id = args.sprint
+        assignment_id = args.assignment
+        result_kind = args.result_kind
+        directive_id = args.directive
+        if args.kind == "result":
+            if assignment_id is None and os.environ.get(
+                "SC_SPRINT_ASSIGNMENT_ID"
+            ):
+                assignment_id = int(os.environ["SC_SPRINT_ASSIGNMENT_ID"])
+            if result_kind is None:
+                result_kind = os.environ.get("SC_SPRINT_REQUIRED_RESULT_KIND")
+            if sprint_doc_id is None and os.environ.get("SC_SPRINT_REF"):
+                sprint_doc_id = int(os.environ["SC_SPRINT_REF"])
+            if assignment_id is not None:
+                if not result_kind:
+                    die(
+                        "a Sprint assignment result needs --result-kind "
+                        "(browser one-shots receive it automatically)"
+                    )
+                if directive_id is None and result_kind != "abort-report":
+                    die(
+                        "a Sprint assignment result needs --directive <id>; "
+                        "final assistant text is evidence, not a board transition"
+                    )
+        elif any(
+            value is not None
+            for value in (assignment_id, result_kind, directive_id)
+        ):
+            die(
+                "--assignment/--result-kind/--directive require --kind result"
+            )
         # dedupe_key makes the send idempotent (#333): the server returns the
         # original row for a repeat key, so _api may safely retry an ambiguous
         # timeout — the failure mode that used to duplicate messages fleet-wide.
         r = _api("POST", "/_sc/mem/messages",
                  {"to": args.to, "body": args.body, "kind": args.kind,
-                  "sprint_doc_id": args.sprint,
+                  "sprint_doc_id": sprint_doc_id,
+                  "sprint_assignment_id": assignment_id,
+                  "sprint_result_kind": result_kind,
+                  "sprint_directive_id": directive_id,
                   "dedupe_key": uuid.uuid4().hex},
                  idempotent=True)
         tag = f" ({args.kind})" if args.kind != "shell" else ""
@@ -1108,6 +1143,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="scope a task/result event to a sprint doc (validated "
                          "server-side) — wake-eligible when the sprint is live "
                          "and the recipient is its bound planner")
+    ms.add_argument(
+        "--assignment",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="correlate a typed result to a browser one-shot assignment "
+             "(defaults from SC_SPRINT_ASSIGNMENT_ID)",
+    )
+    ms.add_argument(
+        "--result-kind",
+        default=None,
+        metavar="KIND",
+        help="typed assignment result "
+             "(defaults from SC_SPRINT_REQUIRED_RESULT_KIND)",
+    )
+    ms.add_argument(
+        "--directive",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="exact Sprint directive returned by this assignment",
+    )
     mm = msub.add_parser("mark-read")
     mm.add_argument("message_id", type=int)
     sp.set_defaults(fn=cmd_message)

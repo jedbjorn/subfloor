@@ -1421,6 +1421,44 @@ def _cancel_existing_sprint_work(con, sprint_doc_id: int):
             " AND r.state IN ('leased','starting','running'))",
             (conversation_id,),
         )
+        binding = con.execute(
+            "SELECT b.binding_id,b.lifecycle,b.state AS binding_state,"
+            "c.state AS conversation_state "
+            "FROM sprint_conversation_bindings b "
+            "JOIN conversations c ON c.conversation_id=b.conversation_id "
+            "WHERE b.conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        live_run = con.execute(
+            "SELECT 1 FROM conversation_runs WHERE conversation_id=? "
+            "AND state IN ('leased','starting','running')",
+            (conversation_id,),
+        ).fetchone()
+        if (
+            binding is not None
+            and binding["lifecycle"] == "one_shot"
+            and binding["binding_state"] != "terminal"
+            and binding["conversation_state"] in ("idle", "waiting", "error")
+            and live_run is None
+        ):
+            con.execute(
+                "UPDATE conversations SET state='closed',"
+                "closed_at=datetime('now'),last_activity_at=datetime('now'),"
+                "version=version+1 WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            _append_conversation_event(
+                con,
+                conversation_id,
+                "conversation.closed",
+                {"state": "closed", "reason": "Sprint cancelled by operator"},
+            )
+            con.execute(
+                "UPDATE sprint_conversation_bindings SET state='terminal',"
+                "outcome='cancelled',completed_at=datetime('now') "
+                "WHERE binding_id=?",
+                (binding["binding_id"],),
+            )
     for run_id in run_ids:
         row = con.execute(
             "SELECT conversation_id,trigger_message_id FROM conversation_runs "
@@ -1739,6 +1777,13 @@ def _abort_sprint(
                 (report, actor.shell_id, cancellation["cancellation_id"]),
             )
             sprint_lifecycle.transition(con, sprint_doc_id, "aborted")
+            conductor_id = sprint_conversations.request_conductor_close(
+                con,
+                sprint_doc_id,
+                reason="originating Planner completed the abort report",
+            )
+            if conductor_id is not None:
+                notify_ids.append(conductor_id)
             con.execute(
                 "UPDATE documents SET frozen=1,frozen_date=date('now'),"
                 "updated_at=datetime('now') WHERE document_id=?",
