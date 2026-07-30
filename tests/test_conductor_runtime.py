@@ -499,13 +499,6 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ),
         (
             "planner",
-            "handoff",
-            "pending",
-            {},
-            False,
-        ),
-        (
-            "planner",
             "kickoff",
             "pending",
             {"to": "DEV1", "instruction": "build", "model": "sonnet"},
@@ -599,7 +592,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                         "(document_id,kind,title,body,frozen) VALUES "
                         "(100,'doc','SPRINT: case','status: ACTIVE',0)"
                     )
-                    sprint_state = "declared" if kind == "handoff" else "active"
+                    sprint_state = "active"
                     con.execute(
                         "INSERT INTO sprints "
                         "(sprint_doc_id,state,legacy,planner_shell_id,"
@@ -931,7 +924,7 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         ).fetchone()
         self.assertEqual(tuple(row), ("refused", "worker slot is no longer live"))
 
-    def test_handoff_slot_waits_for_the_act_transaction_to_commit(self):
+    def test_runtime_backstop_refuses_retired_handoff(self):
         self.set_declared()
         directive_id = self.emit("planner", "handoff", {}, unit=False)
         self.con.commit()
@@ -940,9 +933,9 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
             self.con, directive_id, 1, launcher=self.launcher
         )
 
-        self.assertEqual(result["status"], "executed")
-        self.assertEqual(len(result["launches"]), 1)
-        self.assertIn("--await-sprint-active", result["launches"][0])
+        self.assertEqual(result["status"], "refused")
+        self.assertEqual(result["reason"], "no transition for planner:handoff")
+        self.assertNotIn("launches", result)
 
     def test_refusal_rolls_back_partial_board_changes(self):
         self.set_unit("working")
@@ -973,14 +966,12 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
         with self.assertRaisesRegex(PermissionError, "conductor"):
             runtime.act(self.con, directive_id, 2, launcher=self.launcher)
 
-    def test_declared_zero_unit_and_dependency_cycle_handoffs_are_refused(self):
+    def test_declared_zero_unit_and_dependency_cycle_arming_is_refused(self):
         self.set_declared()
         self.con.execute("DELETE FROM sprint_units WHERE sprint_doc_id=100")
-        empty_id = self.emit("planner", "handoff", {}, unit=False)
         self.con.commit()
-        empty = runtime.act(self.con, empty_id, 1, launcher=self.launcher)
-        self.assertEqual(empty["status"], "refused")
-        self.assertIn("non-empty", empty["reason"])
+        with self.assertRaisesRegex(runtime.DirectiveRefused, "non-empty"):
+            runtime.validate_arm_board(self.con, 100)
         self.assertEqual(
             self.con.execute(
                 "SELECT state FROM sprints WHERE sprint_doc_id=100"
@@ -998,11 +989,9 @@ class ConductorDirectiveMatrixTests(RuntimeFixture):
                 (21, "U2", "cycle two", "U1"),
             ),
         )
-        cycle_id = self.emit("planner", "handoff", {}, unit=False)
         self.con.commit()
-        cycle = runtime.act(self.con, cycle_id, 1, launcher=self.launcher)
-        self.assertEqual(cycle["status"], "refused")
-        self.assertIn("dependency cycle", cycle["reason"])
+        with self.assertRaisesRegex(runtime.DirectiveRefused, "dependency cycle"):
+            runtime.validate_arm_board(self.con, 100)
 
     def test_two_planners_route_questions_only_to_recorded_owner(self):
         self.set_unit("working")
@@ -1095,13 +1084,13 @@ class ConductorSyntheticSprintTests(RuntimeFixture):
 
     def test_kickoff_to_merge_to_conformance_to_close_without_human_input(self):
         self.set_declared()
+        runtime.validate_arm_board(self.con, 100)
+        runtime.sprint_lifecycle.transition(self.con, 100, "active")
+        self.con.execute(
+            "UPDATE sprint_units SET state='working' WHERE unit_id=10"
+        )
+        self.con.commit()
         ids = [
-            self.act_one(
-                "planner",
-                "handoff",
-                {"verified": True},
-                unit=False,
-            ),
             self.act_one(
                 "dev",
                 "ready-for-review",
@@ -1167,14 +1156,14 @@ class ConductorSyntheticSprintTests(RuntimeFixture):
             self.con.execute(
                 "SELECT COUNT(*) FROM directives WHERE status='executed'"
             ).fetchone()[0],
-            6,
+            5,
         )
         self.assertEqual(
             self.con.execute(
                 "SELECT COUNT(*) FROM sentinel_events "
                 "WHERE event_kind='conductor-executed'"
             ).fetchone()[0],
-            6,
+            5,
         )
 
 

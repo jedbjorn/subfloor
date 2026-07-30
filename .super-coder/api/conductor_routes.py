@@ -241,6 +241,13 @@ def _create_directive(con, headers, body):
             422, "directive_kind_not_allowed",
             f"{flavor} may not issue {kind!r}",
         )
+    if flavor == "planner" and kind == "handoff":
+        return _err(
+            409,
+            "handoff_retired",
+            "Planner handoff is retired; stage the board, then arm it with "
+            "`sc sprint arm --sprint <id>`",
+        )
     try:
         sprint = (
             _int(body["sprint_doc_id"], "sprint_doc_id")
@@ -285,12 +292,7 @@ def _create_directive(con, headers, body):
         con.rollback()
         return _err(422, "directive_invalid", str(exc))
     item = _directive(con, cur.lastrowid)
-    # Alpha activation is an explicit FnB gate: Planner leaves a durable
-    # handoff for the operator to inspect, then the FnB boots Conductor.
-    # Once the sprint is active, ordinary worker/system directives retain the
-    # config-gated autonomous wake path.
-    if not (flavor == "planner" and kind == "handoff"):
-        conductor_runtime.maybe_wake(con)
+    conductor_runtime.maybe_wake(con)
     return _json(201, item)
 
 

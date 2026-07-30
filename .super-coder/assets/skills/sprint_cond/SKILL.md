@@ -14,7 +14,6 @@ directly. The stored sprint row is the only owner/state/route authority.
 
 | Issuer | Kind | Mechanical action | Pass |
 |---|---|---|---|
-| planner | handoff | validate non-empty fully assigned board; `declared → active`; boot every dependency-ready developer | state is active; released units are working |
 | dev | ready-for-review | record PR/head/branch; move in_review; boot assigned reviewer | exact stored reviewer route starts |
 | dev/reviewer | ask-planner | block when legal; boot the recorded originating Planner | no fleet-wide Planner selection |
 | dev | merged | verify recorded PR/review head; move merged; release every newly ready dependency | normal merge does not boot Planner |
@@ -31,7 +30,7 @@ directly. The stored sprint row is the only owner/state/route authority.
 
 Refuse malformed payloads, wrong issuer flavor, non-owner Planner directives,
 unassigned issuers, missing stored routes, legacy `needs_owner`, wrong sprint
-state, illegal unit transitions, stale review heads, incomplete handoff boards,
+state, illegal unit transitions, stale review heads, incomplete armed boards,
 and close without exact clean conformance. Record the refusal and route it only
 to that sprint's originating Planner. If no owner exists, record the refusal
 without guessing one.
@@ -45,4 +44,6 @@ without guessing one.
 5. Exit when the pending list is empty.
 
 No scheduled polling, no retained private state, no direct shell control, and
-no decisions.
+no decisions. Conductor never activates, cancels, or closes on its own:
+the originating Planner arms the staged board and authors the final Sprint or
+abort report. The browser may only request cancellation.

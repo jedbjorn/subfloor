@@ -172,7 +172,7 @@ class ConductorContractTests(unittest.TestCase):
         self.assertEqual(status, 201)
         wake.assert_called_once()
 
-    def test_planner_handoff_waits_for_explicit_fnb_conductor_boot(self):
+    def test_planner_handoff_is_retired_in_favor_of_planner_arm(self):
         planner_id = self.con.execute(
             "INSERT INTO shells "
             "(display_name,shortname,flavor,system_prompt,api_key) "
@@ -205,9 +205,17 @@ class ConductorContractTests(unittest.TestCase):
                 token="planner-token",
             )
 
-        self.assertEqual(status, 201)
-        self.assertEqual(item["status"], "pending")
+        self.assertEqual(
+            (status, item["error"]["code"]),
+            (409, "handoff_retired"),
+        )
         wake.assert_not_called()
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM directives WHERE kind='handoff'"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_act_requires_conductor_token_and_calls_mechanical_runtime(self):
         conductor_id = self.con.execute(

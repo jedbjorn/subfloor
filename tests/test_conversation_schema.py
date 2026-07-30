@@ -1253,6 +1253,7 @@ class SnapshotPolicyTest(ConversationDbCase):
     TABLES = (
         "conversations",
         "sprint_conversation_bindings",
+        "sprint_cancellations",
         "conversation_messages",
         "conversation_runs",
         "conversation_events",

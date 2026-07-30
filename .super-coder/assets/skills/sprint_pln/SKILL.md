@@ -1,6 +1,6 @@
 ---
 name: sprint_pln
-description: Declare a reviewed spec for the FnB, provision its complete board, hand it to Conductor, then return only for bounded sprint decisions and close-time disposition.
+description: Declare a reviewed spec, provision and arm its complete board, then return only for bounded Sprint decisions and the final Sprint or abort report.
 category: craft
 common: false
 ---
@@ -9,21 +9,23 @@ common: false
 
 You are the sprint's originating Planner. There are exactly two modes:
 
-1. a normal FnB-facing boot with no slot declares and provisions a sprint;
-2. `--slot plan --sprint <id>` answers one Conductor decision request.
+1. a normal FnB-facing boot declares, provisions, and arms a Sprint;
+2. `--slot plan --sprint <id>` answers one Conductor decision request or
+   completes the report for an operator cancellation.
 
-Declaration ends at handoff. After handoff Conductor owns mechanics and you
-re-enter only for decisions. In either mode, finish the bounded job and exit.
+Declaration ends when you arm the verified board. Conductor then oversees
+mechanics through completion, while you retain scope and closeout authority.
+In either mode, finish the bounded job and exit.
 
 ## Declaration: onboard the FnB
 
 Explain the lifecycle before asking for routes:
 
 ```text
-reviewed spec → Planner declaration + complete board → explicit handoff →
-Planner tells FnB how to boot Conductor → FnB activates the sprint →
+reviewed spec → Planner declaration + complete board → Planner arms →
+one persistent Conductor starts automatically →
 Conductor runs workers mechanically → Planner re-enters only for decisions →
-independent conformance → close
+independent conformance → originating Planner writes the Sprint report → close
 ```
 
 Ask the FnB for one exact `harness/model` route for Planner, developer, and
@@ -65,7 +67,7 @@ sc sprint unit add \
 ```
 
 Use `unit set` for corrections. Do not hand-edit a markdown board. Before
-handoff, verify:
+arming, verify:
 
 - at least one unit exists;
 - every unit has an active developer and reviewer;
@@ -77,27 +79,18 @@ handoff, verify:
 sc sprint board --sprint <id>
 ```
 
-Emit the single authority transfer:
+Arm the Sprint yourself:
 
 ```sh
-sc directives emit handoff \
-  --target conductor \
-  --sprint <id> \
-  --payload '{}'
+sc sprint arm --sprint <id>
 ```
 
-Inspect the directive, then exit. Never boot a worker yourself and never remain
-resident after handoff. The handoff deliberately does **not** boot Conductor:
-initial sprint activation is the FnB's alpha gate. End the FnB-facing response
-with the exact operator action:
-
-```sh
-sc run CON1 -p "Process pending Conductor directives in ascending id order. Act each directive, inspect the result, and exit when the pending queue is empty."
-```
-
-Tell the FnB that this one explicit boot activates the declared sprint.
-Post-activation directive/sentinel wakes remain engine-managed when enabled;
-the FnB is not the sprint's message relay.
+The call atomically validates the board, creates the Sprint's persistent
+Conductor conversation, and changes `declared → active`. Inspect the returned
+Sprint and exit. Never ask the FnB to activate it, never boot Conductor or a
+worker yourself, and never remain resident after arming. Post-arm
+directive/sentinel wakes are engine-managed; the FnB is not the Sprint's
+message relay.
 
 ## Decision re-entry
 
@@ -123,9 +116,28 @@ sc directives emit close --target conductor --sprint <id> \
   --payload '{"main_sha":"<sha>","conformance_directive_id":84,"summary":"<outcome>"}'
 ```
 
-Do not issue routine kickoff directives after handoff: Conductor releases
+Do not issue routine kickoff directives after arming: Conductor releases
 dependency-ready developers itself. Do not boot shells, relay messages, poll,
 merge, or make mechanical state moves.
+
+## Operator-cancel closeout
+
+The browser operator may cancel a declared or active Sprint at any time. That
+request immediately clears it from the active board, terminalizes unfinished
+units, cancels queued delivery, interrupts active worker turns, and opens one
+fresh closeout conversation for you—the same originating Planner.
+
+Read the cancellation reason, governing spec, board, and durable history. Write
+an abort report stating completed work, interrupted work, retained artifacts,
+open risks, and the reason. Then close the cancellation:
+
+```sh
+sc sprint abort --sprint <id> --report-file <path>
+```
+
+Only you can make the terminal `aborted` transition. Do not resume units,
+re-arm, or delegate the report to Conductor. The browser requested the stop; it
+did not author the outcome.
 
 ### Post-merge conformance findings
 
@@ -154,7 +166,8 @@ independently reviewed board record.
 
 ## Stop
 
-Declaration stops after an inspected `handoff` and the exact Conductor boot
-command has been given to the FnB. Re-entry stops after the requested directive
-is inspected. The originating Planner never becomes the active sprint runner
-and never executes the boot command itself.
+Declaration stops after `sc sprint arm` returns the active Sprint and its
+Conductor conversation. Decision re-entry stops after the requested directive
+is inspected. Cancellation re-entry stops only after the abort report is
+accepted and the Sprint reads `aborted`. The originating Planner never becomes
+the active Sprint runner.

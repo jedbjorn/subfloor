@@ -27,6 +27,7 @@ import io
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -35,6 +36,11 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import conductor_policy  # noqa: E402
+import conductor_runtime  # noqa: E402
+import conversation_broker  # noqa: E402
+import conversation_events  # noqa: E402
+import run as run_mod  # noqa: E402
 import sprint_lifecycle  # noqa: E402
 import sprint_state  # noqa: E402
 from sprint_units import SPRINT_UNIT_EDGES  # noqa: E402
@@ -282,6 +288,46 @@ def _idempotent_atomic(con, actor: _Actor, operation: str, headers, body_obj,
     return _json(status, obj, extra)
 
 
+def _idempotent_atomic_replay(
+    con,
+    actor: _Actor,
+    operation: str,
+    headers,
+    body_obj,
+    response_headers=None,
+):
+    """Return a still-live atomic mutation replay before external preparation.
+
+    Fresh arming must inspect Conductor config and route files, but an exact
+    retry must not become dependent on config that changed after the commit.
+    The full helper remains the transactional authority for fresh requests.
+    """
+    key = headers.get("Idempotency-Key") or ""
+    if not key:
+        return None
+    canonical = hashlib.sha256(
+        json.dumps(body_obj, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    row = con.execute(
+        "SELECT request_hash,response_status,response_resource "
+        "FROM interface_idempotency_keys "
+        "WHERE actor_scope=? AND operation=? AND idem_key=? "
+        "AND expires_at>datetime('now')",
+        (actor.scope, operation, key),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["request_hash"] != canonical:
+        return _err(
+            409,
+            "idempotency_conflict",
+            "Idempotency-Key reused with a different request body",
+        )
+    obj = json.loads(row["response_resource"])
+    extra = response_headers(obj) if response_headers else None
+    return _json(row["response_status"], obj, extra)
+
+
 # ------------------------------------------------------- the board as a record
 
 # The board's columns as the planner edits them, minus `state` — which is
@@ -427,6 +473,16 @@ def _may_write_board(con, actor, sprint_doc_id: int):
             409,
             "sprint_needs_owner",
             f"legacy sprint {sprint_doc_id} must be adopted before board writes",
+        )
+    if con.execute(
+        "SELECT 1 FROM sprint_cancellations WHERE sprint_doc_id=?",
+        (sprint_doc_id,),
+    ).fetchone() is not None:
+        return _err(
+            409,
+            "sprint_cancelled",
+            f"sprint {sprint_doc_id} has an operator cancellation request; "
+            "its board is read-only while the Planner writes the abort report",
         )
     if owner["planner_shell_id"] == actor.shell_id:
         return None
@@ -673,6 +729,9 @@ _ADOPT_FIELDS = frozenset(
         "evidence",
     )
 )
+_ARM_FIELDS = frozenset(("state",))
+_CANCEL_FIELDS = frozenset(("reason",))
+_ABORT_FIELDS = frozenset(("state", "report"))
 
 
 def _unknown_fields(body: dict, allowed: frozenset, resource: str):
@@ -821,6 +880,234 @@ def _validate_route(con, route, field: str):
     return f"{harness}/{selector}", None
 
 
+def _append_conversation_event(
+    con,
+    conversation_id: str,
+    event_type: str,
+    payload: dict,
+    *,
+    message_id: int | None = None,
+    run_id: int | None = None,
+) -> int:
+    sequence = int(
+        con.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_events "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+    )
+    con.execute(
+        "INSERT INTO conversation_events "
+        "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+        "VALUES (?,?,?,?,?,?)",
+        (
+            conversation_id,
+            sequence,
+            event_type,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            message_id,
+            run_id,
+        ),
+    )
+    return sequence
+
+
+def _conversation_route(con, shell, harness: str, model: str | None):
+    adapter = run_mod.load_adapter(harness)
+    effort = run_mod.default_headless_effort(adapter)
+    try:
+        run_mod.validate_headless_request(adapter, model, effort)
+    except ValueError as exc:
+        return None, _err_obj("route_not_runnable", str(exc))
+    worktree = run_mod.shell_work_dir(
+        shell["shortname"], shell["flavor"]
+    ).resolve(strict=False)
+    if worktree.exists() and not worktree.is_dir():
+        return None, _err_obj(
+            "worktree_invalid",
+            f"shell {shell['shortname']!r} worktree is not a directory",
+        )
+    return {
+        "harness": harness,
+        "provider": run_mod.session_provider(harness, model),
+        "model": model,
+        "effort": effort,
+        "worktree": str(worktree),
+    }, None
+
+
+def _create_sprint_conversation(
+    con,
+    *,
+    sprint_doc_id: int,
+    shell,
+    role: str,
+    lifecycle: str,
+    route: dict,
+    title: str,
+    creation_key: str,
+    prompt: str,
+    required_result_kind: str | None = None,
+    source_directive_id: int | None = None,
+) -> str:
+    conversation_id = "cv_" + uuid.uuid4().hex
+    creation_body = {
+        "sprint_doc_id": sprint_doc_id,
+        "shell_id": int(shell["shell_id"]),
+        "role": role,
+        "route": route,
+        "title": title,
+    }
+    creation_hash = hashlib.sha256(
+        json.dumps(creation_body, sort_keys=True).encode()
+    ).hexdigest()
+    con.execute(
+        "INSERT INTO conversations "
+        "(conversation_id,shell_id,mode,owner_user_id,sprint_doc_id,harness,"
+        "provider,model,effort,worktree,state,title,"
+        "creation_idempotency_key,creation_request_hash) "
+        "VALUES (?,?, 'sprint',NULL,?,?,?,?,?,?,'queued',?,?,?)",
+        (
+            conversation_id,
+            shell["shell_id"],
+            sprint_doc_id,
+            route["harness"],
+            route["provider"],
+            route["model"],
+            route["effort"],
+            route["worktree"],
+            title,
+            creation_key,
+            creation_hash,
+        ),
+    )
+    binding_state = "active" if lifecycle == "persistent" else "pending"
+    con.execute(
+        "INSERT INTO sprint_conversation_bindings "
+        "(conversation_id,sprint_doc_id,role,lifecycle,slot,"
+        "source_directive_id,required_result_kind,state,started_at) "
+        "VALUES (?,?,?,?,?,?,?,?,"
+        "CASE WHEN ?='active' THEN datetime('now') ELSE NULL END)",
+        (
+            conversation_id,
+            sprint_doc_id,
+            role,
+            lifecycle,
+            shell["shortname"],
+            source_directive_id,
+            required_result_kind,
+            binding_state,
+            binding_state,
+        ),
+    )
+    prompt_key = f"{creation_key}:prompt"
+    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+    message_id = int(
+        con.execute(
+            "INSERT INTO conversation_messages "
+            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+            "idempotency_key,request_hash,state) "
+            "VALUES (?,'engine','sprint','prompt',?,?,?,'queued')",
+            (conversation_id, prompt, prompt_key, prompt_hash),
+        ).lastrowid
+    )
+    con.execute(
+        "INSERT INTO conversation_outbox (conversation_id,message_id) "
+        "VALUES (?,?)",
+        (conversation_id, message_id),
+    )
+    _append_conversation_event(
+        con,
+        conversation_id,
+        "conversation.created",
+        {
+            "shell_id": int(shell["shell_id"]),
+            "mode": "sprint",
+            "sprint_doc_id": sprint_doc_id,
+            "role": role,
+            "harness": route["harness"],
+            "model": route["model"],
+            "effort": route["effort"],
+        },
+    )
+    _append_conversation_event(
+        con,
+        conversation_id,
+        "message.accepted",
+        {"message_id": message_id, "queue_state": "queued", "queue_position": 1},
+        message_id=message_id,
+    )
+    return conversation_id
+
+
+def _conductor_projection(con, sprint_doc_id: int):
+    row = con.execute(
+        "SELECT c.conversation_id,c.state,c.created_at,c.last_activity_at,"
+        "s.shell_id,s.shortname,s.display_name "
+        "FROM sprint_conversation_bindings b "
+        "JOIN conversations c ON c.conversation_id=b.conversation_id "
+        "JOIN shells s ON s.shell_id=c.shell_id "
+        "WHERE b.sprint_doc_id=? AND b.role='conductor' "
+        "ORDER BY b.binding_id DESC LIMIT 1",
+        (sprint_doc_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    messages = [
+        {
+            "message_id": int(item["message_id"]),
+            "sender_kind": item["sender_kind"],
+            "message_kind": item["message_kind"],
+            "body": item["body"],
+            "state": item["state"],
+            "created_at": item["created_at"],
+        }
+        for item in con.execute(
+            "SELECT message_id,sender_kind,message_kind,body,state,created_at "
+            "FROM conversation_messages WHERE conversation_id=? "
+            "AND message_kind<>'control' ORDER BY message_id DESC LIMIT 50",
+            (row["conversation_id"],),
+        ).fetchall()[::-1]
+    ]
+    assistant = [
+        {
+            "sequence": int(item["sequence"]),
+            "text": json.loads(item["payload"]).get("text", ""),
+            "created_at": item["created_at"],
+        }
+        for item in con.execute(
+            "SELECT sequence,payload,created_at FROM conversation_events "
+            "WHERE conversation_id=? AND event_type='assistant.delta' "
+            "ORDER BY sequence DESC LIMIT 200",
+            (row["conversation_id"],),
+        ).fetchall()[::-1]
+    ]
+    return {
+        "conversation_id": row["conversation_id"],
+        "state": row["state"],
+        "created_at": row["created_at"],
+        "last_activity_at": row["last_activity_at"],
+        "shell": {
+            "shell_id": int(row["shell_id"]),
+            "shortname": row["shortname"],
+            "display_name": row["display_name"],
+        },
+        "messages": messages,
+        "assistant": assistant,
+    }
+
+
+def _cancellation_projection(con, sprint_doc_id: int):
+    row = con.execute(
+        "SELECT cancellation_id,sprint_doc_id,reason,state,"
+        "planner_conversation_id,requested_at,abort_report,"
+        "completed_by_shell_id,completed_at "
+        "FROM sprint_cancellations WHERE sprint_doc_id=?",
+        (sprint_doc_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def _sprint_projection(con, sprint_doc_id: int):
     row = con.execute(
         "SELECT sp.*,d.title AS sprint_title,d.feature_id,d.frozen,"
@@ -893,6 +1180,8 @@ def _sprint_projection(con, sprint_doc_id: int):
                 "completed_at": row["qaqc_completed_at"],
             }
         ),
+        "conductor": _conductor_projection(con, sprint_doc_id),
+        "cancellation": _cancellation_projection(con, sprint_doc_id),
         "units": [],
     }
     unit_ids = con.execute(
@@ -1010,6 +1299,578 @@ def _create_sprint(actor: _Actor, headers, body: dict):
         )
     finally:
         con.close()
+
+
+def _arm_sprint(
+    actor: _Actor,
+    headers,
+    sprint_doc_id: int,
+    body: dict,
+):
+    bad = _unknown_fields(body, _ARM_FIELDS, "arming")
+    if bad is not None:
+        return bad
+    if body.get("state") != "active":
+        return _err(
+            422,
+            "validation",
+            "Planner arming requires exactly {\"state\":\"active\"}",
+        )
+    con = _db()
+    notify_ids: list[str] = []
+    try:
+        flavor = _actor_flavor(con, actor)
+        if flavor is None or flavor[0] != "planner":
+            return _err(
+                403,
+                "planner_required",
+                "Sprint arming requires an active Planner shell token",
+            )
+        replay = _idempotent_atomic_replay(
+            con,
+            actor,
+            f"sprint_arm:{sprint_doc_id}",
+            headers,
+            body,
+        )
+        if replay is not None:
+            return replay
+        config = conductor_runtime.load_config()
+        if not config.enabled:
+            return _err(
+                409,
+                "conductor_disabled",
+                "the persistent Conductor is disabled for this install",
+            )
+        conductor = con.execute(
+            "SELECT shell_id,shortname,display_name,flavor FROM shells "
+            "WHERE shortname=? COLLATE NOCASE AND flavor='conductor' "
+            "AND COALESCE(is_deleted,0)=0",
+            (config.shell,),
+        ).fetchone()
+        if conductor is None:
+            return _err(
+                409,
+                "conductor_unavailable",
+                f"configured Conductor shell {config.shell!r} is unavailable",
+            )
+        route, route_error = _conversation_route(
+            con,
+            conductor,
+            conductor_policy.CONDUCTOR_HARNESS,
+            config.model,
+        )
+        if route_error is not None:
+            return _json(422, route_error)
+
+        def produce():
+            sprint = con.execute(
+                "SELECT state,planner_shell_id FROM sprints "
+                "WHERE sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone()
+            if sprint is None:
+                return 404, _err_obj(
+                    "not_found", f"no sprint declaration {sprint_doc_id}"
+                )
+            if sprint["planner_shell_id"] != actor.shell_id:
+                return 403, _err_obj(
+                    "not_sprint_owner",
+                    f"shell {actor.shell_id} is not sprint "
+                    f"{sprint_doc_id}'s originating Planner",
+                )
+            if sprint["state"] != "declared":
+                return 409, _err_obj(
+                    "sprint_not_armable",
+                    f"sprint {sprint_doc_id} is {sprint['state']}, not declared",
+                )
+            if con.execute(
+                "SELECT 1 FROM sprint_cancellations WHERE sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone() is not None:
+                return 409, _err_obj(
+                    "sprint_cancelled",
+                    f"sprint {sprint_doc_id} has been cancelled",
+                )
+            try:
+                conductor_runtime.validate_arm_board(con, sprint_doc_id)
+            except conductor_runtime.DirectiveRefused as exc:
+                return 409, _err_obj("board_not_armable", str(exc))
+            conversation_id = _create_sprint_conversation(
+                con,
+                sprint_doc_id=sprint_doc_id,
+                shell=conductor,
+                role="conductor",
+                lifecycle="persistent",
+                route=route,
+                title=f"Sprint #{sprint_doc_id} Conductor",
+                creation_key=f"sprint-arm:{sprint_doc_id}",
+                prompt=(
+                    f"Sprint #{sprint_doc_id} was armed by its originating "
+                    "Planner. Oversee its mechanical workflow through "
+                    "completion using the sprint_cond contract. The Planner "
+                    "owns scope and the final Sprint or abort report; never "
+                    "activate, cancel, or close the Sprint on the Planner's "
+                    "behalf."
+                ),
+            )
+            sprint_lifecycle.transition(con, sprint_doc_id, "active")
+            con.execute(
+                "INSERT INTO sentinel_events "
+                "(event_kind,shell_id,sprint_doc_id,evidence) "
+                "VALUES ('sprint-armed',?,?,?)",
+                (
+                    actor.shell_id,
+                    sprint_doc_id,
+                    json.dumps(
+                        {"conductor_conversation_id": conversation_id},
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            notify_ids.append(conversation_id)
+            return 200, _sprint_projection(con, sprint_doc_id)
+
+        response = _idempotent_atomic(
+            con,
+            actor,
+            f"sprint_arm:{sprint_doc_id}",
+            headers,
+            body,
+            produce,
+        )
+    finally:
+        con.close()
+    for conversation_id in notify_ids:
+        conversation_events.notify(conversation_id)
+    if notify_ids:
+        conversation_broker.notify_commit()
+    return response
+
+
+def _cancel_existing_sprint_work(con, sprint_doc_id: int):
+    conversation_ids = [
+        row[0]
+        for row in con.execute(
+            "SELECT conversation_id FROM conversations "
+            "WHERE mode='sprint' AND sprint_doc_id=?",
+            (sprint_doc_id,),
+        )
+    ]
+    run_ids = [
+        int(row["run_id"])
+        for row in con.execute(
+            "SELECT r.run_id FROM conversation_runs r "
+            "JOIN conversations c ON c.conversation_id=r.conversation_id "
+            "WHERE c.mode='sprint' AND c.sprint_doc_id=? "
+            "AND r.state IN ('leased','starting','running')",
+            (sprint_doc_id,),
+        )
+    ]
+    for conversation_id in conversation_ids:
+        queued = con.execute(
+            "SELECT o.outbox_id,o.message_id,o.state "
+            "FROM conversation_outbox o "
+            "JOIN conversation_messages m ON m.message_id=o.message_id "
+            "WHERE o.conversation_id=? AND o.state IN ('pending','claimed')",
+            (conversation_id,),
+        ).fetchall()
+        for item in queued:
+            con.execute(
+                "UPDATE conversation_outbox SET state='cancelled' "
+                "WHERE outbox_id=?",
+                (item["outbox_id"],),
+            )
+            con.execute(
+                "UPDATE conversation_messages SET state='cancelled',"
+                "completed_at=datetime('now') WHERE message_id=? "
+                "AND state IN ('accepted','queued')",
+                (item["message_id"],),
+            )
+            _append_conversation_event(
+                con,
+                conversation_id,
+                "message.cancelled",
+                {
+                    "message_id": int(item["message_id"]),
+                    "reason": "Sprint cancelled by operator",
+                },
+                message_id=int(item["message_id"]),
+            )
+        con.execute(
+            "UPDATE conversations SET state='idle',"
+            "last_activity_at=datetime('now'),version=version+1 "
+            "WHERE conversation_id=? AND state='queued' "
+            "AND NOT EXISTS ("
+            " SELECT 1 FROM conversation_runs r "
+            " WHERE r.conversation_id=conversations.conversation_id "
+            " AND r.state IN ('leased','starting','running'))",
+            (conversation_id,),
+        )
+    for run_id in run_ids:
+        row = con.execute(
+            "SELECT conversation_id,trigger_message_id FROM conversation_runs "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        exists = con.execute(
+            "SELECT 1 FROM conversation_events "
+            "WHERE run_id=? AND event_type='run.interrupt.requested'",
+            (run_id,),
+        ).fetchone()
+        if exists is None:
+            _append_conversation_event(
+                con,
+                row["conversation_id"],
+                "run.interrupt.requested",
+                {"reason": "Sprint cancelled by operator"},
+                message_id=int(row["trigger_message_id"]),
+                run_id=run_id,
+            )
+    con.execute(
+        "UPDATE directives SET status='refused',"
+        "refusal_reason='Sprint cancelled by operator',"
+        "executed_at=datetime('now') "
+        "WHERE sprint_doc_id=? AND status='pending'",
+        (sprint_doc_id,),
+    )
+    con.execute(
+        "UPDATE sprint_units SET state='cancelled',"
+        "state_changed_at=datetime('now'),updated_at=datetime('now') "
+        "WHERE sprint_doc_id=? "
+        "AND state NOT IN ('merged','cancelled')",
+        (sprint_doc_id,),
+    )
+    return conversation_ids, run_ids
+
+
+def _cancel_sprint(
+    actor: _Actor,
+    headers,
+    sprint_doc_id: int,
+    body: dict,
+):
+    if actor.kind != "operator":
+        return _err(
+            403,
+            "operator_required",
+            "Sprint cancellation is reserved to the browser operator",
+        )
+    bad = _unknown_fields(body, _CANCEL_FIELDS, "cancellation")
+    if bad is not None:
+        return bad
+    reason = body.get("reason", "Cancelled by the operator")
+    if not isinstance(reason, str) or not reason.strip():
+        return _err(422, "validation", "reason must be a nonblank string")
+    reason = reason.strip()
+    if len(reason) > 2000:
+        return _err(
+            422, "validation", "reason must be at most 2000 characters"
+        )
+    normalized = {"reason": reason}
+    con = _db()
+    notify_ids: list[str] = []
+    interrupt_ids: list[int] = []
+    try:
+        def location(obj):
+            return [
+                (
+                    "Location",
+                    f"/api/sprints/{sprint_doc_id}/cancellations/"
+                    f"{obj['cancellation']['cancellation_id']}",
+                )
+            ] if "cancellation" in obj else []
+        replay = _idempotent_atomic_replay(
+            con,
+            actor,
+            f"sprint_cancel:{sprint_doc_id}",
+            headers,
+            normalized,
+            response_headers=location,
+        )
+        if replay is not None:
+            return replay
+
+        def produce():
+            user = con.execute(
+                "SELECT user_id FROM users WHERE is_active=1 "
+                "ORDER BY user_id LIMIT 1"
+            ).fetchone()
+            if user is None:
+                return 503, _err_obj(
+                    "operator_unavailable", "no active operator exists"
+                )
+            sprint = con.execute(
+                "SELECT sp.state,sp.planner_shell_id,sp.planner_route,"
+                "planner.shortname,planner.display_name,planner.flavor "
+                "FROM sprints sp LEFT JOIN shells planner "
+                "ON planner.shell_id=sp.planner_shell_id "
+                "WHERE sp.sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone()
+            if sprint is None:
+                return 404, _err_obj(
+                    "not_found", f"no sprint declaration {sprint_doc_id}"
+                )
+            if sprint["state"] not in ("declared", "active"):
+                return 409, _err_obj(
+                    "sprint_not_cancellable",
+                    f"sprint {sprint_doc_id} is {sprint['state']}, "
+                    "not declared or active",
+                )
+            if con.execute(
+                "SELECT 1 FROM sprint_cancellations WHERE sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone() is not None:
+                return 409, _err_obj(
+                    "sprint_already_cancelled",
+                    f"sprint {sprint_doc_id} already has a cancellation request",
+                )
+            if sprint["planner_shell_id"] is None \
+                    or sprint["flavor"] != "planner":
+                return 409, _err_obj(
+                    "planner_unavailable",
+                    f"sprint {sprint_doc_id} has no active originating Planner",
+                )
+            planner = {
+                "shell_id": sprint["planner_shell_id"],
+                "shortname": sprint["shortname"],
+                "display_name": sprint["display_name"],
+                "flavor": sprint["flavor"],
+            }
+            try:
+                harness, model = sprint_lifecycle.split_route(
+                    sprint["planner_route"]
+                )
+            except sprint_lifecycle.SprintLifecycleError as exc:
+                return 409, _err_obj("planner_route_invalid", str(exc))
+            route, route_error = _conversation_route(
+                con, planner, harness, model
+            )
+            if route_error is not None:
+                return 422, route_error
+            cancelled_conversations, active_runs = (
+                _cancel_existing_sprint_work(con, sprint_doc_id)
+            )
+            directive_id = int(
+                con.execute(
+                    "INSERT INTO directives "
+                    "(issuer_shell_id,issuer_flavor,kind,payload,target,"
+                    "sprint_doc_id,status,executed_at) "
+                    "VALUES (NULL,'system','cancel',?,'planner',?,"
+                    "'executed',datetime('now'))",
+                    (
+                        json.dumps({"reason": reason}, sort_keys=True),
+                        sprint_doc_id,
+                    ),
+                ).lastrowid
+            )
+            planner_conversation_id = _create_sprint_conversation(
+                con,
+                sprint_doc_id=sprint_doc_id,
+                shell=planner,
+                role="planner",
+                lifecycle="one_shot",
+                route=route,
+                title=f"Sprint #{sprint_doc_id} abort report",
+                creation_key=f"sprint-cancel:{sprint_doc_id}",
+                source_directive_id=directive_id,
+                required_result_kind="abort-report",
+                prompt=(
+                    f"The operator cancelled Sprint #{sprint_doc_id}. "
+                    f"Reason: {reason}\n\n"
+                    "Inspect the durable Sprint board and history, write the "
+                    "abort report, then close it with `sc sprint abort "
+                    f"--sprint {sprint_doc_id} --report-file <path>`. You are "
+                    "the originating Planner and the only actor authorized "
+                    "to complete this abort."
+                ),
+            )
+            cancellation_id = int(
+                con.execute(
+                    "INSERT INTO sprint_cancellations "
+                    "(sprint_doc_id,requested_by_user_id,reason,"
+                    "source_directive_id,planner_conversation_id) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        sprint_doc_id,
+                        user["user_id"],
+                        reason,
+                        directive_id,
+                        planner_conversation_id,
+                    ),
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO sentinel_events "
+                "(event_kind,sprint_doc_id,directive_id,evidence) "
+                "VALUES ('sprint-cancel-requested',?,?,?)",
+                (
+                    sprint_doc_id,
+                    directive_id,
+                    json.dumps(
+                        {
+                            "cancellation_id": cancellation_id,
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            notify_ids.extend(cancelled_conversations)
+            notify_ids.append(planner_conversation_id)
+            interrupt_ids.extend(active_runs)
+            return 202, {
+                "cleared": True,
+                "cancellation": _cancellation_projection(
+                    con, sprint_doc_id
+                ),
+            }
+
+        response = _idempotent_atomic(
+            con,
+            actor,
+            f"sprint_cancel:{sprint_doc_id}",
+            headers,
+            normalized,
+            produce,
+            response_headers=location,
+        )
+    finally:
+        con.close()
+    for conversation_id in set(notify_ids):
+        conversation_events.notify(conversation_id)
+    for run_id in interrupt_ids:
+        try:
+            conversation_broker.interrupt_run(run_id)
+        except conversation_broker.BrokerError:
+            # The interrupt request is already durable. A terminal race or an
+            # offline broker is reconciled from that event on its next cycle.
+            pass
+    if notify_ids or interrupt_ids:
+        conversation_broker.notify_commit()
+    return response
+
+
+def _abort_sprint(
+    actor: _Actor,
+    headers,
+    sprint_doc_id: int,
+    body: dict,
+):
+    bad = _unknown_fields(body, _ABORT_FIELDS, "abort")
+    if bad is not None:
+        return bad
+    if body.get("state") != "aborted":
+        return _err(
+            422,
+            "validation",
+            "Planner abort requires exactly state=aborted plus report",
+        )
+    report = body.get("report")
+    if not isinstance(report, str) or not report.strip():
+        return _err(422, "validation", "report must be a nonblank string")
+    report = report.strip()
+    if len(report) > 1048576:
+        return _err(
+            422, "validation", "report must be at most 1048576 characters"
+        )
+    normalized = {"state": "aborted", "report": report}
+    con = _db()
+    notify_ids: list[str] = []
+    try:
+        flavor = _actor_flavor(con, actor)
+        if flavor is None or flavor[0] != "planner":
+            return _err(
+                403,
+                "planner_required",
+                "Sprint abort completion requires an active Planner token",
+            )
+
+        def produce():
+            sprint = con.execute(
+                "SELECT state,planner_shell_id FROM sprints "
+                "WHERE sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone()
+            if sprint is None:
+                return 404, _err_obj(
+                    "not_found", f"no sprint declaration {sprint_doc_id}"
+                )
+            if sprint["planner_shell_id"] != actor.shell_id:
+                return 403, _err_obj(
+                    "not_sprint_owner",
+                    f"shell {actor.shell_id} is not sprint "
+                    f"{sprint_doc_id}'s originating Planner",
+                )
+            cancellation = con.execute(
+                "SELECT cancellation_id,state FROM sprint_cancellations "
+                "WHERE sprint_doc_id=?",
+                (sprint_doc_id,),
+            ).fetchone()
+            if cancellation is None or cancellation["state"] != "requested":
+                return 409, _err_obj(
+                    "cancellation_required",
+                    f"sprint {sprint_doc_id} has no open cancellation request",
+                )
+            if sprint["state"] not in ("declared", "active"):
+                return 409, _err_obj(
+                    "sprint_not_abortable",
+                    f"sprint {sprint_doc_id} is {sprint['state']}",
+                )
+            con.execute(
+                "UPDATE sprint_cancellations SET state='completed',"
+                "abort_report=?,completed_by_shell_id=?,"
+                "completed_at=datetime('now') WHERE cancellation_id=?",
+                (report, actor.shell_id, cancellation["cancellation_id"]),
+            )
+            sprint_lifecycle.transition(con, sprint_doc_id, "aborted")
+            con.execute(
+                "UPDATE documents SET frozen=1,frozen_date=date('now'),"
+                "updated_at=datetime('now') WHERE document_id=?",
+                (sprint_doc_id,),
+            )
+            con.execute(
+                "INSERT INTO sentinel_events "
+                "(event_kind,shell_id,sprint_doc_id,evidence) "
+                "VALUES ('sprint-aborted',?,?,?)",
+                (
+                    actor.shell_id,
+                    sprint_doc_id,
+                    json.dumps(
+                        {
+                            "cancellation_id": cancellation["cancellation_id"],
+                            "report_sha256": hashlib.sha256(
+                                report.encode()
+                            ).hexdigest(),
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            notify_ids.extend(
+                row[0]
+                for row in con.execute(
+                    "SELECT conversation_id FROM conversations "
+                    "WHERE mode='sprint' AND sprint_doc_id=?",
+                    (sprint_doc_id,),
+                )
+            )
+            return 200, _sprint_projection(con, sprint_doc_id)
+
+        response = _idempotent_atomic(
+            con,
+            actor,
+            f"sprint_abort:{sprint_doc_id}",
+            headers,
+            normalized,
+            produce,
+        )
+    finally:
+        con.close()
+    for conversation_id in set(notify_ids):
+        conversation_events.notify(conversation_id)
+    return response
 
 
 def _resolve_planner(con, value):
@@ -1140,6 +2001,12 @@ def _list_sprints(query: dict):
         if state is not None:
             sql += " WHERE state=?"
             params = (state,)
+            if state == "active":
+                sql += (
+                    " AND NOT EXISTS ("
+                    " SELECT 1 FROM sprint_cancellations sc "
+                    " WHERE sc.sprint_doc_id=sprints.sprint_doc_id)"
+                )
         sql += " ORDER BY sprint_doc_id"
         sprints = [
             _sprint_projection(con, row[0])
@@ -1161,6 +2028,27 @@ def _get_sprint(sprint_doc_id: int):
         return _json(200, sprint) if sprint else _err(
             404, "not_found", f"no sprint declaration {sprint_doc_id}"
         )
+    finally:
+        con.close()
+
+
+def _get_sprint_cancellation(
+    sprint_doc_id: int,
+    cancellation_id: int | None = None,
+):
+    con = _db()
+    try:
+        cancellation = _cancellation_projection(con, sprint_doc_id)
+        if cancellation is None or (
+            cancellation_id is not None
+            and cancellation["cancellation_id"] != cancellation_id
+        ):
+            return _err(
+                404,
+                "not_found",
+                f"no cancellation resource for sprint {sprint_doc_id}",
+            )
+        return _json(200, cancellation)
     finally:
         con.close()
 
@@ -1432,7 +2320,7 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
         return _create_sprint(actor, headers, data)
     if p.startswith("/api/sprints/"):
         parts = p.strip("/").split("/")
-        if len(parts) not in (3, 4):
+        if len(parts) not in (3, 4, 5):
             return _err(404, "no_such_route", f"no route: {method} {p}")
         try:
             sprint_doc_id = int(parts[2])
@@ -1440,6 +2328,37 @@ def handle(method: str, path: str, headers_raw: str, body: bytes) -> tuple:
             return _err(422, "validation", "sprint id must be an integer")
         if len(parts) == 3 and method == "GET":
             return _get_sprint(sprint_doc_id)
+        if len(parts) == 3 and method == "PATCH":
+            if data.get("state") == "active":
+                return _arm_sprint(actor, headers, sprint_doc_id, data)
+            if data.get("state") == "aborted":
+                return _abort_sprint(actor, headers, sprint_doc_id, data)
+            return _err(
+                422,
+                "validation",
+                "Planner Sprint state update must request active or aborted",
+            )
         if len(parts) == 4 and parts[3] == "adopt" and method == "POST":
             return _adopt_sprint(actor, headers, sprint_doc_id, data)
+        if len(parts) == 4 and parts[3] == "cancellations" \
+                and method == "POST":
+            return _cancel_sprint(
+                actor, headers, sprint_doc_id, data
+            )
+        if len(parts) == 4 and parts[3] == "cancellations" \
+                and method == "GET":
+            return _get_sprint_cancellation(sprint_doc_id)
+        if len(parts) == 5 and parts[3] == "cancellations" \
+                and method == "GET":
+            try:
+                cancellation_id = int(parts[4])
+            except ValueError:
+                return _err(
+                    422,
+                    "validation",
+                    "cancellation id must be an integer",
+                )
+            return _get_sprint_cancellation(
+                sprint_doc_id, cancellation_id
+            )
     return _err(404, "no_such_route", f"no route: {method} {p}")

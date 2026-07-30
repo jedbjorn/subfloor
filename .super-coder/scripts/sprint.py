@@ -9,6 +9,8 @@ sprint 25 seq 8 task #84; wake ops seq 10 task #86).
     ./sc sprint board      --sprint <doc-id>
     ./sc sprint declare    --spec <doc-id> --title "…" --planner-route H/M
                            --dev-route H/M --reviewer-route H/M
+    ./sc sprint arm        --sprint <doc-id>
+    ./sc sprint abort      --sprint <doc-id> (--report TEXT | --report-file P)
 
 The BOARD is a record, not a markdown table a planner edits by hand (spec
 doc 58). The planner is its only writer — devs and reviewers work and
@@ -40,10 +42,11 @@ the planner's job. Cancelled units never had a clean review and are exempt.
 write it back into the document: the document keeps its prose, the record is
 the source, and a stored copy would state the board twice.
 
-The retired Interface wake verbs are not part of this parser. During the
-Conductor branch's decoupling window, workers boot explicitly through plain
-headless `./sc run`; automated coordination arrives with the Conductor. The
-CLI remains a pure API client (shell token); it never touches the DB directly.
+The originating Planner arms the fully staged board. The browser never does.
+The browser may cancel at any time; that stops work and sends the same Planner
+one fresh closeout turn. `abort` records that Planner's report and terminalizes
+the Sprint. The CLI remains a pure API client (shell token); it never touches
+the DB directly.
 """
 from __future__ import annotations
 
@@ -54,6 +57,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 
 import ports as ports_mod
 
@@ -110,7 +114,7 @@ def _api(method: str, path: str, payload: "dict | None" = None,
 
 
 _CONDUCTOR_COMMANDS = frozenset(
-    {"action", "arm", "disarm", "status", "alerts", "retry"}
+    {"action", "disarm", "status", "alerts", "retry"}
 )
 
 
@@ -298,7 +302,45 @@ def cmd_declare(args) -> int:
     print(
         f"sc sprint: declared #{sprint['sprint_doc_id']} "
         f"({sprint['title']}) from spec #{args.spec}; "
-        "provision the board, verify it, then emit handoff"
+        "provision the board, verify it, then run `sc sprint arm "
+        f"--sprint {sprint['sprint_doc_id']}`"
+    )
+    return 0
+
+
+def cmd_arm(args) -> int:
+    sprint = _api(
+        "PATCH",
+        f"/api/sprints/{args.sprint}",
+        {"state": "active"},
+        f"sprint-arm|{args.sprint}|{uuid.uuid4()}",
+    )
+    conductor = sprint.get("conductor") or {}
+    print(
+        f"sc sprint: armed #{args.sprint}; persistent Conductor "
+        f"{conductor.get('shell', {}).get('shortname') or 'queued'} now "
+        "oversees the Sprint"
+    )
+    return 0
+
+
+def cmd_abort(args) -> int:
+    if args.report_file:
+        try:
+            report = Path(args.report_file).read_text()
+        except OSError as exc:
+            raise _die(f"cannot read abort report {args.report_file!r}: {exc}")
+    else:
+        report = args.report
+    sprint = _api(
+        "PATCH",
+        f"/api/sprints/{args.sprint}",
+        {"state": "aborted", "report": report},
+        f"sprint-abort|{args.sprint}|{uuid.uuid4()}",
+    )
+    print(
+        f"sc sprint: #{args.sprint} aborted by its originating Planner "
+        f"({sprint['title']})"
     )
     return 0
 
@@ -317,6 +359,19 @@ def main(argv: "list[str] | None" = None) -> int:
     declare.add_argument("--planner-route", required=True)
     declare.add_argument("--dev-route", required=True)
     declare.add_argument("--reviewer-route", required=True)
+    arm = sub.add_parser(
+        "arm",
+        help="validate the staged board and atomically start its Conductor",
+    )
+    arm.add_argument("--sprint", type=int, required=True)
+    abort = sub.add_parser(
+        "abort",
+        help="originating Planner: finish an operator-cancelled Sprint",
+    )
+    abort.add_argument("--sprint", type=int, required=True)
+    report = abort.add_mutually_exclusive_group(required=True)
+    report.add_argument("--report")
+    report.add_argument("--report-file")
     un = sub.add_parser("unit", help="the sprint board record — declare, "
                                      "reassign, and move units (planner "
                                      "writes; anyone reads)")
@@ -382,6 +437,10 @@ def main(argv: "list[str] | None" = None) -> int:
         return cmd_board(args)
     if args.cmd == "declare":
         return cmd_declare(args)
+    if args.cmd == "arm":
+        return cmd_arm(args)
+    if args.cmd == "abort":
+        return cmd_abort(args)
     raise AssertionError(f"unhandled sprint command: {args.cmd}")
 
 

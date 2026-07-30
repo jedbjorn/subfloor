@@ -48,9 +48,12 @@ function mdBlock(text) {
   return div;
 }
 
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, extraHeaders = {}) {
   const r = await fetch("/api" + path, {
-    method, headers: body ? { "Content-Type": "application/json" } : {},
+    method, headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...extraHeaders,
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
@@ -2452,9 +2455,8 @@ async function renderAnalytics(root) {
 }
 
 // ── Active sprints ───────────────────────────────────────────────────────────
-// This is a read-only status surface. The API owns every displayed value; the
-// browser owns only refresh timing, local duration arithmetic, and stale-state
-// retention.
+// The API owns every displayed value. The browser never activates a Sprint:
+// its sole lifecycle control is the operator's durable cancellation resource.
 const SPRINTS_REFRESH_MS = 15000;
 const SPRINTS_DURATION_MS = 60000;
 const SPRINTS_SVG_NS = "http://www.w3.org/2000/svg";
@@ -2502,6 +2504,47 @@ function sprintsHeader(sprint) {
     el("h2", {}, sprint.title),
     el("span", { className: "pill" }, `Doc #${sprint.document_id}`),
     el("span", { className: "pill" }, sprint.state || "unknown"));
+  const cancel = el("button", {
+    className: "act danger sprint-cancel",
+    type: "button",
+    textContent: "Cancel Sprint",
+    title: "Stop Sprint work and route the Planner to an abort report",
+  });
+  cancel.onclick = async () => {
+    if (!confirm(
+      `Cancel ${sprint.title}?\n\n`
+      + "This immediately stops queued and active Sprint work, clears the "
+      + "active board, and asks the originating Planner for an abort report."
+    )) return;
+    const reason = (prompt(
+      "Cancellation reason:", "Cancelled by FnB") || "").trim();
+    if (!reason) return;
+    cancel.disabled = true;
+    cancel.textContent = "Cancelling…";
+    try {
+      await api(
+        `/sprints/${sprint.document_id}/cancellations`,
+        "POST",
+        { reason },
+        { "Idempotency-Key": requestKey() },
+      );
+      sprintsState.payload.sprints = (
+        sprintsState.payload.sprints || []
+      ).filter((item) => item.document_id !== sprint.document_id);
+      sprintsState.payload.active_count = Math.max(
+        0, Number(sprintsState.payload.active_count || 0) - 1);
+      sprintsState.renderedSignature = null;
+      sprintsUpdateNav(sprintsState.payload);
+      sprintsPaint();
+      toast(
+        `Sprint #${sprint.document_id} cancelled; Planner abort report queued.`);
+    } catch (error) {
+      cancel.disabled = false;
+      cancel.textContent = "Cancel Sprint";
+      toast("error: " + error.message);
+    }
+  };
+  header.append(cancel);
   const planner = sprint.planner
     ? sprint.planner.shortname : "Unbound";
   const feature = sprint.feature
@@ -2534,6 +2577,46 @@ function sprintsHeader(sprint) {
       durationNode);
   }
   return [header, meta];
+}
+
+function sprintsConductor(sprint) {
+  const conductor = sprint.conductor;
+  if (!conductor) return el(
+    "div", { className: "sprint-conductor muted" },
+    "Conductor has not started.");
+  const transcript = el("div", { className: "sprint-conductor-transcript" });
+  for (const message of conductor.messages || []) {
+    transcript.append(el(
+      "div",
+      { className: `sprint-conductor-line ${message.sender_kind}` },
+      el("span", { className: "k" },
+        message.sender_kind === "engine" ? "Engine" : message.sender_kind),
+      " ",
+      message.body,
+    ));
+  }
+  const assistantText = (conductor.assistant || [])
+    .map((item) => item.text || "").join("");
+  if (assistantText) transcript.append(el(
+    "div",
+    { className: "sprint-conductor-line assistant" },
+    el("span", { className: "k" }, conductor.shell?.shortname || "Conductor"),
+    " ",
+    assistantText,
+  ));
+  if (!transcript.children.length)
+    transcript.append(el("div", { className: "muted" }, "No transcript yet."));
+  return el(
+    "details",
+    { className: "sprint-conductor" },
+    el(
+      "summary",
+      {},
+      `Conductor · ${conductor.shell?.shortname || "unknown"} · `
+      + `${conductor.state || "unknown"}`,
+    ),
+    transcript,
+  );
 }
 
 // Most-advanced state first: dependency wires run prerequisite → dependent,
@@ -2867,6 +2950,7 @@ function sprintsRenderedProjection(payload) {
     planner_route: sprint.planner_route,
     dev_route: sprint.dev_route,
     reviewer_route: sprint.reviewer_route,
+    conductor: sprint.conductor,
     qaqc: sprint.qaqc ? {
       review_id: sprint.qaqc.review_id,
       verdict: sprint.qaqc.verdict,
@@ -2928,7 +3012,8 @@ function sprintsPaint() {
     nodes.push(el("div", { className: "card" }, "No active sprints."));
   for (const sprint of sprints) {
     nodes.push(el("section", { className: "card sprint-board" },
-      ...sprintsHeader(sprint), sprintsBuildFlow(sprint)));
+      ...sprintsHeader(sprint), sprintsBuildFlow(sprint),
+      sprintsConductor(sprint)));
   }
   root.replaceChildren(...nodes);
   sprintsState.renderedRoot = root;
@@ -3023,7 +3108,7 @@ async function renderSprints(root) {
 // terminal, tmux controls, or live hand-off between browser and CLI.
 const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"];
 const CHAT_FLAVOR_ORDER = [
-  "cartographer", "admin", "conductor", "planner", "dev", "reviewer", "devops",
+  "cartographer", "admin", "planner", "dev", "reviewer", "devops",
 ];
 const CHAT_CONFIGURE_ROUTE = "configure";
 const CHAT_HISTORY_POLL_MS = 2000;
@@ -3677,12 +3762,13 @@ async function renderInterface(root) {
   chatStopHistoryPoll();
   const generation = ++chatRenderGeneration;
   root.replaceChildren(el("div", { className: "chat-loading" }, "Loading conversations…"));
-  const [{ shells }, defaults, catalog, allConversations] = await Promise.all([
+  const [{ shells: allShells }, defaults, catalog, allConversations] = await Promise.all([
     api("/shells"),
     api("/flavor-defaults"),
     api("/models").catch(() => ({ harnesses: {}, stale: true })),
     chatApi("/conversations?limit=100"),
   ]);
+  const shells = allShells.filter((item) => item.flavor !== "conductor");
   if (generation !== chatRenderGeneration) return;
   if (!shells.length) {
     root.replaceChildren(el("div", { className: "card muted" }, "No shells."));

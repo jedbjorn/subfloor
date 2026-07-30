@@ -106,6 +106,8 @@ class ConversationLaunchPreparer:
                 "sp.state AS sprint_state,sp.spec_doc_id,sp.planner_shell_id,"
                 "sp.planner_route,"
                 "sp.dev_route,sp.reviewer_route,"
+                "cancel.state AS cancellation_state,"
+                "cancel.planner_conversation_id AS cancellation_planner_id,"
                 "sprint_doc.title AS sprint_title,"
                 "spec_doc.title AS spec_title,"
                 "u.seq AS unit_seq,u.unit_title,u.state AS unit_state,"
@@ -116,6 +118,8 @@ class ConversationLaunchPreparer:
                 "LEFT JOIN sprint_conversation_bindings b "
                 " ON b.conversation_id=c.conversation_id "
                 "LEFT JOIN sprints sp ON sp.sprint_doc_id=b.sprint_doc_id "
+                "LEFT JOIN sprint_cancellations cancel "
+                " ON cancel.sprint_doc_id=b.sprint_doc_id "
                 "LEFT JOIN documents sprint_doc "
                 " ON sprint_doc.document_id=b.sprint_doc_id "
                 "LEFT JOIN documents spec_doc "
@@ -174,7 +178,13 @@ class ConversationLaunchPreparer:
                 "SPRINT_BINDING_TERMINAL",
                 f"Sprint assignment {row['binding_id']} is already terminal",
             )
-        if row["sprint_state"] not in {"active", "closing"}:
+        cancelled_closeout = (
+            role == "planner"
+            and row["cancellation_state"] == "requested"
+            and row["cancellation_planner_id"] == broker_run.conversation_id
+        )
+        if row["sprint_state"] not in {"active", "closing"} \
+                and not cancelled_closeout:
             raise ConversationLaunchError(
                 "SPRINT_NOT_LAUNCHABLE",
                 f"Sprint {row['sprint_doc_id']} is "
