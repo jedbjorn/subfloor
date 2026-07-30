@@ -2,10 +2,12 @@
 """Feature #24 conversation schema, transition, and rebuild contracts."""
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -19,6 +21,7 @@ FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
+import db_driver  # noqa: E402
 import snapshot  # noqa: E402
 
 
@@ -48,6 +51,16 @@ class ConversationDbCase(unittest.TestCase):
             "INSERT INTO shells "
             "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
             "VALUES (2,'Review','rev1','reviewer','prompt',1)"
+        )
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (3,'Planner','plan1','planner','prompt',1)"
+        )
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Conductor','con1','conductor','prompt',1)"
         )
         self.con.execute(
             "INSERT INTO documents "
@@ -127,6 +140,84 @@ class ConversationDbCase(unittest.TestCase):
                 caused_by_message_id,
                 state,
                 completed_at,
+            ),
+        ).lastrowid
+
+    def add_sprint(self) -> int:
+        self.con.execute(
+            "INSERT OR IGNORE INTO sprints "
+            "(sprint_doc_id,state,legacy) VALUES (24,'declared',1)"
+        )
+        return 24
+
+    def add_unit(self, *, seq: str = "U1") -> int:
+        self.add_sprint()
+        return self.con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id,seq,unit_title) VALUES (24,?,'Unit')",
+            (seq,),
+        ).lastrowid
+
+    def add_directive(self, *, unit_id: int | None = None) -> int:
+        self.add_sprint()
+        return self.con.execute(
+            "INSERT INTO directives "
+            "(issuer_flavor,kind,target,sprint_doc_id,unit_id) "
+            "VALUES ('system','stall','conductor',24,?)",
+            (unit_id,),
+        ).lastrowid
+
+    def add_shell_message(self, *, kind: str = "result") -> int:
+        self.add_sprint()
+        return self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,body,kind,sprint_doc_id) "
+            "VALUES (1,4,'Sprint evidence',?,24)",
+            (kind,),
+        ).lastrowid
+
+    def add_binding(
+        self,
+        conversation_id: str,
+        *,
+        role: str = "conductor",
+        slot: str | None = None,
+        unit_id: int | None = None,
+        source_directive_id: int | None = None,
+        source_message_id: int | None = None,
+        required_result_kind: str | None = None,
+        state: str = "pending",
+        outcome: str | None = None,
+        result_message_id: int | None = None,
+    ) -> int:
+        self.add_sprint()
+        return self.con.execute(
+            "INSERT INTO sprint_conversation_bindings "
+            "(conversation_id,sprint_doc_id,role,lifecycle,slot,unit_id,"
+            "source_directive_id,source_message_id,required_result_kind,"
+            "state,outcome,result_message_id,started_at,completed_at) "
+            "VALUES (?,24,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                conversation_id,
+                role,
+                "persistent" if role == "conductor" else "one_shot",
+                slot
+                or {
+                    "conductor": "con1",
+                    "planner": "plan1",
+                    "developer": "dev1",
+                    "reviewer": "rev1",
+                    "conformance": "rev1",
+                }[role],
+                unit_id,
+                source_directive_id,
+                source_message_id,
+                required_result_kind,
+                state,
+                outcome,
+                result_message_id,
+                "2026-07-30 00:01:00" if state == "active" else None,
+                "2026-07-30 00:02:00" if state == "terminal" else None,
             ),
         ).lastrowid
 
@@ -268,6 +359,77 @@ class MigrationAndShapeTest(ConversationDbCase):
                     "WHERE creation_idempotency_key='legacy'"
                 )
 
+    def test_binding_migration_preserves_reserved_sprint_conversation(
+        self,
+    ) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            apply_schema(
+                con,
+                through="0134_conversation_stars.sql",
+            )
+            con.execute(
+                "INSERT INTO users (user_id,username) VALUES (9,'legacy')"
+            )
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Conductor','con9','conductor','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO documents "
+                "(document_id,kind,title,body) "
+                "VALUES (99,'doc','SPRINT: reserved','x')"
+            )
+            con.execute(
+                "INSERT INTO sprints "
+                "(sprint_doc_id,state,legacy) VALUES (99,'declared',1)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES ('cv_reserved',9,'sprint',99,'opencode','/tmp/con9',"
+                "'reserved','hash')"
+            )
+
+            con.executescript(
+                (
+                    MIGRATIONS / "0135_sprint_conversation_bindings.sql"
+                ).read_text()
+            )
+
+            self.assertEqual(
+                con.execute(
+                    "SELECT conversation_id FROM conversations"
+                ).fetchone()[0],
+                "cv_reserved",
+            )
+            self.assertIsNone(
+                con.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='index' "
+                    "AND name='idx_conversations_live_sprint'"
+                ).fetchone()
+            )
+            con.execute(
+                "INSERT INTO sprint_conversation_bindings "
+                "(conversation_id,sprint_doc_id,role,lifecycle,slot) "
+                "VALUES ('cv_reserved',99,'conductor','persistent','con9')"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES ('cv_second',9,'sprint',99,'opencode','/tmp/con9',"
+                "'second','hash')"
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO sprint_conversation_bindings "
+                    "(conversation_id,sprint_doc_id,role,lifecycle,slot) "
+                    "VALUES ('cv_second',99,'conductor','persistent','con9')"
+                )
+
     def test_normal_and_reserved_sprint_ownership_shapes(self) -> None:
         normal = self.add_conversation()
         sprint = self.add_conversation(mode="sprint")
@@ -281,16 +443,185 @@ class MigrationAndShapeTest(ConversationDbCase):
                 "VALUES (1,'normal','codex','/tmp/x','bad','hash')"
             )
 
-    def test_one_live_sprint_conversation(self) -> None:
-        first = self.add_conversation(mode="sprint")
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.add_conversation(mode="sprint")
-        self.con.execute(
-            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
-            "WHERE conversation_id=?",
-            (first,),
+    def test_sprint_binding_scopes_conductor_and_worker_uniqueness(self) -> None:
+        self.add_sprint()
+        conductor = self.add_conversation(shell_id=4, mode="sprint")
+        conductor_binding = self.add_binding(conductor)
+
+        unit_id = self.add_unit()
+        directive_id = self.add_directive(unit_id=unit_id)
+        worker = self.add_conversation(shell_id=1, mode="sprint")
+        worker_binding = self.add_binding(
+            worker,
+            role="developer",
+            slot="dev1",
+            unit_id=unit_id,
+            source_directive_id=directive_id,
+            required_result_kind="unit-report",
         )
-        self.add_conversation(mode="sprint")
+
+        second_conductor = self.add_conversation(shell_id=4, mode="sprint")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_binding(second_conductor)
+
+        duplicate = self.add_conversation(shell_id=1, mode="sprint")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_binding(
+                duplicate,
+                role="developer",
+                slot="dev1",
+                unit_id=unit_id,
+                source_directive_id=directive_id,
+                required_result_kind="unit-report",
+            )
+
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings "
+            "SET state='active',started_at=datetime('now') "
+            "WHERE binding_id IN (?,?)",
+            (conductor_binding, worker_binding),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE sprint_conversation_bindings "
+                "SET state='terminal',outcome='closed',"
+                "completed_at=datetime('now') WHERE binding_id=?",
+                (conductor_binding,),
+            )
+        self.con.execute(
+            "UPDATE conversations "
+            "SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id IN (?,?)",
+            (conductor, worker),
+        )
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings "
+            "SET state='terminal',outcome='closed',completed_at=datetime('now') "
+            "WHERE binding_id=?",
+            (conductor_binding,),
+        )
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings "
+            "SET state='terminal',outcome='failed',completed_at=datetime('now') "
+            "WHERE binding_id=?",
+            (worker_binding,),
+        )
+
+        self.add_binding(second_conductor)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_binding(
+                duplicate,
+                role="developer",
+                slot="dev1",
+                unit_id=unit_id,
+                source_directive_id=directive_id,
+                required_result_kind="unit-report",
+            )
+
+        self.assertEqual(
+            [
+                row[0]
+                for row in self.con.execute(
+                    "SELECT role FROM sprint_conversation_bindings "
+                    "ORDER BY binding_id"
+                ).fetchall()
+            ],
+            ["conductor", "developer", "conductor"],
+        )
+
+    def test_sprint_binding_rejects_wrong_mode_role_and_source_scope(
+        self,
+    ) -> None:
+        normal = self.add_conversation(shell_id=4)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_binding(normal)
+
+        wrong_role = self.add_conversation(shell_id=1, mode="sprint")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_binding(wrong_role, role="planner")
+
+        self.add_sprint()
+        self.con.execute(
+            "INSERT INTO documents "
+            "(document_id,kind,title,body) "
+            "VALUES (25,'doc','SPRINT: other','x')"
+        )
+        self.con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy) VALUES (25,'declared',1)"
+        )
+        other_directive = self.con.execute(
+            "INSERT INTO directives "
+            "(issuer_flavor,kind,target,sprint_doc_id) "
+            "VALUES ('system','stall','conductor',25)"
+        ).lastrowid
+        planner = self.add_conversation(shell_id=3, mode="sprint")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add_binding(
+                planner,
+                role="planner",
+                slot="plan1",
+                source_directive_id=other_directive,
+                required_result_kind="answer",
+            )
+
+    def test_succeeded_assignment_requires_scoped_result_and_is_immutable(
+        self,
+    ) -> None:
+        unit_id = self.add_unit()
+        directive_id = self.add_directive(unit_id=unit_id)
+        conversation = self.add_conversation(shell_id=1, mode="sprint")
+        binding_id = self.add_binding(
+            conversation,
+            role="developer",
+            slot="dev1",
+            unit_id=unit_id,
+            source_directive_id=directive_id,
+            required_result_kind="unit-report",
+        )
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings "
+            "SET state='active',started_at=datetime('now') "
+            "WHERE binding_id=?",
+            (binding_id,),
+        )
+
+        wrong_kind = self.add_shell_message(kind="task")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE sprint_conversation_bindings "
+                "SET state='terminal',outcome='succeeded',"
+                "result_message_id=?,completed_at=datetime('now') "
+                "WHERE binding_id=?",
+                (wrong_kind, binding_id),
+            )
+
+        result_message = self.add_shell_message()
+        self.con.execute(
+            "UPDATE conversations "
+            "SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (conversation,),
+        )
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings "
+            "SET state='terminal',outcome='succeeded',"
+            "result_message_id=?,completed_at=datetime('now') "
+            "WHERE binding_id=?",
+            (result_message, binding_id),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE sprint_conversation_bindings "
+                "SET outcome='failed',result_message_id=NULL "
+                "WHERE binding_id=?",
+                (binding_id,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "DELETE FROM sprint_conversation_bindings WHERE binding_id=?",
+                (binding_id,),
+            )
 
     def test_conversation_and_message_idempotency_are_scoped(self) -> None:
         conversation = self.add_conversation()
@@ -510,6 +841,46 @@ class TransitionMatrixTest(ConversationDbCase):
             self.update_outbox(row_id, "cancelled")
         return row_id, conversation, message, run_id
 
+    def update_sprint_binding(self, row_id: int, target: str) -> None:
+        if target == "terminal":
+            self.con.execute(
+                "UPDATE conversations "
+                "SET state='closed',closed_at='2026-07-30 00:02:00' "
+                "WHERE conversation_id=("
+                "SELECT conversation_id "
+                "FROM sprint_conversation_bindings WHERE binding_id=?"
+                ")",
+                (row_id,),
+            )
+        self.con.execute(
+            "UPDATE sprint_conversation_bindings "
+            "SET state=?,outcome=?,started_at=?,completed_at=? "
+            "WHERE binding_id=?",
+            (
+                target,
+                "closed" if target == "terminal" else None,
+                "2026-07-30 00:01:00"
+                if target in {"active", "terminal"}
+                else None,
+                "2026-07-30 00:02:00"
+                if target == "terminal"
+                else None,
+                row_id,
+            ),
+        )
+
+    def sprint_binding_at(self, state: str) -> int:
+        conversation = self.add_conversation(shell_id=4, mode="sprint")
+        row_id = self.add_binding(conversation)
+        paths = {
+            "pending": (),
+            "active": ("active",),
+            "terminal": ("active", "terminal"),
+        }
+        for target in paths[state]:
+            self.update_sprint_binding(row_id, target)
+        return row_id
+
     def assert_matrix(
         self,
         machine: str,
@@ -578,6 +949,16 @@ class TransitionMatrixTest(ConversationDbCase):
             self.update_outbox(row_id, target, run_id=run_id)
 
         self.assert_matrix("outbox", self.outbox_at, update)
+
+    def test_exhaustive_sprint_binding_edges_match_helper(self) -> None:
+        self.assert_matrix(
+            "sprint_binding",
+            self.sprint_binding_at,
+            lambda row_id, target, _made: self.update_sprint_binding(
+                row_id,
+                target,
+            ),
+        )
 
     def test_typed_error_names_edge_and_legal_targets(self) -> None:
         with self.assertRaises(
@@ -715,9 +1096,163 @@ class FenceAndEventTest(ConversationDbCase):
             )
 
 
+class SprintBindingConcurrencyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = Path(self.tmp.name) / "engine.db"
+        con = db_driver.connect(self.db_path)
+        apply_schema(con)
+        con.execute(
+            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+        )
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (1,'Developer','dev1','dev','prompt',1)"
+        )
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Conductor','con1','conductor','prompt',1)"
+        )
+        con.execute(
+            "INSERT INTO documents "
+            "(document_id,kind,title,body) "
+            "VALUES (24,'doc','SPRINT: concurrent bindings','x')"
+        )
+        con.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy) VALUES (24,'declared',1)"
+        )
+        self.unit_id = con.execute(
+            "INSERT INTO sprint_units "
+            "(sprint_doc_id,seq,unit_title) VALUES (24,'U1','Unit')"
+        ).lastrowid
+        self.directive_id = con.execute(
+            "INSERT INTO directives "
+            "(issuer_flavor,kind,target,sprint_doc_id,unit_id) "
+            "VALUES ('system','stall','conductor',24,?)",
+            (self.unit_id,),
+        ).lastrowid
+        con.commit()
+        con.close()
+
+    def race_bindings(
+        self,
+        *,
+        role: str,
+        shell_id: int,
+        unit_id: int | None,
+        source_directive_id: int | None,
+    ) -> list[bool]:
+        barrier = threading.Barrier(3)
+
+        def create(owner: str) -> bool:
+            con = db_driver.connect(self.db_path)
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    with db_driver.write_transaction(
+                        con,
+                        "test.sprint_binding",
+                    ):
+                        conversation_id = f"cv_{owner}"
+                        con.execute(
+                            "INSERT INTO conversations "
+                            "(conversation_id,shell_id,mode,sprint_doc_id,"
+                            "harness,worktree,creation_idempotency_key,"
+                            "creation_request_hash) "
+                            "VALUES (?,?, 'sprint',24,?,?,?,?)",
+                            (
+                                conversation_id,
+                                shell_id,
+                                "opencode" if role == "conductor" else "codex",
+                                f"/tmp/{owner}",
+                                f"create-{owner}",
+                                f"hash-{owner}",
+                            ),
+                        )
+                        con.execute(
+                            "INSERT INTO sprint_conversation_bindings "
+                            "(conversation_id,sprint_doc_id,role,lifecycle,"
+                            "slot,unit_id,source_directive_id,"
+                            "required_result_kind) "
+                            "VALUES (?,24,?,?,?,?,?,?)",
+                            (
+                                conversation_id,
+                                role,
+                                "persistent"
+                                if role == "conductor"
+                                else "one_shot",
+                                "con1" if role == "conductor" else "dev1",
+                                unit_id,
+                                source_directive_id,
+                                None
+                                if role == "conductor"
+                                else "unit-report",
+                            ),
+                        )
+                except sqlite3.IntegrityError:
+                    return False
+                return True
+            finally:
+                con.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            workers = [
+                pool.submit(create, f"broker-{index}")
+                for index in (1, 2)
+            ]
+            barrier.wait(timeout=5)
+            return [worker.result(timeout=10) for worker in workers]
+
+    def assert_single_binding(self, results: list[bool], role: str) -> None:
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(results), 1)
+        con = db_driver.connect(self.db_path)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_conversation_bindings "
+                    "WHERE role=?",
+                    (role,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversations "
+                    "WHERE mode='sprint'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            con.close()
+
+    def test_parallel_conductor_bindings_create_exactly_one(self) -> None:
+        results = self.race_bindings(
+            role="conductor",
+            shell_id=4,
+            unit_id=None,
+            source_directive_id=None,
+        )
+        self.assert_single_binding(results, "conductor")
+
+    def test_parallel_assignment_bindings_create_exactly_one(self) -> None:
+        results = self.race_bindings(
+            role="developer",
+            shell_id=1,
+            unit_id=self.unit_id,
+            source_directive_id=self.directive_id,
+        )
+        self.assert_single_binding(results, "developer")
+
+
 class SnapshotPolicyTest(ConversationDbCase):
     TABLES = (
         "conversations",
+        "sprint_conversation_bindings",
         "conversation_messages",
         "conversation_runs",
         "conversation_events",
@@ -730,6 +1265,50 @@ class SnapshotPolicyTest(ConversationDbCase):
             for table in self.TABLES
         ]
         self.assertEqual(positions, sorted(positions))
+
+    def test_snapshot_round_trip_preserves_sprint_binding(self) -> None:
+        self.add_sprint()
+        conversation = self.add_conversation(shell_id=4, mode="sprint")
+        self.add_binding(conversation, slot="con1")
+
+        body = ["PRAGMA foreign_keys=OFF;", "BEGIN;"]
+        for table in ("conversations", "sprint_conversation_bindings"):
+            body.extend(snapshot.dump_table(self.con, table))
+        body.extend(["COMMIT;", "PRAGMA foreign_keys=ON;"])
+
+        target = sqlite3.connect(":memory:")
+        apply_schema(target)
+        target.execute(
+            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+        )
+        target.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Conductor','con1','conductor','prompt',1)"
+        )
+        target.execute(
+            "INSERT INTO documents "
+            "(document_id,kind,title,body) "
+            "VALUES (24,'doc','SPRINT: conversation test','x')"
+        )
+        target.execute(
+            "INSERT INTO sprints "
+            "(sprint_doc_id,state,legacy) VALUES (24,'declared',1)"
+        )
+        target.executescript("\n".join(body))
+
+        self.assertEqual(
+            target.execute(
+                "SELECT conversation_id,sprint_doc_id,role,lifecycle,slot,"
+                "state FROM sprint_conversation_bindings"
+            ).fetchone(),
+            (conversation, 24, "conductor", "persistent", "con1", "pending"),
+        )
+        self.assertEqual(
+            target.execute("PRAGMA foreign_key_check").fetchall(),
+            [],
+        )
+        target.close()
 
     def test_snapshot_round_trip_preserves_queue_and_recovery_evidence(
             self) -> None:

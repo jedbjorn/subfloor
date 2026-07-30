@@ -102,11 +102,12 @@ PER_INSTANCE_TABLES = [
     "directives",
     "sentinel_events",
     "wake_machine_retirements",
-    # Browser-native conversations are durable instance truth: the exact
-    # harness ref, message queue, recovery evidence, replay events, and pending
-    # outbox must all survive update/rebuild. Parents precede children so a
-    # snapshot remains readable and foreign-key-valid when loaded.
+    # Browser-native conversations are durable instance truth: Sprint bindings,
+    # exact harness refs, message queues, recovery evidence, replay events, and
+    # pending outbox work must all survive update/rebuild. Parents precede
+    # children so a snapshot stays readable and foreign-key-valid when loaded.
     "conversations",
+    "sprint_conversation_bindings",
     "conversation_messages",
     "conversation_runs",
     "conversation_events",
