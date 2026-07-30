@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -41,6 +43,8 @@ USAGE_KEYS = {
 }
 STDERR_LIMIT = 16384
 POLL_INTERVAL = 0.01
+COMPLETION_POLL_INTERVAL = 0.05
+COMPLETION_DRAIN_SECONDS = 0.1
 
 
 class KimiAdapter(ConversationAdapter):
@@ -57,7 +61,7 @@ class KimiAdapter(ConversationAdapter):
         super().__init__(manifest or load_manifest(self.harness))
         if identity_timeout <= 0:
             raise ValueError("identity_timeout must be positive")
-        self.runner = runner or SubprocessRunner()
+        self.runner = runner or SubprocessRunner(start_new_session=True)
         self.sessions_root = sessions_root
         self.identity_timeout = identity_timeout
 
@@ -264,17 +268,57 @@ class KimiAdapter(ConversationAdapter):
         return matches
 
     @staticmethod
-    def _cleanup_process(process: Any, timeout: float) -> None:
-        poll = getattr(process, "poll", None)
-        running = callable(poll) and poll() is None
-        if running:
+    def _signal_owned_process(process: Any, value: signal.Signals) -> None:
+        process_group = getattr(
+            process,
+            "_sc_conversation_process_group",
+            None,
+        )
+        if isinstance(process_group, int):
+            try:
+                os.killpg(process_group, value)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        if value == signal.SIGTERM:
             terminate = getattr(process, "terminate", None)
             if callable(terminate):
                 terminate()
-            else:
-                send_signal = getattr(process, "send_signal", None)
-                if callable(send_signal):
-                    send_signal(signal.SIGTERM)
+                return
+        if value == signal.SIGKILL:
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+                return
+        send_signal = getattr(process, "send_signal", None)
+        if callable(send_signal):
+            send_signal(value)
+
+    @staticmethod
+    def _process_group_alive(process: Any) -> bool:
+        process_group = getattr(
+            process,
+            "_sc_conversation_process_group",
+            None,
+        )
+        if not isinstance(process_group, int):
+            return False
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @classmethod
+    def _cleanup_process(cls, process: Any, timeout: float) -> None:
+        poll = getattr(process, "poll", None)
+        running = callable(poll) and poll() is None
+        if running:
+            cls._signal_owned_process(process, signal.SIGTERM)
         wait = getattr(process, "wait", None)
         if not callable(wait):
             return
@@ -283,13 +327,54 @@ class KimiAdapter(ConversationAdapter):
         except TypeError:
             wait()
         except subprocess.TimeoutExpired:
+            pass
+        if cls._process_group_alive(process):
+            cls._signal_owned_process(process, signal.SIGKILL)
+        elif callable(poll) and poll() is None:
             kill = getattr(process, "kill", None)
             if callable(kill):
                 kill()
+        try:
+            wait(timeout=1.0)
+        except (TypeError, subprocess.TimeoutExpired):
+            pass
+
+    def _watch_native_completion(
+        self,
+        turn: NativeTurn,
+        process: Any,
+        completed: threading.Event,
+        stopped: threading.Event,
+    ) -> None:
+        wire_path = turn.metadata.get("wire_path")
+        if not isinstance(wire_path, str):
+            return
+        wire = Path(wire_path)
+        last_size = -1
+        while not stopped.wait(COMPLETION_POLL_INTERVAL):
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
+                return
             try:
-                wait(timeout=1.0)
-            except (TypeError, subprocess.TimeoutExpired):
-                pass
+                size = wire.stat().st_size
+                if size == last_size:
+                    continue
+                last_size = size
+                records = self._run_slice(turn)
+            except (AdapterError, OSError):
+                continue
+            if not self._usage(records):
+                continue
+            # Give final stdout metadata already in flight (especially the
+            # resume hint) a bounded window to reach the validator.
+            if stopped.wait(COMPLETION_DRAIN_SECONDS):
+                return
+            if turn.metadata.get("identity_mismatch"):
+                return
+            turn.metadata["native_completion_observed"] = True
+            completed.set()
+            self._cleanup_process(process, 1.0)
+            return
 
     def _discover_start(
         self,
@@ -766,28 +851,40 @@ class KimiAdapter(ConversationAdapter):
             {"run_ref": turn.run_ref, "status": "running"},
             "turn.prompt",
         )
-        for line in stdout:
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(raw, dict):
-                continue
-            role = raw.get("role")
-            if not isinstance(role, str):
-                continue
-            if role == "meta" and raw.get("type") == "session.resume_hint":
-                if raw.get("session_id") != turn.session_ref:
-                    turn.metadata["identity_mismatch"] = True
-                    raise AdapterError(
-                        "HARNESS_SESSION_MISMATCH",
-                        "Kimi resume hint differs from persisted session ref",
-                    )
-                continue
-            for event in self._normalize(raw):
-                yield event
+        native_completed = threading.Event()
+        stop_watcher = threading.Event()
+        watcher = threading.Thread(
+            target=self._watch_native_completion,
+            args=(turn, process, native_completed, stop_watcher),
+            name="kimi-native-completion",
+            daemon=True,
+        )
+        watcher.start()
+        try:
+            for line in stdout:
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                role = raw.get("role")
+                if not isinstance(role, str):
+                    continue
+                if role == "meta" and raw.get("type") == "session.resume_hint":
+                    if raw.get("session_id") != turn.session_ref:
+                        turn.metadata["identity_mismatch"] = True
+                        raise AdapterError(
+                            "HARNESS_SESSION_MISMATCH",
+                            "Kimi resume hint differs from persisted session ref",
+                        )
+                    continue
+                for event in self._normalize(raw):
+                    yield event
+        finally:
+            stop_watcher.set()
         returncode = process.wait()
         turn.metadata["returncode"] = returncode
         try:
@@ -808,7 +905,7 @@ class KimiAdapter(ConversationAdapter):
             turn.metadata["terminal"] = event.type
             yield event
             return
-        if returncode == 0:
+        if native_completed.is_set() or returncode == 0:
             usage = self._usage(records)
             if usage:
                 yield NormalizedEvent(
@@ -819,7 +916,11 @@ class KimiAdapter(ConversationAdapter):
             event = NormalizedEvent(
                 "run.completed",
                 {"status": "completed"},
-                "process.exit",
+                (
+                    "usage.record"
+                    if native_completed.is_set()
+                    else "process.exit"
+                ),
             )
             turn.metadata["terminal"] = event.type
             yield event
@@ -840,7 +941,7 @@ class KimiAdapter(ConversationAdapter):
         process = turn.opaque
         if process is None or process.poll() is not None:
             return InterruptResult(False, "Kimi process is not running")
-        process.send_signal(signal.SIGINT)
+        self._signal_owned_process(process, signal.SIGINT)
         turn.metadata["interrupt_acknowledged"] = True
         return InterruptResult(True)
 

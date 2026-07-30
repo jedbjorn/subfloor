@@ -398,6 +398,9 @@ class ProcessRunner(Protocol):
 
 
 class SubprocessRunner:
+    def __init__(self, *, start_new_session: bool = False) -> None:
+        self.start_new_session = start_new_session
+
     def spawn(
         self,
         argv: list[str],
@@ -414,7 +417,10 @@ class SubprocessRunner:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=self.start_new_session,
         )
+        if self.start_new_session:
+            process.__dict__["_sc_conversation_process_group"] = process.pid
         captured: list[str] = []
 
         def drain_stderr() -> None:
