@@ -3124,6 +3124,28 @@ function chatPaintShellState(button, state) {
   button.classList.add("active-chat", `state-${state}`);
 }
 
+function chatPaintStar(button, starred) {
+  button.textContent = starred ? "★" : "☆";
+  button.classList.toggle("starred", starred);
+  button.title = starred ? "Unstar chat" : "Star chat";
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-pressed", String(starred));
+}
+
+function chatPaintHistoryItem(item, conversation) {
+  item.conversation = conversation;
+  item.context.textContent =
+    `${chatStartedLabel(conversation)} | ${chatModelLabel(conversation)}`;
+  item.name.textContent = chatConversationName(conversation);
+  const nextState = conversation.state || "idle";
+  if (!item.state.classList.contains(`state-${nextState}`)) {
+    const state = chatStatePill(nextState);
+    item.state.replaceWith(state);
+    item.state = state;
+  }
+  chatPaintStar(item.star, Boolean(conversation.starred));
+}
+
 function chatQueuedCount(messages) {
   return messages.filter(
     (message) => message.message_kind !== "control"
@@ -3635,7 +3657,8 @@ async function chatRenderOpen(host, initialConversation, initialMessages) {
       paint();
       if (["message.accepted", "run.completed", "run.failed",
            "run.interrupted", "run.unknown",
-           "conversation.renamed", "conversation.closed"].includes(event.event_type))
+           "conversation.updated", "conversation.renamed",
+           "conversation.closed"].includes(event.event_type))
         refresh();
     },
     (value) => {
@@ -3678,7 +3701,7 @@ async function renderInterface(root) {
       || "";
   if (selectedId && !conversations.some((item) => item.conversation_id === selectedId))
     selectedId = "";
-  const selectedConversation = allConversations.items.find(
+  let selectedConversation = allConversations.items.find(
     (item) => item.conversation_id === selectedId);
 
   const layout = el("div", { className: "chat-layout" });
@@ -3760,23 +3783,51 @@ async function renderInterface(root) {
   const history = el("div", { className: "chat-history-list" });
   const historyItems = new Map();
   for (const conversation of conversations) {
-    const button = el("button", {
+    const card = el("div", {
       className: "chat-history-item"
         + (conversation.conversation_id === selectedId ? " selected" : ""),
+    });
+    const open = el("button", {
+      className: "chat-history-open",
       type: "button",
     });
-    button.append(el("span", { className: "chat-history-context" },
-      `${chatStartedLabel(conversation)} | ${chatModelLabel(conversation)}`),
-      el("span", { className: "chat-history-name" },
-      chatConversationName(conversation)),
-      chatStatePill(conversation.state));
-    historyItems.set(conversation.conversation_id, button);
-    button.onclick = async () => {
+    const context = el("span", { className: "chat-history-context" });
+    const name = el("span", { className: "chat-history-name" });
+    const state = chatStatePill(conversation.state);
+    const star = el("button", {
+      className: "chat-history-star",
+      type: "button",
+    });
+    const item = { card, open, context, name, state, star, conversation };
+    open.append(context, name, state);
+    card.append(open, star);
+    chatPaintHistoryItem(item, conversation);
+    historyItems.set(conversation.conversation_id, item);
+    open.onclick = async () => {
       if (conversation.conversation_id === selectedId) return;
       if (await chatCloseForSwitch(selectedConversation))
         location.hash = chatHash(shell.shortname, conversation.conversation_id);
     };
-    history.append(button);
+    star.onclick = async (event) => {
+      event.stopPropagation();
+      star.disabled = true;
+      try {
+        const current = item.conversation;
+        const updated = await chatApi(
+          `/conversations/${current.conversation_id}`,
+          "PATCH",
+          { version: current.version, starred: !current.starred },
+        );
+        chatPaintHistoryItem(item, updated);
+        if (updated.conversation_id === selectedConversation?.conversation_id)
+          selectedConversation = updated;
+      } catch (error) {
+        toast(`${error.code}: ${error.message}`);
+      } finally {
+        star.disabled = false;
+      }
+    };
+    history.append(card);
   }
   if (!conversations.length)
     history.append(el("div", { className: "chat-history-empty" }, "No chats yet."));
@@ -3793,11 +3844,10 @@ async function renderInterface(root) {
         if (conversation.state !== "closed")
           openByShell.set(conversation.shell.shell_id, conversation.state || "idle");
         if (conversation.shell.shell_id !== shell.shell_id) continue;
-        const button = historyItems.get(conversation.conversation_id);
-        const pill = button?.querySelector(".chat-state");
-        const nextState = conversation.state || "idle";
-        if (!pill || pill.classList.contains(`state-${nextState}`)) continue;
-        pill.replaceWith(chatStatePill(nextState));
+        const item = historyItems.get(conversation.conversation_id);
+        if (item) chatPaintHistoryItem(item, conversation);
+        if (conversation.conversation_id === selectedConversation?.conversation_id)
+          selectedConversation = conversation;
       }
       for (const [shellId, button] of shellItems)
         chatPaintShellState(button, openByShell.get(shellId));

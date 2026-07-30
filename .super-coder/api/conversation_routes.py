@@ -318,7 +318,7 @@ def _append_event(
 def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
-        "c.provider,c.model,c.effort,c.state,c.title,c.created_at,"
+        "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         "WHERE c.conversation_id=? AND c.mode='normal' AND c.owner_user_id=?",
@@ -343,6 +343,7 @@ def _conversation_projection(row) -> dict:
         },
         "state": row["state"],
         "title": row["title"],
+        "starred": bool(row["starred"]),
         "created_at": row["created_at"],
         "last_activity_at": row["last_activity_at"],
         "closed_at": row["closed_at"],
@@ -677,7 +678,7 @@ def _list_conversations(con, operator: dict, query):
         params.extend((decoded["a"], decoded["a"], decoded["id"]))
     rows = con.execute(
         "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
-        "c.provider,c.model,c.effort,c.state,c.title,c.created_at,"
+        "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE "
         + " AND ".join(clauses)
@@ -701,7 +702,7 @@ def _list_conversations(con, operator: dict, query):
 
 
 def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
-    _only_fields(body, {"version", "title", "state"})
+    _only_fields(body, {"version", "title", "state", "starred"})
     if "version" not in body:
         raise ApiError(
             422, "VALIDATION_ERROR", "version is required for conversation updates"
@@ -709,13 +710,15 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
     version = _integer(body["version"], "version")
     if version <= 0:
         raise ApiError(422, "VALIDATION_ERROR", "version must be positive")
-    if "title" not in body and "state" not in body:
+    if not {"title", "state", "starred"}.intersection(body):
         raise ApiError(422, "VALIDATION_ERROR", "no conversation change supplied")
     title = (
         _nonblank(body.get("title"), "title", maximum=200, optional=True)
         if "title" in body
         else None
     )
+    if "starred" in body and not isinstance(body["starred"], bool):
+        raise ApiError(422, "VALIDATION_ERROR", "starred must be a boolean")
     if "state" in body and body["state"] != "closed":
         raise ApiError(422, "VALIDATION_ERROR", "state may only be changed to closed")
 
@@ -729,7 +732,7 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                 {"expected": int(row["version"]), "received": version},
             )
         closing = body.get("state") == "closed"
-        if row["state"] == "closed":
+        if row["state"] == "closed" and {"title", "state"}.intersection(body):
             raise ApiError(
                 409,
                 "CONVERSATION_CLOSED",
@@ -742,11 +745,16 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                 "a queued or running conversation cannot be closed",
                 {"state": row["state"]},
             )
-        sets = ["version=version+1", "last_activity_at=datetime('now')"]
+        sets = ["version=version+1"]
+        if "title" in body or closing:
+            sets.append("last_activity_at=datetime('now')")
         params: list = []
         if "title" in body:
             sets.append("title=?")
             params.append(title)
+        if "starred" in body:
+            sets.append("starred=?")
+            params.append(int(body["starred"]))
         if closing:
             sets.extend(("state='closed'", "closed_at=datetime('now')"))
         changed = con.execute(
@@ -764,14 +772,15 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
             con,
             conversation_id,
             (
-                "conversation.updated"
-                if "title" in body and closing
-                else "conversation.closed"
-                if closing
+                "conversation.closed"
+                if closing and set(body) == {"version", "state"}
                 else "conversation.renamed"
+                if set(body) == {"version", "title"}
+                else "conversation.updated"
             ),
             {
                 **({"title": title} if "title" in body else {}),
+                **({"starred": body["starred"]} if "starred" in body else {}),
                 **({"state": "closed"} if closing else {}),
             },
         )

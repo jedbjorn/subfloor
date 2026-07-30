@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -215,6 +216,57 @@ class MigrationAndShapeTest(ConversationDbCase):
             "conversation_outbox",
         }.issubset(tables))
         con.close()
+
+    def test_star_migration_defaults_legacy_rows_and_enforces_boolean_values(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            apply_schema(
+                con,
+                through="0133_one_open_normal_conversation_per_shell.sql",
+            )
+            con.execute(
+                "INSERT INTO users (user_id,username) VALUES (9,'legacy')"
+            )
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,mode,owner_user_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (9,'normal',9,'codex','/tmp/legacy','legacy','hash')"
+            )
+
+            con.executescript(
+                (
+                    MIGRATIONS / "0134_conversation_stars.sql"
+                ).read_text()
+            )
+
+            self.assertEqual(
+                con.execute(
+                    "SELECT starred FROM conversations "
+                    "WHERE creation_idempotency_key='legacy'"
+                ).fetchone()[0],
+                0,
+            )
+            con.execute(
+                "UPDATE conversations SET starred=1 "
+                "WHERE creation_idempotency_key='legacy'"
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT starred FROM conversations "
+                    "WHERE creation_idempotency_key='legacy'"
+                ).fetchone()[0],
+                1,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "UPDATE conversations SET starred=2 "
+                    "WHERE creation_idempotency_key='legacy'"
+                )
 
     def test_normal_and_reserved_sprint_ownership_shapes(self) -> None:
         normal = self.add_conversation()

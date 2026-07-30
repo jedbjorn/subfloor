@@ -208,19 +208,22 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     assert ".chat-shell-divider" in STYLE
 
 
-def test_history_badges_and_all_shell_accents_poll_without_repainting_the_interface():
+def test_history_metadata_and_all_shell_accents_poll_without_repainting_interface():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert "const CHAT_HISTORY_POLL_MS = 2000" in interface
     assert "if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer)" in interface
     assert "const historyItems = new Map()" in interface
     assert "const shellItems = new Map()" in interface
-    assert "historyItems.set(conversation.conversation_id, button)" in interface
+    assert "historyItems.set(conversation.conversation_id, item)" in interface
     assert "shellItems.set(item.shell_id, button)" in interface
     assert 'await chatApi("/conversations?limit=100")' in interface
     assert "generation !== chatRenderGeneration || !chatHistoryPollTimer" in interface
     assert "historyItems.get(conversation.conversation_id)" in interface
-    assert "pill.replaceWith(chatStatePill(nextState))" in interface
+    assert "chatPaintHistoryItem(item, conversation)" in interface
+    assert "item.name.textContent = chatConversationName(conversation)" in interface
+    assert "chatPaintStar(item.star, Boolean(conversation.starred))" in interface
+    assert "selectedConversation = conversation" in interface
     assert "const openByShell = new Map()" in interface
     assert 'if (conversation.state !== "closed")' in interface
     assert "openByShell.set(conversation.shell.shell_id" in interface
@@ -232,6 +235,26 @@ def test_history_badges_and_all_shell_accents_poll_without_repainting_the_interf
     poll = interface[interface.index("const pollHistory = async"):
                      interface.index("chatHistoryPollTimer = setInterval")]
     assert "renderInterface(" not in poll
+
+
+def test_history_card_has_independent_durable_star_button():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    history = interface[interface.index('const history = el("div"'):
+                        interface.index("if (!conversations.length)")]
+
+    assert 'const card = el("div", {' in history
+    assert 'className: "chat-history-open"' in history
+    assert 'className: "chat-history-star"' in history
+    assert "open.append(context, name, state)" in history
+    assert "card.append(open, star)" in history
+    assert "event.stopPropagation()" in history
+    assert '{ version: current.version, starred: !current.starred }' in history
+    assert "chatPaintHistoryItem(item, updated)" in history
+    assert 'button.textContent = starred ? "★" : "☆"' in interface
+    assert 'button.setAttribute("aria-pressed", String(starred))' in interface
+    assert ".chat-history-star:hover, .chat-history-star.starred" in STYLE
+    assert "color: #f4cf4a; opacity: 1;" in STYLE
 
 
 def test_working_state_is_plain_animated_transcript_text_not_a_header_pill():
@@ -303,6 +326,8 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-title-button",
         ".chat-shell.active-chat::before",
         ".chat-working-indicator",
+        ".chat-history-open",
+        ".chat-history-star",
     ):
         assert selector in STYLE
     assert "grid-template-columns: 260px 260px minmax(0, 1fr)" in STYLE
