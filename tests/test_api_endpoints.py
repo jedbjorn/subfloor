@@ -156,6 +156,120 @@ class AssemblerSmokeTest(unittest.TestCase):
         by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
         self.assertIsNone(by_id[shell_id]["sprint"])
 
+    def test_get_shells_prioritizes_armed_then_latest_paused_sprint(self) -> None:
+        shell_id = self.ids["shell_id"]
+        self.con.execute(
+            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+        )
+        self.con.execute(
+            "UPDATE shells SET user_id=1 WHERE shell_id=?", (shell_id,)
+        )
+
+        paused_id = self.con.execute(
+            "INSERT INTO sprints "
+            "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+            "VALUES (?,?,1)",
+            (self.ids["feature_id"], shell_id),
+        ).lastrowid
+        paused_participant_id = self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'developer','codex','active')",
+            (paused_id, shell_id),
+        ).lastrowid
+        paused_conversation_id = server.sprint_participant_chats.create_and_select(
+            self.con,
+            participant_id=int(paused_participant_id),
+            owner_user_id=1,
+            purpose="work",
+            harness="codex",
+            provider="openai",
+            model=None,
+            effort="high",
+            worktree="/fixture/paused",
+            title="Paused Sprint participant",
+            idempotency_key="fixture:sprint:paused:participant:work",
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 08:00:00' "
+            "WHERE sprint_id=?",
+            (paused_id,),
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused',paused_at='2026-07-31 10:00:00' "
+            "WHERE sprint_id=?",
+            (paused_id,),
+        )
+
+        armed_id = self.con.execute(
+            "INSERT INTO sprints "
+            "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+            "VALUES (?,?,1)",
+            (self.ids["feature_id"], shell_id),
+        ).lastrowid
+        armed_participant_id = self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'reviewer','kimi','idle')",
+            (armed_id, shell_id),
+        ).lastrowid
+        armed_conversation_id = server.sprint_participant_chats.create_and_select(
+            self.con,
+            participant_id=int(armed_participant_id),
+            owner_user_id=1,
+            purpose="work",
+            harness="kimi",
+            provider="kimi",
+            model=None,
+            effort="high",
+            worktree="/fixture/armed",
+            title="Armed Sprint participant",
+            idempotency_key="fixture:sprint:armed:participant:work",
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 11:00:00' "
+            "WHERE sprint_id=?",
+            (armed_id,),
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            {
+                "sprint_id": int(armed_id),
+                "lifecycle": "armed",
+                "role": "reviewer",
+                "disposition": "idle",
+                "current_conversation_id": armed_conversation_id,
+            },
+            by_id[shell_id]["sprint"],
+        )
+
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused',paused_at='2026-07-31 09:00:00' "
+            "WHERE sprint_id=?",
+            (armed_id,),
+        )
+        self.con.commit()
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            {
+                "sprint_id": int(paused_id),
+                "lifecycle": "paused",
+                "role": "developer",
+                "disposition": "active",
+                "current_conversation_id": paused_conversation_id,
+            },
+            by_id[shell_id]["sprint"],
+        )
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participants WHERE shell_id=?",
+                (shell_id,),
+            ).fetchone()[0],
+        )
+
     def test_get_shell(self) -> None:
         out = server.get_shell(self.con, self.ids["shell_id"])
         self.assertIsNotNone(out)

@@ -323,15 +323,13 @@ def attach_live_participations(con, shells: list[dict]) -> list[dict]:
         "FROM sprint_participants p "
         "JOIN sprints s ON s.sprint_id=p.sprint_id "
         "WHERE s.lifecycle IN ('armed','paused') "
-        "ORDER BY s.lifecycle='armed' DESC,s.sprint_id DESC"
+        "ORDER BY s.lifecycle='armed' DESC,s.paused_at DESC,s.sprint_id DESC"
     ).fetchall()
     by_shell: dict[int, dict] = {}
     for row in rows:
         shell_id = int(row["shell_id"])
         if shell_id in by_shell:
-            raise SprintConversationError(
-                "shell participates in more than one live or paused Sprint"
-            )
+            continue
         if row["current_conversation_id"] is None:
             raise SprintConversationError(
                 "live Sprint participant has no current conversation"

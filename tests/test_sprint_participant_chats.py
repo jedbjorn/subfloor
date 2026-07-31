@@ -40,7 +40,8 @@ def substrate():
           sprint_id INTEGER PRIMARY KEY,
           feature_id INTEGER NOT NULL REFERENCES roadmap(feature_id),
           originating_planner_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
-          lifecycle TEXT NOT NULL
+          lifecycle TEXT NOT NULL,
+          paused_at TEXT
         );
         CREATE TABLE sprint_specs (
           sprint_id INTEGER NOT NULL REFERENCES sprints(sprint_id),
@@ -110,7 +111,9 @@ def substrate():
         INSERT INTO roadmap VALUES (31,'Collaborative orchestration');
         INSERT INTO shells VALUES
           (10,'DEV1','dev',1),(20,'REV1','reviewer',1),(30,'PLN1','planner',1);
-        INSERT INTO sprints VALUES (7,31,30,'armed');
+        INSERT INTO sprints
+          (sprint_id,feature_id,originating_planner_shell_id,lifecycle)
+          VALUES (7,31,30,'armed');
         INSERT INTO sprint_specs VALUES (7,46,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
         INSERT INTO sprint_participants
           (participant_id,sprint_id,shell_id,role,harness,model,effort,disposition)
